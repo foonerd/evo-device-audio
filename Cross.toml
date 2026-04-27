@@ -1,0 +1,11 @@
+# cross (https://github.com/cross-rs/cross) configuration for
+# evo-plugins-audio.
+#
+# Unlike evo-device-volumio, this workspace pins evo-plugin-sdk via a
+# git tag in [workspace.dependencies] rather than a path dependency.
+# No host volume needs to be mounted into the build container; cross
+# defaults handle the git-based SDK fetch.
+#
+# This file exists as a placeholder so that future cross-specific
+# settings (target-specific environment, custom images) have an
+# obvious home.

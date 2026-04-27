@@ -1,0 +1,15 @@
+[package]
+name = "evo-plugins-audio-shared"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared utilities for evo-plugins-audio plugin crates. Workspace-internal; not a published artefact."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
