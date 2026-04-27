@@ -1,0 +1,41 @@
+# Out-of-process bundle only for GitHub Actions: exercise evo-plugin-tool sign/verify with PLUGIN_SIGNING_KEY_PEM.
+# Production org.evoframework.* plugins in this repo are in-process (exec = "<compiled-in>"); the steward does not load this bundle.
+[plugin]
+name = "org.evoframework.cicd.sign-smoke"
+version = "0.0.0"
+contract = 1
+
+[target]
+shelf = "cicd.sign-smoke"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["cicd.ping"]
+response_budget_ms = 1000
