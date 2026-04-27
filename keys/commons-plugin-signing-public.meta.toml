@@ -1,0 +1,18 @@
+# Sidecar for commons-plugin-signing-public.pem
+# (see PLUGIN_PACKAGING / evo_trust::KeyMeta).
+#
+# Public key fingerprint (SHA256 of the DER-encoded
+# SubjectPublicKeyInfo bytes):
+#   9cd7d7381ee7c2b3bfa490b39077afdc925192299dda661ef94dddba71e574da
+# Verify with:
+#   openssl pkey -pubin -in keys/commons-plugin-signing-public.pem \
+#     -outform DER | sha256sum
+
+[authorisation]
+# Plugin commons artefacts published under the evo project's
+# org.evoframework.* namespace.
+name_prefixes = ["org.evoframework.*"]
+# Commons plugins admitted at platform trust class; matches the
+# tier vendor-published plugins use. Operators may downgrade
+# locally per VENDOR_CONTRACT.md operator-sovereignty.
+max_trust_class = "platform"
