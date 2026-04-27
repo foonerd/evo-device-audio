@@ -52,11 +52,14 @@ jobs:
             echo "No plugin crates to cross-build; skipping (scaffold state)."
           fi
       - name: evo-plugin-tool sign + verify (OOP sign-smoke, when bundle exists)
-        if: ${{ secrets.PLUGIN_SIGNING_KEY_PEM != '' }}
         env:
           PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
         run: |
           set -e
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "PLUGIN_SIGNING_KEY_PEM not set; skipping sign-smoke."
+            exit 0
+          fi
           if [ ! -d ci/oob-sign-smoke ]; then
             echo "No OOP sign-smoke bundle present; skipping (lands with first plugin)."
             exit 0
@@ -74,7 +77,11 @@ jobs:
               --trust-dir-etc "$RUNNER_TEMP/trust-etc" \
               --revocations /tmp/evo-revocations-not-present.toml
       - name: Upload OOP sign-smoke bundle
-        if: ${{ success() && secrets.PLUGIN_SIGNING_KEY_PEM != '' && hashFiles('ci/oob-sign-smoke/manifest.toml') != '' }}
+        # Keyed off the sign step's output (manifest.sig) rather than
+        # the secret directly: GitHub Actions does not allow the
+        # secrets context inside step-level `if:` expressions, and the
+        # .sig file is created only when the sign step ran end-to-end.
+        if: ${{ success() && hashFiles('ci/oob-sign-smoke/manifest.sig') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: oob-sign-smoke
