@@ -1,0 +1,42 @@
+[plugin]
+name = "org.evoframework.metadata.local"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.1"
+contract = 1
+
+[target]
+shelf = "metadata.providers"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.9"
+os_family = "linux"
+outbound_network = false
+# Optional in org.evoframework.metadata.local.toml: [library] roots (MPD file paths, same as artwork);
+# [metadata] profile = "standard" | "extended" (default standard) — see plugin docs/METADATA_QUERY_V1.md.
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["metadata.query"]
+response_budget_ms = 10000

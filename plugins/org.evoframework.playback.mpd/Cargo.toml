@@ -1,0 +1,32 @@
+[package]
+name = "org-evoframework-playback-mpd"
+# Kept in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MPD playback warden for the evo audio domain. Stocks the audio.playback shelf."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+# Plugin-local: used to parse `LoadContext::config` in `src/config.rs`.
+# Matches the version the SDK carries transitively; direct declaration is
+# required to name `toml::Table` as a type in this crate. Not a workspace
+# dep because not every future plugin will want a configuration file.
+toml = "0.8"
+
+[dev-dependencies]
+# Extra tokio features only needed by tests (duplex streams, test-util utilities).
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

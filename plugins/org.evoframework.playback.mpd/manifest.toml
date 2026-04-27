@@ -1,0 +1,42 @@
+[plugin]
+name = "org.evoframework.playback.mpd"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.playback"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.9"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.warden]
+custody_domain = "playback"
+custody_exclusive = true
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"

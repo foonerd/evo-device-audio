@@ -1,11 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/evo-plugins-audio-shared"]
+members = [
+    "crates/evo-plugins-audio-shared",
+    "plugins/org.evoframework.playback.mpd",
+    "plugins/org.evoframework.metadata.local",
+    "plugins/org.evoframework.artwork.local",
+]
 
-# Plugin crates land under plugins/<name>/ as the brand-neutral
-# plugins migrate out of evo-device-volumio. Each new crate is
-# added to the members array in the same commit that introduces it.
-# Workspace-internal shared utilities live under crates/.
+# Each plugin crate lives under plugins/<full.dotted.name>/ matching
+# its manifest plugin name. New plugins are added to the members
+# array in the same commit that introduces them. Workspace-internal
+# shared utilities live under crates/.
 
 [workspace.package]
 version = "0.1.0"

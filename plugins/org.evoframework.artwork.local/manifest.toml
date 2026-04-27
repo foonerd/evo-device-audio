@@ -1,0 +1,45 @@
+[plugin]
+name = "org.evoframework.artwork.local"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "artwork.providers"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.9"
+os_family = "linux"
+outbound_network = false
+# Example (optional) in org.evoframework.artwork.local.toml for relative MPD file paths:
+#   [library]
+#   roots = ["/data/music", "/media/usb/Music"]
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+# Resolve visual material (e.g. cover art) for a subject. Payload and response
+# formats will follow the artwork.providers shelf as Milestone 4 phases land.
+request_types = ["artwork.resolve"]
+response_budget_ms = 10000
