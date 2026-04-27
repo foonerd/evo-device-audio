@@ -1,0 +1,31 @@
+# Placeholder: promotion moves a channel pointer on the artefacts repo
+# (no rebuild). To be implemented with evo-plugins-audio-artefacts when
+# the artefact manifest, signing of channel pointers, and a PAT are
+# available.
+name: promote
+
+"on":
+  workflow_dispatch:
+    inputs:
+      piece:
+        description: "Plugin name (e.g. org.evoframework.playback.mpd)"
+        type: string
+        required: true
+      version:
+        description: "Version string already published on the artefacts plane (no rebuild)"
+        type: string
+        required: true
+      channel:
+        description: "Target channel (dev, test, prod)"
+        type: choice
+        options: [dev, test, prod]
+        required: true
+
+jobs:
+  not-implemented:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promotion not yet implemented
+        run: |
+          echo "Would move: piece=${{ inputs.piece }} version=${{ inputs.version }} -> channel=${{ inputs.channel }} on evo-plugins-audio-artefacts"
+          echo "Implement when the artefact manifest, signing of channel pointers, and PAT are available."

@@ -1,0 +1,85 @@
+# Manual: cross-build, sign-smoke, optional upload - same as
+# continuous-dev but for an arbitrary ref and a recorded channel.
+name: manual-build
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or full SHA)"
+        type: string
+        default: main
+      channel:
+        description: "Artefact channel to record in logs (dev / test / prod) - no publish yet"
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+
+env:
+  EVO_CORE_TAG: v0.1.9
+  CROSS_AARCH64_TARGET: aarch64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Log destination channel
+        run: |
+          echo "Building @ ${{ inputs.ref }}; intended channel: ${{ inputs.channel }} (publishing to artefacts is not wired yet)"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: clippy, rustfmt
+      - name: Set up Docker / Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Install evo-plugin-tool
+        run: cargo install --git https://github.com/foonerd/evo-core.git --tag ${EVO_CORE_TAG} --locked evo-plugin-tool
+      - name: Fmt, clippy, test
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Cross build (aarch64, release) when workspace has members
+        run: |
+          if [ -d plugins ] && [ -n "$(ls -A plugins 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+            cross build --release --target "$CROSS_AARCH64_TARGET" --workspace
+          else
+            echo "No plugin crates to cross-build; skipping (scaffold state)."
+          fi
+      - name: evo-plugin-tool sign + verify (OOP sign-smoke, when bundle exists)
+        if: ${{ secrets.PLUGIN_SIGNING_KEY_PEM != '' }}
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+        run: |
+          set -e
+          if [ ! -d ci/oob-sign-smoke ]; then
+            echo "No OOP sign-smoke bundle present; skipping (lands with first plugin)."
+            exit 0
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/plugin-signing.key.pem
+          P="$GITHUB_WORKSPACE"
+          T="$RUNNER_TEMP/trust-opt"
+          mkdir -p "$T" "$RUNNER_TEMP/trust-etc"
+          cp "$P/keys/commons-plugin-signing-public.pem" "$P/keys/commons-plugin-signing-public.meta.toml" "$T/"
+          evo-plugin-tool sign "$P/ci/oob-sign-smoke" --key /tmp/plugin-signing.key.pem
+          evo-plugin-tool verify "$P/ci/oob-sign-smoke" \
+              --trust-dir-opt "$T" \
+              --trust-dir-etc "$RUNNER_TEMP/trust-etc" \
+              --revocations /tmp/evo-revocations-not-present.toml
+      - name: Upload OOP sign-smoke bundle
+        if: ${{ success() && secrets.PLUGIN_SIGNING_KEY_PEM != '' && hashFiles('ci/oob-sign-smoke/manifest.toml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: oob-sign-smoke-manual-${{ inputs.channel }}-${{ inputs.ref }}
+          path: |
+            ci/oob-sign-smoke/manifest.toml
+            ci/oob-sign-smoke/manifest.sig
+            ci/oob-sign-smoke/plugin.bin
+          if-no-files-found: warn
