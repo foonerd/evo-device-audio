@@ -51,6 +51,7 @@ Plugins published from this repository live under the reverse-DNS namespace `org
 -   `org.evoframework.playback.mpd`
 -   `org.evoframework.metadata.local`
 -   `org.evoframework.artwork.local`
+-   `org.evoframework.composition.alsa`
 -   ...
 
 The namespace is reserved for plugin commons artefacts signed by the evo project's commons key. Vendors do not publish under this namespace. Per-vendor namespaces (`com.volumio.*`, `com.acme.*`, etc.) remain the home for genuinely vendor-specific plugins.
@@ -92,6 +93,9 @@ Phase 2 landed: the first three plugins now live in this repository, signed by t
 | `org.evoframework.playback.mpd` | `audio.playback` | 0.1.0 |
 | `org.evoframework.metadata.local` | `metadata.providers` | 0.1.1 |
 | `org.evoframework.artwork.local` | `artwork.providers` | 0.1.0 |
+| `org.evoframework.composition.alsa` | `audio.composition` | 0.1.0 |
+
+`org.evoframework.delivery.alsa` currently provides deterministic ALSA pipeline composition (`alsa.pipeline.compose`) as a responder surface. Steward-side reconciliation hooks (trigger compose + reproject on plugin/output changes) are tracked at the framework tier (`evo-core`).
 
 A workspace-internal shared crate, `evo-plugins-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
 

@@ -5,6 +5,7 @@ members = [
     "plugins/org.evoframework.playback.mpd",
     "plugins/org.evoframework.metadata.local",
     "plugins/org.evoframework.artwork.local",
+    "plugins/org.evoframework.composition.alsa",
 ]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching
