@@ -5,11 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared utilities for evo-plugins-audio plugin crates. Workspace-internal; not a published artefact."
+description = "Shared utilities for the evo-plugins-audio brand-neutral plugin crates: local-library tag scanning and mpd-album value parsing. Workspace-internal; not a published artefact."
 publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+lofty = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
