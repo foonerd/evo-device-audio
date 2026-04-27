@@ -56,9 +56,9 @@ The private key never leaves the GitHub Actions runner. The public key fingerpri
 
 ## Adding a new plugin
 
-1.  Create `plugins/<short-name>/` (e.g. `plugins/playback-mpd/`).
-2.  Add `Cargo.toml` with `name = "<short-name>"` and `package = { workspace = true }` for shared metadata.
-3.  Add `manifest.toml` with `name = "org.evoframework.<dotted.name>"` (e.g. `org.evoframework.playback.mpd`). The reverse-DNS namespace prefix is reserved for the plugin commons; do not publish under any other prefix from this repo.
+1.  Create `plugins/<full.dotted.name>/` (e.g. `plugins/org.evoframework.playback.mpd/`). The directory name matches the plugin's manifest name; this convention is shared with evo distribution repositories so plugins resolve by name on the filesystem directly.
+2.  Add `Cargo.toml` with `name` set to the dotted name with dots replaced by hyphens (e.g. `org-evoframework-playback-mpd`) and `package = { workspace = true }` for shared metadata.
+3.  Add `manifest.toml` with `name` set to the dotted form matching the directory name (e.g. `org.evoframework.playback.mpd`). The reverse-DNS namespace prefix is reserved for the plugin commons; do not publish under any other prefix from this repo.
 4.  Add the new path to `[workspace].members` in the root `Cargo.toml`.
 5.  Implement against the SDK trait that matches the slot the plugin will stock. See evo-core's [`PLUGIN_AUTHORING.md`](https://github.com/foonerd/evo-core/blob/main/docs/engineering/PLUGIN_AUTHORING.md).
 6.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-plugins-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
