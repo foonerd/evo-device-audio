@@ -85,11 +85,15 @@ A distribution catalogue admits the commons plugin by its `org.evoframework.*` n
 
 ## Status
 
-Early. Phase 1 scaffolding only. The first plugins migrate here from `evo-device-volumio` as Phase 2 work, renamed under `org.evoframework.*`:
+Phase 2 landed: the first three plugins now live in this repository, signed by the evo project commons key. They are consumed by `evo-device-volumio` (the first audio distribution) and remain available unchanged to any future audio distribution.
 
--   `com.volumio.playback.mpd` -> `org.evoframework.playback.mpd`
--   `com.volumio.metadata.local` -> `org.evoframework.metadata.local`
--   `com.volumio.artwork.local` -> `org.evoframework.artwork.local`
+| Plugin | Slot | Version |
+|--------|------|---------|
+| `org.evoframework.playback.mpd` | `audio.playback` | 0.1.0 |
+| `org.evoframework.metadata.local` | `metadata.providers` | 0.1.1 |
+| `org.evoframework.artwork.local` | `artwork.providers` | 0.1.0 |
+
+A workspace-internal shared crate, `evo-plugins-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
 
 `evo-core` is pinned at tag `v0.1.9` via `[workspace.dependencies]` in `Cargo.toml`. Bumps are deliberate; see [DEVELOPING.md](DEVELOPING.md) for the procedure.
 
