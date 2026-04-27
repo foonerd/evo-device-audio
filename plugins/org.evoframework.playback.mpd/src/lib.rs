@@ -491,10 +491,10 @@ impl Plugin for MpdPlaybackPlugin {
 }
 
 impl Warden for MpdPlaybackPlugin {
-    fn take_custody<'a>(
-        &'a mut self,
+    fn take_custody(
+        &mut self,
         assignment: Assignment,
-    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
     {
         async move {
             if !self.loaded {
@@ -610,10 +610,10 @@ impl Warden for MpdPlaybackPlugin {
         }
     }
 
-    fn release_custody<'a>(
-        &'a mut self,
+    fn release_custody(
+        &mut self,
         handle: CustodyHandle,
-    ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
             if !self.loaded {
                 return Err(PluginError::Permanent(

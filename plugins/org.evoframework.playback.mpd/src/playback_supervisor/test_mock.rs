@@ -7,8 +7,9 @@
 //! addition to `actor.rs` tests; keeping one copy of the mock
 //! avoids drift between the integration tests for the supervisor
 //! itself and the integration tests for the warden that wraps it.
-
-#![cfg(test)]
+//!
+//! The `#[cfg(test)]` gate lives on the `mod test_mock;` declaration
+//! in `playback_supervisor.rs`; no inner attribute needed here.
 
 use std::future::Future;
 use std::pin::Pin;
