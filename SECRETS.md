@@ -112,7 +112,7 @@ If the private key has leaked or is suspected to have leaked:
 1. Open https://github.com/settings/tokens?type=beta (Settings → Developer settings → Personal access tokens → Fine-grained tokens).
 2. Click **Generate new token**.
 3. Fill the form:
-   - **Token name**: `evo-plugins-audio: publish to artefacts (2026-Q2)`. The `(YYYY-QN)` suffix is the rotation generation; future rotations increment to `(2026-Q3)`, `(2026-Q4)`, etc. Audit logs sort by name; consistent suffixing makes the active vs retiring generation obvious.
+   - **Token name**: `evo-plugins-audio: publish (2026-Q2)`. GitHub limits the token name to 40 characters; this format fits. The `(YYYY-QN)` suffix is the rotation generation; future rotations increment to `(2026-Q3)`, `(2026-Q4)`, etc. Audit logs sort by name; consistent suffixing makes the active vs retiring generation obvious. The longer prose ("Cross-repo write from ... to ...") goes in the **Description** field below, which has no length limit.
    - **Description**: `Cross-repo write from evo-plugins-audio CI to evo-plugins-audio-artefacts. Used by promote.yml and publish.yml. Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
    - **Expiration**: 90 days.
    - **Resource owner**: `foonerd`.
@@ -162,7 +162,7 @@ The 404 confirms scope isolation.
 
 Rotate every 90 days. Set a calendar reminder for 80 days from issue (10-day buffer).
 
-1. Create a fresh PAT (Step 2.1) with the next-quarter token name (e.g. `evo-plugins-audio: publish to artefacts (2026-Q3)`).
+1. Create a fresh PAT (Step 2.1) with the next-quarter token name (e.g. `evo-plugins-audio: publish (2026-Q3)`).
 2. Update the repo secret with the new PAT value (Step 2.2 with **Update secret**).
 3. Verify (Step 2.3).
 4. Revoke the old PAT: https://github.com/settings/tokens?type=beta → find the old token by its `(2026-QN)` suffix → **Revoke**.
@@ -234,4 +234,4 @@ Cross-reference all three when investigating any unexpected publish.
 
 ## This document is a worked example
 
-Distributions and commons creating new evo repositories copy this document with their own repo names, key namespaces, and trust contexts substituted. The two-secret model (signing key + cross-repo write token), the canonical token-name format (`<source-repo>: publish to artefacts (YYYY-QN)`), and the rotation cadences (12 months for signing keys, 90 days for PATs) are project-wide conventions. See [foonerd/evo-device-volumio/SECRETS.md](https://github.com/foonerd/evo-device-volumio/blob/main/SECRETS.md) for the parallel document at the distribution tier.
+Distributions and commons creating new evo repositories copy this document with their own repo names, key namespaces, and trust contexts substituted. The two-secret model (signing key + cross-repo write token), the canonical token-name format (`<source-repo>: publish (YYYY-QN)`, kept under the GitHub 40-character limit), and the rotation cadences (12 months for signing keys, 90 days for PATs) are project-wide conventions. See [foonerd/evo-device-volumio/SECRETS.md](https://github.com/foonerd/evo-device-volumio/blob/main/SECRETS.md) for the parallel document at the distribution tier.
