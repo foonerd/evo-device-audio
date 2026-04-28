@@ -1,0 +1,193 @@
+# Publish evo-core binaries for reference testing.
+#
+# Cross-builds evo-core's `evo` (the steward) and `evo-plugin-tool`
+# from the pinned tag and publishes per-arch binaries to
+# evo-device-audio-artefacts. This is a stop-gap delivery while
+# evo-core gains its own binary publish path (gap [33], 0.1.10 per
+# ADR-0030 / ADR-0031); when that lands, this workflow can be
+# retired and consumers fetch directly from evo-core's artefacts
+# repo.
+#
+# This workflow lives on the reference generic device per ADR-0032.
+# The reference generic device is the natural home for the stop-gap
+# because it is the deployable target plugin developers and vendor
+# distributions consume; vendor distributions (`evo-device-volumio`
+# etc.) start from the reference and inherit the binary supply.
+#
+# Targets:
+#   - x86_64-unknown-linux-gnu  (amd64; reference VMs and dev boxes)
+#   - aarch64-unknown-linux-gnu (arm64; Pi 4 / reference target)
+#   - armv7-unknown-linux-gnueabihf (armhf; Pi 2 / Pi 3 32-bit)
+#
+# Each arch's binaries are signed with the commons signing key
+# (PLUGIN_SIGNING_KEY_PEM on this repository) so devices fetching
+# from this artefacts repo verify against the bundled commons trust
+# root. When evo-core publishes its own signed binaries, devices
+# verify against the framework key directly and this proxy
+# publishing is removed.
+name: publish-core-binaries
+
+"on":
+  workflow_dispatch:
+    inputs:
+      evo_core_tag:
+        description: "evo-core tag to build from"
+        type: string
+        default: v0.1.9
+
+env:
+  ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
+  COMMIT_USER: evo-device-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Set up Docker / Buildx (for cross)
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Clone evo-core at the pinned tag
+        env:
+          EVO_CORE_TAG: ${{ inputs.evo_core_tag }}
+        run: |
+          set -e
+          git clone --depth 1 --branch "${EVO_CORE_TAG}" \
+              https://github.com/foonerd/evo-core.git /tmp/evo-core
+
+      - name: Cross-build evo and evo-plugin-tool
+        run: |
+          set -e
+          cd /tmp/evo-core
+          cross build --release --target ${{ matrix.target }} -p evo --bin evo
+          cross build --release --target ${{ matrix.target }} -p evo-plugin-tool --bin evo-plugin-tool
+
+      - name: Stage and sign binaries for ${{ matrix.target }}
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          TARGET: ${{ matrix.target }}
+          EVO_CORE_TAG: ${{ inputs.evo_core_tag }}
+        run: |
+          set -e
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          STAGE=/tmp/stage
+          STAGE_DIR="$STAGE/binaries/$TARGET"
+          mkdir -p "$STAGE_DIR"
+
+          BUILD_ROOT=/tmp/evo-core/target/$TARGET/release
+          for binary in evo evo-plugin-tool; do
+            src="$BUILD_ROOT/$binary"
+            dst="$STAGE_DIR/$binary"
+            cp "$src" "$dst"
+            chmod 755 "$dst"
+            openssl pkeyutl -sign \
+                -inkey /tmp/key.pem -rawin \
+                -in "$dst" \
+                -out "$dst.sig"
+            sha256sum "$dst" | awk '{print $1}' > "$dst.sha256"
+          done
+
+          {
+            echo "schema_version = 0"
+            echo "kind = \"core-binaries\""
+            echo "evo_core_tag = \"${EVO_CORE_TAG}\""
+            echo "target = \"${TARGET}\""
+            echo "binaries = [\"evo\", \"evo-plugin-tool\"]"
+            echo "built_at = \"$(date -u +%FT%TZ)\""
+            echo "publisher = \"org.evoframework\""
+          } > "$STAGE_DIR/build-info.toml"
+
+          openssl pkeyutl -sign \
+              -inkey /tmp/key.pem -rawin \
+              -in "$STAGE_DIR/build-info.toml" \
+              -out "$STAGE_DIR/build-info.sig"
+
+          shred -u /tmp/key.pem
+          ls -la "$STAGE_DIR"
+
+      - name: Upload binaries as run artefact (matrix-shared)
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-binaries-${{ matrix.target }}
+          path: /tmp/stage/binaries/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all matrix artefacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/stage/binaries/
+
+      - name: Restore matrix directory layout
+        run: |
+          set -e
+          # Each artifact downloaded into its own directory; flatten so
+          # the resulting layout is binaries/<target>/{evo,evo-plugin-tool,...}
+          cd /tmp/stage/binaries
+          for d in core-binaries-*; do
+            target="${d#core-binaries-}"
+            mv "$d" "$target"
+          done
+          ls -la /tmp/stage/binaries/
+
+      - name: Push to artefacts repo
+        env:
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          STAGE=/tmp/stage
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          cd "$ART"
+
+          mkdir -p binaries
+          # Replace any prior version of these per-arch binaries
+          # (they are not append-only the way pieces/<piece>/<version>/
+          # entries are; the binaries reflect the most recent build of
+          # the named tag for that arch).
+          for arch_dir in "$STAGE/binaries"/*/; do
+            arch=$(basename "$arch_dir")
+            target_dir="binaries/$arch"
+            mkdir -p "$target_dir"
+            cp -r "$arch_dir"* "$target_dir/"
+          done
+
+          if git status --porcelain | grep -q .; then
+            git add binaries/
+            git commit -m "publish: evo-core binaries (evo, evo-plugin-tool) per arch"
+            git push origin main
+            echo "Pushed core-binaries for: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf"
+          else
+            echo "No changes to publish."
+          fi
