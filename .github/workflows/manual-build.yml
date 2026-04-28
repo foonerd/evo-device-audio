@@ -82,7 +82,7 @@ jobs:
         # secrets context inside step-level `if:` expressions, and the
         # .sig file is created only when the sign step ran end-to-end.
         if: ${{ success() && hashFiles('ci/oob-sign-smoke/manifest.sig') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oob-sign-smoke-manual-${{ inputs.channel }}-${{ inputs.ref }}
           path: |
