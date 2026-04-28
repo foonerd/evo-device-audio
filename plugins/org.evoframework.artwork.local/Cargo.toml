@@ -11,7 +11,16 @@ description = "Local album-artwork respondent for the evo audio domain. Stocks t
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a v0.1.10 plugin bundle (ADR-0033 D26). The companion
+# in-process admission path uses the lib crate directly.
+[[bin]]
+name = "artwork-local-wire"
+path = "src/bin/artwork-local-wire.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { workspace = true }
 lofty = { workspace = true }
@@ -22,6 +31,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

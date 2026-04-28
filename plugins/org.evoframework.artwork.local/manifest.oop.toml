@@ -1,0 +1,64 @@
+# Out-of-process bundle manifest for org.evoframework.artwork.local.
+#
+# This is the production-shaped variant. The publish-plugin-bundles
+# workflow stages a per-target bundle directory containing this file
+# (renamed to `manifest.toml`) plus the cross-compiled
+# `artwork-local-wire` binary as `plugin.bin`, signs with the
+# commons signing key, packs as `.tar.gz`, and pushes to
+# `foonerd/evo-device-audio-artefacts` under
+# `bundles/org.evoframework.artwork.local/<target>/`.
+#
+# The companion in-process variant (`manifest.toml` in this same
+# directory) is what `evo-device-volumio` and similar in-process
+# distributions consume. Both manifests describe the same plugin at
+# the same version; only the transport differs.
+#
+# See:
+# - evo-core docs/engineering/PLUGIN_PACKAGING.md (bundle layout)
+# - evo-core docs/engineering/RELEASE_PLANE.md  (plugin-bundle kind)
+
+[plugin]
+name = "org.evoframework.artwork.local"
+# Keep in sync with this crate's Cargo.toml [package].version and
+# manifest.toml [plugin].version. All three update together.
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "artwork.providers"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.10"
+os_family = "linux"
+# Example (optional) in org.evoframework.artwork.local.toml for
+# relative MPD file paths:
+#   [library]
+#   roots = ["/data/music", "/media/usb/Music"]
+filesystem_scopes = []
+outbound_network = false
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["artwork.resolve"]
+response_budget_ms = 10000

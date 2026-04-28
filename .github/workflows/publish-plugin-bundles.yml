@@ -1,0 +1,211 @@
+# Publish per-arch signed plugin bundles for evo-device-audio plugins
+# (ADR-0033 D26).
+#
+# For each plugin that ships an out-of-process bundle (declared in
+# the matrix below): cross-build the wire binary for every supported
+# target architecture, stage a bundle directory containing the OOP
+# manifest plus the binary, sign with the commons signing key
+# (`PLUGIN_SIGNING_KEY_PEM`) using `evo-plugin-tool sign` (which
+# canonicalises the manifest and digests the binary per
+# evo-core/docs/engineering/PLUGIN_PACKAGING.md §5), pack as
+# `.tar.gz`, and push to `foonerd/evo-device-audio-artefacts` under
+# `bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz`.
+#
+# Verification on a device runs through `evo-plugin-tool install`
+# (or `verify`), which loads the commons signing key from
+# `keys/commons-plugin-signing-public.pem` (pinned in this repo's
+# source) and refuses installation on signature, prefix, or
+# trust-class mismatch.
+#
+# The first OOP bundle the workflow ships is
+# `org.evoframework.artwork.local`. Additional plugins are added by
+# extending the `plugin` matrix dimension.
+
+name: publish-plugin-bundles
+
+"on":
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional tag/label to record on build-info; defaults to git rev"
+        type: string
+        required: false
+
+env:
+  ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
+  COMMIT_USER: evo-device-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+  RUST_TOOLCHAIN: "1.85"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+        plugin:
+          - name: org.evoframework.artwork.local
+            crate: org-evoframework-artwork-local
+            bin: artwork-local-wire
+            version: "0.1.0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up Docker / Buildx (for cross)
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Cross-build wire bin for ${{ matrix.plugin.name }} on ${{ matrix.target }}
+        env:
+          BIN: ${{ matrix.plugin.bin }}
+          CRATE: ${{ matrix.plugin.crate }}
+        run: |
+          set -e
+          cross build --release --target ${{ matrix.target }} -p "${CRATE}" --bin "${BIN}"
+
+      - name: Host-build evo-plugin-tool from the SDK pin
+        run: |
+          set -e
+          # The reference generic device pins evo-core via the SDK
+          # workspace dep; cargo install --git reads the same pin's
+          # repository and tag/rev. We use the host-native binary to
+          # canonical-sign and pack the bundle (the cross-built
+          # evo-plugin-tool may be a foreign-arch binary).
+          #
+          # Extract the git ref the SDK pin resolves to from the
+          # workspace Cargo.toml. Format options:
+          #   { git = "...", tag = "vX.Y.Z" }
+          #   { git = "...", branch = "..." }
+          #   { git = "...", rev = "<sha>" }
+          # Whichever is present, build evo-plugin-tool from the
+          # matching evo-core source.
+          PIN_LINE=$(awk '/^evo-plugin-sdk *=/{print; exit}' Cargo.toml)
+          echo "SDK pin line: $PIN_LINE"
+          REPO=$(printf '%s' "$PIN_LINE" | sed -n 's/.*git *= *"\([^"]*\)".*/\1/p')
+          if printf '%s' "$PIN_LINE" | grep -q 'tag *='; then
+              GITREF_FLAG="--tag"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*tag *= *"\([^"]*\)".*/\1/p')
+          elif printf '%s' "$PIN_LINE" | grep -q 'branch *='; then
+              GITREF_FLAG="--branch"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*branch *= *"\([^"]*\)".*/\1/p')
+          elif printf '%s' "$PIN_LINE" | grep -q 'rev *='; then
+              GITREF_FLAG="--rev"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p')
+          else
+              echo "::error::Could not infer evo-core git ref from SDK pin"
+              exit 1
+          fi
+          echo "evo-core ref: $GITREF_FLAG $GITREF (repo $REPO)"
+          cargo install --git "$REPO" $GITREF_FLAG "$GITREF" \
+              --locked --root /tmp/evo-plugin-tool-host evo-plugin-tool
+          cp /tmp/evo-plugin-tool-host/bin/evo-plugin-tool /tmp/host-evo-plugin-tool
+          chmod +x /tmp/host-evo-plugin-tool
+
+      - name: Stage, sign, and pack the bundle for ${{ matrix.plugin.name }} on ${{ matrix.target }}
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          TARGET: ${{ matrix.target }}
+          PLUGIN_NAME: ${{ matrix.plugin.name }}
+          PLUGIN_VERSION: ${{ matrix.plugin.version }}
+          PLUGIN_BIN: ${{ matrix.plugin.bin }}
+        run: |
+          set -e
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          STAGE=/tmp/stage
+          BUNDLE_DIR_NAME="${PLUGIN_NAME}-${PLUGIN_VERSION}-${TARGET}"
+          BUNDLE_DIR="${STAGE}/bundles-work/${BUNDLE_DIR_NAME}"
+          mkdir -p "${BUNDLE_DIR}"
+
+          cp "plugins/${PLUGIN_NAME}/manifest.oop.toml" "${BUNDLE_DIR}/manifest.toml"
+          cp "target/${TARGET}/release/${PLUGIN_BIN}" "${BUNDLE_DIR}/plugin.bin"
+          chmod 755 "${BUNDLE_DIR}/plugin.bin"
+
+          /tmp/host-evo-plugin-tool sign "${BUNDLE_DIR}" --key /tmp/key.pem
+
+          BUNDLE_OUT_DIR="${STAGE}/bundles/${PLUGIN_NAME}/${TARGET}"
+          mkdir -p "${BUNDLE_OUT_DIR}"
+          /tmp/host-evo-plugin-tool pack "${BUNDLE_DIR}" \
+              --out "${BUNDLE_OUT_DIR}/${BUNDLE_DIR_NAME}.tar.gz"
+
+          ls -la "${BUNDLE_OUT_DIR}"
+
+      - name: Wipe signing key from runner
+        if: always()
+        run: |
+          rm -f /tmp/key.pem || true
+
+      - name: Upload bundle as run artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-bundle-${{ matrix.plugin.name }}-${{ matrix.target }}
+          path: /tmp/stage/bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all bundle artefacts (merge-multiple)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: plugin-bundle-*
+          path: /tmp/stage/bundles/
+          merge-multiple: true
+
+      - name: Show downloaded layout
+        run: |
+          set -e
+          ls -laR /tmp/stage/bundles/
+
+      - name: Push bundles to artefacts repo
+        env:
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          STAGE=/tmp/stage
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          cd "$ART"
+
+          # OOP plugin bundles. Layout in artefacts repo:
+          # bundles/<plugin>/<arch>/<plugin>-<version>-<arch>.tar.gz
+          if [ -d "$STAGE/bundles" ]; then
+            mkdir -p bundles
+            cp -r "$STAGE/bundles"/* bundles/
+          fi
+
+          if git status --porcelain | grep -q .; then
+            git add bundles/
+            git commit -m "publish: evo-device-audio plugin bundles per arch"
+            git push origin main
+            echo "Pushed plugin bundles."
+          else
+            echo "No changes to publish."
+          fi
