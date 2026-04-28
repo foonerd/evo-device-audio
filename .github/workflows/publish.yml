@@ -1,0 +1,140 @@
+# Publish: stage per-piece bundles for every plugin in this workspace,
+# sign them with the commons signing key, and push them to the
+# artefacts repository under pieces/<name>/<version>/.
+#
+# Append-only invariant: a piece-version directory is created once
+# and never modified. Re-running publish for an already-published
+# version is a no-op (skip).
+#
+# Format is v0. When `evo-core/docs/engineering/RELEASE_PLANE.md`
+# lands per ADR-0027 / GAPS [30], the per-piece shape will reshape
+# to match; the migration is in-place.
+name: publish
+
+"on":
+  workflow_dispatch: {}
+
+env:
+  ARTEFACTS_REPO: foonerd/evo-plugins-audio-artefacts
+  COMMIT_USER: evo-plugins-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Stage and sign per-piece bundles
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+        run: |
+          set -e
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          STAGE=/tmp/stage
+          mkdir -p "$STAGE/pieces"
+          GIT_REV=$(git rev-parse HEAD)
+          PUBLISHED_AT=$(date -u +%FT%TZ)
+          PUBLISHED_COUNT=0
+
+          for plugin_dir in plugins/*/; do
+            plugin_name=$(basename "$plugin_dir")
+            [ "$plugin_name" = "*" ] && continue
+            [ -f "$plugin_dir/manifest.toml" ] || continue
+
+            version=$(awk -F'"' '/^version *=/{print $2; exit}' \
+                "$plugin_dir/manifest.toml")
+            if [ -z "$version" ]; then
+              echo "::error::Could not extract version from $plugin_dir/manifest.toml"
+              exit 1
+            fi
+
+            piece_dir="$STAGE/pieces/$plugin_name/$version"
+            mkdir -p "$piece_dir"
+
+            cp "$plugin_dir/manifest.toml" "$piece_dir/manifest.toml"
+            openssl pkeyutl -sign \
+                -inkey /tmp/key.pem -rawin \
+                -in "$piece_dir/manifest.toml" \
+                -out "$piece_dir/manifest.sig"
+
+            cat > "$piece_dir/source.toml" <<EOF
+schema_version = 0
+piece = "$plugin_name"
+version = "$version"
+git_repository = "https://github.com/foonerd/evo-plugins-audio.git"
+git_rev = "$GIT_REV"
+crate_path = "plugins/$plugin_name"
+published_at = "$PUBLISHED_AT"
+EOF
+            openssl pkeyutl -sign \
+                -inkey /tmp/key.pem -rawin \
+                -in "$piece_dir/source.toml" \
+                -out "$piece_dir/source.sig"
+
+            echo "Staged $plugin_name $version"
+            PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
+          done
+
+          shred -u /tmp/key.pem
+          if [ "$PUBLISHED_COUNT" = "0" ]; then
+            echo "::error::No plugins found under plugins/ — nothing to publish"
+            exit 1
+          fi
+          echo "Staged $PUBLISHED_COUNT pieces"
+
+      - name: Push staged pieces to artefacts repo
+        env:
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          STAGE=/tmp/stage
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          cd "$ART"
+
+          mkdir -p pieces
+          NEW_PIECES=()
+          for piece in "$STAGE/pieces"/*/; do
+            piece_name=$(basename "$piece")
+            for version_dir in "$piece"*/; do
+              version=$(basename "$version_dir")
+              target="pieces/$piece_name/$version"
+              if [ -d "$target" ]; then
+                echo "Skipping $piece_name $version (already published, append-only)"
+                continue
+              fi
+              mkdir -p "pieces/$piece_name"
+              cp -r "$version_dir" "$target"
+              NEW_PIECES+=("$piece_name@$version")
+              echo "Published $piece_name $version"
+            done
+          done
+
+          if [ ${#NEW_PIECES[@]} -eq 0 ]; then
+            echo "No new pieces to publish."
+            exit 0
+          fi
+
+          git add pieces/
+          MSG="publish: ${NEW_PIECES[*]}"
+          git commit -m "$MSG"
+          git push origin main
+          echo "Pushed: $MSG"

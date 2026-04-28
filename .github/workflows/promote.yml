@@ -1,31 +1,119 @@
-# Placeholder: promotion moves a channel pointer on the artefacts repo
-# (no rebuild). To be implemented with evo-plugins-audio-artefacts when
-# the artefact manifest, signing of channel pointers, and a PAT are
-# available.
+# Promote: move a channel pointer to a (piece, version) that is
+# already published in pieces/. No rebuild; no signing of the piece
+# itself. The channel-pointer file is signed with the commons key
+# so consumers can verify which version a channel points at.
+#
+# Format is v0. When `evo-core/docs/engineering/RELEASE_PLANE.md`
+# lands per ADR-0027 / GAPS [30], the channel-pointer file shape
+# will reshape to match; the migration is in-place.
 name: promote
 
 "on":
   workflow_dispatch:
     inputs:
       piece:
-        description: "Plugin name (e.g. org.evoframework.playback.mpd)"
+        description: "Piece name (e.g. org.evoframework.playback.mpd)"
         type: string
         required: true
       version:
-        description: "Version string already published on the artefacts plane (no rebuild)"
+        description: "Version already published under pieces/<piece>/<version>/"
         type: string
         required: true
       channel:
-        description: "Target channel (dev, test, prod)"
+        description: "Target channel"
         type: choice
         options: [dev, test, prod]
         required: true
 
+env:
+  ARTEFACTS_REPO: foonerd/evo-plugins-audio-artefacts
+  COMMIT_USER: evo-plugins-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+
 jobs:
-  not-implemented:
+  promote:
     runs-on: ubuntu-latest
     steps:
-      - name: Promotion not yet implemented
+      - name: Promote channel pointer
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          PIECE: ${{ inputs.piece }}
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
         run: |
-          echo "Would move: piece=${{ inputs.piece }} version=${{ inputs.version }} -> channel=${{ inputs.channel }} on evo-plugins-audio-artefacts"
-          echo "Implement when the artefact manifest, signing of channel pointers, and PAT are available."
+          set -e
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          cd "$ART"
+
+          if [ ! -d "pieces/${PIECE}/${VERSION}" ]; then
+            echo "::error::pieces/${PIECE}/${VERSION} not found in ${ARTEFACTS_REPO}; cannot promote a version that has not been published"
+            exit 1
+          fi
+
+          mkdir -p channels
+          CFILE="channels/${CHANNEL}.toml"
+          UPDATED_AT=$(date -u +%FT%TZ)
+          PYTHON_HELPER=$(mktemp)
+          cat > "$PYTHON_HELPER" <<'PY'
+          import sys, os, datetime
+          path, piece, version, channel, updated_at = sys.argv[1:]
+          rows = {}
+          if os.path.exists(path):
+              cur_piece = None
+              cur_version = None
+              with open(path) as f:
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith("piece"):
+                          cur_piece = line.split("=",1)[1].strip().strip('"')
+                      elif line.startswith("version"):
+                          cur_version = line.split("=",1)[1].strip().strip('"')
+                          if cur_piece is not None:
+                              rows[cur_piece] = cur_version
+                              cur_piece = cur_version = None
+          rows[piece] = version
+          out = []
+          out.append("schema_version = 0\n")
+          out.append('publisher = "org.evoframework"\n')
+          out.append(f'channel = "{channel}"\n')
+          out.append(f'updated_at = "{updated_at}"\n')
+          out.append("\n")
+          for p, v in sorted(rows.items()):
+              out.append("[[pointers]]\n")
+              out.append(f'piece = "{p}"\n')
+              out.append(f'version = "{v}"\n')
+              out.append("\n")
+          with open(path, "w") as f:
+              f.writelines(out)
+          PY
+          python3 "$PYTHON_HELPER" "$CFILE" "$PIECE" "$VERSION" "$CHANNEL" "$UPDATED_AT"
+          rm -f "$PYTHON_HELPER"
+
+          openssl pkeyutl -sign \
+              -inkey /tmp/key.pem -rawin \
+              -in "$CFILE" \
+              -out "${CFILE%.toml}.sig"
+
+          shred -u /tmp/key.pem
+
+          git add channels/
+          MSG="promote: ${PIECE} ${VERSION} -> ${CHANNEL}"
+          git commit -m "$MSG"
+          git push origin main
+          echo "Promoted: $MSG"
