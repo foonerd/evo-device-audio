@@ -67,15 +67,16 @@ jobs:
                 -in "$piece_dir/manifest.toml" \
                 -out "$piece_dir/manifest.sig"
 
-            cat > "$piece_dir/source.toml" <<EOF
-schema_version = 0
-piece = "$plugin_name"
-version = "$version"
-git_repository = "https://github.com/foonerd/evo-plugins-audio.git"
-git_rev = "$GIT_REV"
-crate_path = "plugins/$plugin_name"
-published_at = "$PUBLISHED_AT"
-EOF
+            {
+              echo "schema_version = 0"
+              echo "piece = \"$plugin_name\""
+              echo "version = \"$version\""
+              echo "git_repository = \"https://github.com/foonerd/evo-plugins-audio.git\""
+              echo "git_rev = \"$GIT_REV\""
+              echo "crate_path = \"plugins/$plugin_name\""
+              echo "published_at = \"$PUBLISHED_AT\""
+            } > "$piece_dir/source.toml"
+
             openssl pkeyutl -sign \
                 -inkey /tmp/key.pem -rawin \
                 -in "$piece_dir/source.toml" \
@@ -87,7 +88,7 @@ EOF
 
           shred -u /tmp/key.pem
           if [ "$PUBLISHED_COUNT" = "0" ]; then
-            echo "::error::No plugins found under plugins/ — nothing to publish"
+            echo "::error::No plugins found under plugins/ - nothing to publish"
             exit 1
           fi
           echo "Staged $PUBLISHED_COUNT pieces"

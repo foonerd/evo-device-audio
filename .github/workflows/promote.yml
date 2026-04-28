@@ -34,6 +34,9 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
       - name: Promote channel pointer
         env:
           PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
@@ -69,41 +72,9 @@ jobs:
           mkdir -p channels
           CFILE="channels/${CHANNEL}.toml"
           UPDATED_AT=$(date -u +%FT%TZ)
-          PYTHON_HELPER=$(mktemp)
-          cat > "$PYTHON_HELPER" <<'PY'
-          import sys, os, datetime
-          path, piece, version, channel, updated_at = sys.argv[1:]
-          rows = {}
-          if os.path.exists(path):
-              cur_piece = None
-              cur_version = None
-              with open(path) as f:
-                  for line in f:
-                      line = line.strip()
-                      if line.startswith("piece"):
-                          cur_piece = line.split("=",1)[1].strip().strip('"')
-                      elif line.startswith("version"):
-                          cur_version = line.split("=",1)[1].strip().strip('"')
-                          if cur_piece is not None:
-                              rows[cur_piece] = cur_version
-                              cur_piece = cur_version = None
-          rows[piece] = version
-          out = []
-          out.append("schema_version = 0\n")
-          out.append('publisher = "org.evoframework"\n')
-          out.append(f'channel = "{channel}"\n')
-          out.append(f'updated_at = "{updated_at}"\n')
-          out.append("\n")
-          for p, v in sorted(rows.items()):
-              out.append("[[pointers]]\n")
-              out.append(f'piece = "{p}"\n')
-              out.append(f'version = "{v}"\n')
-              out.append("\n")
-          with open(path, "w") as f:
-              f.writelines(out)
-          PY
-          python3 "$PYTHON_HELPER" "$CFILE" "$PIECE" "$VERSION" "$CHANNEL" "$UPDATED_AT"
-          rm -f "$PYTHON_HELPER"
+
+          python3 "$GITHUB_WORKSPACE/.github/workflows/promote_channel_pointer.py" \
+              "$CFILE" "$PIECE" "$VERSION" "$CHANNEL" "$UPDATED_AT"
 
           openssl pkeyutl -sign \
               -inkey /tmp/key.pem -rawin \
