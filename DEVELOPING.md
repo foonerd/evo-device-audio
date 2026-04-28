@@ -1,4 +1,4 @@
-# Developing evo-plugins-audio
+# Developing evo-device-audio
 
 Contributor workflow for the audio-domain plugin commons.
 
@@ -35,7 +35,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Both must be green before any version bump. In Phase 1 scaffolding state the workspace contains only the `evo-plugins-audio-shared` anchor crate (an empty library that future plugins will share utilities through); `build` and `test` succeed trivially until plugin crates land.
+Both must be green before any version bump. In Phase 1 scaffolding state the workspace contains only the `evo-device-audio-shared` anchor crate (an empty library that future plugins will share utilities through); `build` and `test` succeed trivially until plugin crates land.
 
 ## GitHub Actions
 
@@ -61,7 +61,7 @@ The private key never leaves the GitHub Actions runner. The public key fingerpri
 3.  Add `manifest.toml` with `name` set to the dotted form matching the directory name (e.g. `org.evoframework.playback.mpd`). The reverse-DNS namespace prefix is reserved for the plugin commons; do not publish under any other prefix from this repo.
 4.  Add the new path to `[workspace].members` in the root `Cargo.toml`.
 5.  Implement against the SDK trait that matches the slot the plugin will stock. See evo-core's [`PLUGIN_AUTHORING.md`](https://github.com/foonerd/evo-core/blob/main/docs/engineering/PLUGIN_AUTHORING.md).
-6.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-plugins-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
+6.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-device-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
 7.  `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` all green before commit.
 
 ## Boundary discipline

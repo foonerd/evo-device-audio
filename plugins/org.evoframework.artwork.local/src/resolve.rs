@@ -207,7 +207,7 @@ fn resolve_mpd_album(
     value: &str,
 ) -> Result<ArtworkResolveResponse, String> {
     let (artist, album) =
-        match evo_plugins_audio_shared::parse_mpd_album_value(value) {
+        match evo_device_audio_shared::parse_mpd_album_value(value) {
             Ok(p) => p,
             Err(_) => {
                 return Ok(ArtworkResolveResponse {
@@ -223,13 +223,13 @@ fn resolve_mpd_album(
             });
             }
         };
-    let found = match evo_plugins_audio_shared::first_matching_audio_path(
+    let found = match evo_device_audio_shared::first_matching_audio_path(
         library_roots,
         &artist,
         &album,
     ) {
         Ok(p) => p,
-        Err(evo_plugins_audio_shared::MatchError::LimitExceeded) => {
+        Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
             return Ok(ArtworkResolveResponse {
                 v: 1,
                 status: ResponseStatus::NotFound,
@@ -237,11 +237,11 @@ fn resolve_mpd_album(
                 mime: None,
                 detail: Some(format!(
                     "mpd_album: scan limit ({} files) reached under [library] roots",
-                    evo_plugins_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES
+                    evo_device_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES
                 )),
             });
         }
-        Err(evo_plugins_audio_shared::MatchError::Io(m)) => {
+        Err(evo_device_audio_shared::MatchError::Io(m)) => {
             return Ok(ArtworkResolveResponse {
                 v: 1,
                 status: ResponseStatus::NotFound,
@@ -403,7 +403,7 @@ mod tests {
         use lofty::tag::TagType;
 
         const MINI_MP3: &[u8] = include_bytes!(
-            "../../../crates/evo-plugins-audio-shared/assets/minimal.mp3"
+            "../../../crates/evo-device-audio-shared/assets/minimal.mp3"
         );
         let dir = tempfile::tempdir().unwrap();
         let album_dir = dir.path().join("ArtZ").join("AlbZ");

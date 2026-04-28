@@ -26,8 +26,8 @@ name: promote
         required: true
 
 env:
-  ARTEFACTS_REPO: foonerd/evo-plugins-audio-artefacts
-  COMMIT_USER: evo-plugins-audio CI
+  ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
+  COMMIT_USER: evo-device-audio CI
   COMMIT_EMAIL: ci@evoframework.org
 
 jobs:

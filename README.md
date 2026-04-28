@@ -1,4 +1,4 @@
-# evo-plugins-audio
+# evo-device-audio
 
 > Brand-neutral audio-player plugins for the [evo](https://github.com/foonerd/evo-core) fabric. The middle tier between the framework and any audio-shaped distribution.
 
@@ -9,7 +9,7 @@ A distribution that builds an audio player on top of evo does not need to invent
 ```mermaid
 flowchart LR
     core["<b>evo-core</b><br/><i>framework</i><br/>steward + SDK + contracts<br/>domain-neutral"]
-    commons["<b>evo-plugins-audio</b><br/><i>this repo</i><br/>brand-neutral plugins<br/>for the audio domain"]
+    commons["<b>evo-device-audio</b><br/><i>this repo</i><br/>brand-neutral plugins<br/>for the audio domain"]
     dist["<b>evo-device-&lt;vendor&gt;</b><br/><i>distribution</i><br/>catalogue + branding<br/>+ packaging + curation"]
     art["<b>artefacts repos</b><br/><i>release planes</i><br/>signed bytes per piece"]
 
@@ -33,7 +33,7 @@ A second audio distribution stocks its catalogue from this commons unchanged. A 
 Plugins, and only plugins.
 
 -   Brand-neutral plugin crates that wrap commodity audio infrastructure (MPD, ALSA, NetworkManager, Samba, ID3/FLAC/Vorbis tag readers, NAS mounts, file sharing, library scanning).
--   A workspace-internal shared crate (`crates/evo-plugins-audio-shared`) for utilities used across plugins (path normalisation, library scanning, common error types). Compiled into plugins; not shipped as a separate artefact.
+-   A workspace-internal shared crate (`crates/evo-device-audio-shared`) for utilities used across plugins (path normalisation, library scanning, common error types). Compiled into plugins; not shipped as a separate artefact.
 -   The plugin commons signing key (public half).
 -   Build, test, and signing pipelines that produce signed artefacts for the release plane.
 
@@ -70,7 +70,7 @@ The private signing key lives only in the GitHub Actions repository secret `PLUG
 sequenceDiagram
     autonumber
     participant Vendor as Distribution build
-    participant Commons as evo-plugins-audio-artefacts
+    participant Commons as evo-device-audio-artefacts
     participant Device as Device
     participant Op as Operator
 
@@ -97,7 +97,7 @@ Phase 2 landed: the first three plugins now live in this repository, signed by t
 
 `org.evoframework.delivery.alsa` currently provides deterministic ALSA pipeline composition (`alsa.pipeline.compose`) as a responder surface. Steward-side reconciliation hooks (trigger compose + reproject on plugin/output changes) are tracked at the framework tier (`evo-core`).
 
-A workspace-internal shared crate, `evo-plugins-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
+A workspace-internal shared crate, `evo-device-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
 
 `evo-core` is pinned at tag `v0.1.9` via `[workspace.dependencies]` in `Cargo.toml`. Bumps are deliberate; see [DEVELOPING.md](DEVELOPING.md) for the procedure.
 
@@ -113,7 +113,7 @@ A workspace-internal shared crate, `evo-plugins-audio-shared`, holds utilities c
 ## Related
 
 -   [foonerd/evo-core](https://github.com/foonerd/evo-core) - the framework.
--   [foonerd/evo-plugins-audio-artefacts](https://github.com/foonerd/evo-plugins-audio-artefacts) - the release plane for this commons.
+-   [foonerd/evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts) - the release plane for this commons.
 -   [foonerd/evo-device-volumio](https://github.com/foonerd/evo-device-volumio) - the first audio distribution; consumes plugins from this commons.
 
 ## License

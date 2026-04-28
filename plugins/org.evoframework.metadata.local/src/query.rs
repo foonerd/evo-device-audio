@@ -19,7 +19,7 @@ use crate::config::MetadataProfile;
 
 /// `mpd-path`: MPD's `file` (library-relative or absolute).
 pub(crate) const SCHEME_MPD_PATH: &str = "mpd-path";
-/// `mpd-album`: `Artist|Album` — first matching track under [library] roots (tag scan via `evo_plugins_audio_shared`).
+/// `mpd-album`: `Artist|Album` — first matching track under [library] roots (tag scan via `evo_device_audio_shared`).
 pub(crate) const SCHEME_MPD_ALBUM: &str = "mpd-album";
 
 /// Truncate very large tag values (e.g. embedded lyrics) for stable memory on devices.
@@ -844,7 +844,7 @@ pub(crate) fn query_metadata(
     match req.target.scheme.as_str() {
         SCHEME_MPD_ALBUM => {
             let (artist, album) =
-                match evo_plugins_audio_shared::parse_mpd_album_value(
+                match evo_device_audio_shared::parse_mpd_album_value(
                     &req.target.value,
                 ) {
                     Ok(p) => p,
@@ -859,31 +859,28 @@ pub(crate) fn query_metadata(
                         ));
                     }
                 };
-            let found =
-                match evo_plugins_audio_shared::first_matching_audio_path(
-                    library_roots,
-                    &artist,
-                    &album,
-                ) {
-                    Ok(p) => p,
-                    Err(
-                        evo_plugins_audio_shared::MatchError::LimitExceeded,
-                    ) => {
-                        return Ok(MetadataQueryResponse::v1_error(
+            let found = match evo_device_audio_shared::first_matching_audio_path(
+                library_roots,
+                &artist,
+                &album,
+            ) {
+                Ok(p) => p,
+                Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
+                    return Ok(MetadataQueryResponse::v1_error(
                         ResponseStatus::NotFound,
                         Some(format!(
                             "mpd_album: scan limit ({} files) reached under [library] roots",
-                            evo_plugins_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES
+                            evo_device_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES
                         )),
                     ));
-                    }
-                    Err(evo_plugins_audio_shared::MatchError::Io(m)) => {
-                        return Ok(MetadataQueryResponse::v1_error(
-                            ResponseStatus::NotFound,
-                            Some(m),
-                        ));
-                    }
-                };
+                }
+                Err(evo_device_audio_shared::MatchError::Io(m)) => {
+                    return Ok(MetadataQueryResponse::v1_error(
+                        ResponseStatus::NotFound,
+                        Some(m),
+                    ));
+                }
+            };
             let Some(path) = found else {
                 return Ok(MetadataQueryResponse::v1_error(
                     ResponseStatus::NotFound,
@@ -1068,7 +1065,7 @@ mod tests {
         use lofty::tag::TagType;
 
         const MINI_MP3: &[u8] = include_bytes!(
-            "../../../crates/evo-plugins-audio-shared/assets/minimal.mp3"
+            "../../../crates/evo-device-audio-shared/assets/minimal.mp3"
         );
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("ScanA").join("ScanB");

@@ -1,6 +1,6 @@
 # On code/CI/keys changes to main: cross-compile (aarch64), sign-smoke
 # (when PLUGIN_SIGNING_KEY_PEM is set and the OOP sample bundle exists),
-# optional artefact upload. Publishing to evo-plugins-audio-artefacts is
+# optional artefact upload. Publishing to evo-device-audio-artefacts is
 # deferred until the artefact manifest pipeline is wired.
 name: continuous-dev
 

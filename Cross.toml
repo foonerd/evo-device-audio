@@ -1,5 +1,5 @@
 # cross (https://github.com/cross-rs/cross) configuration for
-# evo-plugins-audio.
+# evo-device-audio.
 #
 # Unlike evo-device-volumio, this workspace pins evo-plugin-sdk via a
 # git tag in [workspace.dependencies] rather than a path dependency.

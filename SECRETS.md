@@ -7,7 +7,7 @@
 This document covers two distinct kinds of credential material:
 
 1. **Commons signing key.** Ed25519 keypair. The **public half** is committed in this repo at [`keys/commons-plugin-signing-public.pem`](keys/commons-plugin-signing-public.pem) and is read by every consumer that verifies plugins published from this commons. The **private half** lives only in the GitHub Actions repository secret `PLUGIN_SIGNING_KEY_PEM` and never leaves the runner.
-2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish.yml` and `promote.yml` workflows to push signed bytes from this repository's CI into [evo-plugins-audio-artefacts](https://github.com/foonerd/evo-plugins-audio-artefacts) (the workflows themselves land when the release-plane contract lands in evo-core).
+2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish.yml` and `promote.yml` workflows to push signed bytes from this repository's CI into [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts) (the workflows themselves land when the release-plane contract lands in evo-core).
 
 Both secrets are kept distinct (compromising one does not compromise the other; defence in depth) and rotated independently.
 
@@ -16,7 +16,7 @@ Both secrets are kept distinct (compromising one does not compromise the other; 
 | Secret name | Type | Purpose | Used by | Rotation cadence |
 |-------------|------|---------|---------|------------------|
 | `PLUGIN_SIGNING_KEY_PEM` | Ed25519 PKCS#8 PEM (private key) | Signs plugin bundles and the release-plane manifest under the `org.evoframework.*` namespace | `continuous-dev.yml`, `manual-build.yml`, future `publish.yml`, `promote.yml` | 12 months, or on suspected compromise |
-| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Cross-repo write to `evo-plugins-audio-artefacts` | future `publish.yml`, `promote.yml` | 90 days (one calendar quarter) |
+| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Cross-repo write to `evo-device-audio-artefacts` | future `publish.yml`, `promote.yml` | 90 days (one calendar quarter) |
 
 Public key fingerprint for the current commons signing key (SHA256 of the DER-encoded SubjectPublicKeyInfo): `9cd7d7381ee7c2b3bfa490b39077afdc925192299dda661ef94dddba71e574da`.
 
@@ -57,14 +57,14 @@ The output is a 64-character hex string. This is the fingerprint recorded in [`k
 
 ```bash
 cp ~/.evo-keys/commons-plugin-signing-public.pem \
-   <path-to>/evo-plugins-audio/keys/commons-plugin-signing-public.pem
+   <path-to>/evo-device-audio/keys/commons-plugin-signing-public.pem
 ```
 
 Update [`keys/commons-plugin-signing-public.meta.toml`](keys/commons-plugin-signing-public.meta.toml) with the new fingerprint comment if the key changed. Commit and push.
 
 ### Step 1.4: Store the private half as a repo secret
 
-1. Open https://github.com/foonerd/evo-plugins-audio/settings/secrets/actions
+1. Open https://github.com/foonerd/evo-device-audio/settings/secrets/actions
 2. If `PLUGIN_SIGNING_KEY_PEM` already exists, click it and choose **Update secret**. Otherwise click **New repository secret**.
 3. **Name**: `PLUGIN_SIGNING_KEY_PEM` (exactly).
 4. **Value**: paste the contents of `~/.evo-keys/commons-signing-private.pem` — the entire PEM block including the `BEGIN`/`END` lines.
@@ -112,11 +112,11 @@ If the private key has leaked or is suspected to have leaked:
 1. Open https://github.com/settings/tokens?type=beta (Settings → Developer settings → Personal access tokens → Fine-grained tokens).
 2. Click **Generate new token**.
 3. Fill the form:
-   - **Token name**: `evo-plugins-audio: publish (2026-Q2)`. GitHub limits the token name to 40 characters; this format fits. The `(YYYY-QN)` suffix is the rotation generation; future rotations increment to `(2026-Q3)`, `(2026-Q4)`, etc. Audit logs sort by name; consistent suffixing makes the active vs retiring generation obvious. The longer prose ("Cross-repo write from ... to ...") goes in the **Description** field below, which has no length limit.
-   - **Description**: `Cross-repo write from evo-plugins-audio CI to evo-plugins-audio-artefacts. Used by promote.yml and publish.yml. Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
+   - **Token name**: `evo-device-audio: publish (2026-Q2)`. GitHub limits the token name to 40 characters; this format fits. The `(YYYY-QN)` suffix is the rotation generation; future rotations increment to `(2026-Q3)`, `(2026-Q4)`, etc. Audit logs sort by name; consistent suffixing makes the active vs retiring generation obvious. The longer prose ("Cross-repo write from ... to ...") goes in the **Description** field below, which has no length limit.
+   - **Description**: `Cross-repo write from evo-device-audio CI to evo-device-audio-artefacts. Used by promote.yml and publish.yml. Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
    - **Expiration**: 90 days.
    - **Resource owner**: `foonerd`.
-   - **Repository access**: **Only select repositories** → `foonerd/evo-plugins-audio-artefacts`. **Do not select any other repository.**
+   - **Repository access**: **Only select repositories** → `foonerd/evo-device-audio-artefacts`. **Do not select any other repository.**
 4. Scroll to **Permissions**. Three groups will be visible:
 
 | Group | Action |
@@ -130,7 +130,7 @@ If the private key has leaked or is suspected to have leaked:
 
 ### Step 2.2: Store as a repo secret
 
-1. Open https://github.com/foonerd/evo-plugins-audio/settings/secrets/actions
+1. Open https://github.com/foonerd/evo-device-audio/settings/secrets/actions
 2. Click **New repository secret** (or **Update secret** if rotating).
 3. **Name**: `ARTEFACTS_PUSH_TOKEN` (exactly).
 4. **Value**: paste the PAT from Step 2.1.
@@ -141,7 +141,7 @@ The settings page now lists two secrets: `PLUGIN_SIGNING_KEY_PEM` and `ARTEFACTS
 ### Step 2.3: Verify (read-only smoke test)
 
 ```bash
-GH_TOKEN=<paste-the-PAT> gh api repos/foonerd/evo-plugins-audio-artefacts \
+GH_TOKEN=<paste-the-PAT> gh api repos/foonerd/evo-device-audio-artefacts \
     --jq '.permissions'
 # Expected: {"admin":false,"maintain":false,"push":true,"triage":false,"pull":true}
 ```
@@ -162,7 +162,7 @@ The 404 confirms scope isolation.
 
 Rotate every 90 days. Set a calendar reminder for 80 days from issue (10-day buffer).
 
-1. Create a fresh PAT (Step 2.1) with the next-quarter token name (e.g. `evo-plugins-audio: publish (2026-Q3)`).
+1. Create a fresh PAT (Step 2.1) with the next-quarter token name (e.g. `evo-device-audio: publish (2026-Q3)`).
 2. Update the repo secret with the new PAT value (Step 2.2 with **Update secret**).
 3. Verify (Step 2.3).
 4. Revoke the old PAT: https://github.com/settings/tokens?type=beta → find the old token by its `(2026-QN)` suffix → **Revoke**.
@@ -197,9 +197,9 @@ When `publish.yml` is wired (after `RELEASE_PLANE.md` lands in evo-core), the se
 
     # ... build pieces, sign with /tmp/signing.pem ...
 
-    git config --global user.name "evo-plugins-audio CI"
+    git config --global user.name "evo-device-audio CI"
     git config --global user.email "ci@evoframework.org"
-    git clone "https://x-access-token:${GH_TOKEN}@github.com/foonerd/evo-plugins-audio-artefacts.git" artefacts
+    git clone "https://x-access-token:${GH_TOKEN}@github.com/foonerd/evo-device-audio-artefacts.git" artefacts
     cd artefacts
 
     # ... copy pieces, update pieces.toml + signature, commit, push ...
@@ -217,9 +217,9 @@ Both secrets are masked in workflow logs by GitHub Actions automatically.
 
 | Surface | What it shows |
 |---------|---------------|
-| https://github.com/foonerd/evo-plugins-audio/actions | Every workflow run that consumed either secret. Failed runs flag credential issues. |
+| https://github.com/foonerd/evo-device-audio/actions | Every workflow run that consumed either secret. Failed runs flag credential issues. |
 | https://github.com/settings/security-log | Every PAT use and every PAT lifecycle event (issue, expiration, revocation). |
-| https://github.com/foonerd/evo-plugins-audio-artefacts/commits | Every push from CI lands here; commit author "evo-plugins-audio CI" identifies the publish path. |
+| https://github.com/foonerd/evo-device-audio-artefacts/commits | Every push from CI lands here; commit author "evo-device-audio CI" identifies the publish path. |
 
 Cross-reference all three when investigating any unexpected publish.
 

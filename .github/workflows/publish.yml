@@ -15,8 +15,8 @@ name: publish
   workflow_dispatch: {}
 
 env:
-  ARTEFACTS_REPO: foonerd/evo-plugins-audio-artefacts
-  COMMIT_USER: evo-plugins-audio CI
+  ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
+  COMMIT_USER: evo-device-audio CI
   COMMIT_EMAIL: ci@evoframework.org
 
 jobs:
@@ -71,7 +71,7 @@ jobs:
               echo "schema_version = 0"
               echo "piece = \"$plugin_name\""
               echo "version = \"$version\""
-              echo "git_repository = \"https://github.com/foonerd/evo-plugins-audio.git\""
+              echo "git_repository = \"https://github.com/foonerd/evo-device-audio.git\""
               echo "git_rev = \"$GIT_REV\""
               echo "crate_path = \"plugins/$plugin_name\""
               echo "published_at = \"$PUBLISHED_AT\""

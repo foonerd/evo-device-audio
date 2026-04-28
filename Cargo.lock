@@ -85,6 +85,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-device-audio-shared"
+version = "0.1.0"
+dependencies = [
+ "lofty",
+ "tempfile",
+]
+
+[[package]]
 name = "evo-plugin-sdk"
 version = "0.1.9"
 source = "git+https://github.com/foonerd/evo-core.git?tag=v0.1.9#216edc8571064fa4cce8e49519514b3374ad45a4"
@@ -99,14 +107,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
-]
-
-[[package]]
-name = "evo-plugins-audio-shared"
-version = "0.1.0"
-dependencies = [
- "lofty",
- "tempfile",
 ]
 
 [[package]]
@@ -285,8 +285,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "org-evoframework-artwork-local"
 version = "0.1.0"
 dependencies = [
+ "evo-device-audio-shared",
  "evo-plugin-sdk",
- "evo-plugins-audio-shared",
  "lofty",
  "semver",
  "serde",
@@ -314,8 +314,8 @@ dependencies = [
 name = "org-evoframework-metadata-local"
 version = "0.1.1"
 dependencies = [
+ "evo-device-audio-shared",
  "evo-plugin-sdk",
- "evo-plugins-audio-shared",
  "lofty",
  "semver",
  "serde",

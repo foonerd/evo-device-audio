@@ -1,11 +1,11 @@
 [package]
-name = "evo-plugins-audio-shared"
+name = "evo-device-audio-shared"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared utilities for the evo-plugins-audio brand-neutral plugin crates: local-library tag scanning and mpd-album value parsing. Workspace-internal; not a published artefact."
+description = "Shared utilities for the evo-device-audio brand-neutral plugin crates: local-library tag scanning and mpd-album value parsing. Workspace-internal; not a published artefact."
 publish = false
 
 [lib]

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/evo-plugins-audio-shared",
+    "crates/evo-device-audio-shared",
     "plugins/org.evoframework.playback.mpd",
     "plugins/org.evoframework.metadata.local",
     "plugins/org.evoframework.artwork.local",
@@ -19,7 +19,7 @@ edition = "2021"
 # Match evo-core MSRV (see foonerd/evo-core docs/engineering/MSRV.md).
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/foonerd/evo-plugins-audio"
+repository = "https://github.com/foonerd/evo-device-audio"
 
 # Single pin for the evo framework. Every plugin crate consumes the
 # SDK via `evo-plugin-sdk = { workspace = true }` so there is exactly
@@ -32,7 +32,7 @@ repository = "https://github.com/foonerd/evo-plugins-audio"
 # they actually import.
 [workspace.dependencies]
 evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.9", version = "0.1.9" }
-evo-plugins-audio-shared = { path = "crates/evo-plugins-audio-shared", version = "0.1.0" }
+evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 tracing = "0.1"

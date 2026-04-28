@@ -26,7 +26,7 @@
 //!   files under [library] roots and picks the **first** track (deterministic
 //!   walk) whose primary tag artist and album match; it then uses the same
 //!   cover logic as `mpd-path` for that file. Large libraries are bounded (see
-//!   `evo_plugins_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES`).
+//!   `evo_device_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES`).
 //!
 //! # Version alignment
 //!

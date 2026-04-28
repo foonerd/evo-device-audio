@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 evo-plugin-sdk = { workspace = true }
-evo-plugins-audio-shared = { workspace = true }
+evo-device-audio-shared = { workspace = true }
 lofty = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
