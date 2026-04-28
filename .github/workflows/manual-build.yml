@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Set up Docker / Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Install cross
         run: cargo install cross --locked
       - name: Install evo-plugin-tool
