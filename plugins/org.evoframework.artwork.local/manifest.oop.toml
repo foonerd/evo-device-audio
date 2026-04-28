@@ -40,7 +40,13 @@ exec = "plugin.bin"
 class = "standard"
 
 [prerequisites]
-evo_min_version = "0.1.10"
+# The OOP path (this manifest variant) needs the SDK's `run_oop`
+# helper, which lands in evo-core 0.1.10. Pinning at the first 0.1.10
+# release candidate (`0.1.10-rc.1`) keeps the constraint honest and
+# admits cleanly on any rc.* build from rc.1 onwards as well as the
+# eventual 0.1.10 final and later — semver pre-release ordering
+# treats `0.1.10-rc.1 <= 0.1.10-rc.N <= 0.1.10`.
+evo_min_version = "0.1.10-rc.1"
 os_family = "linux"
 # Example (optional) in org.evoframework.artwork.local.toml for
 # relative MPD file paths:
