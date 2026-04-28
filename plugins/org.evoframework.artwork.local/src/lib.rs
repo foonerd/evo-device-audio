@@ -326,6 +326,7 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+            instance_id: None,
         };
         let e = p.handle_request(&r).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -345,6 +346,7 @@ mod tests {
             payload: vec![],
             correlation_id: 2,
             deadline: None,
+            instance_id: None,
         };
         let e = p.handle_request(&r).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -364,6 +366,7 @@ mod tests {
             payload: b"{not json".to_vec(),
             correlation_id: 3,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
@@ -384,6 +387,7 @@ mod tests {
             payload: sample_mpd_path_payload("/no/such/absolute.flac"),
             correlation_id: 4,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
@@ -414,6 +418,7 @@ mod tests {
             payload: sample_mpd_path_payload(rel),
             correlation_id: 5,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
@@ -438,6 +443,7 @@ mod tests {
             deadline: Some(
                 std::time::Instant::now() - std::time::Duration::from_secs(1),
             ),
+            instance_id: None,
         };
         let e = p.handle_request(&r).await.unwrap_err();
         assert!(matches!(e, PluginError::Transient(_)));

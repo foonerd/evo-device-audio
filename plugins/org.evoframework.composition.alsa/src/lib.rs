@@ -564,6 +564,7 @@ mod tests {
             payload: compose_request_payload(),
             correlation_id: 1,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -622,6 +623,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 11,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -667,6 +669,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 12,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -686,6 +689,7 @@ ctl.volumio_pipeline {\n\
             payload: b"{not-json".to_vec(),
             correlation_id: 2,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -727,6 +731,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 3,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -752,6 +757,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 4,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -778,6 +784,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 5,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -812,6 +819,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 6,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);
@@ -846,6 +854,7 @@ ctl.volumio_pipeline {\n\
             payload,
             correlation_id: 7,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&out.payload);

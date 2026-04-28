@@ -94,8 +94,8 @@ dependencies = [
 
 [[package]]
 name = "evo-plugin-sdk"
-version = "0.1.10"
-source = "git+https://github.com/foonerd/evo-core.git?tag=v0.1.10#bdf001a60d1be5d338128f7ca3591996e86c2d49"
+version = "0.1.11-rc.1"
+source = "git+https://github.com/foonerd/evo-core.git?tag=v0.1.11-rc.1#426ae89144d3b727cf35557c80ab0a0b229ba4b1"
 dependencies = [
  "base64",
  "once_cell",

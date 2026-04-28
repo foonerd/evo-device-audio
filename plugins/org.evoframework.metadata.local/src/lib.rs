@@ -301,6 +301,7 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+            instance_id: None,
         };
         let e = p.handle_request(&r).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -316,6 +317,7 @@ mod tests {
             payload: b"not-json".to_vec(),
             correlation_id: 2,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
@@ -331,6 +333,7 @@ mod tests {
             payload: sample_mpd_path_payload("/nope/no.flac"),
             correlation_id: 3,
             deadline: None,
+            instance_id: None,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
