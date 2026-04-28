@@ -31,13 +31,13 @@ repository = "https://github.com/foonerd/evo-device-audio"
 # across the plugin population; individual crates pay only for what
 # they actually import.
 #
-# evo-core 0.1.10 is in flight on the `eng-excel` branch. The pin
-# below uses an explicit rev to track a known-good commit (SDK
-# `run_oop` helper, host plugin signing flow). Bump to `tag = "v0.1.10"`
-# once that tag is cut on evo-core; until then the rev pin keeps
-# reproducible builds.
+# Pinned at evo-core's second 0.1.10 release candidate. rc.2 carries
+# the SDK `run_oop` helper, the production-shaped OOP bundle reference,
+# the v0 release-plane contract, and the actions/checkout@v5 (Node 24)
+# workflow fix. Bump to `tag = "v0.1.10"` (no rc suffix) once the
+# final tag is cut on evo-core after the rc acceptance test passes.
 [workspace.dependencies]
-evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", rev = "763b2a41ccd617b2a47a78e334f2ab465327975b" }
+evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.10-rc.2" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
