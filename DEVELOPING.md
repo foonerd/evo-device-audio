@@ -128,7 +128,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 7 | Flight mode for hardware radios (Bluetooth / WiFi / FM / cellular) | Implemented in evo-core v0.1.12: framework provides signal bus + no-panic invariant; the device plugin owns the hardware switch | Audio distribution authors a per-distribution hardware-control plugin if its target devices ship controllable radios. Consumer plugins (streaming, library scanners) honour the framework's no-panic invariant on dependency loss. |
 | 8 | User Interaction Routing (auth flow, credential prompts, etc.) | Implemented in evo-core v0.1.12 | Audio distribution authors a prompt-receiver surface (kiosk UI, frontend modal, remote bridge) if any admitted plugin issues `request_user_interaction`. |
 | 9 | Appointments rack (time-driven plugins) | Implemented in evo-core v0.1.12 | Audio distribution decides whether it admits time-driven audio plugins (alarms, scheduled playback). |
-| 10 | Watches rack (condition-driven plugins) | Implemented in evo-core v0.1.12 | Audio distribution decides whether it admits condition-driven plugins (auto-resume on network up, etc.). |
+| 10 | Watches rack (condition-driven plugins) | Implemented in evo-core v0.1.12 | Audio distribution authors sensor / hardware-event plugins (CEC ARC detection, BT peer manager, jack-insertion handler, USB DAC enumerator, CPU temp reader, motion sensor, etc.) per its target hardware; the framework provides the watch primitive that subscribes to whatever events the plugins emit. Audio-path-switching (BT peer connect / HDMI ARC active / headphone jack / USB DAC plug → switch output) is the canonical audio-domain use case. See "Watches — implications for plugins and UI" section below. |
 | 11 | Fast Path (latency-bounded wire channel) | Implemented in evo-core v0.1.12 | Audio distribution decides whether its frontends use Fast Path for transport ops (volume, pause, seek). |
 | 12 | Steward Reconciliation Loop (compose-and-apply) | Implemented in evo-core v0.1.12 | Audio distribution gains the orchestration surface for `composition.alsa` → `delivery.alsa` flows. Distribution decides which composer/delivery pairs it admits. |
 | 13 | Catalogue corruption resilience | Implemented in evo-core v0.1.12 | Audio distribution inherits the LKG + built-in fallback transparently. Distribution may pre-seed `catalogue.lkg.toml` from its own packaging if it wants to control the recovery state. |
@@ -253,6 +253,65 @@ Frontends, mobile apps, voice agents, MQTT bridges interact with the appointment
 **Calendar integration is a bridge plugin (future direction).**
 
 The calendar-bridge pattern (Google Calendar / Outlook / CalDAV / iCalendar): a plugin authenticates with the upstream calendar provider via User Interaction Routing (`external_redirect` for OAuth), polls or subscribes to upstream events, creates corresponding framework appointments via `create_appointment`. When events change in the upstream calendar, the bridge cancels / updates the framework-side appointments. No framework changes required; calendar-bridge plugins are version-pinned, signed, revocable like any other plugin. Distribution chooses whether and which calendar bridges to ship.
+
+### Watches — implications for plugins and UI
+
+evo-core v0.1.12 provides the watches primitive — a runtime-created subject under the `evo-watch` synthetic addressing scheme that fires a single request action when its declared condition matches. Watches are sibling to Appointments (sharing action / capability / persistence / quota infrastructure) but trigger on **conditions** rather than time.
+
+**Audio-path switching is the canonical audio-domain use case.**
+
+The audio reference's most common watch pattern: hardware events change which output the device should use, and a watch fires the appropriate `audio.delivery` switch. Concrete scenarios audio distributions ship support for:
+
+| Hardware event | Source | Watch condition | Action |
+| --- | --- | --- | --- |
+| HDMI ARC becomes active (TV signals "send audio to me") | CEC plugin (distribution-owned, per-hardware) emits `Happening` on CEC state change | `HappeningMatch { variants: ["audio_output_available"], plugins: ["org.distribution.cec"] }` + `SubjectState { canonical_id: "<arc-port-uuid>", predicate: Equals { field: "state", value: "active" } }` | Dispatch `audio.delivery.set_output { output: "<arc-port-uuid>" }` |
+| Bluetooth headphones connect | BT peer-manager plugin (distribution-owned) emits `Happening` on peer connect | `SubjectState` on the BT peer subject's `state` field, edge-triggered | Dispatch `audio.delivery.set_output { output: "<bt-peer-uuid>" }` |
+| 3.5mm headphone jack inserted | Audio HAL plugin (distribution-owned) emits jack-insertion happening | `HappeningMatch` filter on the jack-insertion variant | Dispatch `audio.delivery.set_output { output: "headphone-3.5mm" }` and unmute internal amp |
+| USB DAC plugged in | USB enumerator factory plugin (distribution-owned) admits a new instance subject | Watch on subject creation events for `evo-factory-instance` of `usb-dac-*` | Dispatch `audio.delivery.set_output` to the new DAC |
+| TV powered off (HDMI ARC drops) | CEC plugin emits state-change | `SubjectState` predicate transitions to `state == "inactive"` | Dispatch `audio.delivery.revert_to_default_output` |
+
+The framework provides watches; the **distribution provides the sensor / hardware-event plugins** that emit the events watches subscribe to. evo-core does NOT ship CEC parsing, BT peer detection, USB enumeration, or jack-insertion drivers. Per-target distributions (Volumio, vendor-specific audio firmware, etc.) author plugins for their hardware and emit structured happenings on the bus.
+
+**For plugin authors (creating watches):**
+
+A plugin needing condition-driven dispatch declares `capabilities.watches = true` and uses `LoadContext.watches.create_watch(...)`. The condition vocabulary covers three primitives that compose:
+
+-   `HappeningMatch { filter }` — fire when a happening matches the existing `HappeningFilter` shape (variants / plugins / shelves dimensions).
+-   `SubjectState { canonical_id, predicate, minimum_duration_ms? }` — fire when a subject's projection field matches a predicate (Equals, NotEquals, GreaterThan, LessThan, InRange, Hysteresis, Regex). Optional minimum-duration qualifier waits for the condition to hold this long before firing.
+-   `Composite { op: All / Any / Not, terms: [...] }` — recursive AND / OR / NOT for compound conditions.
+
+Author guidance:
+
+-   **Edge-triggered by default.** A watch fires once when the condition transitions into match; re-arms automatically on transition out. Most audio-path-switching scenarios are edge-triggered (BT peer connects → switch once; doesn't fire again while connected).
+-   **Level-triggered requires explicit cooldown.** Watches that fire while in match (CPU overheat → throttle every 30s while hot) declare `Level { cooldown_ms }` with mandatory cooldown ≥ 1s. Without cooldown, action storm under high event rates is the foot-gun.
+-   **Hysteresis is first-class** for the canonical control-systems pattern. CPU throttle on temp > 75°C with don't-re-throttle until temp drops below 70°C uses `Hysteresis { upper: 75, lower: 70 }` rather than composite-encoded approximations (which oscillate in the 70-75°C band).
+-   **Minimum duration for "stable" conditions.** "Stopped for 5 minutes" uses `SubjectState { predicate: Equals { state: "stopped" }, minimum_duration_ms: 300_000 }`. The framework tracks "when did the watch enter match state" and compares; transitions out before duration elapses reset the counter.
+-   **One action per watch.** Multi-action orchestration is plugin-side. Chain multiple watches if a single hardware event should trigger multiple actions, or use a respondent plugin that dispatches the multi-action sequence in response to the watch's single fire.
+-   **Time-trust gating is automatic.** Watches with duration-bearing conditions don't fire while `TimeTrust = Untrusted`. Pure event-match watches fire freely regardless.
+-   **Sensor and hardware-event plugins must be distribution-authored** (see below). The framework provides the watch primitive that subscribes to events; the distribution authors plugins that emit the events.
+
+**For consumer surfaces (managing watches via the wire):**
+
+Frontends, mobile apps, voice agents, MQTT bridges interact with the watches surface via four wire ops: `create_watch`, `cancel_watch`, `list_watches`, `project_watch`. Plus `subscribe_subject` against any `evo-watch` subject for live updates. Capability gates parallel appointments — `watches_create` (default same-UID), `watches_admin` (default-denied).
+
+**Sensor plugins are a distribution responsibility (canonical statement):**
+
+Sensor and hardware-event plugins are distribution-owned, same posture as flight-mode hardware control (item 7 in the triage table) and NTP daemon configuration (item 19). evo-core does not ship per-hardware code; per-target distributions (Volumio, vendor-specific firmware, etc.) author the plugins their hardware needs:
+
+| Sensor / event source | Where authored | Why distribution-owned |
+| --- | --- | --- |
+| HDMI CEC (ARC active / TV state) | Distribution plugin | Hardware-specific (which CEC chipset); kernel API may be vendor-specific |
+| Bluetooth peer manager | Distribution plugin | BT stack is OS-specific (BlueZ on Linux, IOBluetoothFamily on macOS, etc.); pairing UI is per-vendor |
+| 3.5mm jack insertion | Distribution plugin (uses ALSA jack-detect on Linux) | ALSA HAL is per-OS; jack-detect API varies |
+| USB DAC enumeration (factory plugin) | Distribution plugin (uses udev on Linux) | udev / IOKit / Windows USB are per-OS |
+| Motion sensor | Distribution plugin (driver-specific) | Sensor hardware varies wildly; no portable abstraction |
+| Ambient light sensor | Distribution plugin | Same |
+| CPU temperature | Distribution plugin (reads `/sys/class/thermal/` on Linux) | Per-OS thermal interface |
+| Accelerometer (if present) | Distribution plugin (iio interface on Linux) | Per-hardware |
+
+The framework's contract: **watches subscribe to whatever events the distribution emits**. The distribution's contract: **emit structured happenings with stable variant names + payload shapes** so watches authored against this audio reference work across vendor distributions.
+
+The audio reference may ship a small set of brand-neutral baseline sensor plugins (e.g., `org.evoframework.sensor.cpu_temp` reading `/sys/class/thermal/` for Linux targets; portability is per-target). Vendor distributions ship the rest per their hardware (`com.volumio.cec`, `com.fiio.dac_enumerator`, etc.).
 
 ## Upgrading the evo-core pin
 
