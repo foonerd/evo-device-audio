@@ -417,6 +417,64 @@ This is a structural choice the distribution makes, not a framework gap. evo-cor
 
 The pattern: plugins with **plugin-owned state** opt in to Live; plugins with **kernel-owned or warden-owned state** stay on Restart and rely on the resource owner outliving the plugin code.
 
+### Runtime capabilities dispatch + manifest-drift discipline + version-skew policy
+
+evo-core v0.1.12 ships three related refinements to the existing dispatch-time capability gate:
+
+**1. Warden-side capability gate** (parallel to the respondent gate shipped in v0.1.10):
+
+Every warden's manifest now declares `capabilities.warden.course_correct_verbs: [...]` listing every verb the warden's `course_correct` accepts. The framework refuses any incoming dispatch whose verb is not in the list with a structured `StewardError::Dispatch` — the warden's `course_correct` body never sees undeclared verbs.
+
+For audio-domain wardens, this means each warden enumerates its accepted course_correct verbs:
+
+| Warden | Typical `course_correct_verbs` |
+| --- | --- |
+| `org.evoframework.playback.mpd` | `["set_volume", "pause", "resume", "seek_to", "set_output", "next_track", "previous_track", "set_playback_state"]` |
+| `org.evoframework.composition.alsa` (future) | `["apply_pipeline", "add_processor", "remove_processor", "set_sample_rate", "set_channels"]` |
+| Audio.delivery wardens | `["play_source", "stop", "set_output", "set_volume", "set_balance"]` |
+
+The exact list is per-warden; the warden author declares it in the manifest, and the framework enforces. `fast_path_verbs` (per the Fast Path design) MUST be a subset of `course_correct_verbs` — the catalogue parser refuses on violation, admission refuses on validation failure.
+
+**2. Three-tier manifest-drift detection** applies universally to both respondents and wardens. Drift = mismatch between the plugin's manifest declarations and the plugin's actual `describe()` output:
+
+-   **Sign-time check via `evo-plugin-tool verify`**: at plugin sign / pack time, the tool extracts the plugin's `describe()` output and compares to the manifest. Mismatch refuses to sign with `VerifyError::ManifestDrift`. Catches drift at the plugin author's workstation before the bundle ships.
+-   **Admission-time check by the framework**: at admit time, the framework calls `plugin.describe()`, compares to manifest, refuses with `AdmissionError::ManifestDrift` on mismatch (subject to the version-skew policy below). Catches drift the plugin author's CI missed.
+-   **CI-time test harness pattern**: a new helper crate `evo-plugin-test` ships an `assert_manifest_matches_describe(&plugin)` helper plugin authors add to their unit tests. Catches drift before the plugin reaches sign.
+
+The three tiers triangulate — drift caught at any one of them stops the bug before production. Plugin authors author all three (CI-time test, sign-time verify, admission-time enforcement passes through automatically).
+
+**3. Kubernetes-style version-skew policy:**
+
+Plugins admitted to a v0.1.12 framework with different `prerequisites.evo_min_version` declarations get different enforcement strictness based on the K8s-style skew window:
+
+| Plugin's `evo_min_version` relative to running framework | Treatment |
+| --- | --- |
+| `> current` | Refused (existing `EvoVersionTooLow` check) |
+| `current` or `current - 1` (in-window strict) | Strict enforcement: drift refuses on mismatch; mandatory new fields enforced |
+| `current - 2` (warn-band) | Admitted; `Happening::PluginVersionSkewWarning` emitted; new fields treated as optional with backward-compat defaults; drift detection runs but warns rather than refuses |
+| `current - 3` or older | Refused at admit with `permission_denied / version_skew_too_wide` |
+
+Plus a time-decoupled refinement: plugins whose required minimum framework version's release date is more than **18 months** old are refused regardless of version-count window; 12-18 months are warn-band; under 12 months are strict (combined with the version-count window — plugin must be in-strict on BOTH dimensions to get strict enforcement).
+
+For audio plugins specifically, this means:
+
+-   Plugins built against v0.1.11 or v0.1.12: full strict enforcement under v0.1.12 framework. Drift caught and refused at admit.
+-   Plugins built against v0.1.10: admitted with version-skew warning. Drift caught and warned about. Plugin author has a one-cycle window to refresh the plugin.
+-   Plugins built against v0.1.9 or older: refused. Plugin author must rebuild against a newer framework before deployment.
+
+This gives plugin authors **two minor-version cycles of grace** between framework release and forced plugin refresh. Operationally proven (Kubernetes pattern); ecosystem hygiene forced over time without breaking deployment headroom.
+
+**For audio distributions:**
+
+-   When this distribution publishes a new audio reference plugin set built against framework v0.1.12, set `evo_min_version = "0.1.12"` in each plugin's manifest. The framework will apply strict enforcement to these plugins.
+-   When the framework moves to v0.1.13, these plugins will continue admitting under strict enforcement (one-version-behind is in-window).
+-   When the framework moves to v0.1.14, these plugins will move into the warn-band — at which point the audio reference's release cycle should produce a refresh.
+-   Plugin authors targeting older devices (long-life embedded systems that may not refresh quickly) should consider declaring the OLDEST `evo_min_version` their plugin actually requires — not the version they happen to be building against.
+
+**Migration impact for v0.1.12:**
+
+Audio reference plugins (org.evoframework.playback.mpd, metadata.local, artwork.local, future composition.alsa) gain their `course_correct_verbs` declarations in v0.1.12 implementation. Vendor distributions update their manifests in the same cycle — check this distribution's `Upgrading the evo-core pin` section for the migration steps when v0.1.12 lands.
+
 ## Upgrading the evo-core pin
 
 1.  Verify the new evo-core tag is green (`cargo test --workspace` in evo-core).
