@@ -140,6 +140,49 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 
 Items 6 through 18 land in evo-core v0.1.12. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
 
+### User Interaction Routing — implications for plugins and UI
+
+Item 8 above (User Interaction Routing) lands in evo-core v0.1.12 and has two distribution-side implications worth calling out explicitly: it shapes how plugins author auth / config flows, and it shapes how the consumer surface (frontend, voice agent, bridge) renders prompts. Authors planning new plugins or new UI surfaces against the audio reference should design against the contract below.
+
+**For plugin authors (issuing prompts):**
+
+A plugin needing the operator's input — credentials, server selection, an OAuth code, a confirmation, a static IP form — issues a prompt via the SDK's `request_user_interaction` (in-process) or its OOP wire-frame equivalent. The contract is plugin-orchestrated; the framework routes prompts but does not manage flow state. Multi-stage flows (WiFi configuration, OAuth code exchange) are chains of independent prompts the plugin issues based on prior answers, with a shared `session_id` field hinting to the consumer that the prompts belong to one wizard.
+
+The closed prompt-type vocabulary for v0.1.12 (ten types):
+
+| Type | Use case |
+| --- | --- |
+| `text` | Single-line free text (email, hostname, API key) |
+| `password` | Masked single-line text |
+| `select` | Pick one from a list (security type, output device, ambiguous-match disambiguation) |
+| `select_with_other` | Pick from list OR enter your own (SSID list with "Hidden network" option) |
+| `multi_select` | Pick multiple (enabled streaming services, allowed source kinds) |
+| `confirm` | Yes/no |
+| `multi_field` | Composite form (login = email + password + remember-me) |
+| `external_redirect` | OAuth, captive-portal, browser-redirect flows |
+| `datetime` | Date / time / datetime picker (Appointments / Watches consume) |
+| `freeform` | Escape hatch: `{ mime_type, payload_b64 }` for unforeseen prompt shapes |
+
+Author guidance:
+
+-   **Validation is the plugin's responsibility.** The framework does not perform semantic validation on answers. The plugin validates after receipt and re-issues the prompt with `error_context: "<reason>"` and `previous_answer: <value>` set to surface the failure inline and let the user fix the wrong field without retyping.
+-   **Persistence of secrets is the plugin's responsibility.** Tokens, credentials, and API keys land in the plugin's `credentials_dir` per `evo-core/docs/engineering/PLUGIN_PACKAGING.md` §3 contract. The framework routes the user's "remember me" choice via the `retention_hint` / `retain_for` fields but does not store the secret. The framework is not a credential store.
+-   **Multi-stage flows compose simple types.** WiFi setup is a chain: `select_with_other` (network) → `select` (security if hidden) → `password`. OAuth is a single `external_redirect`. Static IP is `multi_field` with optional re-prompt-with-error after validation. No special multi-stage primitive; just chain prompts with a shared `session_id`.
+-   **Plugin-declared timeout per prompt** (`timeout_ms`, default 60s, max 24h). Unattended devices with no consumer connected see the prompt time out; the plugin's logic decides how to handle that (retry on next operator action, fall back to default, surface degraded state).
+
+**For consumer surfaces (rendering prompts):**
+
+A consumer surface (frontend, voice agent, MQTT bridge, kiosk) holding the `user_interaction_responder` capability subscribes to open prompts via `op = "subscribe_user_interactions"`, renders them, and answers via `op = "answer_user_interaction"`. Only one connection at a time can hold the responder capability; first-claimer-wins; operator reconfigures precedence via `client_acl.toml`. Designers of consumer surfaces:
+
+-   **MUST render every prompt type in the closed vocabulary.** A consumer that does not know how to render `external_redirect` cannot complete OAuth-shaped flows; a consumer that does not know `datetime` cannot serve Appointments / Watches workflows. Plan the renderer for all ten types.
+-   **MUST render the unknown-type fallback.** New types add via framework ADR + non-breaking enum extension; consumers that observe a future type they don't recognise SHOULD render a "your client is out of date" fallback rather than crashing.
+-   **SHOULD respect `session_id` grouping.** Prompts sharing a `session_id` belong to one user-visible flow; render them in a single wizard / modal stack rather than as independent dialogs.
+-   **SHOULD respect `retention_hint`.** When a prompt declares `retention_hint = until_revoked`, the consumer surfaces a "remember me" affordance; the user's choice flows back as `retain_for: <enum>` on the answer. Without the hint, the consumer assumes single-use and does not surface a retention affordance.
+-   **MUST handle `external_redirect` against whatever URL renderer the surface owns.** A web frontend opens the URL in a popup; a kiosk opens an embedded webview; a voice agent reads the URL aloud or skips the flow with a structured refusal. The framework hands the URL out; the consumer chooses the rendering strategy. Headless surfaces (no URL renderer) decline to handle `external_redirect` prompts and leave them open for whichever consumer can.
+-   **MUST forward `error_context` and pre-fill `previous_answer`** when a re-prompt arrives. Re-typing the entire form after one wrong field is unacceptable UX.
+
+Search and other consumer-initiated queries (browse, list, play, queue, library lookup) use the standard `op = "request"` against the relevant plugin's shelf — they are NOT prompts. The prompt-routing surface is for plugin → user questions only.
+
 ## Upgrading the evo-core pin
 
 1.  Verify the new evo-core tag is green (`cargo test --workspace` in evo-core).
