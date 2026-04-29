@@ -137,8 +137,9 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core a prior release | Audio distribution decides whether its consumers opt in to coalescing for high-rate variants. |
 | 17 | Subject-grammar orphan migration verb | Implemented in evo-core a prior release | Audio distribution decides whether it provides operator tooling that consumes the verb. |
 | 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core a prior release | Audio distribution decides whether it surfaces these verbs in its frontend. |
+| 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core v0.1.12; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
 
-Items 6 through 18 land in evo-core v0.1.12. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
+Items 6 through 19 land in evo-core v0.1.12. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
 
 ### User Interaction Routing — implications for plugins and UI
 
@@ -182,6 +183,76 @@ A consumer surface (frontend, voice agent, MQTT bridge, kiosk) holding the `user
 -   **MUST forward `error_context` and pre-fill `previous_answer`** when a re-prompt arrives. Re-typing the entire form after one wrong field is unacceptable UX.
 
 Search and other consumer-initiated queries (browse, list, play, queue, library lookup) use the standard `op = "request"` against the relevant plugin's shelf — they are NOT prompts. The prompt-routing surface is for plugin → user questions only.
+
+### Time and Clock Trust — distribution and plugin implications
+
+evo-core a prior release maintains a framework-side `TimeTrust` state that consumes OS-reported clock state and gates time-dependent subsystems. The framework does NOT run an NTP / PTP / GPS client — that is distribution / OS responsibility. This split has direct consequences for any audio distribution.
+
+**Distribution responsibility (configure once per device):**
+
+-   **Run an NTP / chrony / PTP daemon.** systemd-timesyncd (Debian/Ubuntu default), chrony (more configurable), or ptp4l (sub-microsecond precision; rare on consumer hardware) are all viable. Audio reference recommends chrony for its better drift handling and richer status surface.
+-   **Configure sync triggers**: cold start, reboot, network-up events (NetworkManager dispatcher hooks), and periodically while running. Distribution's NTP-daemon configuration declares the sync interval; recommended worst-case staleness 24h.
+-   **Use multiple network sources where available**: LAN if internal NTP server is present, public NTP pools as fallback (e.g., `2.pool.ntp.org`, vendor-specific stratum-1 servers if certified). Bluetooth-tethered network sync works if the daemon is configured to operate over the tether interface.
+-   **Declare `has_battery_rtc` in `/etc/evo/evo.toml`.** Pi 3 / Pi 4 / many cheaper ARM SBCs have no battery-backed RTC and lose time on every power-off. reference target and most x86 boards do. Wrong declaration breaks the framework's no-RTC handling for `must_wake_device` appointments.
+-   **Declare `max_acceptable_staleness_ms` in `evo.toml`** (default 24h is a reasonable starting point). Plugins may impose stricter per-plugin tolerances via their manifest's `synced_time_tolerance_ms`.
+-   **For RTC-equipped devices, ensure the NTP daemon writes back to RTC** so cold-start trust is closer to correct. systemd-timesyncd does this automatically; chrony needs `rtcautotrim` configured.
+-   **Document the chosen NTP source** in this distribution's own `DEVELOPING.md` so plugin authors and operators know what to expect. Stratum 1 is the realistic floor; public pools at Stratum 2-3 are normal; latency to the chosen pool affects sync precision (LAN sync ~1ms, public pool sync ~10-100ms).
+
+**Plugin authoring (declare what you need):**
+
+-   **Plugins requiring trustworthy time declare** `capabilities.requires_synced_time = true` in their manifest. The framework signals current trust state via `LoadContext.time_trust` plus subsequent `ClockTrustChanged` happenings; the plugin defers its real work until trust transitions to `Trusted`.
+-   **Plugins with stricter tolerances declare** `capabilities.synced_time_tolerance_ms` (e.g., 1000 for "needs sync within 1s"; multi-device audio sync plugins may need much stricter). The framework respects the stricter value when signalling per-plugin trust state.
+-   **Plugins managing their own time-dependent state subscribe to `Happening::ClockAdjusted`** and re-evaluate their internal schedules (cached future timestamps, OAuth refresh windows, etc.). The framework re-evaluates appointment + watch schedules automatically on clock adjustment; plugins managing their own future timestamps re-evaluate themselves.
+
+**Consumer rendering:**
+
+-   Frontends and other consumer surfaces SHOULD render the current `clock_trust` state visibly when it is not `Trusted` — operators need to see "device clock is untrustworthy; some features may not work" rather than experiencing silent failure.
+-   Time-stamped wire frames carry a `clock_trust` annotation; consumer surfaces SHOULD distinguish "stamped during boot before sync" from "stamped during steady-state" when rendering historical data (audit logs, custody history, etc.).
+
+**Test discipline:**
+
+The reference target acceptance test exercises both RTC-equipped (reference target) and the no-RTC path (running on Pi 4 in dev contexts). Distributions should exercise their own target hardware mix during release acceptance.
+
+### Appointments — implications for plugins and UI
+
+evo-core a prior release provides the appointments primitive — a runtime-created subject under the `evo-appointment` synthetic addressing scheme that fires a single request action at the declared time and recurrence. Multi-stage / multi-action coordination (alarm clock with brightness ramp + audio + snooze; scheduled-mode-transition with display + power + notification changes) is plugin-side orchestration. The framework provides the firing mechanism + the wake gate + persistence.
+
+**For plugin authors (creating appointments):**
+
+A plugin needing scheduled work — alarm clock, periodic library scan, daily backup, scheduled mode transitions, calendar-bridge translations — declares `capabilities.appointments = true` in its manifest and uses `LoadContext.appointments.create_appointment(...)` to schedule. The recurrence vocabulary covers the common cases:
+
+| Recurrence | Use case |
+| --- | --- |
+| `OneShot { fire_at }` | Doctor reminder, package delivery alert, deadline notification |
+| `Daily` | Every day, every time slot |
+| `Weekdays` / `Weekends` | Mon-Fri / Sat-Sun shorthands |
+| `Weekly { days }` | Per-day-of-week schedules (e.g., `["tue", "thu"]`) |
+| `Monthly { day_of_month }` | "1st of every month" |
+| `Yearly { month, day }` | "every 25 December" |
+| `Cron { expr }` | Anything the structured variants can't express |
+
+Author guidance:
+
+-   **One action per appointment.** The framework dispatches ONE request to ONE shelf when the appointment fires. Multi-action orchestration is the receiving plugin's responsibility — chain multiple appointments with different `id` values + matching `session_id` if the plugin wants to render them as one logical alarm in the operator's UI.
+-   **Wake control.** Set `must_wake_device = true` for alarm-clock-class appointments that must wake the device from suspend. Set `wake_pre_arm_ms` (default 0) to wake N ms before the fire to allow network and NTP sync to complete — critical on no-RTC devices where the device's clock is `Untrusted` immediately after wake.
+-   **Pre-fire signalling.** Set `pre_fire_ms` to receive `Happening::AppointmentApproaching` N ms before the fire — useful for pre-warming (display brightness ramp, prefetching network resources) without authoring a separate appointment.
+-   **Miss policy.** Set `miss_policy` per the appointment's intent: `Drop` for "fire only at the precise moment" (rare); `Catchup` for "fire anyway, even if hours late" (rare); `CatchupWithinGrace { grace_ms }` (default 5 min) for the natural alarm-clock behaviour.
+-   **Time zone semantics.** `local` for alarms tied to wall-clock time (DST-aware); `utc` for events bound to absolute moments (e.g., "fire at exactly UTC midnight on the 1st"); `anchored { zone }` for events bound to a specific region's local time regardless of device location.
+-   **Time-trust gating is automatic.** Appointments do not fire while `TimeTrust = Untrusted`; the framework queues them with `awaiting_clock_trust` reason. Plugin authors do not need to check trust state manually before scheduling — but DO need to handle the case where an alarm appointment's fire is delayed past the operator's expectation.
+-   **Cross-restart resume is automatic.** Appointment subjects persist; the framework rehydrates pending appointments on every boot. A plugin re-issuing an appointment with the same content sees the existing subject; the plugin chooses to re-attach or supersede.
+
+**For consumer surfaces (managing appointments via the wire):**
+
+Frontends, mobile apps, voice agents, MQTT bridges interact with the appointments surface via four wire ops: `create_appointment`, `cancel_appointment`, `list_appointments`, `project_appointment`. Plus `subscribe_subject` against any `evo-appointment` subject for live updates. Consumer authors:
+
+-   **MUST capability-negotiate `appointments_create`** before issuing `create_appointment` — default-allowed for same-UID Unix-socket peers; explicit ACL config for remote consumers.
+-   **MUST handle the `appointments_admin` capability gate** for cross-claimant operations (cancelling another user's appointment, listing system-internal appointments). Default-denied; operator's `client_acl.toml` declares the granted set.
+-   **SHOULD render `Happening::AppointmentFired` / `AppointmentMissed` / `AppointmentCancelled`** in the operator's history view so the operator sees what happened and when.
+-   **SHOULD use `subscribe_subject`** on the `evo-appointment` subject for live state updates rather than polling `project_appointment`.
+
+**Calendar integration is a bridge plugin (future direction).**
+
+The calendar-bridge pattern (Google Calendar / Outlook / CalDAV / iCalendar): a plugin authenticates with the upstream calendar provider via User Interaction Routing (`external_redirect` for OAuth), polls or subscribes to upstream events, creates corresponding framework appointments via `create_appointment`. When events change in the upstream calendar, the bridge cancels / updates the framework-side appointments. No framework changes required; calendar-bridge plugins are version-pinned, signed, revocable like any other plugin. Distribution chooses whether and which calendar bridges to ship.
 
 ## Upgrading the evo-core pin
 
