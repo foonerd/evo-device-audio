@@ -134,7 +134,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 13 | Catalogue corruption resilience | Implemented in evo-core v0.1.12 | Audio distribution inherits the LKG + built-in fallback transparently. Distribution may pre-seed `catalogue.lkg.toml` from its own packaging if it wants to control the recovery state. |
 | 14 | CBOR codec on the wire | Implemented in evo-core v0.1.12 | Audio distribution decides whether its frontends prefer CBOR over JSON. JSON remains supported. |
 | 15 | Hot-reload `Live` mode | Implemented in evo-core v0.1.12 | Audio distribution decides whether any of its plugins author live-reload state-handover. Default: `Restart` mode is sufficient. |
-| 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core v0.1.12 | Audio distribution decides whether its consumers opt in to coalescing for high-rate variants. |
+| 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core v0.1.12 — label-based keying via `CoalesceLabels` trait + derive macro; subscribers declare label lists on `subscribe_happenings.coalesce`; `describe_capabilities` advertises per-variant label sets; new `Happening::PluginEvent` variant lets sensor / hardware-event plugins emit structured events that participate in coalescing | Audio distribution: consumers (frontend, voice agent, MQTT bridge) declare coalesce label lists per subscription based on their use case (per-handle for custody bursts, per-subject for cross-variant collapse, per-watch / per-appointment / per-pair for the v0.1.12 trigger primitives). Sensor and hardware-event plugins emit through `PluginEvent` with structured payloads; coalescing keys on flattened payload fields like `sensor_id`. See "Happenings coalescing" subsection below for guidance. |
 | 17 | Subject-grammar orphan migration verb | Implemented in evo-core v0.1.12 | Audio distribution decides whether it provides operator tooling that consumes the verb. |
 | 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core v0.1.12 | Audio distribution decides whether it surfaces these verbs in its frontend. |
 | 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core v0.1.12; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
@@ -312,6 +312,41 @@ Sensor and hardware-event plugins are distribution-owned, same posture as flight
 The framework's contract: **watches subscribe to whatever events the distribution emits**. The distribution's contract: **emit structured happenings with stable variant names + payload shapes** so watches authored against this audio reference work across vendor distributions.
 
 The audio reference may ship a small set of brand-neutral baseline sensor plugins (e.g., `org.evoframework.sensor.cpu_temp` reading `/sys/class/thermal/` for Linux targets; portability is per-target). Vendor distributions ship the rest per their hardware (`com.volumio.cec`, `com.fiio.dac_enumerator`, etc.).
+
+### Happenings coalescing — implications for plugins and consumer surfaces
+
+evo-core v0.1.12 ships per-subscriber happenings coalescing — subscribers declare which fields ("labels") collapse a stream of high-rate events into a single representative event per window. The framework provides a `CoalesceLabels` trait on every `Happening` variant (auto-derived via a proc-macro from the variant's typed struct); each variant exposes its struct fields as labels; subscribers declare a label list on `subscribe_happenings.coalesce`; the framework computes a label tuple per matched happening and groups same-tuple happenings within a declared window.
+
+**For plugin authors emitting events:**
+
+A plugin that emits **structured events** the framework didn't anticipate (sensor readings, hardware state changes, plugin-specific notifications, periodic status reports) uses the new `Happening::PluginEvent { plugin, event_type, payload, at }` variant. The plugin's payload is opaque to the framework but flattened as labels for coalescing — top-level payload fields become labels under the same names. Author guidance:
+
+-   **Document your `event_type` taxonomy.** Each plugin emitting `PluginEvent` defines a stable set of `event_type` strings; document these in your plugin's README so consumers can subscribe with the right filter and coalesce labels.
+-   **Use stable payload field names.** Top-level payload fields become coalesce labels. A sensor plugin emitting `payload: { sensor_id, value, unit }` lets consumers coalesce by `["variant", "plugin", "sensor_id"]` cleanly. Field-name drift across releases breaks consumer coalesce configs.
+-   **Sensor and hardware-event plugins emit via `PluginEvent`** — not via `CustodyStateReported`. Sensor data is producer-shaped, not custody-shaped; the `PluginEvent` variant fits the semantics correctly.
+
+**For consumer surfaces (subscribing with coalesce):**
+
+Consumers declare the coalesce label list per subscription based on their use case. Key scenarios for the audio domain:
+
+| Consumer scenario | Coalesce labels |
+| --- | --- |
+| Per-handle position updates (one update per ~100ms per playback handle) | `["variant", "plugin", "shelf", "handle_id"]` filtered to `custody_state_reported` |
+| Per-subject "current state" stream (any variant touching subject X) | `["primary_subject_id"]` (variant intentionally omitted) |
+| Per-watch fire (level-triggered watch) | `["variant", "watch_id"]` filtered to `watch_fired` |
+| Per-sensor reading (CPU temp at 1 Hz collapsed to 1/min) | `["variant", "plugin", "sensor_id"]` filtered to `plugin_event` with `event_type=reading` |
+| Per-reconciliation pair update | `["variant", "pair"]` filtered to `reconciliation_applied` |
+
+Consumer guidance:
+
+-   **Query `describe_capabilities` once at connection time** to learn each variant's canonical label set. The response carries a `coalesce_labels` field listing labels per variant. Build coalesce configs against this authoritative source.
+-   **Missing-label happenings pass through individually.** A coalesce config requesting `["handle_id"]` won't coalesce `SubjectForgotten` events (no handle_id field); they're delivered as-is. Not an error, just a no-op for that variant.
+-   **`window_ms` defaults 100; max 5000.** Lower defeats coalescing; higher hides meaningful state changes. 100 ms is the sweet spot for moderate-burst smoothing on `CustodyStateReported`-class streams.
+-   **`selection: latest` is default; `first` is available** for transition-event streams where the first-fire matters more than the most-recent-state.
+-   **Cursor seq compresses; resume via `since` is consistent.** A subscriber reconnecting after disconnect with the same coalesce config replays the same coalesced view; no duplicate fires, no missed transitions.
+-   **Use multiple subscriptions for multi-rule scenarios.** Different variants needing different keying = different subscriptions. The framework does NOT support multi-rule per single subscription.
+
+The discoverability (via `describe_capabilities`) means consumer engineers don't have to read framework source to know what labels each variant exposes — runtime introspection IS the documentation.
 
 ## Upgrading the evo-core pin
 
