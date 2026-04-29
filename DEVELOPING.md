@@ -654,6 +654,54 @@ Cost on Pi Zero W (smallest target) for typical operations:
 
 Negligible on every target. Reload calls do not require the chunking / background-mode patterns that the orphan migration uses.
 
+### Catalogue schemas — implications for plugin authors and distribution packagers
+
+The framework's catalogue document declares racks, shelves, subject types, and cardinality. Each shelf carries a **shape** — the request types, payload shape, and acceptance criteria a plugin satisfies when claiming to implement the shelf. The schemas are versioned TOML files describing those shapes.
+
+**Two schema surfaces:**
+
+| Surface | Where it lives | Role |
+| --- | --- | --- |
+| In-tree skeleton | [evo-core's `dist/catalogue/schemas/`](https://github.com/foonerd/evo-core/tree/main/dist/catalogue/schemas) | Worked-example reference for the on-disk shape; carries `example/echo.v1.toml` |
+| Brand-neutral framework-tier schemas | [`foonerd/evo-catalogue-schemas`](https://github.com/foonerd/evo-catalogue-schemas) | Canonical source for `org.evoframework.*` namespace shelves; versioned independently of evo-core |
+
+The framework runtime does NOT consume the schemas at admission — the steward validates against the catalogue document, not per-shelf schemas. Schemas are author-time / CI-time artefacts only.
+
+**For audio reference plugin authors:**
+
+1.  **Reference the schemas repo by pinned version** in your plugin's CI configuration. Pin the `evo-catalogue-schemas` git tag matching the shelf shape you target (e.g., your plugin claims `org.evoframework.audio.delivery` shape v1; pin the schemas-repo tag that ships that shape).
+2.  **Validate locally before shipping.** Once evo-core v0.1.12 ships:
+
+    ```sh
+    git clone -b v<X.Y.Z> https://github.com/foonerd/evo-catalogue-schemas /tmp/schemas
+    evo-plugin-tool validate-shelf-schema \
+      --schemas-path=/tmp/schemas/schemas \
+      --plugin=path/to/your/plugin.toml
+    ```
+
+3.  **Read the schemas as your code contract.** When implementing a plugin claiming `target.shelf = "audio.delivery"`, `target.shape = 1`, the schema TOML at `schemas/org.evoframework/audio/delivery.v1.toml` documents:
+    - The request types your plugin's `handle_request` must accept.
+    - The payload shape (in-bytes / out-bytes layout) for each request type.
+    - The acceptance criteria your plugin must satisfy (testable behaviours).
+4.  **When a shelf shape needs to change**, open a PR against `foonerd/evo-catalogue-schemas` adding a new shape version (v2 alongside v1). Plugins targeting v1 keep working through the framework's `shape_supports` migration window. See the schemas repo's CONTRIBUTING.md for the review process.
+
+**For audio-distribution packagers:**
+
+1.  **Bundle the schemas.** The audio reference's distribution package (or a separate `evo-catalogue-schemas` package) installs the schemas to `/usr/share/evo-catalogue-schemas/` on the target device. Consumers (`evo-plugin-tool` and any other tool needing schemas) resolve via the cascade:
+    - `--schemas-path` flag if passed
+    - `$EVO_SCHEMAS_DIR` env var if set
+    - `/usr/share/evo-catalogue-schemas/` if present
+    - Error with guidance to install a schemas package or pass `--schemas-path`
+
+2.  **Pin a specific schemas version** in your distribution's package manifest. Bumping the schemas pin is a deliberate distribution release decision, not an auto-update. The pinned version must be compatible with the evo-core version your distribution ships (the schemas repo's CHANGELOG.md documents per-version evo-core compatibility).
+3.  **Track schemas-repo releases independently of evo-core.** A schemas-repo patch release (new shelf added, new acceptance criterion) doesn't require an evo-core version bump; a schemas-repo minor release (new shape version) typically aligns with framework-tier feature work the audio reference is shipping anyway.
+
+**Distribution-specific shelves do NOT belong in `foonerd/evo-catalogue-schemas`.** Vendor distributions adopting the audio reference can author their own schemas under their own namespace (`com.<vendor>.*`) and publish them in their own schemas repository. The brand-neutral repo hosts contracts shared across the audio reference and any distribution adopting it.
+
+**Validation tooling on the audio reference's CI:**
+
+Once `evo-plugin-tool validate-shelf-schema` ships in evo-core v0.1.12, the audio reference's CI workflow adds a step that validates each plugin's manifest against the pinned schemas-repo version. The check runs on every PR and gates merge.
+
 ## Upgrading the evo-core pin
 
 1.  Verify the new evo-core tag is green (`cargo test --workspace` in evo-core).
