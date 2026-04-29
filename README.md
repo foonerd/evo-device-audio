@@ -1,8 +1,10 @@
 # evo-device-audio
 
-> Brand-neutral audio-player plugins for the [evo](https://github.com/foonerd/evo-core) fabric. The middle tier between the framework and any audio-shaped distribution.
+> Brand-neutral audio-player plugins for the [evo](https://github.com/foonerd/evo-core) fabric. The reference generic device for the audio domain — and the canonical demonstration of the framework's full surface.
 
 A distribution that builds an audio player on top of evo does not need to invent an MPD warden, a local-file metadata respondent, an ALSA delivery, or an ID3 tag reader. Those exist here, signed by the evo project, ready to be admitted into any catalogue that declares the audio domain.
+
+This repository is also the framework's own showcase. Every core function evo-core ships — admission, custody, projections, happenings bus, durable persistence, plugin packaging, the wire protocol — is exercised end-to-end by the plugins in this repo against a real audio workload. A vendor adopting evo for an audio device starts here; a contributor reading the framework starts here too, because the contracts the framework defines become concrete in the plugins below.
 
 ## How it fits together
 
@@ -86,7 +88,7 @@ A distribution catalogue admits the commons plugin by its `org.evoframework.*` n
 
 ## Status
 
-Phase 2 landed: the first three plugins now live in this repository, signed by the evo project commons key. They are consumed by `evo-device-volumio` (the first audio distribution) and remain available unchanged to any future audio distribution.
+Three brand-neutral audio plugins live in this repository, signed by the evo project commons key. They are consumed by any vendor distribution that adopts the audio reference; `evo-device-volumio` is one such adopter today, and the plugins remain available unchanged to any future audio distribution.
 
 | Plugin | Slot | Version |
 |--------|------|---------|
