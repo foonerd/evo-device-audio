@@ -135,7 +135,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 14 | CBOR codec on the wire | Implemented in evo-core v0.1.12 | Audio distribution decides whether its frontends prefer CBOR over JSON. JSON remains supported. |
 | 15 | Hot-reload `Live` mode | Implemented in evo-core v0.1.12 — applies to both in-process and OOP plugins via the same SDK contract (`prepare_for_live_reload` + `load_with_state` callbacks); in-process sequential callback for state-preserving re-init; OOP cross-process state transfer for schema migration recovery | Audio distribution: in-process plugins opt in to Live for catalogue / config / runtime-context reload without dropping admission slot. OOP plugins use Restart by default (cold reload), Live for schema migrations between versions. Hardware-bound state preservation (ALSA pipeline, kernel-bound resources) uses the warden-architecture-pattern (resource owner separate from reloadable plugin code) — not framework-supported as a primitive. See "Hot reload — Live mode authoring" subsection below. |
 | 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core v0.1.12 — label-based keying via `CoalesceLabels` trait + derive macro; subscribers declare label lists on `subscribe_happenings.coalesce`; `describe_capabilities` advertises per-variant label sets; new `Happening::PluginEvent` variant lets sensor / hardware-event plugins emit structured events that participate in coalescing | Audio distribution: consumers (frontend, voice agent, MQTT bridge) declare coalesce label lists per subscription based on their use case (per-handle for custody bursts, per-subject for cross-variant collapse, per-watch / per-appointment / per-pair for the v0.1.12 trigger primitives). Sensor and hardware-event plugins emit through `PluginEvent` with structured payloads; coalescing keys on flattened payload fields like `sensor_id`. See "Happenings coalescing" subsection below for guidance. |
-| 17 | Subject-grammar orphan migration verb | Implemented in evo-core v0.1.12 | Audio distribution decides whether it provides operator tooling that consumes the verb. |
+| 17 | Subject-grammar orphan migration verb | Implemented in evo-core v0.1.12 — three operator wire ops (`list_grammar_orphans`, `migrate_grammar_orphans` with `Rename` / `Map` / `Filter` strategies, `accept_grammar_orphans`); always-mint-new-IDs identity model reusing merge/split alias machinery; `pending_grammar_orphans` table; batched-commit + background-mode + dry-run for ARM-SBC operability | Audio distribution: catalogue authors planning subject-type renames or splits (e.g., `audio_track` → `track`, or `media_item` → `audio_track` + `video_track`) ship the catalogue change under a major version bump and document the migration call operators must issue. Distribution-side admin tooling consumes the three verbs and surfaces grammar-orphan state to the operator UI. See "Subject-grammar orphan migration — implications for catalogue authors and operators" subsection below. |
 | 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core v0.1.12 | Audio distribution decides whether it surfaces these verbs in its frontend. |
 | 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core v0.1.12; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
 
@@ -474,6 +474,79 @@ This gives plugin authors **two minor-version cycles of grace** between framewor
 **Migration impact for v0.1.12:**
 
 Audio reference plugins (org.evoframework.playback.mpd, metadata.local, artwork.local, future composition.alsa) gain their `course_correct_verbs` declarations in v0.1.12 implementation. Vendor distributions update their manifests in the same cycle — check this distribution's `Upgrading the evo-core pin` section for the migration steps when v0.1.12 lands.
+
+### Subject-grammar orphan migration — implications for catalogue authors and operators
+
+Subject types are part of a catalogue's public contract. The framework treats type stability as a major-version concern: renaming or removing a subject type is a breaking change that requires a catalogue major-version bump. Existing subjects of a removed type become **orphans** — they remain in the registry, no rack opines on them, and no plugin can announce a new subject of that type.
+
+In v0.1.11 and earlier, the only signal the framework offered was a boot-time diagnostic warning. v0.1.12 ships the operator-callable structured migration surface that lets orphans join the new grammar without losing identity, relations, custody, or history.
+
+**For audio distribution catalogue authors:**
+
+When you publish a new audio reference catalogue version that renames or splits a subject type, you carry three responsibilities:
+
+1.  **Bump the catalogue major version.** Subject-type changes are breaking. Distribution operators on the prior catalogue version must consciously upgrade.
+2.  **Document the migration in the catalogue release notes.** State the operator command needed to migrate the orphans. Example for a rename:
+
+    ```text
+    Catalogue v3 renames subject type 'audio_track' to 'track'.
+    Existing 'audio_track' subjects on deployed devices become orphans
+    on first boot under v3. Operators migrate via:
+
+      evo-plugin-tool admin grammar plan \
+        --from-type=audio_track \
+        --strategy=rename:to_type=track
+
+      # review the dry-run output, then:
+
+      evo-plugin-tool admin grammar migrate \
+        --from-type=audio_track \
+        --strategy=rename:to_type=track \
+        --reason="catalogue v3: audio_track renamed to track"
+    ```
+
+3.  **Test the migration on the largest realistic library size before publishing the catalogue version.** Running 50,000-subject migrations on Pi Zero W is expected to take ~30 seconds; on reference target ~5 seconds. Catalogue authors validate this before shipping.
+
+**Identity invariants the migration preserves:**
+
+-   Each migrated subject receives a new canonical ID; the old ID retires as a `TypeMigrated` alias record.
+-   Consumers holding stale references to the old ID receive a redirect via `describe_alias` (same as merge/split).
+-   External addressings carry to the new ID (re-statement preserves identity).
+-   Custody ledger ownership flows from old ID to new ID atomically.
+-   Relations are rewritten via the merge cascade infrastructure.
+-   Per-subject `Happening::SubjectMigrated` is emitted before the relation-graph rewrite (same emission ordering as `SubjectMerged` / `SubjectSplit`).
+
+**The three migration strategies — when to use each:**
+
+| Strategy | Use case | Catalogue change shape |
+| --- | --- | --- |
+| `Rename { to_type }` | A type was renamed. All orphans become a single new type. | Catalogue v3: `audio_track` → `track`. |
+| `Map { discriminator_field, mapping }` | A type was split. Orphans route to multiple new types based on a payload field. | Catalogue v4: `media_item` splits into `audio_track` / `video_track` / `still_image` based on `mime_type`. |
+| `Filter { predicate, to_type }` | Operator wants to migrate only some orphans (e.g., scope-limited rollout). Non-matching orphans remain. | Catalogue v3 with operator scoping the rollout to specific library roots. |
+
+**For operator tooling consuming the verbs:**
+
+A distribution's admin panel (whether shipped by the audio reference or a vendor distribution) typically consumes all three wire ops:
+
+-   `list_grammar_orphans` — populate a "Pending grammar orphans" view: subject_type, count, first_observed_at, status.
+-   `migrate_grammar_orphans` — surface a migration form per orphan type. Strategy selector (Rename / Map / Filter) drives the form fields. Always issue with `dry_run = true` first; show the operator the plan + duration estimate; require explicit confirmation before issuing the real call.
+-   `accept_grammar_orphans` — surface as a "leave permanently orphaned" affordance with mandatory reason text.
+
+The operator UI defaults the migration to `mode = "background"` for any plan with `would_migrate > 1000`. Foreground is the default for smaller migrations (operator gets immediate feedback).
+
+**For ARM-SBC distribution operators:**
+
+The framework's batched-commit, background-mode, and bounded-per-call execution model means migrations work on every target. Operators on slower SD-card storage (Pi Zero / Pi 3 with SD card) optionally chunk large migrations via `max_subjects = 1000`, running multiple calls overnight to avoid one long-running blocker. The verb is naturally idempotent against `from_type` — re-issuing after a partial migration resumes from the cursor.
+
+**Per-subject vs per-batch happenings — what subscribers see:**
+
+The framework emits both `Happening::GrammarMigrationProgress` (per batch) and `Happening::SubjectMigrated` (per subject). Consumer surfaces choose:
+
+-   Ops dashboards: subscribe to `GrammarMigrationProgress` only; see ~50 events for a 5,000-subject migration.
+-   Forensic / audit consumers: subscribe to `SubjectMigrated` without coalescing; see one event per subject.
+-   Frontend "now-migrating" indicator: subscribe to `SubjectMigrated` with coalesce labels `["variant", "from_type", "to_type", "migration_id"]` — the framework's per-subscriber coalescing collapses these to one event per from_type/to_type pair.
+
+The audio reference's admin-panel reference UI subscribes to `GrammarMigrationProgress` for the migration progress bar and to coalesced `SubjectMigrated` for the "completed N of M" counter.
 
 ## Upgrading the evo-core pin
 
