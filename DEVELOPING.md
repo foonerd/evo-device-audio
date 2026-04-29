@@ -136,7 +136,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 15 | Hot-reload `Live` mode | Implemented in evo-core v0.1.12 — applies to both in-process and OOP plugins via the same SDK contract (`prepare_for_live_reload` + `load_with_state` callbacks); in-process sequential callback for state-preserving re-init; OOP cross-process state transfer for schema migration recovery | Audio distribution: in-process plugins opt in to Live for catalogue / config / runtime-context reload without dropping admission slot. OOP plugins use Restart by default (cold reload), Live for schema migrations between versions. Hardware-bound state preservation (ALSA pipeline, kernel-bound resources) uses the warden-architecture-pattern (resource owner separate from reloadable plugin code) — not framework-supported as a primitive. See "Hot reload — Live mode authoring" subsection below. |
 | 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core v0.1.12 — label-based keying via `CoalesceLabels` trait + derive macro; subscribers declare label lists on `subscribe_happenings.coalesce`; `describe_capabilities` advertises per-variant label sets; new `Happening::PluginEvent` variant lets sensor / hardware-event plugins emit structured events that participate in coalescing | Audio distribution: consumers (frontend, voice agent, MQTT bridge) declare coalesce label lists per subscription based on their use case (per-handle for custody bursts, per-subject for cross-variant collapse, per-watch / per-appointment / per-pair for the v0.1.12 trigger primitives). Sensor and hardware-event plugins emit through `PluginEvent` with structured payloads; coalescing keys on flattened payload fields like `sensor_id`. See "Happenings coalescing" subsection below for guidance. |
 | 17 | Subject-grammar orphan migration verb | Implemented in evo-core v0.1.12 — three operator wire ops (`list_grammar_orphans`, `migrate_grammar_orphans` with `Rename` / `Map` / `Filter` strategies, `accept_grammar_orphans`); always-mint-new-IDs identity model reusing merge/split alias machinery; `pending_grammar_orphans` table; batched-commit + background-mode + dry-run for ARM-SBC operability | Audio distribution: catalogue authors planning subject-type renames or splits (e.g., `audio_track` → `track`, or `media_item` → `audio_track` + `video_track`) ship the catalogue change under a major version bump and document the migration call operators must issue. Distribution-side admin tooling consumes the three verbs and surfaces grammar-orphan state to the operator UI. See "Subject-grammar orphan migration — implications for catalogue authors and operators" subsection below. |
-| 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core v0.1.12 | Audio distribution decides whether it surfaces these verbs in its frontend. |
+| 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core v0.1.12 — two operator-trust-class wire ops (`reload_catalogue`, `reload_manifest`) distinct from `reload_plugin` (which reloads code); atomic-swap semantics with six-stage validation; idempotent-by-default with hash-skip; `dry_run` plan preview; five new Reserved happening subclasses for structured success/failure signaling; LKG updated only on success | Audio distribution: catalogue and manifest updates no longer require steward restart. Distribution-side admin tooling consumes both verbs to apply config rollouts live. CI/CD pipelines call the verbs sequentially for compose-and-apply distribution updates. See "Reload-catalogue / reload-manifest — implications for catalogue authors and operators" subsection below. |
 | 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core v0.1.12; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
 
 Items 6 through 19 land in evo-core v0.1.12. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
@@ -547,6 +547,112 @@ The framework emits both `Happening::GrammarMigrationProgress` (per batch) and `
 -   Frontend "now-migrating" indicator: subscribe to `SubjectMigrated` with coalesce labels `["variant", "from_type", "to_type", "migration_id"]` — the framework's per-subscriber coalescing collapses these to one event per from_type/to_type pair.
 
 The audio reference's admin-panel reference UI subscribes to `GrammarMigrationProgress` for the migration progress bar and to coalesced `SubjectMigrated` for the "completed N of M" counter.
+
+### Reload-catalogue / reload-manifest — implications for catalogue authors and operators
+
+The framework reads its catalogue and plugin manifests at steward boot. v0.1.12 ships two new operator-callable wire ops that update the loaded declarations without steward restart, decoupling operator-issued declaration updates from service interruption.
+
+**Three reload verbs, three concerns:**
+
+| Verb | Reloads | When to use |
+| --- | --- | --- |
+| `reload_plugin` | Plugin code (binary or in-process module) | Plugin author shipped a new code version |
+| `reload_catalogue` | Catalogue declarations (rack, shelf, type, cardinality) | Distribution rolling out a new catalogue version |
+| `reload_manifest` | A single plugin's manifest declarations (capabilities, verbs, lifecycle) | Plugin author bumped manifest declarations; code unchanged |
+
+The three are independent. Operators combine them in sequence for code + declaration co-updates: `reload_plugin` first (manifest-drift window opens), then `reload_manifest` to update the framework's gate table.
+
+**For audio distribution catalogue authors:**
+
+When you publish a new audio reference catalogue version that adds racks, removes racks, or changes cardinality rules, the operator-facing rollout flow is:
+
+1.  **Validate locally first.** Run `evo-plugin-tool admin reload plan catalogue --source=path:<new-catalogue.toml>` against a representative test deployment; review the dry-run output (added racks, removed racks, plugins that would be refused, cardinality violations). Catch breaking changes before they ship.
+2.  **Document the rollout in catalogue release notes.** State the operator command verbatim:
+
+    ```text
+    Catalogue v3 adds the flight_mode rack.
+    Operators apply the catalogue update without steward restart via:
+
+      # Plan preview:
+      evo-plugin-tool admin reload plan catalogue
+
+      # Apply:
+      evo-plugin-tool admin reload catalogue \
+        --reason="catalogue v3: add flight_mode rack"
+    ```
+
+3.  **For breaking changes (rack removed, type removed, cardinality tightened):** document the `--allow-cardinality-divergence` flag if it applies, and document any required pre-cleanup (`migrate_grammar_orphans` for type removals, plugin admission cleanup for rack removals).
+
+**Validation pipeline — what the verb checks before swapping:**
+
+The new catalogue or manifest must pass a six-stage validation before any state mutation:
+
+| Stage | What it checks | Refusal mode |
+| --- | --- | --- |
+| Parse | TOML syntax + schema | `catalogue_invalid` / `manifest_invalid` Reserved happening |
+| Schema | Every field has a known shape | Structured error naming the offending field |
+| Cardinality re-check | New rules vs current storage | `cardinality_violation` Reserved happening per offending shelf (refused unless `allow_cardinality_divergence = true`) |
+| Admission re-evaluation | Currently-admitted plugins vs new catalogue | Plugins-to-be-refused listed in reply; forced-retract on commit |
+| Drift re-check (manifest only) | New manifest vs live `describe()` | `manifest_drift` per the version-skew window |
+| Atomic swap | Only after all checks pass | Old state preserved if any stage fails |
+
+Failed reload is a no-op against framework state — old catalogue/manifest stays loaded; structured error names the failure mode.
+
+**For operator tooling consuming the verbs:**
+
+A distribution's admin panel typically wires both verbs:
+
+-   `reload_catalogue` consumed for catalogue version rollouts. Default UI flow: dry-run → plan review → confirm → apply. Default `mode` is foreground (admission re-evaluation completes within the verb call; no progress polling needed).
+-   `reload_manifest` consumed for per-plugin manifest updates. Often paired with `reload_plugin` (code reload) in a single operator-issued sequence; UI surfaces a single "Update plugin" button that issues both verbs in order.
+
+The operator UI defaults `dry_run = true` for the first call and only issues the real reload after explicit confirmation.
+
+**Idempotence and CI/CD:**
+
+Both verbs are idempotent by default — calling with an unchanged catalogue/manifest is a no-op (hash-based skip; reply returns success with `from_version == to_version`, `duration_ms ≤ 5`). CI/CD pipelines deploying audio reference distribution updates can call the verbs unconditionally as part of every release without side effects.
+
+When CI/CD ships a bundle (new catalogue + N updated plugin manifests), the recommended sequence is:
+
+```text
+1. Push catalogue file + manifest files to the device's filesystem.
+2. evo-plugin-tool admin reload plan catalogue       # dry-run
+3. evo-plugin-tool admin reload catalogue            # apply
+4. For each updated plugin:
+   evo-plugin-tool admin reload manifest --plugin=<id>
+5. Verify outcome via list-of-admitted-plugins query.
+```
+
+Each step is independently failable; failure leaves prior steps committed and lets the operator (or CI/CD pipeline) fix-and-retry without rollback.
+
+**LKG (last-known-good) interaction:**
+
+A successful `reload_catalogue` writes the new catalogue to the LKG shadow file. Failed reload doesn't touch LKG — the catalogue corruption-resilience recovery path stays trustworthy across every reload event. Manifests are not LKG-cached; they live next to their plugin bundles.
+
+**Reserved happening subclasses for consumer surfaces:**
+
+Subscribe to these for structured success/failure signaling:
+
+| Variant | Emitted when | Consumer use |
+| --- | --- | --- |
+| `Happening::Reserved::CatalogueInvalid` | Catalogue parse / schema check failed | Frontend shows the structured error fields |
+| `Happening::Reserved::CardinalityViolation` | `allow_cardinality_divergence = true` accepted a violating state | Per-shelf operator alert: "shelf X has 12 subjects, declared max is 1" |
+| `Happening::Reserved::ManifestInvalid` | Manifest reload failed validation | Per-plugin error in the admin panel |
+| `Happening::CatalogueReloaded` | Successful catalogue reload | Notification: "Catalogue updated from v2 to v3; flight_mode rack added" |
+| `Happening::ManifestReloaded` | Successful manifest reload | Per-plugin badge: "manifest updated to v0.4.2" |
+
+Frontend admin panels render each subclass with field-level context, not free-text logs.
+
+**Performance on ARM SBCs:**
+
+Cost on Pi Zero W (smallest target) for typical operations:
+
+| Operation | Cost |
+| --- | --- |
+| `reload_catalogue` with 20 plugins re-admitted | <200ms |
+| `reload_manifest` (single plugin) | <10ms |
+| Failed reload (validation refuses early) | <30ms |
+
+Negligible on every target. Reload calls do not require the chunking / background-mode patterns that the orphan migration uses.
 
 ## Upgrading the evo-core pin
 
