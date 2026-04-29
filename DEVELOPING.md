@@ -148,10 +148,6 @@ Items 6 through 18 land in evo-core v0.1.12. Audio distributions consume each as
 4.  Rerun `cargo build --workspace` and `cargo test --workspace`.
 5.  Commit with a message naming the new evo-core version and any public-surface changes the bump forced.
 
-## Git
-
-Claude (the assistant used during development) proposes file changes. The user commits, tags, and pushes. Claude does not run git commands.
-
 ## License
 
 Apache 2.0. Each source file carries the SPDX identifier `Apache-2.0` in its header once code lands.
