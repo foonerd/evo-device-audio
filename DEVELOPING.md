@@ -133,7 +133,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 12 | Steward Reconciliation Loop (compose-and-apply) | Implemented in evo-core v0.1.12 | Audio distribution gains the orchestration surface for `composition.alsa` → `delivery.alsa` flows. Distribution decides which composer/delivery pairs it admits. |
 | 13 | Catalogue corruption resilience | Implemented in evo-core v0.1.12 | Audio distribution inherits the LKG + built-in fallback transparently. Distribution may pre-seed `catalogue.lkg.toml` from its own packaging if it wants to control the recovery state. |
 | 14 | CBOR codec on the wire | Implemented in evo-core v0.1.12 | Audio distribution decides whether its frontends prefer CBOR over JSON. JSON remains supported. |
-| 15 | Hot-reload `Live` mode | Implemented in evo-core v0.1.12 | Audio distribution decides whether any of its plugins author live-reload state-handover. Default: `Restart` mode is sufficient. |
+| 15 | Hot-reload `Live` mode | Implemented in evo-core v0.1.12 — applies to both in-process and OOP plugins via the same SDK contract (`prepare_for_live_reload` + `load_with_state` callbacks); in-process sequential callback for state-preserving re-init; OOP cross-process state transfer for schema migration recovery | Audio distribution: in-process plugins opt in to Live for catalogue / config / runtime-context reload without dropping admission slot. OOP plugins use Restart by default (cold reload), Live for schema migrations between versions. Hardware-bound state preservation (ALSA pipeline, kernel-bound resources) uses the warden-architecture-pattern (resource owner separate from reloadable plugin code) — not framework-supported as a primitive. See "Hot reload — Live mode authoring" subsection below. |
 | 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core v0.1.12 — label-based keying via `CoalesceLabels` trait + derive macro; subscribers declare label lists on `subscribe_happenings.coalesce`; `describe_capabilities` advertises per-variant label sets; new `Happening::PluginEvent` variant lets sensor / hardware-event plugins emit structured events that participate in coalescing | Audio distribution: consumers (frontend, voice agent, MQTT bridge) declare coalesce label lists per subscription based on their use case (per-handle for custody bursts, per-subject for cross-variant collapse, per-watch / per-appointment / per-pair for the v0.1.12 trigger primitives). Sensor and hardware-event plugins emit through `PluginEvent` with structured payloads; coalescing keys on flattened payload fields like `sensor_id`. See "Happenings coalescing" subsection below for guidance. |
 | 17 | Subject-grammar orphan migration verb | Implemented in evo-core v0.1.12 | Audio distribution decides whether it provides operator tooling that consumes the verb. |
 | 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core v0.1.12 | Audio distribution decides whether it surfaces these verbs in its frontend. |
@@ -347,6 +347,75 @@ Consumer guidance:
 -   **Use multiple subscriptions for multi-rule scenarios.** Different variants needing different keying = different subscriptions. The framework does NOT support multi-rule per single subscription.
 
 The discoverability (via `describe_capabilities`) means consumer engineers don't have to read framework source to know what labels each variant exposes — runtime introspection IS the documentation.
+
+### Hot reload — Live mode authoring
+
+evo-core v0.1.12 ships hot-reload Live mode applying to both in-process and out-of-process plugins via the same SDK contract. The canonical use cases differ by transport:
+
+-   **In-process plugins**: Live mode re-initializes the plugin's internal state machine without dropping the plugin's admission slot. Use cases: catalogue reload (new shelves / predicates without losing claim state); operator config reload (`/etc/evo/plugins.d/<plugin>.toml` change picked up); runtime context refresh (LoadContext re-built with current registry / bus / persistence handles).
+-   **Out-of-process plugins**: Live mode is the schema-migration recovery path for binary updates. Default OOP reload remains Restart (cold start, no state handover); Live applies when the new plugin version's state format differs from the old version stored, and the plugin author wants in-flight state preserved across the swap.
+
+**SDK contract — both transports:**
+
+```rust
+pub trait Plugin {
+    // Existing methods.
+    fn load(&self, ctx: LoadContext) -> /* ... */ {
+        // Default: forward to load_with_state with no blob.
+        self.load_with_state(ctx, None).await
+    }
+    fn unload(&self) -> /* ... */ { /* ... */ }
+
+    // New optional callbacks for Live mode. Default impls
+    // make Live equivalent to cold-load (Restart-shaped).
+    fn prepare_for_live_reload(&self) -> Result<Option<StateBlob>, ReportError> {
+        Ok(None)  // default: no state to preserve
+    }
+    fn load_with_state(&self, ctx: LoadContext, blob: Option<StateBlob>) -> /* ... */ {
+        // Plugin author overrides this; default treats blob as cold-load.
+        self.load(ctx).await  // discards blob
+    }
+}
+
+pub struct StateBlob {
+    pub schema_version: u32,
+    pub payload: Bytes,
+}
+```
+
+Plugin author guidance:
+
+-   **Opt in to Live mode** by declaring `lifecycle.hot_reload = "live"` in the manifest AND implementing both callbacks. Without both, framework refuses Live with `unavailable / live_reload_not_implemented`; operator falls back to Restart.
+-   **State blob is opaque to the framework** and is the plugin author's contract. Define a stable schema; bump `schema_version` on format changes; handle migration in `load_with_state`.
+-   **Size limit is 16 MiB default, 64 MiB max.** Use the blob for transient in-flight state (buffer contents, partial OAuth code, EQ filter coefficients, library-scan progress); use durable persistence (subject store, `state_dir`) for long-lived data that already has a persistence path.
+-   **`unload` must clean up resources** — file handles, threads, sockets, pending tasks. In-process Live reload runs `unload` then `load_with_state` in the same process; resource leaks accumulate across reload cycles in a way they don't accumulate across separate process lifetimes.
+-   **Rollback semantics protect against bad migrations.** If `load_with_state` fails: in-process plugin gets cold-reloaded with `blob: None`; OOP plugin's old process keeps running and the new process is terminated. Plugin sees structured error; operator triages.
+
+**Hardware-bound state preservation — the warden-architecture-pattern:**
+
+Audio plugins managing hardware-bound state (ALSA pipeline, open device file handles, kernel-bound resources) cannot preserve that state through a plugin process restart — the kernel resources die with the process. Live mode preserves what's in the plugin's address space (or the emitted blob); it does NOT preserve kernel-side state via plugin's open handles.
+
+The answer for distributions wanting **zero-disruption updates** to hardware-bound flows is the **warden-architecture-pattern**:
+
+-   The warden plugin holds the resource only briefly during dispatch; the actual long-running resource owner (ALSA pipeline, kernel audio router, mixer engine) lives in a separate process or kernel thread the plugin code does NOT own.
+-   Plugin code reload (Live mode) reconnects to the running resource owner; resource-side state is preserved because it never died.
+-   Distribution authors the resource owner as a separate component (e.g., systemd-managed ALSA daemon; a kernel module; a separate vendor process) the plugin connects to.
+
+This is a structural choice the distribution makes, not a framework gap. evo-core's Live mode primitive serves the in-process state path; hardware-bound preservation is the distribution's architectural decision.
+
+**For audio-domain plugins specifically:**
+
+| Plugin type | Live mode opt-in? | Why |
+| --- | --- | --- |
+| Library scanner / metadata fetcher | Yes (in-process) | Catalogue / config reload without losing scan progress |
+| Streaming source (Spotify, Tidal, etc.) | Yes (OOP, Live) | Schema migration on plugin updates; OAuth refresh-token handover |
+| MPD playback warden | Restart only (warden-arch holds ALSA state separately) | Hardware-bound state via the resource owner pattern |
+| ALSA composition warden | Restart only (same reason) | Hardware-bound; resource owner is the actual ALSA pipeline daemon |
+| Local artwork / file-tag respondents | Yes (in-process) | Cache state preserved across catalogue reload |
+| Sensor plugins (CPU temp, BT peer, etc.) | Restart only | State is the kernel's; nothing for the plugin to hand over |
+| Alarm clock plugin | Yes (in-process) | Pending-alarm state preserved across operator config reload |
+
+The pattern: plugins with **plugin-owned state** opt in to Live; plugins with **kernel-owned or warden-owned state** stay on Restart and rely on the resource owner outliving the plugin code.
 
 ## Upgrading the evo-core pin
 
