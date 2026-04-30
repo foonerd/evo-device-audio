@@ -347,6 +347,14 @@ fn default_intent_version() -> u32 {
     1
 }
 
+fn default_intent_state_schema_version() -> u32 {
+    1
+}
+
+fn default_captive_state_schema_version() -> u32 {
+    1
+}
+
 fn default_hotspot_channel() -> u32 {
     4
 }
@@ -387,6 +395,67 @@ fn tmp_shadow_path(path: &Path) -> PathBuf {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "state".to_string());
         path.with_file_name(format!("{base}.tmp"))
+    }
+}
+
+fn migrate_intent_state(
+    schema_version: u32,
+    mut intent: NetworkIntent,
+) -> Result<NetworkIntent, String> {
+    match schema_version {
+        0 | 1 => {
+            if intent.version == 0 {
+                intent.version = default_intent_version();
+            }
+            Ok(intent)
+        }
+        _ => Err(format!(
+            "unsupported intent state schema_version {schema_version}"
+        )),
+    }
+}
+
+fn parse_intent_state_toml(raw: &str) -> Result<NetworkIntent, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(NetworkIntent::default());
+    }
+    match toml::from_str::<IntentStateEnvelope>(t) {
+        Ok(env) => migrate_intent_state(env.schema_version, env.intent),
+        Err(env_err) => match toml::from_str::<NetworkIntent>(t) {
+            Ok(legacy_intent) => migrate_intent_state(0, legacy_intent),
+            Err(legacy_err) => Err(format!(
+                "intent state parse failed (envelope: {env_err}; legacy: {legacy_err})"
+            )),
+        },
+    }
+}
+
+fn migrate_captive_state(
+    schema_version: u32,
+    state: CaptiveSessionState,
+) -> Result<CaptiveSessionState, String> {
+    match schema_version {
+        0 | 1 => Ok(state),
+        _ => Err(format!(
+            "unsupported captive state schema_version {schema_version}"
+        )),
+    }
+}
+
+fn parse_captive_state_json(raw: &str) -> Result<CaptiveSessionState, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(CaptiveSessionState::default());
+    }
+    match serde_json::from_str::<CaptiveStateEnvelope>(t) {
+        Ok(env) => migrate_captive_state(env.schema_version, env.state),
+        Err(env_err) => match serde_json::from_str::<CaptiveSessionState>(t) {
+            Ok(legacy_state) => migrate_captive_state(0, legacy_state),
+            Err(legacy_err) => Err(format!(
+                "captive state parse failed (envelope: {env_err}; legacy: {legacy_err})"
+            )),
+        },
     }
 }
 
@@ -480,6 +549,42 @@ struct CaptiveSessionState {
     submit_attempts: u32,
     #[serde(default)]
     requires_user_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentStateEnvelope {
+    #[serde(default = "default_intent_state_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    intent: NetworkIntent,
+}
+
+impl Default for IntentStateEnvelope {
+    fn default() -> Self {
+        Self {
+            schema_version: default_intent_state_schema_version(),
+            intent: NetworkIntent::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptiveStateEnvelope {
+    #[serde(default = "default_captive_state_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    state: CaptiveSessionState,
+}
+
+impl Default for CaptiveStateEnvelope {
+    fn default() -> Self {
+        Self {
+            schema_version: default_captive_state_schema_version(),
+            state: CaptiveSessionState::default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -603,7 +708,7 @@ impl NetworkNmPlugin {
         let lkg = lkg_shadow_path(&path);
         let primary_raw = tokio::fs::read_to_string(&path).await.ok();
         if let Some(raw) = primary_raw {
-            match serde_json::from_str::<CaptiveSessionState>(&raw) {
+            match parse_captive_state_json(&raw) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     tracing::warn!(
@@ -616,7 +721,7 @@ impl NetworkNmPlugin {
             }
         }
         if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
-            if let Ok(v) = serde_json::from_str::<CaptiveSessionState>(&raw) {
+            if let Ok(v) = parse_captive_state_json(&raw) {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     path = %lkg.display(),
@@ -633,7 +738,11 @@ impl NetworkNmPlugin {
         state: &CaptiveSessionState,
     ) -> Result<(), PluginError> {
         let path = self.captive_state_path()?;
-        let raw = serde_json::to_string_pretty(state).map_err(|e| {
+        let envelope = CaptiveStateEnvelope {
+            schema_version: default_captive_state_schema_version(),
+            state: state.clone(),
+        };
+        let raw = serde_json::to_string_pretty(&envelope).map_err(|e| {
             PluginError::Permanent(format!(
                 "captive state serialization failed: {e}"
             ))
@@ -882,7 +991,7 @@ impl NetworkNmPlugin {
             if raw.trim().is_empty() {
                 return Ok(NetworkIntent::default());
             }
-            match toml::from_str::<NetworkIntent>(&raw) {
+            match parse_intent_state_toml(&raw) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     tracing::warn!(
@@ -895,7 +1004,7 @@ impl NetworkNmPlugin {
             }
         }
         if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
-            if let Ok(v) = toml::from_str::<NetworkIntent>(&raw) {
+            if let Ok(v) = parse_intent_state_toml(&raw) {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     path = %lkg.display(),
@@ -912,7 +1021,11 @@ impl NetworkNmPlugin {
         intent: &NetworkIntent,
     ) -> Result<(), PluginError> {
         let path = self.intent_path()?;
-        let text = toml::to_string_pretty(intent).map_err(|e| {
+        let envelope = IntentStateEnvelope {
+            schema_version: default_intent_state_schema_version(),
+            intent: intent.clone(),
+        };
+        let text = toml::to_string_pretty(&envelope).map_err(|e| {
             PluginError::Permanent(format!("intent serialization failed: {e}"))
         })?;
         self.write_text_atomic_with_lkg(&path, &text).await
@@ -3316,5 +3429,97 @@ hotspot_enabled = true
         let intent = p.load_intent().await.expect("load intent");
         assert_eq!(intent.wifi.ifname, "wlan1");
         assert_eq!(intent.wifi.sta_ssid, "HotelWiFi");
+    }
+
+    #[test]
+    fn parse_intent_state_toml_accepts_legacy_and_envelope() {
+        let legacy = r#"
+version = 1
+[wifi]
+ifname = "wlan1"
+role = "sta"
+sta_ssid = "HotelWiFi"
+"#;
+        let parsed_legacy =
+            parse_intent_state_toml(legacy).expect("legacy parses");
+        assert_eq!(parsed_legacy.wifi.ifname, "wlan1");
+        assert_eq!(parsed_legacy.wifi.sta_ssid, "HotelWiFi");
+
+        let envelope = r#"
+schema_version = 1
+[intent]
+version = 1
+[intent.wifi]
+ifname = "wlan0"
+role = "sta"
+sta_ssid = "OfficeWiFi"
+"#;
+        let parsed_envelope =
+            parse_intent_state_toml(envelope).expect("envelope parses");
+        assert_eq!(parsed_envelope.wifi.ifname, "wlan0");
+        assert_eq!(parsed_envelope.wifi.sta_ssid, "OfficeWiFi");
+    }
+
+    #[test]
+    fn parse_intent_state_toml_rejects_unknown_schema() {
+        let src = r#"
+schema_version = 99
+[intent]
+version = 1
+"#;
+        let err = parse_intent_state_toml(src).expect_err("must fail");
+        assert!(err.contains("unsupported intent state schema_version"));
+    }
+
+    #[test]
+    fn parse_captive_state_json_accepts_legacy_and_envelope() {
+        let legacy = r#"{"phase":"authenticated","submit_attempts":1}"#;
+        let parsed_legacy =
+            parse_captive_state_json(legacy).expect("legacy parses");
+        assert!(matches!(parsed_legacy.phase, CaptivePhase::Authenticated));
+        assert_eq!(parsed_legacy.submit_attempts, 1);
+
+        let envelope = r#"{
+  "schema_version": 1,
+  "state": {
+    "phase": "awaiting_credentials",
+    "requires_user_confirmation": true
+  }
+}"#;
+        let parsed_envelope =
+            parse_captive_state_json(envelope).expect("envelope parses");
+        assert!(matches!(
+            parsed_envelope.phase,
+            CaptivePhase::AwaitingCredentials
+        ));
+        assert!(parsed_envelope.requires_user_confirmation);
+    }
+
+    #[tokio::test]
+    async fn save_intent_and_captive_state_write_schema_envelopes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+
+        let intent = NetworkIntent::default();
+        p.save_intent(&intent).await.expect("save intent");
+        let intent_raw =
+            tokio::fs::read_to_string(p.intent_path().expect("path"))
+                .await
+                .expect("read intent");
+        assert!(intent_raw.contains("schema_version = 1"));
+        assert!(intent_raw.contains("[intent]"));
+
+        let captive = CaptiveSessionState {
+            phase: CaptivePhase::Authenticated,
+            ..Default::default()
+        };
+        p.save_captive_state(&captive).await.expect("save captive");
+        let captive_raw =
+            tokio::fs::read_to_string(p.captive_state_path().expect("path"))
+                .await
+                .expect("read captive");
+        assert!(captive_raw.contains("\"schema_version\": 1"));
+        assert!(captive_raw.contains("\"state\""));
     }
 }
