@@ -94,6 +94,7 @@ Current apply/reconcile logic covers these branches:
 - `STA with hotspot enabled (same radio)`: retry AP bring-up and restore STA as needed.
 - `STA with hotspot enabled (split iface)`: run STA and hotspot on distinct ifaces.
 - `STA with hotspot enabled (concurrent vif)`: create AP vif (`ap0` or override), follow STA channel.
+- `Concurrent vif create failure`: best-effort fallback to shared iface mode with warning.
 - `AP role`: enforce AP/hotspot profile as primary mode.
 - `No LAN carrier + hotspot failure`: critical open-hotspot recovery path.
 - `LAN carrier present`: prefer restoring STA on single-radio displacement.
