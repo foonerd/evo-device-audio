@@ -16,6 +16,8 @@ Operational procedures: `docs/NETWORK_NM_RUNBOOK.md`.
 - `network.nm.captive.start`
 - `network.nm.captive.submit`
 - `network.nm.captive.complete`
+- `network.nm.security.status`
+- `network.nm.security.harden`
 
 ## Intent model parity notes
 
@@ -55,6 +57,38 @@ Optional runtime guardrails:
 - `curl_timeout_ms` (default `30000`, minimum `100`)
 - `scan_cache_ttl_ms` (default `3000`, set `0` to disable cache)
 
+### Hardware profile guidance (UI/warden scope)
+
+For vendor-specific devices, guardrail values should be selected by a hardware
+profile layer (UI onboarding, warden policy, or image defaults), not by
+hardcoding per-board logic inside the plugin.
+
+Suggested profile targets:
+
+- `balanced` (default):
+  - `nmcli_timeout_ms = 8000`
+  - `curl_timeout_ms = 30000`
+  - `scan_cache_ttl_ms = 3000`
+- `constrained` (low-end CPU/storage pressure):
+  - `nmcli_timeout_ms = 10000`
+  - `curl_timeout_ms = 30000` (or `35000` for unstable WANs)
+  - `scan_cache_ttl_ms = 5000`
+- `performance` (higher-end devices):
+  - `nmcli_timeout_ms = 6000`
+  - `curl_timeout_ms = 20000`
+  - `scan_cache_ttl_ms = 1500-3000`
+
+Recommended auto-profiler behavior:
+
+1. Resolve a profile key from hardware metadata (board/vendor class).
+2. Apply profile values to plugin config before load/restart.
+3. Surface active profile and overrides in UI diagnostics.
+4. Keep operator override as highest priority.
+5. If profiler metadata is missing/unknown, fall back to `balanced`.
+
+This keeps behavior deterministic across vendor SKUs while preserving an
+operator escape hatch for field tuning.
+
 ## Durability naming convention
 
 Following steward conventions, this plugin uses:
@@ -84,6 +118,29 @@ Wi-Fi PSK files (`wifi-sta.psk`, `wifi-ap.psk`) support encrypted-at-rest storag
 
 Without a key, plugin behavior remains backward compatible (plaintext) unless
 `require_encrypted` is enabled.
+
+### Security operator contract (UI scope)
+
+Security hardening is intentionally opt-in. UI and warden CLI should use these
+request types instead of manipulating files directly:
+
+- `network.nm.security.status`
+  - returns `security.key_configured`
+  - returns `security.require_encrypted`
+  - reports per-secret state (`security.sta_secret.*`, `security.ap_secret.*`)
+  - includes `security.ui_scope.*` hints for UI gating/confirmation
+- `network.nm.security.harden`
+  - rewrites existing secret files into encrypted envelope format
+  - supports `enforce_runtime` (turns on runtime plaintext rejection in current process)
+  - fails clearly when no key is configured (`EVO_NETWORK_SECRET_KEY`)
+
+Recommended UI flow:
+
+1. Call `network.nm.security.status`.
+2. If `key_configured=false`, block hardening toggle and show remediation.
+3. On operator confirmation, call `network.nm.security.harden` with
+   `{"enforce_runtime": true}`.
+4. Re-read `network.nm.security.status` and render hardened state.
 
 ## Operational scenario coverage
 

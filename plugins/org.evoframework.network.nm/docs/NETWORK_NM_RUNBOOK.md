@@ -83,3 +83,25 @@ Operator action:
 - Keep fallback hotspot policy explicit in intent.
 - Use `network.nm.scan` `candidates` for deterministic STA selection.
 - Use `observability.correlation_id` to correlate API/UI/log events per action.
+
+## 8) Hardware auto-profiler policy (vendor devices)
+
+For fleets with mixed hardware, keep a profile policy outside the plugin and
+feed values through config management (UI provisioning, warden, image defaults).
+
+Profile baseline:
+
+- `balanced`: `nmcli_timeout_ms=8000`, `curl_timeout_ms=30000`,
+  `scan_cache_ttl_ms=3000`
+- `constrained`: `nmcli_timeout_ms=10000`, `curl_timeout_ms=30000-35000`,
+  `scan_cache_ttl_ms=5000`
+- `performance`: `nmcli_timeout_ms=6000`, `curl_timeout_ms=20000`,
+  `scan_cache_ttl_ms=1500-3000`
+
+Operational rules:
+
+1. Hardware profiler chooses profile by board/vendor class.
+2. Operator override always wins over profiler recommendation.
+3. Unknown board class falls back to `balanced`.
+4. Changes should be applied on controlled restart windows (avoid churn).
+5. Record selected profile in device diagnostics for support triage.
