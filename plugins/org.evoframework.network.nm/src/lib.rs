@@ -89,6 +89,8 @@ struct PluginConfig {
     captive: CaptiveConfig,
     secret_key: Option<[u8; 32]>,
     require_encrypted_secrets: bool,
+    nmcli_timeout_ms: u64,
+    curl_timeout_ms: u64,
 }
 
 #[derive(
@@ -139,6 +141,8 @@ impl PluginConfig {
             captive: CaptiveConfig::default(),
             secret_key: env_key,
             require_encrypted_secrets,
+            nmcli_timeout_ms: 8000,
+            curl_timeout_ms: 30000,
         }
     }
 
@@ -161,6 +165,26 @@ impl PluginConfig {
                 ));
             }
             out.default_wifi_iface = t.to_string();
+        }
+        if let Some(v) =
+            table.get("nmcli_timeout_ms").and_then(|v| v.as_integer())
+        {
+            if v < 100 {
+                return Err(PluginError::Permanent(
+                    "nmcli_timeout_ms must be >= 100".to_string(),
+                ));
+            }
+            out.nmcli_timeout_ms = v as u64;
+        }
+        if let Some(v) =
+            table.get("curl_timeout_ms").and_then(|v| v.as_integer())
+        {
+            if v < 100 {
+                return Err(PluginError::Permanent(
+                    "curl_timeout_ms must be >= 100".to_string(),
+                ));
+            }
+            out.curl_timeout_ms = v as u64;
         }
         let captive_table = table
             .get("captive")
@@ -596,6 +620,24 @@ fn parse_captive_state_json(raw: &str) -> Result<CaptiveSessionState, String> {
     }
 }
 
+async fn run_command_output_with_timeout(
+    mut cmd: Command,
+    timeout_ms: u64,
+    label: &str,
+) -> Result<std::process::Output, PluginError> {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
+        .await
+    {
+        Ok(v) => v.map_err(|e| {
+            PluginError::Transient(format!("spawn {label} failed: {e}"))
+        }),
+        Err(_) => Err(PluginError::Transient(format!(
+            "{label} timed out after {}ms",
+            timeout_ms
+        ))),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DeviceRow {
     device: String,
@@ -904,26 +946,24 @@ impl NetworkNmPlugin {
         &self,
         url: &str,
     ) -> Result<(Option<u16>, Option<String>), PluginError> {
-        let out = Command::new("curl")
-            .args([
-                "-sS",
-                "-L",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}|%{url_effective}",
-                "--max-time",
-                "20",
-                url,
-            ])
-            .output()
-            .await
-            .map_err(|e| {
-                PluginError::Transient(format!(
-                    "curl probe spawn failed: {}",
-                    e
-                ))
-            })?;
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sS",
+            "-L",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}|%{url_effective}",
+            "--max-time",
+            "20",
+            url,
+        ]);
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.curl_timeout_ms,
+            "curl probe",
+        )
+        .await?;
         if !out.status.success() {
             return Err(PluginError::Transient(format!(
                 "curl probe failed (exit {}): {}",
@@ -1073,16 +1113,14 @@ impl NetworkNmPlugin {
         state.submit_attempts = state.submit_attempts.saturating_add(1);
         state.last_submit_fingerprint = Some(fingerprint);
         state.last_submit_at_epoch = Some(now_epoch);
-        let out = Command::new("curl")
-            .args(args.iter().map(String::as_str))
-            .output()
-            .await
-            .map_err(|e| {
-                PluginError::Transient(format!(
-                    "curl submit spawn failed: {}",
-                    e
-                ))
-            })?;
+        let mut cmd = Command::new("curl");
+        cmd.args(args.iter().map(String::as_str));
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.curl_timeout_ms,
+            "curl submit",
+        )
+        .await?;
         if !out.status.success() {
             state.phase = CaptivePhase::Failed;
             state.last_error = Some(format!(
@@ -1310,27 +1348,27 @@ impl NetworkNmPlugin {
     }
 
     async fn nmcli_output(&self, args: &[&str]) -> Result<String, PluginError> {
-        let direct = Command::new(&self.config.nmcli_path)
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| {
-                PluginError::Transient(format!(
-                    "spawn {} failed: {}",
-                    self.config.nmcli_path, e
-                ))
-            })?;
+        let mut cmd = Command::new(&self.config.nmcli_path);
+        cmd.args(args);
+        let direct = run_command_output_with_timeout(
+            cmd,
+            self.config.nmcli_timeout_ms,
+            "nmcli direct",
+        )
+        .await?;
         if direct.status.success() {
             return Ok(String::from_utf8_lossy(&direct.stdout).to_string());
         }
 
-        let sudo = Command::new("sudo")
-            .arg("-n")
-            .arg(&self.config.nmcli_path)
-            .args(args)
-            .output()
-            .await
-            .ok();
+        let mut sudo_cmd = Command::new("sudo");
+        sudo_cmd.arg("-n").arg(&self.config.nmcli_path).args(args);
+        let sudo = run_command_output_with_timeout(
+            sudo_cmd,
+            self.config.nmcli_timeout_ms,
+            "nmcli sudo fallback",
+        )
+        .await
+        .ok();
         if let Some(out) = sudo {
             if out.status.success() {
                 return Ok(String::from_utf8_lossy(&out.stdout).to_string());
@@ -1356,10 +1394,14 @@ impl NetworkNmPlugin {
     }
 
     async fn nm_connection_exists(&self, name: &str) -> bool {
-        let out = Command::new(&self.config.nmcli_path)
-            .args(["connection", "show", name])
-            .output()
-            .await;
+        let mut cmd = Command::new(&self.config.nmcli_path);
+        cmd.args(["connection", "show", name]);
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.nmcli_timeout_ms,
+            "nmcli connection show",
+        )
+        .await;
         out.map(|o| o.status.success()).unwrap_or(false)
     }
 
@@ -1667,10 +1709,14 @@ impl NetworkNmPlugin {
         if name.trim().is_empty() {
             return;
         }
-        let out = Command::new(&self.config.nmcli_path)
-            .args(["connection", "down", name])
-            .output()
-            .await;
+        let mut cmd = Command::new(&self.config.nmcli_path);
+        cmd.args(["connection", "down", name]);
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.nmcli_timeout_ms,
+            "nmcli connection down",
+        )
+        .await;
         match out {
             Ok(v) if v.status.success() => {}
             Ok(v) => {
@@ -1692,16 +1738,14 @@ impl NetworkNmPlugin {
         &self,
         args: &[&str],
     ) -> Result<std::process::Output, PluginError> {
-        Command::new(&self.config.nmcli_path)
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| {
-                PluginError::Transient(format!(
-                    "spawn {} failed: {}",
-                    self.config.nmcli_path, e
-                ))
-            })
+        let mut cmd = Command::new(&self.config.nmcli_path);
+        cmd.args(args);
+        run_command_output_with_timeout(
+            cmd,
+            self.config.nmcli_timeout_ms,
+            "nmcli spawn output",
+        )
+        .await
     }
 
     async fn connection_up_hotspot_with_retries(
@@ -2465,6 +2509,8 @@ impl Plugin for NetworkNmPlugin {
                 plugin = PLUGIN_NAME,
                 nmcli = %self.config.nmcli_path,
                 wifi_iface = %self.config.default_wifi_iface,
+                nmcli_timeout_ms = self.config.nmcli_timeout_ms,
+                curl_timeout_ms = self.config.curl_timeout_ms,
                 secret_encryption = self.config.secret_key.is_some(),
                 secret_encryption_required = self.config.require_encrypted_secrets,
                 "network plugin loaded"
@@ -3664,6 +3710,8 @@ hotspot_fallback = true
             r#"
 nmcli_path = "/usr/bin/nmcli"
 wifi_iface = "wlan1"
+nmcli_timeout_ms = 12000
+curl_timeout_ms = 45000
 
 [captive]
 credential_policy = "single_use_ticket"
@@ -3684,6 +3732,8 @@ require_encrypted = true
         assert_eq!(cfg.captive.retry_budget, 1);
         assert_eq!(cfg.captive.replay_window_sec, 120);
         assert!(cfg.require_encrypted_secrets);
+        assert_eq!(cfg.nmcli_timeout_ms, 12000);
+        assert_eq!(cfg.curl_timeout_ms, 45000);
     }
 
     #[test]
@@ -4124,5 +4174,32 @@ exit 0\n",
         assert_eq!(status_v["degraded"], true);
         assert_eq!(status_v["domain_health"]["device_table"]["ok"], false);
         assert_eq!(status_v["domain_health"]["general_status"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn nmcli_output_times_out_on_slow_backend() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-slow.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\nsleep 2\necho connected\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.config.nmcli_timeout_ms = 50;
+        let err = p
+            .nmcli_output(&["general", "status"])
+            .await
+            .expect_err("must timeout");
+        assert!(format!("{err}").contains("timed out"));
     }
 }
