@@ -47,5 +47,7 @@ request_types = [
     "network.nm.captive.complete",
     "network.nm.security.status",
     "network.nm.security.harden",
+    "network.nm.flight_mode.get",
+    "network.nm.flight_mode.set",
 ]
 response_budget_ms = 15000

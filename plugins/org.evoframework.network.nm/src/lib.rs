@@ -64,6 +64,8 @@ const REQUEST_NETWORK_CAPTIVE_SUBMIT: &str = "network.nm.captive.submit";
 const REQUEST_NETWORK_CAPTIVE_COMPLETE: &str = "network.nm.captive.complete";
 const REQUEST_NETWORK_SECURITY_STATUS: &str = "network.nm.security.status";
 const REQUEST_NETWORK_SECURITY_HARDEN: &str = "network.nm.security.harden";
+const REQUEST_NETWORK_FLIGHT_MODE_GET: &str = "network.nm.flight_mode.get";
+const REQUEST_NETWORK_FLIGHT_MODE_SET: &str = "network.nm.flight_mode.set";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
@@ -635,6 +637,34 @@ fn parse_captive_state_json(raw: &str) -> Result<CaptiveSessionState, String> {
     }
 }
 
+fn migrate_flight_mode_state(
+    schema_version: u32,
+    state: FlightModeState,
+) -> Result<FlightModeState, String> {
+    match schema_version {
+        0 | 1 => Ok(state),
+        _ => Err(format!(
+            "unsupported flight mode state schema_version {schema_version}"
+        )),
+    }
+}
+
+fn parse_flight_mode_state_toml(raw: &str) -> Result<FlightModeState, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(FlightModeState::default());
+    }
+    match toml::from_str::<FlightModeStateEnvelope>(t) {
+        Ok(env) => migrate_flight_mode_state(env.schema_version, env.state),
+        Err(env_err) => match toml::from_str::<FlightModeState>(t) {
+            Ok(legacy_state) => migrate_flight_mode_state(0, legacy_state),
+            Err(legacy_err) => Err(format!(
+                "flight mode state parse failed (envelope: {env_err}; legacy: {legacy_err})"
+            )),
+        },
+    }
+}
+
 async fn run_command_output_with_timeout(
     mut cmd: Command,
     timeout_ms: u64,
@@ -701,6 +731,15 @@ struct CachedScan {
     available: Vec<ScanRow>,
     candidates: Vec<WifiStaCandidate>,
     captured_at: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NmRadioState {
+    wifi_hw_enabled: Option<bool>,
+    wifi_enabled: Option<bool>,
+    wwan_hw_enabled: Option<bool>,
+    wwan_enabled: Option<bool>,
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -791,6 +830,34 @@ impl Default for CaptiveStateEnvelope {
     }
 }
 
+fn default_flight_mode_state_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FlightModeState {
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlightModeStateEnvelope {
+    #[serde(default = "default_flight_mode_state_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    state: FlightModeState,
+}
+
+impl Default for FlightModeStateEnvelope {
+    fn default() -> Self {
+        Self {
+            schema_version: default_flight_mode_state_schema_version(),
+            state: FlightModeState::default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CaptiveStatusRequest {
     #[serde(default = "default_true")]
@@ -829,6 +896,11 @@ struct SecurityHardenRequest {
     enforce_runtime: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct FlightModeSetRequest {
+    enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ApplyReport {
     ok: bool,
@@ -842,6 +914,7 @@ pub struct NetworkNmPlugin {
     state_dir: Option<PathBuf>,
     requests_handled: u64,
     scan_cache: HashMap<String, CachedScan>,
+    wifi_flight_mode_enabled: bool,
 }
 
 impl NetworkNmPlugin {
@@ -853,6 +926,7 @@ impl NetworkNmPlugin {
             state_dir: None,
             requests_handled: 0,
             scan_cache: HashMap::new(),
+            wifi_flight_mode_enabled: false,
         }
     }
 
@@ -876,6 +950,10 @@ impl NetworkNmPlugin {
 
     fn captive_state_path(&self) -> Result<PathBuf, PluginError> {
         Ok(self.ensure_state_dir()?.join("captive-session.json"))
+    }
+
+    fn flight_mode_state_path(&self) -> Result<PathBuf, PluginError> {
+        Ok(self.ensure_state_dir()?.join("flight-mode.toml"))
     }
 
     async fn write_text_atomic_with_lkg(
@@ -957,6 +1035,55 @@ impl NetworkNmPlugin {
         let raw = serde_json::to_string_pretty(&envelope).map_err(|e| {
             PluginError::Permanent(format!(
                 "captive state serialization failed: {e}"
+            ))
+        })?;
+        self.write_text_atomic_with_lkg(&path, &raw).await
+    }
+
+    async fn load_flight_mode_state(
+        &self,
+    ) -> Result<FlightModeState, PluginError> {
+        let path = self.flight_mode_state_path()?;
+        let lkg = lkg_shadow_path(&path);
+        let primary_raw = tokio::fs::read_to_string(&path).await.ok();
+        if let Some(raw) = primary_raw {
+            match parse_flight_mode_state_toml(&raw) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        error = %e,
+                        "invalid flight mode state; trying LKG shadow"
+                    );
+                }
+            }
+        }
+        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
+            if let Ok(v) = parse_flight_mode_state_toml(&raw) {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %lkg.display(),
+                    "using LKG flight mode state shadow"
+                );
+                return Ok(v);
+            }
+        }
+        Ok(FlightModeState::default())
+    }
+
+    async fn save_flight_mode_state(
+        &self,
+        state: &FlightModeState,
+    ) -> Result<(), PluginError> {
+        let path = self.flight_mode_state_path()?;
+        let envelope = FlightModeStateEnvelope {
+            schema_version: default_flight_mode_state_schema_version(),
+            state: state.clone(),
+        };
+        let raw = toml::to_string_pretty(&envelope).map_err(|e| {
+            PluginError::Permanent(format!(
+                "flight mode state serialization failed: {e}"
             ))
         })?;
         self.write_text_atomic_with_lkg(&path, &raw).await
@@ -1926,6 +2053,35 @@ impl NetworkNmPlugin {
         .await
     }
 
+    async fn nm_radio_state(&self) -> Result<NmRadioState, PluginError> {
+        let compact = self
+            .nmcli_output(&["-t", "-f", "WIFI-HW,WIFI,WWAN-HW,WWAN", "radio"])
+            .await;
+        if let Ok(raw) = compact {
+            if let Some(mut parsed) = parse_nm_radio_compact(&raw) {
+                parsed.source = "nmcli_compact".to_string();
+                return Ok(parsed);
+            }
+        }
+        let table = self.nmcli_output(&["radio", "all"]).await?;
+        if let Some(mut parsed) = parse_nm_radio_table(&table) {
+            parsed.source = "nmcli_table".to_string();
+            return Ok(parsed);
+        }
+        Err(PluginError::Transient(
+            "could not parse nmcli radio output".to_string(),
+        ))
+    }
+
+    async fn nm_set_wifi_radio(
+        &self,
+        enabled: bool,
+    ) -> Result<(), PluginError> {
+        let value = if enabled { "on" } else { "off" };
+        self.nmcli_output(&["radio", "wifi", value]).await?;
+        Ok(())
+    }
+
     async fn connection_up_hotspot_with_retries(
         &self,
         con_name: &str,
@@ -2463,6 +2619,31 @@ impl NetworkNmPlugin {
 
         self.ensure_ethernet(intent, &mut steps).await?;
 
+        if !matches!(intent.wifi.role, WifiRole::Disabled) {
+            if self.wifi_flight_mode_enabled {
+                steps.push(
+                    "warning: wifi flight mode is enabled; skip wifi apply. Disable flight mode and retry"
+                        .to_string(),
+                );
+                return Ok(ApplyReport { ok: false, steps });
+            }
+            match self.nm_radio_state().await {
+                Ok(radio) => {
+                    if let Some(reason) = radio_block_reason(&radio) {
+                        steps.push(format!(
+                            "warning: wifi radio blocked ({reason}); skip wifi apply. Toggle flight mode off or unblock rfkill and retry"
+                        ));
+                        return Ok(ApplyReport { ok: false, steps });
+                    }
+                }
+                Err(e) => {
+                    steps.push(format!(
+                        "warning: radio preflight unavailable; continuing apply: {e}"
+                    ));
+                }
+            }
+        }
+
         match intent.wifi.role {
             WifiRole::Disabled => {
                 self.connection_down_lossy(NM_CON_WIFI_STA).await;
@@ -2671,6 +2852,8 @@ impl Plugin for NetworkNmPlugin {
                         REQUEST_NETWORK_CAPTIVE_COMPLETE.to_string(),
                         REQUEST_NETWORK_SECURITY_STATUS.to_string(),
                         REQUEST_NETWORK_SECURITY_HARDEN.to_string(),
+                        REQUEST_NETWORK_FLIGHT_MODE_GET.to_string(),
+                        REQUEST_NETWORK_FLIGHT_MODE_SET.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -2692,6 +2875,8 @@ impl Plugin for NetworkNmPlugin {
         async move {
             self.config = PluginConfig::from_toml_table(&ctx.config)?;
             self.state_dir = Some(ctx.state_dir.clone());
+            let flight_mode_state = self.load_flight_mode_state().await?;
+            self.wifi_flight_mode_enabled = flight_mode_state.enabled;
             self.loaded = true;
             self.scan_cache.clear();
             tracing::info!(
@@ -2703,6 +2888,7 @@ impl Plugin for NetworkNmPlugin {
                 scan_cache_ttl_ms = self.config.scan_cache_ttl_ms,
                 secret_encryption = self.config.secret_key.is_some(),
                 secret_encryption_required = self.config.require_encrypted_secrets,
+                wifi_flight_mode_enabled = self.wifi_flight_mode_enabled,
                 "network plugin loaded"
             );
             if self.config.require_encrypted_secrets
@@ -2713,6 +2899,23 @@ impl Plugin for NetworkNmPlugin {
                     env = ENV_SECRET_KEY,
                     "encrypted secrets required but no key is configured"
                 );
+            }
+            match self.nm_set_wifi_radio(!self.wifi_flight_mode_enabled).await {
+                Ok(()) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        wifi_enabled = !self.wifi_flight_mode_enabled,
+                        "applied startup wifi radio policy"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        wifi_enabled = !self.wifi_flight_mode_enabled,
+                        "could not enforce startup wifi radio policy"
+                    );
+                }
             }
             Ok(())
         }
@@ -2726,6 +2929,7 @@ impl Plugin for NetworkNmPlugin {
             self.state_dir = None;
             self.config = PluginConfig::defaults();
             self.scan_cache.clear();
+            self.wifi_flight_mode_enabled = false;
             Ok(())
         }
     }
@@ -2780,9 +2984,28 @@ impl Respondent for NetworkNmPlugin {
                         .await
                         .err()
                         .map(|e| format!("{e}"));
+                    let radio_out = self.nm_radio_state().await;
+                    let (radio, radio_error) = match radio_out {
+                        Ok(v) => (Some(v), Option::<String>::None),
+                        Err(e) => (None, Some(format!("{e}"))),
+                    };
+                    let configured_flight_mode = self.wifi_flight_mode_enabled;
+                    let radio_blocked =
+                        radio.as_ref().and_then(radio_block_reason).is_some();
+                    let radio_block_reason = radio
+                        .as_ref()
+                        .and_then(radio_block_reason)
+                        .map(ToString::to_string);
+                    let radio_blocked_intentional = configured_flight_mode
+                        && matches!(
+                            radio_block_reason.as_deref(),
+                            Some("software_blocked")
+                        );
                     let degraded = devices_error.is_some()
                         || general_error.is_some()
-                        || wifi_scan_error.is_some();
+                        || wifi_scan_error.is_some()
+                        || radio_error.is_some()
+                        || (radio_blocked && !radio_blocked_intentional);
                     Self::response_json(
                         req,
                         self.with_observability(
@@ -2796,6 +3019,19 @@ impl Respondent for NetworkNmPlugin {
                                 "devices": devices,
                                 "scan_ifname": scan_if,
                                 "wifi_scan_error": wifi_scan_error,
+                                "flight_mode": {
+                                    "configured_enabled": configured_flight_mode,
+                                    "wifi_blocked": radio_blocked,
+                                    "block_reason": radio_block_reason.clone(),
+                                    "blocked_intentional": radio_blocked_intentional,
+                                    "radio": radio.as_ref().map(|r| json!({
+                                        "source": r.source,
+                                        "wifi_hw_enabled": r.wifi_hw_enabled,
+                                        "wifi_enabled": r.wifi_enabled,
+                                        "wwan_hw_enabled": r.wwan_hw_enabled,
+                                        "wwan_enabled": r.wwan_enabled,
+                                    })),
+                                },
                                 "domain_health": {
                                     "device_table": {
                                         "ok": devices_error.is_none(),
@@ -2808,6 +3044,14 @@ impl Respondent for NetworkNmPlugin {
                                     "wifi_scan": {
                                         "ok": wifi_scan_error.is_none(),
                                         "error": wifi_scan_error,
+                                    },
+                                    "radio": {
+                                        "ok": radio_error.is_none()
+                                            && (!radio_blocked || radio_blocked_intentional),
+                                        "error": radio_error,
+                                        "blocked": radio_blocked,
+                                        "reason": radio_block_reason,
+                                        "blocked_intentional": radio_blocked_intentional,
                                     },
                                 }
                             }),
@@ -3136,6 +3380,66 @@ impl Respondent for NetworkNmPlugin {
                         ),
                     )
                 }
+                REQUEST_NETWORK_FLIGHT_MODE_GET => {
+                    let radio = self.nm_radio_state().await.ok();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "flight_mode": {
+                                    "enabled": self.wifi_flight_mode_enabled,
+                                    "radio": radio.as_ref().map(|r| json!({
+                                        "source": r.source,
+                                        "wifi_hw_enabled": r.wifi_hw_enabled,
+                                        "wifi_enabled": r.wifi_enabled,
+                                    })),
+                                },
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_FLIGHT_MODE_SET => {
+                    let body =
+                        Self::parse_request_json::<FlightModeSetRequest>(req)?;
+                    self.wifi_flight_mode_enabled = body.enabled;
+                    self.save_flight_mode_state(&FlightModeState {
+                        enabled: body.enabled,
+                    })
+                    .await?;
+                    match self.nm_set_wifi_radio(!body.enabled).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                enabled = body.enabled,
+                                error = %e,
+                                "failed to enforce wifi flight mode immediately"
+                            );
+                        }
+                    }
+                    let radio = self.nm_radio_state().await.ok();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "flight_mode": {
+                                    "enabled": self.wifi_flight_mode_enabled,
+                                    "radio": radio.as_ref().map(|r| json!({
+                                        "source": r.source,
+                                        "wifi_hw_enabled": r.wifi_hw_enabled,
+                                        "wifi_enabled": r.wifi_enabled,
+                                    })),
+                                },
+                            }),
+                        ),
+                    )
+                }
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type: {:?}",
                     other
@@ -3161,6 +3465,67 @@ fn parse_http_probe_metrics(raw: &str) -> (Option<u16>, Option<String>) {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     (code, url)
+}
+
+fn parse_radio_enabled_token(token: &str) -> Option<bool> {
+    let v = token.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "enabled" | "on" | "yes" | "true" | "unblocked" => Some(true),
+        "disabled" | "off" | "no" | "false" | "blocked" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_nm_radio_compact(raw: &str) -> Option<NmRadioState> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?;
+    let parts: Vec<&str> = line.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(NmRadioState {
+        wifi_hw_enabled: parts
+            .first()
+            .and_then(|v| parse_radio_enabled_token(v)),
+        wifi_enabled: parts.get(1).and_then(|v| parse_radio_enabled_token(v)),
+        wwan_hw_enabled: parts
+            .get(2)
+            .and_then(|v| parse_radio_enabled_token(v)),
+        wwan_enabled: parts.get(3).and_then(|v| parse_radio_enabled_token(v)),
+        source: String::new(),
+    })
+}
+
+fn parse_nm_radio_table(raw: &str) -> Option<NmRadioState> {
+    let data_line = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .nth(1)?;
+    let parts: Vec<&str> = data_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(NmRadioState {
+        wifi_hw_enabled: parts
+            .first()
+            .and_then(|v| parse_radio_enabled_token(v)),
+        wifi_enabled: parts.get(1).and_then(|v| parse_radio_enabled_token(v)),
+        wwan_hw_enabled: parts
+            .get(2)
+            .and_then(|v| parse_radio_enabled_token(v)),
+        wwan_enabled: parts.get(3).and_then(|v| parse_radio_enabled_token(v)),
+        source: String::new(),
+    })
+}
+
+fn radio_block_reason(state: &NmRadioState) -> Option<&'static str> {
+    if matches!(state.wifi_hw_enabled, Some(false)) {
+        return Some("hardware_or_bios_blocked");
+    }
+    if matches!(state.wifi_enabled, Some(false)) {
+        return Some("software_blocked");
+    }
+    None
 }
 
 fn notice(level: &str, code: &str, message: String) -> serde_json::Value {
@@ -3684,6 +4049,14 @@ mod tests {
             .request_types
             .iter()
             .any(|v| v == REQUEST_NETWORK_SECURITY_HARDEN));
+        assert!(cap
+            .request_types
+            .iter()
+            .any(|v| v == REQUEST_NETWORK_FLIGHT_MODE_GET));
+        assert!(cap
+            .request_types
+            .iter()
+            .any(|v| v == REQUEST_NETWORK_FLIGHT_MODE_SET));
     }
 
     #[tokio::test]
@@ -3912,6 +4285,41 @@ hotspot_fallback = true
         let (code, url) = parse_http_probe_metrics("not-a-code");
         assert_eq!(code, None);
         assert!(url.is_none());
+    }
+
+    #[test]
+    fn parse_nm_radio_outputs_compact_and_table() {
+        let compact = "enabled:disabled:enabled:enabled\n";
+        let c = parse_nm_radio_compact(compact).expect("compact parse");
+        assert_eq!(c.wifi_hw_enabled, Some(true));
+        assert_eq!(c.wifi_enabled, Some(false));
+        assert_eq!(radio_block_reason(&c), Some("software_blocked"));
+
+        let table = "WIFI-HW  WIFI  WWAN-HW  WWAN\nenabled  enabled  disabled  disabled\n";
+        let t = parse_nm_radio_table(table).expect("table parse");
+        assert_eq!(t.wifi_hw_enabled, Some(true));
+        assert_eq!(t.wifi_enabled, Some(true));
+        assert_eq!(t.wwan_hw_enabled, Some(false));
+        assert_eq!(radio_block_reason(&t), None);
+    }
+
+    #[test]
+    fn parse_flight_mode_state_toml_accepts_legacy_and_envelope() {
+        let legacy = r#"
+enabled = true
+"#;
+        let parsed_legacy =
+            parse_flight_mode_state_toml(legacy).expect("legacy parses");
+        assert!(parsed_legacy.enabled);
+
+        let envelope = r#"
+schema_version = 1
+[state]
+enabled = false
+"#;
+        let parsed_envelope =
+            parse_flight_mode_state_toml(envelope).expect("envelope parses");
+        assert!(!parsed_envelope.enabled);
     }
 
     #[test]
@@ -4400,6 +4808,220 @@ exit 0\n",
             .await
             .expect("nmcli log");
         assert!(nmcli_log.contains("connection down evo-network-wifi-sta"));
+    }
+
+    #[tokio::test]
+    async fn request_flow_apply_reports_nonfatal_when_flight_mode_blocks_wifi()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock-flight-mode.sh");
+        let nmcli_log_path = dir.path().join("nmcli-flight.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{}\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"WIFI-HW,WIFI,WWAN-HW,WWAN\" && \"$4\" == \"radio\" ]]; then\n\
+  echo \"enabled:disabled:enabled:enabled\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                nmcli_log_path.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+
+        let apply_req = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "sta", "ifname": "wlan0", "sta_ssid": "HotelWiFi", "sta_open": true },
+                    "fallback": { "hotspot_enabled": false }
+                }
+            }),
+            1005,
+        );
+        let apply_out =
+            p.handle_request(&apply_req).await.expect("intent.apply");
+        let apply_v: Value =
+            serde_json::from_slice(&apply_out.payload).expect("json");
+        assert_eq!(apply_v["status"], "ok");
+        assert_eq!(apply_v["apply"]["ok"], false);
+        assert!(apply_v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("wifi radio blocked")));
+        assert!(apply_v["notices"]
+            .as_array()
+            .expect("notices")
+            .iter()
+            .any(|n| n["code"] == "network_apply_failed"));
+    }
+
+    #[tokio::test]
+    async fn request_flow_flight_mode_set_get_and_apply_guard() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock-flight-set.sh");
+        let nmcli_log_path = dir.path().join("nmcli-flight-set.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{}\"\n\
+if [[ \"$1\" == \"radio\" && \"$2\" == \"wifi\" ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"WIFI-HW,WIFI,WWAN-HW,WWAN\" && \"$4\" == \"radio\" ]]; then\n\
+  echo \"enabled:disabled:enabled:enabled\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                nmcli_log_path.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+
+        let set_req = req(
+            REQUEST_NETWORK_FLIGHT_MODE_SET,
+            serde_json::json!({ "enabled": true }),
+            1210,
+        );
+        let set_out =
+            p.handle_request(&set_req).await.expect("flight_mode.set");
+        let set_v: Value =
+            serde_json::from_slice(&set_out.payload).expect("json");
+        assert_eq!(set_v["status"], "ok");
+        assert_eq!(set_v["flight_mode"]["enabled"], true);
+
+        let get_req =
+            req(REQUEST_NETWORK_FLIGHT_MODE_GET, serde_json::json!({}), 1211);
+        let get_out =
+            p.handle_request(&get_req).await.expect("flight_mode.get");
+        let get_v: Value =
+            serde_json::from_slice(&get_out.payload).expect("json");
+        assert_eq!(get_v["status"], "ok");
+        assert_eq!(get_v["flight_mode"]["enabled"], true);
+
+        let apply_req = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "sta", "ifname": "wlan0", "sta_ssid": "HotelWiFi", "sta_open": true },
+                    "fallback": { "hotspot_enabled": false }
+                }
+            }),
+            1212,
+        );
+        let apply_out =
+            p.handle_request(&apply_req).await.expect("intent.apply");
+        let apply_v: Value =
+            serde_json::from_slice(&apply_out.payload).expect("json");
+        assert_eq!(apply_v["status"], "ok");
+        assert_eq!(apply_v["apply"]["ok"], false);
+        assert!(apply_v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .any(|s| s
+                .as_str()
+                .unwrap_or("")
+                .contains("flight mode is enabled")));
+
+        let flight_raw = tokio::fs::read_to_string(
+            p.flight_mode_state_path().expect("path"),
+        )
+        .await
+        .expect("read flight state");
+        assert!(flight_raw.contains("schema_version = 1"));
+        assert!(flight_raw.contains("enabled = true"));
+
+        let nmcli_log = tokio::fs::read_to_string(&nmcli_log_path)
+            .await
+            .expect("read log");
+        assert!(nmcli_log.contains("radio wifi off"));
+    }
+
+    #[tokio::test]
+    async fn request_flow_status_treats_configured_flight_mode_as_intentional_block(
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock-status-flight.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"DEVICE,TYPE,STATE,CONNECTION\" && \"$4\" == \"device\" ]]; then\n\
+  echo \"wlan0:wifi:disconnected:--\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo \"disconnected\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"SSID,SIGNAL,SECURITY,ACTIVE\" ]]; then\n\
+  echo \"HotelWiFi:80:WPA2:no\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"WIFI-HW,WIFI,WWAN-HW,WWAN\" && \"$4\" == \"radio\" ]]; then\n\
+  echo \"enabled:disabled:enabled:enabled\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.wifi_flight_mode_enabled = true;
+
+        let status_req =
+            req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1213);
+        let status_out = p.handle_request(&status_req).await.expect("status");
+        let status_v: Value =
+            serde_json::from_slice(&status_out.payload).expect("json");
+        assert_eq!(status_v["status"], "ok");
+        assert_eq!(status_v["degraded"], false);
+        assert_eq!(status_v["flight_mode"]["configured_enabled"], true);
+        assert_eq!(status_v["flight_mode"]["wifi_blocked"], true);
+        assert_eq!(status_v["flight_mode"]["blocked_intentional"], true);
+        assert_eq!(status_v["domain_health"]["radio"]["ok"], true);
     }
 
     #[tokio::test]

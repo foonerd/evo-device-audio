@@ -76,6 +76,10 @@ Operator action:
 - `wifi_scan` failed:
   - do not clear persisted credentials preemptively;
   - continue with known SSID/BSSID policy where possible.
+- `radio` blocked:
+  - check `flight_mode.block_reason` in `network.nm.status`;
+  - for `software_blocked`, clear rfkill/NM flight mode then retry apply;
+  - for `hardware_or_bios_blocked`, verify chassis switch/key or BIOS policy.
 
 ## 7) Zero-downtime operating posture
 
@@ -105,3 +109,25 @@ Operational rules:
 3. Unknown board class falls back to `balanced`.
 4. Changes should be applied on controlled restart windows (avoid churn).
 5. Record selected profile in device diagnostics for support triage.
+
+## 9) Flight mode and rfkill behavior
+
+The plugin is defensive for both software and hardware flight-mode cases:
+
+- status reports radio lock state under `flight_mode.*` and `domain_health.radio`;
+- apply does not panic on blocked Wi-Fi radio; it returns a controlled
+  non-success report (`apply.ok=false`) with actionable warning steps.
+- on startup, plugin enforces Wi-Fi radio `on` unless persisted flight mode is enabled.
+
+Control API (Wi-Fi only):
+
+- `network.nm.flight_mode.get`
+- `network.nm.flight_mode.set` with `{ "enabled": true|false }`
+
+Operator workflow:
+
+1. Call `network.nm.status`.
+2. If `flight_mode.wifi_blocked=true`, resolve the blocker first:
+   - software path: unblock via NM/rfkill policy tooling;
+   - hardware path: toggle physical key/switch or BIOS/EC policy.
+3. Re-run `network.nm.intent.apply`.
