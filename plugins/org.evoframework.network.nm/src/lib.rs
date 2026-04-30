@@ -62,6 +62,8 @@ const REQUEST_NETWORK_CAPTIVE_STATUS: &str = "network.nm.captive.status";
 const REQUEST_NETWORK_CAPTIVE_START: &str = "network.nm.captive.start";
 const REQUEST_NETWORK_CAPTIVE_SUBMIT: &str = "network.nm.captive.submit";
 const REQUEST_NETWORK_CAPTIVE_COMPLETE: &str = "network.nm.captive.complete";
+const REQUEST_NETWORK_SECURITY_STATUS: &str = "network.nm.security.status";
+const REQUEST_NETWORK_SECURITY_HARDEN: &str = "network.nm.security.harden";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
@@ -821,6 +823,12 @@ struct CaptiveCompleteRequest {
     success: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SecurityHardenRequest {
+    #[serde(default)]
+    enforce_runtime: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ApplyReport {
     ok: bool,
@@ -1370,6 +1378,116 @@ impl NetworkNmPlugin {
                 Ok(())
             }
         }
+    }
+
+    async fn read_secret_value_permissive(
+        &self,
+        path: &Path,
+    ) -> Result<Option<String>, PluginError> {
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let t = raw.trim();
+        if t.is_empty() {
+            return Ok(None);
+        }
+        match serde_json::from_str::<SecretEnvelope>(t) {
+            Ok(env) => {
+                let key = self.config.secret_key.as_ref().ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "encrypted secret {} requires {}",
+                        path.display(),
+                        ENV_SECRET_KEY
+                    ))
+                })?;
+                decrypt_secret_value(&env, key).map(Some)
+            }
+            Err(_) => Ok(Some(t.to_string())),
+        }
+    }
+
+    async fn secret_storage_status(
+        &self,
+        path: &Path,
+    ) -> (bool, bool, Option<String>) {
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(v) => v,
+            Err(_) => return (false, false, None),
+        };
+        let t = raw.trim();
+        if t.is_empty() {
+            return (false, false, None);
+        }
+        if serde_json::from_str::<SecretEnvelope>(t).is_ok() {
+            return (true, true, None);
+        }
+        (true, false, Some("plaintext_or_legacy_format".to_string()))
+    }
+
+    async fn build_security_status(
+        &self,
+    ) -> Result<serde_json::Value, PluginError> {
+        let sta_path = self.sta_psk_path()?;
+        let ap_path = self.ap_psk_path()?;
+        let (sta_present, sta_encrypted, sta_note) =
+            self.secret_storage_status(&sta_path).await;
+        let (ap_present, ap_encrypted, ap_note) =
+            self.secret_storage_status(&ap_path).await;
+        Ok(json!({
+            "key_configured": self.config.secret_key.is_some(),
+            "require_encrypted": self.config.require_encrypted_secrets,
+            "sta_secret": {
+                "present": sta_present,
+                "encrypted": sta_encrypted,
+                "note": sta_note,
+            },
+            "ap_secret": {
+                "present": ap_present,
+                "encrypted": ap_encrypted,
+                "note": ap_note,
+            },
+            "harden_ready": self.config.secret_key.is_some(),
+            "ui_scope": {
+                "harden_toggle_available": true,
+                "operator_confirmation_required": true,
+            }
+        }))
+    }
+
+    async fn harden_secret_storage(
+        &mut self,
+        enforce_runtime: bool,
+    ) -> Result<serde_json::Value, PluginError> {
+        if self.config.secret_key.is_none() {
+            return Err(PluginError::Permanent(format!(
+                "cannot harden secrets without {}",
+                ENV_SECRET_KEY
+            )));
+        }
+        let mut migrated_files = 0u32;
+        let sta_path = self.sta_psk_path()?;
+        let ap_path = self.ap_psk_path()?;
+        if let Some(v) = self.read_secret_value_permissive(&sta_path).await? {
+            self.write_optional_secret(sta_path.clone(), Some(v.as_str()))
+                .await?;
+            migrated_files += 1;
+        }
+        if let Some(v) = self.read_secret_value_permissive(&ap_path).await? {
+            self.write_optional_secret(ap_path.clone(), Some(v.as_str()))
+                .await?;
+            migrated_files += 1;
+        }
+        if enforce_runtime {
+            self.config.require_encrypted_secrets = true;
+        }
+        let security = self.build_security_status().await?;
+        Ok(json!({
+            "ok": true,
+            "migrated_files": migrated_files,
+            "enforce_runtime": enforce_runtime,
+            "security": security,
+        }))
     }
 
     async fn nmcli_output(&self, args: &[&str]) -> Result<String, PluginError> {
@@ -2551,6 +2669,8 @@ impl Plugin for NetworkNmPlugin {
                         REQUEST_NETWORK_CAPTIVE_START.to_string(),
                         REQUEST_NETWORK_CAPTIVE_SUBMIT.to_string(),
                         REQUEST_NETWORK_CAPTIVE_COMPLETE.to_string(),
+                        REQUEST_NETWORK_SECURITY_STATUS.to_string(),
+                        REQUEST_NETWORK_SECURITY_HARDEN.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -2978,6 +3098,43 @@ impl Respondent for NetworkNmPlugin {
                             "replay_window_sec": self.config.captive.replay_window_sec,
                         }
                     })))
+                }
+                REQUEST_NETWORK_SECURITY_STATUS => {
+                    let security = self.build_security_status().await?;
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "security": security,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_SECURITY_HARDEN => {
+                    let body = if req.payload.is_empty() {
+                        SecurityHardenRequest {
+                            enforce_runtime: false,
+                        }
+                    } else {
+                        Self::parse_request_json::<SecurityHardenRequest>(req)?
+                    };
+                    let harden = self
+                        .harden_secret_storage(body.enforce_runtime)
+                        .await?;
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "harden": harden,
+                            }),
+                        ),
+                    )
                 }
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type: {:?}",
@@ -3519,6 +3676,14 @@ mod tests {
             .request_types
             .iter()
             .any(|v| v == REQUEST_NETWORK_CAPTIVE_SUBMIT));
+        assert!(cap
+            .request_types
+            .iter()
+            .any(|v| v == REQUEST_NETWORK_SECURITY_STATUS));
+        assert!(cap
+            .request_types
+            .iter()
+            .any(|v| v == REQUEST_NETWORK_SECURITY_HARDEN));
     }
 
     #[tokio::test]
@@ -4431,5 +4596,83 @@ exit 0\n",
             .await
             .expect_err("must timeout");
         assert!(format!("{err}").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn request_flow_security_status_and_harden_encrypts_plaintext() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.secret_key = Some(derive_secret_key("integration-hardening"));
+
+        tokio::fs::write(p.sta_psk_path().expect("sta path"), "StaSecret1\n")
+            .await
+            .expect("write sta");
+        tokio::fs::write(p.ap_psk_path().expect("ap path"), "ApSecret2\n")
+            .await
+            .expect("write ap");
+
+        let status_req =
+            req(REQUEST_NETWORK_SECURITY_STATUS, serde_json::json!({}), 1201);
+        let status_out = p
+            .handle_request(&status_req)
+            .await
+            .expect("security.status");
+        let status_v: Value =
+            serde_json::from_slice(&status_out.payload).expect("json");
+        assert_eq!(status_v["status"], "ok");
+        assert_eq!(status_v["security"]["key_configured"], true);
+        assert_eq!(status_v["security"]["require_encrypted"], false);
+        assert_eq!(status_v["security"]["sta_secret"]["present"], true);
+        assert_eq!(status_v["security"]["sta_secret"]["encrypted"], false);
+        assert_eq!(
+            status_v["security"]["ui_scope"]["harden_toggle_available"],
+            true
+        );
+
+        let harden_req = req(
+            REQUEST_NETWORK_SECURITY_HARDEN,
+            serde_json::json!({ "enforce_runtime": true }),
+            1202,
+        );
+        let harden_out = p
+            .handle_request(&harden_req)
+            .await
+            .expect("security.harden");
+        let harden_v: Value =
+            serde_json::from_slice(&harden_out.payload).expect("json");
+        assert_eq!(harden_v["status"], "ok");
+        assert_eq!(harden_v["harden"]["ok"], true);
+        assert_eq!(harden_v["harden"]["migrated_files"], 2);
+        assert_eq!(harden_v["harden"]["security"]["require_encrypted"], true);
+
+        let sta_raw =
+            tokio::fs::read_to_string(p.sta_psk_path().expect("path"))
+                .await
+                .expect("read sta");
+        assert!(sta_raw.contains("\"cipher\": \"xchacha20poly1305\""));
+    }
+
+    #[tokio::test]
+    async fn request_flow_security_harden_rejects_without_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.secret_key = None;
+
+        let harden_req = req(
+            REQUEST_NETWORK_SECURITY_HARDEN,
+            serde_json::json!({ "enforce_runtime": true }),
+            1203,
+        );
+        let err = p
+            .handle_request(&harden_req)
+            .await
+            .expect_err("must reject");
+        assert!(format!("{err}").contains("cannot harden secrets"));
     }
 }
