@@ -200,6 +200,17 @@ enum Ipv4Mode {
     Static,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum StaSelectionMode {
+    Legacy,
+    #[default]
+    AutoStable,
+    AutoPerformance,
+    PreferBand,
+    LockBssid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EthernetIntent {
     #[serde(default = "default_true")]
@@ -248,6 +259,12 @@ struct WifiIntent {
     #[serde(default)]
     sta_ipv4_dns: Vec<String>,
     #[serde(default)]
+    sta_selection_mode: StaSelectionMode,
+    #[serde(default)]
+    sta_preferred_band: String,
+    #[serde(default)]
+    sta_lock_bssid: String,
+    #[serde(default)]
     ap_ssid: String,
     #[serde(default = "default_hotspot_channel")]
     ap_channel: u32,
@@ -266,6 +283,9 @@ impl Default for WifiIntent {
             sta_ipv4_address: String::new(),
             sta_ipv4_gateway: String::new(),
             sta_ipv4_dns: Vec::new(),
+            sta_selection_mode: StaSelectionMode::AutoStable,
+            sta_preferred_band: String::new(),
+            sta_lock_bssid: String::new(),
             ap_ssid: default_ap_ssid(),
             ap_channel: default_hotspot_channel(),
             ap_band: String::new(),
@@ -383,6 +403,25 @@ struct ScanRow {
     ssid: String,
     signal: u8,
     security: String,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BandClass {
+    Ghz2_4,
+    Ghz5,
+    Ghz6,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WifiStaCandidate {
+    bssid: String,
+    ssid: String,
+    signal_pct: u8,
+    freq_mhz: Option<u32>,
+    band: BandClass,
     active: bool,
 }
 
@@ -1044,6 +1083,105 @@ impl NetworkNmPlugin {
         Ok(out)
     }
 
+    async fn wifi_scan_candidates(
+        &self,
+        ifname: Option<&str>,
+    ) -> Result<Vec<WifiStaCandidate>, PluginError> {
+        let mut args: Vec<String> = vec![
+            "-t".into(),
+            "-f".into(),
+            "BSSID,SSID,SIGNAL,FREQ,ACTIVE".into(),
+            "dev".into(),
+            "wifi".into(),
+            "list".into(),
+        ];
+        if let Some(i) = ifname.map(str::trim).filter(|s| !s.is_empty()) {
+            args.push("ifname".into());
+            args.push(i.to_string());
+        }
+        let raw = self.nmcli_output_owned(&args).await?;
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut p = line.splitn(5, ':');
+            let bssid = p.next().unwrap_or("").trim().to_string();
+            let ssid = p.next().unwrap_or("").trim().to_string();
+            let signal_pct = p
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .unwrap_or(0);
+            let freq_mhz = p.next().unwrap_or("").trim().parse::<u32>().ok();
+            let active = matches!(
+                p.next().unwrap_or("").trim().to_ascii_lowercase().as_str(),
+                "yes" | "y"
+            );
+            if bssid.is_empty() || ssid.is_empty() {
+                continue;
+            }
+            out.push(WifiStaCandidate {
+                bssid,
+                ssid,
+                signal_pct,
+                freq_mhz,
+                band: band_from_freq(freq_mhz),
+                active,
+            });
+        }
+        Ok(out)
+    }
+
+    fn select_sta_candidate(
+        &self,
+        wifi: &WifiIntent,
+        candidates: &[WifiStaCandidate],
+    ) -> Option<WifiStaCandidate> {
+        let ssid = wifi.sta_ssid.trim();
+        if ssid.is_empty() {
+            return None;
+        }
+        let lock_bssid = wifi.sta_lock_bssid.trim();
+        if !lock_bssid.is_empty() {
+            return candidates
+                .iter()
+                .find(|c| {
+                    c.ssid == ssid && c.bssid.eq_ignore_ascii_case(lock_bssid)
+                })
+                .cloned();
+        }
+
+        let preferred_band =
+            normalize_band_pref(wifi.sta_preferred_band.as_str());
+        let mut filtered: Vec<WifiStaCandidate> = candidates
+            .iter()
+            .filter(|c| c.ssid == ssid)
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            return None;
+        }
+        filtered.sort_by(|a, b| {
+            let sa = sta_candidate_score(
+                a,
+                &wifi.sta_selection_mode,
+                preferred_band,
+            );
+            let sb = sta_candidate_score(
+                b,
+                &wifi.sta_selection_mode,
+                preferred_band,
+            );
+            sb.cmp(&sa)
+                .then_with(|| b.active.cmp(&a.active))
+                .then_with(|| b.signal_pct.cmp(&a.signal_pct))
+        });
+        filtered.into_iter().next()
+    }
+
     fn hotspot_connection_name(intent: &NetworkIntent) -> String {
         let t = intent.fallback.hotspot_connection_name.trim();
         if t.is_empty() {
@@ -1289,6 +1427,26 @@ impl NetworkNmPlugin {
             ));
         }
 
+        let scan_candidates =
+            self.wifi_scan_candidates(Some(ifname)).await.ok();
+        let selected_candidate = scan_candidates
+            .as_ref()
+            .and_then(|c| self.select_sta_candidate(wifi, c));
+        let selected_bssid = selected_candidate
+            .as_ref()
+            .map(|c| c.bssid.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref cand) = selected_candidate {
+            steps.push(format!(
+                "STA candidate selected ssid={:?} bssid={} band={:?} signal={} mode={:?}",
+                cand.ssid,
+                cand.bssid,
+                cand.band,
+                cand.signal_pct,
+                wifi.sta_selection_mode
+            ));
+        }
+
         let mut base = vec![
             "connection".to_string(),
             "modify".to_string(),
@@ -1298,6 +1456,14 @@ impl NetworkNmPlugin {
             "802-11-wireless.ssid".to_string(),
             ssid.to_string(),
         ];
+        if let Some(ref bssid) = selected_bssid {
+            base.extend([
+                "802-11-wireless.bssid".to_string(),
+                bssid.to_string(),
+            ]);
+        } else {
+            base.extend(["802-11-wireless.bssid".to_string(), String::new()]);
+        }
         if wifi.sta_open {
             base.extend(["wifi-sec.key-mgmt".into(), "none".into()]);
         } else {
@@ -1341,6 +1507,9 @@ impl NetworkNmPlugin {
                 "ssid".into(),
                 ssid.to_string(),
             ];
+            if let Some(ref bssid) = selected_bssid {
+                add.extend(["802-11-wireless.bssid".into(), bssid.to_string()]);
+            }
             if wifi.sta_open {
                 add.extend(["wifi-sec.key-mgmt".into(), "none".into()]);
             } else {
@@ -2009,12 +2178,14 @@ impl Respondent for NetworkNmPlugin {
                         .as_deref()
                         .or(Some(self.config.default_wifi_iface.as_str()));
                     let rows = self.wifi_scan(ifname).await?;
+                    let candidates = self.wifi_scan_candidates(ifname).await?;
                     Self::response_json(
                         req,
                         json!({
                             "v": 1,
                             "status": "ok",
                             "available": rows,
+                            "candidates": candidates,
                         }),
                     )
                 }
@@ -2346,15 +2517,15 @@ fn build_captive_notices(
                 .clone()
                 .unwrap_or_else(|| "Captive authentication failed".to_string()),
         )),
-        CaptivePhase::AwaitingCredentials => {
-            if state.requires_user_confirmation {
-                out.push(notice(
-                    "warning",
-                    "captive_confirmation_required",
-                    "Manual confirmation required before credential replay"
-                        .to_string(),
-                ));
-            }
+        CaptivePhase::AwaitingCredentials
+            if state.requires_user_confirmation =>
+        {
+            out.push(notice(
+                "warning",
+                "captive_confirmation_required",
+                "Manual confirmation required before credential replay"
+                    .to_string(),
+            ));
         }
         _ => {}
     }
@@ -2409,6 +2580,85 @@ fn normalize_nm_ap_band(raw: &str) -> Option<&'static str> {
         return Some("6GHz");
     }
     None
+}
+
+fn normalize_band_pref(raw: &str) -> Option<BandClass> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.eq_ignore_ascii_case("2.4")
+        || t.eq_ignore_ascii_case("2.4ghz")
+        || t.eq_ignore_ascii_case("2g")
+        || t.eq_ignore_ascii_case("bg")
+    {
+        return Some(BandClass::Ghz2_4);
+    }
+    if t.eq_ignore_ascii_case("5")
+        || t.eq_ignore_ascii_case("5ghz")
+        || t.eq_ignore_ascii_case("5g")
+        || t.eq_ignore_ascii_case("a")
+    {
+        return Some(BandClass::Ghz5);
+    }
+    if t.eq_ignore_ascii_case("6")
+        || t.eq_ignore_ascii_case("6ghz")
+        || t.eq_ignore_ascii_case("6g")
+    {
+        return Some(BandClass::Ghz6);
+    }
+    None
+}
+
+fn band_from_freq(freq_mhz: Option<u32>) -> BandClass {
+    match freq_mhz {
+        Some(v) if (2412..=2484).contains(&v) => BandClass::Ghz2_4,
+        Some(v) if (5000..=5895).contains(&v) => BandClass::Ghz5,
+        Some(v) if (5925..=7125).contains(&v) => BandClass::Ghz6,
+        _ => BandClass::Unknown,
+    }
+}
+
+fn band_weight_stable(band: &BandClass) -> i32 {
+    match band {
+        BandClass::Ghz2_4 => 120,
+        BandClass::Ghz5 => 100,
+        BandClass::Ghz6 => 80,
+        BandClass::Unknown => 0,
+    }
+}
+
+fn band_weight_performance(band: &BandClass) -> i32 {
+    match band {
+        BandClass::Ghz2_4 => 100,
+        BandClass::Ghz5 => 220,
+        BandClass::Ghz6 => 260,
+        BandClass::Unknown => 0,
+    }
+}
+
+fn sta_candidate_score(
+    c: &WifiStaCandidate,
+    mode: &StaSelectionMode,
+    preferred_band: Option<BandClass>,
+) -> i32 {
+    let signal = i32::from(c.signal_pct);
+    let pref = preferred_band
+        .as_ref()
+        .filter(|b| **b == c.band)
+        .map(|_| 2000)
+        .unwrap_or(0);
+    match mode {
+        StaSelectionMode::Legacy => signal,
+        StaSelectionMode::AutoStable => {
+            (signal * 3) + band_weight_stable(&c.band)
+        }
+        StaSelectionMode::AutoPerformance => {
+            (signal * 2) + band_weight_performance(&c.band)
+        }
+        StaSelectionMode::PreferBand => (signal * 2) + pref,
+        StaSelectionMode::LockBssid => signal,
+    }
 }
 
 fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
@@ -2800,6 +3050,78 @@ hotspot_fallback = true
                 "5",
             ]
         );
+    }
+
+    #[test]
+    fn band_from_freq_maps_common_ranges() {
+        assert_eq!(band_from_freq(Some(2412)), BandClass::Ghz2_4);
+        assert_eq!(band_from_freq(Some(5180)), BandClass::Ghz5);
+        assert_eq!(band_from_freq(Some(5975)), BandClass::Ghz6);
+        assert_eq!(band_from_freq(Some(1000)), BandClass::Unknown);
+    }
+
+    #[test]
+    fn select_sta_candidate_honors_lock_bssid() {
+        let plugin = NetworkNmPlugin::new();
+        let wifi = WifiIntent {
+            sta_ssid: "HotelWiFi".to_string(),
+            sta_lock_bssid: "AA:BB:CC:DD:EE:FF".to_string(),
+            ..WifiIntent::default()
+        };
+        let candidates = vec![
+            WifiStaCandidate {
+                bssid: "11:22:33:44:55:66".to_string(),
+                ssid: "HotelWiFi".to_string(),
+                signal_pct: 90,
+                freq_mhz: Some(5180),
+                band: BandClass::Ghz5,
+                active: false,
+            },
+            WifiStaCandidate {
+                bssid: "AA:BB:CC:DD:EE:FF".to_string(),
+                ssid: "HotelWiFi".to_string(),
+                signal_pct: 40,
+                freq_mhz: Some(2412),
+                band: BandClass::Ghz2_4,
+                active: false,
+            },
+        ];
+        let picked = plugin
+            .select_sta_candidate(&wifi, &candidates)
+            .expect("candidate selected");
+        assert_eq!(picked.bssid, "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn select_sta_candidate_prefers_performance_band() {
+        let plugin = NetworkNmPlugin::new();
+        let wifi = WifiIntent {
+            sta_ssid: "HotelWiFi".to_string(),
+            sta_selection_mode: StaSelectionMode::AutoPerformance,
+            ..WifiIntent::default()
+        };
+        let candidates = vec![
+            WifiStaCandidate {
+                bssid: "11:22:33:44:55:66".to_string(),
+                ssid: "HotelWiFi".to_string(),
+                signal_pct: 80,
+                freq_mhz: Some(2412),
+                band: BandClass::Ghz2_4,
+                active: false,
+            },
+            WifiStaCandidate {
+                bssid: "AA:BB:CC:DD:EE:FF".to_string(),
+                ssid: "HotelWiFi".to_string(),
+                signal_pct: 65,
+                freq_mhz: Some(5180),
+                band: BandClass::Ghz5,
+                active: false,
+            },
+        ];
+        let picked = plugin
+            .select_sta_candidate(&wifi, &candidates)
+            .expect("candidate selected");
+        assert_eq!(picked.bssid, "AA:BB:CC:DD:EE:FF");
     }
 
     #[test]
