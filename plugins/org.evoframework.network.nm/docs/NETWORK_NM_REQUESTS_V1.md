@@ -26,6 +26,9 @@ The plugin accepts/uses the tested `volumio-evo`-style fields:
 - `wifi.ifname`, `wifi.role` (`sta|ap|disabled`)
 - `wifi.sta_ssid`, `wifi.sta_open`
 - `wifi.sta_ipv4_mode`, `wifi.sta_ipv4_address`, `wifi.sta_ipv4_gateway`, `wifi.sta_ipv4_dns[]`
+- `wifi.sta_selection_mode` (`legacy|auto_stable|auto_performance|prefer_band|lock_bssid`)
+- `wifi.sta_preferred_band` (`2.4ghz|5ghz|6ghz`) for `prefer_band`
+- `wifi.sta_lock_bssid` (AA:BB:CC:DD:EE:FF)
 - `wifi.ap_ssid`, `wifi.ap_channel`, `wifi.ap_band` (`bg|a|6GHz`)
 - `fallback.hotspot_enabled`, `fallback.hotspot_connection_name`
 - `fallback.hotspot_ifname`, `fallback.hotspot_fallback`
@@ -131,6 +134,16 @@ rendering without parsing freeform text. Stable code list:
   "url": "http://connectivitycheck.gstatic.com/generate_204"
 }
 ```
+
+### `network.nm.scan` response notes
+
+`network.nm.scan` now returns:
+
+- `available`: de-duplicated SSID view (UI list)
+- `candidates`: BSSID-level records (`ssid`, `bssid`, `signal_pct`, `freq_mhz`, `band`, `active`)
+
+Use `candidates` when presenting advanced roaming/debug screens or when allowing
+operators to pin `sta_lock_bssid`.
 
 ### `network.nm.captive.submit`
 
