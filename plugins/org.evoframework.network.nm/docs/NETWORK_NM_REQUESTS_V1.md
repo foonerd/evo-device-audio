@@ -18,6 +18,8 @@ Operational procedures: `docs/NETWORK_NM_RUNBOOK.md`.
 - `network.nm.captive.complete`
 - `network.nm.security.status`
 - `network.nm.security.harden`
+- `network.nm.flight_mode.get`
+- `network.nm.flight_mode.set`
 
 ## Intent model parity notes
 
@@ -215,8 +217,45 @@ without parsing free-form step strings.
 - `domain_health.device_table`
 - `domain_health.general_status`
 - `domain_health.wifi_scan`
+- `domain_health.radio`
+
+Flight-mode/radio lock visibility:
+
+- `flight_mode.configured_enabled` (plugin-persisted Wi-Fi flight mode flag)
+- `flight_mode.wifi_blocked` (`true` when Wi-Fi is blocked by software or hardware)
+- `flight_mode.block_reason` (`software_blocked` or `hardware_or_bios_blocked`)
+- `flight_mode.blocked_intentional` (`true` when software block matches configured flight mode)
+- `flight_mode.radio.*` (`wifi_hw_enabled`, `wifi_enabled`, `wwan_hw_enabled`, `wwan_enabled`)
 
 This keeps the status endpoint responsive even when one subsystem is degraded.
+
+`network.nm.intent.apply` is radio-aware:
+
+- if Wi-Fi role is active and radio is blocked, apply returns `status = ok` with
+  `apply.ok = false` and warning steps (non-panic behavior for warden/UI flows)
+- operator/UI should unblock flight mode (or rfkill/BIOs toggle) and retry apply
+
+Startup behavior:
+
+- on plugin load, Wi-Fi radio is enforced to `on` unless configured flight mode is enabled
+- this avoids distro defaults leaving Wi-Fi soft-blocked unexpectedly on boot
+
+### Flight mode control (Wi-Fi only)
+
+This plugin exposes Wi-Fi flight mode as an explicit UI/warden control surface:
+
+- `network.nm.flight_mode.get`
+  - returns persisted `flight_mode.enabled`
+  - returns current radio snapshot (`wifi_hw_enabled`, `wifi_enabled`)
+- `network.nm.flight_mode.set`
+  - request body: `{ "enabled": true|false }`
+  - persists state in plugin storage
+  - applies immediate best-effort `nmcli radio wifi off|on`
+
+Notes:
+
+- `enabled=true` means Wi-Fi flight mode is active (Wi-Fi should remain off).
+- hardware/BIOs RF locks still dominate and may prevent enabling Wi-Fi.
 
 ## Minimal request examples
 
