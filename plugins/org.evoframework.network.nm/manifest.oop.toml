@@ -1,0 +1,49 @@
+[plugin]
+name = "org.evoframework.network.nm"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "networking.link"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.11-rc.1"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 10
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "network.nm.status",
+    "network.nm.scan",
+    "network.nm.intent.get",
+    "network.nm.intent.set",
+    "network.nm.intent.apply",
+    "network.nm.captive.status",
+    "network.nm.captive.start",
+    "network.nm.captive.submit",
+    "network.nm.captive.complete",
+]
+response_budget_ms = 15000
