@@ -49,6 +49,11 @@ Plugin config accepts optional reliability controls (either top-level or under `
 These controls govern how aggressively the plugin can replay captive credentials
 after drop/reboot/failure.
 
+Optional runtime guardrails:
+
+- `nmcli_timeout_ms` (default `8000`, minimum `100`)
+- `curl_timeout_ms` (default `30000`, minimum `100`)
+
 ## Durability naming convention
 
 Following steward conventions, this plugin uses:
