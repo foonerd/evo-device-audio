@@ -3,6 +3,8 @@
 `org.evoframework.network.nm` is a singleton respondent for the `networking.link`
 shelf. Payloads are UTF-8 JSON.
 
+Operational procedures: `docs/NETWORK_NM_RUNBOOK.md`.
+
 ## Request types
 
 - `network.nm.status`
