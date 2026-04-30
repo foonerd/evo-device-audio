@@ -124,6 +124,19 @@ Implementation note: captive/apply responses expose a machine-readable
 rendering without parsing freeform text. Stable code list:
 `docs/NOTICE_CODES.md`.
 
+## Observability contract
+
+All successful `network.nm.*` responses include:
+
+- `observability.request_type`
+- `observability.correlation_id`
+- `observability.requests_handled`
+- `observability.secret_encryption`
+- `observability.secret_encryption_required`
+
+These are intended for operator telemetry stitching (API, steward logs, UI traces)
+without parsing free-form step strings.
+
 ## Minimal request examples
 
 ### `network.nm.intent.set`
