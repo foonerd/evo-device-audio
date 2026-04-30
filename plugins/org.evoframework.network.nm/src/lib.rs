@@ -1554,7 +1554,7 @@ impl NetworkNmPlugin {
         &mut self,
         ifname: Option<&str>,
         refresh: bool,
-    ) -> Result<(Vec<ScanRow>, Vec<WifiStaCandidate>), PluginError> {
+    ) -> Result<(Vec<ScanRow>, Vec<WifiStaCandidate>, bool), PluginError> {
         let key = ifname.unwrap_or_default().trim().to_string();
         let ttl = self.config.scan_cache_ttl_ms;
         if !refresh && ttl > 0 {
@@ -1565,6 +1565,7 @@ impl NetworkNmPlugin {
                     return Ok((
                         cached.available.clone(),
                         cached.candidates.clone(),
+                        true,
                     ));
                 }
             }
@@ -1581,7 +1582,7 @@ impl NetworkNmPlugin {
                 },
             );
         }
-        Ok((available, candidates))
+        Ok((available, candidates, false))
     }
 
     fn select_sta_candidate(
@@ -2703,9 +2704,30 @@ impl Respondent for NetworkNmPlugin {
                     } else {
                         Some(ifname_trimmed.as_str())
                     };
-                    let (rows, candidates) = self
+                    let scan_cache_key =
+                        ifname.unwrap_or_default().trim().to_string();
+                    let scan_result = self
                         .wifi_scan_with_cache(ifname, scan_req.refresh)
-                        .await?;
+                        .await;
+                    let (rows, candidates, cache_hit, cache_stale, scan_error) =
+                        match scan_result {
+                            Ok((r, c, hit)) => (r, c, hit, false, None),
+                            Err(e) => {
+                                if let Some(cached) =
+                                    self.scan_cache.get(&scan_cache_key)
+                                {
+                                    (
+                                        cached.available.clone(),
+                                        cached.candidates.clone(),
+                                        true,
+                                        true,
+                                        Some(format!("{e}")),
+                                    )
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        };
                     Self::response_json(
                         req,
                         self.with_observability(
@@ -2715,6 +2737,12 @@ impl Respondent for NetworkNmPlugin {
                                 "status": "ok",
                                 "available": rows,
                                 "candidates": candidates,
+                                "cache": {
+                                    "hit": cache_hit,
+                                    "stale": cache_stale,
+                                    "refresh_requested": scan_req.refresh,
+                                },
+                                "scan_error": scan_error,
                             }),
                         ),
                     )
@@ -4308,6 +4336,66 @@ exit 0\n",
             nmcli_log.matches("BSSID,SSID,SIGNAL,FREQ,ACTIVE").count();
         assert_eq!(available_calls, 2);
         assert_eq!(candidate_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn request_flow_scan_returns_stale_cache_on_backend_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-scan-fail.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\necho scan-failed 1>&2\nexit 10\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.config.scan_cache_ttl_ms = 60000;
+        p.scan_cache.insert(
+            "wlan0".to_string(),
+            CachedScan {
+                available: vec![ScanRow {
+                    ssid: "HotelWiFi".to_string(),
+                    signal: 4,
+                    security: "wpa2".to_string(),
+                    active: true,
+                }],
+                candidates: vec![WifiStaCandidate {
+                    bssid: "AA:BB:CC:DD:EE:FF".to_string(),
+                    ssid: "HotelWiFi".to_string(),
+                    signal_pct: 80,
+                    freq_mhz: Some(5180),
+                    band: BandClass::Ghz5,
+                    active: true,
+                }],
+                captured_at: Instant::now(),
+            },
+        );
+
+        let scan_req = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "ifname": "wlan0", "refresh": true }),
+            1104,
+        );
+        let out = p.handle_request(&scan_req).await.expect("scan");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["cache"]["hit"], true);
+        assert_eq!(v["cache"]["stale"], true);
+        assert_eq!(v["available"][0]["ssid"], "HotelWiFi");
+        assert!(v["scan_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scan-failed"));
     }
 
     #[tokio::test]

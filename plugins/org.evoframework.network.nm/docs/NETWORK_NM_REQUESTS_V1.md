@@ -205,6 +205,12 @@ Request body accepts optional:
 - `ifname`
 - `refresh` (`true` bypasses cache even when `scan_cache_ttl_ms` is active)
 
+Response includes:
+
+- `cache.hit`
+- `cache.stale` (best-effort stale fallback when backend scan fails)
+- `scan_error` (present when stale fallback was used)
+
 ### `network.nm.captive.submit`
 
 ```json
