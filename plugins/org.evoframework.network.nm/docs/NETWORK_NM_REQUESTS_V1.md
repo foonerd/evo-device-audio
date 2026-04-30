@@ -58,6 +58,14 @@ Following steward conventions, this plugin uses:
 This mirrors the steward catalogue pattern (`catalogue.lkg.toml`, `<file>.tmp`) rather
 than a `.bak` suffix.
 
+State files are persisted in versioned envelopes with `schema_version`:
+
+- `network-intent.toml` -> `{ schema_version, intent }`
+- `captive-session.json` -> `{ schema_version, state }`
+
+Legacy flat payloads are still accepted on load and migrated in-memory, then the
+next save rewrites canonical envelope format.
+
 ## Operational scenario coverage
 
 Current apply/reconcile logic covers these branches:
