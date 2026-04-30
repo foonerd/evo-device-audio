@@ -2390,6 +2390,26 @@ impl NetworkNmPlugin {
         })?;
         Ok(Response::for_request(req, body))
     }
+
+    fn with_observability(
+        &self,
+        req: &Request,
+        mut value: serde_json::Value,
+    ) -> serde_json::Value {
+        if let serde_json::Value::Object(ref mut m) = value {
+            m.insert(
+                "observability".to_string(),
+                json!({
+                    "request_type": req.request_type,
+                    "correlation_id": req.correlation_id,
+                    "requests_handled": self.requests_handled,
+                    "secret_encryption": self.config.secret_key.is_some(),
+                    "secret_encryption_required": self.config.require_encrypted_secrets,
+                }),
+            );
+        }
+        value
+    }
 }
 
 impl Default for NetworkNmPlugin {
@@ -2512,18 +2532,15 @@ impl Respondent for NetworkNmPlugin {
                         .await
                         .err()
                         .map(|e| format!("{e:?}"));
-                    Self::response_json(
-                        req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "nmcli_path": self.config.nmcli_path,
-                            "general_status": general.map(|s| s.trim().to_string()),
-                            "devices": devices,
-                            "scan_ifname": scan_if,
-                            "wifi_scan_error": wifi_scan_error,
-                        }),
-                    )
+                    Self::response_json(req, self.with_observability(req, json!({
+                        "v": 1,
+                        "status": "ok",
+                        "nmcli_path": self.config.nmcli_path,
+                        "general_status": general.map(|s| s.trim().to_string()),
+                        "devices": devices,
+                        "scan_ifname": scan_if,
+                        "wifi_scan_error": wifi_scan_error,
+                    })))
                 }
                 REQUEST_NETWORK_SCAN => {
                     let scan_req = if req.payload.is_empty() {
@@ -2539,12 +2556,15 @@ impl Respondent for NetworkNmPlugin {
                     let candidates = self.wifi_scan_candidates(ifname).await?;
                     Self::response_json(
                         req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "available": rows,
-                            "candidates": candidates,
-                        }),
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "available": rows,
+                                "candidates": candidates,
+                            }),
+                        ),
                     )
                 }
                 REQUEST_NETWORK_INTENT_GET => {
@@ -2559,13 +2579,16 @@ impl Respondent for NetworkNmPlugin {
                         .is_some();
                     Self::response_json(
                         req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "intent": intent,
-                            "sta_psk_configured": sta_psk,
-                            "ap_psk_configured": ap_psk,
-                        }),
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "intent": intent,
+                                "sta_psk_configured": sta_psk,
+                                "ap_psk_configured": ap_psk,
+                            }),
+                        ),
                     )
                 }
                 REQUEST_NETWORK_INTENT_SET => {
@@ -2596,16 +2619,19 @@ impl Respondent for NetworkNmPlugin {
                     };
                     Self::response_json(
                         req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "saved": true,
-                            "apply": report,
-                            "notices": report
-                                .as_ref()
-                                .map(build_apply_notices)
-                                .unwrap_or_default(),
-                        }),
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "saved": true,
+                                "apply": report,
+                                "notices": report
+                                    .as_ref()
+                                    .map(build_apply_notices)
+                                    .unwrap_or_default(),
+                            }),
+                        ),
                     )
                 }
                 REQUEST_NETWORK_INTENT_APPLY => {
@@ -2632,12 +2658,15 @@ impl Respondent for NetworkNmPlugin {
                         .await?;
                     Self::response_json(
                         req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "apply": report,
-                            "notices": build_apply_notices(&report),
-                        }),
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "apply": report,
+                                "notices": build_apply_notices(&report),
+                            }),
+                        ),
                     )
                 }
                 REQUEST_NETWORK_CAPTIVE_STATUS => {
@@ -2663,24 +2692,21 @@ impl Respondent for NetworkNmPlugin {
                             }
                         }
                     }
-                    Self::response_json(
-                        req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "connectivity": connectivity,
-                            "captive": state,
-                            "notices": build_captive_notices(
-                                &state,
-                                connectivity.as_deref(),
-                            ),
-                            "reliability": {
-                                "credential_policy": self.config.captive.credential_policy,
-                                "retry_budget": self.config.captive.retry_budget,
-                                "replay_window_sec": self.config.captive.replay_window_sec,
-                            }
-                        }),
-                    )
+                    Self::response_json(req, self.with_observability(req, json!({
+                        "v": 1,
+                        "status": "ok",
+                        "connectivity": connectivity,
+                        "captive": state,
+                        "notices": build_captive_notices(
+                            &state,
+                            connectivity.as_deref(),
+                        ),
+                        "reliability": {
+                            "credential_policy": self.config.captive.credential_policy,
+                            "retry_budget": self.config.captive.retry_budget,
+                            "replay_window_sec": self.config.captive.replay_window_sec,
+                        }
+                    })))
                 }
                 REQUEST_NETWORK_CAPTIVE_START => {
                     let body = if req.payload.is_empty() {
@@ -2694,40 +2720,34 @@ impl Respondent for NetworkNmPlugin {
                         state.phase = CaptivePhase::AwaitingCredentials;
                     }
                     self.save_captive_state(&state).await?;
-                    Self::response_json(
-                        req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "captive": state,
-                            "notices": build_captive_notices(&state, None),
-                            "reliability": {
-                                "credential_policy": self.config.captive.credential_policy,
-                                "retry_budget": self.config.captive.retry_budget,
-                                "replay_window_sec": self.config.captive.replay_window_sec,
-                            }
-                        }),
-                    )
+                    Self::response_json(req, self.with_observability(req, json!({
+                        "v": 1,
+                        "status": "ok",
+                        "captive": state,
+                        "notices": build_captive_notices(&state, None),
+                        "reliability": {
+                            "credential_policy": self.config.captive.credential_policy,
+                            "retry_budget": self.config.captive.retry_budget,
+                            "replay_window_sec": self.config.captive.replay_window_sec,
+                        }
+                    })))
                 }
                 REQUEST_NETWORK_CAPTIVE_SUBMIT => {
                     let body =
                         Self::parse_request_json::<CaptiveSubmitRequest>(req)?;
                     let state = self.captive_submit(&body).await?;
                     self.save_captive_state(&state).await?;
-                    Self::response_json(
-                        req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "captive": state,
-                            "notices": build_captive_notices(&state, None),
-                            "reliability": {
-                                "credential_policy": self.config.captive.credential_policy,
-                                "retry_budget": self.config.captive.retry_budget,
-                                "replay_window_sec": self.config.captive.replay_window_sec,
-                            }
-                        }),
-                    )
+                    Self::response_json(req, self.with_observability(req, json!({
+                        "v": 1,
+                        "status": "ok",
+                        "captive": state,
+                        "notices": build_captive_notices(&state, None),
+                        "reliability": {
+                            "credential_policy": self.config.captive.credential_policy,
+                            "retry_budget": self.config.captive.retry_budget,
+                            "replay_window_sec": self.config.captive.replay_window_sec,
+                        }
+                    })))
                 }
                 REQUEST_NETWORK_CAPTIVE_COMPLETE => {
                     let body = if req.payload.is_empty() {
@@ -2753,20 +2773,17 @@ impl Respondent for NetworkNmPlugin {
                         }
                     }
                     self.save_captive_state(&state).await?;
-                    Self::response_json(
-                        req,
-                        json!({
-                            "v": 1,
-                            "status": "ok",
-                            "captive": state,
-                            "notices": build_captive_notices(&state, None),
-                            "reliability": {
-                                "credential_policy": self.config.captive.credential_policy,
-                                "retry_budget": self.config.captive.retry_budget,
-                                "replay_window_sec": self.config.captive.replay_window_sec,
-                            }
-                        }),
-                    )
+                    Self::response_json(req, self.with_observability(req, json!({
+                        "v": 1,
+                        "status": "ok",
+                        "captive": state,
+                        "notices": build_captive_notices(&state, None),
+                        "reliability": {
+                            "credential_policy": self.config.captive.credential_policy,
+                            "retry_budget": self.config.captive.retry_budget,
+                            "replay_window_sec": self.config.captive.replay_window_sec,
+                        }
+                    })))
                 }
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type: {:?}",
@@ -3869,6 +3886,11 @@ version = 1
             serde_json::from_slice(&set_out.payload).expect("json");
         assert_eq!(set_v["status"], "ok");
         assert_eq!(set_v["saved"], true);
+        assert_eq!(
+            set_v["observability"]["request_type"],
+            REQUEST_NETWORK_INTENT_SET
+        );
+        assert_eq!(set_v["observability"]["correlation_id"], 1001);
 
         let get_req =
             req(REQUEST_NETWORK_INTENT_GET, serde_json::json!({}), 1002);
@@ -3879,6 +3901,11 @@ version = 1
         assert_eq!(get_v["sta_psk_configured"], true);
         assert_eq!(get_v["ap_psk_configured"], true);
         assert_eq!(get_v["intent"]["wifi"]["sta_ssid"], "HotelWiFi");
+        assert_eq!(
+            get_v["observability"]["request_type"],
+            REQUEST_NETWORK_INTENT_GET
+        );
+        assert_eq!(get_v["observability"]["correlation_id"], 1002);
 
         let sta_psk_raw =
             tokio::fs::read_to_string(p.sta_psk_path().expect("path"))
@@ -3952,6 +3979,11 @@ exit 0\n",
             serde_json::from_slice(&apply_out.payload).expect("json");
         assert_eq!(apply_v["status"], "ok");
         assert_eq!(apply_v["apply"]["ok"], true);
+        assert_eq!(
+            apply_v["observability"]["request_type"],
+            REQUEST_NETWORK_INTENT_APPLY
+        );
+        assert_eq!(apply_v["observability"]["correlation_id"], 1003);
         assert!(apply_v["notices"]
             .as_array()
             .expect("notices")
