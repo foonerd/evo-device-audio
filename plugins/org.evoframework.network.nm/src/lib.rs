@@ -20,11 +20,15 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+use std::fs::Permissions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -33,7 +37,13 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Embedded plugin manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -54,6 +64,11 @@ const REQUEST_NETWORK_CAPTIVE_COMPLETE: &str = "network.nm.captive.complete";
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
 const NM_CON_HOTSPOT_DEFAULT: &str = "volumio-hotspot";
+const SECRET_FILE_MODE: u32 = 0o600;
+const SECRET_SCHEMA_VERSION: u32 = 1;
+const SECRET_CIPHER_XCHACHA20POLY1305: &str = "xchacha20poly1305";
+const ENV_SECRET_KEY: &str = "EVO_NETWORK_SECRET_KEY";
+const ENV_SECRET_REQUIRE: &str = "EVO_NETWORK_SECRET_REQUIRE";
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -71,6 +86,8 @@ struct PluginConfig {
     nmcli_path: String,
     default_wifi_iface: String,
     captive: CaptiveConfig,
+    secret_key: Option<[u8; 32]>,
+    require_encrypted_secrets: bool,
 }
 
 #[derive(
@@ -103,10 +120,24 @@ impl Default for CaptiveConfig {
 
 impl PluginConfig {
     fn defaults() -> Self {
+        let env_key = std::env::var(ENV_SECRET_KEY)
+            .ok()
+            .map(|v| derive_secret_key(v.trim()));
+        let require_encrypted_secrets = std::env::var(ENV_SECRET_REQUIRE)
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Self {
             nmcli_path: "/usr/bin/nmcli".to_string(),
             default_wifi_iface: "wlan0".to_string(),
             captive: CaptiveConfig::default(),
+            secret_key: env_key,
+            require_encrypted_secrets,
         }
     }
 
@@ -177,6 +208,16 @@ impl PluginConfig {
                 ));
             }
             out.captive.replay_window_sec = v as u64;
+        }
+        let secrets_table = table
+            .get("secrets")
+            .and_then(|v| v.as_table())
+            .unwrap_or(table);
+        if let Some(v) = secrets_table
+            .get("require_encrypted")
+            .and_then(|v| v.as_bool())
+        {
+            out.require_encrypted_secrets = v;
         }
         Ok(out)
     }
@@ -396,6 +437,101 @@ fn tmp_shadow_path(path: &Path) -> PathBuf {
             .unwrap_or_else(|| "state".to_string());
         path.with_file_name(format!("{base}.tmp"))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretEnvelope {
+    #[serde(default = "default_secret_schema_version")]
+    schema_version: u32,
+    cipher: String,
+    nonce_b64: String,
+    ciphertext_b64: String,
+}
+
+fn default_secret_schema_version() -> u32 {
+    SECRET_SCHEMA_VERSION
+}
+
+fn derive_secret_key(raw: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"org.evoframework.network.nm:secret-key:v1:");
+    hasher.update(raw.trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest[..32]);
+    key
+}
+
+fn encrypt_secret_value(
+    plain: &str,
+    key: &[u8; 32],
+) -> Result<SecretEnvelope, PluginError> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce = [0u8; 24];
+    getrandom::fill(&mut nonce).map_err(|e| {
+        PluginError::Permanent(format!("cannot generate secret nonce: {e}"))
+    })?;
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), plain.trim().as_bytes())
+        .map_err(|e| {
+            PluginError::Permanent(format!("cannot encrypt secret value: {e}"))
+        })?;
+    Ok(SecretEnvelope {
+        schema_version: SECRET_SCHEMA_VERSION,
+        cipher: SECRET_CIPHER_XCHACHA20POLY1305.to_string(),
+        nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
+        ciphertext_b64: base64::engine::general_purpose::STANDARD
+            .encode(ciphertext),
+    })
+}
+
+fn decrypt_secret_value(
+    env: &SecretEnvelope,
+    key: &[u8; 32],
+) -> Result<String, PluginError> {
+    if env.schema_version != SECRET_SCHEMA_VERSION {
+        return Err(PluginError::Permanent(format!(
+            "unsupported secret schema_version {}",
+            env.schema_version
+        )));
+    }
+    if env.cipher.trim() != SECRET_CIPHER_XCHACHA20POLY1305 {
+        return Err(PluginError::Permanent(format!(
+            "unsupported secret cipher {}",
+            env.cipher
+        )));
+    }
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(env.nonce_b64.trim())
+        .map_err(|e| {
+            PluginError::Permanent(format!(
+                "invalid secret nonce encoding: {e}"
+            ))
+        })?;
+    if nonce.len() != 24 {
+        return Err(PluginError::Permanent(format!(
+            "invalid secret nonce length {}",
+            nonce.len()
+        )));
+    }
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(env.ciphertext_b64.trim())
+        .map_err(|e| {
+            PluginError::Permanent(format!(
+                "invalid secret ciphertext encoding: {e}"
+            ))
+        })?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let plain = cipher
+        .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|e| {
+            PluginError::Permanent(format!("cannot decrypt secret value: {e}"))
+        })?;
+    let value = String::from_utf8(plain).map_err(|e| {
+        PluginError::Permanent(format!("secret payload is not UTF-8: {e}"))
+    })?;
+    Ok(value.trim().to_string())
 }
 
 fn migrate_intent_state(
@@ -1031,13 +1167,103 @@ impl NetworkNmPlugin {
         self.write_text_atomic_with_lkg(&path, &text).await
     }
 
-    async fn read_optional_secret(path: &Path) -> Option<String> {
-        let raw = tokio::fs::read_to_string(path).await.ok()?;
+    async fn write_secret_bytes_atomic(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), PluginError> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                PluginError::Permanent(format!(
+                    "cannot create parent {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+        let tmp = tmp_shadow_path(path);
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(SECRET_FILE_MODE);
+        let mut f = opts.open(&tmp).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "cannot open {}: {}",
+                tmp.display(),
+                e
+            ))
+        })?;
+        f.write_all(bytes).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "cannot write {}: {}",
+                tmp.display(),
+                e
+            ))
+        })?;
+        f.flush().await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "cannot flush {}: {}",
+                tmp.display(),
+                e
+            ))
+        })?;
+        f.sync_all().await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "cannot sync {}: {}",
+                tmp.display(),
+                e
+            ))
+        })?;
+        drop(f);
+        tokio::fs::rename(&tmp, path).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "cannot rename {} -> {}: {}",
+                tmp.display(),
+                path.display(),
+                e
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            let perms = Permissions::from_mode(SECRET_FILE_MODE);
+            let _ = tokio::fs::set_permissions(path, perms).await;
+        }
+        Ok(())
+    }
+
+    async fn read_optional_secret(
+        &self,
+        path: &Path,
+    ) -> Result<Option<String>, PluginError> {
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
         let t = raw.trim();
         if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
+            return Ok(None);
+        }
+        match serde_json::from_str::<SecretEnvelope>(t) {
+            Ok(env) => {
+                let key = self.config.secret_key.as_ref().ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "encrypted secret {} requires {}",
+                        path.display(),
+                        ENV_SECRET_KEY
+                    ))
+                })?;
+                let plain = decrypt_secret_value(&env, key)?;
+                Ok(Some(plain))
+            }
+            Err(_) => {
+                if self.config.require_encrypted_secrets {
+                    return Err(PluginError::Permanent(format!(
+                        "plaintext secret {} rejected; encrypted secrets required",
+                        path.display()
+                    )));
+                }
+                Ok(Some(t.to_string()))
+            }
         }
     }
 
@@ -1048,16 +1274,24 @@ impl NetworkNmPlugin {
     ) -> Result<(), PluginError> {
         match value.map(str::trim) {
             Some(v) if !v.is_empty() => {
-                tokio::fs::write(&path, format!("{v}\n")).await.map_err(
-                    |e| {
+                let payload = if let Some(key) = self.config.secret_key.as_ref()
+                {
+                    let envelope = encrypt_secret_value(v, key)?;
+                    serde_json::to_vec_pretty(&envelope).map_err(|e| {
                         PluginError::Permanent(format!(
-                            "cannot write {}: {}",
-                            path.display(),
-                            e
+                            "cannot serialize encrypted secret envelope: {e}"
                         ))
-                    },
-                )?;
-                Ok(())
+                    })?
+                } else {
+                    if self.config.require_encrypted_secrets {
+                        return Err(PluginError::Permanent(format!(
+                            "{} required by {} but key is missing",
+                            ENV_SECRET_KEY, ENV_SECRET_REQUIRE
+                        )));
+                    }
+                    format!("{v}\n").into_bytes()
+                };
+                self.write_secret_bytes_atomic(&path, &payload).await
             }
             _ => {
                 if tokio::fs::metadata(&path).await.is_ok() {
@@ -2210,8 +2444,19 @@ impl Plugin for NetworkNmPlugin {
                 plugin = PLUGIN_NAME,
                 nmcli = %self.config.nmcli_path,
                 wifi_iface = %self.config.default_wifi_iface,
+                secret_encryption = self.config.secret_key.is_some(),
+                secret_encryption_required = self.config.require_encrypted_secrets,
                 "network plugin loaded"
             );
+            if self.config.require_encrypted_secrets
+                && self.config.secret_key.is_none()
+            {
+                tracing::error!(
+                    plugin = PLUGIN_NAME,
+                    env = ENV_SECRET_KEY,
+                    "encrypted secrets required but no key is configured"
+                );
+            }
             Ok(())
         }
     }
@@ -2304,14 +2549,14 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_INTENT_GET => {
                     let intent = self.load_intent().await?;
-                    let sta_psk =
-                        Self::read_optional_secret(&self.sta_psk_path()?)
-                            .await
-                            .is_some();
-                    let ap_psk =
-                        Self::read_optional_secret(&self.ap_psk_path()?)
-                            .await
-                            .is_some();
+                    let sta_psk = self
+                        .read_optional_secret(&self.sta_psk_path()?)
+                        .await?
+                        .is_some();
+                    let ap_psk = self
+                        .read_optional_secret(&self.ap_psk_path()?)
+                        .await?
+                        .is_some();
                     Self::response_json(
                         req,
                         json!({
@@ -2373,10 +2618,11 @@ impl Respondent for NetworkNmPlugin {
                         Some(v) => v,
                         None => self.load_intent().await?,
                     };
-                    let sta_psk =
-                        Self::read_optional_secret(&self.sta_psk_path()?).await;
+                    let sta_psk = self
+                        .read_optional_secret(&self.sta_psk_path()?)
+                        .await?;
                     let ap_psk =
-                        Self::read_optional_secret(&self.ap_psk_path()?).await;
+                        self.read_optional_secret(&self.ap_psk_path()?).await?;
                     let report = self
                         .apply_intent(
                             &intent,
@@ -3334,6 +3580,9 @@ wifi_iface = "wlan1"
 credential_policy = "single_use_ticket"
 retry_budget = 1
 replay_window_sec = 120
+
+[secrets]
+require_encrypted = true
 "#,
         )
         .expect("toml parses");
@@ -3345,6 +3594,7 @@ replay_window_sec = 120
         );
         assert_eq!(cfg.captive.retry_budget, 1);
         assert_eq!(cfg.captive.replay_window_sec, 120);
+        assert!(cfg.require_encrypted_secrets);
     }
 
     #[test]
@@ -3521,5 +3771,55 @@ version = 1
                 .expect("read captive");
         assert!(captive_raw.contains("\"schema_version\": 1"));
         assert!(captive_raw.contains("\"state\""));
+    }
+
+    #[test]
+    fn secret_crypto_roundtrip() {
+        let key = derive_secret_key("test-key-material");
+        let env = encrypt_secret_value("AbC123xY", &key).expect("encrypt");
+        let plain = decrypt_secret_value(&env, &key).expect("decrypt");
+        assert_eq!(plain, "AbC123xY");
+    }
+
+    #[tokio::test]
+    async fn write_secret_encrypts_when_key_configured() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config.secret_key = Some(derive_secret_key("test-key"));
+        p.write_optional_secret(
+            p.sta_psk_path().expect("path"),
+            Some("SeCrEt9"),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read_to_string(p.sta_psk_path().expect("path"))
+            .await
+            .expect("read");
+        assert!(raw.contains("\"schema_version\": 1"));
+        let decoded = p
+            .read_optional_secret(&p.sta_psk_path().expect("path"))
+            .await
+            .expect("decode");
+        assert_eq!(decoded.as_deref(), Some("SeCrEt9"));
+    }
+
+    #[tokio::test]
+    async fn read_plaintext_secret_rejected_when_encryption_required() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config.require_encrypted_secrets = true;
+        let path = p.sta_psk_path().expect("path");
+        tokio::fs::write(&path, "plainsecret\n")
+            .await
+            .expect("write");
+
+        let err = p
+            .read_optional_secret(&path)
+            .await
+            .expect_err("must reject plaintext");
+        assert!(format!("{err}").contains("plaintext secret"));
     }
 }
