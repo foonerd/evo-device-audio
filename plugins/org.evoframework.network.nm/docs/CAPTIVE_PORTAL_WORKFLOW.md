@@ -84,6 +84,7 @@ but a UI/browser layer must collect dynamic form structure and user actions.
 - Poll `network.nm.captive.status` until connectivity is `full` or phase is `authenticated`.
 - If plugin returns `failed`, show `captive.last_error` and allow retry/edit.
 - When `captive.requires_user_confirmation=true`, UI must require explicit user/operator action before retry.
+- Render backend-provided `actions[]` (for example `captive.confirm_replay`) as the primary UI action model, instead of inferring behavior from free-form text.
 
 ## Toast/status notification guidance
 

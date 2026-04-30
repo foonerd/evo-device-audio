@@ -124,6 +124,12 @@ Implementation note: captive/apply responses expose a machine-readable
 rendering without parsing freeform text. Stable code list:
 `docs/NOTICE_CODES.md`.
 
+Captive responses also expose `actions` for explicit UI affordances. Current IDs:
+
+- `captive.start_probe`
+- `captive.confirm_replay` (present when guarded replay confirmation is required)
+- `captive.mark_complete_failed` (present during failed captive state)
+
 ## Observability contract
 
 All successful `network.nm.*` responses include:

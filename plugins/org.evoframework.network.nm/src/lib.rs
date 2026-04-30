@@ -2701,6 +2701,7 @@ impl Respondent for NetworkNmPlugin {
                             &state,
                             connectivity.as_deref(),
                         ),
+                        "actions": build_captive_actions(&state),
                         "reliability": {
                             "credential_policy": self.config.captive.credential_policy,
                             "retry_budget": self.config.captive.retry_budget,
@@ -2725,6 +2726,7 @@ impl Respondent for NetworkNmPlugin {
                         "status": "ok",
                         "captive": state,
                         "notices": build_captive_notices(&state, None),
+                        "actions": build_captive_actions(&state),
                         "reliability": {
                             "credential_policy": self.config.captive.credential_policy,
                             "retry_budget": self.config.captive.retry_budget,
@@ -2742,6 +2744,7 @@ impl Respondent for NetworkNmPlugin {
                         "status": "ok",
                         "captive": state,
                         "notices": build_captive_notices(&state, None),
+                        "actions": build_captive_actions(&state),
                         "reliability": {
                             "credential_policy": self.config.captive.credential_policy,
                             "retry_budget": self.config.captive.retry_budget,
@@ -2778,6 +2781,7 @@ impl Respondent for NetworkNmPlugin {
                         "status": "ok",
                         "captive": state,
                         "notices": build_captive_notices(&state, None),
+                        "actions": build_captive_actions(&state),
                         "reliability": {
                             "credential_policy": self.config.captive.credential_policy,
                             "retry_budget": self.config.captive.retry_budget,
@@ -2906,6 +2910,36 @@ fn build_captive_notices(
         _ => {}
     }
     out
+}
+
+fn build_captive_actions(
+    state: &CaptiveSessionState,
+) -> Vec<serde_json::Value> {
+    let mut actions = Vec::new();
+    actions.push(json!({
+        "id": "captive.start_probe",
+        "label": "Probe captive connectivity",
+        "request_type": REQUEST_NETWORK_CAPTIVE_START,
+    }));
+    if matches!(state.phase, CaptivePhase::AwaitingCredentials)
+        && state.requires_user_confirmation
+    {
+        actions.push(json!({
+            "id": "captive.confirm_replay",
+            "label": "Confirm guarded credential replay",
+            "request_type": REQUEST_NETWORK_CAPTIVE_SUBMIT,
+            "payload_patch": { "confirm_replay": true },
+        }));
+    }
+    if matches!(state.phase, CaptivePhase::Failed) {
+        actions.push(json!({
+            "id": "captive.mark_complete_failed",
+            "label": "Mark captive flow failed",
+            "request_type": REQUEST_NETWORK_CAPTIVE_COMPLETE,
+            "payload_patch": { "success": false },
+        }));
+    }
+    actions
 }
 
 fn unix_epoch_seconds() -> u64 {
@@ -3649,6 +3683,17 @@ require_encrypted = true
         assert!(notices
             .iter()
             .any(|n| n["code"] == "captive_confirmation_required"));
+    }
+
+    #[test]
+    fn build_captive_actions_includes_guarded_replay_action() {
+        let s = CaptiveSessionState {
+            phase: CaptivePhase::AwaitingCredentials,
+            requires_user_confirmation: true,
+            ..Default::default()
+        };
+        let actions = build_captive_actions(&s);
+        assert!(actions.iter().any(|a| a["id"] == "captive.confirm_replay"));
     }
 
     #[test]
