@@ -15,6 +15,7 @@
 //! Request/response contracts and scenario coverage live under:
 //! - `docs/NETWORK_NM_REQUESTS_V1.md`
 //! - `docs/CAPTIVE_PORTAL_WORKFLOW.md`
+//! - `docs/NETWORK_NM_RUNBOOK.md`
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
