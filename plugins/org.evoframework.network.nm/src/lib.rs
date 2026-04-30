@@ -3248,7 +3248,10 @@ fn signal_bars_from_pct(pct: Option<u8>) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evo_plugin_sdk::contract::HealthStatus;
+    use evo_plugin_sdk::contract::{HealthStatus, Request};
+    use serde_json::Value;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn manifest_parses() {
@@ -3821,5 +3824,143 @@ version = 1
             .await
             .expect_err("must reject plaintext");
         assert!(format!("{err}").contains("plaintext secret"));
+    }
+
+    fn req(
+        request_type: &str,
+        payload: serde_json::Value,
+        correlation_id: u64,
+    ) -> Request {
+        Request {
+            request_type: request_type.to_string(),
+            payload: serde_json::to_vec(&payload).expect("payload"),
+            correlation_id,
+            deadline: None,
+            instance_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_flow_intent_set_and_get_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.secret_key = Some(derive_secret_key("integration-key"));
+
+        let set_req = req(
+            REQUEST_NETWORK_INTENT_SET,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "sta", "ifname": "wlan0", "sta_ssid": "HotelWiFi", "sta_open": false },
+                    "fallback": { "hotspot_enabled": false }
+                },
+                "sta_psk": "AbC123xY",
+                "ap_psk": "HotspotPass9",
+                "apply": false
+            }),
+            1001,
+        );
+        let set_out = p.handle_request(&set_req).await.expect("intent.set");
+        let set_v: Value =
+            serde_json::from_slice(&set_out.payload).expect("json");
+        assert_eq!(set_v["status"], "ok");
+        assert_eq!(set_v["saved"], true);
+
+        let get_req =
+            req(REQUEST_NETWORK_INTENT_GET, serde_json::json!({}), 1002);
+        let get_out = p.handle_request(&get_req).await.expect("intent.get");
+        let get_v: Value =
+            serde_json::from_slice(&get_out.payload).expect("json");
+        assert_eq!(get_v["status"], "ok");
+        assert_eq!(get_v["sta_psk_configured"], true);
+        assert_eq!(get_v["ap_psk_configured"], true);
+        assert_eq!(get_v["intent"]["wifi"]["sta_ssid"], "HotelWiFi");
+
+        let sta_psk_raw =
+            tokio::fs::read_to_string(p.sta_psk_path().expect("path"))
+                .await
+                .expect("read sta secret");
+        assert!(sta_psk_raw.contains("\"cipher\": \"xchacha20poly1305\""));
+    }
+
+    #[tokio::test]
+    async fn request_flow_apply_works_with_mock_nmcli() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock.sh");
+        let nmcli_log_path = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{}\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"DEVICE,TYPE,STATE,CONNECTION\" && \"$4\" == \"device\" ]]; then\n\
+  echo \"wlan0:wifi:connected:evo-network-wifi-sta\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo \"connected\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"SSID,SIGNAL,SECURITY,ACTIVE\" ]]; then\n\
+  echo \"HotelWiFi:80:WPA2:yes\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"BSSID,SSID,SIGNAL,FREQ,ACTIVE\" ]]; then\n\
+  echo \"AA:BB:CC:DD:EE:FF:HotelWiFi:80:5180:yes\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                nmcli_log_path.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+
+        let apply_req = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "disabled", "ifname": "wlan0" },
+                    "fallback": { "hotspot_enabled": false }
+                }
+            }),
+            1003,
+        );
+        let apply_out =
+            p.handle_request(&apply_req).await.expect("intent.apply");
+        let apply_v: Value =
+            serde_json::from_slice(&apply_out.payload).expect("json");
+        assert_eq!(apply_v["status"], "ok");
+        assert_eq!(apply_v["apply"]["ok"], true);
+        assert!(apply_v["notices"]
+            .as_array()
+            .expect("notices")
+            .iter()
+            .any(|n| n["code"] == "network_apply_ok"));
+
+        let nmcli_log = tokio::fs::read_to_string(&nmcli_log_path)
+            .await
+            .expect("nmcli log");
+        assert!(nmcli_log.contains("connection down evo-network-wifi-sta"));
     }
 }
