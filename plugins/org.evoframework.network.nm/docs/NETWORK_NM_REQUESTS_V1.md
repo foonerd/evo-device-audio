@@ -53,6 +53,7 @@ Optional runtime guardrails:
 
 - `nmcli_timeout_ms` (default `8000`, minimum `100`)
 - `curl_timeout_ms` (default `30000`, minimum `100`)
+- `scan_cache_ttl_ms` (default `3000`, set `0` to disable cache)
 
 ## Durability naming convention
 
@@ -198,6 +199,11 @@ This keeps the status endpoint responsive even when one subsystem is degraded.
 
 Use `candidates` when presenting advanced roaming/debug screens or when allowing
 operators to pin `sta_lock_bssid`.
+
+Request body accepts optional:
+
+- `ifname`
+- `refresh` (`true` bypasses cache even when `scan_cache_ttl_ms` is active)
 
 ### `network.nm.captive.submit`
 

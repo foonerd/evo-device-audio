@@ -21,11 +21,12 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+use std::collections::HashMap;
 use std::fs::Permissions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -91,6 +92,7 @@ struct PluginConfig {
     require_encrypted_secrets: bool,
     nmcli_timeout_ms: u64,
     curl_timeout_ms: u64,
+    scan_cache_ttl_ms: u64,
 }
 
 #[derive(
@@ -143,6 +145,7 @@ impl PluginConfig {
             require_encrypted_secrets,
             nmcli_timeout_ms: 8000,
             curl_timeout_ms: 30000,
+            scan_cache_ttl_ms: 3000,
         }
     }
 
@@ -185,6 +188,16 @@ impl PluginConfig {
                 ));
             }
             out.curl_timeout_ms = v as u64;
+        }
+        if let Some(v) =
+            table.get("scan_cache_ttl_ms").and_then(|v| v.as_integer())
+        {
+            if v < 0 {
+                return Err(PluginError::Permanent(
+                    "scan_cache_ttl_ms must be >= 0".to_string(),
+                ));
+            }
+            out.scan_cache_ttl_ms = v as u64;
         }
         let captive_table = table
             .get("captive")
@@ -646,7 +659,7 @@ struct DeviceRow {
     connection: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ScanRow {
     ssid: String,
     signal: u8,
@@ -675,7 +688,17 @@ struct WifiStaCandidate {
 
 #[derive(Debug, Deserialize)]
 struct ScanRequest {
+    #[serde(default)]
     ifname: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedScan {
+    available: Vec<ScanRow>,
+    candidates: Vec<WifiStaCandidate>,
+    captured_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,6 +833,7 @@ pub struct NetworkNmPlugin {
     config: PluginConfig,
     state_dir: Option<PathBuf>,
     requests_handled: u64,
+    scan_cache: HashMap<String, CachedScan>,
 }
 
 impl NetworkNmPlugin {
@@ -820,6 +844,7 @@ impl NetworkNmPlugin {
             config: PluginConfig::defaults(),
             state_dir: None,
             requests_handled: 0,
+            scan_cache: HashMap::new(),
         }
     }
 
@@ -1523,6 +1548,40 @@ impl NetworkNmPlugin {
             });
         }
         Ok(out)
+    }
+
+    async fn wifi_scan_with_cache(
+        &mut self,
+        ifname: Option<&str>,
+        refresh: bool,
+    ) -> Result<(Vec<ScanRow>, Vec<WifiStaCandidate>), PluginError> {
+        let key = ifname.unwrap_or_default().trim().to_string();
+        let ttl = self.config.scan_cache_ttl_ms;
+        if !refresh && ttl > 0 {
+            if let Some(cached) = self.scan_cache.get(&key) {
+                if cached.captured_at.elapsed()
+                    <= Duration::from_millis(self.config.scan_cache_ttl_ms)
+                {
+                    return Ok((
+                        cached.available.clone(),
+                        cached.candidates.clone(),
+                    ));
+                }
+            }
+        }
+        let available = self.wifi_scan(ifname).await?;
+        let candidates = self.wifi_scan_candidates(ifname).await?;
+        if ttl > 0 {
+            self.scan_cache.insert(
+                key,
+                CachedScan {
+                    available: available.clone(),
+                    candidates: candidates.clone(),
+                    captured_at: Instant::now(),
+                },
+            );
+        }
+        Ok((available, candidates))
     }
 
     fn select_sta_candidate(
@@ -2505,12 +2564,14 @@ impl Plugin for NetworkNmPlugin {
             self.config = PluginConfig::from_toml_table(&ctx.config)?;
             self.state_dir = Some(ctx.state_dir.clone());
             self.loaded = true;
+            self.scan_cache.clear();
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 nmcli = %self.config.nmcli_path,
                 wifi_iface = %self.config.default_wifi_iface,
                 nmcli_timeout_ms = self.config.nmcli_timeout_ms,
                 curl_timeout_ms = self.config.curl_timeout_ms,
+                scan_cache_ttl_ms = self.config.scan_cache_ttl_ms,
                 secret_encryption = self.config.secret_key.is_some(),
                 secret_encryption_required = self.config.require_encrypted_secrets,
                 "network plugin loaded"
@@ -2535,6 +2596,7 @@ impl Plugin for NetworkNmPlugin {
             self.loaded = false;
             self.state_dir = None;
             self.config = PluginConfig::defaults();
+            self.scan_cache.clear();
             Ok(())
         }
     }
@@ -2625,16 +2687,25 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_SCAN => {
                     let scan_req = if req.payload.is_empty() {
-                        ScanRequest { ifname: None }
+                        ScanRequest {
+                            ifname: None,
+                            refresh: false,
+                        }
                     } else {
                         Self::parse_request_json::<ScanRequest>(req)?
                     };
-                    let ifname = scan_req
-                        .ifname
-                        .as_deref()
-                        .or(Some(self.config.default_wifi_iface.as_str()));
-                    let rows = self.wifi_scan(ifname).await?;
-                    let candidates = self.wifi_scan_candidates(ifname).await?;
+                    let ifname_owned = scan_req.ifname.unwrap_or_else(|| {
+                        self.config.default_wifi_iface.clone()
+                    });
+                    let ifname_trimmed = ifname_owned.trim().to_string();
+                    let ifname = if ifname_trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(ifname_trimmed.as_str())
+                    };
+                    let (rows, candidates) = self
+                        .wifi_scan_with_cache(ifname, scan_req.refresh)
+                        .await?;
                     Self::response_json(
                         req,
                         self.with_observability(
@@ -2675,6 +2746,7 @@ impl Respondent for NetworkNmPlugin {
                 REQUEST_NETWORK_INTENT_SET => {
                     let body =
                         Self::parse_request_json::<IntentSetRequest>(req)?;
+                    self.scan_cache.clear();
                     self.save_intent(&body.intent).await?;
                     self.write_optional_secret(
                         self.sta_psk_path()?,
@@ -2737,6 +2809,7 @@ impl Respondent for NetworkNmPlugin {
                             ap_psk.as_deref(),
                         )
                         .await?;
+                    self.scan_cache.clear();
                     Self::response_json(
                         req,
                         self.with_observability(
@@ -3712,6 +3785,7 @@ nmcli_path = "/usr/bin/nmcli"
 wifi_iface = "wlan1"
 nmcli_timeout_ms = 12000
 curl_timeout_ms = 45000
+scan_cache_ttl_ms = 6000
 
 [captive]
 credential_policy = "single_use_ticket"
@@ -3734,6 +3808,7 @@ require_encrypted = true
         assert!(cfg.require_encrypted_secrets);
         assert_eq!(cfg.nmcli_timeout_ms, 12000);
         assert_eq!(cfg.curl_timeout_ms, 45000);
+        assert_eq!(cfg.scan_cache_ttl_ms, 6000);
     }
 
     #[test]
@@ -4174,6 +4249,65 @@ exit 0\n",
         assert_eq!(status_v["degraded"], true);
         assert_eq!(status_v["domain_health"]["device_table"]["ok"], false);
         assert_eq!(status_v["domain_health"]["general_status"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn request_flow_scan_uses_cache_until_refresh_requested() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-scan-cache.sh");
+        let nmcli_log_path = dir.path().join("nmcli-cache.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{}\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"SSID,SIGNAL,SECURITY,ACTIVE\" ]]; then\n\
+  echo \"HotelWiFi:80:WPA2:yes\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"BSSID,SSID,SIGNAL,FREQ,ACTIVE\" ]]; then\n\
+  echo \"AA:BB:CC:DD:EE:FF:HotelWiFi:80:5180:yes\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                nmcli_log_path.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.config.scan_cache_ttl_ms = 60000;
+
+        let scan_req_1 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1101);
+        p.handle_request(&scan_req_1).await.expect("scan-1");
+        let scan_req_2 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1102);
+        p.handle_request(&scan_req_2).await.expect("scan-2");
+        let scan_req_3 = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "refresh": true }),
+            1103,
+        );
+        p.handle_request(&scan_req_3).await.expect("scan-3");
+
+        let nmcli_log = tokio::fs::read_to_string(&nmcli_log_path)
+            .await
+            .expect("read log");
+        let available_calls =
+            nmcli_log.matches("SSID,SIGNAL,SECURITY,ACTIVE").count();
+        let candidate_calls =
+            nmcli_log.matches("BSSID,SSID,SIGNAL,FREQ,ACTIVE").count();
+        assert_eq!(available_calls, 2);
+        assert_eq!(candidate_calls, 2);
     }
 
     #[tokio::test]
