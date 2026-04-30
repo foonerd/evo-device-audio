@@ -2523,24 +2523,58 @@ impl Respondent for NetworkNmPlugin {
 
             match req.request_type.as_str() {
                 REQUEST_NETWORK_STATUS => {
-                    let devices = self.nm_device_table().await?;
-                    let general =
-                        self.nmcli_output(&["general", "status"]).await.ok();
+                    let devices_out = self.nm_device_table().await;
+                    let (devices, devices_error) = match devices_out {
+                        Ok(v) => (v, Option::<String>::None),
+                        Err(e) => (Vec::new(), Some(format!("{e}"))),
+                    };
+                    let general_out =
+                        self.nmcli_output(&["general", "status"]).await;
+                    let (general, general_error) = match general_out {
+                        Ok(v) => {
+                            (Some(v.trim().to_string()), Option::<String>::None)
+                        }
+                        Err(e) => (None, Some(format!("{e}"))),
+                    };
                     let scan_if = self.config.default_wifi_iface.clone();
                     let wifi_scan_error = self
                         .wifi_scan(Some(scan_if.as_str()))
                         .await
                         .err()
-                        .map(|e| format!("{e:?}"));
-                    Self::response_json(req, self.with_observability(req, json!({
-                        "v": 1,
-                        "status": "ok",
-                        "nmcli_path": self.config.nmcli_path,
-                        "general_status": general.map(|s| s.trim().to_string()),
-                        "devices": devices,
-                        "scan_ifname": scan_if,
-                        "wifi_scan_error": wifi_scan_error,
-                    })))
+                        .map(|e| format!("{e}"));
+                    let degraded = devices_error.is_some()
+                        || general_error.is_some()
+                        || wifi_scan_error.is_some();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "degraded": degraded,
+                                "nmcli_path": self.config.nmcli_path,
+                                "general_status": general,
+                                "devices": devices,
+                                "scan_ifname": scan_if,
+                                "wifi_scan_error": wifi_scan_error,
+                                "domain_health": {
+                                    "device_table": {
+                                        "ok": devices_error.is_none(),
+                                        "error": devices_error,
+                                    },
+                                    "general_status": {
+                                        "ok": general_error.is_none(),
+                                        "error": general_error,
+                                    },
+                                    "wifi_scan": {
+                                        "ok": wifi_scan_error.is_none(),
+                                        "error": wifi_scan_error,
+                                    },
+                                }
+                            }),
+                        ),
+                    )
                 }
                 REQUEST_NETWORK_SCAN => {
                     let scan_req = if req.payload.is_empty() {
@@ -4039,5 +4073,55 @@ exit 0\n",
             .await
             .expect("nmcli log");
         assert!(nmcli_log.contains("connection down evo-network-wifi-sta"));
+    }
+
+    #[tokio::test]
+    async fn request_flow_status_is_degraded_on_partial_backend_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock-status.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"DEVICE,TYPE,STATE,CONNECTION\" && \"$4\" == \"device\" ]]; then\n\
+  echo \"device-table-failed\" 1>&2\n\
+  exit 10\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo \"connected\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"SSID,SIGNAL,SECURITY,ACTIVE\" ]]; then\n\
+  echo \"HotelWiFi:80:WPA2:yes\"\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"BSSID,SSID,SIGNAL,FREQ,ACTIVE\" ]]; then\n\
+  echo \"AA:BB:CC:DD:EE:FF:HotelWiFi:80:5180:yes\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkNmPlugin::new();
+        p.loaded = true;
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.config = PluginConfig::defaults();
+        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+
+        let status_req =
+            req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1004);
+        let status_out = p.handle_request(&status_req).await.expect("status");
+        let status_v: Value =
+            serde_json::from_slice(&status_out.payload).expect("json");
+        assert_eq!(status_v["status"], "ok");
+        assert_eq!(status_v["degraded"], true);
+        assert_eq!(status_v["domain_health"]["device_table"]["ok"], false);
+        assert_eq!(status_v["domain_health"]["general_status"]["ok"], true);
     }
 }
