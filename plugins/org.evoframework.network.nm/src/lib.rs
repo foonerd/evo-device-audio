@@ -2334,7 +2334,7 @@ impl NetworkNmPlugin {
             &self.config.nmcli_path,
         )
         .await;
-        let (resolved_ap_ifname, intent_hotspot_if_is_explicit) =
+        let (mut resolved_ap_ifname, intent_hotspot_if_is_explicit) =
             resolve_ap_ifname(
                 intent,
                 sta_ifname.as_str(),
@@ -2383,13 +2383,21 @@ impl NetworkNmPlugin {
                 if intent.fallback.hotspot_enabled
                     && sta_ifname != resolved_ap_ifname
                     && !intent_hotspot_if_is_explicit
-                    && ensure_ap_vif_present(&sta_ifname, &resolved_ap_ifname)
-                        .await
                 {
-                    steps.push(format!(
-                        "created AP vif {} on phy of {} (type __ap)",
-                        resolved_ap_ifname, sta_ifname
-                    ));
+                    if ensure_ap_vif_present(&sta_ifname, &resolved_ap_ifname)
+                        .await
+                    {
+                        steps.push(format!(
+                            "created AP vif {} on phy of {} (type __ap)",
+                            resolved_ap_ifname, sta_ifname
+                        ));
+                    } else {
+                        steps.push(format!(
+                            "warning: could not create AP vif {} on {}; falling back to shared iface {}",
+                            resolved_ap_ifname, sta_ifname, sta_ifname
+                        ));
+                        resolved_ap_ifname = sta_ifname.clone();
+                    }
                 }
 
                 let mut wifi_for_ap = intent.wifi.clone();
