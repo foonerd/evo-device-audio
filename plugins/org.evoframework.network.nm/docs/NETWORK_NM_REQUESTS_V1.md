@@ -143,6 +143,15 @@ All successful `network.nm.*` responses include:
 These are intended for operator telemetry stitching (API, steward logs, UI traces)
 without parsing free-form step strings.
 
+`network.nm.status` additionally exposes failure-domain fields:
+
+- `degraded` (`true` when one or more backend checks fail)
+- `domain_health.device_table`
+- `domain_health.general_status`
+- `domain_health.wifi_scan`
+
+This keeps the status endpoint responsive even when one subsystem is degraded.
+
 ## Minimal request examples
 
 ### `network.nm.intent.set`
