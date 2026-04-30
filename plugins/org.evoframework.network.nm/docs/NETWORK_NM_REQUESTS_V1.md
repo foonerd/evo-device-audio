@@ -66,6 +66,17 @@ State files are persisted in versioned envelopes with `schema_version`:
 Legacy flat payloads are still accepted on load and migrated in-memory, then the
 next save rewrites canonical envelope format.
 
+### Secret at-rest hardening
+
+Wi-Fi PSK files (`wifi-sta.psk`, `wifi-ap.psk`) support encrypted-at-rest storage:
+
+- Set `EVO_NETWORK_SECRET_KEY` to enable encryption with `xchacha20poly1305`.
+- Set `EVO_NETWORK_SECRET_REQUIRE=1` (or plugin config `secrets.require_encrypted = true`)
+  to reject plaintext secret files.
+
+Without a key, plugin behavior remains backward compatible (plaintext) unless
+`require_encrypted` is enabled.
+
 ## Operational scenario coverage
 
 Current apply/reconcile logic covers these branches:
