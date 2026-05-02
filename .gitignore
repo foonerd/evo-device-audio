@@ -1,1 +1,24 @@
 /target
+
+# AI tooling — never committed.
+#
+# Excludes per-machine settings, project memories, caches, and
+# rule files for every coding-assistant tool. Two concerns:
+# (1) per-user / per-machine settings (allowlists, model
+# preferences, auth state) leaking into the public repo, and
+# (2) project-memory files containing internal context.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.aiderignore
+.continue/
+.windsurf/
+.windsurfrules
+.codeium/
+.zed/
+.junie/
+.github/copilot-instructions.md
