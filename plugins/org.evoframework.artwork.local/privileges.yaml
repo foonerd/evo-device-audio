@@ -1,0 +1,33 @@
+schema_version: "1.0"
+plugin: org.evoframework.artwork.local
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml.
+
+capability_intent:
+  - id: media_library_read
+    need: read declared media library roots so the plugin can locate embedded cover art and accompanying artwork files (folder.jpg, cover.png, etc.).
+    access_path: filesystem/library
+    failure_mode: respond with no-artwork; structured event; no panic.
+  - id: artwork_cache_write
+    need: write extracted/resized artwork to the per-plugin cache directory under /var/lib/evo for fast subsequent serves.
+    access_path: filesystem/state
+    failure_mode: degrade to per-request extraction (slower but functional); structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists and is writable as the steward identity
+
+host_provisioning: {}

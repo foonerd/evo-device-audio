@@ -1,0 +1,39 @@
+schema_version: "1.0"
+plugin: org.evoframework.composition.alsa
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml — that
+# record adds the `audio` group to the steward identity to satisfy
+# this plugin's audio-device intent, and notes the snd_pcm kernel
+# module dependency.
+
+capability_intent:
+  - id: alsa_device_enumerate
+    need: enumerate ALSA PCM devices via /proc/asound and libasound to discover hardware available for composition.
+    access_path: alsa/control
+    failure_mode: respond with empty device list; structured event; no panic.
+  - id: alsa_mixer_query
+    need: query and adjust ALSA mixer controls (volume, mute) for selected output devices.
+    access_path: alsa/mixer
+    failure_mode: degrade to inability to adjust mixer; structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules:
+  - snd_pcm
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /proc/asound"
+    - "test -r /proc/asound/cards"
+  expected:
+    - ALSA proc tree present (kernel snd subsystem loaded)
+    - cards file readable as the steward identity
+
+host_provisioning: {}
