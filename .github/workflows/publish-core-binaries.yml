@@ -33,7 +33,7 @@ name: publish-core-binaries
       evo_core_tag:
         description: "evo-core tag to build from"
         type: string
-        default: v0.1.9
+        default: v0.1.12
 
 env:
   ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts

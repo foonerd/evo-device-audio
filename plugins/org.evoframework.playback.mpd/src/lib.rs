@@ -400,6 +400,7 @@ impl Plugin for MpdPlaybackPlugin {
                     request_types: vec![],
                     accepts_custody: true,
                     flags: Default::default(),
+                    course_correct_verbs: Vec::new(),
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),
