@@ -15,9 +15,10 @@ isolation: oop
 # the installer reading `getent passwd 1000` (or equivalent) and
 # templating the resolved name into the systemd unit. Vendor
 # distributions that pre-bake a service user override by pinning
-# `User:` explicitly. Identity is mutable post-install via the
-# operator-issued migration verb (lands per ADR-0087 Pillar IV
-# implementation in v0.1.13).
+# `User:` explicitly. Identity is mutable post-install via an
+# operator-issued migration verb that lands with the dynamic
+# provisioning-lifecycle implementation in a subsequent framework
+# release.
 #
 # Bundled in-process plugins covered by this provisioning:
 #   - org.evoframework.metadata.local (filesystem/library + state)
