@@ -9,8 +9,9 @@ Behaviour:
   replace or insert the (piece, version) entry passed on the command
   line, and write back a sorted pointer list.
 
-The format is provisional (v0); see SECRETS.md and ADR-0027 for the
-ongoing release-plane contract work in evo-core.
+The format is provisional (v0); see SECRETS.md and the framework's
+release-plane contract documentation for the ongoing work in
+evo-core that will reshape this in-place.
 """
 
 from __future__ import annotations

@@ -13,8 +13,8 @@ path = "src/lib.rs"
 
 # Out-of-process wire binary — the production-shaped OOP entrypoint
 # the framework's release plane cross-builds, signs, packs, and
-# publishes as a v0.1.10 plugin bundle (ADR-0033 D26). The companion
-# in-process admission path uses the lib crate directly.
+# publishes as a v0.1.10 plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
 [[bin]]
 name = "artwork-local-wire"
 path = "src/bin/artwork-local-wire.rs"

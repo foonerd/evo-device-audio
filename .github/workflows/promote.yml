@@ -3,9 +3,10 @@
 # itself. The channel-pointer file is signed with the commons key
 # so consumers can verify which version a channel points at.
 #
-# Format is v0. When `evo-core/docs/engineering/RELEASE_PLANE.md`
-# lands per ADR-0027 / GAPS [30], the channel-pointer file shape
-# will reshape to match; the migration is in-place.
+# Format is v0. When the framework ships its release-plane contract
+# in `evo-core/docs/engineering/RELEASE_PLANE.md`, the channel-
+# pointer file shape will reshape to match; the migration is
+# in-place.
 name: promote
 
 "on":

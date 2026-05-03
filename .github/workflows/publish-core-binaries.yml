@@ -2,17 +2,16 @@
 #
 # Cross-builds evo-core's `evo` (the steward) and `evo-plugin-tool`
 # from the pinned tag and publishes per-arch binaries to
-# evo-device-audio-artefacts. This is a stop-gap delivery while
-# evo-core gains its own binary publish path (gap [33], 0.1.10 per
-# ADR-0030 / ADR-0031); when that lands, this workflow can be
-# retired and consumers fetch directly from evo-core's artefacts
-# repo.
+# evo-device-audio-artefacts. This is a stop-gap delivery while the
+# framework gains its own binary publish path; when that ships,
+# this workflow can be retired and consumers fetch directly from
+# evo-core's artefacts repo.
 #
-# This workflow lives on the reference generic device per ADR-0032.
-# The reference generic device is the natural home for the stop-gap
-# because it is the deployable target plugin developers and vendor
-# distributions consume; vendor distributions (`evo-device-volumio`
-# etc.) start from the reference and inherit the binary supply.
+# This workflow lives on the reference generic device. The reference
+# generic device is the natural home for the stop-gap because it is
+# the deployable target plugin developers and vendor distributions
+# consume; vendor distributions (`evo-device-volumio` etc.) start
+# from the reference and inherit the binary supply.
 #
 # Targets:
 #   - x86_64-unknown-linux-gnu  (amd64; reference VMs and dev boxes)
