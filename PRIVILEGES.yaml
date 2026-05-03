@@ -1,0 +1,92 @@
+schema_version: "1.0"
+plugin: org.evoframework.distribution.audio
+owner: evo-device-audio
+isolation: oop
+
+# Reference-distribution-bootstrap record for evo-device-audio.
+#
+# This record describes what the distribution provisions at install
+# time: the steward systemd unit + supplementary group memberships
+# + polkit drop-ins satisfying the union of in-process plugin needs
+# bundled with this distribution.
+#
+# Identity policy: appliance-class default — the steward runs as the
+# operator's first user (uid >= 1000), determined at install time by
+# the installer reading `getent passwd 1000` (or equivalent) and
+# templating the resolved name into the systemd unit. Vendor
+# distributions that pre-bake a service user override by pinning
+# `User:` explicitly. Identity is mutable post-install via the
+# operator-issued migration verb (lands per ADR-0087 Pillar IV
+# implementation in v0.1.13).
+#
+# Bundled in-process plugins covered by this provisioning:
+#   - org.evoframework.metadata.local (filesystem/library + state)
+#   - org.evoframework.artwork.local (filesystem/library + state)
+#   - org.evoframework.composition.alsa (alsa/control via `audio` group)
+#   - org.evoframework.playback.mpd (mpd binary + mpd.service control socket)
+#   - org.evoframework.network.nm (NetworkManager via D-Bus + polkit + `netdev` group)
+
+capability_intent:
+  - id: bootstrap_steward_unit
+    need: install the steward systemd unit at /etc/systemd/system/evo.service with the resolved User= value and the union of supplementary groups required by the bundled in-process plugin set.
+    access_path: filesystem/system
+    failure_mode: distribution install fails; structured installer error.
+  - id: bootstrap_state_directory
+    need: create /var/lib/evo with ownership matching the steward identity, and seed default catalogue + trust roots under /etc/evo.
+    access_path: filesystem/system
+    failure_mode: distribution install fails; structured installer error.
+  - id: bootstrap_polkit_drops
+    need: install polkit drop-ins under /etc/polkit-1/rules.d/ granting the steward identity authority for NetworkManager (and any other action sets required by bundled plugins).
+    access_path: polkit/policy
+    failure_mode: bundled plugins requiring polkit grants admit but degrade at runtime; structured event names the missing action set.
+
+required_binaries:
+  - name: nmcli
+    min_version: "1.30"
+    failure_mode: org.evoframework.network.nm refuses to admit; structured event.
+  - name: mpd
+    failure_mode: org.evoframework.playback.mpd refuses to admit; structured event.
+
+required_kernel_modules:
+  - snd_pcm
+
+required_system_services:
+  - NetworkManager.service
+  - mpd.service
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -r /etc/evo"
+    - "test -d /run/evo"
+    - "test -d /proc/asound"
+  expected:
+    - steward state directory exists as steward identity (writable)
+    - steward config directory exists (readable)
+    - steward run directory exists for the wire socket
+    - ALSA proc tree present (kernel snd subsystem loaded)
+
+host_provisioning:
+  debian:
+    systemd:
+      # User= deferred. Installer resolves at install time per the
+      # appliance-class identity policy (operator's first user;
+      # `getent passwd 1000`). Vendor distributions overriding may
+      # pin a literal name here.
+      SupplementaryGroups: [audio, netdev]
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo
+        - /run/evo
+      ReadOnlyPaths:
+        - /etc/evo
+      NoNewPrivileges: true
+    polkit:
+      policy_file: 50-evo-org.evoframework.distribution.audio.rules
+      required_actions:
+        - "org.freedesktop.NetworkManager.*"
+    capabilities: []
+    sudoers: []

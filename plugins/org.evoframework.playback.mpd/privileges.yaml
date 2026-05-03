@@ -1,0 +1,40 @@
+schema_version: "1.0"
+plugin: org.evoframework.playback.mpd
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml — that
+# record ensures the mpd binary is on PATH and that the steward
+# identity has read access to the mpd control socket / TCP port.
+
+capability_intent:
+  - id: mpd_control
+    need: connect to the local Music Player Daemon over its TCP port (default 6600) or Unix socket to issue play/pause/seek/queue/status commands.
+    access_path: mpd/protocol
+    failure_mode: respond with playback unavailable; structured event identifies missing MPD; no panic.
+  - id: media_library_path_resolution
+    need: resolve relative paths emitted by MPD against declared media library roots so the playback plugin can correlate with metadata + artwork plugins.
+    access_path: filesystem/library
+    failure_mode: degrade to MPD-only paths (no library cross-reference); structured event; no panic.
+
+required_binaries:
+  - name: mpd
+    failure_mode: refuse to admit; structured admission error names the missing binary.
+
+required_kernel_modules: []
+
+required_system_services:
+  - mpd.service
+
+verification:
+  commands:
+    - "test -e /var/lib/evo"
+    - "test -d /run"
+  expected:
+    - state directory exists
+    - run directory exists for the mpd control socket (when MPD configured for Unix-socket control)
+
+host_provisioning: {}

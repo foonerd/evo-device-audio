@@ -1,0 +1,38 @@
+schema_version: "1.0"
+plugin: org.evoframework.metadata.local
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml — that
+# record translates this plugin's intent (read media library files)
+# into the steward identity's actual ReadOnlyPaths and any required
+# group memberships.
+
+capability_intent:
+  - id: media_library_read
+    need: read declared media library roots (catalogue of music files) so the plugin can extract embedded metadata and serve metadata queries.
+    access_path: filesystem/library
+    failure_mode: respond with empty metadata; structured event indicates missing access; no panic.
+  - id: state_storage
+    need: write per-plugin state directory for cached metadata extracts.
+    access_path: filesystem/state
+    failure_mode: degrade to no-cache mode; structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -r /var/lib/evo"
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory readable as the steward identity
+    - state directory exists
+
+host_provisioning: {}

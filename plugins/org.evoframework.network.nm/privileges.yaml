@@ -1,0 +1,46 @@
+schema_version: "1.0"
+plugin: org.evoframework.network.nm
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml — that
+# record adds the steward identity to the `netdev` group and drops a
+# polkit rules file granting the org.freedesktop.NetworkManager.*
+# action set. The plugin must remain non-panic under hardware/BIOS
+# radio lock, software rfkill, and partial NM degradation per
+# ADR-0039.
+
+capability_intent:
+  - id: nm_connection_control
+    need: query and modify NetworkManager connection profiles (list, activate, deactivate, edit) via the system D-Bus.
+    access_path: dbus/polkit
+    failure_mode: degraded networking-shelf state; structured event identifies the unmet polkit action; no panic.
+  - id: wifi_radio_control
+    need: toggle Wi-Fi soft-block / unblock (flight-mode signal per ADR-0039) via NetworkManager and rfkill where applicable.
+    access_path: dbus/polkit
+    failure_mode: warning + recoverable operator action; structured event identifies hardware-vs-software block; no panic.
+  - id: connectivity_query
+    need: read NetworkManager connectivity-check state (online / limited / portal / none) for shelf state reporting.
+    access_path: dbus/polkit
+    failure_mode: report unknown connectivity; structured event; no panic.
+
+required_binaries:
+  - name: nmcli
+    min_version: "1.30"
+    failure_mode: refuse to admit; structured admission error names the missing binary.
+
+required_kernel_modules: []
+
+required_system_services:
+  - NetworkManager.service
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+
+host_provisioning: {}
