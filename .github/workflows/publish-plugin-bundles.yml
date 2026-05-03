@@ -1,5 +1,4 @@
-# Publish per-arch signed plugin bundles for evo-device-audio plugins
-# (ADR-0033 D26).
+# Publish per-arch signed plugin bundles for evo-device-audio plugins.
 #
 # For each plugin that ships an out-of-process bundle (declared in
 # the matrix below): cross-build the wire binary for every supported

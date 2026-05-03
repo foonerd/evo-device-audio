@@ -6,9 +6,9 @@
 # and never modified. Re-running publish for an already-published
 # version is a no-op (skip).
 #
-# Format is v0. When `evo-core/docs/engineering/RELEASE_PLANE.md`
-# lands per ADR-0027 / GAPS [30], the per-piece shape will reshape
-# to match; the migration is in-place.
+# Format is v0. When the framework ships its release-plane contract
+# in `evo-core/docs/engineering/RELEASE_PLANE.md`, the per-piece
+# shape will reshape to match; the migration is in-place.
 name: publish
 
 "on":
