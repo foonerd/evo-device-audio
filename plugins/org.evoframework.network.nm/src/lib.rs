@@ -2857,6 +2857,7 @@ impl Plugin for NetworkNmPlugin {
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
+                    course_correct_verbs: Vec::new(),
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),

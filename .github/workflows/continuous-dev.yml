@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EVO_CORE_TAG: v0.1.9
+  EVO_CORE_TAG: v0.1.12
   CROSS_AARCH64_TARGET: aarch64-unknown-linux-gnu
 
 jobs:

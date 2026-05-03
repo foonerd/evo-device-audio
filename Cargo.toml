@@ -32,14 +32,13 @@ repository = "https://github.com/foonerd/evo-device-audio"
 # across the plugin population; individual crates pay only for what
 # they actually import.
 #
-# Pinned at evo-core's 0.1.11-rc.1 release. Adds the durability
-# triad — admin / custody / relation-graph SQLite write-through with
-# boot rehydrate — on top of the 0.1.10 surface. The plugin SDK is
-# unchanged at the API level; this bump moves consumers onto a
-# steward whose state survives restart so device behaviour does not
-# rely on an in-memory-only fabric.
+# Pinned at evo-core's v0.1.12 release (the latest stable tag on
+# public foonerd/evo-core after the eng/public squash-and-promote
+# split). Earlier rc tags are not promoted — only the GA cuts
+# v0.1.10, v0.1.11, v0.1.12 exist on the public repo. Bumping the
+# pin here is the only place this project follows the framework.
 [workspace.dependencies]
-evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.11-rc.1" }
+evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.12" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }

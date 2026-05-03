@@ -140,6 +140,7 @@ impl Plugin for ArtworkLocalPlugin {
                     request_types: vec![REQUEST_ARTWORK_RESOLVE.to_string()],
                     accepts_custody: false,
                     flags: Default::default(),
+                    course_correct_verbs: Vec::new(),
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),

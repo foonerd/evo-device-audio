@@ -120,6 +120,7 @@ impl Plugin for MetadataLocalPlugin {
                     request_types: vec![REQUEST_METADATA_QUERY.to_string()],
                     accepts_custody: false,
                     flags: Default::default(),
+                    course_correct_verbs: Vec::new(),
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),
