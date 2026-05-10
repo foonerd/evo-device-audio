@@ -82,7 +82,26 @@ const RECONNECT_MAX: Duration = Duration::from_secs(10);
 /// exhausted.
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 /// Budget per [`MpdConnection::idle`] call on the idle task.
-const IDLE_BUDGET: Duration = Duration::from_secs(30);
+///
+/// MPD's `idle` protocol blocks the connection until a
+/// subsystem change is observed. The `idle()` API takes a
+/// budget so tests can drive deterministic short-timeout
+/// paths; in production on a quiet MPD, idle should block
+/// for as long as MPD is willing to hold the connection
+/// open (typically indefinitely). Sending another `idle`
+/// command on a connection still in idle state is a
+/// protocol violation that MPD closes the connection on,
+/// so a short client-side timeout that re-issues without
+/// first sending `noidle` is wrong; the budget therefore
+/// has to be effectively-forever so the timeout path is
+/// never reached in steady state. 1 day picks a value
+/// large enough that healthy MPD never times out
+/// client-side, while still bounded for testability /
+/// catastrophic-stuck-state recovery. Real connection
+/// failures (TCP close, protocol error) surface as
+/// `MpdError::Transport` / `Protocol` and trigger the
+/// actor's reconnect path.
+const IDLE_BUDGET: Duration = Duration::from_secs(86_400);
 /// Subsystems the idle task subscribes to. Covers everything that
 /// affects the fields reported in `PlaybackStateReport`.
 const IDLE_SUBSYSTEMS: &[IdleSubsystem] = &[
