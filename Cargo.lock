@@ -996,6 +996,7 @@ dependencies = [
  "anyhow",
  "evo-plugin-sdk",
  "semver",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

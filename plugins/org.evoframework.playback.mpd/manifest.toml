@@ -54,3 +54,55 @@ course_correct_verbs = [
     "seek",
     "set_volume",
 ]
+
+# Source-plugin declaration. The plugin owns the `mpd-path`
+# URI scheme (paths the local MPD daemon's library knows
+# about) and bridges into the audio data plane: the
+# framework hands the plugin a typed WriteEndpoint via
+# LoadContext::audio_routing, and the plugin renders MPD's
+# audio_output config to point there (chunks F3 onwards).
+# bit_perfect_capable + preferred_topology = no_intermediate
+# tell the reconciliation engine that MPD writes directly
+# to the delivery hardware when format-aligned, no
+# intermediate composition stage required.
+[capabilities.source]
+uri_schemes = ["mpd-path"]
+output_kind = "audio.pcm"
+bit_perfect_capable = true
+preferred_topology = "no_intermediate"
+
+# Audio formats MPD can produce when wired through the
+# ALSA audio_output plugin. Standard PCM bit-depths at
+# common audiophile rate ladder. DSD output (DoP / native)
+# is a follow-on (gated on delivery's DSD capability and
+# operator policy).
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s16_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s24_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s32_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+# Respondent capabilities. Source plugins MUST also be
+# respondents — source verbs targeting the URI schemes
+# this plugin owns arrive via handle_request. F2 declares
+# play_now only; F4 grows the surface to the full set
+# (stop / pause / resume / seek / next / previous), at
+# which point the warden's course_correct surface is
+# reconciled with the source-verb surface (overlapping
+# verb names route through their respective dispatchers
+# without functional duplication).
+[capabilities.respondent]
+request_types = ["play_now"]
+response_budget_ms = 2000

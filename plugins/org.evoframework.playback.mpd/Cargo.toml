@@ -18,6 +18,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# Source-verb request/response payload encoding. play_now and the
+# rest of the source-verb surface ship typed payloads as UTF-8 JSON
+# (per the audio.playback shape contract).
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Plugin-local: used to parse `LoadContext::config` in `src/config.rs`.
 # Matches the version the SDK carries transitively; direct declaration is
 # required to name `toml::Table` as a type in this crate. Not a workspace

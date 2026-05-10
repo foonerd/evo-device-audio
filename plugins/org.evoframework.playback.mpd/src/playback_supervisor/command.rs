@@ -33,6 +33,12 @@ pub(crate) enum PlaybackCommand {
     Seek(Duration),
     /// Set output volume (0-100; MPD ACKs values above 100).
     SetVolume(u8),
+    /// Replace the queue with a single library path and start
+    /// playback. Issued in response to a `play_now` source-verb
+    /// dispatch: the supervisor clears the queue, adds the path,
+    /// then plays. The path is the URI's substring after the
+    /// `mpd-path:` scheme prefix.
+    LoadAndPlay(String),
 }
 
 /// Failure modes of playback command execution.

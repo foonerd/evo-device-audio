@@ -113,10 +113,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use evo_plugin_sdk::contract::audio_routing::AudioRouting;
 use evo_plugin_sdk::contract::{
     Assignment, BuildInfo, CourseCorrection, CustodyHandle, HealthReport,
     LoadContext, Plugin, PluginDescription, PluginError, PluginIdentity,
-    RelationAnnouncer, RuntimeCapabilities, SubjectAnnouncer, Warden,
+    RelationAnnouncer, Request, Respondent, Response, RuntimeCapabilities,
+    SubjectAnnouncer, Warden,
 };
 use evo_plugin_sdk::Manifest;
 
@@ -159,6 +161,25 @@ const COURSE_CORRECT_VERBS: &[&str] = &[
     "seek",
     "set_volume",
 ];
+
+/// Source verbs the plugin handles via the respondent
+/// dispatch path. Mirrors
+/// `manifest.toml`'s `[capabilities.respondent].request_types`
+/// entries; admission would refuse a mismatch between the
+/// runtime's declared list and the manifest's. F2 ships
+/// `play_now` only; F4 grows the surface to the full
+/// state-transition set (`stop` / `pause` / `resume` /
+/// `seek` / `next` / `previous`) alongside the warden
+/// surface refresh, at which point the source-verb and
+/// course_correct dispatchers exercise overlapping verb
+/// names through their respective paths.
+const SOURCE_REQUEST_TYPES: &[&str] = &["play_now"];
+
+/// URI scheme this source plugin owns. Items addressed
+/// via `mpd-path:...` URIs are loaded into the local MPD
+/// daemon's library and played; items in other schemes
+/// dispatch elsewhere by the framework's URI-routing rules.
+const URI_SCHEME_MPD_PATH: &str = "mpd-path";
 
 /// Parse the embedded manifest into a [`Manifest`] struct.
 ///
@@ -214,6 +235,19 @@ pub struct MpdPlaybackPlugin {
     /// [`LoadContext`]; `take_custody` refuses to proceed when
     /// absent.
     subject_emitter: Option<SubjectEmitter>,
+    /// Audio data plane routing handle pulled from
+    /// [`LoadContext::audio_routing`] at load time. `None`
+    /// before the first successful load and after every
+    /// `unload`. The plugin uses the handle in chunk F3
+    /// onwards to learn which ALSA pcm MPD's audio_output
+    /// should write to (the framework's negotiated
+    /// `WriteEndpoint`) and to react to topology rewires.
+    /// Composition plugins that declare
+    /// `[capabilities.composition]` and source plugins
+    /// (this one) that declare `[capabilities.source]` with
+    /// an audio `output_kind` MUST receive this handle;
+    /// `Plugin::load` refuses loudly when it is `None`.
+    audio_routing: Option<Arc<dyn AudioRouting>>,
     custodies: HashMap<String, TrackedCustody>,
     /// Cumulative count of custodies accepted since construction.
     /// Does not decrement on release.
@@ -223,6 +257,10 @@ pub struct MpdPlaybackPlugin {
     /// successes: a dispatched command that the supervisor then
     /// fails still increments this counter.
     corrections_dispatched: u64,
+    /// Cumulative count of source-verb requests handled.
+    /// Mirrors `corrections_dispatched` on the respondent
+    /// dispatch side.
+    requests_handled: u64,
 }
 
 impl MpdPlaybackPlugin {
@@ -249,10 +287,43 @@ impl MpdPlaybackPlugin {
             endpoint,
             timeouts,
             subject_emitter: None,
+            audio_routing: None,
             custodies: HashMap::new(),
             custodies_taken: 0,
             corrections_dispatched: 0,
+            requests_handled: 0,
         }
+    }
+
+    /// Cumulative count of source-verb requests handled
+    /// since construction.
+    pub fn requests_handled(&self) -> u64 {
+        self.requests_handled
+    }
+
+    /// Load contract isolated to its testable inputs: the
+    /// audio routing handle. The public [`Plugin::load`]
+    /// entry pulls the handle off the context and forwards
+    /// here; the split lets unit tests exercise the
+    /// refuse-when-`None` contract without needing to
+    /// construct a full [`LoadContext`] (which carries
+    /// many mandatory trait-object fields).
+    fn install_routing(
+        &mut self,
+        routing: Option<Arc<dyn AudioRouting>>,
+    ) -> Result<(), PluginError> {
+        let routing = routing.ok_or_else(|| {
+            PluginError::Permanent(
+                "playback.mpd plugin requires LoadContext::audio_routing; \
+                 received None — manifest declares [capabilities.source] \
+                 with an audio output_kind, so the framework MUST provision \
+                 an audio_routing handle. Indicates a manifest / trust / \
+                 admission misconfiguration."
+                    .to_string(),
+            )
+        })?;
+        self.audio_routing = Some(routing);
+        Ok(())
     }
 
     /// Number of custodies currently held (taken but not yet
@@ -415,7 +486,10 @@ impl Plugin for MpdPlaybackPlugin {
                     contract: 1,
                 },
                 runtime_capabilities: RuntimeCapabilities {
-                    request_types: vec![],
+                    request_types: SOURCE_REQUEST_TYPES
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                     accepts_custody: true,
                     flags: Default::default(),
                     course_correct_verbs: COURSE_CORRECT_VERBS
@@ -445,6 +519,16 @@ impl Plugin for MpdPlaybackPlugin {
             );
 
             self.apply_config_table(&ctx.config)?;
+
+            // Engage the audio data plane. The plugin is a
+            // source plugin (declared via
+            // [capabilities.source] with output_kind =
+            // "audio.pcm"); admission MUST hand it an
+            // audio_routing handle. install_routing refuses
+            // loudly when the handle is None — that
+            // indicates manifest / trust / admission
+            // misconfiguration.
+            self.install_routing(ctx.audio_routing.clone())?;
 
             // Equip the subject emitter from the announcer
             // handles the steward supplied. The Arcs are cloned
@@ -495,6 +579,13 @@ impl Plugin for MpdPlaybackPlugin {
                 );
                 tracked.supervisor.shutdown().await;
             }
+
+            // Drop the audio routing handle so the
+            // framework releases its Arc when nothing else
+            // holds it. F3 onwards adds a route-change
+            // reactor that needs explicit shutdown here
+            // before this point.
+            self.audio_routing = None;
 
             self.loaded = false;
             Ok(())
@@ -671,6 +762,152 @@ impl Warden for MpdPlaybackPlugin {
     }
 }
 
+impl Respondent for MpdPlaybackPlugin {
+    fn handle_request<'a>(
+        &'a mut self,
+        req: &'a Request,
+    ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
+        async move {
+            if !self.loaded {
+                return Err(PluginError::Permanent(
+                    "playback plugin not loaded".to_string(),
+                ));
+            }
+            if req.is_past_deadline() {
+                return Err(PluginError::Transient(
+                    "request deadline already expired".to_string(),
+                ));
+            }
+            if !SOURCE_REQUEST_TYPES.contains(&req.request_type.as_str()) {
+                return Err(PluginError::Permanent(format!(
+                    "unknown request type: {:?} (declared types: {:?})",
+                    req.request_type, SOURCE_REQUEST_TYPES
+                )));
+            }
+
+            self.requests_handled += 1;
+
+            // F2 ships play_now only; the broader source-verb
+            // surface (stop / pause / resume / seek / next /
+            // previous) lands as part of the F4 warden-surface
+            // refresh.
+            match req.request_type.as_str() {
+                "play_now" => self.handle_play_now(req).await,
+                other => Err(PluginError::Permanent(format!(
+                    "request type {other:?} declared but no handler wired; \
+                     this is a manifest/runtime drift bug"
+                ))),
+            }
+        }
+    }
+}
+
+impl MpdPlaybackPlugin {
+    /// Handle a `play_now` source-verb request: parse the
+    /// payload, verify the URI scheme this plugin owns,
+    /// extract the library path, and dispatch
+    /// [`PlaybackCommand::LoadAndPlay`] through the active
+    /// custody's supervisor.
+    async fn handle_play_now(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: PlayNowPayload = serde_json::from_slice(&req.payload)
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "play_now payload is not valid JSON \
+                     {{\"uri\": \"...\"}}: {e}"
+                ))
+            })?;
+
+        let path = parse_mpd_path_uri(&payload.uri)?;
+
+        // Pick the active custody. custody_exclusive = true
+        // (manifest) means at most one custody exists at any
+        // time; the framework's source-verb dispatcher
+        // acquires custody before invoking handle_request so
+        // the slot is populated. Zero custodies indicates a
+        // race or framework misconfiguration; refuse loudly
+        // rather than silently no-op. SupervisorHandle is
+        // not Clone (it owns the shutdown signal half), so
+        // dispatch through a reference rather than copying
+        // the handle.
+        let supervisor = self
+            .custodies
+            .values()
+            .next()
+            .map(|t| &t.supervisor)
+            .ok_or_else(|| {
+                PluginError::Permanent(
+                    "play_now received but no active custody on the \
+                     warden — the framework's source-verb dispatcher \
+                     should have acquired custody before invoking \
+                     handle_request"
+                        .to_string(),
+                )
+            })?;
+
+        supervisor
+            .command(PlaybackCommand::LoadAndPlay(path.to_string()))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+
+        let body = serde_json::to_vec(&PlayNowResponse {
+            status: "ok",
+            uri: payload.uri,
+        })
+        .map_err(|e| {
+            PluginError::Permanent(format!(
+                "play_now response JSON encode failed: {e}"
+            ))
+        })?;
+        Ok(Response::for_request(req, body))
+    }
+}
+
+/// Wire shape of the `play_now` request payload. Carries
+/// the full URI; the plugin validates the scheme prefix
+/// matches one it owns and strips the prefix to form an
+/// MPD library-relative path.
+#[derive(Debug, serde::Deserialize)]
+struct PlayNowPayload {
+    uri: String,
+}
+
+/// Wire shape of the `play_now` success response. Echoes
+/// the URI back so the caller can confirm the dispatch
+/// landed against the URI it sent (cheap correctness
+/// check; useful for dispatch-tracing diagnostics).
+#[derive(Debug, serde::Serialize)]
+struct PlayNowResponse {
+    status: &'static str,
+    uri: String,
+}
+
+/// Strip the `mpd-path:` URI scheme prefix and return the
+/// remaining library path. Refuses URIs that don't bear
+/// the expected scheme — those routed here through a
+/// framework-side URI-routing mistake; surface the
+/// problem rather than silently treating the URI as a
+/// library path.
+fn parse_mpd_path_uri(uri: &str) -> Result<&str, PluginError> {
+    let prefix = format!("{URI_SCHEME_MPD_PATH}:");
+    if let Some(path) = uri.strip_prefix(&prefix) {
+        if path.is_empty() {
+            return Err(PluginError::Permanent(format!(
+                "play_now URI {uri:?} has empty path component after scheme"
+            )));
+        }
+        Ok(path)
+    } else {
+        Err(PluginError::Permanent(format!(
+            "play_now URI {uri:?} does not bear the {URI_SCHEME_MPD_PATH:?} \
+             scheme this plugin owns; framework's URI router should not \
+             have dispatched it here"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,7 +1044,20 @@ mod tests {
         assert_eq!(d.build_info.plugin_build, d.identity.version.to_string());
         assert_eq!(d.identity.contract, 1);
         assert!(d.runtime_capabilities.accepts_custody);
-        assert!(d.runtime_capabilities.request_types.is_empty());
+        assert_eq!(
+            d.runtime_capabilities.request_types,
+            SOURCE_REQUEST_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            d.runtime_capabilities.course_correct_verbs,
+            COURSE_CORRECT_VERBS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[tokio::test]
@@ -996,6 +1246,60 @@ mod tests {
         let handle = CustodyHandle::new("custody-phantom");
         let e = p.release_custody(handle).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
+    }
+
+    // ===== F2 substrate consumption tests =====
+
+    #[tokio::test]
+    async fn install_routing_refuses_when_handle_is_none() {
+        let mut p = MpdPlaybackPlugin::new();
+        let err = p.install_routing(None).expect_err(
+            "playback.mpd plugin must refuse load without audio_routing",
+        );
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("audio_routing"),
+                    "refusal message must name the missing field: {msg:?}"
+                );
+            }
+            other => panic!("expected Permanent error, got {other:?}"),
+        }
+        assert!(p.audio_routing.is_none());
+    }
+
+    // ===== F2 play_now URI parsing tests (pure) =====
+
+    #[test]
+    fn parse_mpd_path_uri_strips_scheme() {
+        let path = parse_mpd_path_uri("mpd-path:Music/Album/Track.flac")
+            .expect("scheme strip");
+        assert_eq!(path, "Music/Album/Track.flac");
+    }
+
+    #[test]
+    fn parse_mpd_path_uri_refuses_unknown_scheme() {
+        let err = parse_mpd_path_uri("file:/Music/Track.flac")
+            .expect_err("non-mpd-path scheme must refuse");
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("mpd-path"));
+                assert!(msg.contains("file:"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mpd_path_uri_refuses_empty_path() {
+        let err = parse_mpd_path_uri("mpd-path:")
+            .expect_err("empty path component must refuse");
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("empty path"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
     }
 
     // ===== parse_correction tests (pure) =====
