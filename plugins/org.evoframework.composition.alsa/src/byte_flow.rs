@@ -14,12 +14,21 @@
 //!   pumps bytes between them. Hermetic, testable on any
 //!   Unix box; the production path for chains the framework
 //!   wires through named-pipe substrate.
-//! - `EndpointKind::AlsaPcm` / `SharedMemory` / `JackPort` —
-//!   reported as `UnsupportedKind` by this build. The
-//!   AlsaPcm path lands as part of the next chunk
-//!   (libasound link + reference target cross-compile + real-hardware
-//!   verification); shared-memory and JACK-port substrates
-//!   are vendor-distribution territory.
+//! - `EndpointKind::AlsaPcm` — opens both endpoints as ALSA
+//!   capture/playback PCMs via libasound (the `alsa` crate),
+//!   configures hwparams from the negotiated `AudioFormat`,
+//!   pumps frames input → output with cancel-aware
+//!   non-blocking PCM waits. Compiled only when the
+//!   `alsa-substrate` Cargo feature is enabled — typically
+//!   for cross-builds targeting reference target / Debian Trixie /
+//!   ALSA-having hardware. The dev-rig native build runs
+//!   without the feature and reports AlsaPcm as
+//!   `UnsupportedKind`.
+//! - `EndpointKind::SharedMemory` / `JackPort` — reported as
+//!   `UnsupportedKind`. Shared-memory and JACK-port
+//!   substrates are vendor-distribution territory; the
+//!   reference plugin in this build does not implement
+//!   them.
 //!
 //! When the input and output endpoints declare different
 //! substrate kinds, the worker reports `MixedSubstrate` —
@@ -118,9 +127,17 @@ pub async fn run_substrate(
         EndpointKind::NamedPipe => {
             run_named_pipe(endpoints.clone(), cancel).await
         }
-        kind @ (EndpointKind::AlsaPcm
-        | EndpointKind::SharedMemory
-        | EndpointKind::JackPort) => Err(ByteFlowError::UnsupportedKind(kind)),
+        #[cfg(feature = "alsa-substrate")]
+        EndpointKind::AlsaPcm => {
+            crate::byte_flow_alsa::run_alsa_pcm(endpoints.clone(), cancel).await
+        }
+        #[cfg(not(feature = "alsa-substrate"))]
+        EndpointKind::AlsaPcm => {
+            Err(ByteFlowError::UnsupportedKind(EndpointKind::AlsaPcm))
+        }
+        kind @ (EndpointKind::SharedMemory | EndpointKind::JackPort) => {
+            Err(ByteFlowError::UnsupportedKind(kind))
+        }
     }
 }
 

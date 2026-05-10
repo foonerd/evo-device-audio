@@ -1,11 +1,56 @@
 # cross (https://github.com/cross-rs/cross) configuration for
 # evo-device-audio.
 #
-# Unlike evo-device-volumio, this workspace pins evo-plugin-sdk via a
-# git tag in [workspace.dependencies] rather than a path dependency.
-# No host volume needs to be mounted into the build container; cross
-# defaults handle the git-based SDK fetch.
+# This file shapes how `cross build` runs: per-target image
+# overrides and pre-build scripts. The volume mount needed
+# for the v0.1.13 path-dep on evo-core-eng (see explanation
+# below) is supplied via the CROSS_CONTAINER_OPTS environment
+# variable rather than this file's `volumes` field — see
+# scripts/cross-build.sh and DEVELOPING.md for the canonical
+# invocation.
 #
-# This file exists as a placeholder so that future cross-specific
-# settings (target-specific environment, custom images) have an
-# obvious home.
+# v0.1.13 development branch state — two reasons we need
+# Cross.toml content beyond a placeholder:
+#
+# 1. evo-plugin-sdk path-dep visibility.
+#    [workspace.dependencies] in this repo's Cargo.toml pins
+#    evo-plugin-sdk via
+#    `path = "../evo-core-eng/crates/evo-plugin-sdk"` against
+#    the sibling local clone of evo-core-eng for the
+#    duration of v0.1.13 development (substrate-current SDK
+#    types — AudioRouting, CompositionCapabilities at
+#    shape 2 — ship only on evo-core-eng's eng-line). cross
+#    auto-discovers path-dep crate directories and mounts
+#    each leaf into the container at the host-canonical path,
+#    but it does NOT mount the path-dep's workspace root.
+#    evo-plugin-sdk uses `edition.workspace = true` so cargo
+#    must walk up from
+#    `<host>/evo-core-eng/crates/evo-plugin-sdk/Cargo.toml`
+#    to `<host>/evo-core-eng/Cargo.toml` to resolve the
+#    inheritance. The CROSS_CONTAINER_OPTS env-var
+#    workaround mounts the workspace root explicitly. At
+#    v0.1.13 release-cut the SDK pin flips back to git+tag
+#    and the volume mount can be removed.
+#
+# 2. libasound2 cross-target dependency.
+#    The composition.alsa plugin's optional `alsa-substrate`
+#    Cargo feature pulls in the `alsa` crate (libasound
+#    bindings). Cross-builds for aarch64-unknown-linux-gnu
+#    therefore need libasound2-dev for the arm64 architecture
+#    inside the container. The pre-build script installs it
+#    on every fresh container start. Other targets that do
+#    not enable `alsa-substrate` are unaffected.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
+]

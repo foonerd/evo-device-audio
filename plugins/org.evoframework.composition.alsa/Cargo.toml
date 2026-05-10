@@ -11,6 +11,29 @@ description = "ALSA composition stage for the evo audio data plane. Drives the f
 [lib]
 path = "src/lib.rs"
 
+# Cargo features.
+#
+# `alsa-substrate` (off by default) pulls in the `alsa` crate
+# and enables the AlsaPcm byte-flow path. Off-by-default keeps
+# the host x86_64 dev-box build hermetic — no libasound link
+# on the rig, no system dev-bundle dependency. Cross-builds
+# for the target hardware (reference target = aarch64-unknown-linux-gnu)
+# enable the feature explicitly:
+#
+#     cross build --release --features alsa-substrate \
+#         --target aarch64-unknown-linux-gnu \
+#         -p org-evoframework-composition-alsa
+#
+# The Cross.toml at the workspace root pre-installs
+# libasound2-dev:arm64 inside the cross container so the
+# alsa crate's libasound link resolves against the same
+# libasound version the target ships. NamedPipe substrate
+# remains available regardless of feature state; the feature
+# only adds the AlsaPcm arm.
+[features]
+default = []
+alsa-substrate = ["dep:alsa", "dep:nix"]
+
 [dependencies]
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
@@ -25,6 +48,15 @@ thiserror = { workspace = true }
 # reactor + byte-flow worker tasks.
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+# Optional: ALSA PCM substrate. Linked only when the
+# `alsa-substrate` feature is on — see [features] above.
+alsa = { version = "0.10", optional = true }
+# Optional: needed to inspect ALSA error errno values
+# (alsa::Error::errno() returns nix::errno::Errno). Pulled in
+# only when alsa-substrate is enabled. nix also appears in
+# [dev-dependencies] for the FIFO test fixtures; the regular
+# dep here is independent and feature-gated.
+nix = { version = "0.30", default-features = false, features = ["fs"], optional = true }
 
 [dev-dependencies]
 # Unique tempdir per test for FIFO endpoint paths. Hermetic;

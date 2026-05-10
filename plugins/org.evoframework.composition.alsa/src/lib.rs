@@ -124,6 +124,9 @@ use crate::byte_flow::{run_substrate, ByteFlowError};
 
 mod byte_flow;
 
+#[cfg(feature = "alsa-substrate")]
+mod byte_flow_alsa;
+
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Plugin identity name (must match manifest).
@@ -641,9 +644,15 @@ fn precheck_substrate(
     }
     match endpoints.input.kind {
         EndpointKind::NamedPipe => Ok(()),
-        kind @ (EndpointKind::AlsaPcm
-        | EndpointKind::SharedMemory
-        | EndpointKind::JackPort) => Err(ByteFlowError::UnsupportedKind(kind)),
+        #[cfg(feature = "alsa-substrate")]
+        EndpointKind::AlsaPcm => Ok(()),
+        #[cfg(not(feature = "alsa-substrate"))]
+        EndpointKind::AlsaPcm => {
+            Err(ByteFlowError::UnsupportedKind(EndpointKind::AlsaPcm))
+        }
+        kind @ (EndpointKind::SharedMemory | EndpointKind::JackPort) => {
+            Err(ByteFlowError::UnsupportedKind(kind))
+        }
     }
 }
 
