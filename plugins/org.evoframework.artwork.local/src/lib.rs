@@ -281,7 +281,13 @@ mod tests {
         let m = manifest();
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.plugin.contract, 1);
-        assert_eq!(m.kind.interaction, InteractionShape::Respondent);
+        assert_eq!(
+            m.kind
+                .as_ref()
+                .expect("manifest must declare [kind]")
+                .interaction,
+            InteractionShape::Respondent
+        );
         let cap = m
             .capabilities
             .respondent

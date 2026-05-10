@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ALSA modular-pipeline composer respondent for the evo audio domain. Stocks the audio.composition shelf."
+description = "ALSA composition stage for the evo audio data plane. Drives the framework-configured CompositionEndpoints, declares typed mode list, reacts to topology rewires. Stocks the audio.composition shelf at shape 2."
 
 [lib]
 path = "src/lib.rs"

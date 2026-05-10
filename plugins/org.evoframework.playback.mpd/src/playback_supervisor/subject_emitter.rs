@@ -271,6 +271,21 @@ impl SubjectAnnouncer for NullSubjectAnnouncer {
     > {
         Box::pin(async { Ok(()) })
     }
+
+    fn update_state<'a>(
+        &'a self,
+        _: ExternalAddressing,
+        _: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::ReportError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ contract = 1
 
 [target]
 shelf = "audio.composition"
-shape = 1
+shape = 2
 
 [kind]
 instance = "singleton"
@@ -20,7 +20,7 @@ exec = "<compiled-in>"
 class = "standard"
 
 [prerequisites]
-evo_min_version = "0.1.9"
+evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 filesystem_scopes = []
@@ -36,5 +36,27 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["alsa.pipeline.compose"]
-response_budget_ms = 2000
+request_types = ["composition.select_mode"]
+response_budget_ms = 1000
+
+# Audio data plane: composition stage. The framework configures
+# CompositionEndpoints (input + output) and a negotiated
+# AudioFormat per topology; this plugin opens the endpoints,
+# drives audio bytes through them, and reacts to topology
+# rewires through a registered RouteChangeCallback. Audio bytes
+# never traverse the wire protocol or any SDK callback — they
+# flow exclusively through the OS-native primitive the
+# framework selected (ALSA loopback for the reference build).
+[capabilities.composition]
+input_kind = "audio.pcm"
+output_kind = "audio.pcm"
+default_mode = "passthrough"
+
+# Passthrough mode: byte-identical copy from input endpoint to
+# output endpoint, no transformation. Preserves bit-perfect by
+# definition. Subsequent commits layer further modes (eq_only,
+# resampler, dsd_to_pcm) onto this same plugin without
+# requiring a shape bump.
+[[capabilities.composition.modes]]
+name = "passthrough"
+preserves_bit_perfect = true

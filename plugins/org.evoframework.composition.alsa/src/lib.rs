@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Plugin identity name (must match manifest).
 pub const PLUGIN_NAME: &str = "org.evoframework.composition.alsa";
-const REQUEST_ALSA_PIPELINE_COMPOSE: &str = "alsa.pipeline.compose";
+const REQUEST_COMPOSITION_SELECT_MODE: &str = "composition.select_mode";
 const PAYLOAD_VERSION: u32 = 1;
 const DEFAULT_FINAL_ALIAS: &str = "evo_modular_pipeline";
 const INPUT_PCM_PLACEHOLDER: &str = "{{input_pcm}}";
@@ -105,7 +105,7 @@ impl Plugin for AlsaCompositionPlugin {
                 },
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec![
-                        REQUEST_ALSA_PIPELINE_COMPOSE.to_string()
+                        REQUEST_COMPOSITION_SELECT_MODE.to_string()
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -167,11 +167,11 @@ impl Respondent for AlsaCompositionPlugin {
                     "request deadline already expired".to_string(),
                 ));
             }
-            if req.request_type != REQUEST_ALSA_PIPELINE_COMPOSE {
+            if req.request_type != REQUEST_COMPOSITION_SELECT_MODE {
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
-                    [REQUEST_ALSA_PIPELINE_COMPOSE]
+                    [REQUEST_COMPOSITION_SELECT_MODE]
                 )));
             }
 
@@ -561,7 +561,7 @@ mod tests {
         p.loaded = true;
 
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload: compose_request_payload(),
             correlation_id: 1,
             deadline: None,
@@ -620,7 +620,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 11,
             deadline: None,
@@ -666,7 +666,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 12,
             deadline: None,
@@ -686,7 +686,7 @@ ctl.volumio_pipeline {\n\
         let mut p = AlsaCompositionPlugin::new();
         p.loaded = true;
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload: b"{not-json".to_vec(),
             correlation_id: 2,
             deadline: None,
@@ -728,7 +728,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 3,
             deadline: None,
@@ -754,7 +754,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 4,
             deadline: None,
@@ -781,7 +781,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 5,
             deadline: None,
@@ -816,7 +816,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 6,
             deadline: None,
@@ -851,7 +851,7 @@ ctl.volumio_pipeline {\n\
         .to_string()
         .into_bytes();
         let req = Request {
-            request_type: REQUEST_ALSA_PIPELINE_COMPOSE.to_string(),
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload,
             correlation_id: 7,
             deadline: None,

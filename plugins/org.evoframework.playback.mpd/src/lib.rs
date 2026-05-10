@@ -713,7 +713,10 @@ mod tests {
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.plugin.contract, 1);
         assert_eq!(
-            m.kind.interaction,
+            m.kind
+                .as_ref()
+                .expect("manifest must declare [kind]")
+                .interaction,
             evo_plugin_sdk::manifest::InteractionShape::Warden
         );
     }
