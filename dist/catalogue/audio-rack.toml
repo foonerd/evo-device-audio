@@ -1,0 +1,88 @@
+# Catalogue extension for the audio domain.
+#
+# Distributions admitting the evo-device-audio plugin set
+# include this rack + subjects + relation predicates in
+# their catalogue. It is NOT a complete catalogue on its
+# own — it omits `schema_version` and any framework-tier
+# rack the distribution chooses to admit alongside (e.g.
+# the validation distribution's `acceptance` rack); the
+# distribution composes a full catalogue from this and
+# whatever else it admits.
+#
+# The audio rack hosts two shelves: composition (audio
+# data plane composition stage; substrate-aware respondent)
+# and playback (warden + source for MPD-backed playback).
+# The subject + relation declarations cover the
+# subject-graph emission the audio playback warden makes
+# on every song change (track + album subjects with the
+# `album_of` relation, and its `tracks_of` inverse).
+#
+# Reference plugins that stock these shelves live in
+# `evo-device-audio/plugins/` and are admitted in-process
+# by the `evo-device-audio` steward binary
+# (`crates/evo-device-audio-distribution`). Vendor
+# distributions that swap one or more reference plugins for
+# their own implementations carry a different catalogue
+# fragment that declares the same shelves with the vendor's
+# plugin set.
+
+[[racks]]
+name = "audio"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Audio data plane reference: substrate-aware composition + \
+MPD-backed playback warden, owning the mpd-path URI scheme. \
+"""
+
+[[racks.shelves]]
+name = "composition"
+shape = 2
+description = """
+Audio data plane composition stage. Substrate-aware \
+respondent; declares typed [capabilities.composition] modes; \
+consumes LoadContext::audio_routing for endpoint resolution.
+"""
+
+[[racks.shelves]]
+name = "playback"
+shape = 1
+description = """
+Audio playback warden. Owns playback custody; handles \
+course_correct verbs; also exposes a respondent surface \
+for source-verb dispatches (play_now) targeting the \
+mpd-path URI scheme.
+"""
+
+# Subject types the audio playback warden announces on
+# every song change. The track subject is keyed by
+# `mpd-path` URI scheme; the album subject is keyed by
+# `mpd-album` and carries `"{artist}|{album}"` value form.
+[[subjects]]
+name = "track"
+
+[[subjects]]
+name = "album"
+
+# Relation predicates between the audio domain's subject
+# types. The audio playback warden asserts album_of from
+# the playing track to its album on every song change;
+# library / UI views consume the inverse tracks_of to
+# enumerate album contents.
+[[relation]]
+predicate = "album_of"
+description = "track belongs to album"
+source_type = "track"
+target_type = "album"
+source_cardinality = "at_most_one"
+target_cardinality = "many"
+inverse = "tracks_of"
+
+[[relation]]
+predicate = "tracks_of"
+description = "album contains tracks"
+source_type = "album"
+target_type = "track"
+source_cardinality = "many"
+target_cardinality = "at_most_one"
+inverse = "album_of"
