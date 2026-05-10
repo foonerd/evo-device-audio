@@ -494,6 +494,18 @@ async fn dispatch_command(
         PlaybackCommand::Previous => cmd_conn.previous().await,
         PlaybackCommand::Seek(d) => cmd_conn.seek(d).await,
         PlaybackCommand::SetVolume(v) => cmd_conn.set_volume(v).await,
+        PlaybackCommand::LoadAndPlay(path) => {
+            // Replace queue with the single supplied path
+            // and start playback. The three commands run on
+            // the same connection sequentially; if any
+            // step ACKs, the error short-circuits and the
+            // queue is left in an intermediate state — the
+            // operator-readable diagnostic carries the
+            // failing step's MPD error.
+            cmd_conn.clear().await?;
+            cmd_conn.add(&path).await?;
+            cmd_conn.play().await
+        }
     }
 }
 

@@ -190,6 +190,32 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Clear the queue. Removes every queued song;
+    /// playback stops if it was running. Used by the
+    /// source-verb dispatch path on `play_now` (which
+    /// replaces the queue with a single URI before
+    /// playing).
+    ///
+    /// Wire form: `clear\n`.
+    pub(crate) async fn clear(&mut self) -> Result<(), MpdError> {
+        self.dispatch("clear", &[]).await?;
+        Ok(())
+    }
+
+    /// Add a URI / library path to the end of the queue.
+    /// MPD's `add` accepts library-relative paths (the
+    /// `mpd-path:` URI scheme strips the prefix) and
+    /// some external URIs (HTTP / Icecast streams) when
+    /// MPD is built with the matching input plugins.
+    /// `play_now` issues `clear` then `add` then `play`
+    /// to replace the queue with a single URI.
+    ///
+    /// Wire form: `add "<path>"\n`.
+    pub(crate) async fn add(&mut self, path: &str) -> Result<(), MpdError> {
+        self.dispatch("add", &[path]).await?;
+        Ok(())
+    }
+
     /// Skip to the next song in the queue.
     ///
     /// Wire form: `next\n`. If the queue has no next song MPD may
