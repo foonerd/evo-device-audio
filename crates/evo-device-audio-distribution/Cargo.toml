@@ -1,0 +1,54 @@
+[package]
+name = "evo-device-audio-distribution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference audio-domain steward binary for the evo framework. Composes the evo-core steward with the evo-device-audio plugin set in-process, producing a single binary that the validation distribution + downstream vendor distributions can deploy or extend."
+
+[[bin]]
+name = "evo-device-audio"
+path = "src/main.rs"
+
+[dependencies]
+# The evo-core steward crate provides `evo::run` (the boot
+# entrypoint), `AdmissionEngine` (in-process plugin admission
+# surface), `StewardConfig` (the parsed `evo.toml`), and
+# `cli::Args` (CLI parser). The evo-plugin-sdk path-dep on
+# the workspace gives us the `Manifest` type for in-process
+# admission.
+evo = { path = "../../../evo-core-eng/crates/evo" }
+evo-plugin-sdk = { workspace = true }
+
+# Audio plugin set this distribution links in-process. Each
+# plugin crate exports its public Plugin type and the
+# embedded `MANIFEST_TOML` constant; the distribution's
+# admission setup parses each manifest and admits the plugin.
+# Reshape progress: composition.alsa (chunks A-E, substrate-
+# aware composition stage) and playback.mpd (F1+F2,
+# warden + source + respondent surfaces) are the v0.1.13
+# baseline; the remaining plugins (metadata.local /
+# artwork.local / network.nm) join as their reshape lands.
+org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
+org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
+
+# Async runtime and CLI parser surfaces shared with the
+# steward.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+
+[features]
+default = []
+# Cross-builds for target hardware (reference target / aarch64) enable
+# this feature to pull in the libasound-backed AlsaPcm
+# substrate path inside composition.alsa. Native dev-rig
+# builds run without the feature; AlsaPcm endpoints surface
+# as Unsupported and the NamedPipe substrate covers byte-
+# flow. See the plugin's Cargo.toml for the feature
+# definition.
+alsa-substrate = ["org-evoframework-composition-alsa/alsa-substrate"]
+
+[lints]
+workspace = true
