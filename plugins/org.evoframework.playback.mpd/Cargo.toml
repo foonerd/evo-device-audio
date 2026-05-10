@@ -27,6 +27,10 @@ toml = "0.8"
 [dev-dependencies]
 # Extra tokio features only needed by tests (duplex streams, test-util utilities).
 tokio = { workspace = true, features = ["test-util"] }
+# Test-mock impls of `SubjectAnnouncer::update_state` need `serde_json::Value`.
+# Production code does not handle JSON state directly; only the capturing /
+# null mocks under `#[cfg(test)]` reference the type.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

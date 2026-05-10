@@ -32,13 +32,19 @@ repository = "https://github.com/foonerd/evo-device-audio"
 # across the plugin population; individual crates pay only for what
 # they actually import.
 #
-# Pinned at evo-core's v0.1.12 release (the latest stable tag on
-# public foonerd/evo-core after the eng/public squash-and-promote
-# split). Earlier rc tags are not promoted — only the GA cuts
-# v0.1.10, v0.1.11, v0.1.12 exist on the public repo. Bumping the
-# pin here is the only place this project follows the framework.
+# v0.1.13 development branch: the SDK substrate this branch
+# reshapes plugins against (typed audio data plane, AudioRouting
+# trait, CompositionCapabilities at shape 2, etc.) ships in
+# evo-core-eng's eng-line and has not yet been promoted to a
+# public evo-core release. The pin therefore points at the
+# sibling local clone of evo-core-eng for the duration of v0.1.13
+# development. At v0.1.13 release-cut, evo-core publishes the
+# substrate as a public tag and this pin flips back to
+# `git = "...evo-core.git", tag = "v0.1.13"` before the branch
+# merges to main. main branch on this repo continues to pin
+# v0.1.12 (the current public release) until that flip.
 [workspace.dependencies]
-evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.12" }
+evo-plugin-sdk = { path = "../evo-core-eng/crates/evo-plugin-sdk" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }

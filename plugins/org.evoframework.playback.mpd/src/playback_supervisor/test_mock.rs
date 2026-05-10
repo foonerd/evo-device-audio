@@ -208,6 +208,15 @@ impl SubjectAnnouncer for CapturingSubjectAnnouncer {
             Ok(())
         })
     }
+
+    fn update_state<'a>(
+        &'a self,
+        _addressing: ExternalAddressing,
+        _state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// [`RelationAnnouncer`] double that records every `assert` and

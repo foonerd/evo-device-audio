@@ -268,7 +268,13 @@ mod tests {
             .request_types
             .iter()
             .any(|s| s == REQUEST_METADATA_QUERY));
-        assert_eq!(m.kind.interaction, InteractionShape::Respondent);
+        assert_eq!(
+            m.kind
+                .as_ref()
+                .expect("manifest must declare [kind]")
+                .interaction,
+            InteractionShape::Respondent
+        );
     }
 
     #[tokio::test]
