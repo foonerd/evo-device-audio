@@ -142,6 +142,24 @@ const DEFAULT_MPD_HOST: &str = "127.0.0.1";
 /// Default MPD TCP port (matches MPD's upstream default).
 const DEFAULT_MPD_PORT: u16 = 6600;
 
+/// Course-correction verbs the warden honours. Kept in
+/// lockstep with `manifest.toml`'s
+/// `[capabilities.warden].course_correct_verbs` entries
+/// and with the `audio.playback` shape v1 schema-of-record;
+/// admission would refuse a mismatch between the runtime's
+/// declared list and the manifest's. The
+/// `manifest_course_correct_verbs_match_runtime` test
+/// enforces the lockstep.
+const COURSE_CORRECT_VERBS: &[&str] = &[
+    "play",
+    "pause",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+];
+
 /// Parse the embedded manifest into a [`Manifest`] struct.
 ///
 /// Panics if the embedded manifest fails to parse. Such a failure
@@ -400,7 +418,10 @@ impl Plugin for MpdPlaybackPlugin {
                     request_types: vec![],
                     accepts_custody: true,
                     flags: Default::default(),
-                    course_correct_verbs: Vec::new(),
+                    course_correct_verbs: COURSE_CORRECT_VERBS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),
@@ -719,6 +740,49 @@ mod tests {
                 .interaction,
             evo_plugin_sdk::manifest::InteractionShape::Warden
         );
+    }
+
+    #[test]
+    fn manifest_course_correct_verbs_match_runtime() {
+        let m = manifest();
+        let warden = m
+            .capabilities
+            .warden
+            .as_ref()
+            .expect("manifest must declare [capabilities.warden]");
+        let manifest_verbs: Vec<&str> = warden
+            .course_correct_verbs
+            .as_ref()
+            .expect(
+                "manifest must declare \
+                 [capabilities.warden].course_correct_verbs",
+            )
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // Round-trip: every const-table verb appears in
+        // the manifest, and every manifest verb appears
+        // in the const table. Drift between these two is
+        // caught here at unit-test time rather than at
+        // admission.
+        for declared in COURSE_CORRECT_VERBS {
+            assert!(
+                manifest_verbs.contains(declared),
+                "COURSE_CORRECT_VERBS entry {:?} missing from \
+                 manifest verbs {:?}",
+                declared,
+                manifest_verbs
+            );
+        }
+        for verb in &manifest_verbs {
+            assert!(
+                COURSE_CORRECT_VERBS.contains(verb),
+                "manifest verb {:?} missing from \
+                 COURSE_CORRECT_VERBS {:?}",
+                verb,
+                COURSE_CORRECT_VERBS
+            );
+        }
     }
 
     #[tokio::test]

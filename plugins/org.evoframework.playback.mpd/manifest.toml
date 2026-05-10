@@ -20,7 +20,7 @@ exec = "<compiled-in>"
 class = "standard"
 
 [prerequisites]
-evo_min_version = "0.1.9"
+evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 filesystem_scopes = []
@@ -40,3 +40,17 @@ custody_domain = "playback"
 custody_exclusive = true
 course_correction_budget_ms = 1000
 custody_failure_mode = "abort"
+# course_correct verb set the warden honours. The framework
+# refuses any verb not in this list at the router boundary
+# before the warden's `course_correct` body is invoked.
+# Mirrors the audio.playback shape v1 contract; the runtime
+# constants in src/lib.rs hold the same list verbatim.
+course_correct_verbs = [
+    "play",
+    "pause",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+]
