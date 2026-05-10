@@ -702,6 +702,21 @@ The framework runtime does NOT consume the schemas at admission — the steward 
 
 Once `evo-plugin-tool validate-shelf-schema` ships in evo-core v0.1.12, the audio reference's CI workflow adds a step that validates each plugin's manifest against the pinned schemas-repo version. The check runs on every PR and gates merge.
 
+## Cross-compiling for the target hardware
+
+reference target (`aarch64-unknown-linux-gnu`) and other non-host targets cross-compile via the [`cross`](https://github.com/cross-rs/cross) crate, configured by the workspace's `Cross.toml`. During active development the workspace pins `evo-plugin-sdk` via a path dep on the sibling `evo-core-eng` clone; cross-rs auto-mounts each path-dep crate directory but does not mount the path-dep's workspace root, so cargo's `edition.workspace = true` inheritance walk fails. The workaround is the `scripts/cross-build.sh` wrapper, which sets `CROSS_CONTAINER_OPTS` to mount the eng-line workspace root explicitly:
+
+```sh
+scripts/cross-build.sh aarch64-unknown-linux-gnu \
+    --release \
+    --features alsa-substrate \
+    -p org-evoframework-composition-alsa
+```
+
+The `alsa-substrate` Cargo feature (off by default) pulls in the `alsa` crate; cross-builds enabling it install `libasound2-dev:$CROSS_DEB_ARCH` inside the container via `Cross.toml`'s `pre-build`. The dev-rig (Ubuntu 24.04 host) does not need libasound installed; native `cargo build` / `cargo test` runs without the feature and the `alsa-substrate` code is excluded from the build.
+
+At the release-cut, the SDK pin flips back to a `git+tag` form, the path-dep workaround is no longer needed, and `scripts/cross-build.sh` becomes a thin convenience wrapper.
+
 ## Upgrading the evo-core pin
 
 1.  Verify the new evo-core tag is green (`cargo test --workspace` in evo-core).
