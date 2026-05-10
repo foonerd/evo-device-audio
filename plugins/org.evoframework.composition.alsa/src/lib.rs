@@ -73,11 +73,27 @@
 //! routing-side callback so the framework drops its
 //! reference, and only then forgets the routing handle.
 //!
-//! ## What this chunk does NOT yet implement
+//! ## Byte-flow worker
 //!
-//! - The byte-flow worker that drives the OS-native
-//!   primitives (chunk D lands the ALSA loopback worker
-//!   that reads the endpoint snapshots and pumps frames).
+//! Alongside the reactor, the plugin spawns a byte-flow
+//! worker that consumes the endpoint snapshot stream the
+//! reactor publishes. On every snapshot, the worker tears
+//! down any previous substrate, opens the OS-native
+//! primitives the framework configured for the new
+//! endpoint pair, and runs the substrate's pump loop until
+//! the next snapshot, an unrecoverable substrate error, or
+//! shutdown. Worker status (`Idle` / `Running { kind }` /
+//! `Failed { reason }` / `Unsupported { kind }`) is
+//! published to a watch channel so observability surfaces
+//! and tests can render the current substrate state.
+//!
+//! This build implements the `EndpointKind::NamedPipe`
+//! substrate (filesystem FIFOs read+written via tokio
+//! async I/O). The `EndpointKind::AlsaPcm` substrate lands
+//! in the next chunk together with the libasound link and
+//! reference target cross-compile + real-hardware verification.
+//! `SharedMemory` and `JackPort` substrates are vendor-
+//! distribution territory and report as unsupported.
 //!
 //! [`AudioFormat`]: evo_plugin_sdk::audio::AudioFormat
 //! [`CompositionEndpoints`]: evo_plugin_sdk::contract::audio_routing::CompositionEndpoints
@@ -91,8 +107,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::audio_routing::{
-    AudioRouting, AudioRoutingError, CompositionEndpoints, RouteChange,
-    RouteChangeCallback,
+    AudioRouting, AudioRoutingError, CompositionEndpoints, EndpointKind,
+    RouteChange, RouteChangeCallback,
 };
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
@@ -103,6 +119,10 @@ use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
+
+use crate::byte_flow::{run_substrate, ByteFlowError};
+
+mod byte_flow;
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -155,6 +175,51 @@ pub struct AlsaCompositionPlugin {
     /// after `Plugin::unload`, and after a test path that
     /// stops at `install_routing`.
     reactor: Option<ReactorHandle>,
+    /// Byte-flow worker handle. `Some` while the worker
+    /// task is running. Spawned on load (after the
+    /// reactor) and stopped on unload (before the reactor).
+    worker: Option<WorkerHandle>,
+}
+
+/// Byte-flow worker status. Published to the worker's
+/// watch channel for observability surfaces and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// No topology — no substrate is open.
+    Idle,
+    /// Substrate is running; pump is active. `kind` is the
+    /// homogeneous substrate kind (input.kind ==
+    /// output.kind for passthrough mode).
+    Running {
+        /// Substrate kind currently driving the pump.
+        kind: EndpointKind,
+    },
+    /// Substrate exited with an error. The worker waits
+    /// for the next route change to retry. `reason`
+    /// carries the structured error message from
+    /// [`ByteFlowError::Display`](crate::byte_flow::ByteFlowError).
+    Failed {
+        /// Operator-readable failure reason carrying the
+        /// underlying [`ByteFlowError`] message.
+        reason: String,
+    },
+    /// Substrate kind declared by the framework is not
+    /// implemented in this build. Same recovery semantics
+    /// as `Failed`; the worker stays in this state until
+    /// the next route change.
+    Unsupported {
+        /// Endpoint substrate kind the framework selected.
+        kind: EndpointKind,
+    },
+}
+
+/// Handle on the byte-flow worker task. Owns the shutdown
+/// signal, the join handle, and the receiver-end of the
+/// worker-status channel.
+struct WorkerHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+    status_rx: watch::Receiver<WorkerStatus>,
 }
 
 /// Handle on the reactor task spawned at load. Owns the
@@ -184,7 +249,16 @@ impl AlsaCompositionPlugin {
             audio_routing: None,
             requests_handled: 0,
             reactor: None,
+            worker: None,
         }
+    }
+
+    /// Subscribe to the byte-flow worker's status channel.
+    /// Returns `None` when no worker is running.
+    pub fn subscribe_worker_status(
+        &self,
+    ) -> Option<watch::Receiver<WorkerStatus>> {
+        self.worker.as_ref().map(|w| w.status_rx.clone())
     }
 
     /// Subscribe to endpoint snapshots produced by the
@@ -322,6 +396,49 @@ impl AlsaCompositionPlugin {
         Ok(())
     }
 
+    /// Spawn the byte-flow worker task. Must be called
+    /// after [`Self::spawn_reactor`] succeeds — the worker
+    /// subscribes to the reactor's endpoint snapshot
+    /// channel.
+    async fn spawn_worker(&mut self) -> Result<(), PluginError> {
+        debug_assert!(
+            self.reactor.is_some(),
+            "spawn_worker called before spawn_reactor"
+        );
+        debug_assert!(
+            self.worker.is_none(),
+            "spawn_worker called while a worker is already running"
+        );
+
+        let endpoints_rx = self
+            .reactor
+            .as_ref()
+            .expect("reactor populated")
+            .endpoints_rx
+            .clone();
+        let (status_tx, status_rx) = watch::channel(WorkerStatus::Idle);
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            run_worker(endpoints_rx, task_shutdown, status_tx).await;
+        });
+
+        self.worker = Some(WorkerHandle {
+            task,
+            shutdown,
+            status_rx,
+        });
+        Ok(())
+    }
+
+    /// Wind down the byte-flow worker task. Idempotent.
+    async fn stop_worker(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+    }
+
     /// Wind down the reactor task and clear the
     /// route-change callback. Idempotent — calling on a
     /// plugin without an active reactor is a no-op.
@@ -354,6 +471,179 @@ impl AlsaCompositionPlugin {
             .as_ref()
             .map(|r| r.refresh_count.load(std::sync::atomic::Ordering::SeqCst))
             .unwrap_or(0)
+    }
+}
+
+/// Byte-flow worker loop. Subscribes to the reactor's
+/// endpoint snapshot channel; on each new snapshot, runs
+/// the substrate appropriate to the endpoint kind until
+/// the next snapshot, an unrecoverable substrate error,
+/// or shutdown. Worker status is published to the watch
+/// channel for observability.
+///
+/// The worker spawns each substrate run as its own
+/// sub-task with a cancel signal so endpoint changes can
+/// preempt an in-flight pump cleanly: the worker fires
+/// cancel and awaits the run task before opening the next
+/// substrate, avoiding double-open of the same path.
+async fn run_worker(
+    mut endpoints_rx: watch::Receiver<Option<CompositionEndpoints>>,
+    shutdown: Arc<Notify>,
+    status_tx: watch::Sender<WorkerStatus>,
+) {
+    loop {
+        // The borrow_and_update marks the current value as
+        // seen so a subsequent `changed()` only fires for
+        // the next publication.
+        let snapshot = endpoints_rx.borrow_and_update().clone();
+
+        let outcome = match snapshot {
+            None => {
+                let _ = status_tx.send(WorkerStatus::Idle);
+                wait_for_next_event(&mut endpoints_rx, &shutdown).await
+            }
+            Some(endpoints) => {
+                run_substrate_lifecycle(
+                    endpoints,
+                    &mut endpoints_rx,
+                    Arc::clone(&shutdown),
+                    &status_tx,
+                )
+                .await
+            }
+        };
+
+        if matches!(outcome, EventOutcome::Shutdown) {
+            return;
+        }
+    }
+}
+
+/// Outcome of a wait inside the worker loop. Drives the
+/// outer loop's decision to continue or terminate.
+enum EventOutcome {
+    /// Endpoint snapshot changed (or the channel closed —
+    /// treated identically).
+    EndpointChanged,
+    /// Shutdown was signalled.
+    Shutdown,
+}
+
+/// Wait for the next worker event: either the endpoint
+/// snapshot changes (or the channel closes) or shutdown
+/// is signalled. Returns the outcome so the outer loop
+/// knows whether to terminate.
+async fn wait_for_next_event(
+    endpoints_rx: &mut watch::Receiver<Option<CompositionEndpoints>>,
+    shutdown: &Notify,
+) -> EventOutcome {
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => EventOutcome::Shutdown,
+        _ = endpoints_rx.changed() => EventOutcome::EndpointChanged,
+    }
+}
+
+/// Run a single substrate lifecycle: spawn the substrate
+/// run task, wait for run-completion / endpoint-change /
+/// shutdown, signal cancel, and drain the run task. On
+/// return, the outer worker loop picks up the next
+/// snapshot.
+async fn run_substrate_lifecycle(
+    endpoints: CompositionEndpoints,
+    endpoints_rx: &mut watch::Receiver<Option<CompositionEndpoints>>,
+    shutdown: Arc<Notify>,
+    status_tx: &watch::Sender<WorkerStatus>,
+) -> EventOutcome {
+    // Pre-flight: reject a snapshot whose substrate kind
+    // is not implemented. The worker stays in the
+    // Unsupported state and waits for the next route
+    // change.
+    if let Err(ByteFlowError::UnsupportedKind(kind)) =
+        precheck_substrate(&endpoints)
+    {
+        let _ = status_tx.send(WorkerStatus::Unsupported { kind });
+        return wait_for_next_event(endpoints_rx, &shutdown).await;
+    }
+    if let Err(ByteFlowError::MixedSubstrate { input, output }) =
+        precheck_substrate(&endpoints)
+    {
+        let _ = status_tx.send(WorkerStatus::Failed {
+            reason: format!(
+                "input/output substrate kinds differ: input={input:?} output={output:?}"
+            ),
+        });
+        return wait_for_next_event(endpoints_rx, &shutdown).await;
+    }
+
+    let kind = endpoints.input.kind;
+    let _ = status_tx.send(WorkerStatus::Running { kind });
+
+    let cancel = Arc::new(Notify::new());
+    let cancel_for_run = Arc::clone(&cancel);
+    let endpoints_for_run = endpoints.clone();
+    let mut run_handle = tokio::spawn(async move {
+        run_substrate(&endpoints_for_run, cancel_for_run).await
+    });
+
+    tokio::select! {
+        biased;
+        _ = shutdown.notified() => {
+            cancel.notify_one();
+            let _ = (&mut run_handle).await;
+            EventOutcome::Shutdown
+        }
+        res = endpoints_rx.changed() => {
+            cancel.notify_one();
+            let _ = (&mut run_handle).await;
+            if res.is_err() {
+                EventOutcome::Shutdown
+            } else {
+                EventOutcome::EndpointChanged
+            }
+        }
+        result = &mut run_handle => {
+            match result {
+                Ok(Ok(())) => {
+                    let _ = status_tx.send(WorkerStatus::Idle);
+                }
+                Ok(Err(e)) => {
+                    let _ = status_tx.send(WorkerStatus::Failed {
+                        reason: e.to_string(),
+                    });
+                }
+                Err(join_err) => {
+                    let _ = status_tx.send(WorkerStatus::Failed {
+                        reason: format!(
+                            "substrate task panicked: {join_err}"
+                        ),
+                    });
+                }
+            }
+            wait_for_next_event(endpoints_rx, &shutdown).await
+        }
+    }
+}
+
+/// Inspect the snapshot for substrate kinds the worker
+/// declines to attempt and for input/output kind mismatch.
+/// Returns `Ok(())` for kinds the worker will drive; the
+/// `Err` variants let the caller publish the appropriate
+/// status without spawning a substrate task.
+fn precheck_substrate(
+    endpoints: &CompositionEndpoints,
+) -> Result<(), ByteFlowError> {
+    if endpoints.input.kind != endpoints.output.kind {
+        return Err(ByteFlowError::MixedSubstrate {
+            input: endpoints.input.kind,
+            output: endpoints.output.kind,
+        });
+    }
+    match endpoints.input.kind {
+        EndpointKind::NamedPipe => Ok(()),
+        kind @ (EndpointKind::AlsaPcm
+        | EndpointKind::SharedMemory
+        | EndpointKind::JackPort) => Err(ByteFlowError::UnsupportedKind(kind)),
     }
 }
 
@@ -443,7 +733,8 @@ impl Plugin for AlsaCompositionPlugin {
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
             self.install_routing(ctx.audio_routing.clone())?;
-            self.spawn_reactor().await
+            self.spawn_reactor().await?;
+            self.spawn_worker().await
         }
     }
 
@@ -451,6 +742,11 @@ impl Plugin for AlsaCompositionPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            // Stop worker first — it consumes the
+            // reactor's snapshot channel; tearing the
+            // reactor down before the worker would race
+            // the worker against a closed channel.
+            self.stop_worker().await;
             self.stop_reactor().await;
             self.audio_routing = None;
             self.loaded = false;
@@ -1053,6 +1349,223 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "unload must drain the reactor quickly; took {elapsed:?}"
         );
+        assert!(p.reactor.is_none());
+    }
+
+    // -- Chunk D: byte-flow worker -------------------------------------
+
+    use super::test_support::{make_fifo_pair, named_pipe_endpoints};
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Wait until the worker's status channel reports a
+    /// state matching the predicate. Bounded so a wedged
+    /// worker doesn't hang CI.
+    async fn wait_for_worker_status<F>(
+        rx: &mut watch::Receiver<WorkerStatus>,
+        deadline_ms: u64,
+        mut predicate: F,
+    ) -> WorkerStatus
+    where
+        F: FnMut(&WorkerStatus) -> bool,
+    {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(deadline_ms);
+        // Check current value first so the test doesn't
+        // stall waiting for a change that already
+        // happened.
+        if predicate(&rx.borrow()) {
+            return rx.borrow().clone();
+        }
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "worker did not reach the expected status within \
+                     {deadline_ms}ms; current = {:?}",
+                    rx.borrow()
+                );
+            }
+            tokio::select! {
+                _ = rx.changed() => {
+                    if predicate(&rx.borrow()) {
+                        return rx.borrow().clone();
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// Concurrently open the test side of a FIFO pair —
+    /// writer on input (test acts as upstream source),
+    /// reader on output (test acts as downstream
+    /// delivery). Both opens are async and the FIFO open
+    /// path blocks until both ends connect, so the worker
+    /// must already be on its way to opening the other
+    /// ends.
+    async fn open_test_fifo_sides(
+        input_path: PathBuf,
+        output_path: PathBuf,
+    ) -> (tokio::fs::File, tokio::fs::File) {
+        let mut write_opts = tokio::fs::OpenOptions::new();
+        write_opts.write(true);
+        let mut read_opts = tokio::fs::OpenOptions::new();
+        read_opts.read(true);
+        let writer_fut = write_opts.open(input_path);
+        let reader_fut = read_opts.open(output_path);
+        let (writer, reader) = tokio::join!(writer_fut, reader_fut);
+        (
+            writer.expect("test-side open input fifo"),
+            reader.expect("test-side open output fifo"),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_idle_when_topology_absent() {
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_worker().await.unwrap();
+
+        let mut rx = p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut rx, 500, |s| {
+            matches!(s, WorkerStatus::Idle)
+        })
+        .await;
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_unsupported_when_substrate_kind_unimplemented() {
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        // Default ALSA endpoints point at AlsaPcm — not
+        // implemented in chunk D. Worker must publish
+        // Unsupported, not Failed or Running.
+        stub.set_endpoints(crate::test_support::default_alsa_endpoints());
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_worker().await.unwrap();
+
+        let mut rx = p.subscribe_worker_status().expect("worker running");
+        let status = wait_for_worker_status(&mut rx, 500, |s| {
+            matches!(s, WorkerStatus::Unsupported { .. })
+        })
+        .await;
+        match status {
+            WorkerStatus::Unsupported { kind } => {
+                assert_eq!(kind, EndpointKind::AlsaPcm);
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_running_when_named_pipe_substrate_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_path, output_path) = make_fifo_pair(dir.path());
+
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        stub.set_endpoints(named_pipe_endpoints(
+            input_path.clone(),
+            output_path.clone(),
+        ));
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_worker().await.unwrap();
+
+        // Connect the test sides; the worker is already
+        // attempting to open its sides.
+        let (mut writer, mut reader) =
+            open_test_fifo_sides(input_path, output_path).await;
+
+        let mut status_rx =
+            p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut status_rx, 500, |s| {
+            matches!(
+                s,
+                WorkerStatus::Running {
+                    kind: EndpointKind::NamedPipe
+                }
+            )
+        })
+        .await;
+
+        // Pump a frame through and assert byte-identical
+        // delivery on the output.
+        let payload: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        writer.write_all(&payload).await.expect("write payload");
+        writer.flush().await.expect("flush payload");
+
+        let mut received = [0u8; 8];
+        reader
+            .read_exact(&mut received)
+            .await
+            .expect("read echoed payload");
+        assert_eq!(payload, received);
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_failed_on_mixed_substrate_kinds() {
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        // Build a deliberately mismatched endpoint pair:
+        // input AlsaPcm, output NamedPipe. Passthrough
+        // mode requires homogeneous substrate.
+        let mut endpoints = crate::test_support::default_alsa_endpoints();
+        endpoints.output.kind = EndpointKind::NamedPipe;
+        stub.set_endpoints(endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_worker().await.unwrap();
+
+        let mut rx = p.subscribe_worker_status().expect("worker running");
+        let status = wait_for_worker_status(&mut rx, 500, |s| {
+            matches!(s, WorkerStatus::Failed { .. })
+        })
+        .await;
+        match status {
+            WorkerStatus::Failed { reason } => {
+                assert!(
+                    reason.contains("substrate kinds differ"),
+                    "expected mixed-substrate diagnostic, got {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_terminates_promptly_on_unload() {
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_worker().await.unwrap();
+
+        let mut rx = p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut rx, 500, |s| {
+            matches!(s, WorkerStatus::Idle)
+        })
+        .await;
+
+        let started = std::time::Instant::now();
+        p.unload().await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "unload must drain the worker quickly; took {elapsed:?}"
+        );
+        assert!(p.worker.is_none());
         assert!(p.reactor.is_none());
     }
 }

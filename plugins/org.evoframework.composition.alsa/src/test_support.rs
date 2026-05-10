@@ -16,7 +16,7 @@
 //! tests that exercise route-change reactions
 //! (chunk C onwards).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
@@ -25,6 +25,8 @@ use evo_plugin_sdk::contract::audio_routing::{
     EndpointKind, ReadEndpoint, RouteChange, RouteChangeCallback,
     WriteEndpoint,
 };
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 
 /// Inner state guarded by a single mutex so the stub stays
 /// `Send + Sync` per the trait's bound.
@@ -180,4 +182,47 @@ pub(crate) fn route_change(new_format: AudioFormat) -> RouteChange {
 #[allow(dead_code)]
 pub(crate) fn as_routing_arc(stub: StubAudioRouting) -> Arc<dyn AudioRouting> {
     Arc::new(stub)
+}
+
+/// Create a FIFO pair for NamedPipe substrate testing.
+/// Returns `(input_fifo_path, output_fifo_path)` inside
+/// the supplied directory. Both FIFOs are created with
+/// mode 0o600.
+#[allow(dead_code)]
+pub(crate) fn make_fifo_pair(dir: &Path) -> (PathBuf, PathBuf) {
+    let input_path = dir.join("input.fifo");
+    let output_path = dir.join("output.fifo");
+    mkfifo(&input_path, Mode::S_IRUSR | Mode::S_IWUSR).expect("mkfifo input");
+    mkfifo(&output_path, Mode::S_IRUSR | Mode::S_IWUSR).expect("mkfifo output");
+    (input_path, output_path)
+}
+
+/// Build a NamedPipe-substrate [`CompositionEndpoints`]
+/// pair for the supplied paths and a typical 44.1 kHz
+/// stereo s16le PCM format. Tests that need a different
+/// format build the endpoints struct directly.
+#[allow(dead_code)]
+pub(crate) fn named_pipe_endpoints(
+    input_path: PathBuf,
+    output_path: PathBuf,
+) -> CompositionEndpoints {
+    let format = AudioFormat::Pcm {
+        codec: PcmCodec::PcmS16Le,
+        rate_hz: 44_100,
+        channels: 2,
+    };
+    CompositionEndpoints {
+        input: ReadEndpoint {
+            kind: EndpointKind::NamedPipe,
+            path: input_path,
+            format: format.clone(),
+            buffer_frames: 1024,
+        },
+        output: WriteEndpoint {
+            kind: EndpointKind::NamedPipe,
+            path: output_path,
+            format,
+            buffer_frames: 1024,
+        },
+    }
 }

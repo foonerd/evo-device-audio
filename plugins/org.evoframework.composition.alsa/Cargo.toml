@@ -16,8 +16,25 @@ evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# Structured byte-flow error variants returned from the
+# substrate workers, surfaced to the operator-readable
+# worker status channel.
+thiserror = { workspace = true }
+# `tokio::sync::watch`, `Notify`, async file I/O for the
+# substrate worker, and `tokio::spawn` for the route-change
+# reactor + byte-flow worker tasks.
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Unique tempdir per test for FIFO endpoint paths. Hermetic;
+# no test fixture lingers across runs.
+tempfile = { workspace = true }
+# `nix::unistd::mkfifo` is the only Unix syscall the test
+# fixtures need; pulling in `nix` rather than rolling
+# `unsafe { libc::mkfifo }` keeps `#![forbid(unsafe_code)]`
+# on the plugin's source intact.
+nix = { version = "0.30", default-features = false, features = ["fs"] }
 
 [lints]
 workspace = true
