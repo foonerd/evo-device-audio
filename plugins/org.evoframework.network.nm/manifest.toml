@@ -51,5 +51,6 @@ request_types = [
     "network.nm.flight_mode.set",
     "network.nm.radio.status",
     "network.nm.radio.set",
+    "network.nm.supervisor.status",
 ]
 response_budget_ms = 15000
