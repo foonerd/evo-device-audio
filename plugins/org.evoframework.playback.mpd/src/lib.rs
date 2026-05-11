@@ -140,6 +140,7 @@ use crate::mpd_fragment::{
 };
 use crate::mpd_restart::{
     AutoMpdRestarter, MpdRestarter, SudoSystemctlRestarter,
+    INTENT_MPD_FRAGMENT_WRITE, INTENT_MPD_SYSTEMCTL_RESTART,
 };
 use crate::playback_supervisor::{
     PlaybackCommand, PlaybackError, SubjectEmitter, SupervisorHandle,
@@ -910,6 +911,79 @@ fn playback_error_to_plugin_error(e: PlaybackError) -> PluginError {
 }
 
 impl Plugin for MpdPlaybackPlugin {
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        use evo_plugin_sdk::privileges::{
+            AccessMode, FilesystemAccessProbe, ProbePlan, SudoersCommandProbe,
+        };
+
+        let mut plans: Vec<ProbePlan> = Vec::with_capacity(2);
+
+        // mpd_systemctl_restart — strategy depends on EUID:
+        // root → DirectSystemctlRestarter (no sudo); non-root →
+        // SudoSystemctlRestarter (NOPASSWD sudo). When running
+        // as root, probing `sudo -l -n` is misleading (root can
+        // sudo anything), so we synthesise an Available
+        // resolution via a BinaryPresentProbe on systemctl. When
+        // non-root, we probe the sudoers entry directly.
+        let systemctl_bin = std::env::var("EVO_SYSTEMCTL")
+            .unwrap_or_else(|_| "/usr/bin/systemctl".to_string());
+        // Reuse the plugin's existing EUID detector
+        // (`/proc/self/status` on Linux, `EVO_RUNTIME_USER`
+        // elsewhere) so the probe-side strategy hint and the
+        // legacy fallback path observe identical mechanics.
+        let needs_sudo = crate::mpd_restart::process_needs_sudo();
+        if !needs_sudo {
+            plans.push(ProbePlan {
+                intent_id: INTENT_MPD_SYSTEMCTL_RESTART.to_string(),
+                probe: Box::new(
+                    evo_plugin_sdk::privileges::BinaryPresentProbe::new(
+                        systemctl_bin.clone(),
+                    ),
+                ),
+                strategy_hint: Some("direct".to_string()),
+                remedy: format!(
+                    "install systemd ({systemctl_bin} not on PATH); MPD \
+                     restart leg disabled until present"
+                ),
+            });
+        } else if let Some(probe) =
+            SudoersCommandProbe::new([systemctl_bin.as_str(), "restart", "mpd"])
+        {
+            plans.push(ProbePlan {
+                intent_id: INTENT_MPD_SYSTEMCTL_RESTART.to_string(),
+                probe: Box::new(probe),
+                strategy_hint: Some("sudo".to_string()),
+                remedy: format!(
+                    "install the distribution bootstrap sudoers drop-in \
+                     granting NOPASSWD `{systemctl_bin} restart mpd` to the \
+                     steward service user"
+                ),
+            });
+        }
+
+        // mpd_fragment_write — checks write access on the fragment
+        // path the worker will emit to. No strategy hint: the
+        // worker treats the resolution as Available / Unavailable
+        // and publishes FragmentWorkerStatus::Failed when the path
+        // is unwritable.
+        plans.push(ProbePlan {
+            intent_id: INTENT_MPD_FRAGMENT_WRITE.to_string(),
+            probe: Box::new(FilesystemAccessProbe::new(
+                &self.fragment_path,
+                AccessMode::Writable,
+            )),
+            strategy_hint: None,
+            remedy: format!(
+                "ensure {} (and its parent directory) is writable by the \
+                 steward service user; run the distribution bootstrap to \
+                 chown /etc/evo to the service user",
+                self.fragment_path.display()
+            ),
+        });
+
+        plans
+    }
+
     fn describe(&self) -> impl Future<Output = PluginDescription> + Send + '_ {
         async move {
             PluginDescription {
