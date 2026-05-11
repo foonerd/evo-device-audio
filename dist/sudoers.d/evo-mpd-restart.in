@@ -1,0 +1,30 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-mpd-restart with mode 0440,
+# owned root:root.
+#
+# Allows the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) to invoke
+# the exact MPD-restart command via sudo without password.
+# This is the narrowest possible NOPASSWD scope: one binary
+# path, one verb, one unit name — no `ALL`, no wildcards.
+#
+# Path discipline: the binary path MUST match
+# `Environment=EVO_SYSTEMCTL=...` in the steward's systemd
+# drop-in. Plugin code reads `EVO_SYSTEMCTL` at runtime;
+# sudo matches against this string verbatim; the two must
+# stay aligned or sudo refuses with `Sorry, user X is not
+# allowed to execute /usr/bin/systemctl restart mpd`.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh --install-mpd-sudoers
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-mpd-restart.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-mpd-restart
+#
+# `visudo -c -f /etc/sudoers.d/evo-mpd-restart` verifies
+# syntactically valid sudoers.
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/bin/systemctl restart mpd
