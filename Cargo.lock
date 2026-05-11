@@ -713,6 +713,7 @@ dependencies = [
  "ciborium",
  "evo-coalesce-labels",
  "jsonschema",
+ "nix",
  "once_cell",
  "regex",
  "semver",

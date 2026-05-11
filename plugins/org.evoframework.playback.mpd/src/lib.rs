@@ -138,7 +138,9 @@ use crate::mpd::{ConnectTimeouts, MpdEndpoint};
 use crate::mpd_fragment::{
     atomic_write_fragment, render_audio_output_fragment,
 };
-use crate::mpd_restart::{MpdRestarter, SudoSystemctlRestarter};
+use crate::mpd_restart::{
+    AutoMpdRestarter, MpdRestarter, SudoSystemctlRestarter,
+};
 use crate::playback_supervisor::{
     PlaybackCommand, PlaybackError, SubjectEmitter, SupervisorHandle,
 };
@@ -950,6 +952,29 @@ impl Plugin for MpdPlaybackPlugin {
             );
 
             self.apply_config_table(&ctx.config)?;
+
+            // Resolve the MPD restart strategy from the
+            // framework's preflight result. AutoMpdRestarter
+            // inspects the capability-resolution map for the
+            // `mpd_systemctl_restart` intent and picks the
+            // right concrete strategy (Direct / Sudo /
+            // disabled). When the framework's runner is not
+            // yet wired (the map is empty) the composite
+            // falls back to /proc/self/status EUID detection
+            // — same shape volumio-evo has run in production.
+            // Production code path swaps the
+            // `SudoSystemctlRestarter` default the constructor
+            // installed; tests that constructed the plugin
+            // through `with_restarter` keep their injected
+            // strategy because they never invoke `Plugin::load`.
+            let auto = AutoMpdRestarter::resolve(&ctx.capabilities);
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                strategy = auto.strategy_name(),
+                rationale = %auto.rationale(),
+                "MPD restart strategy resolved"
+            );
+            self.restarter = Arc::new(auto) as Arc<dyn MpdRestarter>;
 
             // Engage the audio data plane. The plugin is a
             // source plugin (declared via
