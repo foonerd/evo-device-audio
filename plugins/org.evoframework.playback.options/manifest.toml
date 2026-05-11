@@ -1,0 +1,61 @@
+[plugin]
+name = "org.evoframework.playback.options"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.options"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 2
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+# Respondent capabilities. The plugin exposes operator-facing
+# audiophile-grade settings: resampling preference / target,
+# mixer-type choice (hardware / software / none), DOP enable
+# for DSD-capable DACs, output-device selection (drives
+# delivery.alsa's pcm.evo binding), volume-normalization
+# policy. Read verbs return the current state; write verbs
+# validate + persist + emit a Happening for other plugins to
+# react to (delivery.alsa rewires the AAMPP pipeline on every
+# output-device change).
+#
+# Settings persist to /var/lib/evo/org.evoframework.playback.options/state.toml
+# (the plugin's state directory; the framework guarantees
+# per-plugin filesystem isolation). On restart, the plugin
+# rehydrates from this file; absence is treated as defaults.
+[capabilities.respondent]
+request_types = [
+    "options.get_settings",
+    "options.set_resampling",
+    "options.set_mixer_type",
+    "options.set_dop",
+    "options.set_output_device",
+    "options.set_volume_normalization",
+]
+response_budget_ms = 2000

@@ -687,6 +687,7 @@ dependencies = [
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
  "org-evoframework-playback-mpd",
+ "org-evoframework-playback-options",
  "tokio",
 ]
 
@@ -1594,6 +1595,21 @@ name = "org-evoframework-playback-mpd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "org-evoframework-playback-options"
+version = "0.1.0"
+dependencies = [
  "evo-plugin-sdk",
  "semver",
  "serde",

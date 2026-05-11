@@ -1,0 +1,29 @@
+[package]
+name = "org-evoframework-playback-options"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Operator-facing audiophile-grade playback settings plugin. Persists resampling / mixer-type / DOP / output-device / volume-normalization preferences; drives the delivery.alsa plugin to apply them. Stocks the audio.options shelf at shape 1."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+toml = "0.8"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

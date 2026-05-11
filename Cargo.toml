@@ -8,6 +8,7 @@ members = [
     "plugins/org.evoframework.artwork.local",
     "plugins/org.evoframework.composition.alsa",
     "plugins/org.evoframework.delivery.alsa",
+    "plugins/org.evoframework.playback.options",
     "plugins/org.evoframework.network.nm",
 ]
 
