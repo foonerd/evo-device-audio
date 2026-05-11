@@ -2038,6 +2038,135 @@ impl NetworkNmPlugin {
         self.nmcli_output(&refs).await
     }
 
+    /// Active `iw` privilege dispatcher. Returns the framework-
+    /// resolved `Arc<AutoPrivilegedExec>` when `Plugin::load`
+    /// has run, otherwise a fresh [`DirectExec`] so unit tests
+    /// that bypass `load` can still call the `wifi_phy` helpers
+    /// (they will exec `iw` directly without sudo).
+    fn effective_iw_exec(&self) -> Arc<dyn PrivilegedExec> {
+        if let Some(auto) = self.iw_exec.as_ref() {
+            auto.clone() as Arc<dyn PrivilegedExec>
+        } else {
+            Arc::new(DirectExec::new())
+        }
+    }
+
+    /// Active `rfkill` privilege dispatcher. Same fallback shape
+    /// as [`Self::effective_iw_exec`].
+    #[allow(dead_code)]
+    fn effective_rfkill_exec(&self) -> Arc<dyn PrivilegedExec> {
+        if let Some(auto) = self.rfkill_exec.as_ref() {
+            auto.clone() as Arc<dyn PrivilegedExec>
+        } else {
+            Arc::new(DirectExec::new())
+        }
+    }
+
+    /// Active `curl` privilege dispatcher. Same fallback shape
+    /// as [`Self::effective_iw_exec`].
+    #[allow(dead_code)]
+    fn effective_curl_exec(&self) -> Arc<dyn PrivilegedExec> {
+        if let Some(auto) = self.curl_exec.as_ref() {
+            auto.clone() as Arc<dyn PrivilegedExec>
+        } else {
+            Arc::new(DirectExec::new())
+        }
+    }
+
+    /// Probe the PHY backing `sta_if` for concurrent
+    /// `managed + AP` support via the `wifi_phy` module. Honours
+    /// the `EVO_NETWORK_ASSUME_CONCURRENT_STA_AP=1` test override.
+    async fn sta_phy_concurrent_capable(&self, sta_if: &str) -> bool {
+        if std::env::var("EVO_NETWORK_ASSUME_CONCURRENT_STA_AP")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return true;
+        }
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        wifi_phy::sta_phy_supports_concurrent_sta_ap(
+            exec.as_ref(),
+            &self.config.iw_path,
+            sta_if,
+            timeout,
+        )
+        .await
+    }
+
+    /// Create the AP vif on the same PHY as `sta_if` iff it
+    /// does not already exist. Returns `true` on success or when
+    /// the vif is already present; `false` on failure (logs a
+    /// warning, never panics).
+    async fn ensure_ap_vif_present(&self, sta_if: &str, ap_if: &str) -> bool {
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        match wifi_phy::ensure_ap_vif_present(
+            exec.as_ref(),
+            &self.config.iw_path,
+            sta_if,
+            ap_if,
+            timeout,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    sta_if = sta_if,
+                    ap_if = ap_if,
+                    error = %e,
+                    "ensure_ap_vif_present failed"
+                );
+                false
+            }
+        }
+    }
+
+    /// Remove the AP vif if it exists. Returns `true` when the
+    /// vif is absent on return (already gone or successfully
+    /// removed); `false` on removal failure.
+    async fn ensure_ap_vif_absent(&self, ap_if: &str) -> bool {
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        match wifi_phy::ensure_ap_vif_absent(
+            exec.as_ref(),
+            &self.config.iw_path,
+            ap_if,
+            timeout,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    ap_if = ap_if,
+                    error = %e,
+                    "ensure_ap_vif_absent nonfatal"
+                );
+                false
+            }
+        }
+    }
+
+    /// Read the current STA link state via `iw dev <sta> link`.
+    /// Returns the default (disconnected) view on any error so
+    /// callers can render diagnostics without branching.
+    async fn sta_link_info(&self, sta_if: &str) -> wifi_phy::StaLinkInfo {
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        wifi_phy::sta_link_info(
+            exec.as_ref(),
+            &self.config.iw_path,
+            sta_if,
+            timeout,
+        )
+        .await
+    }
+
     async fn nm_connection_exists(&self, name: &str) -> bool {
         let out = self
             .dispatcher
@@ -2978,11 +3107,8 @@ impl NetworkNmPlugin {
         let mut steps = Vec::new();
         let sta_ifname = self.effective_wifi_ifname(intent);
         let hotspot_ifname_intent = self.effective_hotspot_ifname(intent);
-        let phy_supports_concurrent = sta_phy_supports_concurrent_sta_ap(
-            sta_ifname.as_str(),
-            &self.config.nmcli_path,
-        )
-        .await;
+        let phy_supports_concurrent =
+            self.sta_phy_concurrent_capable(sta_ifname.as_str()).await;
         let (mut resolved_ap_ifname, intent_hotspot_if_is_explicit) =
             resolve_ap_ifname(
                 intent,
@@ -3024,7 +3150,8 @@ impl NetworkNmPlugin {
                 self.connection_down_lossy(NM_CON_WIFI_STA).await;
                 self.connection_down_lossy(&hs_name).await;
                 if sta_ifname != resolved_ap_ifname {
-                    let _ = ensure_ap_vif_absent(&resolved_ap_ifname).await;
+                    let _ =
+                        self.ensure_ap_vif_absent(&resolved_ap_ifname).await;
                 }
                 steps.push("wifi role disabled; brought down STA and hotspot (best effort)".to_string());
             }
@@ -3036,7 +3163,11 @@ impl NetworkNmPlugin {
 
                 self.connection_down_lossy(&hs_name).await;
                 if concurrent_vif {
-                    let _ = ensure_ap_vif_absent(&resolved_ap_ifname).await;
+                    let _ =
+                        self.ensure_ap_vif_absent(&resolved_ap_ifname).await;
+                    steps.push(format!(
+                        "pre-STA: removed AP vif {resolved_ap_ifname} to free phy for STA association"
+                    ));
                 }
                 self.connection_down_lossy(NM_CON_WIFI_STA).await;
                 steps.push(
@@ -3058,7 +3189,8 @@ impl NetworkNmPlugin {
                     && sta_ifname != resolved_ap_ifname
                     && !intent_hotspot_if_is_explicit
                 {
-                    if ensure_ap_vif_present(&sta_ifname, &resolved_ap_ifname)
+                    if self
+                        .ensure_ap_vif_present(&sta_ifname, &resolved_ap_ifname)
                         .await
                     {
                         steps.push(format!(
@@ -3078,19 +3210,24 @@ impl NetworkNmPlugin {
                 if sta_ifname != resolved_ap_ifname
                     && !intent_hotspot_if_is_explicit
                 {
-                    if let Some(link) = sta_link_info(&sta_ifname).await {
-                        if link.connected {
-                            if let (Some(ch), Some(band)) =
-                                (link.channel, link.band.clone())
-                            {
-                                wifi_for_ap.ap_channel = ch;
-                                wifi_for_ap.ap_band = band;
-                                steps.push(format!(
-                                    "AP follows STA: band={} channel={}",
-                                    wifi_for_ap.ap_band, wifi_for_ap.ap_channel
-                                ));
-                            }
+                    let link = self.sta_link_info(&sta_ifname).await;
+                    if link.connected {
+                        if let (Some(ch), Some(band)) =
+                            (link.channel, link.band.clone())
+                        {
+                            wifi_for_ap.ap_channel = ch;
+                            wifi_for_ap.ap_band = band;
+                            steps.push(format!(
+                                "AP follows STA: band={} channel={}",
+                                wifi_for_ap.ap_band, wifi_for_ap.ap_channel
+                            ));
                         }
+                    } else {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            sta_if = %sta_ifname,
+                            "AP channel follow-STA skipped (STA not associated yet)"
+                        );
                     }
                 }
 
@@ -4430,152 +4567,6 @@ fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
     seq.push(ch.to_string());
 }
 
-#[derive(Debug, Clone)]
-struct StaLinkInfo {
-    connected: bool,
-    channel: Option<u32>,
-    band: Option<String>,
-}
-
-fn freq_to_channel_and_band(freq: u32) -> Option<(u32, String)> {
-    if (2412..=2484).contains(&freq) {
-        let ch = if freq == 2484 { 14 } else { (freq - 2407) / 5 };
-        return Some((ch, "bg".to_string()));
-    }
-    if (5000..=5895).contains(&freq) {
-        return Some(((freq - 5000) / 5, "a".to_string()));
-    }
-    if (5925..=7125).contains(&freq) {
-        return Some(((freq - 5950) / 5, "6GHz".to_string()));
-    }
-    None
-}
-
-async fn sta_link_info(sta_ifname: &str) -> Option<StaLinkInfo> {
-    let out = Command::new("iw")
-        .args(["dev", sta_ifname, "link"])
-        .output()
-        .await
-        .ok()?;
-    let body = String::from_utf8_lossy(&out.stdout);
-    let connected = body.contains("Connected to");
-    let mut channel = None;
-    let mut band = None;
-    for line in body.lines() {
-        let t = line.trim();
-        if let Some(v) = t.strip_prefix("freq:") {
-            let freq = v.trim().parse::<u32>().ok();
-            if let Some(f) = freq {
-                if let Some((ch, b)) = freq_to_channel_and_band(f) {
-                    channel = Some(ch);
-                    band = Some(b);
-                }
-            }
-        }
-    }
-    Some(StaLinkInfo {
-        connected,
-        channel,
-        band,
-    })
-}
-
-async fn wifi_iface_exists(ifname: &str) -> bool {
-    tokio::fs::metadata(format!("/sys/class/net/{}", ifname.trim()))
-        .await
-        .is_ok()
-}
-
-async fn ensure_ap_vif_absent(ap_ifname: &str) -> bool {
-    if ap_ifname.trim().is_empty() {
-        return false;
-    }
-    if !wifi_iface_exists(ap_ifname).await {
-        return true;
-    }
-    Command::new("iw")
-        .args(["dev", ap_ifname, "del"])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-async fn ensure_ap_vif_present(sta_ifname: &str, ap_ifname: &str) -> bool {
-    if sta_ifname.trim().is_empty() || ap_ifname.trim().is_empty() {
-        return false;
-    }
-    if wifi_iface_exists(ap_ifname).await {
-        return true;
-    }
-    Command::new("iw")
-        .args([
-            "dev",
-            sta_ifname,
-            "interface",
-            "add",
-            ap_ifname,
-            "type",
-            "__ap",
-        ])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-async fn sta_phy_supports_concurrent_sta_ap(
-    sta_ifname: &str,
-    _nmcli_path: &str,
-) -> bool {
-    if std::env::var("EVO_NETWORK_ASSUME_CONCURRENT_STA_AP")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        return true;
-    }
-    let out = Command::new("iw")
-        .args(["dev", sta_ifname, "info"])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let info = String::from_utf8_lossy(&out.stdout);
-    let mut phy_name: Option<String> = None;
-    for line in info.lines() {
-        let t = line.trim();
-        if let Some(v) = t.strip_prefix("wiphy") {
-            let n = v.trim();
-            if !n.is_empty() {
-                phy_name = Some(format!("phy{}", n));
-                break;
-            }
-        }
-    }
-    let Some(phy) = phy_name else {
-        return false;
-    };
-    let out = Command::new("iw")
-        .args(["phy", &phy, "info"])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let txt = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-    txt.contains("valid interface combinations")
-        && txt.contains("managed")
-        && txt.contains(" ap")
-}
-
 fn resolve_ap_ifname(
     intent: &NetworkIntent,
     sta_ifname: &str,
@@ -4588,7 +4579,7 @@ fn resolve_ap_ifname(
     let resolved = if intent_hotspot_if_is_explicit {
         hotspot_ifname_intent.to_string()
     } else if phy_supports_concurrent {
-        std::env::var("VOLUMIO_EVO_AP_IFNAME")
+        std::env::var("EVO_NETWORK_AP_IFNAME")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
