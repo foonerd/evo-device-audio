@@ -1,0 +1,103 @@
+[plugin]
+name = "org.evoframework.delivery.alsa"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.delivery"
+shape = 2
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+# Respondent capabilities. Operator-facing introspection of the
+# AAMPP pipeline state: which cards / mixers / formats the host
+# supports right now. The settings layer (playback.options) drives
+# this plugin via the same surface to bind a chosen output device.
+[capabilities.respondent]
+request_types = [
+    "delivery.probe_hardware",
+    "delivery.list_cards",
+    "delivery.list_mixers",
+    "delivery.active_endpoint",
+]
+response_budget_ms = 5000
+
+# Audio data plane: delivery stage. This plugin owns the
+# AAMPP-style modular ALSA pipeline (`pcm.evo` defined in
+# /etc/asound.conf) and declares it as the WriteEndpoint other
+# audio-producing plugins write into. The framework's
+# reconciliation engine intersects this plugin's declared
+# `audio_formats` with each source plugin's declared formats to
+# negotiate a chain-wide format on every topology rewire.
+#
+# `device = "alsa:evo"` names the ALSA pcm the framework
+# publishes to source / composition plugins' WriteEndpoints.
+# Format-negotiation uses the enumerated `audio_formats` below as
+# the format set this plugin's hardware accepts; runtime hardware
+# probing (alsa_hw_params via libasound) lands as an enhancement
+# once the production substrate stabilises.
+#
+# `exclusive_mode = false` and `bit_perfect_capable = false` keep
+# the reference posture conservative: the pcm.evo chain
+# uses ALSA's `plug` plugin (automatic format conversion), so the
+# delivery stage is NOT bit-perfect on its own — the source must
+# produce a format the chain's terminus accepts, with `plug`
+# bridging any mismatch. Bit-perfect topologies require pinning
+# pcm.evo to a direct `hw:` slave and matching format exactly;
+# that posture is a later improvement for the playback.options-driven
+# config arc.
+[capabilities.delivery]
+input_kind = "audio.pcm"
+device = "alsa:evo"
+exclusive_mode = false
+bit_perfect_capable = false
+
+# Standard PCM bit-depths + rate ladder the I-Sabre Q2M DAC
+# accepts (and most contemporary DACs accept). The enumerated
+# list is the floor; runtime `alsa_hw_params` probing on a
+# specific host narrows it to the active card's actual range.
+# Vendor distributions targeting a fixed-format DAC trim this
+# list to match their hardware.
+[[capabilities.delivery.audio_formats]]
+kind = "pcm"
+codec = "pcm_s16_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.delivery.audio_formats]]
+kind = "pcm"
+codec = "pcm_s24_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.delivery.audio_formats]]
+kind = "pcm"
+codec = "pcm_s32_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2

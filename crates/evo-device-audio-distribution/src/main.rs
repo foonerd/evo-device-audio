@@ -51,6 +51,7 @@ use evo::config::StewardConfig;
 use evo::AdmissionSetup;
 use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
+use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 
 #[tokio::main]
@@ -77,7 +78,26 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting composition.alsa")?;
 
-            // 2. playback.mpd: warden + respondent on
+            // 2. delivery.alsa: singleton respondent on
+            //    audio.delivery shape 2. Owns the AAMPP
+            //    modular ALSA pipeline (pcm.evo definition in
+            //    /etc/asound.conf); declares the WriteEndpoint
+            //    upstream plugins write into; exposes
+            //    operator-facing hardware probing verbs
+            //    consumed by the playback.options plugin.
+            let delivery_manifest = Manifest::from_toml(
+                org_evoframework_delivery_alsa::MANIFEST_TOML,
+            )
+            .context("parsing delivery.alsa manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    AlsaDeliveryPlugin::new(),
+                    delivery_manifest,
+                )
+                .await
+                .context("admitting delivery.alsa")?;
+
+            // 3. playback.mpd: warden + respondent on
             //    audio.playback shape 1. Owns the `mpd-path`
             //    URI scheme; the framework's source-verb
             //    dispatcher routes play_now / etc. to its

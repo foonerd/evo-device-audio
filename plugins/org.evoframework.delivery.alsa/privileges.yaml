@@ -1,0 +1,40 @@
+schema_version: "1.0"
+plugin: org.evoframework.delivery.alsa
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml.
+
+capability_intent:
+  - id: alsa_hardware_probe
+    need: probe the host's ALSA hardware via `aplay -L` and `amixer -c <N>` to enumerate playback cards + their available mixer controls. Used by the delivery plugin to surface the operator-visible card / mixer choice (driven by the playback.options plugin) and to validate that the AAMPP pipeline's terminus card is present on the host.
+    access_path: binary/aplay-amixer
+    failure_mode: probe verbs respond with structured empty list + diagnostic; plugin admits and continues with the static pcm.evo definition the bootstrap script installed; operator-visible card-selection UI shows no cards but the previously-installed pipeline keeps audio flowing on the existing card.
+  - id: alsa_pipeline_definition_read
+    need: read `/etc/asound.conf` to surface the active pcm.evo definition through the `delivery.active_endpoint` verb so operators / settings UI can confirm what the framework's reconciliation engine is binding playback against.
+    access_path: filesystem/system
+    failure_mode: active_endpoint verb returns Unknown with operator-readable hint; plugin admits and continues.
+
+required_binaries:
+  - name: aplay
+    failure_mode: hardware-probing verbs respond with structured empty list + diagnostic; plugin admits but operator-visible card-selection is empty.
+  - name: amixer
+    failure_mode: mixer-probing verbs respond with structured empty list + diagnostic; plugin admits but mixer-control selection is empty.
+
+required_kernel_modules:
+  - snd_pcm
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -r /etc/asound.conf"
+    - "test -d /proc/asound"
+  expected:
+    - asound.conf readable (operator-visible AAMPP pipeline definition)
+    - ALSA proc tree present (kernel snd subsystem loaded)
+
+host_provisioning: {}
