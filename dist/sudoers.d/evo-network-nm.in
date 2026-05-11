@@ -2,26 +2,51 @@
 # script at /etc/sudoers.d/evo-network-nm with mode 0440,
 # owned root:root.
 #
-# Allows the steward service user (substituted at install
-# time for the `@EVO_SERVICE_USER@` placeholder) to invoke
-# `nmcli` via sudo without password. The grant is scoped to
-# the nmcli binary only — no wildcards, no `ALL`, no
-# arbitrary commands. The network.nm plugin's argv covers
-# read-only verbs (status / scan / connection show /
-# general / radio) and mutation verbs (connection up / down
-# / add / modify, radio wifi on/off) under the same binary.
-# Per-verb scoping is intentionally not done: sudoers
-# argv-match against nmcli's option flags is brittle (any
-# `-t -f FIELD` reordering breaks the match) and the binary
-# itself is the operator-relevant trust boundary.
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to the binaries the network.nm plugin invokes
+# (nmcli, iw, curl). Two scopes:
 #
-# Path discipline: the binary path MUST match
+# 1. `EVO_NM_POLL` `Cmnd_Alias` — the read-side polling
+#    commands the supervisor invokes on a periodic cadence
+#    (NetworkManager connectivity probe, fallback HTTP
+#    connectivity probe against `connectivitycheck.gstatic.com`,
+#    Wi-Fi device enumeration, per-interface link state).
+#    The `Defaults!EVO_NM_POLL !pam_session, !syslog` line
+#    below suppresses PAM session open/close lines and the
+#    sudo invocation log line for this alias only. The
+#    suppression is scoped to read-side polling argv
+#    patterns; any nmcli argv outside the alias falls through
+#    to the broader rule below and retains full audit
+#    logging.
+#
+# 2. Broad `/usr/bin/nmcli` grant — covers state-changing
+#    invocations (`connection up`, `connection down`,
+#    `connection add`, `connection modify`, `radio wifi on`,
+#    `radio wifi off`, and similar). These retain full
+#    journald audit logging.
+#
+# Per-verb argv scoping on the broad nmcli rule is
+# intentionally not done: sudoers argv-match against nmcli's
+# option flags is brittle (any `-t -f FIELD` reordering
+# breaks the match) and the binary itself is the
+# operator-relevant trust boundary.
+#
+# Path discipline: the nmcli path MUST match
 # `PluginConfig.nmcli_path` (default `/usr/bin/nmcli`,
 # overridable via the plugin's `nmcli_path` config field).
-# Plugin code passes this path to the dispatcher at every
-# call; sudo matches against this string verbatim; the two
-# must stay aligned or sudo refuses with `Sorry, user X is
-# not allowed to execute /usr/bin/nmcli`.
+# The bootstrap script substitutes this path verbatim at
+# install time. iw + curl paths in the polling alias are
+# hardcoded to the canonical Debian locations; non-standard
+# distributions add new substitutions to the bootstrap
+# script.
+#
+# Operator override of the connectivity-check URL (the
+# plugin's `connectivity_check_url` config field) requires
+# updating this template's URL pattern and re-running the
+# bootstrap; otherwise the new URL falls through to the
+# broader rule and is rejected (curl is not granted outside
+# the alias).
 #
 # Apply via the bootstrap script:
 #   scripts/bootstrap.sh --install-network-nm-sudoers
@@ -35,4 +60,13 @@
 # `visudo -c -f /etc/sudoers.d/evo-network-nm` verifies
 # syntactically valid sudoers.
 
+Cmnd_Alias EVO_NM_POLL = \
+    /usr/bin/nmcli -t -f CONNECTIVITY general, \
+    /usr/bin/curl -sS -L -o /dev/null -w * --max-time * http\://connectivitycheck.gstatic.com/generate_204, \
+    /usr/sbin/iw dev, \
+    /usr/sbin/iw dev * link
+
+Defaults!EVO_NM_POLL !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NM_POLL
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/bin/nmcli
