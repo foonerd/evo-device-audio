@@ -27,6 +27,37 @@ use evo_plugin_sdk::contract::PluginError;
 
 use crate::nmcli_dispatch::PrivilegedExec;
 
+/// Per-band support flags for one PHY, derived from the
+/// `Frequencies:` blocks of `iw phy <phy> info`. A band is
+/// supported when at least one of its centre-frequencies is
+/// listed and not flagged `disabled` by the kernel's regulatory
+/// domain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhyBandSupport {
+    /// 2.4 GHz family (channels 1–14).
+    pub ghz_2_4: bool,
+    /// 5 GHz family (channels 36–177).
+    pub ghz_5: bool,
+    /// 6 GHz family (UNII-5 through UNII-8 — channels 1–233 in
+    /// the 6 GHz numbering scheme).
+    pub ghz_6: bool,
+}
+
+impl PhyBandSupport {
+    /// Number of distinct bands the PHY supports. Used to rank
+    /// radios when picking the STA-traffic-bearer.
+    pub fn band_count(&self) -> u32 {
+        u32::from(self.ghz_2_4) + u32::from(self.ghz_5) + u32::from(self.ghz_6)
+    }
+
+    /// `true` when this PHY supports any band above 2.4 GHz —
+    /// the "fast-band-capable" predicate the role-assignment
+    /// heuristic uses to favour 5 / 6 GHz for STA traffic.
+    pub fn has_fast_band(&self) -> bool {
+        self.ghz_5 || self.ghz_6
+    }
+}
+
 /// Per-`phy` capability summary surfaced by [`phy_capability`].
 #[derive(Debug, Clone, Default)]
 pub struct PhyCapability {
@@ -42,6 +73,10 @@ pub struct PhyCapability {
     pub max_channels: u32,
     /// `Supported interface modes` list (informational).
     pub interface_modes: Vec<String>,
+    /// Per-band support derived from the `Frequencies:` blocks
+    /// of the same `iw phy <phy> info` output. Drives multi-
+    /// radio role assignment.
+    pub bands: PhyBandSupport,
 }
 
 /// Per-interface Wi-Fi device row parsed from `iw dev`.
@@ -150,7 +185,52 @@ pub fn parse_phy_info(phy_name: &str, raw: &str) -> PhyCapability {
             }
         }
     }
+    cap.bands = parse_phy_band_support(raw);
     cap
+}
+
+/// Parse the `Frequencies:` blocks of `iw phy <phy> info` and
+/// flag the bands that contain at least one non-disabled channel.
+/// `iw` renders disabled channels with a `(disabled)` suffix;
+/// regulatory-restricted channels still count as "supported" for
+/// inventory purposes.
+fn parse_phy_band_support(raw: &str) -> PhyBandSupport {
+    let mut bands = PhyBandSupport::default();
+    let mut in_frequencies = false;
+    for line in raw.lines() {
+        let lt = line.trim();
+        if lt.starts_with("Frequencies:") {
+            in_frequencies = true;
+            continue;
+        }
+        if in_frequencies {
+            let is_indented = line.starts_with(' ') || line.starts_with('\t');
+            if !is_indented && !lt.is_empty() {
+                in_frequencies = false;
+                continue;
+            }
+            // Expected shape: `* 5180 MHz [36] (22.0 dBm)` or
+            // `* 2412 MHz [1] (20.0 dBm)`; disabled channels
+            // end in `(disabled)`.
+            let Some(rest) = lt.strip_prefix("* ") else {
+                continue;
+            };
+            if rest.contains("(disabled)") {
+                continue;
+            }
+            let mhz_token = rest.split_whitespace().next().unwrap_or("");
+            let Ok(mhz) = mhz_token.parse::<u32>() else {
+                continue;
+            };
+            match mhz {
+                2400..=2500 => bands.ghz_2_4 = true,
+                4900..=5900 => bands.ghz_5 = true,
+                5901..=7200 => bands.ghz_6 = true,
+                _ => {}
+            }
+        }
+    }
+    bands
 }
 
 /// Extract each `* …` combination line under
@@ -626,6 +706,50 @@ Wiphy phy1
 		   total <= 2, #channels <= 1
 "#;
 
+    /// Dual-band phy info — 2.4 GHz channels 1–13 + 5 GHz UNII-1
+    /// channels 36/40/44/48. Used to exercise `PhyBandSupport`.
+    const DUAL_BAND_PHY_INFO: &str = r#"
+Wiphy phy0
+	Supported interface modes:
+		 * managed
+		 * AP
+	valid interface combinations:
+		 * #{ managed } <= 1, #{ AP } <= 1,
+		   total <= 2, #channels <= 1
+	Band 1:
+		Frequencies:
+			* 2412 MHz [1] (20.0 dBm)
+			* 2417 MHz [2] (20.0 dBm)
+			* 2462 MHz [11] (20.0 dBm)
+	Band 2:
+		Frequencies:
+			* 5180 MHz [36] (22.0 dBm)
+			* 5200 MHz [40] (22.0 dBm)
+			* 5220 MHz [44] (22.0 dBm)
+			* 5240 MHz [48] (22.0 dBm)
+"#;
+
+    /// Tri-band phy info — adds 6 GHz UNII-5. Mirrors what a
+    /// WiFi 6E adapter advertises after the regulatory load.
+    const TRI_BAND_PHY_INFO: &str = r#"
+Wiphy phy2
+	Supported interface modes:
+		 * managed
+	valid interface combinations:
+		 * #{ managed } <= 1, total <= 1, #channels <= 1
+	Band 1:
+		Frequencies:
+			* 2412 MHz [1] (20.0 dBm)
+	Band 2:
+		Frequencies:
+			* 5180 MHz [36] (22.0 dBm)
+			* 5200 MHz [40] (22.0 dBm) (disabled)
+	Band 4:
+		Frequencies:
+			* 5955 MHz [1] (23.0 dBm)
+			* 5975 MHz [5] (23.0 dBm)
+"#;
+
     const IW_DEV_SAMPLE: &str = r#"phy#0
 	Interface ap0
 		ifindex 8
@@ -660,6 +784,35 @@ phy#1
         let cap = parse_phy_info("phy1", STA_ONLY_PHY_INFO);
         assert!(!cap.supports_managed_plus_ap);
         assert_eq!(cap.max_channels, 1);
+    }
+
+    #[test]
+    fn dual_band_phy_reports_2_4_and_5_ghz_support() {
+        let cap = parse_phy_info("phy0", DUAL_BAND_PHY_INFO);
+        assert!(cap.bands.ghz_2_4);
+        assert!(cap.bands.ghz_5);
+        assert!(!cap.bands.ghz_6);
+        assert_eq!(cap.bands.band_count(), 2);
+        assert!(cap.bands.has_fast_band());
+    }
+
+    #[test]
+    fn tri_band_phy_reports_6_ghz_support_and_ignores_disabled() {
+        let cap = parse_phy_info("phy2", TRI_BAND_PHY_INFO);
+        assert!(cap.bands.ghz_2_4);
+        assert!(cap.bands.ghz_5);
+        assert!(cap.bands.ghz_6);
+        assert_eq!(cap.bands.band_count(), 3);
+    }
+
+    #[test]
+    fn sta_only_phy_with_no_frequencies_reports_no_bands() {
+        let cap = parse_phy_info("phy1", STA_ONLY_PHY_INFO);
+        assert!(!cap.bands.ghz_2_4);
+        assert!(!cap.bands.ghz_5);
+        assert!(!cap.bands.ghz_6);
+        assert_eq!(cap.bands.band_count(), 0);
+        assert!(!cap.bands.has_fast_band());
     }
 
     #[test]
