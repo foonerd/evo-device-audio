@@ -1,7 +1,7 @@
 //! NetworkManager-backed network plugin for the evo framework.
 //!
-//! This plugin ports the functional `nmcli` flow used by volumio-evo into an
-//! evo-framework plugin surface with durable intent persistence:
+//! This plugin exposes a NetworkManager-backed control surface to
+//! the evo framework with durable intent persistence:
 //! - `network.nm.status`
 //! - `network.nm.scan`
 //! - `network.nm.intent.get`
@@ -80,7 +80,7 @@ const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
-const NM_CON_HOTSPOT_DEFAULT: &str = "volumio-hotspot";
+const NM_CON_HOTSPOT_DEFAULT: &str = "evo-network-hotspot";
 const SECRET_FILE_MODE: u32 = 0o600;
 const SECRET_SCHEMA_VERSION: u32 = 1;
 const SECRET_CIPHER_XCHACHA20POLY1305: &str = "xchacha20poly1305";
@@ -305,6 +305,60 @@ enum StaSelectionMode {
     LockBssid,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum BandPreference {
+    #[serde(rename = "6ghz", alias = "ghz6", alias = "6g")]
+    Ghz6,
+    #[serde(rename = "5ghz", alias = "ghz5", alias = "5g")]
+    Ghz5,
+    #[serde(
+        rename = "2.4ghz",
+        alias = "ghz2_4",
+        alias = "24ghz",
+        alias = "2g"
+    )]
+    Ghz2_4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RadioPolicy {
+    /// Master kill. When `true`, the framework keeps every wireless
+    /// radio (Wi-Fi, Bluetooth) blocked. Composes with
+    /// [`Self::wifi_enabled_pref`] / [`Self::bluetooth_enabled_pref`]
+    /// and with the kernel's rfkill state.
+    #[serde(default)]
+    flight_mode: bool,
+    /// Operator's Wi-Fi preference. Effective state requires
+    /// `flight_mode == false` AND rfkill not blocking. Default
+    /// `true` so a fresh install matches "Wi-Fi on outside flight".
+    #[serde(default = "default_true")]
+    wifi_enabled_pref: bool,
+    /// Operator's Bluetooth preference. Same composition rules as
+    /// [`Self::wifi_enabled_pref`]. The Bluetooth plugin owns the
+    /// runtime radio surface; this field is the single policy bit
+    /// shared between Wi-Fi and Bluetooth families.
+    #[serde(default = "default_true")]
+    bluetooth_enabled_pref: bool,
+    /// Multi-radio band ranking when more than one Wi-Fi PHY is
+    /// present (or one PHY with multiple band capabilities). Higher
+    /// index = lower priority. Default ordering favours throughput
+    /// (6 GHz > 5 GHz > 2.4 GHz).
+    #[serde(default = "default_band_priority")]
+    band_priority: Vec<BandPreference>,
+}
+
+impl Default for RadioPolicy {
+    fn default() -> Self {
+        Self {
+            flight_mode: false,
+            wifi_enabled_pref: true,
+            bluetooth_enabled_pref: true,
+            band_priority: default_band_priority(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EthernetIntent {
     #[serde(default = "default_true")]
@@ -420,6 +474,12 @@ struct NetworkIntent {
     wifi: WifiIntent,
     #[serde(default)]
     fallback: FallbackIntent,
+    /// Per-radio policy (flight mode + per-family preference + band
+    /// priority). Subsumes the legacy `flight-mode.toml` and
+    /// `wifi-preference.toml` state files; migrated automatically
+    /// on first load when the schema-2 intent envelope is written.
+    #[serde(default)]
+    radio_policy: RadioPolicy,
 }
 
 impl Default for NetworkIntent {
@@ -429,6 +489,7 @@ impl Default for NetworkIntent {
             ethernet: EthernetIntent::default(),
             wifi: WifiIntent::default(),
             fallback: FallbackIntent::default(),
+            radio_policy: RadioPolicy::default(),
         }
     }
 }
@@ -442,7 +503,15 @@ fn default_intent_version() -> u32 {
 }
 
 fn default_intent_state_schema_version() -> u32 {
-    1
+    2
+}
+
+fn default_band_priority() -> Vec<BandPreference> {
+    vec![
+        BandPreference::Ghz6,
+        BandPreference::Ghz5,
+        BandPreference::Ghz2_4,
+    ]
 }
 
 fn default_captive_state_schema_version() -> u32 {
@@ -458,7 +527,46 @@ fn default_wlan_if() -> String {
 }
 
 fn default_ap_ssid() -> String {
-    "Volumio".to_string()
+    netdev_mac_suffix_hex_upper()
+        .map(|s| format!("Evo-{s}"))
+        .unwrap_or_else(|| "Evo".to_string())
+}
+
+/// Last three MAC octets of the first usable host netdev, upper-hex,
+/// no separators (e.g. `7B6816`). Used to derive a per-device
+/// hotspot SSID without leaking serial numbers.
+fn netdev_mac_suffix_hex_upper() -> Option<String> {
+    for iface in ["eth0", "end0", "wlan0"] {
+        let p = std::path::Path::new("/sys/class/net")
+            .join(iface)
+            .join("address");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            return Some(mac_last_three_octets_hex_upper(&s));
+        }
+    }
+    let dir = std::fs::read_dir("/sys/class/net").ok()?;
+    for ent in dir.flatten() {
+        let name = ent.file_name();
+        let n = name.to_string_lossy();
+        if n == "lo" || n == "docker0" {
+            continue;
+        }
+        let p = ent.path().join("address");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            return Some(mac_last_three_octets_hex_upper(&s));
+        }
+    }
+    None
+}
+
+fn mac_last_three_octets_hex_upper(addr: &str) -> String {
+    let p: Vec<&str> =
+        addr.trim().split(':').filter(|x| !x.is_empty()).collect();
+    if p.len() >= 3 {
+        p[p.len() - 3..].join("").to_ascii_uppercase()
+    } else {
+        addr.replace(':', "").to_ascii_uppercase()
+    }
 }
 
 fn default_hotspot_connection_name() -> String {
@@ -592,7 +700,7 @@ fn migrate_intent_state(
     mut intent: NetworkIntent,
 ) -> Result<NetworkIntent, String> {
     match schema_version {
-        0 | 1 => {
+        0..=2 => {
             if intent.version == 0 {
                 intent.version = default_intent_version();
             }
@@ -648,32 +756,25 @@ fn parse_captive_state_json(raw: &str) -> Result<CaptiveSessionState, String> {
     }
 }
 
-fn migrate_flight_mode_state(
-    schema_version: u32,
-    state: FlightModeState,
-) -> Result<FlightModeState, String> {
-    match schema_version {
-        0 | 1 => Ok(state),
-        _ => Err(format!(
-            "unsupported flight mode state schema_version {schema_version}"
-        )),
+/// Parse a legacy radio-state file (`flight-mode.toml` or
+/// `wifi-preference.toml`) and extract the `enabled` bit. Accepts
+/// both the envelope shape (`{schema_version, state: {enabled}}`)
+/// and the bare shape (`{enabled}`). Returns `None` for empty,
+/// unparseable, or shape-incompatible inputs — callers treat
+/// `None` as "no migration carried over from this file".
+fn parse_legacy_enabled_bit(raw: &str) -> Option<bool> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-}
-
-fn parse_flight_mode_state_toml(raw: &str) -> Result<FlightModeState, String> {
-    let t = raw.trim();
-    if t.is_empty() {
-        return Ok(FlightModeState::default());
+    let value: toml::Value = toml::from_str(trimmed).ok()?;
+    let table = value.as_table()?;
+    if let Some(state) = table.get("state").and_then(|x| x.as_table()) {
+        if let Some(b) = state.get("enabled").and_then(|x| x.as_bool()) {
+            return Some(b);
+        }
     }
-    match toml::from_str::<FlightModeStateEnvelope>(t) {
-        Ok(env) => migrate_flight_mode_state(env.schema_version, env.state),
-        Err(env_err) => match toml::from_str::<FlightModeState>(t) {
-            Ok(legacy_state) => migrate_flight_mode_state(0, legacy_state),
-            Err(legacy_err) => Err(format!(
-                "flight mode state parse failed (envelope: {env_err}; legacy: {legacy_err})"
-            )),
-        },
-    }
+    table.get("enabled").and_then(|x| x.as_bool())
 }
 
 async fn run_command_output_with_timeout(
@@ -841,99 +942,6 @@ impl Default for CaptiveStateEnvelope {
     }
 }
 
-fn default_flight_mode_state_schema_version() -> u32 {
-    1
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct FlightModeState {
-    #[serde(default)]
-    enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FlightModeStateEnvelope {
-    #[serde(default = "default_flight_mode_state_schema_version")]
-    schema_version: u32,
-    #[serde(default)]
-    state: FlightModeState,
-}
-
-impl Default for FlightModeStateEnvelope {
-    fn default() -> Self {
-        Self {
-            schema_version: default_flight_mode_state_schema_version(),
-            state: FlightModeState::default(),
-        }
-    }
-}
-
-fn default_wifi_preference_state_schema_version() -> u32 {
-    1
-}
-
-fn default_wifi_preference_enabled() -> bool {
-    true
-}
-
-/// Persisted per-radio preference for the Wi-Fi family. Captures
-/// the operator's "what would wifi be when flight-mode is off"
-/// answer; the load-time policy applier composes this with
-/// flight-mode + rfkill to derive the effective state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WifiPreferenceState {
-    /// Operator's preference. Default `true` so a fresh install
-    /// with no persisted state matches the prior behaviour
-    /// (wifi enabled by default when not in flight-mode).
-    #[serde(default = "default_wifi_preference_enabled")]
-    enabled: bool,
-}
-
-impl Default for WifiPreferenceState {
-    fn default() -> Self {
-        Self {
-            enabled: default_wifi_preference_enabled(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WifiPreferenceStateEnvelope {
-    #[serde(default = "default_wifi_preference_state_schema_version")]
-    schema_version: u32,
-    #[serde(default)]
-    state: WifiPreferenceState,
-}
-
-impl Default for WifiPreferenceStateEnvelope {
-    fn default() -> Self {
-        Self {
-            schema_version: default_wifi_preference_state_schema_version(),
-            state: WifiPreferenceState::default(),
-        }
-    }
-}
-
-fn parse_wifi_preference_state_toml(
-    raw: &str,
-) -> Result<WifiPreferenceState, String> {
-    let t = raw.trim();
-    if t.is_empty() {
-        return Ok(WifiPreferenceState::default());
-    }
-    match toml::from_str::<WifiPreferenceStateEnvelope>(t) {
-        Ok(envelope) => Ok(envelope.state),
-        Err(env_err) => match toml::from_str::<WifiPreferenceState>(t) {
-            Ok(state) => Ok(state),
-            Err(state_err) => Err(format!(
-                "envelope parse: {env_err}; state parse: {state_err}"
-            )),
-        },
-    }
-}
-
 /// Wire-op body for `network.nm.radio.set`. UI writes
 /// `{ "radio": "wifi", "preference": "enabled" }` (or
 /// `"disabled"`); the plugin records the preference, attempts
@@ -1052,7 +1060,7 @@ impl NetworkNmPlugin {
             requests_handled: 0,
             scan_cache: HashMap::new(),
             wifi_flight_mode_enabled: false,
-            wifi_preference_enabled: default_wifi_preference_enabled(),
+            wifi_preference_enabled: true,
             dispatcher: Arc::new(DirectNmcliDispatcher::new()),
             auto_dispatcher: None,
             capabilities_watcher: None,
@@ -1261,102 +1269,28 @@ impl NetworkNmPlugin {
         self.write_text_atomic_with_lkg(&path, &raw).await
     }
 
-    async fn load_flight_mode_state(
+    /// Persist `flight_mode` to the unified intent. Equivalent to
+    /// loading the intent, updating `radio_policy.flight_mode`, and
+    /// saving — kept as a single call site so handlers do not race
+    /// each other on the same intent file.
+    async fn save_flight_mode_pref(
         &self,
-    ) -> Result<FlightModeState, PluginError> {
-        let path = self.flight_mode_state_path()?;
-        let lkg = lkg_shadow_path(&path);
-        let primary_raw = tokio::fs::read_to_string(&path).await.ok();
-        if let Some(raw) = primary_raw {
-            match parse_flight_mode_state_toml(&raw) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        path = %path.display(),
-                        error = %e,
-                        "invalid flight mode state; trying LKG shadow"
-                    );
-                }
-            }
-        }
-        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
-            if let Ok(v) = parse_flight_mode_state_toml(&raw) {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    path = %lkg.display(),
-                    "using LKG flight mode state shadow"
-                );
-                return Ok(v);
-            }
-        }
-        Ok(FlightModeState::default())
-    }
-
-    async fn load_wifi_preference_state(
-        &self,
-    ) -> Result<WifiPreferenceState, PluginError> {
-        let path = self.wifi_preference_state_path()?;
-        let lkg = lkg_shadow_path(&path);
-        let primary_raw = tokio::fs::read_to_string(&path).await.ok();
-        if let Some(raw) = primary_raw {
-            match parse_wifi_preference_state_toml(&raw) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        path = %path.display(),
-                        error = %e,
-                        "invalid wifi preference state; trying LKG shadow"
-                    );
-                }
-            }
-        }
-        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
-            if let Ok(v) = parse_wifi_preference_state_toml(&raw) {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    path = %lkg.display(),
-                    "using LKG wifi preference state shadow"
-                );
-                return Ok(v);
-            }
-        }
-        Ok(WifiPreferenceState::default())
-    }
-
-    async fn save_wifi_preference_state(
-        &self,
-        state: &WifiPreferenceState,
+        enabled: bool,
     ) -> Result<(), PluginError> {
-        let path = self.wifi_preference_state_path()?;
-        let envelope = WifiPreferenceStateEnvelope {
-            schema_version: default_wifi_preference_state_schema_version(),
-            state: state.clone(),
-        };
-        let raw = toml::to_string_pretty(&envelope).map_err(|e| {
-            PluginError::Permanent(format!(
-                "wifi preference state serialization failed: {e}"
-            ))
-        })?;
-        self.write_text_atomic_with_lkg(&path, &raw).await
+        let mut intent = self.load_intent().await?;
+        intent.radio_policy.flight_mode = enabled;
+        self.save_intent(&intent).await
     }
 
-    async fn save_flight_mode_state(
+    /// Persist `wifi_enabled_pref` to the unified intent. Same
+    /// load-modify-save discipline as [`Self::save_flight_mode_pref`].
+    async fn save_wifi_enabled_pref(
         &self,
-        state: &FlightModeState,
+        enabled: bool,
     ) -> Result<(), PluginError> {
-        let path = self.flight_mode_state_path()?;
-        let envelope = FlightModeStateEnvelope {
-            schema_version: default_flight_mode_state_schema_version(),
-            state: state.clone(),
-        };
-        let raw = toml::to_string_pretty(&envelope).map_err(|e| {
-            PluginError::Permanent(format!(
-                "flight mode state serialization failed: {e}"
-            ))
-        })?;
-        self.write_text_atomic_with_lkg(&path, &raw).await
+        let mut intent = self.load_intent().await?;
+        intent.radio_policy.wifi_enabled_pref = enabled;
+        self.save_intent(&intent).await
     }
 
     async fn nm_connectivity(&self) -> Option<String> {
@@ -1592,33 +1526,116 @@ impl NetworkNmPlugin {
     async fn load_intent(&self) -> Result<NetworkIntent, PluginError> {
         let path = self.intent_path()?;
         let lkg = lkg_shadow_path(&path);
+        let mut intent = NetworkIntent::default();
+        let mut from_disk = false;
         if let Ok(raw) = tokio::fs::read_to_string(&path).await {
             if raw.trim().is_empty() {
-                return Ok(NetworkIntent::default());
+                // Empty primary still triggers the legacy migration probe.
+            } else {
+                match parse_intent_state_toml(&raw) {
+                    Ok(v) => {
+                        intent = v;
+                        from_disk = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            path = %path.display(),
+                            error = %e,
+                            "invalid intent TOML; trying LKG shadow"
+                        );
+                    }
+                }
             }
-            match parse_intent_state_toml(&raw) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
+        }
+        if !from_disk {
+            if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
+                if let Ok(v) = parse_intent_state_toml(&raw) {
                     tracing::warn!(
                         plugin = PLUGIN_NAME,
-                        path = %path.display(),
+                        path = %lkg.display(),
+                        "using LKG intent shadow"
+                    );
+                    intent = v;
+                }
+            }
+        }
+        let migrated = self.try_migrate_legacy_radio_state(&mut intent).await?;
+        if migrated {
+            // Persist the unified intent at the current schema
+            // version so subsequent loads skip the legacy probe.
+            if let Err(e) = self.save_intent(&intent).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to persist intent after legacy radio-state migration; leaving legacy files in place for retry"
+                );
+                return Ok(intent);
+            }
+            self.delete_legacy_radio_state_files().await;
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                flight_mode = intent.radio_policy.flight_mode,
+                wifi_enabled_pref = intent.radio_policy.wifi_enabled_pref,
+                "migrated legacy flight-mode + wifi-preference state into intent.radio_policy"
+            );
+        }
+        Ok(intent)
+    }
+
+    /// Inline-parse `flight-mode.toml` and `wifi-preference.toml` if
+    /// they still exist alongside `network-intent.toml`, fold their
+    /// `enabled` bits into `intent.radio_policy`, and report whether
+    /// any state was carried over. Tolerant of both the envelope
+    /// shape (`{schema_version, state: {enabled}}`) and the bare
+    /// `{enabled}` shape used by the earliest writes.
+    async fn try_migrate_legacy_radio_state(
+        &self,
+        intent: &mut NetworkIntent,
+    ) -> Result<bool, PluginError> {
+        let mut migrated = false;
+        let fm_path = self.flight_mode_state_path()?;
+        if let Some(enabled) = self.read_legacy_enabled_bit(&fm_path).await {
+            intent.radio_policy.flight_mode = enabled;
+            migrated = true;
+        }
+        let wp_path = self.wifi_preference_state_path()?;
+        if let Some(enabled) = self.read_legacy_enabled_bit(&wp_path).await {
+            intent.radio_policy.wifi_enabled_pref = enabled;
+            migrated = true;
+        }
+        Ok(migrated)
+    }
+
+    /// Read a legacy radio-state file. Returns the `enabled` bit on
+    /// success, or `None` when the file is absent / empty /
+    /// unparseable (treated as "nothing to migrate from this file").
+    async fn read_legacy_enabled_bit(&self, path: &Path) -> Option<bool> {
+        let raw = tokio::fs::read_to_string(path).await.ok()?;
+        parse_legacy_enabled_bit(&raw)
+    }
+
+    /// Best-effort deletion of legacy radio-state files plus their
+    /// LKG shadows. Errors are logged at debug because absence is
+    /// the expected post-migration state.
+    async fn delete_legacy_radio_state_files(&self) {
+        let candidates = [
+            self.flight_mode_state_path().ok(),
+            self.wifi_preference_state_path().ok(),
+        ];
+        for opt in candidates.into_iter().flatten() {
+            let lkg = lkg_shadow_path(&opt);
+            for p in [opt.as_path(), lkg.as_path()] {
+                if let Err(e) = tokio::fs::remove_file(p).await {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        path = %p.display(),
                         error = %e,
-                        "invalid intent TOML; trying LKG shadow"
+                        "legacy radio-state file already absent or unremovable"
                     );
                 }
             }
         }
-        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
-            if let Ok(v) = parse_intent_state_toml(&raw) {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    path = %lkg.display(),
-                    "using LKG intent shadow"
-                );
-                return Ok(v);
-            }
-        }
-        Ok(NetworkIntent::default())
     }
 
     async fn save_intent(
@@ -2675,6 +2692,7 @@ impl NetworkNmPlugin {
             ethernet: EthernetIntent::default(),
             wifi: wifi.clone(),
             fallback: fallback.clone(),
+            radio_policy: RadioPolicy::default(),
         });
         self.ensure_wifi_ap(wifi_ifname, wifi, ap_psk, &hs_name, steps)
             .await
@@ -3207,10 +3225,10 @@ impl Plugin for NetworkNmPlugin {
                 self.spawn_capabilities_watcher(auto, rx);
             }
 
-            let flight_mode_state = self.load_flight_mode_state().await?;
-            self.wifi_flight_mode_enabled = flight_mode_state.enabled;
-            let wifi_pref_state = self.load_wifi_preference_state().await?;
-            self.wifi_preference_enabled = wifi_pref_state.enabled;
+            let intent = self.load_intent().await?;
+            self.wifi_flight_mode_enabled = intent.radio_policy.flight_mode;
+            self.wifi_preference_enabled =
+                intent.radio_policy.wifi_enabled_pref;
             self.loaded = true;
             self.scan_cache.clear();
             tracing::info!(
@@ -3295,7 +3313,7 @@ impl Plugin for NetworkNmPlugin {
             self.config = PluginConfig::defaults();
             self.scan_cache.clear();
             self.wifi_flight_mode_enabled = false;
-            self.wifi_preference_enabled = default_wifi_preference_enabled();
+            self.wifi_preference_enabled = true;
             self.dispatcher = Arc::new(DirectNmcliDispatcher::new());
             self.auto_dispatcher = None;
             Ok(())
@@ -3777,10 +3795,7 @@ impl Respondent for NetworkNmPlugin {
                     let body =
                         Self::parse_request_json::<FlightModeSetRequest>(req)?;
                     self.wifi_flight_mode_enabled = body.enabled;
-                    self.save_flight_mode_state(&FlightModeState {
-                        enabled: body.enabled,
-                    })
-                    .await?;
+                    self.save_flight_mode_pref(body.enabled).await?;
                     match self.nm_set_wifi_radio(!body.enabled).await {
                         Ok(()) => {}
                         Err(e) => {
@@ -3843,10 +3858,7 @@ impl Respondent for NetworkNmPlugin {
                     }
                     let enabled = body.preference.is_enabled();
                     self.wifi_preference_enabled = enabled;
-                    self.save_wifi_preference_state(&WifiPreferenceState {
-                        enabled,
-                    })
-                    .await?;
+                    self.save_wifi_enabled_pref(enabled).await?;
                     // Attempt immediate application: only when
                     // not in flight-mode AND not hard-blocked
                     // does the nmcli call have a chance of
@@ -4566,13 +4578,13 @@ role = "sta"
 sta_ssid = "HotelWiFi"
 sta_open = true
 sta_ipv4_mode = "dhcp"
-ap_ssid = "Volumio-Guest"
+ap_ssid = "Guest-AP"
 ap_channel = 36
 ap_band = "a"
 
 [fallback]
 hotspot_enabled = true
-hotspot_connection_name = "volumio-hotspot"
+hotspot_connection_name = "evo-network-hotspot"
 hotspot_ifname = "wlan0"
 hotspot_fallback = true
 "#;
@@ -4755,22 +4767,20 @@ hotspot_fallback = true
     }
 
     #[test]
-    fn parse_flight_mode_state_toml_accepts_legacy_and_envelope() {
-        let legacy = r#"
+    fn parse_legacy_enabled_bit_accepts_envelope_and_bare_shapes() {
+        let bare = r#"
 enabled = true
 "#;
-        let parsed_legacy =
-            parse_flight_mode_state_toml(legacy).expect("legacy parses");
-        assert!(parsed_legacy.enabled);
+        assert_eq!(parse_legacy_enabled_bit(bare), Some(true));
 
         let envelope = r#"
 schema_version = 1
 [state]
 enabled = false
 "#;
-        let parsed_envelope =
-            parse_flight_mode_state_toml(envelope).expect("envelope parses");
-        assert!(!parsed_envelope.enabled);
+        assert_eq!(parse_legacy_enabled_bit(envelope), Some(false));
+
+        assert_eq!(parse_legacy_enabled_bit(""), None);
     }
 
     #[test]
@@ -5042,7 +5052,7 @@ version = 1
             tokio::fs::read_to_string(p.intent_path().expect("path"))
                 .await
                 .expect("read intent");
-        assert!(intent_raw.contains("schema_version = 1"));
+        assert!(intent_raw.contains("schema_version = 2"));
         assert!(intent_raw.contains("[intent]"));
 
         let captive = CaptiveSessionState {
@@ -5407,13 +5417,18 @@ exit 0\n",
                 .unwrap_or("")
                 .contains("flight mode is enabled")));
 
-        let flight_raw = tokio::fs::read_to_string(
+        let intent_raw =
+            tokio::fs::read_to_string(p.intent_path().expect("path"))
+                .await
+                .expect("read intent");
+        assert!(intent_raw.contains("schema_version = 2"));
+        assert!(intent_raw.contains("[intent.radio_policy]"));
+        assert!(intent_raw.contains("flight_mode = true"));
+        assert!(!tokio::fs::try_exists(
             p.flight_mode_state_path().expect("path"),
         )
         .await
-        .expect("read flight state");
-        assert!(flight_raw.contains("schema_version = 1"));
-        assert!(flight_raw.contains("enabled = true"));
+        .expect("probe legacy file"));
 
         let nmcli_log = tokio::fs::read_to_string(&nmcli_log_path)
             .await
