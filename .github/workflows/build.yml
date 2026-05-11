@@ -1,11 +1,21 @@
 # PR and branch push: host-side fmt, clippy, tests. SDK arrives via
 # git tag in [workspace.dependencies]; no sibling evo-core checkout
 # needed.
+#
+# Scope: main branch + PRs targeting main. Development branches
+# (e.g. v0.1.X feature branches) may pin the SDK via a path
+# dependency on a sibling private evo-core-eng clone for
+# dev-velocity reasons; those branches do not auto-trigger CI
+# here because the sibling is not available on the runner. At
+# release-cut, the dev branch's SDK pin flips back to a
+# git+tag form and the merge to main validates here cleanly.
 name: build
 
 "on":
-  pull_request: {}
-  push: {}
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
