@@ -23,7 +23,7 @@ Operational procedures: `docs/NETWORK_NM_RUNBOOK.md`.
 
 ## Intent model parity notes
 
-The plugin accepts/uses the tested `volumio-evo`-style fields:
+The plugin uses these intent fields:
 
 - `ethernet.enabled`
 - `ethernet.device` (alias: `ethernet.ifname`)
@@ -269,7 +269,7 @@ Notes:
     "wifi": { "ifname": "wlan1", "role": "sta", "sta_ssid": "HotelWiFi", "sta_open": false },
     "fallback": {
       "hotspot_enabled": true,
-      "hotspot_connection_name": "volumio-hotspot",
+      "hotspot_connection_name": "evo-network-hotspot",
       "hotspot_ifname": "wlan0",
       "hotspot_fallback": true
     }
