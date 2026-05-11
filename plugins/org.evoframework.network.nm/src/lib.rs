@@ -25,6 +25,7 @@ pub mod nmcli_dispatch;
 pub mod rfkill;
 pub mod wifi_phy;
 pub mod wifi_radio;
+pub mod wifi_roles;
 
 use std::collections::HashMap;
 use std::fs::Permissions;
@@ -2167,6 +2168,77 @@ impl NetworkNmPlugin {
         .await
     }
 
+    /// Build the multi-radio inventory by walking `iw dev` and
+    /// probing each PHY's capability + band support. The plugin
+    /// uses this to drive role assignment (STA bearer vs AP
+    /// bearer) and to render the `network.nm.wifi_devices`
+    /// wire-op surface. Returns an empty `Vec` when `iw` fails
+    /// or the host has no Wi-Fi adapters; callers degrade
+    /// gracefully.
+    async fn enumerate_wifi_radios(&self) -> Vec<wifi_roles::WifiRadio> {
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let devs = match wifi_phy::list_wifi_devices(
+            exec.as_ref(),
+            &self.config.iw_path,
+            timeout,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "enumerate_wifi_radios: list_wifi_devices failed"
+                );
+                return Vec::new();
+            }
+        };
+        let mut rows = Vec::with_capacity(devs.len());
+        // Cache PHY capability by phy name — multiple ifnames on
+        // the same PHY (concurrent-vif mode: wlan0 + ap0) reuse
+        // the same probe result.
+        let mut cap_cache: std::collections::HashMap<
+            String,
+            wifi_phy::PhyCapability,
+        > = std::collections::HashMap::new();
+        for dev in &devs {
+            let cap = if let Some(c) = cap_cache.get(&dev.phy) {
+                c.clone()
+            } else {
+                match wifi_phy::phy_capability(
+                    exec.as_ref(),
+                    &self.config.iw_path,
+                    &dev.phy,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(c) => {
+                        cap_cache.insert(dev.phy.clone(), c.clone());
+                        c
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            phy = %dev.phy,
+                            ifname = %dev.ifname,
+                            error = %e,
+                            "phy_capability probe failed; row dropped"
+                        );
+                        continue;
+                    }
+                }
+            };
+            let class = classify_connection_class(&dev.ifname);
+            rows.push(wifi_roles::WifiRadio::from_dev_and_capability(
+                dev, cap, class,
+            ));
+        }
+        rows
+    }
+
     async fn nm_connection_exists(&self, name: &str) -> bool {
         let out = self
             .dispatcher
@@ -2396,14 +2468,6 @@ impl NetworkNmPlugin {
             return t.to_string();
         }
         self.config.default_wifi_iface.clone()
-    }
-
-    fn effective_hotspot_ifname(&self, intent: &NetworkIntent) -> String {
-        let t = intent.fallback.hotspot_ifname.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-        self.effective_wifi_ifname(intent)
     }
 
     fn nm_ipv4_args(
@@ -3105,17 +3169,72 @@ impl NetworkNmPlugin {
         let _guard = lock.lock().await;
 
         let mut steps = Vec::new();
-        let sta_ifname = self.effective_wifi_ifname(intent);
-        let hotspot_ifname_intent = self.effective_hotspot_ifname(intent);
+
+        // Multi-radio role assignment. Build the live inventory
+        // (one row per kernel netdev with its PHY capability +
+        // USB classification), then ask the role-assigner for
+        // STA / AP physical-radio pinning. Explicit overrides on
+        // `wifi.ifname` / `fallback.hotspot_ifname` win; the
+        // operator's `radio_policy.band_priority` orders the
+        // auto-pick over multi-radio inventories.
+        let inventory = self.enumerate_wifi_radios().await;
+        let band_priority: Vec<wifi_roles::BandClass> = intent
+            .radio_policy
+            .band_priority
+            .iter()
+            .copied()
+            .map(band_class_from_preference)
+            .collect();
+        let default_sta = self.effective_wifi_ifname(intent);
+        let assignment = wifi_roles::assign_wifi_roles(
+            &inventory,
+            &band_priority,
+            wifi_roles::RoleOverrides {
+                explicit_sta: intent.wifi.ifname.trim(),
+                explicit_ap: intent.fallback.hotspot_ifname.trim(),
+                default_sta_fallback: default_sta.as_str(),
+            },
+        );
+        if inventory.len() > 1 || !assignment.had_explicit_ap {
+            steps.push(format!(
+                "wifi role assignment: {} ({} radios in inventory)",
+                assignment.rationale,
+                inventory.len(),
+            ));
+        }
+        tracing::debug!(
+            plugin = PLUGIN_NAME,
+            inventory_size = inventory.len(),
+            sta_ifname = %assignment.sta_ifname,
+            ap_ifname = %assignment.ap_ifname,
+            same_iface = assignment.same_iface,
+            had_explicit_ap = assignment.had_explicit_ap,
+            rationale = %assignment.rationale,
+            "apply_intent: wifi role assignment"
+        );
+
+        let sta_ifname = assignment.sta_ifname.clone();
+        let intent_hotspot_if_is_explicit = assignment.had_explicit_ap;
         let phy_supports_concurrent =
             self.sta_phy_concurrent_capable(sta_ifname.as_str()).await;
-        let (mut resolved_ap_ifname, intent_hotspot_if_is_explicit) =
-            resolve_ap_ifname(
-                intent,
-                sta_ifname.as_str(),
-                hotspot_ifname_intent.as_str(),
-                phy_supports_concurrent,
-            );
+        // Concurrent-vif promotion: when STA and AP collapsed to
+        // one physical radio AND the operator did not pin AP AND
+        // the PHY supports concurrent managed+AP, promote AP to
+        // a virtual vif name (`ap0` by default, overridable via
+        // `EVO_NETWORK_AP_IFNAME`). Otherwise honour the
+        // assigner's physical-radio choice verbatim.
+        let mut resolved_ap_ifname = if assignment.same_iface
+            && !assignment.had_explicit_ap
+            && phy_supports_concurrent
+        {
+            std::env::var("EVO_NETWORK_AP_IFNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "ap0".to_string())
+        } else {
+            assignment.ap_ifname.clone()
+        };
         let hs_name = Self::hotspot_connection_name(intent);
 
         self.ensure_ethernet(intent, &mut steps).await?;
@@ -4567,27 +4686,38 @@ fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
     seq.push(ch.to_string());
 }
 
-fn resolve_ap_ifname(
-    intent: &NetworkIntent,
-    sta_ifname: &str,
-    hotspot_ifname_intent: &str,
-    phy_supports_concurrent: bool,
-) -> (String, bool) {
-    let intent_hotspot_if_is_explicit =
-        !intent.fallback.hotspot_ifname.trim().is_empty()
-            && hotspot_ifname_intent != sta_ifname;
-    let resolved = if intent_hotspot_if_is_explicit {
-        hotspot_ifname_intent.to_string()
-    } else if phy_supports_concurrent {
-        std::env::var("EVO_NETWORK_AP_IFNAME")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "ap0".to_string())
-    } else {
-        sta_ifname.to_string()
+/// Classify a Wi-Fi netdev's connection class by reading
+/// `/sys/class/net/<if>/device/uevent` for the kernel's
+/// `DEVTYPE=usb_*` line. USB dongles set `DEVTYPE=usb_interface`;
+/// PCIe / on-SoC radios surface other DEVTYPE values (or none).
+fn classify_connection_class(ifname: &str) -> wifi_roles::ConnectionClass {
+    let path = std::path::Path::new("/sys/class/net")
+        .join(ifname.trim())
+        .join("device")
+        .join("uevent");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return wifi_roles::ConnectionClass::Onboard;
     };
-    (resolved, intent_hotspot_if_is_explicit)
+    for line in raw.lines() {
+        if let Some(value) = line.trim().strip_prefix("DEVTYPE=") {
+            if value.trim().starts_with("usb_") {
+                return wifi_roles::ConnectionClass::Usb;
+            }
+        }
+    }
+    wifi_roles::ConnectionClass::Onboard
+}
+
+/// Convert the intent's per-band preference enum to the
+/// role-assigner's. Identity mapping — both enums share the same
+/// three variants — kept as a thin shim so the assigner stays
+/// pure (no `BandPreference` dependency).
+fn band_class_from_preference(p: BandPreference) -> wifi_roles::BandClass {
+    match p {
+        BandPreference::Ghz6 => wifi_roles::BandClass::Ghz6,
+        BandPreference::Ghz5 => wifi_roles::BandClass::Ghz5,
+        BandPreference::Ghz2_4 => wifi_roles::BandClass::Ghz2_4,
+    }
 }
 
 fn security_label(nm: &str) -> &'static str {
@@ -4747,34 +4877,6 @@ hotspot_fallback = true
         assert_eq!(intent.ethernet.ipv4_mode, Ipv4Mode::Static);
         assert_eq!(intent.wifi.ifname, "wlan1");
         assert_eq!(intent.fallback.hotspot_ifname, "wlan0");
-    }
-
-    #[test]
-    fn resolve_ap_ifname_prefers_explicit_hotspot_iface() {
-        let mut intent = NetworkIntent::default();
-        intent.fallback.hotspot_ifname = "wlan0".to_string();
-        let (resolved, explicit) =
-            resolve_ap_ifname(&intent, "wlan1", "wlan0", true);
-        assert_eq!(resolved, "wlan0");
-        assert!(explicit);
-    }
-
-    #[test]
-    fn resolve_ap_ifname_uses_ap0_when_concurrent_supported() {
-        let intent = NetworkIntent::default();
-        let (resolved, explicit) =
-            resolve_ap_ifname(&intent, "wlan1", "wlan1", true);
-        assert_eq!(resolved, "ap0");
-        assert!(!explicit);
-    }
-
-    #[test]
-    fn resolve_ap_ifname_falls_back_to_sta_when_not_concurrent() {
-        let intent = NetworkIntent::default();
-        let (resolved, explicit) =
-            resolve_ap_ifname(&intent, "wlan1", "wlan1", false);
-        assert_eq!(resolved, "wlan1");
-        assert!(!explicit);
     }
 
     #[test]
