@@ -64,6 +64,14 @@ use evo_plugin_sdk::privileges::{
 /// the framework-resolved strategy.
 pub const INTENT_MPD_SYSTEMCTL_RESTART: &str = "mpd_systemctl_restart";
 
+/// Capability-intent id the framework's preflight associates
+/// with the fragment-write leg. The fragment-writer worker
+/// observes this resolution via `LoadContext::capabilities` —
+/// when the framework reports the path is not writable, the
+/// worker publishes `FragmentWorkerStatus::Failed` instead of
+/// emitting writes that would fail at runtime.
+pub const INTENT_MPD_FRAGMENT_WRITE: &str = "mpd_fragment_write";
+
 /// Default systemctl binary path. Overridden by the
 /// `EVO_SYSTEMCTL` environment variable for distributions on
 /// non-standard prefixes (Alpine `/sbin/systemctl`, Yocto
@@ -237,7 +245,7 @@ fn linux_effective_uid() -> Option<u32> {
 /// `/proc/self/status`; on other platforms or when `/proc` is
 /// unreadable, defer to `EVO_RUNTIME_USER` set by the
 /// distribution's bootstrap script.
-fn process_needs_sudo() -> bool {
+pub(crate) fn process_needs_sudo() -> bool {
     #[cfg(target_os = "linux")]
     if let Some(uid) = linux_effective_uid() {
         return uid != 0;
