@@ -19,6 +19,14 @@ capability_intent:
     need: resolve relative paths emitted by MPD against declared media library roots so the playback plugin can correlate with metadata + artwork plugins.
     access_path: filesystem/library
     failure_mode: degrade to MPD-only paths (no library cross-reference); structured event; no panic.
+  - id: mpd_fragment_write
+    need: write the framework-controlled `audio_output` block to the configured fragment path (default `/etc/evo/mpd.conf`) so MPD picks up the substrate-negotiated ALSA device + format on its next start. The bootstrap script chowns the fragment path to the steward service user at install time so the running plugin writes directly without escalation.
+    access_path: filesystem/system
+    failure_mode: route-change fragment-writer worker publishes FragmentWorkerStatus::Failed with an operator-readable reason naming the bootstrap remedy; the previous fragment file is left in place; playback continues with the prior audio_output configuration; no panic.
+  - id: mpd_systemctl_restart
+    need: signal `systemctl restart mpd` after every fragment rewrite so MPD re-reads its audio_output configuration and applies the framework-negotiated device + format. When running as root, exec systemctl directly; when running as a non-root service user, dispatch via `sudo -n` against a narrow NOPASSWD drop-in shipped by the distribution's bootstrap. The plugin selects the strategy via the framework's CapabilityResolution for this intent, or falls back to /proc/self/status EUID detection when the framework's preflight runner has not yet populated the map.
+    access_path: sudoers/command
+    failure_mode: AutoMpdRestarter resolves to the no-op variant; fragment file is on disk but MPD does not pick it up until next manual restart; route-change worker publishes Failed status with the framework's remedy string; playback continues on the prior MPD configuration; no panic.
 
 required_binaries:
   - name: mpd
