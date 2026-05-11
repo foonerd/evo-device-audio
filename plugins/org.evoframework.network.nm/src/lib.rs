@@ -23,6 +23,7 @@
 
 pub mod nmcli_dispatch;
 pub mod rfkill;
+pub mod supervisor;
 pub mod wifi_phy;
 pub mod wifi_radio;
 pub mod wifi_roles;
@@ -79,6 +80,7 @@ const REQUEST_NETWORK_FLIGHT_MODE_GET: &str = "network.nm.flight_mode.get";
 const REQUEST_NETWORK_FLIGHT_MODE_SET: &str = "network.nm.flight_mode.set";
 const REQUEST_NETWORK_RADIO_STATUS: &str = "network.nm.radio.status";
 const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
+const REQUEST_NETWORK_SUPERVISOR_STATUS: &str = "network.nm.supervisor.status";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
@@ -1123,6 +1125,16 @@ pub struct NetworkNmPlugin {
     /// the framework's re-probe publications and re-resolves
     /// every per-tool dispatcher on each change.
     capabilities_watcher: Option<CapabilitiesWatcherHandle>,
+    /// Runtime supervisor task. Reachability probe loop plus
+    /// critical-recovery and STA-restore decisions. Spawned at
+    /// `Plugin::load` once the dispatcher fan-out is resolved;
+    /// idle by default in unit tests that bypass `load`.
+    supervisor: Option<supervisor::SupervisorTask>,
+    /// Watch receiver mirroring the supervisor's published view.
+    /// Wire-op handlers and reactive subjects borrow this
+    /// without locking the task.
+    supervisor_view_rx:
+        Option<tokio::sync::watch::Receiver<supervisor::SupervisorView>>,
 }
 
 /// Handle on the PPAG capabilities-watch reactor task. Mirrors
@@ -1156,6 +1168,8 @@ impl NetworkNmPlugin {
             rfkill_exec: None,
             curl_exec: None,
             capabilities_watcher: None,
+            supervisor: None,
+            supervisor_view_rx: None,
         }
     }
 
@@ -1244,6 +1258,98 @@ impl NetworkNmPlugin {
         if let Some(handle) = self.capabilities_watcher.take() {
             handle.shutdown.notify_one();
             let _ = handle.task.await;
+        }
+    }
+
+    /// Spawn the runtime supervisor. Builds probe + recovery
+    /// closures that capture Arc-cloned dispatcher state so the
+    /// task body is `Send + 'static`. Critical-recovery and
+    /// STA-restore callbacks log the decision and rely on the
+    /// reactive view + wire-op surface — the autonomous-recovery
+    /// apply path wires in the next sub-primitive.
+    fn spawn_supervisor(&mut self) {
+        let nmcli_exec = self.dispatcher.clone();
+        let nmcli_path = self.config.nmcli_path.clone();
+        let nmcli_timeout = Duration::from_millis(self.config.nmcli_timeout_ms);
+        let curl_exec = self.effective_curl_exec();
+        let curl_path = self.config.curl_path.clone();
+        let curl_timeout = Duration::from_millis(self.config.curl_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let iw_path = self.config.iw_path.clone();
+        let iw_timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let probe_url = supervisor::SupervisorConfig::from_env().probe_url;
+        let config = supervisor::SupervisorConfig::from_env();
+        let plugin_tag: &'static str = PLUGIN_NAME;
+
+        let probe: supervisor::SupervisorActions =
+            supervisor::SupervisorActions {
+                probe: Arc::new(move || {
+                    let nmcli_exec = nmcli_exec.clone();
+                    let nmcli_path = nmcli_path.clone();
+                    let curl_exec = curl_exec.clone();
+                    let curl_path = curl_path.clone();
+                    let iw_exec = iw_exec.clone();
+                    let iw_path = iw_path.clone();
+                    let probe_url = probe_url.clone();
+                    Box::pin(async move {
+                        probe_observations(
+                            nmcli_exec.as_ref(),
+                            &nmcli_path,
+                            nmcli_timeout,
+                            curl_exec.as_ref(),
+                            &curl_path,
+                            curl_timeout,
+                            iw_exec.as_ref(),
+                            &iw_path,
+                            iw_timeout,
+                            &probe_url,
+                        )
+                        .await
+                    })
+                }),
+                raise_critical_recovery: Arc::new(|| {
+                    Box::pin(async move {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            "supervisor: critical-recovery action not yet \
+                         wired in this build; operator-side surface \
+                         (wire-op + reactive subject) reflects the \
+                         decision so a downstream orchestrator can react"
+                        );
+                    })
+                }),
+                restore_sta: Arc::new(|| {
+                    Box::pin(async move {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            "supervisor: STA-restore action not yet wired \
+                         in this build; operator-side surface reflects \
+                         the decision"
+                        );
+                    })
+                }),
+            };
+
+        let task = supervisor::spawn(config, probe, plugin_tag);
+        self.supervisor_view_rx = Some(task.view.subscribe());
+        self.supervisor = Some(task);
+    }
+
+    /// Stop the supervisor task. Idempotent.
+    async fn stop_supervisor(&mut self) {
+        if let Some(task) = self.supervisor.take() {
+            task.shutdown().await;
+        }
+        self.supervisor_view_rx = None;
+    }
+
+    /// Borrow the latest supervisor view. Returns the default
+    /// (Unknown reachability) when the task hasn't been spawned
+    /// — e.g. in unit tests that bypass `Plugin::load`.
+    fn latest_supervisor_view(&self) -> supervisor::SupervisorView {
+        match self.supervisor_view_rx.as_ref() {
+            Some(rx) => rx.borrow().clone(),
+            None => supervisor::SupervisorView::default(),
         }
     }
 
@@ -3553,6 +3659,7 @@ impl Plugin for NetworkNmPlugin {
                         REQUEST_NETWORK_FLIGHT_MODE_SET.to_string(),
                         REQUEST_NETWORK_RADIO_STATUS.to_string(),
                         REQUEST_NETWORK_RADIO_SET.to_string(),
+                        REQUEST_NETWORK_SUPERVISOR_STATUS.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -3644,6 +3751,7 @@ impl Plugin for NetworkNmPlugin {
             self.wifi_flight_mode_enabled = intent.radio_policy.flight_mode;
             self.wifi_preference_enabled =
                 intent.radio_policy.wifi_enabled_pref;
+            self.spawn_supervisor();
             self.loaded = true;
             self.scan_cache.clear();
             tracing::info!(
@@ -3722,6 +3830,7 @@ impl Plugin for NetworkNmPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            self.stop_supervisor().await;
             self.stop_capabilities_watcher().await;
             self.loaded = false;
             self.state_dir = None;
@@ -4321,6 +4430,20 @@ impl Respondent for NetworkNmPlugin {
                         ),
                     )
                 }
+                REQUEST_NETWORK_SUPERVISOR_STATUS => {
+                    let view = self.latest_supervisor_view();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "supervisor": view,
+                            }),
+                        ),
+                    )
+                }
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type: {:?}",
                     other
@@ -4684,6 +4807,138 @@ fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
     seq.push(band);
     seq.push("802-11-wireless.channel".into());
     seq.push(ch.to_string());
+}
+
+/// Build one [`supervisor::SupervisorObservations`] snapshot for
+/// the supervisor's tick. Probes NetworkManager connectivity,
+/// runs the connectivity-check `curl` against `probe_url`, walks
+/// `iw dev` for Wi-Fi association state, and reads sysfs for
+/// Ethernet carrier state. All I/O is best-effort: a failed
+/// probe surfaces as `None` / `false` in the snapshot rather
+/// than aborting the tick.
+#[allow(clippy::too_many_arguments)]
+async fn probe_observations(
+    nmcli_exec: &dyn PrivilegedExec,
+    nmcli_path: &str,
+    nmcli_timeout: Duration,
+    curl_exec: &dyn PrivilegedExec,
+    curl_path: &str,
+    curl_timeout: Duration,
+    iw_exec: &dyn PrivilegedExec,
+    iw_path: &str,
+    iw_timeout: Duration,
+    probe_url: &str,
+) -> supervisor::SupervisorObservations {
+    let nm_connectivity =
+        probe_nm_connectivity(nmcli_exec, nmcli_path, nmcli_timeout).await;
+    let (probe_http_code, probe_effective_url) =
+        probe_connectivity_url(curl_exec, curl_path, curl_timeout, probe_url)
+            .await;
+    let wifi_associated =
+        probe_any_wifi_associated(iw_exec, iw_path, iw_timeout).await;
+    let ethernet_carrier_up = probe_ethernet_carrier();
+    supervisor::SupervisorObservations {
+        nm_connectivity,
+        probe_http_code,
+        probe_effective_url,
+        ethernet_carrier_up,
+        wifi_associated,
+    }
+}
+
+async fn probe_nm_connectivity(
+    exec: &dyn PrivilegedExec,
+    nmcli_path: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let out = exec
+        .dispatch(
+            nmcli_path,
+            &["-t", "-f", "CONNECTIVITY", "general"],
+            timeout,
+        )
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let v = raw.lines().next().unwrap_or("").trim().to_ascii_lowercase();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+async fn probe_connectivity_url(
+    exec: &dyn PrivilegedExec,
+    curl_path: &str,
+    timeout: Duration,
+    probe_url: &str,
+) -> (Option<u16>, Option<String>) {
+    let args = [
+        "-sS",
+        "-L",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}|%{url_effective}",
+        "--max-time",
+        "20",
+        probe_url,
+    ];
+    let out = match exec.dispatch(curl_path, &args, timeout).await {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    if !out.status.success() {
+        return (None, None);
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).to_string();
+    parse_http_probe_metrics(raw.trim())
+}
+
+async fn probe_any_wifi_associated(
+    exec: &dyn PrivilegedExec,
+    iw_path: &str,
+    timeout: Duration,
+) -> bool {
+    let devs = match wifi_phy::list_wifi_devices(exec, iw_path, timeout).await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for d in devs
+        .iter()
+        .filter(|d| d.iftype.eq_ignore_ascii_case("managed"))
+    {
+        let link =
+            wifi_phy::sta_link_info(exec, iw_path, &d.ifname, timeout).await;
+        if link.connected {
+            return true;
+        }
+    }
+    false
+}
+
+fn probe_ethernet_carrier() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let n = name.to_string_lossy();
+        if n == "lo" || n.starts_with("wl") || n.starts_with("docker") {
+            continue;
+        }
+        let carrier_path = entry.path().join("carrier");
+        if let Ok(s) = std::fs::read_to_string(&carrier_path) {
+            if s.trim() == "1" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Classify a Wi-Fi netdev's connection class by reading
