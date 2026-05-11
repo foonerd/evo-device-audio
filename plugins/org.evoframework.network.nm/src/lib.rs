@@ -1015,6 +1015,31 @@ pub struct NetworkNmPlugin {
     /// in an [`AutoNmcliDispatcher`] keyed off the framework's
     /// `LoadContext::capabilities` resolution map.
     dispatcher: Arc<dyn NmcliDispatcher>,
+    /// Concrete handle on the auto-dispatcher composite so the
+    /// capabilities-watch reactor can call `re_resolve` on it
+    /// without going through the `Arc<dyn NmcliDispatcher>`
+    /// erasure. Same underlying Arc as [`Self::dispatcher`]
+    /// when `Plugin::load` runs the production resolver.
+    auto_dispatcher: Option<Arc<AutoNmcliDispatcher>>,
+    /// PPAG capabilities-watch reactor. Spawned at load when
+    /// `LoadContext::capabilities_watch` is `Some`; observes
+    /// the framework's re-probe publications and re-resolves
+    /// the auto-dispatcher's inner strategy on every change.
+    capabilities_watcher: Option<CapabilitiesWatcherHandle>,
+}
+
+/// Handle on the PPAG capabilities-watch reactor task. Mirrors
+/// the shape used by playback.mpd so both PPAG-consuming
+/// plugins share an identical reactor pattern.
+struct CapabilitiesWatcherHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Re-resolve counter — bumped after every observed map
+    /// change. Kept on the handle so the counter's Arc clone
+    /// in the task body retains a live observer for future
+    /// reactor-progress tests.
+    #[allow(dead_code)]
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl NetworkNmPlugin {
@@ -1029,6 +1054,8 @@ impl NetworkNmPlugin {
             wifi_flight_mode_enabled: false,
             wifi_preference_enabled: default_wifi_preference_enabled(),
             dispatcher: Arc::new(DirectNmcliDispatcher::new()),
+            auto_dispatcher: None,
+            capabilities_watcher: None,
         }
     }
 
@@ -1036,6 +1063,76 @@ impl NetworkNmPlugin {
         self.state_dir.as_deref().ok_or_else(|| {
             PluginError::Permanent("state_dir not initialised".to_string())
         })
+    }
+
+    /// Spawn the PPAG capabilities-watch reactor. Subscribes to
+    /// the framework's `LoadContext::capabilities_watch`
+    /// channel; on every observed change calls
+    /// `AutoNmcliDispatcher::re_resolve` so the inner strategy
+    /// stays aligned with the framework-published resolution.
+    /// Exit conditions: plugin unload (shutdown notify) or
+    /// sender side dropping (framework re-probe task stopped).
+    fn spawn_capabilities_watcher(
+        &mut self,
+        auto: Arc<AutoNmcliDispatcher>,
+        mut rx: tokio::sync::watch::Receiver<
+            Arc<evo_plugin_sdk::privileges::CapabilityResolutionMap>,
+        >,
+    ) {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let refresh_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_refresh = Arc::clone(&refresh_count);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "capabilities-watch sender dropped; \
+                                 reactor exiting"
+                            );
+                            break;
+                        }
+                        let new_map = rx.borrow_and_update().clone();
+                        auto.re_resolve(&new_map);
+                        task_refresh.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            strategy = auto.current_strategy_name(),
+                            rationale = %auto.rationale(),
+                            "nmcli dispatch strategy re-resolved from \
+                             PPAG update"
+                        );
+                    }
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "capabilities-watch reactor received \
+                             shutdown signal; exiting"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        self.capabilities_watcher = Some(CapabilitiesWatcherHandle {
+            task,
+            shutdown,
+            refresh_count,
+        });
+    }
+
+    /// Wind down the capabilities-watch reactor. Idempotent.
+    async fn stop_capabilities_watcher(&mut self) {
+        if let Some(handle) = self.capabilities_watcher.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
     }
 
     fn intent_path(&self) -> Result<PathBuf, PluginError> {
@@ -3088,14 +3185,27 @@ impl Plugin for NetworkNmPlugin {
             // AutoMpdRestarter resolution shape so the two
             // PPAG consumers in this distribution observe the
             // same EUID floor.
-            let auto = AutoNmcliDispatcher::resolve(&ctx.capabilities);
+            let auto =
+                Arc::new(AutoNmcliDispatcher::resolve(&ctx.capabilities));
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                strategy = auto.strategy_name(),
+                strategy = auto.current_strategy_name(),
                 rationale = %auto.rationale(),
                 "nmcli dispatch strategy resolved"
             );
-            self.dispatcher = Arc::new(auto) as Arc<dyn NmcliDispatcher>;
+            self.dispatcher = auto.clone() as Arc<dyn NmcliDispatcher>;
+            self.auto_dispatcher = Some(auto.clone());
+
+            // Spawn the PPAG capabilities-watch reactor when the
+            // framework's hot-tightening re-probe task is
+            // publishing live updates. On every observed change
+            // the reactor calls `AutoNmcliDispatcher::re_resolve`,
+            // so a sudoers drop-in removed mid-operation flips
+            // the inner strategy from sudo to direct (or to a
+            // refusal rationale) without re-admission.
+            if let Some(rx) = ctx.capabilities_watch.clone() {
+                self.spawn_capabilities_watcher(auto, rx);
+            }
 
             let flight_mode_state = self.load_flight_mode_state().await?;
             self.wifi_flight_mode_enabled = flight_mode_state.enabled;
@@ -3179,6 +3289,7 @@ impl Plugin for NetworkNmPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            self.stop_capabilities_watcher().await;
             self.loaded = false;
             self.state_dir = None;
             self.config = PluginConfig::defaults();
@@ -3186,6 +3297,7 @@ impl Plugin for NetworkNmPlugin {
             self.wifi_flight_mode_enabled = false;
             self.wifi_preference_enabled = default_wifi_preference_enabled();
             self.dispatcher = Arc::new(DirectNmcliDispatcher::new());
+            self.auto_dispatcher = None;
             Ok(())
         }
     }

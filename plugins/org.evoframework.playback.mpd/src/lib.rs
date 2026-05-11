@@ -315,6 +315,35 @@ pub struct MpdPlaybackPlugin {
     /// MPD audio_output fragment, and asks the restarter to
     /// recycle MPD on every snapshot.
     fragment_worker: Option<FragmentWorkerHandle>,
+    /// Concrete handle on the auto-restarter composite so a
+    /// future capabilities-watch reactor can call `re_resolve`
+    /// on it without going through the `Arc<dyn MpdRestarter>`
+    /// erasure. Same underlying Arc as [`Self::restarter`] in
+    /// production; `None` when tests inject a different
+    /// restarter via [`MpdPlaybackPlugin::with_restarter`].
+    auto_restarter: Option<Arc<AutoMpdRestarter>>,
+    /// PPAG capabilities-watch reactor handle. `Some` when the
+    /// framework's re-probe task is publishing live resolution
+    /// updates to `LoadContext::capabilities_watch`; `None` on
+    /// admission paths that did not wire the watch (test
+    /// fixtures, OOP transports). Held here so
+    /// `Plugin::unload` can stop it cleanly.
+    capabilities_watcher: Option<CapabilitiesWatcherHandle>,
+}
+
+/// Handle on the PPAG capabilities-watch reactor task. Spawned
+/// once at load when `LoadContext::capabilities_watch` is `Some`;
+/// observes the framework's re-probe publications and re-resolves
+/// the auto-restarter's inner strategy on every change.
+struct CapabilitiesWatcherHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+    /// Re-resolve counter — bumped after every observed map
+    /// change. Kept on the handle so the counter's Arc clone
+    /// in the task body retains a live observer for future
+    /// reactor-progress tests.
+    #[allow(dead_code)]
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Fragment-writer worker status published to the worker's
@@ -392,6 +421,8 @@ impl MpdPlaybackPlugin {
             restarter: Arc::new(SudoSystemctlRestarter::new()),
             reactor: None,
             fragment_worker: None,
+            auto_restarter: None,
+            capabilities_watcher: None,
         }
     }
 
@@ -614,6 +645,71 @@ impl MpdPlaybackPlugin {
             handle.shutdown.notify_one();
             let _ = handle.task.await;
         }
+    }
+
+    /// Spawn the PPAG capabilities-watch reactor.
+    fn spawn_capabilities_watcher(
+        &mut self,
+        auto: Arc<AutoMpdRestarter>,
+        mut rx: tokio::sync::watch::Receiver<
+            Arc<evo_plugin_sdk::privileges::CapabilityResolutionMap>,
+        >,
+    ) {
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let refresh_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_refresh = Arc::clone(&refresh_count);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "capabilities-watch sender dropped; \
+                                 reactor exiting"
+                            );
+                            break;
+                        }
+                        let new_map = rx.borrow_and_update().clone();
+                        auto.re_resolve(&new_map);
+                        task_refresh.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            strategy = auto.current_strategy_name(),
+                            rationale = %auto.rationale(),
+                            "MPD restart strategy re-resolved from \
+                             PPAG update"
+                        );
+                    }
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "capabilities-watch reactor received \
+                             shutdown signal; exiting"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        self.capabilities_watcher = Some(CapabilitiesWatcherHandle {
+            task,
+            shutdown,
+            refresh_count,
+        });
+    }
+
+    /// Wind down the capabilities-watch reactor. Idempotent.
+    async fn stop_capabilities_watcher(&mut self) {
+        if let Some(handle) = self.capabilities_watcher.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+        self.auto_restarter = None;
     }
 
     /// Wind down the reactor task and clear the route-change
@@ -1041,14 +1137,22 @@ impl Plugin for MpdPlaybackPlugin {
             // installed; tests that constructed the plugin
             // through `with_restarter` keep their injected
             // strategy because they never invoke `Plugin::load`.
-            let auto = AutoMpdRestarter::resolve(&ctx.capabilities);
+            let auto = Arc::new(AutoMpdRestarter::resolve(&ctx.capabilities));
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                strategy = auto.strategy_name(),
+                strategy = auto.current_strategy_name(),
                 rationale = %auto.rationale(),
                 "MPD restart strategy resolved"
             );
-            self.restarter = Arc::new(auto) as Arc<dyn MpdRestarter>;
+            self.restarter = auto.clone() as Arc<dyn MpdRestarter>;
+            self.auto_restarter = Some(auto.clone());
+
+            // Spawn the PPAG capabilities-watch reactor when
+            // the framework's hot-tightening re-probe task is
+            // publishing live updates.
+            if let Some(rx) = ctx.capabilities_watch.clone() {
+                self.spawn_capabilities_watcher(auto, rx);
+            }
 
             // Engage the audio data plane. The plugin is a
             // source plugin (declared via
@@ -1127,6 +1231,7 @@ impl Plugin for MpdPlaybackPlugin {
             // channel. Then stop the reactor (which also
             // clears the framework-held callback). Finally
             // release the routing handle.
+            self.stop_capabilities_watcher().await;
             self.stop_fragment_worker().await;
             self.stop_reactor().await;
             self.audio_routing = None;
