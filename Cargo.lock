@@ -686,6 +686,7 @@ dependencies = [
  "evo-plugin-sdk",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
+ "org-evoframework-network-nm",
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
  "tokio",

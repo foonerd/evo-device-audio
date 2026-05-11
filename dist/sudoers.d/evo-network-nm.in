@@ -1,0 +1,38 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-network-nm with mode 0440,
+# owned root:root.
+#
+# Allows the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) to invoke
+# `nmcli` via sudo without password. The grant is scoped to
+# the nmcli binary only — no wildcards, no `ALL`, no
+# arbitrary commands. The network.nm plugin's argv covers
+# read-only verbs (status / scan / connection show /
+# general / radio) and mutation verbs (connection up / down
+# / add / modify, radio wifi on/off) under the same binary.
+# Per-verb scoping is intentionally not done: sudoers
+# argv-match against nmcli's option flags is brittle (any
+# `-t -f FIELD` reordering breaks the match) and the binary
+# itself is the operator-relevant trust boundary.
+#
+# Path discipline: the binary path MUST match
+# `PluginConfig.nmcli_path` (default `/usr/bin/nmcli`,
+# overridable via the plugin's `nmcli_path` config field).
+# Plugin code passes this path to the dispatcher at every
+# call; sudo matches against this string verbatim; the two
+# must stay aligned or sudo refuses with `Sorry, user X is
+# not allowed to execute /usr/bin/nmcli`.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh --install-network-nm-sudoers
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-network-nm.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-network-nm
+#
+# `visudo -c -f /etc/sudoers.d/evo-network-nm` verifies
+# syntactically valid sudoers.
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/bin/nmcli

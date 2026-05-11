@@ -79,6 +79,32 @@ on every setter so the delivery plugin re-renders the modular \
 ALSA pipeline and the UI surfaces stay coherent.
 """
 
+[[racks]]
+name = "networking"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Host networking surface: NetworkManager-backed connection \
+control + Wi-Fi radio + connectivity-check + captive-portal \
+helpers. One shelf for the link-layer operator surface; \
+additional shelves (link aggregation, VPN, etc.) attach as \
+their plugins land.
+"""
+
+[[racks.shelves]]
+name = "link"
+shape = 1
+description = """
+Host link-layer respondent. Operator-facing networking \
+verbs (status / scan / intent.get|set|apply / captive.* / \
+security.* / flight_mode.get|set) for the
+NetworkManager-backed reference implementation. Plugin \
+dispatches every nmcli invocation through a privilege \
+composite that the framework's preflight runner resolves \
+at admission (direct under root, sudo -n under a non-root \
+service user).
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by
