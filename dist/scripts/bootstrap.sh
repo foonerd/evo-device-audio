@@ -180,9 +180,19 @@ fi
 # Step 3: /etc/evo/mpd.conf — boot-time fragment owned by service user
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_MPD_FRAGMENT:-1}" != "0" ]]; then
-    install -d -m 0755 -o root -g root "$(dirname "$MPD_FRAGMENT_PATH")"
+    FRAGMENT_PARENT="$(dirname "$MPD_FRAGMENT_PATH")"
+    install -d -m 0755 -o root -g root "$FRAGMENT_PARENT"
+    # The fragment-writer worker uses atomic-write (stage at
+    # .mpd.conf.tmp, fsync, rename) so the service user needs
+    # WRITE permission on the PARENT directory, not just the
+    # fragment file. chown the parent so creating the staging
+    # file works without the worker needing extra privileges.
+    # Sibling root-owned files (client_acl.toml, trust.d/)
+    # stay untouched per their own ownership.
+    chown "$SERVICE_USER:$SERVICE_USER" "$FRAGMENT_PARENT"
+    echo "[bootstrap] $FRAGMENT_PARENT owned by $SERVICE_USER (mode 0755)"
     # Seed with the static AAMPP-pipeline fragment (device
-    # "evo" -> /etc/asound.d/99-evo.conf -> hardware). The
+    # "evo" -> /etc/asound.conf -> hardware). The
     # plugin's fragment-writer worker overwrites this on every
     # route change once the framework publishes a topology;
     # the static form gives MPD a valid audio_output at boot
