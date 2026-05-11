@@ -1,0 +1,47 @@
+# Client-API capability ACL for evo-device-audio.
+#
+# The framework's wire surface exposes operator-tier
+# capabilities (plans_admin, plugins_admin,
+# reconciliation_admin, ...). Each is gated by this file: a
+# capability is granted only to peers matching the declared
+# policy. The framework's default (file absent) is conservative
+# — `plans_admin` etc. are NOT granted automatically; an
+# operator wiring evo-plugin-tool over the local Unix socket
+# is refused until this file is in place.
+#
+# This distribution's posture: trust local-socket peers whose
+# UID matches the steward's UID. The Unix socket sits under
+# /run/evo/evo.sock (mode 0660; group = service user); only
+# the operator's identity (and root) can connect at all. The
+# matching-UID check is then strong enough to grant operator
+# capabilities without further interaction. Distributions
+# wiring a separate frontend / bridge under a DIFFERENT UID
+# widen the ACL via additional allow_uids / allow_gids
+# entries.
+
+[capabilities.plans_admin]
+# Operators issuing plan fire / list verbs via
+# `evo-plugin-tool plan ...`. Required for the audio
+# distribution's plan-firing workflow (loading + playing
+# tracks via the framework's source-verb dispatcher).
+allow_local = true
+
+[capabilities.plugins_admin]
+# Operators inspecting + reloading the plugin set via
+# `evo-plugin-tool admin ...`. Useful for development +
+# diagnostics; not strictly required for runtime playback.
+allow_local = true
+
+[capabilities.reconciliation_admin]
+# Operators inspecting + forcing reconciliation pairs via
+# `evo-plugin-tool admin reconciliation ...`. Useful for
+# diagnostics on the audio data plane's compose-and-apply
+# loop; not strictly required for runtime playback.
+allow_local = true
+
+[capabilities.grammar_admin]
+# Operators issuing subject-grammar migration verbs (orphan
+# scan / accept / migrate). Useful when the catalogue's
+# subject types change across release boundaries; not
+# strictly required for runtime playback.
+allow_local = true

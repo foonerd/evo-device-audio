@@ -34,7 +34,10 @@
 # Toggles:
 #   EVO_INSTALL_MPD_SUDOERS=0  — skip /etc/sudoers.d/evo-mpd-restart
 #   EVO_INSTALL_SYSTEMD_DROP_INS=0  — skip /etc/systemd/system/evo.service.d/
+#   EVO_INSTALL_CLIENT_ACL=0  — skip /etc/evo/client_acl.toml install
 #   EVO_INSTALL_MPD_FRAGMENT=0  — skip /etc/evo/mpd.conf bootstrap (empty file)
+#   EVO_INSTALL_ASOUND_CONF=0  — skip /etc/asound.conf install
+#   EVO_INSTALL_CATALOGUE=0  — skip /opt/evo/catalogue/default.toml install
 #
 # These mirror volumio-evo's `EVO_INSTALL_*_SUDOERS=0/1`
 # pattern so operators can disable individual steps without
@@ -174,6 +177,37 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
     echo "[bootstrap] systemctl daemon-reload"
 else
     echo "[bootstrap] systemd drop-ins skipped (EVO_INSTALL_SYSTEMD_DROP_INS=0 or --skip-systemd)"
+fi
+
+# ----------------------------------------------------------
+# Step 2.5: /etc/evo/client_acl.toml — operator capability ACL
+# ----------------------------------------------------------
+# The framework's wire-surface ACL gates plans_admin /
+# plugins_admin / reconciliation_admin / grammar_admin
+# capabilities behind operator-controlled policy. Absent file =
+# default-deny posture; operator wiring `evo-plugin-tool` over
+# the local socket would be refused until this file is in
+# place. Toggle off via EVO_INSTALL_CLIENT_ACL=0 for vendor
+# distributions composing their own ACL externally.
+if [[ "${EVO_INSTALL_CLIENT_ACL:-1}" != "0" ]]; then
+    CLIENT_ACL_TEMPLATE="$DIST_DIR/etc-evo/client_acl.toml"
+    CLIENT_ACL_PATH="/etc/evo/client_acl.toml"
+    if [[ ! -f "$CLIENT_ACL_TEMPLATE" ]]; then
+        echo "client_acl template not found at $CLIENT_ACL_TEMPLATE" >&2
+        exit 2
+    fi
+    install -d -m 0755 -o root -g root "$(dirname "$CLIENT_ACL_PATH")"
+    if [[ -f "$CLIENT_ACL_PATH" ]] && \
+       ! cmp -s "$CLIENT_ACL_TEMPLATE" "$CLIENT_ACL_PATH"; then
+        backup="$CLIENT_ACL_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
+        cp -a "$CLIENT_ACL_PATH" "$backup"
+        echo "[bootstrap] backed up prior $CLIENT_ACL_PATH to $backup"
+    fi
+    install -m 0644 -o root -g root \
+        "$CLIENT_ACL_TEMPLATE" "$CLIENT_ACL_PATH"
+    echo "[bootstrap] installed $CLIENT_ACL_PATH"
+else
+    echo "[bootstrap] EVO_INSTALL_CLIENT_ACL=0 — skipping client_acl"
 fi
 
 # ----------------------------------------------------------
@@ -317,6 +351,13 @@ if [[ -w "$MPD_FRAGMENT_PATH" ]] && \
     echo "  [ok]    $MPD_FRAGMENT_PATH writable by $SERVICE_USER"
 else
     echo "  [WARN]  $MPD_FRAGMENT_PATH not owned by $SERVICE_USER or not writable"
+fi
+
+# client_acl present (operator capability gate).
+if [[ -f /etc/evo/client_acl.toml ]]; then
+    echo "  [ok]    /etc/evo/client_acl.toml installed (plans_admin + plugins_admin + reconciliation_admin granted to matching-UID local peers)"
+else
+    echo "  [WARN]  /etc/evo/client_acl.toml absent — operator wire-ops (evo-plugin-tool plan / admin) will be refused until installed"
 fi
 
 echo
