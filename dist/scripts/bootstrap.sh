@@ -225,7 +225,7 @@ if [[ "${EVO_INSTALL_MPD_FRAGMENT:-1}" != "0" ]]; then
     # stay untouched per their own ownership.
     chown "$SERVICE_USER:$SERVICE_USER" "$FRAGMENT_PARENT"
     echo "[bootstrap] $FRAGMENT_PARENT owned by $SERVICE_USER (mode 0755)"
-    # Seed with the static AAMPP-pipeline fragment (device
+    # Seed with the static modular-pipeline fragment (device
     # "evo" -> /etc/asound.conf -> hardware). The
     # plugin's fragment-writer worker overwrites this on every
     # route change once the framework publishes a topology;
@@ -294,7 +294,7 @@ else
 fi
 
 # ----------------------------------------------------------
-# Step 4: /etc/asound.conf — AAMPP pipeline pcm.evo
+# Step 4: /etc/asound.conf — modular ALSA pipeline (pcm.evo)
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
     ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"

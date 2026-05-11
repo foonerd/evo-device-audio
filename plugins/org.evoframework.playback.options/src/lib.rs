@@ -1,7 +1,7 @@
 //! # org-evoframework-playback-options
 //!
 //! Operator-facing audiophile-grade playback settings plugin.
-//! Owns the operator's policy choices for the AAMPP audio
+//! Owns the operator's policy choices for the modular ALSA
 //! pipeline:
 //!
 //! - **Output device** — which ALSA card / pcm.evo terminus the
@@ -28,7 +28,7 @@
 //! **policy**, not **mechanism**: it remembers what the
 //! operator chose and tells other plugins about it. The
 //! delivery.alsa plugin (mechanism) reacts to settings-changed
-//! happenings by re-rendering the AAMPP pipeline; the
+//! happenings by re-rendering the modular ALSA pipeline; the
 //! playback.mpd plugin (mechanism) reads settings via the
 //! framework's audio_routing handle once topology negotiation
 //! incorporates the operator's resampling preference.
@@ -190,8 +190,9 @@ pub struct ResamplingPolicy {
     /// `true` when MPD should resample the source to the
     /// declared `target_bitdepth` / `target_samplerate`; `false`
     /// when MPD should pass through the source's native format
-    /// (the AAMPP "no manipulation" path; `plug` still bridges
-    /// the format to the card via the kernel's automatic conversion).
+    /// (the pipeline's "no manipulation" path; `plug` still
+    /// bridges the format to the card via the kernel's automatic
+    /// conversion).
     pub enabled: bool,
     /// Target bit depth when `enabled = true`. Empty string
     /// (`""`) means "match source"; concrete values are `"16"`,

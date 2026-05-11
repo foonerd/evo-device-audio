@@ -42,8 +42,8 @@ restart_budget = 5
 # delivery.alsa's pcm.evo binding), volume-normalization
 # policy. Read verbs return the current state; write verbs
 # validate + persist + emit a Happening for other plugins to
-# react to (delivery.alsa rewires the AAMPP pipeline on every
-# output-device change).
+# react to (delivery.alsa rewires the modular ALSA pipeline on
+# every output-device change).
 #
 # Settings persist to /var/lib/evo/org.evoframework.playback.options/state.toml
 # (the plugin's state directory; the framework guarantees

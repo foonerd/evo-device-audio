@@ -58,7 +58,7 @@ mpd-path URI scheme.
 name = "delivery"
 shape = 2
 description = """
-Audio delivery stage. Owns the AAMPP modular ALSA pipeline \
+Audio delivery stage. Owns the modular ALSA pipeline \
 (pcm.evo defined in /etc/asound.conf); declares the \
 WriteEndpoint other audio-producing plugins write into. \
 Exposes a respondent surface for operator-facing hardware \
@@ -75,8 +75,8 @@ Operator-facing playback settings. Persists audiophile \
 preferences across steward restarts (resampling / mixer_type \
 / DOP / output_device / volume_normalization). Emits \
 `Happening::PluginEvent` with event_type `audio.options.changed` \
-on every setter so the delivery plugin re-renders the AAMPP \
-pipeline and the UI surfaces stay coherent.
+on every setter so the delivery plugin re-renders the modular \
+ALSA pipeline and the UI surfaces stay coherent.
 """
 
 # Subject types the audio playback warden announces on
