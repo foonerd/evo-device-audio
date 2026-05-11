@@ -27,6 +27,9 @@
 //! connect_ms = 5000      # default 5000; range 1-60000
 //! welcome_ms = 2000      # default 2000; range 1-60000
 //! command_ms = 3000      # default 3000; range 1-300000
+//!
+//! [fragment]
+//! path = "/etc/evo/mpd.conf"  # default; absolute path
 //! ```
 //!
 //! # Validation
@@ -47,6 +50,12 @@ use crate::mpd::{ConnectTimeouts, MpdEndpoint};
 const DEFAULT_MPD_HOST: &str = "127.0.0.1";
 /// Default MPD TCP port.
 const DEFAULT_MPD_PORT: u16 = 6600;
+/// Default MPD `audio_output` fragment path. The distribution's
+/// bring-up procedure wires `/etc/mpd.conf` to `include_optional
+/// /etc/evo/mpd.conf`; F3's fragment writer renders this file
+/// from the framework's negotiated WriteEndpoint on every
+/// route change.
+pub(crate) const DEFAULT_FRAGMENT_PATH: &str = "/etc/evo/mpd.conf";
 
 /// Minimum timeout value (milliseconds). Zero is rejected because a
 /// zero-budget timeout never succeeds and silently produces only
@@ -69,13 +78,19 @@ const COMMAND_TIMEOUT_MAX_MS: u64 = 300_000;
 /// Validated plugin configuration.
 ///
 /// Constructed from [`PluginConfig::from_toml_table`] or
-/// [`PluginConfig::defaults`]. Carries the two pieces of state the
-/// plugin actually uses at runtime: the MPD endpoint and the
-/// connection timeouts.
+/// [`PluginConfig::defaults`]. Carries the runtime state the
+/// plugin needs after parsing the operator's TOML.
 #[derive(Debug)]
 pub(crate) struct PluginConfig {
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
+    /// Path the route-change fragment writer renders MPD's
+    /// `audio_output` block to. Absolute. The default
+    /// `/etc/evo/mpd.conf` matches the distribution's MPD
+    /// include line (`include_optional /etc/evo/mpd.conf` in
+    /// `/etc/mpd.conf`); operator override is for distributions
+    /// that route MPD's config through a different path.
+    pub(crate) fragment_path: PathBuf,
 }
 
 impl PluginConfig {
@@ -87,6 +102,7 @@ impl PluginConfig {
             endpoint: MpdEndpoint::tcp(DEFAULT_MPD_HOST, DEFAULT_MPD_PORT)
                 .expect("default host is non-empty"),
             timeouts: ConnectTimeouts::default(),
+            fragment_path: PathBuf::from(DEFAULT_FRAGMENT_PATH),
         }
     }
 
@@ -103,7 +119,7 @@ impl PluginConfig {
         // sections added in later phases will not break older
         // operator configs.
         for key in table.keys() {
-            if !matches!(key.as_str(), "endpoint" | "timeouts") {
+            if !matches!(key.as_str(), "endpoint" | "timeouts" | "fragment") {
                 tracing::warn!(
                     plugin = crate::PLUGIN_NAME,
                     key = key.as_str(),
@@ -114,8 +130,13 @@ impl PluginConfig {
 
         let endpoint = parse_endpoint(table.get("endpoint"))?;
         let timeouts = parse_timeouts(table.get("timeouts"))?;
+        let fragment_path = parse_fragment_path(table.get("fragment"))?;
 
-        Ok(Self { endpoint, timeouts })
+        Ok(Self {
+            endpoint,
+            timeouts,
+            fragment_path,
+        })
     }
 }
 
@@ -175,6 +196,17 @@ pub(crate) enum ConfigError {
         min: u64,
         max: u64,
     },
+
+    /// `fragment.path` was empty or whitespace-only.
+    #[error("fragment.path must not be empty")]
+    EmptyFragmentPath,
+
+    /// `fragment.path` was not an absolute path. MPD reads the
+    /// fragment from a system-wide location; relative paths are
+    /// ambiguous against the steward's working directory and
+    /// refused at config-parse time.
+    #[error("fragment.path must be absolute, got {0:?}")]
+    RelativeFragmentPath(String),
 }
 
 // ----- parse helpers -----
@@ -327,6 +359,49 @@ fn parse_timeouts(
     })
 }
 
+fn parse_fragment_path(
+    value: Option<&toml::Value>,
+) -> Result<PathBuf, ConfigError> {
+    let Some(value) = value else {
+        return Ok(PathBuf::from(DEFAULT_FRAGMENT_PATH));
+    };
+
+    let table = value.as_table().ok_or(ConfigError::WrongType {
+        field: "fragment",
+        expected: "table",
+        actual: type_name_of(value),
+    })?;
+
+    // Warn on unknown keys within [fragment].
+    for key in table.keys() {
+        if key.as_str() != "path" {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                key = format!("fragment.{}", key),
+                "unknown config key; ignored"
+            );
+        }
+    }
+
+    let path_str = match table.get("path") {
+        Some(v) => v.as_str().ok_or(ConfigError::WrongType {
+            field: "fragment.path",
+            expected: "string",
+            actual: type_name_of(v),
+        })?,
+        None => return Ok(PathBuf::from(DEFAULT_FRAGMENT_PATH)),
+    };
+
+    if path_str.trim().is_empty() {
+        return Err(ConfigError::EmptyFragmentPath);
+    }
+    let path = PathBuf::from(path_str);
+    if !path.is_absolute() {
+        return Err(ConfigError::RelativeFragmentPath(path_str.to_string()));
+    }
+    Ok(path)
+}
+
 fn parse_timeout_ms(
     value: Option<&toml::Value>,
     field: &'static str,
@@ -391,6 +466,109 @@ mod tests {
         assert_eq!(c.timeouts.connect, dt.connect);
         assert_eq!(c.timeouts.welcome, dt.welcome);
         assert_eq!(c.timeouts.command, dt.command);
+        assert_eq!(c.fragment_path, PathBuf::from(DEFAULT_FRAGMENT_PATH));
+    }
+
+    // ===== fragment-path parsing =====
+
+    #[test]
+    fn fragment_path_defaults_when_section_absent() {
+        let c = parse("").unwrap();
+        assert_eq!(c.fragment_path, PathBuf::from(DEFAULT_FRAGMENT_PATH));
+    }
+
+    #[test]
+    fn fragment_path_defaults_when_path_field_absent() {
+        let c = parse(
+            r#"
+            [fragment]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.fragment_path, PathBuf::from(DEFAULT_FRAGMENT_PATH));
+    }
+
+    #[test]
+    fn fragment_path_accepts_absolute_path() {
+        let c = parse(
+            r#"
+            [fragment]
+            path = "/etc/evo/mpd-custom.conf"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.fragment_path, PathBuf::from("/etc/evo/mpd-custom.conf"));
+    }
+
+    #[test]
+    fn fragment_path_rejects_empty() {
+        let e = parse(
+            r#"
+            [fragment]
+            path = ""
+        "#,
+        )
+        .unwrap_err();
+        assert_eq!(e, ConfigError::EmptyFragmentPath);
+    }
+
+    #[test]
+    fn fragment_path_rejects_whitespace_only() {
+        let e = parse(
+            r#"
+            [fragment]
+            path = "   "
+        "#,
+        )
+        .unwrap_err();
+        assert_eq!(e, ConfigError::EmptyFragmentPath);
+    }
+
+    #[test]
+    fn fragment_path_rejects_relative() {
+        let e = parse(
+            r#"
+            [fragment]
+            path = "etc/evo/mpd.conf"
+        "#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            ConfigError::RelativeFragmentPath("etc/evo/mpd.conf".to_string())
+        );
+    }
+
+    #[test]
+    fn fragment_path_rejects_non_string() {
+        let e = parse(
+            r#"
+            [fragment]
+            path = 42
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            e,
+            ConfigError::WrongType {
+                field: "fragment.path",
+                expected: "string",
+                actual: "integer",
+            }
+        ));
+    }
+
+    #[test]
+    fn fragment_unknown_keys_are_ignored() {
+        let c = parse(
+            r#"
+            [fragment]
+            path = "/etc/evo/mpd.conf"
+            future_field = true
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.fragment_path, PathBuf::from("/etc/evo/mpd.conf"));
     }
 
     #[test]
