@@ -67,6 +67,18 @@ inspection (delivery.probe_hardware / list_cards / list_mixers \
 drive output-device selection.
 """
 
+[[racks.shelves]]
+name = "options"
+shape = 1
+description = """
+Operator-facing playback settings. Persists audiophile \
+preferences across steward restarts (resampling / mixer_type \
+/ DOP / output_device / volume_normalization). Emits \
+`Happening::PluginEvent` with event_type `audio.options.changed` \
+on every setter so the delivery plugin re-renders the AAMPP \
+pipeline and the UI surfaces stay coherent.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by

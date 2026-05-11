@@ -53,6 +53,7 @@ use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
+use org_evoframework_playback_options::PlaybackOptionsPlugin;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -116,6 +117,30 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting playback.mpd")?;
+
+            // 4. playback.options: singleton respondent on
+            //    audio.options shape 1. Operator-facing
+            //    audiophile-grade settings (resampling /
+            //    mixer_type / DOP / output_device /
+            //    volume_normalization). Persists state
+            //    across restarts; emits
+            //    Happening::PluginEvent on every change so
+            //    delivery.alsa can re-render the AAMPP
+            //    pipeline. Admit AFTER delivery.alsa so the
+            //    cross-plugin reaction chain is in place
+            //    when the first settings-changed happening
+            //    fires.
+            let options_manifest = Manifest::from_toml(
+                org_evoframework_playback_options::MANIFEST_TOML,
+            )
+            .context("parsing playback.options manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    PlaybackOptionsPlugin::new(),
+                    options_manifest,
+                )
+                .await
+                .context("admitting playback.options")?;
 
             Ok(())
         })

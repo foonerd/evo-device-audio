@@ -1,0 +1,31 @@
+schema_version: "1.0"
+plugin: org.evoframework.playback.options
+owner: evo-device-audio
+isolation: in_process
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml. Privileges declared here union into the steward
+# record at admission. The plugin operates on its own state
+# directory; the framework guarantees per-plugin filesystem
+# isolation under /var/lib/evo/<plugin-name>/.
+
+capability_intent:
+  - id: state_directory_read_write
+    need: read + write the plugin's per-plugin state file at /var/lib/evo/org.evoframework.playback.options/state.toml. Holds the operator's audiophile-grade settings (resampling / mixer_type / DOP / output_device / volume_normalization) across steward restarts.
+    access_path: filesystem/state
+    failure_mode: plugin admits; get_settings returns defaults; set_* verbs fail with PluginError::Permanent naming the IO error; the plugin remembers the in-memory settings for the steward's lifetime so the operator can re-try once filesystem state is recovered.
+  - id: emit_settings_changed_happenings
+    need: emit Happening::PluginEvent events on every settings change so the delivery.alsa plugin (and future UI / multi-room peer / analytics surfaces) can react. Event type `audio.options.changed` carries the field that changed + the new value.
+    access_path: framework/happenings
+    failure_mode: setter verbs succeed; the emit failure is logged at warn level; the persisted state remains correct; consumers of the happening see no event but can re-read via get_settings at any time.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - steward state directory exists
+host_provisioning: {}

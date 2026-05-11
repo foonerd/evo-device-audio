@@ -33,6 +33,7 @@ evo-plugin-sdk = { workspace = true }
 org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
+org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.
