@@ -96,13 +96,24 @@ channels = 2
 
 # Respondent capabilities. Source plugins MUST also be
 # respondents — source verbs targeting the URI schemes
-# this plugin owns arrive via handle_request. F2 declares
-# play_now only; F4 grows the surface to the full set
-# (stop / pause / resume / seek / next / previous), at
-# which point the warden's course_correct surface is
-# reconciled with the source-verb surface (overlapping
-# verb names route through their respective dispatchers
-# without functional duplication).
+# this plugin owns arrive via handle_request. The full
+# state-transition set ships here: play_now loads-and-plays
+# a specific mpd-path URI; play / pause / resume / stop /
+# next / previous / seek / set_volume drive the supervisor
+# through its existing PlaybackCommand surface so the
+# warden's course_correct path and the source-verb dispatch
+# path share the same execution machinery (different
+# entry points, identical outcome).
 [capabilities.respondent]
-request_types = ["play_now"]
+request_types = [
+    "play_now",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+]
 response_budget_ms = 2000
