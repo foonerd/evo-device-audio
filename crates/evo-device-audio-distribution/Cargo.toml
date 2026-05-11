@@ -40,6 +40,7 @@ org-evoframework-playback-options = { path = "../../plugins/org.evoframework.pla
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = []

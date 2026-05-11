@@ -689,6 +689,7 @@ dependencies = [
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
