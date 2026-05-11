@@ -14,7 +14,13 @@ path = "src/lib.rs"
 [dependencies]
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
-tokio = { workspace = true }
+# Plugin-local tokio features: workspace baseline plus `fs`
+# (atomic-write of the MPD audio_output fragment under
+# /etc/evo/mpd.conf) and `process` (invocation of
+# `sudo -n systemctl restart mpd` from the route-change
+# fragment-writer worker). Both are MPD-specific surfaces that
+# do not belong on the workspace baseline.
+tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -36,6 +42,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # Production code does not handle JSON state directly; only the capturing /
 # null mocks under `#[cfg(test)]` reference the type.
 serde_json = { workspace = true }
+# Unique tempdir per F3 fragment-writer test so the atomic-
+# write tests do not collide on a shared path. Hermetic; no
+# fixture lingers across runs.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

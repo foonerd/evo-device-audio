@@ -106,14 +106,23 @@
 
 mod config;
 mod mpd;
+mod mpd_fragment;
+mod mpd_restart;
 mod playback_supervisor;
+
+#[cfg(test)]
+mod test_support_routing;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use evo_plugin_sdk::contract::audio_routing::AudioRouting;
+use evo_plugin_sdk::contract::audio_routing::{
+    AudioRouting, AudioRoutingError, RouteChange, RouteChangeCallback,
+    WriteEndpoint,
+};
 use evo_plugin_sdk::contract::{
     Assignment, BuildInfo, CourseCorrection, CustodyHandle, HealthReport,
     LoadContext, Plugin, PluginDescription, PluginError, PluginIdentity,
@@ -121,9 +130,15 @@ use evo_plugin_sdk::contract::{
     SubjectAnnouncer, Warden,
 };
 use evo_plugin_sdk::Manifest;
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinHandle;
 
 use crate::config::PluginConfig;
 use crate::mpd::{ConnectTimeouts, MpdEndpoint};
+use crate::mpd_fragment::{
+    atomic_write_fragment, render_audio_output_fragment,
+};
+use crate::mpd_restart::{MpdRestarter, SudoSystemctlRestarter};
 use crate::playback_supervisor::{
     PlaybackCommand, PlaybackError, SubjectEmitter, SupervisorHandle,
 };
@@ -261,6 +276,71 @@ pub struct MpdPlaybackPlugin {
     /// Mirrors `corrections_dispatched` on the respondent
     /// dispatch side.
     requests_handled: u64,
+    /// Path the route-change reactor's fragment writer renders
+    /// MPD's `audio_output` block to. Populated from the
+    /// operator's config (or the hardcoded default
+    /// `/etc/evo/mpd.conf`) at construction and refreshed at
+    /// every `Plugin::load`. The dynamic shape supersedes the
+    /// static fragment at `dist/mpd/evo-fragment.conf`.
+    fragment_path: PathBuf,
+    /// Restart strategy invoked after every fragment rewrite
+    /// so MPD picks the new audio_output up. Production uses
+    /// [`SudoSystemctlRestarter`]; tests inject a counting or
+    /// failing stub via [`MpdPlaybackPlugin::with_restarter`].
+    restarter: Arc<dyn MpdRestarter>,
+    /// Route-change reactor task handle. `Some` after a
+    /// successful `Plugin::load`; `None` before first load and
+    /// after `Plugin::unload`.
+    reactor: Option<ReactorHandle>,
+    /// Fragment-writer worker task handle. `Some` after a
+    /// successful `Plugin::load`; `None` before first load and
+    /// after `Plugin::unload`. The worker subscribes to the
+    /// reactor's snapshot channel, renders + atomic-writes the
+    /// MPD audio_output fragment, and asks the restarter to
+    /// recycle MPD on every snapshot.
+    fragment_worker: Option<FragmentWorkerHandle>,
+}
+
+/// Fragment-writer worker status published to the worker's
+/// watch channel for observability surfaces and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentWorkerStatus {
+    /// No topology — no fragment has been rendered yet.
+    Idle,
+    /// Worker rendered the supplied [`WriteEndpoint`] and
+    /// restarted MPD successfully.
+    Restarted {
+        /// The endpoint the active fragment file describes.
+        endpoint: WriteEndpoint,
+    },
+    /// Render / write / restart leg failed. Worker keeps
+    /// running and reattempts on the next route change. The
+    /// previous fragment file (if any) is unaffected.
+    Failed {
+        /// Operator-readable failure reason — render error
+        /// message, IO error description, or restarter error
+        /// string verbatim.
+        reason: String,
+    },
+}
+
+/// Handle on the route-change reactor task spawned at load.
+struct ReactorHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+    endpoints_rx: watch::Receiver<Option<WriteEndpoint>>,
+    /// Reactor refresh counter — bumped after every endpoint
+    /// fetch. Tests poll on this to observe reactor progress
+    /// without racy sleeps.
+    #[cfg_attr(not(test), allow(dead_code))]
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Handle on the fragment-writer worker task.
+struct FragmentWorkerHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+    status_rx: watch::Receiver<FragmentWorkerStatus>,
 }
 
 impl MpdPlaybackPlugin {
@@ -292,7 +372,51 @@ impl MpdPlaybackPlugin {
             custodies_taken: 0,
             corrections_dispatched: 0,
             requests_handled: 0,
+            fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
+            restarter: Arc::new(SudoSystemctlRestarter::new()),
+            reactor: None,
+            fragment_worker: None,
         }
+    }
+
+    /// Replace the MPD restart strategy. Used by tests to
+    /// substitute a deterministic stub for the production
+    /// `sudo systemctl restart mpd` invocation. Production
+    /// builds use the default [`SudoSystemctlRestarter`]
+    /// installed by [`MpdPlaybackPlugin::new`].
+    #[cfg(test)]
+    pub(crate) fn with_restarter(
+        mut self,
+        restarter: Arc<dyn MpdRestarter>,
+    ) -> Self {
+        self.restarter = restarter;
+        self
+    }
+
+    /// Replace the fragment-output path. Used by tests so
+    /// the fragment-writer worker writes into a tempdir
+    /// rather than `/etc/evo/mpd.conf`.
+    #[cfg(test)]
+    pub(crate) fn with_fragment_path(mut self, path: PathBuf) -> Self {
+        self.fragment_path = path;
+        self
+    }
+
+    /// Subscribe to the fragment-writer worker's status
+    /// channel. Returns `None` when no worker is running.
+    pub fn subscribe_fragment_status(
+        &self,
+    ) -> Option<watch::Receiver<FragmentWorkerStatus>> {
+        self.fragment_worker.as_ref().map(|w| w.status_rx.clone())
+    }
+
+    /// Subscribe to endpoint snapshots from the route-change
+    /// reactor. Returns `None` when the plugin is not loaded
+    /// (no reactor is running).
+    pub fn subscribe_endpoints(
+        &self,
+    ) -> Option<watch::Receiver<Option<WriteEndpoint>>> {
+        self.reactor.as_ref().map(|r| r.endpoints_rx.clone())
     }
 
     /// Cumulative count of source-verb requests handled
@@ -360,13 +484,307 @@ impl MpdPlaybackPlugin {
         })?;
         self.endpoint = config.endpoint;
         self.timeouts = config.timeouts;
+        self.fragment_path = config.fragment_path;
         Ok(())
+    }
+
+    /// Spawn the route-change reactor task. Must be called
+    /// after `install_routing` succeeds so `audio_routing` is
+    /// populated; must be called inside a tokio runtime
+    /// context. Mirrors composition.alsa's reactor shape but
+    /// consumes [`AudioRouting::write_endpoint`] in place of
+    /// `composition_endpoints` because playback.mpd is a
+    /// source-plugin endpoint consumer.
+    async fn spawn_reactor(&mut self) -> Result<(), PluginError> {
+        debug_assert!(
+            self.audio_routing.is_some(),
+            "spawn_reactor called before install_routing"
+        );
+        debug_assert!(
+            self.reactor.is_none(),
+            "spawn_reactor called while a reactor is already running"
+        );
+
+        let routing = Arc::clone(
+            self.audio_routing
+                .as_ref()
+                .expect("audio_routing populated when loaded"),
+        );
+
+        let initial = fetch_write_endpoint(routing.as_ref());
+        let (endpoints_tx, endpoints_rx) = watch::channel(initial);
+
+        let wake = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        let refresh_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let wake_for_callback = Arc::clone(&wake);
+        let callback: RouteChangeCallback =
+            Arc::new(move |_event: &RouteChange| {
+                wake_for_callback.notify_one();
+            });
+        routing.on_route_change(Some(callback));
+
+        let task_routing = Arc::clone(&routing);
+        let task_wake = Arc::clone(&wake);
+        let task_shutdown = Arc::clone(&shutdown);
+        let task_count = Arc::clone(&refresh_count);
+        let task = tokio::spawn(async move {
+            run_reactor(
+                task_routing,
+                task_wake,
+                task_shutdown,
+                endpoints_tx,
+                task_count,
+            )
+            .await;
+        });
+
+        self.reactor = Some(ReactorHandle {
+            task,
+            shutdown,
+            endpoints_rx,
+            refresh_count,
+        });
+        Ok(())
+    }
+
+    /// Spawn the fragment-writer worker task. Must be called
+    /// after `spawn_reactor` succeeds — the worker subscribes
+    /// to the reactor's endpoint snapshot channel.
+    async fn spawn_fragment_worker(&mut self) -> Result<(), PluginError> {
+        debug_assert!(
+            self.reactor.is_some(),
+            "spawn_fragment_worker called before spawn_reactor"
+        );
+        debug_assert!(
+            self.fragment_worker.is_none(),
+            "spawn_fragment_worker called while a worker is already running"
+        );
+
+        let endpoints_rx = self
+            .reactor
+            .as_ref()
+            .expect("reactor populated")
+            .endpoints_rx
+            .clone();
+        let (status_tx, status_rx) = watch::channel(FragmentWorkerStatus::Idle);
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task_fragment_path = self.fragment_path.clone();
+        let task_restarter = Arc::clone(&self.restarter);
+        let task = tokio::spawn(async move {
+            run_fragment_worker(
+                endpoints_rx,
+                task_shutdown,
+                status_tx,
+                task_fragment_path,
+                task_restarter,
+            )
+            .await;
+        });
+
+        self.fragment_worker = Some(FragmentWorkerHandle {
+            task,
+            shutdown,
+            status_rx,
+        });
+        Ok(())
+    }
+
+    /// Wind down the fragment-writer worker. Idempotent.
+    async fn stop_fragment_worker(&mut self) {
+        if let Some(handle) = self.fragment_worker.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Wind down the reactor task and clear the route-change
+    /// callback. Idempotent — calling on a plugin without an
+    /// active reactor is a no-op.
+    async fn stop_reactor(&mut self) {
+        if let Some(routing) = self.audio_routing.as_ref() {
+            // Drop the framework's reference to the callback
+            // before signalling shutdown so the routing
+            // handle releases its Arc and the callback
+            // closure (and its captured wake notify) can be
+            // dropped on schedule.
+            routing.on_route_change(None);
+        }
+        if let Some(handle) = self.reactor.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Returns the reactor's refresh counter. Tests poll on
+    /// this to observe the reactor making progress after
+    /// firing a route change. Returns 0 when no reactor is
+    /// running.
+    #[cfg(test)]
+    fn refresh_count(&self) -> u64 {
+        self.reactor
+            .as_ref()
+            .map(|r| r.refresh_count.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
     }
 }
 
 impl Default for MpdPlaybackPlugin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One-shot endpoint fetch over the AudioRouting handle.
+/// Returns `Some(endpoint)` when topology is configured,
+/// `None` for the benign pre-reconciliation state, and `None`
+/// (with a warning log) for any other error — the reactor
+/// treats unexpected errors as transient and re-polls on the
+/// next wake.
+fn fetch_write_endpoint(routing: &dyn AudioRouting) -> Option<WriteEndpoint> {
+    match routing.write_endpoint() {
+        Ok(ep) => Some(ep),
+        Err(AudioRoutingError::EndpointNotConfigured) => None,
+        Err(other) => {
+            tracing::warn!(
+                error = %other,
+                "audio_routing.write_endpoint returned unexpected error; \
+                 treating as pre-reconciliation"
+            );
+            None
+        }
+    }
+}
+
+/// Reactor loop. Awakens on the wake signal (route changes)
+/// or the shutdown signal (unload). Each wake triggers a
+/// refetch of the routing handle's `write_endpoint`,
+/// publishes the new value (or `None` for pre-reconciliation
+/// state) on the watch channel, and bumps the refresh counter
+/// so tests can observe progress.
+async fn run_reactor(
+    routing: Arc<dyn AudioRouting>,
+    wake: Arc<Notify>,
+    shutdown: Arc<Notify>,
+    endpoints_tx: watch::Sender<Option<WriteEndpoint>>,
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
+) {
+    loop {
+        tokio::select! {
+            _ = wake.notified() => {
+                let snapshot = fetch_write_endpoint(routing.as_ref());
+                if endpoints_tx.send(snapshot).is_err() {
+                    // Receiver side dropped — nobody reads
+                    // these snapshots anymore. The plugin
+                    // is on its way out; exit the reactor.
+                    break;
+                }
+                refresh_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ = shutdown.notified() => {
+                break;
+            }
+        }
+    }
+}
+
+/// Fragment-writer worker loop. Subscribes to the reactor's
+/// endpoint snapshot channel; on each new snapshot, renders
+/// the MPD `audio_output` block, atomic-writes it to the
+/// configured fragment path, and asks the restarter to
+/// recycle MPD. Worker status (Idle / Restarted / Failed) is
+/// published to the watch channel for observability.
+async fn run_fragment_worker(
+    mut endpoints_rx: watch::Receiver<Option<WriteEndpoint>>,
+    shutdown: Arc<Notify>,
+    status_tx: watch::Sender<FragmentWorkerStatus>,
+    fragment_path: PathBuf,
+    restarter: Arc<dyn MpdRestarter>,
+) {
+    loop {
+        let snapshot = endpoints_rx.borrow_and_update().clone();
+        match snapshot {
+            None => {
+                let _ = status_tx.send(FragmentWorkerStatus::Idle);
+            }
+            Some(endpoint) => {
+                let status = apply_fragment_cycle(
+                    &endpoint,
+                    &fragment_path,
+                    restarter.as_ref(),
+                )
+                .await;
+                let _ = status_tx.send(status);
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => return,
+            res = endpoints_rx.changed() => {
+                if res.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One render + write + restart cycle. Returns the worker
+/// status the caller should publish.
+async fn apply_fragment_cycle(
+    endpoint: &WriteEndpoint,
+    fragment_path: &std::path::Path,
+    restarter: &dyn MpdRestarter,
+) -> FragmentWorkerStatus {
+    let rendered = match render_audio_output_fragment(endpoint) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                ?endpoint,
+                "fragment render failed; keeping previous fragment file"
+            );
+            return FragmentWorkerStatus::Failed {
+                reason: format!("render: {e}"),
+            };
+        }
+    };
+
+    if let Err(e) = atomic_write_fragment(fragment_path, &rendered).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            path = %fragment_path.display(),
+            "fragment atomic-write failed; keeping previous fragment file"
+        );
+        return FragmentWorkerStatus::Failed {
+            reason: format!("write: {e}"),
+        };
+    }
+
+    if let Err(reason) = restarter.restart().await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            reason = %reason,
+            "MPD restart failed after fragment rewrite; new fragment is on \
+             disk but MPD has not picked it up yet"
+        );
+        return FragmentWorkerStatus::Failed { reason };
+    }
+
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        path = %fragment_path.display(),
+        device = %endpoint.path.display(),
+        "MPD audio_output fragment rewritten and MPD restarted"
+    );
+    FragmentWorkerStatus::Restarted {
+        endpoint: endpoint.clone(),
     }
 }
 
@@ -540,6 +958,14 @@ impl Plugin for MpdPlaybackPlugin {
                     as Arc<dyn RelationAnnouncer>,
             ));
 
+            // Spawn the route-change reactor and the
+            // fragment-writer worker. The reactor watches
+            // the framework's topology rewires; the worker
+            // renders MPD's audio_output block and recycles
+            // MPD on every snapshot.
+            self.spawn_reactor().await?;
+            self.spawn_fragment_worker().await?;
+
             self.loaded = true;
 
             tracing::info!(
@@ -548,7 +974,9 @@ impl Plugin for MpdPlaybackPlugin {
                 connect_ms = self.timeouts.connect.as_millis() as u64,
                 welcome_ms = self.timeouts.welcome.as_millis() as u64,
                 command_ms = self.timeouts.command.as_millis() as u64,
-                "plugin loaded; config applied; subject emitter equipped"
+                fragment_path = %self.fragment_path.display(),
+                "plugin loaded; config applied; subject emitter equipped; \
+                 route-change reactor + fragment-writer worker running"
             );
 
             Ok(())
@@ -580,11 +1008,15 @@ impl Plugin for MpdPlaybackPlugin {
                 tracked.supervisor.shutdown().await;
             }
 
-            // Drop the audio routing handle so the
-            // framework releases its Arc when nothing else
-            // holds it. F3 onwards adds a route-change
-            // reactor that needs explicit shutdown here
-            // before this point.
+            // Stop the fragment-writer worker first — it
+            // subscribes to the reactor's snapshot channel,
+            // so tearing the reactor down before the worker
+            // would race the worker against a closed
+            // channel. Then stop the reactor (which also
+            // clears the framework-held callback). Finally
+            // release the routing handle.
+            self.stop_fragment_worker().await;
+            self.stop_reactor().await;
             self.audio_routing = None;
 
             self.loaded = false;
@@ -1705,6 +2137,385 @@ mod tests {
 
         p.release_custody(handle).await.unwrap();
         drop(mock_task);
+    }
+
+    // ===== F3 fragment-writer + reactor tests =====
+
+    use super::test_support_routing::{
+        default_alsa_write_endpoint, route_change as source_route_change,
+        StubSourceAudioRouting,
+    };
+    use crate::mpd_restart::{FailingRestarter, NoOpRestarter};
+    use evo_plugin_sdk::audio::{
+        AudioFormat as F3AudioFormat, PcmCodec as F3PcmCodec,
+    };
+    use evo_plugin_sdk::contract::audio_routing::{
+        AudioRouting as F3AudioRouting, EndpointKind as F3EndpointKind,
+        WriteEndpoint as F3WriteEndpoint,
+    };
+
+    /// Wait until the reactor's refresh counter advances from
+    /// `prior` to at least `prior + advances`. Bounded so a
+    /// wedged reactor does not hang CI.
+    async fn wait_for_refresh(
+        plugin: &MpdPlaybackPlugin,
+        prior: u64,
+        advances: u64,
+    ) {
+        let target = prior + advances;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if plugin.refresh_count() >= target {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "reactor refresh counter did not advance from {prior} to \
+                     {target} within 500ms"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Wait until the worker status channel reports a state
+    /// matching the predicate.
+    async fn wait_for_fragment_status<F>(
+        rx: &mut watch::Receiver<FragmentWorkerStatus>,
+        deadline_ms: u64,
+        mut predicate: F,
+    ) -> FragmentWorkerStatus
+    where
+        F: FnMut(&FragmentWorkerStatus) -> bool,
+    {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(deadline_ms);
+        if predicate(&rx.borrow()) {
+            return rx.borrow().clone();
+        }
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "fragment worker did not reach the expected status within \
+                     {deadline_ms}ms; current = {:?}",
+                    rx.borrow()
+                );
+            }
+            tokio::select! {
+                _ = rx.changed() => {
+                    if predicate(&rx.borrow()) {
+                        return rx.borrow().clone();
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// Convenience: build a loaded plugin wired to a fresh
+    /// `StubSourceAudioRouting`, a tempdir-backed fragment
+    /// path, and a `NoOpRestarter`. Returns the plugin, the
+    /// stub (for publishing endpoints / firing route changes),
+    /// the restarter (for asserting call count), and the
+    /// tempdir + fragment path (for inspecting written
+    /// content). Caller drives `spawn_reactor` +
+    /// `spawn_fragment_worker` directly so each test can
+    /// observe intermediate states.
+    fn fragment_test_plugin() -> (
+        MpdPlaybackPlugin,
+        Arc<StubSourceAudioRouting>,
+        Arc<NoOpRestarter>,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fragment_path = tempdir.path().join("mpd.conf");
+        let restarter = Arc::new(NoOpRestarter::new());
+        let mut p = MpdPlaybackPlugin::new()
+            .with_restarter(Arc::clone(&restarter) as Arc<dyn MpdRestarter>)
+            .with_fragment_path(fragment_path.clone());
+        let stub = Arc::new(StubSourceAudioRouting::new());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn F3AudioRouting>))
+            .unwrap();
+        (p, stub, restarter, tempdir, fragment_path)
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_registers_route_change_callback() {
+        let (mut p, stub, _restarter, _td, _fp) = fragment_test_plugin();
+        assert!(!stub.has_route_change_callback());
+        p.spawn_reactor().await.unwrap();
+        assert!(stub.has_route_change_callback());
+        p.stop_reactor().await;
+        assert!(!stub.has_route_change_callback());
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_publishes_initial_endpoint_when_topology_present() {
+        let (mut p, stub, _restarter, _td, _fp) = fragment_test_plugin();
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.spawn_reactor().await.unwrap();
+
+        let rx = p.subscribe_endpoints().expect("reactor running");
+        assert_eq!(rx.borrow().clone(), Some(default_alsa_write_endpoint()));
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_publishes_none_when_topology_absent() {
+        let (mut p, _stub, _restarter, _td, _fp) = fragment_test_plugin();
+        p.spawn_reactor().await.unwrap();
+
+        let rx = p.subscribe_endpoints().expect("reactor running");
+        assert!(
+            rx.borrow().is_none(),
+            "EndpointNotConfigured must publish None"
+        );
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn route_change_refreshes_endpoint_via_reactor() {
+        let (mut p, stub, _restarter, _td, _fp) = fragment_test_plugin();
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.spawn_reactor().await.unwrap();
+
+        let mut rx = p.subscribe_endpoints().expect("reactor running");
+        let prior_refresh = p.refresh_count();
+
+        // Publish a new topology at a different format and
+        // fire the route change. The reactor must refetch.
+        let new_format = F3AudioFormat::Pcm {
+            codec: F3PcmCodec::PcmS24Le,
+            rate_hz: 192_000,
+            channels: 2,
+        };
+        let new_ep = F3WriteEndpoint {
+            kind: F3EndpointKind::AlsaPcm,
+            path: PathBuf::from("hw:3,0"),
+            format: new_format.clone(),
+            buffer_frames: 1024,
+        };
+        stub.set_write_endpoint(new_ep.clone());
+        assert!(stub.fire_route_change(source_route_change(new_format)));
+
+        wait_for_refresh(&p, prior_refresh, 1).await;
+        rx.changed().await.expect("watch channel still alive");
+        assert_eq!(rx.borrow().clone(), Some(new_ep));
+
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn fragment_worker_renders_and_restarts_on_initial_endpoint() {
+        let (mut p, stub, restarter, _td, fragment_path) =
+            fragment_test_plugin();
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        let mut status_rx =
+            p.subscribe_fragment_status().expect("worker running");
+        wait_for_fragment_status(&mut status_rx, 1000, |s| {
+            matches!(s, FragmentWorkerStatus::Restarted { .. })
+        })
+        .await;
+
+        // Restarter was invoked once for the initial
+        // endpoint.
+        assert_eq!(restarter.call_count(), 1);
+
+        // Fragment file is on disk with the expected
+        // content.
+        let body = tokio::fs::read_to_string(&fragment_path).await.unwrap();
+        assert!(body.contains("device          \"hw:2,0\""));
+        assert!(body.contains("format          \"44100:16:2\""));
+        assert!(body.contains("mixer_type      \"software\""));
+
+        p.stop_fragment_worker().await;
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn fragment_worker_rewrites_and_restarts_on_route_change() {
+        let (mut p, stub, restarter, _td, fragment_path) =
+            fragment_test_plugin();
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        let mut status_rx =
+            p.subscribe_fragment_status().expect("worker running");
+        wait_for_fragment_status(&mut status_rx, 1000, |s| {
+            matches!(s, FragmentWorkerStatus::Restarted { .. })
+        })
+        .await;
+        let initial_restart_count = restarter.call_count();
+        assert!(initial_restart_count >= 1);
+
+        // Publish a new endpoint and fire route change. The
+        // worker must re-render, re-write, and re-restart.
+        let new_format = F3AudioFormat::Pcm {
+            codec: F3PcmCodec::PcmS24Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        let new_ep = F3WriteEndpoint {
+            kind: F3EndpointKind::AlsaPcm,
+            path: PathBuf::from("hw:4,0"),
+            format: new_format.clone(),
+            buffer_frames: 1024,
+        };
+        stub.set_write_endpoint(new_ep.clone());
+        let prior_refresh = p.refresh_count();
+        assert!(stub.fire_route_change(source_route_change(new_format)));
+        wait_for_refresh(&p, prior_refresh, 1).await;
+
+        wait_for_fragment_status(&mut status_rx, 1000, |s| match s {
+            FragmentWorkerStatus::Restarted { endpoint } => {
+                endpoint.path == std::path::Path::new("hw:4,0")
+            }
+            _ => false,
+        })
+        .await;
+
+        // Restarter was invoked again for the new endpoint.
+        assert!(restarter.call_count() > initial_restart_count);
+
+        // Fragment file now describes the new device.
+        let body = tokio::fs::read_to_string(&fragment_path).await.unwrap();
+        assert!(body.contains("device          \"hw:4,0\""));
+        assert!(body.contains("format          \"96000:24:2\""));
+
+        p.stop_fragment_worker().await;
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn fragment_worker_publishes_failed_when_restart_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let fragment_path = tempdir.path().join("mpd.conf");
+        let restarter = Arc::new(FailingRestarter::new("test failure"));
+        let mut p = MpdPlaybackPlugin::new()
+            .with_restarter(Arc::clone(&restarter) as Arc<dyn MpdRestarter>)
+            .with_fragment_path(fragment_path.clone());
+        let stub = Arc::new(StubSourceAudioRouting::new());
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn F3AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        let mut status_rx =
+            p.subscribe_fragment_status().expect("worker running");
+        let status = wait_for_fragment_status(&mut status_rx, 1000, |s| {
+            matches!(s, FragmentWorkerStatus::Failed { .. })
+        })
+        .await;
+        match status {
+            FragmentWorkerStatus::Failed { reason } => {
+                assert!(
+                    reason.contains("test failure"),
+                    "expected restarter reason to propagate, got {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Fragment file IS on disk (render + write
+        // succeeded); only the restart failed. The previous
+        // state is undisturbed because there was no
+        // previous state.
+        assert!(fragment_path.exists());
+
+        p.stop_fragment_worker().await;
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn fragment_worker_failed_when_endpoint_kind_unsupported() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let fragment_path = tempdir.path().join("mpd.conf");
+        let restarter = Arc::new(NoOpRestarter::new());
+        let mut p = MpdPlaybackPlugin::new()
+            .with_restarter(Arc::clone(&restarter) as Arc<dyn MpdRestarter>)
+            .with_fragment_path(fragment_path.clone());
+        let stub = Arc::new(StubSourceAudioRouting::new());
+        // Publish a NamedPipe endpoint — out of scope for
+        // F3's MPD audio_output fragment renderer.
+        let unsupported = F3WriteEndpoint {
+            kind: F3EndpointKind::NamedPipe,
+            path: PathBuf::from("/tmp/evo.fifo"),
+            format: F3AudioFormat::Pcm {
+                codec: F3PcmCodec::PcmS16Le,
+                rate_hz: 44_100,
+                channels: 2,
+            },
+            buffer_frames: 1024,
+        };
+        stub.set_write_endpoint(unsupported);
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn F3AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        let mut status_rx =
+            p.subscribe_fragment_status().expect("worker running");
+        let status = wait_for_fragment_status(&mut status_rx, 1000, |s| {
+            matches!(s, FragmentWorkerStatus::Failed { .. })
+        })
+        .await;
+        match status {
+            FragmentWorkerStatus::Failed { reason } => {
+                assert!(
+                    reason.contains("render"),
+                    "expected render failure in reason, got {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Restarter was NOT invoked — render failed before
+        // the restart leg.
+        assert_eq!(restarter.call_count(), 0);
+        // No fragment file was written (atomic-write was
+        // never reached).
+        assert!(!fragment_path.exists());
+
+        p.stop_fragment_worker().await;
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn unload_terminates_reactor_and_worker_promptly() {
+        let (mut p, stub, _restarter, _td, _fp) = fragment_test_plugin();
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        // Drive through Plugin::unload to verify the full
+        // teardown path — same shape composition.alsa
+        // exercises.
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+        p.loaded = true;
+        // Equip a null subject emitter to satisfy any
+        // future invariants the unload path may add; not
+        // strictly required for this teardown shape today.
+        p.subject_emitter = Some(SubjectEmitter::null());
+
+        let started = std::time::Instant::now();
+        p.unload().await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "unload must drain reactor + worker quickly; took {elapsed:?}"
+        );
+        assert!(p.reactor.is_none());
+        assert!(p.fragment_worker.is_none());
+        assert!(p.audio_routing.is_none());
+        assert!(
+            !stub.has_route_change_callback(),
+            "unload must release the route-change callback"
+        );
     }
 
     #[tokio::test]
