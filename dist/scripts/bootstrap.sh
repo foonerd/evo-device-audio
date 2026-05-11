@@ -202,6 +202,54 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 3.5: /opt/evo/catalogue/default.toml — distribution
+# catalogue including this audio-rack fragment. The catalogue
+# composer is intentionally minimal in this build: it
+# overwrites the existing catalogue at the canonical install
+# path with the dist's audio-rack.toml AS-IS — the framework's
+# validation distribution catalogue (which the framework
+# release ships) is replaced by the audio distribution's
+# catalogue. Vendor distributions that compose racks from
+# multiple sources override `EVO_INSTALL_CATALOGUE=0` and
+# handle composition externally.
+# ----------------------------------------------------------
+if [[ "${EVO_INSTALL_CATALOGUE:-1}" != "0" ]]; then
+    CATALOGUE_TEMPLATE="$DIST_DIR/catalogue/audio-rack.toml"
+    CATALOGUE_PATH="/opt/evo/catalogue/default.toml"
+    if [[ ! -f "$CATALOGUE_TEMPLATE" ]]; then
+        echo "catalogue template not found at $CATALOGUE_TEMPLATE" >&2
+        exit 2
+    fi
+    install -d -m 0755 -o root -g root "$(dirname "$CATALOGUE_PATH")"
+    if [[ -f "$CATALOGUE_PATH" ]] && \
+       ! cmp -s "$CATALOGUE_TEMPLATE" "$CATALOGUE_PATH"; then
+        backup="$CATALOGUE_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
+        cp -a "$CATALOGUE_PATH" "$backup"
+        echo "[bootstrap] backed up prior $CATALOGUE_PATH to $backup"
+    fi
+    # The audio-rack.toml dist fragment is NOT a complete
+    # catalogue — it omits schema_version on purpose so it can
+    # be included from a larger catalogue. Render a complete
+    # form by prepending schema_version = 1.
+    TMP_CAT=$(mktemp)
+    {
+        echo "# Composed by dist/scripts/bootstrap.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "# Source fragment: $CATALOGUE_TEMPLATE"
+        echo "# Vendor distributions compose differently; this is the"
+        echo "# audio-only reference."
+        echo
+        echo "schema_version = 1"
+        echo
+        cat "$CATALOGUE_TEMPLATE"
+    } > "$TMP_CAT"
+    install -m 0644 -o root -g root "$TMP_CAT" "$CATALOGUE_PATH"
+    rm -f "$TMP_CAT"
+    echo "[bootstrap] installed $CATALOGUE_PATH"
+else
+    echo "[bootstrap] EVO_INSTALL_CATALOGUE=0 — skipping catalogue install"
+fi
+
+# ----------------------------------------------------------
 # Step 4: /etc/asound.conf — AAMPP pipeline pcm.evo
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
