@@ -22,6 +22,8 @@
 #![allow(clippy::manual_async_fn)]
 
 pub mod nmcli_dispatch;
+pub mod rfkill;
+pub mod wifi_radio;
 
 use std::collections::HashMap;
 use std::fs::Permissions;
@@ -73,6 +75,8 @@ const REQUEST_NETWORK_SECURITY_STATUS: &str = "network.nm.security.status";
 const REQUEST_NETWORK_SECURITY_HARDEN: &str = "network.nm.security.harden";
 const REQUEST_NETWORK_FLIGHT_MODE_GET: &str = "network.nm.flight_mode.get";
 const REQUEST_NETWORK_FLIGHT_MODE_SET: &str = "network.nm.flight_mode.set";
+const REQUEST_NETWORK_RADIO_STATUS: &str = "network.nm.radio.status";
+const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
@@ -865,6 +869,81 @@ impl Default for FlightModeStateEnvelope {
     }
 }
 
+fn default_wifi_preference_state_schema_version() -> u32 {
+    1
+}
+
+fn default_wifi_preference_enabled() -> bool {
+    true
+}
+
+/// Persisted per-radio preference for the Wi-Fi family. Captures
+/// the operator's "what would wifi be when flight-mode is off"
+/// answer; the load-time policy applier composes this with
+/// flight-mode + rfkill to derive the effective state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WifiPreferenceState {
+    /// Operator's preference. Default `true` so a fresh install
+    /// with no persisted state matches the prior behaviour
+    /// (wifi enabled by default when not in flight-mode).
+    #[serde(default = "default_wifi_preference_enabled")]
+    enabled: bool,
+}
+
+impl Default for WifiPreferenceState {
+    fn default() -> Self {
+        Self {
+            enabled: default_wifi_preference_enabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WifiPreferenceStateEnvelope {
+    #[serde(default = "default_wifi_preference_state_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    state: WifiPreferenceState,
+}
+
+impl Default for WifiPreferenceStateEnvelope {
+    fn default() -> Self {
+        Self {
+            schema_version: default_wifi_preference_state_schema_version(),
+            state: WifiPreferenceState::default(),
+        }
+    }
+}
+
+fn parse_wifi_preference_state_toml(
+    raw: &str,
+) -> Result<WifiPreferenceState, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(WifiPreferenceState::default());
+    }
+    match toml::from_str::<WifiPreferenceStateEnvelope>(t) {
+        Ok(envelope) => Ok(envelope.state),
+        Err(env_err) => match toml::from_str::<WifiPreferenceState>(t) {
+            Ok(state) => Ok(state),
+            Err(state_err) => Err(format!(
+                "envelope parse: {env_err}; state parse: {state_err}"
+            )),
+        },
+    }
+}
+
+/// Wire-op body for `network.nm.radio.set`. UI writes
+/// `{ "radio": "wifi", "preference": "enabled" }` (or
+/// `"disabled"`); the plugin records the preference, attempts
+/// immediate application, and returns the composed view.
+#[derive(Debug, Deserialize)]
+struct RadioSetRequest {
+    radio: String,
+    preference: wifi_radio::RadioState,
+}
+
 #[derive(Debug, Deserialize)]
 struct CaptiveStatusRequest {
     #[serde(default = "default_true")]
@@ -922,6 +1001,13 @@ pub struct NetworkNmPlugin {
     requests_handled: u64,
     scan_cache: HashMap<String, CachedScan>,
     wifi_flight_mode_enabled: bool,
+    /// Operator's per-radio Wi-Fi preference. Composed with
+    /// [`Self::wifi_flight_mode_enabled`] and the kernel's
+    /// rfkill state to derive the effective Wi-Fi radio state
+    /// surfaced via `network.nm.radio.status`. Default `true`
+    /// so fresh installs match the prior "wifi on when not in
+    /// flight-mode" behaviour.
+    wifi_preference_enabled: bool,
     /// Privilege-strategy dispatcher for every nmcli invocation.
     /// Initial construction installs a no-op direct dispatcher
     /// so the plugin is usable in unit tests that bypass
@@ -941,6 +1027,7 @@ impl NetworkNmPlugin {
             requests_handled: 0,
             scan_cache: HashMap::new(),
             wifi_flight_mode_enabled: false,
+            wifi_preference_enabled: default_wifi_preference_enabled(),
             dispatcher: Arc::new(DirectNmcliDispatcher::new()),
         }
     }
@@ -969,6 +1056,28 @@ impl NetworkNmPlugin {
 
     fn flight_mode_state_path(&self) -> Result<PathBuf, PluginError> {
         Ok(self.ensure_state_dir()?.join("flight-mode.toml"))
+    }
+
+    fn wifi_preference_state_path(&self) -> Result<PathBuf, PluginError> {
+        Ok(self.ensure_state_dir()?.join("wifi-preference.toml"))
+    }
+
+    /// Read every rfkill entry the kernel exposes and aggregate
+    /// the Wi-Fi block state. Synchronous sysfs reads; no
+    /// privileges required; safe to call on any control path.
+    fn read_wifi_block_state(&self) -> Option<rfkill::RadioBlockState> {
+        let entries = rfkill::read_all();
+        rfkill::aggregate_for(&entries, &rfkill::RadioKind::Wlan)
+    }
+
+    /// Compose the operator-facing Wi-Fi radio view from the
+    /// three independent inputs (preference + flight-mode +
+    /// rfkill). Pure read; no side effects.
+    fn compose_wifi_radio_view(&self) -> wifi_radio::RadioStateView {
+        let preference =
+            wifi_radio::RadioState::from_bool(self.wifi_preference_enabled);
+        let block = self.read_wifi_block_state();
+        wifi_radio::resolve(preference, self.wifi_flight_mode_enabled, block)
     }
 
     async fn write_text_atomic_with_lkg(
@@ -1085,6 +1194,55 @@ impl NetworkNmPlugin {
             }
         }
         Ok(FlightModeState::default())
+    }
+
+    async fn load_wifi_preference_state(
+        &self,
+    ) -> Result<WifiPreferenceState, PluginError> {
+        let path = self.wifi_preference_state_path()?;
+        let lkg = lkg_shadow_path(&path);
+        let primary_raw = tokio::fs::read_to_string(&path).await.ok();
+        if let Some(raw) = primary_raw {
+            match parse_wifi_preference_state_toml(&raw) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        error = %e,
+                        "invalid wifi preference state; trying LKG shadow"
+                    );
+                }
+            }
+        }
+        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
+            if let Ok(v) = parse_wifi_preference_state_toml(&raw) {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %lkg.display(),
+                    "using LKG wifi preference state shadow"
+                );
+                return Ok(v);
+            }
+        }
+        Ok(WifiPreferenceState::default())
+    }
+
+    async fn save_wifi_preference_state(
+        &self,
+        state: &WifiPreferenceState,
+    ) -> Result<(), PluginError> {
+        let path = self.wifi_preference_state_path()?;
+        let envelope = WifiPreferenceStateEnvelope {
+            schema_version: default_wifi_preference_state_schema_version(),
+            state: state.clone(),
+        };
+        let raw = toml::to_string_pretty(&envelope).map_err(|e| {
+            PluginError::Permanent(format!(
+                "wifi preference state serialization failed: {e}"
+            ))
+        })?;
+        self.write_text_atomic_with_lkg(&path, &raw).await
     }
 
     async fn save_flight_mode_state(
@@ -2894,6 +3052,8 @@ impl Plugin for NetworkNmPlugin {
                         REQUEST_NETWORK_SECURITY_HARDEN.to_string(),
                         REQUEST_NETWORK_FLIGHT_MODE_GET.to_string(),
                         REQUEST_NETWORK_FLIGHT_MODE_SET.to_string(),
+                        REQUEST_NETWORK_RADIO_STATUS.to_string(),
+                        REQUEST_NETWORK_RADIO_SET.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -2939,6 +3099,8 @@ impl Plugin for NetworkNmPlugin {
 
             let flight_mode_state = self.load_flight_mode_state().await?;
             self.wifi_flight_mode_enabled = flight_mode_state.enabled;
+            let wifi_pref_state = self.load_wifi_preference_state().await?;
+            self.wifi_preference_enabled = wifi_pref_state.enabled;
             self.loaded = true;
             self.scan_cache.clear();
             tracing::info!(
@@ -2962,21 +3124,51 @@ impl Plugin for NetworkNmPlugin {
                     "encrypted secrets required but no key is configured"
                 );
             }
-            match self.nm_set_wifi_radio(!self.wifi_flight_mode_enabled).await {
-                Ok(()) => {
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        wifi_enabled = !self.wifi_flight_mode_enabled,
-                        "applied startup wifi radio policy"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        wifi_enabled = !self.wifi_flight_mode_enabled,
-                        "could not enforce startup wifi radio policy"
-                    );
+            // Startup Wi-Fi radio policy: compose flight-mode +
+            // operator preference + kernel rfkill state into the
+            // effective Wi-Fi state, then push that to NM via
+            // nmcli (which goes through rfkill under the hood,
+            // clearing soft-block when we ask for enabled).
+            //
+            // Hard-block short-circuits: the kernel refuses
+            // software overrides, so we log and skip rather
+            // than emit a redundant nmcli call that NM will
+            // refuse with `Wi-Fi hardware-blocked`.
+            let view = self.compose_wifi_radio_view();
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                wifi_effective = ?view.effective_state,
+                wifi_preference = ?view.preference,
+                wifi_hard_blocked = view.hard_blocked,
+                wifi_soft_blocked = view.soft_blocked,
+                wifi_source = ?view.source,
+                "wifi radio policy resolved"
+            );
+            if view.hard_blocked {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "wifi hard-blocked at the kernel level; skipping \
+                     startup policy apply — operator must resolve at \
+                     the device (BIOS / physical switch / firmware)"
+                );
+            } else {
+                let desired = view.effective_state.is_enabled();
+                match self.nm_set_wifi_radio(desired).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            wifi_enabled = desired,
+                            "applied startup wifi radio policy"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            wifi_enabled = desired,
+                            "could not enforce startup wifi radio policy"
+                        );
+                    }
                 }
             }
             Ok(())
@@ -2992,6 +3184,7 @@ impl Plugin for NetworkNmPlugin {
             self.config = PluginConfig::defaults();
             self.scan_cache.clear();
             self.wifi_flight_mode_enabled = false;
+            self.wifi_preference_enabled = default_wifi_preference_enabled();
             self.dispatcher = Arc::new(DirectNmcliDispatcher::new());
             Ok(())
         }
@@ -3053,6 +3246,7 @@ impl Respondent for NetworkNmPlugin {
                         Err(e) => (None, Some(format!("{e}"))),
                     };
                     let configured_flight_mode = self.wifi_flight_mode_enabled;
+                    let wifi_radio_view = self.compose_wifi_radio_view();
                     let radio_blocked =
                         radio.as_ref().and_then(radio_block_reason).is_some();
                     let radio_block_reason = radio
@@ -3080,6 +3274,9 @@ impl Respondent for NetworkNmPlugin {
                                 "nmcli_path": self.config.nmcli_path,
                                 "general_status": general,
                                 "devices": devices,
+                                "radios": {
+                                    "wifi": wifi_radio_view,
+                                },
                                 "scan_ifname": scan_if,
                                 "wifi_scan_error": wifi_scan_error,
                                 "flight_mode": {
@@ -3498,6 +3695,85 @@ impl Respondent for NetworkNmPlugin {
                                         "wifi_hw_enabled": r.wifi_hw_enabled,
                                         "wifi_enabled": r.wifi_enabled,
                                     })),
+                                },
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_RADIO_STATUS => {
+                    let view = self.compose_wifi_radio_view();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "flight_mode": self.wifi_flight_mode_enabled,
+                                "radios": {
+                                    "wifi": view,
+                                },
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_RADIO_SET => {
+                    let body =
+                        Self::parse_request_json::<RadioSetRequest>(req)?;
+                    if body.radio != "wifi" {
+                        return Err(PluginError::Permanent(format!(
+                            "network.nm.radio.set: unknown radio family \
+                             {:?} — this plugin only owns the wifi radio; \
+                             bluetooth + other radios are owned by their \
+                             respective plugins",
+                            body.radio
+                        )));
+                    }
+                    let enabled = body.preference.is_enabled();
+                    self.wifi_preference_enabled = enabled;
+                    self.save_wifi_preference_state(&WifiPreferenceState {
+                        enabled,
+                    })
+                    .await?;
+                    // Attempt immediate application: only when
+                    // not in flight-mode AND not hard-blocked
+                    // does the nmcli call have a chance of
+                    // taking effect.
+                    let block = self.read_wifi_block_state();
+                    let hard_blocked =
+                        block.as_ref().map(|b| b.hard_blocked).unwrap_or(false);
+                    let applied = if self.wifi_flight_mode_enabled
+                        || hard_blocked
+                    {
+                        false
+                    } else {
+                        match self.nm_set_wifi_radio(enabled).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    enabled = enabled,
+                                    error = %e,
+                                    "failed to apply wifi preference immediately"
+                                );
+                                false
+                            }
+                        }
+                    };
+                    // Re-read after the apply attempt so the
+                    // response carries the post-state.
+                    let view = self.compose_wifi_radio_view();
+                    Self::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "applied": applied,
+                                "flight_mode": self.wifi_flight_mode_enabled,
+                                "radios": {
+                                    "wifi": view,
                                 },
                             }),
                         ),
