@@ -77,7 +77,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use evo_plugin_sdk::contract::audio_routing::AudioRouting;
+use evo_plugin_sdk::contract::audio_routing::{
+    AudioRouting, AudioRoutingError, ReadEndpoint, RouteChange,
+    RouteChangeCallback,
+};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -85,6 +88,8 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinHandle;
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -144,6 +149,28 @@ pub struct AlsaDeliveryPlugin {
     /// construction. Surfaced for diagnostics; not part of the
     /// wire contract.
     requests_handled: u64,
+    /// Route-change reactor handle. `Some` after a successful
+    /// `Plugin::load`; `None` before first load and after
+    /// `Plugin::unload`. Mirrors the reactor shape composition
+    /// .alsa and playback.mpd ship — every audio-tier plugin
+    /// reacts to topology rewires through the same primitive.
+    reactor: Option<ReactorHandle>,
+}
+
+/// Handle on the route-change reactor task spawned at load.
+/// Carries the shutdown signal, the join handle, and the
+/// receiver-end of the endpoint-snapshot channel consumers
+/// (asound.conf re-renderer when wired in a subsequent chunk)
+/// subscribe to.
+struct ReactorHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+    endpoints_rx: watch::Receiver<Option<ReadEndpoint>>,
+    /// Counter bumped on every wake-and-refetch the reactor
+    /// performs. Tests poll on this to observe reactor
+    /// progress without racy sleeps.
+    #[cfg_attr(not(test), allow(dead_code))]
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AlsaDeliveryPlugin {
@@ -154,6 +181,7 @@ impl AlsaDeliveryPlugin {
             audio_routing: None,
             asound_conf_path: PathBuf::from(ASOUND_CONF_PATH),
             requests_handled: 0,
+            reactor: None,
         }
     }
 
@@ -192,6 +220,182 @@ impl AlsaDeliveryPlugin {
         self.audio_routing = Some(routing);
         self.loaded = true;
         Ok(())
+    }
+
+    /// Spawn the route-change reactor task. Must be called
+    /// after `install_routing` succeeds so the audio_routing
+    /// handle is populated; must be called inside a tokio
+    /// runtime context. Mirrors composition.alsa's reactor
+    /// shape, consuming [`AudioRouting::read_endpoint`]
+    /// (delivery is the chain terminus; its endpoint is the
+    /// read side of the upstream stage's output).
+    async fn spawn_reactor(&mut self) -> Result<(), PluginError> {
+        debug_assert!(
+            self.audio_routing.is_some(),
+            "spawn_reactor called before install_routing"
+        );
+        debug_assert!(
+            self.reactor.is_none(),
+            "spawn_reactor called while a reactor is already running"
+        );
+        let routing = Arc::clone(
+            self.audio_routing
+                .as_ref()
+                .expect("audio_routing populated when loaded"),
+        );
+        let initial = fetch_read_endpoint(routing.as_ref());
+        let (endpoints_tx, endpoints_rx) = watch::channel(initial);
+
+        let wake = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        let refresh_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Register the route-change callback on the routing
+        // handle. The callback notifies the wake signal; the
+        // reactor picks up on its next select iteration. The
+        // callback holds an Arc<Notify> rather than the
+        // routing handle itself so callback invocation does
+        // not re-enter the trait.
+        let wake_for_callback = Arc::clone(&wake);
+        let callback: RouteChangeCallback =
+            Arc::new(move |_event: &RouteChange| {
+                wake_for_callback.notify_one();
+            });
+        routing.on_route_change(Some(callback));
+
+        let task_routing = Arc::clone(&routing);
+        let task_wake = Arc::clone(&wake);
+        let task_shutdown = Arc::clone(&shutdown);
+        let task_count = Arc::clone(&refresh_count);
+        let task = tokio::spawn(async move {
+            run_reactor(
+                task_routing,
+                task_wake,
+                task_shutdown,
+                endpoints_tx,
+                task_count,
+            )
+            .await;
+        });
+
+        self.reactor = Some(ReactorHandle {
+            task,
+            shutdown,
+            endpoints_rx,
+            refresh_count,
+        });
+        Ok(())
+    }
+
+    /// Wind down the reactor task and clear the route-change
+    /// callback. Idempotent — calling on a plugin without an
+    /// active reactor is a no-op.
+    async fn stop_reactor(&mut self) {
+        if let Some(routing) = self.audio_routing.as_ref() {
+            // Drop the framework's reference to the callback
+            // before signalling shutdown so the routing
+            // handle releases its Arc and the callback
+            // closure (and its captured wake notify) can be
+            // dropped on schedule.
+            routing.on_route_change(None);
+        }
+        if let Some(handle) = self.reactor.take() {
+            handle.shutdown.notify_one();
+            // Best-effort wait for the reactor to drain.
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Subscribe to endpoint snapshots produced by the
+    /// route-change reactor. Returns `None` when no reactor
+    /// is running (plugin not loaded). Future
+    /// asound.conf-re-rendering consumers subscribe here;
+    /// today the channel is logged-only.
+    pub fn subscribe_endpoints(
+        &self,
+    ) -> Option<watch::Receiver<Option<ReadEndpoint>>> {
+        self.reactor.as_ref().map(|r| r.endpoints_rx.clone())
+    }
+
+    /// Returns the reactor's refresh counter. Tests poll on
+    /// this to observe progress after firing a route change.
+    /// Returns 0 when no reactor is running.
+    #[cfg(test)]
+    fn refresh_count(&self) -> u64 {
+        self.reactor
+            .as_ref()
+            .map(|r| r.refresh_count.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}
+
+/// One-shot endpoint fetch over the AudioRouting handle.
+/// Returns `Some(endpoint)` when topology is configured,
+/// `None` for the benign pre-reconciliation state, and `None`
+/// (with a warning log) for any other error.
+fn fetch_read_endpoint(routing: &dyn AudioRouting) -> Option<ReadEndpoint> {
+    match routing.read_endpoint() {
+        Ok(ep) => Some(ep),
+        Err(AudioRoutingError::EndpointNotConfigured) => None,
+        Err(other) => {
+            tracing::warn!(
+                error = %other,
+                "audio_routing.read_endpoint returned unexpected error; \
+                 treating as pre-reconciliation"
+            );
+            None
+        }
+    }
+}
+
+/// Reactor loop. Awakens on the wake signal (route changes)
+/// or the shutdown signal (unload). Each wake triggers a
+/// refetch of the routing handle's `read_endpoint`, publishes
+/// the new value (or `None`) on the watch channel, and bumps
+/// the refresh counter.
+///
+/// Operator-readable trace: every refetch logs the endpoint
+/// kind + path + format at INFO so the journal carries an
+/// audit trail of every topology rewire the delivery plugin
+/// saw.
+async fn run_reactor(
+    routing: Arc<dyn AudioRouting>,
+    wake: Arc<Notify>,
+    shutdown: Arc<Notify>,
+    endpoints_tx: watch::Sender<Option<ReadEndpoint>>,
+    refresh_count: Arc<std::sync::atomic::AtomicU64>,
+) {
+    loop {
+        tokio::select! {
+            _ = wake.notified() => {
+                let snapshot = fetch_read_endpoint(routing.as_ref());
+                match &snapshot {
+                    Some(ep) => tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        endpoint_kind = ?ep.kind,
+                        endpoint_path = %ep.path.display(),
+                        endpoint_format = ?ep.format,
+                        "topology rewire observed; new ReadEndpoint received"
+                    ),
+                    None => tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "topology rewire observed; endpoint cleared \
+                         (pre-reconciliation state)"
+                    ),
+                }
+                if endpoints_tx.send(snapshot).is_err() {
+                    // Receiver side dropped — nobody reads
+                    // these snapshots anymore. Plugin is on
+                    // its way out; exit the reactor.
+                    break;
+                }
+                refresh_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ = shutdown.notified() => {
+                break;
+            }
+        }
     }
 }
 
@@ -241,9 +445,19 @@ impl Plugin for AlsaDeliveryPlugin {
                 "plugin load beginning"
             );
             self.install_routing(ctx.audio_routing.clone())?;
+            // Spawn the route-change reactor. The framework's
+            // audio_topology_store publishes topology rewires
+            // via every plugin's RouteChangeCallback; the
+            // delivery plugin's reactor logs every rewire +
+            // publishes the snapshot to a watch channel that
+            // future asound.conf re-render consumers
+            // subscribe to. Same shape composition.alsa +
+            // playback.mpd already ship.
+            self.spawn_reactor().await?;
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                "plugin loaded; AAMPP delivery surface ready"
+                "plugin loaded; AAMPP delivery surface ready; \
+                 route-change reactor running"
             );
             Ok(())
         }
@@ -258,6 +472,7 @@ impl Plugin for AlsaDeliveryPlugin {
                 requests_handled = self.requests_handled,
                 "plugin unload"
             );
+            self.stop_reactor().await;
             self.audio_routing = None;
             self.loaded = false;
             Ok(())
@@ -741,6 +956,25 @@ mod tests {
             self.inner.lock().unwrap().read_endpoint = Some(ep);
             self
         }
+
+        fn set_read_endpoint(&self, ep: ReadEndpoint) {
+            self.inner.lock().unwrap().read_endpoint = Some(ep);
+        }
+
+        fn fire_route_change(&self, event: RouteChange) -> bool {
+            let cb = self.inner.lock().unwrap().callback.clone();
+            match cb {
+                Some(callback) => {
+                    callback(&event);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn has_route_change_callback(&self) -> bool {
+            self.inner.lock().unwrap().callback.is_some()
+        }
     }
 
     impl AudioRouting for StubDeliveryAudioRouting {
@@ -1131,5 +1365,162 @@ pcm.evo {
         .await
         .unwrap();
         assert_eq!(p.requests_handled(), 2);
+    }
+
+    // ----- route-change reactor tests -----
+
+    use evo_plugin_sdk::contract::audio_routing::RouteChange;
+
+    /// Wait until the reactor's refresh counter advances from
+    /// `prior` to at least `prior + advances`. Bounded so a
+    /// wedged reactor does not hang CI.
+    async fn wait_for_refresh(
+        plugin: &AlsaDeliveryPlugin,
+        prior: u64,
+        advances: u64,
+    ) {
+        let target = prior + advances;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if plugin.refresh_count() >= target {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "reactor refresh counter did not advance from {prior} \
+                     to {target} within 500ms"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    fn route_change(new_format: AudioFormat) -> RouteChange {
+        RouteChange {
+            new_format,
+            reason: "test-injected route change".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_registers_route_change_callback() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let stub = Arc::new(StubDeliveryAudioRouting::new());
+        assert!(!stub.has_route_change_callback());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        assert!(stub.has_route_change_callback());
+        p.stop_reactor().await;
+        assert!(!stub.has_route_change_callback());
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_publishes_initial_endpoint_when_topology_present() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let endpoint = ReadEndpoint {
+            kind: EndpointKind::AlsaPcm,
+            path: PathBuf::from("evo"),
+            format: AudioFormat::Pcm {
+                codec: PcmCodec::PcmS16Le,
+                rate_hz: 44_100,
+                channels: 2,
+            },
+            buffer_frames: 1024,
+        };
+        let stub = Arc::new(
+            StubDeliveryAudioRouting::new()
+                .with_read_endpoint(endpoint.clone()),
+        );
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        let rx = p.subscribe_endpoints().expect("reactor running");
+        assert_eq!(rx.borrow().clone(), Some(endpoint));
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_reactor_publishes_none_when_topology_absent() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let stub = Arc::new(StubDeliveryAudioRouting::new());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        let rx = p.subscribe_endpoints().expect("reactor running");
+        assert!(
+            rx.borrow().is_none(),
+            "EndpointNotConfigured must publish None"
+        );
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn route_change_refreshes_endpoint_via_reactor() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let initial = ReadEndpoint {
+            kind: EndpointKind::AlsaPcm,
+            path: PathBuf::from("evo"),
+            format: AudioFormat::Pcm {
+                codec: PcmCodec::PcmS16Le,
+                rate_hz: 44_100,
+                channels: 2,
+            },
+            buffer_frames: 1024,
+        };
+        let stub = Arc::new(
+            StubDeliveryAudioRouting::new().with_read_endpoint(initial),
+        );
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        let mut rx = p.subscribe_endpoints().expect("reactor running");
+        let prior_refresh = p.refresh_count();
+
+        // Publish a new topology + fire route_change. The
+        // reactor must refetch + republish.
+        let new_format = AudioFormat::Pcm {
+            codec: PcmCodec::PcmS24Le,
+            rate_hz: 192_000,
+            channels: 2,
+        };
+        let new_endpoint = ReadEndpoint {
+            kind: EndpointKind::AlsaPcm,
+            path: PathBuf::from("evo"),
+            format: new_format.clone(),
+            buffer_frames: 1024,
+        };
+        stub.set_read_endpoint(new_endpoint.clone());
+        assert!(stub.fire_route_change(route_change(new_format)));
+
+        wait_for_refresh(&p, prior_refresh, 1).await;
+        rx.changed().await.expect("watch channel still alive");
+        assert_eq!(rx.borrow().clone(), Some(new_endpoint));
+
+        p.stop_reactor().await;
+    }
+
+    #[tokio::test]
+    async fn unload_terminates_reactor_promptly() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let stub = Arc::new(StubDeliveryAudioRouting::new());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        assert!(stub.has_route_change_callback());
+
+        let started = std::time::Instant::now();
+        p.unload().await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "unload must drain the reactor quickly; took {elapsed:?}"
+        );
+        assert!(p.reactor.is_none());
+        assert!(!stub.has_route_change_callback());
     }
 }
