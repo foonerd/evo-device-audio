@@ -1466,8 +1466,18 @@ fn encode_play_now_ok(
 /// the envelope `v` and the full URI; the plugin validates
 /// the scheme prefix matches one it owns and strips the
 /// prefix to form an MPD library-relative path.
+///
+/// `v` defaults to [`PAYLOAD_VERSION`] when absent so the
+/// plugin accepts both the legacy F2-era `{ uri }` shape
+/// and the F4 versioned `{ v, uri }` shape. The framework's
+/// source-verb dispatcher is updated in lockstep to emit the
+/// versioned shape; the defaulted-`v` is the
+/// backwards-compatibility bridge against older framework
+/// builds and against on-disk plan files that pre-date the
+/// envelope.
 #[derive(Debug, serde::Deserialize)]
 struct PlayNowPayload {
+    #[serde(default = "default_payload_version")]
     v: u32,
     uri: String,
 }
@@ -1478,9 +1488,12 @@ impl HasPayloadVersion for PlayNowPayload {
     }
 }
 
-/// Wire shape of a `seek` request payload.
+/// Wire shape of a `seek` request payload. `v` defaults to
+/// [`PAYLOAD_VERSION`] when absent, mirroring
+/// [`PlayNowPayload`]'s tolerance.
 #[derive(Debug, serde::Deserialize)]
 struct SeekPayload {
+    #[serde(default = "default_payload_version")]
     v: u32,
     position_ms: u64,
 }
@@ -1491,9 +1504,11 @@ impl HasPayloadVersion for SeekPayload {
     }
 }
 
-/// Wire shape of a `set_volume` request payload.
+/// Wire shape of a `set_volume` request payload. `v`
+/// defaults to [`PAYLOAD_VERSION`] when absent.
 #[derive(Debug, serde::Deserialize)]
 struct SetVolumePayload {
+    #[serde(default = "default_payload_version")]
     v: u32,
     volume: u8,
 }
@@ -1505,11 +1520,13 @@ impl HasPayloadVersion for SetVolumePayload {
 }
 
 /// Wire shape of a bare-envelope request payload (`{ "v":
-/// 1 }`). Used by every source verb whose action carries no
-/// parameters: `play` / `pause` / `resume` / `stop` /
-/// `next` / `previous`.
+/// 1 }` or `{}`). Used by every source verb whose action
+/// carries no parameters: `play` / `pause` / `resume` /
+/// `stop` / `next` / `previous`. `v` defaults to
+/// [`PAYLOAD_VERSION`] when absent.
 #[derive(Debug, serde::Deserialize)]
 struct EmptyPayload {
+    #[serde(default = "default_payload_version")]
     v: u32,
 }
 
@@ -1517,6 +1534,15 @@ impl HasPayloadVersion for EmptyPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
+}
+
+/// Default function for serde's `default = "..."` attribute
+/// on every source-verb payload's `v` field. Returns the
+/// current [`PAYLOAD_VERSION`] so absent fields are treated
+/// as "this payload is on the current wire shape" rather
+/// than a hard-coded literal.
+fn default_payload_version() -> u32 {
+    PAYLOAD_VERSION
 }
 
 /// Wire shape of the `play_now` success response. Echoes
@@ -2914,6 +2940,58 @@ mod tests {
                 assert!(msg.contains("no active custody"));
             }
             other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn play_now_accepts_legacy_payload_without_version_field() {
+        // Backwards-compatibility regression guard. The
+        // framework's source-verb dispatcher (before the
+        // matching framework update) emitted `{ "uri": ... }`
+        // without a `v` field. The plugin's
+        // default_payload_version() lets such payloads parse
+        // with v = PAYLOAD_VERSION so older framework builds
+        // and on-disk plan files keep working.
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request(
+            "play_now",
+            json!({ "uri": "mpd-path:Music/A/01.flac" }),
+        );
+        let resp = p.handle_request(&req).await.unwrap();
+        let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["uri"], "mpd-path:Music/A/01.flac");
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bare_envelope_verbs_accept_payload_without_version_field() {
+        // Same backwards-compatibility shape as
+        // play_now_accepts_legacy_payload_without_version_field
+        // but for the bare-envelope verbs. The framework's
+        // dispatcher emits `{}` for stop/pause/resume/next/
+        // previous; without the default, every one would
+        // refuse with "missing field `v`".
+        for verb in ["play", "pause", "resume", "stop", "next", "previous"] {
+            let (mut p, handle, _mock) =
+                loaded_plugin_with_active_custody(vec![
+                    F4Conn::Standard,
+                    F4Conn::HoldAfterWelcome,
+                ])
+                .await;
+
+            let req = source_request(verb, json!({}));
+            let resp = p.handle_request(&req).await.unwrap_or_else(|e| {
+                panic!("verb {verb} failed unexpectedly: {e:?}")
+            });
+            let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+            assert_eq!(body["status"], "ok", "verb {verb}");
+            p.release_custody(handle).await.unwrap();
         }
     }
 
