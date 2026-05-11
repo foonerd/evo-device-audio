@@ -23,6 +23,7 @@
 
 pub mod nmcli_dispatch;
 pub mod rfkill;
+pub mod wifi_phy;
 pub mod wifi_radio;
 
 use std::collections::HashMap;
@@ -33,8 +34,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::nmcli_dispatch::{
-    AutoNmcliDispatcher, DirectNmcliDispatcher, NmcliDispatcher,
-    INTENT_NMCLI_INVOCATION,
+    AutoPrivilegedExec, DirectExec, PrivilegedExec, INTENT_CURL_INVOCATION,
+    INTENT_IW_INVOCATION, INTENT_NMCLI_INVOCATION, INTENT_RFKILL_INVOCATION,
 };
 
 use base64::Engine;
@@ -101,11 +102,29 @@ fn plugin_crate_version() -> semver::Version {
 #[derive(Clone)]
 struct PluginConfig {
     nmcli_path: String,
+    /// `iw` binary path for PHY capability detection + virtual
+    /// AP vif lifecycle. Overridable via `EVO_NETWORK_IW`.
+    /// Default `/usr/sbin/iw`.
+    iw_path: String,
+    /// `rfkill` binary path for hardware / software radio
+    /// block toggle. Overridable via `EVO_NETWORK_RFKILL`.
+    /// Default `/usr/sbin/rfkill`.
+    rfkill_path: String,
+    /// `curl` binary path for connectivity + captive-portal
+    /// probes. Overridable via `EVO_NETWORK_CURL`. Default
+    /// `/usr/bin/curl`.
+    curl_path: String,
     default_wifi_iface: String,
     captive: CaptiveConfig,
     secret_key: Option<[u8; 32]>,
     require_encrypted_secrets: bool,
     nmcli_timeout_ms: u64,
+    /// Timeout applied to single `iw` invocations. Default
+    /// 5000 ms; tunable via `EVO_NETWORK_IW_TIMEOUT_MS`.
+    iw_timeout_ms: u64,
+    /// Timeout applied to single `rfkill` invocations. Default
+    /// 2000 ms; tunable via `EVO_NETWORK_RFKILL_TIMEOUT_MS`.
+    rfkill_timeout_ms: u64,
     curl_timeout_ms: u64,
     scan_cache_ttl_ms: u64,
 }
@@ -152,13 +171,43 @@ impl PluginConfig {
                 )
             })
             .unwrap_or(false);
+        let iw_path = std::env::var("EVO_NETWORK_IW")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/usr/sbin/iw".to_string());
+        let rfkill_path = std::env::var("EVO_NETWORK_RFKILL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/usr/sbin/rfkill".to_string());
+        let curl_path = std::env::var("EVO_NETWORK_CURL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/usr/bin/curl".to_string());
+        let iw_timeout_ms = std::env::var("EVO_NETWORK_IW_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 100)
+            .unwrap_or(5000);
+        let rfkill_timeout_ms = std::env::var("EVO_NETWORK_RFKILL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 100)
+            .unwrap_or(2000);
         Self {
             nmcli_path: "/usr/bin/nmcli".to_string(),
+            iw_path,
+            rfkill_path,
+            curl_path,
             default_wifi_iface: "wlan0".to_string(),
             captive: CaptiveConfig::default(),
             secret_key: env_key,
             require_encrypted_secrets,
             nmcli_timeout_ms: 8000,
+            iw_timeout_ms,
+            rfkill_timeout_ms,
             curl_timeout_ms: 30000,
             scan_cache_ttl_ms: 3000,
         }
@@ -174,6 +223,34 @@ impl PluginConfig {
                 ));
             }
             out.nmcli_path = t.to_string();
+        }
+        for (key, slot) in [
+            ("iw_path", &mut out.iw_path),
+            ("rfkill_path", &mut out.rfkill_path),
+            ("curl_path", &mut out.curl_path),
+        ] {
+            if let Some(v) = table.get(key).and_then(|v| v.as_str()) {
+                let t = v.trim();
+                if t.is_empty() {
+                    return Err(PluginError::Permanent(format!(
+                        "{key} cannot be empty"
+                    )));
+                }
+                *slot = t.to_string();
+            }
+        }
+        for (key, slot) in [
+            ("iw_timeout_ms", &mut out.iw_timeout_ms),
+            ("rfkill_timeout_ms", &mut out.rfkill_timeout_ms),
+        ] {
+            if let Some(v) = table.get(key).and_then(|v| v.as_integer()) {
+                if v < 100 {
+                    return Err(PluginError::Permanent(format!(
+                        "{key} must be >= 100"
+                    )));
+                }
+                *slot = v as u64;
+            }
         }
         if let Some(v) = table.get("wifi_iface").and_then(|v| v.as_str()) {
             let t = v.trim();
@@ -1020,19 +1097,30 @@ pub struct NetworkNmPlugin {
     /// Initial construction installs a no-op direct dispatcher
     /// so the plugin is usable in unit tests that bypass
     /// `Plugin::load`; `Plugin::load` then resolves and swaps
-    /// in an [`AutoNmcliDispatcher`] keyed off the framework's
+    /// in an [`AutoPrivilegedExec`] keyed off the framework's
     /// `LoadContext::capabilities` resolution map.
-    dispatcher: Arc<dyn NmcliDispatcher>,
+    dispatcher: Arc<dyn PrivilegedExec>,
     /// Concrete handle on the auto-dispatcher composite so the
     /// capabilities-watch reactor can call `re_resolve` on it
-    /// without going through the `Arc<dyn NmcliDispatcher>`
+    /// without going through the `Arc<dyn PrivilegedExec>`
     /// erasure. Same underlying Arc as [`Self::dispatcher`]
     /// when `Plugin::load` runs the production resolver.
-    auto_dispatcher: Option<Arc<AutoNmcliDispatcher>>,
+    auto_dispatcher: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege-strategy dispatcher for every `iw` invocation
+    /// (PHY capability detection + virtual AP vif lifecycle).
+    /// `None` until `Plugin::load` resolves the strategy from
+    /// the framework's preflight result.
+    iw_exec: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege-strategy dispatcher for every `rfkill`
+    /// invocation (hardware / software radio block toggle).
+    rfkill_exec: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege-strategy dispatcher for every `curl`
+    /// invocation (connectivity + captive-portal probes).
+    curl_exec: Option<Arc<AutoPrivilegedExec>>,
     /// PPAG capabilities-watch reactor. Spawned at load when
     /// `LoadContext::capabilities_watch` is `Some`; observes
     /// the framework's re-probe publications and re-resolves
-    /// the auto-dispatcher's inner strategy on every change.
+    /// every per-tool dispatcher on each change.
     capabilities_watcher: Option<CapabilitiesWatcherHandle>,
 }
 
@@ -1061,8 +1149,11 @@ impl NetworkNmPlugin {
             scan_cache: HashMap::new(),
             wifi_flight_mode_enabled: false,
             wifi_preference_enabled: true,
-            dispatcher: Arc::new(DirectNmcliDispatcher::new()),
+            dispatcher: Arc::new(DirectExec::new()),
             auto_dispatcher: None,
+            iw_exec: None,
+            rfkill_exec: None,
+            curl_exec: None,
             capabilities_watcher: None,
         }
     }
@@ -1076,13 +1167,17 @@ impl NetworkNmPlugin {
     /// Spawn the PPAG capabilities-watch reactor. Subscribes to
     /// the framework's `LoadContext::capabilities_watch`
     /// channel; on every observed change calls
-    /// `AutoNmcliDispatcher::re_resolve` so the inner strategy
-    /// stays aligned with the framework-published resolution.
-    /// Exit conditions: plugin unload (shutdown notify) or
-    /// sender side dropping (framework re-probe task stopped).
+    /// `AutoPrivilegedExec::re_resolve` on every per-tool
+    /// dispatcher so each inner strategy stays aligned with the
+    /// framework-published resolution. Exit conditions: plugin
+    /// unload (shutdown notify) or sender side dropping (the
+    /// framework re-probe task stopped).
     fn spawn_capabilities_watcher(
         &mut self,
-        auto: Arc<AutoNmcliDispatcher>,
+        nmcli_auto: Arc<AutoPrivilegedExec>,
+        iw_auto: Arc<AutoPrivilegedExec>,
+        rfkill_auto: Arc<AutoPrivilegedExec>,
+        curl_auto: Arc<AutoPrivilegedExec>,
         mut rx: tokio::sync::watch::Receiver<
             Arc<evo_plugin_sdk::privileges::CapabilityResolutionMap>,
         >,
@@ -1104,17 +1199,25 @@ impl NetworkNmPlugin {
                             break;
                         }
                         let new_map = rx.borrow_and_update().clone();
-                        auto.re_resolve(&new_map);
+                        for auto in [
+                            nmcli_auto.as_ref(),
+                            iw_auto.as_ref(),
+                            rfkill_auto.as_ref(),
+                            curl_auto.as_ref(),
+                        ] {
+                            auto.re_resolve(&new_map);
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                intent = auto.intent_id(),
+                                strategy = auto.current_strategy_name(),
+                                rationale = %auto.rationale(),
+                                "privileged-exec strategy re-resolved \
+                                 from PPAG update"
+                            );
+                        }
                         task_refresh.fetch_add(
                             1,
                             std::sync::atomic::Ordering::Relaxed,
-                        );
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            strategy = auto.current_strategy_name(),
-                            rationale = %auto.rationale(),
-                            "nmcli dispatch strategy re-resolved from \
-                             PPAG update"
                         );
                     }
                     _ = task_shutdown.notified() => {
@@ -3108,38 +3211,63 @@ impl Plugin for NetworkNmPlugin {
             BinaryPresentProbe, ProbePlan, SudoersCommandProbe,
         };
 
-        let mut plans: Vec<ProbePlan> = Vec::with_capacity(1);
-        let nmcli_bin = self.config.nmcli_path.clone();
-        // EUID-aware: under root the plugin exec nmcli directly,
-        // so the probe just verifies the binary is on the host;
-        // under a non-root service identity it must dispatch via
-        // `sudo -n nmcli`, so the probe checks the sudoers entry
-        // directly. Same EUID floor as playback.mpd.
-        if nmcli_dispatch::process_needs_sudo() {
-            if let Some(probe) = SudoersCommandProbe::new([nmcli_bin.as_str()])
-            {
+        // EUID-aware probe planning. Under root the plugin
+        // executes each privileged binary directly, so the probe
+        // verifies the binary is on the host. Under a non-root
+        // service identity each binary is reached via `sudo -n`,
+        // so the probe checks the sudoers entry directly. Same
+        // EUID floor as playback.mpd's probe-plan shape.
+        let needs_sudo = nmcli_dispatch::process_needs_sudo();
+        let entries: [(&str, String, &str); 4] = [
+            (
+                INTENT_NMCLI_INVOCATION,
+                self.config.nmcli_path.clone(),
+                "NetworkManager `nmcli`",
+            ),
+            (
+                INTENT_IW_INVOCATION,
+                self.config.iw_path.clone(),
+                "`iw` (PHY capability detection + virtual AP vif lifecycle)",
+            ),
+            (
+                INTENT_RFKILL_INVOCATION,
+                self.config.rfkill_path.clone(),
+                "`rfkill` (kernel-level radio block toggle)",
+            ),
+            (
+                INTENT_CURL_INVOCATION,
+                self.config.curl_path.clone(),
+                "`curl` (connectivity + captive-portal probes)",
+            ),
+        ];
+
+        let mut plans: Vec<ProbePlan> = Vec::with_capacity(entries.len());
+        for (intent_id, bin, label) in entries {
+            if needs_sudo {
+                if let Some(probe) = SudoersCommandProbe::new([bin.as_str()]) {
+                    plans.push(ProbePlan {
+                        intent_id: intent_id.to_string(),
+                        probe: Box::new(probe),
+                        strategy_hint: Some("sudo".to_string()),
+                        remedy: format!(
+                            "install the distribution bootstrap sudoers \
+                             drop-in granting NOPASSWD `{bin}` to the \
+                             steward service user (intent: {intent_id}, \
+                             tool: {label})"
+                        ),
+                    });
+                }
+            } else {
                 plans.push(ProbePlan {
-                    intent_id: INTENT_NMCLI_INVOCATION.to_string(),
-                    probe: Box::new(probe),
-                    strategy_hint: Some("sudo".to_string()),
+                    intent_id: intent_id.to_string(),
+                    probe: Box::new(BinaryPresentProbe::new(bin.clone())),
+                    strategy_hint: Some("direct".to_string()),
                     remedy: format!(
-                        "install the distribution bootstrap sudoers \
-                         drop-in granting NOPASSWD `{nmcli_bin}` to the \
-                         steward service user"
+                        "install {label} (`{bin}` not on PATH); networking \
+                         surface degrades while this tool is absent"
                     ),
                 });
             }
-        } else {
-            plans.push(ProbePlan {
-                intent_id: INTENT_NMCLI_INVOCATION.to_string(),
-                probe: Box::new(BinaryPresentProbe::new(nmcli_bin.clone())),
-                strategy_hint: Some("direct".to_string()),
-                remedy: format!(
-                    "install NetworkManager (`{nmcli_bin}` not on PATH); \
-                     networking surface degrades to unavailable until \
-                     present"
-                ),
-            });
         }
         plans
     }
@@ -3192,37 +3320,68 @@ impl Plugin for NetworkNmPlugin {
             self.config = PluginConfig::from_toml_table(&ctx.config)?;
             self.state_dir = Some(ctx.state_dir.clone());
 
-            // Resolve the nmcli privilege strategy from the
-            // framework's preflight result. AutoNmcliDispatcher
+            // Resolve a privilege-dispatch strategy per tool from
+            // the framework's preflight result. AutoPrivilegedExec
             // inspects the capability-resolution map for the
-            // `nmcli_invocation` intent and installs the right
-            // concrete strategy (Direct / Sudo); when the
-            // framework's runner has not yet populated the map
-            // it falls back to `/proc/self/status` EUID
-            // detection, mirroring the playback.mpd plugin's
-            // AutoMpdRestarter resolution shape so the two
-            // PPAG consumers in this distribution observe the
-            // same EUID floor.
-            let auto =
-                Arc::new(AutoNmcliDispatcher::resolve(&ctx.capabilities));
-            tracing::info!(
-                plugin = PLUGIN_NAME,
-                strategy = auto.current_strategy_name(),
-                rationale = %auto.rationale(),
-                "nmcli dispatch strategy resolved"
-            );
-            self.dispatcher = auto.clone() as Arc<dyn NmcliDispatcher>;
-            self.auto_dispatcher = Some(auto.clone());
+            // matching intent (nmcli / iw / rfkill / curl) and
+            // installs the right concrete strategy (Direct /
+            // Sudo); when the framework's runner has not yet
+            // populated the map it falls back to
+            // `/proc/self/status` EUID detection, mirroring the
+            // playback.mpd plugin's AutoMpdRestarter resolution
+            // shape so the PPAG consumers in this distribution
+            // observe the same EUID floor.
+            let nmcli_auto = Arc::new(AutoPrivilegedExec::resolve(
+                INTENT_NMCLI_INVOCATION,
+                &ctx.capabilities,
+            ));
+            let iw_auto = Arc::new(AutoPrivilegedExec::resolve(
+                INTENT_IW_INVOCATION,
+                &ctx.capabilities,
+            ));
+            let rfkill_auto = Arc::new(AutoPrivilegedExec::resolve(
+                INTENT_RFKILL_INVOCATION,
+                &ctx.capabilities,
+            ));
+            let curl_auto = Arc::new(AutoPrivilegedExec::resolve(
+                INTENT_CURL_INVOCATION,
+                &ctx.capabilities,
+            ));
+            for auto in [
+                nmcli_auto.as_ref(),
+                iw_auto.as_ref(),
+                rfkill_auto.as_ref(),
+                curl_auto.as_ref(),
+            ] {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    intent = auto.intent_id(),
+                    strategy = auto.current_strategy_name(),
+                    rationale = %auto.rationale(),
+                    "privileged-exec strategy resolved"
+                );
+            }
+            self.dispatcher = nmcli_auto.clone() as Arc<dyn PrivilegedExec>;
+            self.auto_dispatcher = Some(nmcli_auto.clone());
+            self.iw_exec = Some(iw_auto.clone());
+            self.rfkill_exec = Some(rfkill_auto.clone());
+            self.curl_exec = Some(curl_auto.clone());
 
             // Spawn the PPAG capabilities-watch reactor when the
             // framework's hot-tightening re-probe task is
             // publishing live updates. On every observed change
-            // the reactor calls `AutoNmcliDispatcher::re_resolve`,
-            // so a sudoers drop-in removed mid-operation flips
-            // the inner strategy from sudo to direct (or to a
-            // refusal rationale) without re-admission.
+            // the reactor calls `AutoPrivilegedExec::re_resolve`
+            // on each tool dispatcher in turn, so a sudoers
+            // drop-in removed mid-operation flips the inner
+            // strategy without re-admission.
             if let Some(rx) = ctx.capabilities_watch.clone() {
-                self.spawn_capabilities_watcher(auto, rx);
+                self.spawn_capabilities_watcher(
+                    nmcli_auto,
+                    iw_auto,
+                    rfkill_auto,
+                    curl_auto,
+                    rx,
+                );
             }
 
             let intent = self.load_intent().await?;
@@ -3314,8 +3473,11 @@ impl Plugin for NetworkNmPlugin {
             self.scan_cache.clear();
             self.wifi_flight_mode_enabled = false;
             self.wifi_preference_enabled = true;
-            self.dispatcher = Arc::new(DirectNmcliDispatcher::new());
+            self.dispatcher = Arc::new(DirectExec::new());
             self.auto_dispatcher = None;
+            self.iw_exec = None;
+            self.rfkill_exec = None;
+            self.curl_exec = None;
             Ok(())
         }
     }
