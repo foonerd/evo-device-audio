@@ -1,0 +1,30 @@
+[package]
+name = "org-evoframework-delivery-alsa"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ALSA delivery plugin for the evo audio data plane. Owns the AAMPP modular ALSA pipeline (pcm.evo); probes the host's audio hardware; declares the WriteEndpoint other plugins write into. Stocks the audio.delivery shelf at shape 2."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Async filesystem (asound.conf rendering / atomic writes) +
+# subprocess (`aplay -L`, `amixer -c` hardware probing).
+tokio = { workspace = true, features = ["fs", "process"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -54,6 +54,19 @@ for source-verb dispatches (play_now) targeting the \
 mpd-path URI scheme.
 """
 
+[[racks.shelves]]
+name = "delivery"
+shape = 2
+description = """
+Audio delivery stage. Owns the AAMPP modular ALSA pipeline \
+(pcm.evo defined in /etc/asound.conf); declares the \
+WriteEndpoint other audio-producing plugins write into. \
+Exposes a respondent surface for operator-facing hardware \
+inspection (delivery.probe_hardware / list_cards / list_mixers \
+/ active_endpoint) consumed by the playback.options plugin to \
+drive output-device selection.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by
