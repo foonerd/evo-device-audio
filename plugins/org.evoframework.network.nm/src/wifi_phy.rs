@@ -32,7 +32,7 @@ use crate::nmcli_dispatch::PrivilegedExec;
 /// supported when at least one of its centre-frequencies is
 /// listed and not flagged `disabled` by the kernel's regulatory
 /// domain.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PhyBandSupport {
     /// 2.4 GHz family (channels 1–14).
     pub ghz_2_4: bool,
@@ -59,7 +59,7 @@ impl PhyBandSupport {
 }
 
 /// Per-`phy` capability summary surfaced by [`phy_capability`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PhyCapability {
     /// `phy` name (e.g. `phy0`); kept for diagnostics + `Debug`.
     pub phy: String,

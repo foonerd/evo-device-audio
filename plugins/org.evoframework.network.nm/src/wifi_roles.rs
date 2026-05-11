@@ -36,7 +36,8 @@ use crate::wifi_phy::{PhyBandSupport, PhyCapability, WifiDev};
 /// disturbing the on-SoC link) — but if the USB is the only
 /// dual-band radio, STA wins on it instead per the band-priority
 /// rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionClass {
     /// Anything not classified as USB — PCIe, on-SoC, SDIO,
     /// integrated.
@@ -49,7 +50,7 @@ pub enum ConnectionClass {
 
 /// Inventory row for one Wi-Fi radio. The assigner reads these
 /// to pick STA and AP duties.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WifiRadio {
     /// Kernel netdev name (`wlan0`, `wlan1`, ...).
     pub ifname: String,

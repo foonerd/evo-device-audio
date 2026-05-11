@@ -45,9 +45,9 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use evo_plugin_sdk::contract::{
-    BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    BuildInfo, HappeningEmitter, HealthReport, LoadContext, Plugin,
+    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,16 @@ const REQUEST_NETWORK_FLIGHT_MODE_SET: &str = "network.nm.flight_mode.set";
 const REQUEST_NETWORK_RADIO_STATUS: &str = "network.nm.radio.status";
 const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
 const REQUEST_NETWORK_SUPERVISOR_STATUS: &str = "network.nm.supervisor.status";
+const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
+
+/// Reactive-event names emitted on `Happening::PluginEvent`. The
+/// network plugin's taxonomy lives under `network.*` so cross-
+/// plugin subscribers can filter the bus by prefix.
+const EVENT_NETWORK_REACHABILITY_CHANGED: &str = "network.reachability_changed";
+const EVENT_NETWORK_PORTAL_DETECTED: &str = "network.portal_detected";
+const EVENT_NETWORK_CRITICAL_RECOVERY_RAISED: &str =
+    "network.critical_recovery_raised";
+const EVENT_NETWORK_STA_RESTORED: &str = "network.sta_restored";
 
 const NM_CON_ETHERNET: &str = "evo-network-ethernet";
 const NM_CON_WIFI_STA: &str = "evo-network-wifi-sta";
@@ -1131,6 +1141,13 @@ pub struct NmInner {
     pub(crate) scan_cache: tokio::sync::Mutex<HashMap<String, CachedScan>>,
     /// Lifetime request count for observability.
     pub(crate) requests_handled: std::sync::atomic::AtomicU64,
+    /// Framework-supplied happening emitter. Used by the
+    /// supervisor's transition watcher and by the autonomous
+    /// recovery actions to publish reactive events on the
+    /// durable bus. Optional because unit tests construct
+    /// `NmInner` via `defaults_for_new()` without a framework
+    /// LoadContext.
+    pub(crate) happening_emitter: Option<Arc<dyn HappeningEmitter>>,
 }
 
 /// NetworkManager plugin implementing request/response network operations.
@@ -1153,6 +1170,16 @@ pub struct NetworkNmPlugin {
     /// Watch receiver mirroring the supervisor's published view.
     supervisor_view_rx:
         Option<tokio::sync::watch::Receiver<supervisor::SupervisorView>>,
+    /// Bus-emission task — subscribes to the supervisor view
+    /// watch channel and emits typed `PluginEvent` happenings on
+    /// every operator-visible transition.
+    supervisor_emitter: Option<SupervisorEmitterHandle>,
+}
+
+/// Handle on the supervisor-view → bus emitter task.
+struct SupervisorEmitterHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl std::ops::Deref for NetworkNmPlugin {
@@ -1184,6 +1211,7 @@ impl NmInner {
             loaded: std::sync::atomic::AtomicBool::new(false),
             wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(false),
             wifi_preference_enabled: std::sync::atomic::AtomicBool::new(true),
+            happening_emitter: None,
             scan_cache: tokio::sync::Mutex::new(HashMap::new()),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1212,6 +1240,7 @@ impl NetworkNmPlugin {
             capabilities_watcher: None,
             supervisor: None,
             supervisor_view_rx: None,
+            supervisor_emitter: None,
         }
     }
 
@@ -1384,6 +1413,58 @@ impl NetworkNmPlugin {
             task.shutdown().await;
         }
         self.supervisor_view_rx = None;
+    }
+
+    /// Spawn the supervisor-view → bus emitter task. Subscribes
+    /// to the supervisor's `tokio::sync::watch` channel and
+    /// invokes `NmInner::emit_supervisor_transition` on every
+    /// observed change. Captures an `Arc<NmInner>` clone so the
+    /// emitter has access to the framework `HappeningEmitter`
+    /// resolved at `Plugin::load`.
+    fn spawn_supervisor_emitter(
+        &mut self,
+        rx: tokio::sync::watch::Receiver<supervisor::SupervisorView>,
+    ) {
+        let inner = self.inner.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut prev = rx.borrow_and_update().clone();
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "supervisor-emitter: watch sender dropped; exiting"
+                            );
+                            break;
+                        }
+                        let next = rx.borrow_and_update().clone();
+                        inner.emit_supervisor_transition(&prev, &next).await;
+                        prev = next;
+                    }
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "supervisor-emitter: shutdown signal received"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        self.supervisor_emitter =
+            Some(SupervisorEmitterHandle { task, shutdown });
+    }
+
+    /// Stop the supervisor-emitter task. Idempotent.
+    async fn stop_supervisor_emitter(&mut self) {
+        if let Some(handle) = self.supervisor_emitter.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
     }
 
     /// Borrow the latest supervisor view. Returns the default
@@ -3189,6 +3270,97 @@ impl NmInner {
         Ok(sysfs_ethernet_no_carrier(&iface))
     }
 
+    /// Best-effort emission of a typed `PluginEvent` on the
+    /// framework bus. Swallows the framework-level error into a
+    /// debug log — the supervisor / recovery callers do not
+    /// surface the error to operators because the reactive
+    /// channel is a notification path, not a control path.
+    pub(crate) async fn emit_network_event(
+        &self,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        let Some(emitter) = self.happening_emitter.as_ref() else {
+            return;
+        };
+        if let Err(e) = emitter
+            .emit_plugin_event(event_type.to_string(), payload)
+            .await
+        {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                event = event_type,
+                error = %e,
+                "emit_network_event: durable write failed"
+            );
+        }
+    }
+
+    /// Compare two supervisor views and emit reactive events for
+    /// every observed transition. Invoked from the dedicated
+    /// supervisor-view watcher task at `Plugin::load` time so
+    /// every operator-visible state change publishes onto the
+    /// framework bus alongside the existing `tokio::sync::watch`
+    /// channel that wire-op handlers read.
+    pub(crate) async fn emit_supervisor_transition(
+        &self,
+        prev: &supervisor::SupervisorView,
+        next: &supervisor::SupervisorView,
+    ) {
+        if prev.reachability != next.reachability {
+            self.emit_network_event(
+                EVENT_NETWORK_REACHABILITY_CHANGED,
+                json!({
+                    "v": 1,
+                    "from": prev.reachability,
+                    "to": next.reachability,
+                    "observations": next.last_observations,
+                }),
+            )
+            .await;
+        }
+        let entered_portal =
+            matches!(next.reachability, supervisor::ReachabilityState::Portal)
+                && !matches!(
+                    prev.reachability,
+                    supervisor::ReachabilityState::Portal
+                );
+        if entered_portal {
+            if let Some(portal) = next.portal.as_ref() {
+                self.emit_network_event(
+                    EVENT_NETWORK_PORTAL_DETECTED,
+                    json!({
+                        "v": 1,
+                        "portal_url": portal.portal_url,
+                    }),
+                )
+                .await;
+            }
+        }
+        if next.critical_recovery_active && !prev.critical_recovery_active {
+            self.emit_network_event(
+                EVENT_NETWORK_CRITICAL_RECOVERY_RAISED,
+                json!({
+                    "v": 1,
+                    "reachability": next.reachability,
+                    "state_ticks": next.state_ticks,
+                }),
+            )
+            .await;
+        }
+        if prev.critical_recovery_active && !next.critical_recovery_active {
+            self.emit_network_event(
+                EVENT_NETWORK_STA_RESTORED,
+                json!({
+                    "v": 1,
+                    "reachability": next.reachability,
+                    "state_ticks": next.state_ticks,
+                }),
+            )
+            .await;
+        }
+    }
+
     /// Autonomous critical-recovery action invoked by the
     /// supervisor when `Offline` persists past
     /// `SupervisorConfig::critical_grace_ms`. Loads the persisted
@@ -3804,6 +3976,7 @@ impl Plugin for NetworkNmPlugin {
                         REQUEST_NETWORK_RADIO_STATUS.to_string(),
                         REQUEST_NETWORK_RADIO_SET.to_string(),
                         REQUEST_NETWORK_SUPERVISOR_STATUS.to_string(),
+                        REQUEST_NETWORK_WIFI_DEVICES.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -3885,6 +4058,7 @@ impl Plugin for NetworkNmPlugin {
                 rfkill_exec: Some(rfkill_auto.clone()),
                 curl_exec: Some(curl_auto.clone()),
                 require_encrypted_secrets,
+                happening_emitter: Some(ctx.happening_emitter.clone()),
                 loaded: std::sync::atomic::AtomicBool::new(false),
                 wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(
                     false,
@@ -3920,6 +4094,9 @@ impl Plugin for NetworkNmPlugin {
             self.wifi_preference_enabled
                 .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
             self.spawn_supervisor();
+            if let Some(rx) = self.supervisor_view_rx.clone() {
+                self.spawn_supervisor_emitter(rx);
+            }
             self.loaded.store(true, Relaxed);
             self.scan_cache.lock().await.clear();
             tracing::info!(
@@ -3998,6 +4175,7 @@ impl Plugin for NetworkNmPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            self.stop_supervisor_emitter().await;
             self.stop_supervisor().await;
             self.stop_capabilities_watcher().await;
             // Replace the shared inner wholesale — drops every
@@ -4614,6 +4792,20 @@ impl Respondent for NetworkNmPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "supervisor": view,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_WIFI_DEVICES => {
+                    let radios = self.enumerate_wifi_radios().await;
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "radios": radios,
                             }),
                         ),
                     )
