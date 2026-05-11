@@ -608,24 +608,53 @@ async fn emit_best_effort_report(
     let status = match cmd_conn.status().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                handle = %custody_handle.id,
-                error = %e,
-                "state report: status query failed"
-            );
+            // Transient transport errors (broken pipe after MPD
+            // restart, read timeout) are expected during the
+            // recovery window — the next command-path call
+            // triggers the proper reconnect via
+            // error_calls_for_reconnect. Logging at WARN would
+            // pollute the journal every time MPD restarts (which
+            // the framework triggers on every route change).
+            // Demote to DEBUG for those; keep WARN for
+            // protocol-level surprises.
+            if error_calls_for_reconnect(&e) {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    handle = %custody_handle.id,
+                    error = %e,
+                    "state report: status query failed transiently; \
+                     next command will reconnect"
+                );
+            } else {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    handle = %custody_handle.id,
+                    error = %e,
+                    "state report: status query failed"
+                );
+            }
             return;
         }
     };
     let song = match cmd_conn.current_song().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                handle = %custody_handle.id,
-                error = %e,
-                "state report: currentsong query failed"
-            );
+            if error_calls_for_reconnect(&e) {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    handle = %custody_handle.id,
+                    error = %e,
+                    "state report: currentsong query failed \
+                     transiently; next command will reconnect"
+                );
+            } else {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    handle = %custody_handle.id,
+                    error = %e,
+                    "state report: currentsong query failed"
+                );
+            }
             return;
         }
     };
