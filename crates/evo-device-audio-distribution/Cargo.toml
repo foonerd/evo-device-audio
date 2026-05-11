@@ -21,19 +21,17 @@ path = "src/main.rs"
 evo = { path = "../../../evo-core-eng/crates/evo" }
 evo-plugin-sdk = { workspace = true }
 
-# Audio plugin set this distribution links in-process. Each
-# plugin crate exports its public Plugin type and the
-# embedded `MANIFEST_TOML` constant; the distribution's
-# admission setup parses each manifest and admits the plugin.
-# Reshape progress: composition.alsa (chunks A-E, substrate-
-# aware composition stage) and playback.mpd (F1+F2,
-# warden + source + respondent surfaces) are the v0.1.13
-# baseline; the remaining plugins (metadata.local /
-# artwork.local / network.nm) join as their reshape lands.
+# Plugin set this distribution links in-process. Each plugin
+# crate exports its public Plugin type and the embedded
+# `MANIFEST_TOML` constant; the distribution's admission setup
+# parses each manifest and admits the plugin. The remaining
+# plugins (metadata.local / artwork.local) join as their
+# reshape lands.
 org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
 org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
+org-evoframework-network-nm = { path = "../../plugins/org.evoframework.network.nm" }
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.

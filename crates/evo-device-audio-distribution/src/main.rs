@@ -14,21 +14,33 @@
 //!
 //! ## Plugin set
 //!
-//! v0.1.13 baseline ships two reshaped plugins:
+//! v0.1.13 baseline ships:
 //!
 //! - `org.evoframework.composition.alsa` — substrate-aware
 //!   composition stage; admits as a singleton respondent on
 //!   the `audio.composition` shelf at shape 2.
+//! - `org.evoframework.delivery.alsa` — delivery stage that
+//!   owns the modular ALSA pipeline (`pcm.evo`) and declares
+//!   the WriteEndpoint other audio-producing plugins write
+//!   into.
 //! - `org.evoframework.playback.mpd` — warden + source +
 //!   respondent for MPD-backed playback; admits via the
 //!   framework's
 //!   [`AdmissionEngine::admit_singleton_warden_with_respondent`]
 //!   path so both course_correct and source-verb dispatches
 //!   route to the same plugin instance.
+//! - `org.evoframework.playback.options` — operator-facing
+//!   audiophile-grade settings; emits a `PluginEvent` on
+//!   every change that delivery.alsa consumes to re-render
+//!   the pipeline.
+//! - `org.evoframework.network.nm` — NetworkManager-backed
+//!   networking surface; consumes the framework's PPAG
+//!   resolution for the `nmcli_invocation` intent to install
+//!   an EUID-aware dispatch composite (direct under root,
+//!   `sudo -n` under a non-root service user).
 //!
-//! The remaining plugins (metadata.local / artwork.local /
-//! network.nm) join the admission setup as their reshape
-//! lands.
+//! The remaining plugins (metadata.local / artwork.local)
+//! join the admission setup as their reshape lands.
 //!
 //! ## Catalogue + boundary
 //!
@@ -52,6 +64,7 @@ use evo::AdmissionSetup;
 use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
+use org_evoframework_network_nm::NetworkNmPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 use org_evoframework_playback_options::PlaybackOptionsPlugin;
 
@@ -143,6 +156,30 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting playback.options")?;
+
+            // 5. network.nm: singleton respondent on
+            //    networking.link shape 1. NetworkManager-
+            //    backed networking surface (status / scan /
+            //    intent / captive-portal / security /
+            //    flight-mode). Holds an
+            //    [`NmcliDispatcher`] composite that the
+            //    framework's PPAG runner stamps from the
+            //    `nmcli_invocation` resolution at admission
+            //    time, so under non-root service identities
+            //    every nmcli invocation goes through
+            //    `sudo -n nmcli` against the distribution's
+            //    NOPASSWD drop-in without re-probing on each
+            //    call.
+            let network_nm_manifest =
+                Manifest::from_toml(org_evoframework_network_nm::MANIFEST_TOML)
+                    .context("parsing network.nm manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    NetworkNmPlugin::new(),
+                    network_nm_manifest,
+                )
+                .await
+                .context("admitting network.nm")?;
 
             Ok(())
         })

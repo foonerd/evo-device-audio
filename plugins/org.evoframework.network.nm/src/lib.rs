@@ -21,12 +21,19 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+pub mod nmcli_dispatch;
+
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use crate::nmcli_dispatch::{
+    AutoNmcliDispatcher, DirectNmcliDispatcher, NmcliDispatcher,
+    INTENT_NMCLI_INVOCATION,
+};
 
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -915,6 +922,13 @@ pub struct NetworkNmPlugin {
     requests_handled: u64,
     scan_cache: HashMap<String, CachedScan>,
     wifi_flight_mode_enabled: bool,
+    /// Privilege-strategy dispatcher for every nmcli invocation.
+    /// Initial construction installs a no-op direct dispatcher
+    /// so the plugin is usable in unit tests that bypass
+    /// `Plugin::load`; `Plugin::load` then resolves and swaps
+    /// in an [`AutoNmcliDispatcher`] keyed off the framework's
+    /// `LoadContext::capabilities` resolution map.
+    dispatcher: Arc<dyn NmcliDispatcher>,
 }
 
 impl NetworkNmPlugin {
@@ -927,6 +941,7 @@ impl NetworkNmPlugin {
             requests_handled: 0,
             scan_cache: HashMap::new(),
             wifi_flight_mode_enabled: false,
+            dispatcher: Arc::new(DirectNmcliDispatcher::new()),
         }
     }
 
@@ -1618,38 +1633,23 @@ impl NetworkNmPlugin {
     }
 
     async fn nmcli_output(&self, args: &[&str]) -> Result<String, PluginError> {
-        let mut cmd = Command::new(&self.config.nmcli_path);
-        cmd.args(args);
-        let direct = run_command_output_with_timeout(
-            cmd,
-            self.config.nmcli_timeout_ms,
-            "nmcli direct",
-        )
-        .await?;
-        if direct.status.success() {
-            return Ok(String::from_utf8_lossy(&direct.stdout).to_string());
+        let out = self
+            .dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                args,
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).to_string());
         }
-
-        let mut sudo_cmd = Command::new("sudo");
-        sudo_cmd.arg("-n").arg(&self.config.nmcli_path).args(args);
-        let sudo = run_command_output_with_timeout(
-            sudo_cmd,
-            self.config.nmcli_timeout_ms,
-            "nmcli sudo fallback",
-        )
-        .await
-        .ok();
-        if let Some(out) = sudo {
-            if out.status.success() {
-                return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-            }
-        }
-
-        let stderr = String::from_utf8_lossy(&direct.stderr);
-        let stdout = String::from_utf8_lossy(&direct.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
         Err(PluginError::Transient(format!(
-            "nmcli failed (args {:?}): {} {}",
+            "nmcli failed (args {:?}, strategy {}): {} {}",
             args,
+            self.dispatcher.strategy_name(),
             stderr.trim(),
             stdout.trim()
         )))
@@ -1664,14 +1664,14 @@ impl NetworkNmPlugin {
     }
 
     async fn nm_connection_exists(&self, name: &str) -> bool {
-        let mut cmd = Command::new(&self.config.nmcli_path);
-        cmd.args(["connection", "show", name]);
-        let out = run_command_output_with_timeout(
-            cmd,
-            self.config.nmcli_timeout_ms,
-            "nmcli connection show",
-        )
-        .await;
+        let out = self
+            .dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                &["connection", "show", name],
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await;
         out.map(|o| o.status.success()).unwrap_or(false)
     }
 
@@ -2014,14 +2014,14 @@ impl NetworkNmPlugin {
         if name.trim().is_empty() {
             return;
         }
-        let mut cmd = Command::new(&self.config.nmcli_path);
-        cmd.args(["connection", "down", name]);
-        let out = run_command_output_with_timeout(
-            cmd,
-            self.config.nmcli_timeout_ms,
-            "nmcli connection down",
-        )
-        .await;
+        let out = self
+            .dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                &["connection", "down", name],
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await;
         match out {
             Ok(v) if v.status.success() => {}
             Ok(v) => {
@@ -2043,14 +2043,13 @@ impl NetworkNmPlugin {
         &self,
         args: &[&str],
     ) -> Result<std::process::Output, PluginError> {
-        let mut cmd = Command::new(&self.config.nmcli_path);
-        cmd.args(args);
-        run_command_output_with_timeout(
-            cmd,
-            self.config.nmcli_timeout_ms,
-            "nmcli spawn output",
-        )
-        .await
+        self.dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                args,
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await
     }
 
     async fn nm_radio_state(&self) -> Result<NmRadioState, PluginError> {
@@ -2831,6 +2830,47 @@ impl Default for NetworkNmPlugin {
 }
 
 impl Plugin for NetworkNmPlugin {
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        use evo_plugin_sdk::privileges::{
+            BinaryPresentProbe, ProbePlan, SudoersCommandProbe,
+        };
+
+        let mut plans: Vec<ProbePlan> = Vec::with_capacity(1);
+        let nmcli_bin = self.config.nmcli_path.clone();
+        // EUID-aware: under root the plugin exec nmcli directly,
+        // so the probe just verifies the binary is on the host;
+        // under a non-root service identity it must dispatch via
+        // `sudo -n nmcli`, so the probe checks the sudoers entry
+        // directly. Same EUID floor as playback.mpd.
+        if nmcli_dispatch::process_needs_sudo() {
+            if let Some(probe) = SudoersCommandProbe::new([nmcli_bin.as_str()])
+            {
+                plans.push(ProbePlan {
+                    intent_id: INTENT_NMCLI_INVOCATION.to_string(),
+                    probe: Box::new(probe),
+                    strategy_hint: Some("sudo".to_string()),
+                    remedy: format!(
+                        "install the distribution bootstrap sudoers \
+                         drop-in granting NOPASSWD `{nmcli_bin}` to the \
+                         steward service user"
+                    ),
+                });
+            }
+        } else {
+            plans.push(ProbePlan {
+                intent_id: INTENT_NMCLI_INVOCATION.to_string(),
+                probe: Box::new(BinaryPresentProbe::new(nmcli_bin.clone())),
+                strategy_hint: Some("direct".to_string()),
+                remedy: format!(
+                    "install NetworkManager (`{nmcli_bin}` not on PATH); \
+                     networking surface degrades to unavailable until \
+                     present"
+                ),
+            });
+        }
+        plans
+    }
+
     fn describe(&self) -> impl Future<Output = PluginDescription> + Send + '_ {
         async move {
             PluginDescription {
@@ -2876,6 +2916,27 @@ impl Plugin for NetworkNmPlugin {
         async move {
             self.config = PluginConfig::from_toml_table(&ctx.config)?;
             self.state_dir = Some(ctx.state_dir.clone());
+
+            // Resolve the nmcli privilege strategy from the
+            // framework's preflight result. AutoNmcliDispatcher
+            // inspects the capability-resolution map for the
+            // `nmcli_invocation` intent and installs the right
+            // concrete strategy (Direct / Sudo); when the
+            // framework's runner has not yet populated the map
+            // it falls back to `/proc/self/status` EUID
+            // detection, mirroring the playback.mpd plugin's
+            // AutoMpdRestarter resolution shape so the two
+            // PPAG consumers in this distribution observe the
+            // same EUID floor.
+            let auto = AutoNmcliDispatcher::resolve(&ctx.capabilities);
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                strategy = auto.strategy_name(),
+                rationale = %auto.rationale(),
+                "nmcli dispatch strategy resolved"
+            );
+            self.dispatcher = Arc::new(auto) as Arc<dyn NmcliDispatcher>;
+
             let flight_mode_state = self.load_flight_mode_state().await?;
             self.wifi_flight_mode_enabled = flight_mode_state.enabled;
             self.loaded = true;
@@ -2931,6 +2992,7 @@ impl Plugin for NetworkNmPlugin {
             self.config = PluginConfig::defaults();
             self.scan_cache.clear();
             self.wifi_flight_mode_enabled = false;
+            self.dispatcher = Arc::new(DirectNmcliDispatcher::new());
             Ok(())
         }
     }

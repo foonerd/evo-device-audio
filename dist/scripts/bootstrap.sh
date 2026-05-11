@@ -32,16 +32,18 @@
 #   2 — install error (a step failed; previous steps left in place).
 #
 # Toggles:
-#   EVO_INSTALL_MPD_SUDOERS=0  — skip /etc/sudoers.d/evo-mpd-restart
-#   EVO_INSTALL_SYSTEMD_DROP_INS=0  — skip /etc/systemd/system/evo.service.d/
-#   EVO_INSTALL_CLIENT_ACL=0  — skip /etc/evo/client_acl.toml install
-#   EVO_INSTALL_MPD_FRAGMENT=0  — skip /etc/evo/mpd.conf bootstrap (empty file)
-#   EVO_INSTALL_ASOUND_CONF=0  — skip /etc/asound.conf install
-#   EVO_INSTALL_CATALOGUE=0  — skip /opt/evo/catalogue/default.toml install
+#   EVO_INSTALL_MPD_SUDOERS=0          — skip /etc/sudoers.d/evo-mpd-restart
+#   EVO_INSTALL_NETWORK_NM_SUDOERS=0   — skip /etc/sudoers.d/evo-network-nm
+#   EVO_INSTALL_SYSTEMD_DROP_INS=0     — skip /etc/systemd/system/evo.service.d/
+#   EVO_INSTALL_CLIENT_ACL=0           — skip /etc/evo/client_acl.toml install
+#   EVO_INSTALL_MPD_FRAGMENT=0         — skip /etc/evo/mpd.conf bootstrap (empty file)
+#   EVO_INSTALL_ASOUND_CONF=0          — skip /etc/asound.conf install
+#   EVO_INSTALL_CATALOGUE=0            — skip /opt/evo/catalogue/default.toml install
 #
-# These mirror volumio-evo's `EVO_INSTALL_*_SUDOERS=0/1`
-# pattern so operators can disable individual steps without
-# editing this script.
+# Per-step toggles let operators disable individual install
+# legs without editing this script — useful when a vendor
+# distribution composes its own privileged-action surface
+# alongside the reference one.
 
 set -euo pipefail
 
@@ -54,6 +56,8 @@ DIST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_USER=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
+NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
+NMCLI_BIN="/usr/bin/nmcli"
 SYSTEMD_DROPIN_DIR="/etc/systemd/system/evo.service.d"
 MPD_FRAGMENT_PATH="/etc/evo/mpd.conf"
 ASOUND_CONF_PATH="/etc/asound.conf"
@@ -156,6 +160,41 @@ if [[ "${EVO_INSTALL_MPD_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_MPD_SUDOERS=0 — skipping sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1b: /etc/sudoers.d/evo-network-nm (narrow NOPASSWD)
+# ----------------------------------------------------------
+# Mirrors Step 1 for the network.nm plugin's nmcli surface.
+# Both PPAG consumers in this distribution share the same
+# sudoers-drop-in install discipline: render the template
+# with the resolved service user + binary path, validate
+# with visudo -c, install at mode 0440 owned root:root.
+if [[ "${EVO_INSTALL_NETWORK_NM_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-network-nm.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        -e "s|/usr/bin/nmcli|$NMCLI_BIN|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$NETWORK_NM_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $NETWORK_NM_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_NETWORK_NM_SUDOERS=0 — skipping network.nm sudoers drop-in"
 fi
 
 # ----------------------------------------------------------
@@ -332,8 +371,8 @@ fi
 echo
 echo "[verify] preflight checks:"
 
-# sudoers drop-in is present + the service user can dry-run
-# the exact command.
+# MPD-restart sudoers drop-in present + the service user can
+# dry-run the exact command.
 if [[ -f "$SUDOERS_FILE" ]]; then
     if sudo -u "$SERVICE_USER" sudo -n -l -- "$SYSTEMCTL_BIN" restart mpd >/dev/null 2>&1; then
         echo "  [ok]    $SERVICE_USER permitted to run \`$SYSTEMCTL_BIN restart mpd\` via NOPASSWD"
@@ -342,7 +381,20 @@ if [[ -f "$SUDOERS_FILE" ]]; then
         echo "          (review $SUDOERS_FILE and Environment=EVO_SYSTEMCTL in $SYSTEMD_DROPIN_DIR/mpd-restart-privileges.conf)"
     fi
 else
-    echo "  [skip]  sudoers drop-in not installed"
+    echo "  [skip]  MPD-restart sudoers drop-in not installed"
+fi
+
+# network.nm sudoers drop-in present + the service user can
+# dry-run the nmcli binary.
+if [[ -f "$NETWORK_NM_SUDOERS_FILE" ]]; then
+    if sudo -u "$SERVICE_USER" sudo -n -l -- "$NMCLI_BIN" >/dev/null 2>&1; then
+        echo "  [ok]    $SERVICE_USER permitted to run \`$NMCLI_BIN\` via NOPASSWD"
+    else
+        echo "  [WARN]  sudo -n -l -- $NMCLI_BIN did not match for $SERVICE_USER"
+        echo "          (review $NETWORK_NM_SUDOERS_FILE; ensure binary path matches plugin config nmcli_path)"
+    fi
+else
+    echo "  [skip]  network.nm sudoers drop-in not installed"
 fi
 
 # Fragment path writable by service user.
