@@ -17,13 +17,27 @@ target host.
   playback warden announces on every song change. Vendor
   distributions include this fragment in their full
   catalogue alongside any other racks they admit.
-- `mpd/evo-fragment.conf` — static reference fragment used
-  for verification before the substrate-aware shape lands.
-  Once the playback.mpd plugin is admitted, the
-  fragment-writer worker overwrites `/etc/evo/mpd.conf` at
+- `mpd/evo-fragment.conf` — boot-time MPD fragment. Carries
+  the AAMPP-compliant `device "evo"` pointing at the
+  `pcm.evo` pipeline (see `alsa/99-evo.conf`). The
+  fragment-writer worker rewrites `/etc/evo/mpd.conf` at
   every route-change from the framework-negotiated
-  WriteEndpoint; this static file then serves only as a
-  documentation reference.
+  WriteEndpoint once a topology is published; this static
+  form keeps MPD operational at boot before reconciliation
+  has run.
+- `alsa/asound.conf` — AAMPP modular ALSA pipeline.
+  Defines `pcm.evo` as the single entry point every
+  audio-producing plugin writes to: `plug` (handles format
+  negotiation) → `hw:CARD=DAC,DEV=0` (hardware terminus,
+  kernel-stable card name). The bootstrap script installs
+  this file at `/etc/asound.conf` (system-wide; ALSA reads
+  it at every PCM open). Future AAMPP modules (soxr
+  resampler, EQ, room correction, peppyalsa visualisation)
+  are layered in via the same file under operator control,
+  or via the `delivery.alsa` plugin's authority once it
+  lands. Existing `/etc/asound.conf` content is backed up
+  to `/etc/asound.conf.pre-evo.<timestamp>` before
+  overwrite; idempotent on re-run.
 - `systemd/evo.service.d/state-dir-mode.conf` — drop-in
   override widening `StateDirectoryMode` to `0755` so MPD
   can traverse `/var/lib/evo/` to reach the music tree.

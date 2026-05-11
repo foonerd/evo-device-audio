@@ -53,6 +53,7 @@ SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 SYSTEMD_DROPIN_DIR="/etc/systemd/system/evo.service.d"
 MPD_FRAGMENT_PATH="/etc/evo/mpd.conf"
+ASOUND_CONF_PATH="/etc/asound.conf"
 SKIP_SYSTEMD=0
 
 # Argument parsing — minimal; positional args not supported.
@@ -176,20 +177,61 @@ else
 fi
 
 # ----------------------------------------------------------
-# Step 3: /etc/evo/mpd.conf — empty file owned by service user
+# Step 3: /etc/evo/mpd.conf — boot-time fragment owned by service user
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_MPD_FRAGMENT:-1}" != "0" ]]; then
     install -d -m 0755 -o root -g root "$(dirname "$MPD_FRAGMENT_PATH")"
-    if [[ ! -f "$MPD_FRAGMENT_PATH" ]]; then
-        # Seed an empty file. The plugin's fragment-writer
-        # worker overwrites it on every route change.
+    # Seed with the static AAMPP-pipeline fragment (device
+    # "evo" -> /etc/asound.d/99-evo.conf -> hardware). The
+    # plugin's fragment-writer worker overwrites this on every
+    # route change once the framework publishes a topology;
+    # the static form gives MPD a valid audio_output at boot
+    # before any topology is resolved.
+    FRAGMENT_TEMPLATE="$DIST_DIR/mpd/evo-fragment.conf"
+    if [[ -f "$FRAGMENT_TEMPLATE" ]]; then
+        install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            "$FRAGMENT_TEMPLATE" "$MPD_FRAGMENT_PATH"
+    else
         : > "$MPD_FRAGMENT_PATH"
+        chown "$SERVICE_USER:$SERVICE_USER" "$MPD_FRAGMENT_PATH"
+        chmod 0644 "$MPD_FRAGMENT_PATH"
     fi
-    chown "$SERVICE_USER:$SERVICE_USER" "$MPD_FRAGMENT_PATH"
-    chmod 0644 "$MPD_FRAGMENT_PATH"
     echo "[bootstrap] $MPD_FRAGMENT_PATH owned by $SERVICE_USER (mode 0644)"
 else
     echo "[bootstrap] EVO_INSTALL_MPD_FRAGMENT=0 — skipping fragment-path chown"
+fi
+
+# ----------------------------------------------------------
+# Step 4: /etc/asound.conf — AAMPP pipeline pcm.evo
+# ----------------------------------------------------------
+if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
+    ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
+    if [[ ! -f "$ASOUND_TEMPLATE" ]]; then
+        echo "asound template not found at $ASOUND_TEMPLATE" >&2
+        exit 2
+    fi
+    # If an existing /etc/asound.conf is present with different
+    # contents, back it up first so the operator never loses
+    # state silently. Idempotent: re-running after a clean
+    # install does not stack backups.
+    if [[ -f "$ASOUND_CONF_PATH" ]] && \
+       ! cmp -s "$ASOUND_TEMPLATE" "$ASOUND_CONF_PATH"; then
+        backup="$ASOUND_CONF_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
+        cp -a "$ASOUND_CONF_PATH" "$backup"
+        echo "[bootstrap] backed up prior $ASOUND_CONF_PATH to $backup"
+    fi
+    install -m 0644 -o root -g root "$ASOUND_TEMPLATE" "$ASOUND_CONF_PATH"
+    echo "[bootstrap] installed $ASOUND_CONF_PATH"
+    # ALSA reads /etc/asound.conf at every PCM open, so no
+    # daemon reload is needed for ALSA itself. MPD caches the
+    # asound state at startup though, so bounce it to pick up
+    # the new pcm.evo definition. We are running as root here.
+    if "$SYSTEMCTL_BIN" is-active mpd.service >/dev/null 2>&1; then
+        "$SYSTEMCTL_BIN" restart mpd.service
+        echo "[bootstrap] restarted mpd.service to pick up pcm.evo"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_ASOUND_CONF=0 — skipping asound.conf"
 fi
 
 # ----------------------------------------------------------
