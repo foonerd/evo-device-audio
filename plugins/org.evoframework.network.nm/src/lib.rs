@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::fs::Permissions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1081,60 +1082,112 @@ struct ApplyReport {
     steps: Vec<String>,
 }
 
-/// NetworkManager plugin implementing request/response network operations.
-pub struct NetworkNmPlugin {
-    loaded: bool,
-    config: PluginConfig,
-    state_dir: Option<PathBuf>,
-    requests_handled: u64,
-    scan_cache: HashMap<String, CachedScan>,
-    wifi_flight_mode_enabled: bool,
-    /// Operator's per-radio Wi-Fi preference. Composed with
-    /// [`Self::wifi_flight_mode_enabled`] and the kernel's
-    /// rfkill state to derive the effective Wi-Fi radio state
-    /// surfaced via `network.nm.radio.status`. Default `true`
-    /// so fresh installs match the prior "wifi on when not in
-    /// flight-mode" behaviour.
-    wifi_preference_enabled: bool,
+/// Shared I/O state + apply-pipeline behaviour. Lives behind an
+/// `Arc` so the supervisor task can drive autonomous recovery by
+/// invoking `apply_intent` and the helper chain from outside the
+/// Plugin-trait method receivers. Interior mutability (Atomic,
+/// `tokio::sync::Mutex`) covers the few runtime-mutable fields so
+/// every method on `NmInner` is `&self`.
+pub struct NmInner {
+    /// Loaded configuration. Reset to defaults on `unload` by
+    /// replacing the whole `NmInner` Arc on the outer plugin.
+    pub(crate) config: PluginConfig,
+    /// Steward-supplied per-plugin state directory.
+    pub(crate) state_dir: Option<PathBuf>,
     /// Privilege-strategy dispatcher for every nmcli invocation.
-    /// Initial construction installs a no-op direct dispatcher
-    /// so the plugin is usable in unit tests that bypass
-    /// `Plugin::load`; `Plugin::load` then resolves and swaps
+    /// Default: `DirectExec`; `Plugin::load` resolves and swaps
     /// in an [`AutoPrivilegedExec`] keyed off the framework's
-    /// `LoadContext::capabilities` resolution map.
-    dispatcher: Arc<dyn PrivilegedExec>,
-    /// Concrete handle on the auto-dispatcher composite so the
-    /// capabilities-watch reactor can call `re_resolve` on it
-    /// without going through the `Arc<dyn PrivilegedExec>`
-    /// erasure. Same underlying Arc as [`Self::dispatcher`]
-    /// when `Plugin::load` runs the production resolver.
-    auto_dispatcher: Option<Arc<AutoPrivilegedExec>>,
-    /// Privilege-strategy dispatcher for every `iw` invocation
-    /// (PHY capability detection + virtual AP vif lifecycle).
-    /// `None` until `Plugin::load` resolves the strategy from
-    /// the framework's preflight result.
-    iw_exec: Option<Arc<AutoPrivilegedExec>>,
-    /// Privilege-strategy dispatcher for every `rfkill`
-    /// invocation (hardware / software radio block toggle).
-    rfkill_exec: Option<Arc<AutoPrivilegedExec>>,
-    /// Privilege-strategy dispatcher for every `curl`
-    /// invocation (connectivity + captive-portal probes).
-    curl_exec: Option<Arc<AutoPrivilegedExec>>,
-    /// PPAG capabilities-watch reactor. Spawned at load when
-    /// `LoadContext::capabilities_watch` is `Some`; observes
-    /// the framework's re-probe publications and re-resolves
-    /// every per-tool dispatcher on each change.
+    /// `LoadContext::capabilities` map.
+    pub(crate) dispatcher: Arc<dyn PrivilegedExec>,
+    /// Concrete handle on the nmcli auto-dispatcher composite so
+    /// the capabilities-watch reactor can call `re_resolve` on
+    /// it without going through the `Arc<dyn PrivilegedExec>`
+    /// erasure.
+    #[allow(dead_code)]
+    pub(crate) auto_dispatcher: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege dispatcher for every `iw` invocation.
+    pub(crate) iw_exec: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege dispatcher for every `rfkill` invocation.
+    pub(crate) rfkill_exec: Option<Arc<AutoPrivilegedExec>>,
+    /// Privilege dispatcher for every `curl` invocation
+    /// (connectivity + captive-portal probes).
+    pub(crate) curl_exec: Option<Arc<AutoPrivilegedExec>>,
+    /// Runtime mirror of `PluginConfig.require_encrypted_secrets`,
+    /// promoted to interior-mutable so the `network.nm.security.harden`
+    /// verb can flip it without rebuilding the whole `NmInner`.
+    pub(crate) require_encrypted_secrets: std::sync::atomic::AtomicBool,
+    /// `true` once `Plugin::load` has run. Cleared on `unload`.
+    pub(crate) loaded: std::sync::atomic::AtomicBool,
+    /// Operator's flight-mode signal. Composed with
+    /// [`Self::wifi_preference_enabled`] and the kernel's rfkill
+    /// state to derive the effective Wi-Fi radio surface.
+    pub(crate) wifi_flight_mode_enabled: std::sync::atomic::AtomicBool,
+    /// Operator's per-radio Wi-Fi preference. Defaults to `true`
+    /// so a fresh install matches "Wi-Fi on outside flight mode".
+    pub(crate) wifi_preference_enabled: std::sync::atomic::AtomicBool,
+    /// Per-ifname scan cache. Reader / writer guarded by an
+    /// async-friendly Mutex; entries expire after
+    /// [`PluginConfig::scan_cache_ttl_ms`].
+    pub(crate) scan_cache: tokio::sync::Mutex<HashMap<String, CachedScan>>,
+    /// Lifetime request count for observability.
+    pub(crate) requests_handled: std::sync::atomic::AtomicU64,
+}
+
+/// NetworkManager plugin implementing request/response network operations.
+///
+/// Thin outer handle: holds the shared `NmInner` plus task
+/// handles (capabilities-watch reactor + supervisor). All I/O
+/// state and the apply pipeline live on `NmInner`; this struct
+/// auto-dereferences to it so wire-op handlers continue to read
+/// state and call helpers via `self.X` unchanged.
+pub struct NetworkNmPlugin {
+    /// Shared I/O state + behaviour. Cloned into the supervisor
+    /// task's closures so autonomous recovery can invoke the
+    /// apply pipeline.
+    pub(crate) inner: Arc<NmInner>,
+    /// PPAG capabilities-watch reactor.
     capabilities_watcher: Option<CapabilitiesWatcherHandle>,
     /// Runtime supervisor task. Reachability probe loop plus
-    /// critical-recovery and STA-restore decisions. Spawned at
-    /// `Plugin::load` once the dispatcher fan-out is resolved;
-    /// idle by default in unit tests that bypass `load`.
+    /// critical-recovery and STA-restore decisions.
     supervisor: Option<supervisor::SupervisorTask>,
     /// Watch receiver mirroring the supervisor's published view.
-    /// Wire-op handlers and reactive subjects borrow this
-    /// without locking the task.
     supervisor_view_rx:
         Option<tokio::sync::watch::Receiver<supervisor::SupervisorView>>,
+}
+
+impl std::ops::Deref for NetworkNmPlugin {
+    type Target = NmInner;
+    fn deref(&self) -> &NmInner {
+        &self.inner
+    }
+}
+
+impl NmInner {
+    /// Construct a default-state `NmInner` for `Plugin::new()`
+    /// / tests / the unload reset path. Production load builds
+    /// a fully-populated instance via
+    /// [`NmInner::from_load_context`].
+    pub(crate) fn defaults_for_new() -> Self {
+        let config = PluginConfig::defaults();
+        let require_encrypted_secrets = std::sync::atomic::AtomicBool::new(
+            config.require_encrypted_secrets,
+        );
+        Self {
+            config,
+            state_dir: None,
+            dispatcher: Arc::new(DirectExec::new()),
+            auto_dispatcher: None,
+            iw_exec: None,
+            rfkill_exec: None,
+            curl_exec: None,
+            require_encrypted_secrets,
+            loaded: std::sync::atomic::AtomicBool::new(false),
+            wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(false),
+            wifi_preference_enabled: std::sync::atomic::AtomicBool::new(true),
+            scan_cache: tokio::sync::Mutex::new(HashMap::new()),
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 /// Handle on the PPAG capabilities-watch reactor task. Mirrors
@@ -1155,22 +1208,21 @@ impl NetworkNmPlugin {
     /// Construct a plugin instance.
     pub fn new() -> Self {
         Self {
-            loaded: false,
-            config: PluginConfig::defaults(),
-            state_dir: None,
-            requests_handled: 0,
-            scan_cache: HashMap::new(),
-            wifi_flight_mode_enabled: false,
-            wifi_preference_enabled: true,
-            dispatcher: Arc::new(DirectExec::new()),
-            auto_dispatcher: None,
-            iw_exec: None,
-            rfkill_exec: None,
-            curl_exec: None,
+            inner: Arc::new(NmInner::defaults_for_new()),
             capabilities_watcher: None,
             supervisor: None,
             supervisor_view_rx: None,
         }
+    }
+
+    /// Test-only accessor: mutate the inner state before any
+    /// task has captured an `Arc<NmInner>` clone. Panics if
+    /// the inner Arc has additional strong refs, which can
+    /// only happen in production after `Plugin::load` has run.
+    #[cfg(test)]
+    fn inner_mut(&mut self) -> &mut NmInner {
+        Arc::get_mut(&mut self.inner)
+            .expect("test setup: NmInner Arc must be uniquely owned")
     }
 
     fn ensure_state_dir(&self) -> Result<&Path, PluginError> {
@@ -1389,10 +1441,15 @@ impl NetworkNmPlugin {
     /// three independent inputs (preference + flight-mode +
     /// rfkill). Pure read; no side effects.
     fn compose_wifi_radio_view(&self) -> wifi_radio::RadioStateView {
-        let preference =
-            wifi_radio::RadioState::from_bool(self.wifi_preference_enabled);
+        let preference = wifi_radio::RadioState::from_bool(
+            self.wifi_preference_enabled.load(Relaxed),
+        );
         let block = self.read_wifi_block_state();
-        wifi_radio::resolve(preference, self.wifi_flight_mode_enabled, block)
+        wifi_radio::resolve(
+            preference,
+            self.wifi_flight_mode_enabled.load(Relaxed),
+            block,
+        )
     }
 
     async fn write_text_atomic_with_lkg(
@@ -1952,7 +2009,7 @@ impl NetworkNmPlugin {
                 Ok(Some(plain))
             }
             Err(_) => {
-                if self.config.require_encrypted_secrets {
+                if self.require_encrypted_secrets.load(Relaxed) {
                     return Err(PluginError::Permanent(format!(
                         "plaintext secret {} rejected; encrypted secrets required",
                         path.display()
@@ -1979,7 +2036,7 @@ impl NetworkNmPlugin {
                         ))
                     })?
                 } else {
-                    if self.config.require_encrypted_secrets {
+                    if self.require_encrypted_secrets.load(Relaxed) {
                         return Err(PluginError::Permanent(format!(
                             "{} required by {} but key is missing",
                             ENV_SECRET_KEY, ENV_SECRET_REQUIRE
@@ -2060,7 +2117,7 @@ impl NetworkNmPlugin {
             self.secret_storage_status(&ap_path).await;
         Ok(json!({
             "key_configured": self.config.secret_key.is_some(),
-            "require_encrypted": self.config.require_encrypted_secrets,
+            "require_encrypted": self.require_encrypted_secrets.load(Relaxed),
             "sta_secret": {
                 "present": sta_present,
                 "encrypted": sta_encrypted,
@@ -2103,7 +2160,7 @@ impl NetworkNmPlugin {
             migrated_files += 1;
         }
         if enforce_runtime {
-            self.config.require_encrypted_secrets = true;
+            self.require_encrypted_secrets.store(true, Relaxed);
         }
         let security = self.build_security_status().await?;
         Ok(json!({
@@ -2485,7 +2542,8 @@ impl NetworkNmPlugin {
         let key = ifname.unwrap_or_default().trim().to_string();
         let ttl = self.config.scan_cache_ttl_ms;
         if !refresh && ttl > 0 {
-            if let Some(cached) = self.scan_cache.get(&key) {
+            let cache = self.scan_cache.lock().await;
+            if let Some(cached) = cache.get(&key) {
                 if cached.captured_at.elapsed()
                     <= Duration::from_millis(self.config.scan_cache_ttl_ms)
                 {
@@ -2496,11 +2554,12 @@ impl NetworkNmPlugin {
                     ));
                 }
             }
+            drop(cache);
         }
         let available = self.wifi_scan(ifname).await?;
         let candidates = self.wifi_scan_candidates(ifname).await?;
         if ttl > 0 {
-            self.scan_cache.insert(
+            self.scan_cache.lock().await.insert(
                 key,
                 CachedScan {
                     available: available.clone(),
@@ -3346,7 +3405,7 @@ impl NetworkNmPlugin {
         self.ensure_ethernet(intent, &mut steps).await?;
 
         if !matches!(intent.wifi.role, WifiRole::Disabled) {
-            if self.wifi_flight_mode_enabled {
+            if self.wifi_flight_mode_enabled.load(Relaxed) {
                 steps.push(
                     "warning: wifi flight mode is enabled; skip wifi apply. Disable flight mode and retry"
                         .to_string(),
@@ -3551,9 +3610,9 @@ impl NetworkNmPlugin {
                 json!({
                     "request_type": req.request_type,
                     "correlation_id": req.correlation_id,
-                    "requests_handled": self.requests_handled,
+                    "requests_handled": self.requests_handled.load(Relaxed),
                     "secret_encryption": self.config.secret_key.is_some(),
-                    "secret_encryption_required": self.config.require_encrypted_secrets,
+                    "secret_encryption_required": self.require_encrypted_secrets.load(Relaxed),
                 }),
             );
         }
@@ -3680,8 +3739,8 @@ impl Plugin for NetworkNmPlugin {
         ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
-            self.config = PluginConfig::from_toml_table(&ctx.config)?;
-            self.state_dir = Some(ctx.state_dir.clone());
+            // Parse config first; the rest of NmInner depends on it.
+            let config = PluginConfig::from_toml_table(&ctx.config)?;
 
             // Resolve a privilege-dispatch strategy per tool from
             // the framework's preflight result. AutoPrivilegedExec
@@ -3724,11 +3783,34 @@ impl Plugin for NetworkNmPlugin {
                     "privileged-exec strategy resolved"
                 );
             }
-            self.dispatcher = nmcli_auto.clone() as Arc<dyn PrivilegedExec>;
-            self.auto_dispatcher = Some(nmcli_auto.clone());
-            self.iw_exec = Some(iw_auto.clone());
-            self.rfkill_exec = Some(rfkill_auto.clone());
-            self.curl_exec = Some(curl_auto.clone());
+
+            // Build the fresh NmInner state and replace the Arc
+            // wholesale. Subsequent task spawns capture the new
+            // Arc; the old Arc is dropped once any outstanding
+            // borrowers (none yet at load) release it.
+            let require_encrypted_secrets = std::sync::atomic::AtomicBool::new(
+                config.require_encrypted_secrets,
+            );
+            let inner = NmInner {
+                config,
+                state_dir: Some(ctx.state_dir.clone()),
+                dispatcher: nmcli_auto.clone() as Arc<dyn PrivilegedExec>,
+                auto_dispatcher: Some(nmcli_auto.clone()),
+                iw_exec: Some(iw_auto.clone()),
+                rfkill_exec: Some(rfkill_auto.clone()),
+                curl_exec: Some(curl_auto.clone()),
+                require_encrypted_secrets,
+                loaded: std::sync::atomic::AtomicBool::new(false),
+                wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                wifi_preference_enabled: std::sync::atomic::AtomicBool::new(
+                    true,
+                ),
+                scan_cache: tokio::sync::Mutex::new(HashMap::new()),
+                requests_handled: std::sync::atomic::AtomicU64::new(0),
+            };
+            self.inner = Arc::new(inner);
 
             // Spawn the PPAG capabilities-watch reactor when the
             // framework's hot-tightening re-probe task is
@@ -3748,12 +3830,13 @@ impl Plugin for NetworkNmPlugin {
             }
 
             let intent = self.load_intent().await?;
-            self.wifi_flight_mode_enabled = intent.radio_policy.flight_mode;
-            self.wifi_preference_enabled =
-                intent.radio_policy.wifi_enabled_pref;
+            self.wifi_flight_mode_enabled
+                .store(intent.radio_policy.flight_mode, Relaxed);
+            self.wifi_preference_enabled
+                .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
             self.spawn_supervisor();
-            self.loaded = true;
-            self.scan_cache.clear();
+            self.loaded.store(true, Relaxed);
+            self.scan_cache.lock().await.clear();
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 nmcli = %self.config.nmcli_path,
@@ -3762,11 +3845,11 @@ impl Plugin for NetworkNmPlugin {
                 curl_timeout_ms = self.config.curl_timeout_ms,
                 scan_cache_ttl_ms = self.config.scan_cache_ttl_ms,
                 secret_encryption = self.config.secret_key.is_some(),
-                secret_encryption_required = self.config.require_encrypted_secrets,
-                wifi_flight_mode_enabled = self.wifi_flight_mode_enabled,
+                secret_encryption_required = self.require_encrypted_secrets.load(Relaxed),
+                wifi_flight_mode_enabled = self.wifi_flight_mode_enabled.load(Relaxed),
                 "network plugin loaded"
             );
-            if self.config.require_encrypted_secrets
+            if self.require_encrypted_secrets.load(Relaxed)
                 && self.config.secret_key.is_none()
             {
                 tracing::error!(
@@ -3832,24 +3915,17 @@ impl Plugin for NetworkNmPlugin {
         async move {
             self.stop_supervisor().await;
             self.stop_capabilities_watcher().await;
-            self.loaded = false;
-            self.state_dir = None;
-            self.config = PluginConfig::defaults();
-            self.scan_cache.clear();
-            self.wifi_flight_mode_enabled = false;
-            self.wifi_preference_enabled = true;
-            self.dispatcher = Arc::new(DirectExec::new());
-            self.auto_dispatcher = None;
-            self.iw_exec = None;
-            self.rfkill_exec = None;
-            self.curl_exec = None;
+            // Replace the shared inner wholesale — drops every
+            // dispatcher Arc, clears all interior-mutable state,
+            // and resets the config to defaults in one step.
+            self.inner = Arc::new(NmInner::defaults_for_new());
             Ok(())
         }
     }
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
-            if self.loaded {
+            if self.loaded.load(Relaxed) {
                 HealthReport::healthy()
             } else {
                 HealthReport::unhealthy("network plugin not loaded")
@@ -3864,7 +3940,7 @@ impl Respondent for NetworkNmPlugin {
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
-            if !self.loaded {
+            if !self.loaded.load(Relaxed) {
                 return Err(PluginError::Permanent(
                     "network plugin not loaded".to_string(),
                 ));
@@ -3874,7 +3950,7 @@ impl Respondent for NetworkNmPlugin {
                     "request deadline already expired".to_string(),
                 ));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, Relaxed);
 
             match req.request_type.as_str() {
                 REQUEST_NETWORK_STATUS => {
@@ -3902,7 +3978,8 @@ impl Respondent for NetworkNmPlugin {
                         Ok(v) => (Some(v), Option::<String>::None),
                         Err(e) => (None, Some(format!("{e}"))),
                     };
-                    let configured_flight_mode = self.wifi_flight_mode_enabled;
+                    let configured_flight_mode =
+                        self.wifi_flight_mode_enabled.load(Relaxed);
                     let wifi_radio_view = self.compose_wifi_radio_view();
                     let radio_blocked =
                         radio.as_ref().and_then(radio_block_reason).is_some();
@@ -4002,12 +4079,16 @@ impl Respondent for NetworkNmPlugin {
                         match scan_result {
                             Ok((r, c, hit)) => (r, c, hit, false, None),
                             Err(e) => {
-                                if let Some(cached) =
-                                    self.scan_cache.get(&scan_cache_key)
-                                {
+                                let cached_clone = self
+                                    .scan_cache
+                                    .lock()
+                                    .await
+                                    .get(&scan_cache_key)
+                                    .cloned();
+                                if let Some(cached) = cached_clone {
                                     (
-                                        cached.available.clone(),
-                                        cached.candidates.clone(),
+                                        cached.available,
+                                        cached.candidates,
                                         true,
                                         true,
                                         Some(format!("{e}")),
@@ -4063,7 +4144,7 @@ impl Respondent for NetworkNmPlugin {
                 REQUEST_NETWORK_INTENT_SET => {
                     let body =
                         Self::parse_request_json::<IntentSetRequest>(req)?;
-                    self.scan_cache.clear();
+                    self.scan_cache.lock().await.clear();
                     self.save_intent(&body.intent).await?;
                     self.write_optional_secret(
                         self.sta_psk_path()?,
@@ -4126,7 +4207,7 @@ impl Respondent for NetworkNmPlugin {
                             ap_psk.as_deref(),
                         )
                         .await?;
-                    self.scan_cache.clear();
+                    self.scan_cache.lock().await.clear();
                     Self::response_json(
                         req,
                         self.with_observability(
@@ -4307,7 +4388,7 @@ impl Respondent for NetworkNmPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "flight_mode": {
-                                    "enabled": self.wifi_flight_mode_enabled,
+                                    "enabled": self.wifi_flight_mode_enabled.load(Relaxed),
                                     "radio": radio.as_ref().map(|r| json!({
                                         "source": r.source,
                                         "wifi_hw_enabled": r.wifi_hw_enabled,
@@ -4321,7 +4402,7 @@ impl Respondent for NetworkNmPlugin {
                 REQUEST_NETWORK_FLIGHT_MODE_SET => {
                     let body =
                         Self::parse_request_json::<FlightModeSetRequest>(req)?;
-                    self.wifi_flight_mode_enabled = body.enabled;
+                    self.wifi_flight_mode_enabled.store(body.enabled, Relaxed);
                     self.save_flight_mode_pref(body.enabled).await?;
                     match self.nm_set_wifi_radio(!body.enabled).await {
                         Ok(()) => {}
@@ -4343,7 +4424,7 @@ impl Respondent for NetworkNmPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "flight_mode": {
-                                    "enabled": self.wifi_flight_mode_enabled,
+                                    "enabled": self.wifi_flight_mode_enabled.load(Relaxed),
                                     "radio": radio.as_ref().map(|r| json!({
                                         "source": r.source,
                                         "wifi_hw_enabled": r.wifi_hw_enabled,
@@ -4363,7 +4444,7 @@ impl Respondent for NetworkNmPlugin {
                             json!({
                                 "v": 1,
                                 "status": "ok",
-                                "flight_mode": self.wifi_flight_mode_enabled,
+                                "flight_mode": self.wifi_flight_mode_enabled.load(Relaxed),
                                 "radios": {
                                     "wifi": view,
                                 },
@@ -4384,7 +4465,7 @@ impl Respondent for NetworkNmPlugin {
                         )));
                     }
                     let enabled = body.preference.is_enabled();
-                    self.wifi_preference_enabled = enabled;
+                    self.wifi_preference_enabled.store(enabled, Relaxed);
                     self.save_wifi_enabled_pref(enabled).await?;
                     // Attempt immediate application: only when
                     // not in flight-mode AND not hard-blocked
@@ -4393,7 +4474,7 @@ impl Respondent for NetworkNmPlugin {
                     let block = self.read_wifi_block_state();
                     let hard_blocked =
                         block.as_ref().map(|b| b.hard_blocked).unwrap_or(false);
-                    let applied = if self.wifi_flight_mode_enabled
+                    let applied = if self.wifi_flight_mode_enabled.load(Relaxed)
                         || hard_blocked
                     {
                         false
@@ -4422,7 +4503,7 @@ impl Respondent for NetworkNmPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "applied": applied,
-                                "flight_mode": self.wifi_flight_mode_enabled,
+                                "flight_mode": self.wifi_flight_mode_enabled.load(Relaxed),
                                 "radios": {
                                     "wifi": view,
                                 },
@@ -5457,7 +5538,7 @@ require_encrypted = true
     async fn load_intent_falls_back_to_lkg_shadow_on_primary_parse_error() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         let primary = p.intent_path().expect("intent path");
         let lkg = lkg_shadow_path(&primary);
 
@@ -5554,7 +5635,7 @@ version = 1
     async fn save_intent_and_captive_state_write_schema_envelopes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
 
         let intent = NetworkIntent::default();
         p.save_intent(&intent).await.expect("save intent");
@@ -5590,8 +5671,8 @@ version = 1
     async fn write_secret_encrypts_when_key_configured() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config.secret_key = Some(derive_secret_key("test-key"));
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config.secret_key = Some(derive_secret_key("test-key"));
         p.write_optional_secret(
             p.sta_psk_path().expect("path"),
             Some("SeCrEt9"),
@@ -5614,8 +5695,8 @@ version = 1
     async fn read_plaintext_secret_rejected_when_encryption_required() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config.require_encrypted_secrets = true;
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().require_encrypted_secrets.store(true, Relaxed);
         let path = p.sta_psk_path().expect("path");
         tokio::fs::write(&path, "plainsecret\n")
             .await
@@ -5646,10 +5727,11 @@ version = 1
     async fn request_flow_intent_set_and_get_roundtrip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.secret_key = Some(derive_secret_key("integration-key"));
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.secret_key =
+            Some(derive_secret_key("integration-key"));
 
         let set_req = req(
             REQUEST_NETWORK_INTENT_SET,
@@ -5741,10 +5823,11 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
 
         let apply_req = req(
             REQUEST_NETWORK_INTENT_APPLY,
@@ -5809,10 +5892,11 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
 
         let apply_req = req(
             REQUEST_NETWORK_INTENT_APPLY,
@@ -5874,10 +5958,11 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
 
         let set_req = req(
             REQUEST_NETWORK_FLIGHT_MODE_SET,
@@ -5981,11 +6066,12 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
-        p.wifi_flight_mode_enabled = true;
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().wifi_flight_mode_enabled.store(true, Relaxed);
 
         let status_req =
             req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1213);
@@ -6034,10 +6120,11 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
 
         let status_req =
             req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1004);
@@ -6081,11 +6168,12 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
-        p.config.scan_cache_ttl_ms = 60000;
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.scan_cache_ttl_ms = 60000;
 
         let scan_req_1 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1101);
         p.handle_request(&scan_req_1).await.expect("scan-1");
@@ -6126,12 +6214,13 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
-        p.config.scan_cache_ttl_ms = 60000;
-        p.scan_cache.insert(
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.scan_cache_ttl_ms = 60000;
+        p.scan_cache.lock().await.insert(
             "wlan0".to_string(),
             CachedScan {
                 available: vec![ScanRow {
@@ -6186,9 +6275,10 @@ exit 0\n",
         .expect("chmod");
 
         let mut p = NetworkNmPlugin::new();
-        p.config = PluginConfig::defaults();
-        p.config.nmcli_path = nmcli_path.to_string_lossy().to_string();
-        p.config.nmcli_timeout_ms = 50;
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.nmcli_timeout_ms = 50;
         let err = p
             .nmcli_output(&["general", "status"])
             .await
@@ -6200,10 +6290,11 @@ exit 0\n",
     async fn request_flow_security_status_and_harden_encrypts_plaintext() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.secret_key = Some(derive_secret_key("integration-hardening"));
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.secret_key =
+            Some(derive_secret_key("integration-hardening"));
 
         tokio::fs::write(p.sta_psk_path().expect("sta path"), "StaSecret1\n")
             .await
@@ -6257,10 +6348,10 @@ exit 0\n",
     async fn request_flow_security_harden_rejects_without_key() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut p = NetworkNmPlugin::new();
-        p.loaded = true;
-        p.state_dir = Some(dir.path().to_path_buf());
-        p.config = PluginConfig::defaults();
-        p.config.secret_key = None;
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.secret_key = None;
 
         let harden_req = req(
             REQUEST_NETWORK_SECURITY_HARDEN,
