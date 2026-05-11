@@ -216,6 +216,50 @@ mod tests {
     }
 
     #[test]
+    fn render_pcm_s16_mono() {
+        let ep = pcm_endpoint("evo", PcmCodec::PcmS16Le, 44_100, 1);
+        let out = render_audio_output_fragment(&ep).unwrap();
+        assert!(out.contains("format          \"44100:16:1\""));
+    }
+
+    #[test]
+    fn render_pcm_s24_5_1_surround() {
+        // 5.1 = 6 channels. The renderer passes the channel
+        // count through verbatim; MPD's format-line parser
+        // accepts any 1..=255 channel count.
+        let ep = pcm_endpoint("evo", PcmCodec::PcmS24Le, 96_000, 6);
+        let out = render_audio_output_fragment(&ep).unwrap();
+        assert!(out.contains("format          \"96000:24:6\""));
+    }
+
+    #[test]
+    fn render_pcm_s32_high_rate_352800() {
+        // DSD64-equivalent PCM sample rate. Some DACs accept
+        // PCM at this rate; the renderer must pass it through
+        // verbatim.
+        let ep = pcm_endpoint("evo", PcmCodec::PcmS32Le, 352_800, 2);
+        let out = render_audio_output_fragment(&ep).unwrap();
+        assert!(out.contains("format          \"352800:32:2\""));
+    }
+
+    #[test]
+    fn render_pcm_s32_ultra_high_rate_384000() {
+        // Studio / DXD rate. Common audiophile high end.
+        let ep = pcm_endpoint("evo", PcmCodec::PcmS32Le, 384_000, 2);
+        let out = render_audio_output_fragment(&ep).unwrap();
+        assert!(out.contains("format          \"384000:32:2\""));
+    }
+
+    #[test]
+    fn render_pcm_f32_at_non_44_1_rate() {
+        // PcmF32 maps to MPD's `f` marker; rate is independent
+        // of the bit-depth marker.
+        let ep = pcm_endpoint("evo", PcmCodec::PcmF32, 192_000, 2);
+        let out = render_audio_output_fragment(&ep).unwrap();
+        assert!(out.contains("format          \"192000:f:2\""));
+    }
+
+    #[test]
     fn render_alsa_loopback_path() {
         let ep = pcm_endpoint("hw:Loopback,1,0", PcmCodec::PcmS24Le, 48_000, 2);
         let out = render_audio_output_fragment(&ep).unwrap();
