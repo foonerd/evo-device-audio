@@ -1225,12 +1225,6 @@ impl NetworkNmPlugin {
             .expect("test setup: NmInner Arc must be uniquely owned")
     }
 
-    fn ensure_state_dir(&self) -> Result<&Path, PluginError> {
-        self.state_dir.as_deref().ok_or_else(|| {
-            PluginError::Permanent("state_dir not initialised".to_string())
-        })
-    }
-
     /// Spawn the PPAG capabilities-watch reactor. Subscribes to
     /// the framework's `LoadContext::capabilities_watch`
     /// channel; on every observed change calls
@@ -1359,27 +1353,24 @@ impl NetworkNmPlugin {
                         .await
                     })
                 }),
-                raise_critical_recovery: Arc::new(|| {
-                    Box::pin(async move {
-                        tracing::warn!(
-                            plugin = PLUGIN_NAME,
-                            "supervisor: critical-recovery action not yet \
-                         wired in this build; operator-side surface \
-                         (wire-op + reactive subject) reflects the \
-                         decision so a downstream orchestrator can react"
-                        );
+                raise_critical_recovery: {
+                    let inner = self.inner.clone();
+                    Arc::new(move || {
+                        let inner = inner.clone();
+                        Box::pin(async move {
+                            let _ = inner.autonomous_critical_recovery().await;
+                        })
                     })
-                }),
-                restore_sta: Arc::new(|| {
-                    Box::pin(async move {
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            "supervisor: STA-restore action not yet wired \
-                         in this build; operator-side surface reflects \
-                         the decision"
-                        );
+                },
+                restore_sta: {
+                    let inner = self.inner.clone();
+                    Arc::new(move || {
+                        let inner = inner.clone();
+                        Box::pin(async move {
+                            let _ = inner.autonomous_sta_restore().await;
+                        })
                     })
-                }),
+                },
             };
 
         let task = supervisor::spawn(config, probe, plugin_tag);
@@ -1403,6 +1394,18 @@ impl NetworkNmPlugin {
             Some(rx) => rx.borrow().clone(),
             None => supervisor::SupervisorView::default(),
         }
+    }
+}
+
+impl NmInner {
+    /// Guard around `state_dir`. Returns `PluginError::Permanent`
+    /// when the steward has not stamped a state directory onto
+    /// the plugin — only possible in test builds that bypass
+    /// `Plugin::load`.
+    fn ensure_state_dir(&self) -> Result<&Path, PluginError> {
+        self.state_dir.as_deref().ok_or_else(|| {
+            PluginError::Permanent("state_dir not initialised".to_string())
+        })
     }
 
     fn intent_path(&self) -> Result<PathBuf, PluginError> {
@@ -2137,7 +2140,7 @@ impl NetworkNmPlugin {
     }
 
     async fn harden_secret_storage(
-        &mut self,
+        &self,
         enforce_runtime: bool,
     ) -> Result<serde_json::Value, PluginError> {
         if self.config.secret_key.is_none() {
@@ -2535,7 +2538,7 @@ impl NetworkNmPlugin {
     }
 
     async fn wifi_scan_with_cache(
-        &mut self,
+        &self,
         ifname: Option<&str>,
         refresh: bool,
     ) -> Result<(Vec<ScanRow>, Vec<WifiStaCandidate>, bool), PluginError> {
@@ -3184,6 +3187,88 @@ impl NetworkNmPlugin {
             return Ok(false);
         };
         Ok(sysfs_ethernet_no_carrier(&iface))
+    }
+
+    /// Autonomous critical-recovery action invoked by the
+    /// supervisor when `Offline` persists past
+    /// `SupervisorConfig::critical_grace_ms`. Loads the persisted
+    /// intent, derives the hotspot connection name, and forces
+    /// an open AP up so an operator can recover the device
+    /// without physical access.
+    pub(crate) async fn autonomous_critical_recovery(
+        &self,
+    ) -> Result<(), PluginError> {
+        let intent = self.load_intent().await?;
+        let hs_name = Self::hotspot_connection_name(&intent);
+        let mut steps = Vec::new();
+        match self
+            .try_critical_open_hotspot_recovery(&intent, &hs_name, &mut steps)
+            .await
+        {
+            Ok(raised) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    hotspot = %hs_name,
+                    raised = raised,
+                    steps = ?steps,
+                    "supervisor: autonomous critical-recovery action complete"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    plugin = PLUGIN_NAME,
+                    hotspot = %hs_name,
+                    error = %e,
+                    steps = ?steps,
+                    "supervisor: autonomous critical-recovery action failed"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Autonomous STA-restore action invoked by the supervisor
+    /// when reachability returns to serviceable for longer than
+    /// `SupervisorConfig::restore_grace_ms` after a recovery
+    /// hotspot was raised. Reads the persisted intent + PSK
+    /// sidecars and replays the full apply pipeline so the
+    /// operator's declared shape comes back.
+    pub(crate) async fn autonomous_sta_restore(
+        &self,
+    ) -> Result<(), PluginError> {
+        let intent = self.load_intent().await?;
+        let sta_psk_path = self.sta_psk_path()?;
+        let ap_psk_path = self.ap_psk_path()?;
+        let sta_psk = self
+            .read_optional_secret(&sta_psk_path)
+            .await
+            .ok()
+            .flatten();
+        let ap_psk =
+            self.read_optional_secret(&ap_psk_path).await.ok().flatten();
+        match self
+            .apply_intent(&intent, sta_psk.as_deref(), ap_psk.as_deref())
+            .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    ok = report.ok,
+                    steps = ?report.steps,
+                    "supervisor: autonomous STA-restore action complete"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "supervisor: autonomous STA-restore action failed"
+                );
+                Err(e)
+            }
+        }
     }
 
     async fn try_critical_open_hotspot_recovery(
@@ -3997,7 +4082,7 @@ impl Respondent for NetworkNmPlugin {
                         || wifi_scan_error.is_some()
                         || radio_error.is_some()
                         || (radio_blocked && !radio_blocked_intentional);
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4059,7 +4144,7 @@ impl Respondent for NetworkNmPlugin {
                             refresh: false,
                         }
                     } else {
-                        Self::parse_request_json::<ScanRequest>(req)?
+                        NmInner::parse_request_json::<ScanRequest>(req)?
                     };
                     let ifname_owned = scan_req.ifname.unwrap_or_else(|| {
                         self.config.default_wifi_iface.clone()
@@ -4098,7 +4183,7 @@ impl Respondent for NetworkNmPlugin {
                                 }
                             }
                         };
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4127,7 +4212,7 @@ impl Respondent for NetworkNmPlugin {
                         .read_optional_secret(&self.ap_psk_path()?)
                         .await?
                         .is_some();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4143,7 +4228,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_INTENT_SET => {
                     let body =
-                        Self::parse_request_json::<IntentSetRequest>(req)?;
+                        NmInner::parse_request_json::<IntentSetRequest>(req)?;
                     self.scan_cache.lock().await.clear();
                     self.save_intent(&body.intent).await?;
                     self.write_optional_secret(
@@ -4168,7 +4253,7 @@ impl Respondent for NetworkNmPlugin {
                     } else {
                         None
                     };
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4189,7 +4274,7 @@ impl Respondent for NetworkNmPlugin {
                     let payload = if req.payload.is_empty() {
                         IntentApplyRequest { intent: None }
                     } else {
-                        Self::parse_request_json::<IntentApplyRequest>(req)?
+                        NmInner::parse_request_json::<IntentApplyRequest>(req)?
                     };
                     let intent = match payload.intent {
                         Some(v) => v,
@@ -4208,7 +4293,7 @@ impl Respondent for NetworkNmPlugin {
                         )
                         .await?;
                     self.scan_cache.lock().await.clear();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4228,7 +4313,9 @@ impl Respondent for NetworkNmPlugin {
                             url: None,
                         }
                     } else {
-                        Self::parse_request_json::<CaptiveStatusRequest>(req)?
+                        NmInner::parse_request_json::<CaptiveStatusRequest>(
+                            req,
+                        )?
                     };
                     let mut state = self.load_captive_state().await?;
                     let connectivity = self.nm_connectivity().await;
@@ -4244,7 +4331,7 @@ impl Respondent for NetworkNmPlugin {
                             }
                         }
                     }
-                    Self::response_json(req, self.with_observability(req, json!({
+                    NmInner::response_json(req, self.with_observability(req, json!({
                         "v": 1,
                         "status": "ok",
                         "connectivity": connectivity,
@@ -4265,7 +4352,7 @@ impl Respondent for NetworkNmPlugin {
                     let body = if req.payload.is_empty() {
                         CaptiveStartRequest { url: None }
                     } else {
-                        Self::parse_request_json::<CaptiveStartRequest>(req)?
+                        NmInner::parse_request_json::<CaptiveStartRequest>(req)?
                     };
                     let mut state =
                         self.captive_detect(body.url.as_deref()).await?;
@@ -4273,7 +4360,7 @@ impl Respondent for NetworkNmPlugin {
                         state.phase = CaptivePhase::AwaitingCredentials;
                     }
                     self.save_captive_state(&state).await?;
-                    Self::response_json(req, self.with_observability(req, json!({
+                    NmInner::response_json(req, self.with_observability(req, json!({
                         "v": 1,
                         "status": "ok",
                         "captive": state,
@@ -4287,11 +4374,12 @@ impl Respondent for NetworkNmPlugin {
                     })))
                 }
                 REQUEST_NETWORK_CAPTIVE_SUBMIT => {
-                    let body =
-                        Self::parse_request_json::<CaptiveSubmitRequest>(req)?;
+                    let body = NmInner::parse_request_json::<
+                        CaptiveSubmitRequest,
+                    >(req)?;
                     let state = self.captive_submit(&body).await?;
                     self.save_captive_state(&state).await?;
-                    Self::response_json(req, self.with_observability(req, json!({
+                    NmInner::response_json(req, self.with_observability(req, json!({
                         "v": 1,
                         "status": "ok",
                         "captive": state,
@@ -4310,7 +4398,9 @@ impl Respondent for NetworkNmPlugin {
                             success: Some(true),
                         }
                     } else {
-                        Self::parse_request_json::<CaptiveCompleteRequest>(req)?
+                        NmInner::parse_request_json::<CaptiveCompleteRequest>(
+                            req,
+                        )?
                     };
                     let mut state = self.load_captive_state().await?;
                     if body.success.unwrap_or(true) {
@@ -4328,7 +4418,7 @@ impl Respondent for NetworkNmPlugin {
                         }
                     }
                     self.save_captive_state(&state).await?;
-                    Self::response_json(req, self.with_observability(req, json!({
+                    NmInner::response_json(req, self.with_observability(req, json!({
                         "v": 1,
                         "status": "ok",
                         "captive": state,
@@ -4343,7 +4433,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_SECURITY_STATUS => {
                     let security = self.build_security_status().await?;
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4361,12 +4451,14 @@ impl Respondent for NetworkNmPlugin {
                             enforce_runtime: false,
                         }
                     } else {
-                        Self::parse_request_json::<SecurityHardenRequest>(req)?
+                        NmInner::parse_request_json::<SecurityHardenRequest>(
+                            req,
+                        )?
                     };
                     let harden = self
                         .harden_secret_storage(body.enforce_runtime)
                         .await?;
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4380,7 +4472,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_FLIGHT_MODE_GET => {
                     let radio = self.nm_radio_state().await.ok();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4400,8 +4492,9 @@ impl Respondent for NetworkNmPlugin {
                     )
                 }
                 REQUEST_NETWORK_FLIGHT_MODE_SET => {
-                    let body =
-                        Self::parse_request_json::<FlightModeSetRequest>(req)?;
+                    let body = NmInner::parse_request_json::<
+                        FlightModeSetRequest,
+                    >(req)?;
                     self.wifi_flight_mode_enabled.store(body.enabled, Relaxed);
                     self.save_flight_mode_pref(body.enabled).await?;
                     match self.nm_set_wifi_radio(!body.enabled).await {
@@ -4416,7 +4509,7 @@ impl Respondent for NetworkNmPlugin {
                         }
                     }
                     let radio = self.nm_radio_state().await.ok();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4437,7 +4530,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_RADIO_STATUS => {
                     let view = self.compose_wifi_radio_view();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4454,7 +4547,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_RADIO_SET => {
                     let body =
-                        Self::parse_request_json::<RadioSetRequest>(req)?;
+                        NmInner::parse_request_json::<RadioSetRequest>(req)?;
                     if body.radio != "wifi" {
                         return Err(PluginError::Permanent(format!(
                             "network.nm.radio.set: unknown radio family \
@@ -4495,7 +4588,7 @@ impl Respondent for NetworkNmPlugin {
                     // Re-read after the apply attempt so the
                     // response carries the post-state.
                     let view = self.compose_wifi_radio_view();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
@@ -4513,7 +4606,7 @@ impl Respondent for NetworkNmPlugin {
                 }
                 REQUEST_NETWORK_SUPERVISOR_STATUS => {
                     let view = self.latest_supervisor_view();
-                    Self::response_json(
+                    NmInner::response_json(
                         req,
                         self.with_observability(
                             req,
