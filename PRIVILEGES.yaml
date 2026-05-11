@@ -40,6 +40,18 @@ capability_intent:
     need: install polkit drop-ins under /etc/polkit-1/rules.d/ granting the steward identity authority for NetworkManager (and any other action sets required by bundled plugins).
     access_path: polkit/policy
     failure_mode: bundled plugins requiring polkit grants admit but degrade at runtime; structured event names the missing action set.
+  - id: bootstrap_mpd_sudoers
+    need: install /etc/sudoers.d/evo-mpd-restart granting the steward service user the exact NOPASSWD command `/usr/bin/systemctl restart mpd` (only). The bootstrap script substitutes the resolved service user into the template at dist/sudoers.d/evo-mpd-restart.in, validates via visudo -c, and installs at mode 0440 root:root. Required for the playback.mpd plugin's fragment-writer worker to recycle MPD after every audio_output rewrite without interactive auth.
+    access_path: filesystem/system
+    failure_mode: bundled playback.mpd plugin admits; restart leg resolves to NoOp (sudo refusal would otherwise pollute the journal with "Interactive authentication required"); fragment file is rewritten on disk on every route change but MPD does not pick it up until next manual restart.
+  - id: bootstrap_mpd_fragment_path
+    need: seed /etc/evo/mpd.conf owned by the steward service user (mode 0644) so the playback.mpd plugin's fragment-writer worker can rewrite the audio_output block on every route change without escalation.
+    access_path: filesystem/system
+    failure_mode: bundled playback.mpd plugin admits; fragment-writer worker publishes Failed status on first write attempt; previous fragment file (if any) is preserved; playback continues on prior MPD configuration.
+  - id: bootstrap_evo_service_drop_ins
+    need: install systemd drop-ins under /etc/systemd/system/evo.service.d/ that (a) widen StateDirectoryMode to 0755 so external services like MPD can traverse /var/lib/evo, and (b) relax the framework's reference hardening to permit playback.mpd's fragment write + sudo escalation (ReadWritePaths=/etc/evo, NoNewPrivileges=no, Environment=EVO_SYSTEMCTL).
+    access_path: filesystem/system
+    failure_mode: distribution install fails; structured installer error; framework's reference hardening posture remains in effect (playback.mpd's privileged legs resolve to NoOp).
 
 required_binaries:
   - name: nmcli
@@ -70,24 +82,42 @@ verification:
 host_provisioning:
   debian:
     systemd:
-      # User= deferred. Installer resolves at install time per the
-      # appliance-class identity policy (operator's first user;
-      # `getent passwd 1000`). Vendor distributions overriding may
+      # User= resolved at install time per the appliance-class
+      # identity policy (operator's first user; `getent passwd`
+      # picks uid >= 1000). Vendor distributions overriding may
       # pin a literal name here.
       SupplementaryGroups: [audio, netdev]
       CapabilityBoundingSet: []
       AmbientCapabilities: []
       ProtectSystem: strict
       ProtectHome: "yes"
+      # /etc/evo writable so the playback.mpd plugin's fragment-
+      # writer worker can rewrite /etc/evo/mpd.conf on every
+      # route change without sudo. The bootstrap script chowns
+      # the fragment file to the service user at install time.
+      # /var/lib/evo + /run/evo are the framework defaults.
       ReadWritePaths:
         - /var/lib/evo
         - /run/evo
-      ReadOnlyPaths:
         - /etc/evo
-      NoNewPrivileges: true
+      ReadOnlyPaths: []
+      # NoNewPrivileges relaxed distribution-wide so the
+      # playback.mpd plugin can dispatch `sudo -n systemctl
+      # restart mpd` against the narrow NOPASSWD drop-in
+      # installed at /etc/sudoers.d/evo-mpd-restart. Sudo is
+      # setuid; NoNewPrivileges=true would block the escalation.
+      # The relaxation is intentional + scoped to a single
+      # NOPASSWD command (no general escalation surface).
+      NoNewPrivileges: false
     polkit:
       policy_file: 50-evo-org.evoframework.distribution.audio.rules
       required_actions:
         - "org.freedesktop.NetworkManager.*"
     capabilities: []
-    sudoers: []
+    # Narrow NOPASSWD entries the bootstrap script installs as
+    # individual drop-ins under /etc/sudoers.d/. Each entry is
+    # one binary + one verb + one unit (no wildcards, no ALL).
+    # The bootstrap script substitutes <user> with the resolved
+    # service user at install time.
+    sudoers:
+      - "<user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart mpd"

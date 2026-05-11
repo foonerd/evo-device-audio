@@ -17,17 +17,41 @@ target host.
   playback warden announces on every song change. Vendor
   distributions include this fragment in their full
   catalogue alongside any other racks they admit.
-- `mpd/evo-fragment.conf` — MPD `audio_output` fragment
-  declaring the device the steward's playback warden
-  drives. Static form for verification; the
-  substrate-aware shape lands as part of the playback
-  warden's fragment-writer arc.
+- `mpd/evo-fragment.conf` — static reference fragment used
+  for verification before the substrate-aware shape lands.
+  Once the playback.mpd plugin is admitted, the
+  fragment-writer worker overwrites `/etc/evo/mpd.conf` at
+  every route-change from the framework-negotiated
+  WriteEndpoint; this static file then serves only as a
+  documentation reference.
 - `systemd/evo.service.d/state-dir-mode.conf` — drop-in
   override widening `StateDirectoryMode` to `0755` so MPD
   can traverse `/var/lib/evo/` to reach the music tree.
   Required only when the music library lives under
   `/var/lib/evo/music/`; vendor distributions that route
   the music tree elsewhere can omit it.
+- `systemd/evo.service.d/mpd-restart-privileges.conf` —
+  drop-in that relaxes the framework's reference hardening
+  to permit the playback.mpd plugin's fragment-write +
+  sudo-systemctl-restart legs. Adds
+  `ReadWritePaths=/etc/evo`, `NoNewPrivileges=no`, and
+  `Environment=EVO_SYSTEMCTL=/usr/bin/systemctl`. Vendor
+  distributions that prefer to run the steward as root, or
+  that park the playback.mpd restart leg, can omit this
+  drop-in.
+- `sudoers.d/evo-mpd-restart.in` — narrow NOPASSWD sudoers
+  template granting the steward service user the exact
+  command `/usr/bin/systemctl restart mpd` (only). The
+  bootstrap script substitutes `@EVO_SERVICE_USER@` and
+  installs at `/etc/sudoers.d/evo-mpd-restart` after
+  validating syntax via `visudo -c`.
+- `scripts/bootstrap.sh` — idempotent installer that lays
+  down all of the above artefacts, resolves the appliance-
+  class service user, chowns `/etc/evo/mpd.conf` to that
+  user, and runs a verification preflight at the end. The
+  framework's admission-time Privilege Preflight Admission
+  Gate consumes the resulting state; the bootstrap is the
+  dual that creates it.
 
 ## Bring-up procedure (reference target)
 
@@ -42,22 +66,44 @@ The steps captured during the release verification:
 3. Edit `/etc/mpd.conf`: set `music_directory` to
    `/var/lib/evo/music`; append
    `include_optional /etc/evo/mpd.conf`.
-4. Drop `dist/mpd/evo-fragment.conf` to `/etc/evo/mpd.conf`
-   and tune the `device` line for the target's DAC.
-5. Drop `dist/systemd/evo.service.d/state-dir-mode.conf`
-   to `/etc/systemd/system/evo.service.d/` and run
-   `systemctl daemon-reload`.
-6. Compose the distribution's catalogue from
+4. Compose the distribution's catalogue from
    `dist/catalogue/audio-rack.toml` plus any other racks
    the distribution admits, drop the result at
    `/opt/evo/catalogue/default.toml`.
-7. Cross-build + deploy the steward binary
+5. Run the bootstrap script as root. It resolves the
+   appliance-class service user, installs the systemd
+   drop-ins, installs the sudoers drop-in (validated via
+   `visudo -c`), seeds `/etc/evo/mpd.conf` owned by the
+   service user, and runs a preflight that verifies the
+   install:
+
+   ```bash
+   sudo dist/scripts/bootstrap.sh
+   ```
+
+   Or, with an explicit service user:
+
+   ```bash
+   sudo dist/scripts/bootstrap.sh --service-user evo
+   ```
+
+   Toggle individual steps with
+   `EVO_INSTALL_MPD_SUDOERS=0`,
+   `EVO_INSTALL_SYSTEMD_DROP_INS=0`,
+   `EVO_INSTALL_MPD_FRAGMENT=0`.
+6. Cross-build + deploy the steward binary
    (`scripts/cross-build.sh aarch64-unknown-linux-gnu
    --release --features alsa-substrate -p
    evo-device-audio-distribution` then `scp` to
    `/opt/evo/bin/evo`).
-8. Restart `evo.service`; verify both plugins admit
-   (`journalctl -u evo.service | grep "plugin admitted"`).
+7. Restart `evo.service`; verify both plugins admit
+   (`journalctl -u evo.service | grep "plugin admitted"`)
+   and that the playback.mpd plugin resolved its restart
+   strategy (`journalctl -u evo.service | grep "MPD
+   restart strategy resolved"` — log line names the
+   strategy: `direct` for root, `sudo` for the service
+   user, or `no_op_disabled` when the framework's
+   preflight refused).
 
 ## Verification
 
