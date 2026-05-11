@@ -1,0 +1,20 @@
+# Cargo configuration for the evo-device-audio workspace.
+#
+# Mirror of the evo-core-eng cross-compile shape: when a developer
+# runs `cargo build --target aarch64-unknown-linux-gnu` (the reference target
+# reference target), cargo picks up the matching cross-gcc linker
+# the host has installed via the documented apt packages
+# (`gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabihf`). Without
+# this file, rust-lld defaults to the host x86_64 linker and the
+# build fails at link time with `is incompatible with elf64-x86-64`.
+#
+# The blocks are no-ops for builds that target the host triple.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
