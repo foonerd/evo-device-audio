@@ -196,7 +196,7 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
             // already propagated it through the routing
             // runtime). Re-publishing on top of that would emit
             // a redundant route-change.
-            let existing = match ctx.audio_topology_store.list().await {
+            let existing = match ctx.audio.topology_store.list().await {
                 Ok(rows) => rows.len(),
                 Err(e) => {
                     tracing::warn!(
@@ -253,7 +253,8 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 delivery = "org.evoframework.delivery.alsa",
                 "post-admission: publishing default AAMPP topology"
             );
-            ctx.audio_topology_store
+            ctx.audio
+                .topology_store
                 .publish(topology, "evo-device-audio:post-admission")
                 .await
                 .context("publishing default AAMPP topology")?;
