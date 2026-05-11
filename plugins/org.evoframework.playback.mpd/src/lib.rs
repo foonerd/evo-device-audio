@@ -181,14 +181,27 @@ const COURSE_CORRECT_VERBS: &[&str] = &[
 /// dispatch path. Mirrors
 /// `manifest.toml`'s `[capabilities.respondent].request_types`
 /// entries; admission would refuse a mismatch between the
-/// runtime's declared list and the manifest's. F2 ships
-/// `play_now` only; F4 grows the surface to the full
-/// state-transition set (`stop` / `pause` / `resume` /
-/// `seek` / `next` / `previous`) alongside the warden
-/// surface refresh, at which point the source-verb and
-/// course_correct dispatchers exercise overlapping verb
-/// names through their respective paths.
-const SOURCE_REQUEST_TYPES: &[&str] = &["play_now"];
+/// runtime's declared list and the manifest's. Every verb
+/// drives the active custody's supervisor through its
+/// existing `PlaybackCommand` surface, so the warden's
+/// `course_correct` path and the source-verb dispatch path
+/// share the same execution machinery.
+const SOURCE_REQUEST_TYPES: &[&str] = &[
+    "play_now",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+];
+
+/// Wire-protocol payload version every source-verb request
+/// and response carries. Independent of plugin SemVer; bumped
+/// when the wire shape changes incompatibly.
+const PAYLOAD_VERSION: u32 = 1;
 
 /// URI scheme this source plugin owns. Items addressed
 /// via `mpd-path:...` URIs are loaded into the local MPD
@@ -1219,12 +1232,37 @@ impl Respondent for MpdPlaybackPlugin {
 
             self.requests_handled += 1;
 
-            // F2 ships play_now only; the broader source-verb
-            // surface (stop / pause / resume / seek / next /
-            // previous) lands as part of the F4 warden-surface
-            // refresh.
             match req.request_type.as_str() {
                 "play_now" => self.handle_play_now(req).await,
+                "play" => {
+                    self.handle_simple_command(req, PlaybackCommand::Play).await
+                }
+                "pause" => {
+                    self.handle_simple_command(
+                        req,
+                        PlaybackCommand::Pause(true),
+                    )
+                    .await
+                }
+                "resume" => {
+                    self.handle_simple_command(
+                        req,
+                        PlaybackCommand::Pause(false),
+                    )
+                    .await
+                }
+                "stop" => {
+                    self.handle_simple_command(req, PlaybackCommand::Stop).await
+                }
+                "next" => {
+                    self.handle_simple_command(req, PlaybackCommand::Next).await
+                }
+                "previous" => {
+                    self.handle_simple_command(req, PlaybackCommand::Previous)
+                        .await
+                }
+                "seek" => self.handle_seek(req).await,
+                "set_volume" => self.handle_set_volume(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      this is a manifest/runtime drift bug"
@@ -1244,66 +1282,216 @@ impl MpdPlaybackPlugin {
         &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
-        let payload: PlayNowPayload = serde_json::from_slice(&req.payload)
-            .map_err(|e| {
-                PluginError::Permanent(format!(
-                    "play_now payload is not valid JSON \
-                     {{\"uri\": \"...\"}}: {e}"
-                ))
-            })?;
-
+        let payload: PlayNowPayload = parse_versioned_payload(req, "play_now")?;
         let path = parse_mpd_path_uri(&payload.uri)?;
-
-        // Pick the active custody. custody_exclusive = true
-        // (manifest) means at most one custody exists at any
-        // time; the framework's source-verb dispatcher
-        // acquires custody before invoking handle_request so
-        // the slot is populated. Zero custodies indicates a
-        // race or framework misconfiguration; refuse loudly
-        // rather than silently no-op. SupervisorHandle is
-        // not Clone (it owns the shutdown signal half), so
-        // dispatch through a reference rather than copying
-        // the handle.
-        let supervisor = self
-            .custodies
-            .values()
-            .next()
-            .map(|t| &t.supervisor)
-            .ok_or_else(|| {
-                PluginError::Permanent(
-                    "play_now received but no active custody on the \
-                     warden — the framework's source-verb dispatcher \
-                     should have acquired custody before invoking \
-                     handle_request"
-                        .to_string(),
-                )
-            })?;
-
+        let supervisor = self.active_supervisor("play_now")?;
         supervisor
             .command(PlaybackCommand::LoadAndPlay(path.to_string()))
             .await
             .map_err(playback_error_to_plugin_error)?;
+        encode_play_now_ok(req, payload.uri)
+    }
 
-        let body = serde_json::to_vec(&PlayNowResponse {
-            status: "ok",
-            uri: payload.uri,
-        })
-        .map_err(|e| {
-            PluginError::Permanent(format!(
-                "play_now response JSON encode failed: {e}"
-            ))
-        })?;
-        Ok(Response::for_request(req, body))
+    /// Handle a source-verb request whose payload is the
+    /// bare envelope (`{ "v": 1 }`) and whose effect is one
+    /// fixed [`PlaybackCommand`]. Covers `play` / `pause` /
+    /// `resume` / `stop` / `next` / `previous`.
+    async fn handle_simple_command(
+        &self,
+        req: &Request,
+        cmd: PlaybackCommand,
+    ) -> Result<Response, PluginError> {
+        let _: EmptyPayload =
+            parse_versioned_payload(req, req.request_type.as_str())?;
+        let supervisor = self.active_supervisor(req.request_type.as_str())?;
+        supervisor
+            .command(cmd)
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
+    /// Handle a `seek` source-verb request: extract the
+    /// target millisecond position and issue a
+    /// [`PlaybackCommand::Seek`].
+    async fn handle_seek(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SeekPayload = parse_versioned_payload(req, "seek")?;
+        let supervisor = self.active_supervisor("seek")?;
+        supervisor
+            .command(PlaybackCommand::Seek(Duration::from_millis(
+                payload.position_ms,
+            )))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
+    /// Handle a `set_volume` source-verb request: clamp /
+    /// validate the volume byte and issue a
+    /// [`PlaybackCommand::SetVolume`].
+    async fn handle_set_volume(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetVolumePayload =
+            parse_versioned_payload(req, "set_volume")?;
+        let supervisor = self.active_supervisor("set_volume")?;
+        supervisor
+            .command(PlaybackCommand::SetVolume(payload.volume))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
+    /// Pick the active custody's supervisor.
+    /// `custody_exclusive = true` in the manifest means at
+    /// most one custody exists at any time; the framework's
+    /// source-verb dispatcher acquires custody before
+    /// invoking `handle_request` so the slot is populated.
+    /// Zero custodies indicates a race or framework
+    /// misconfiguration; refuse loudly rather than silently
+    /// no-op. `SupervisorHandle` is not `Clone` (it owns the
+    /// shutdown signal half), so dispatch through a
+    /// reference rather than copying the handle.
+    fn active_supervisor(
+        &self,
+        verb: &str,
+    ) -> Result<&SupervisorHandle, PluginError> {
+        self.custodies
+            .values()
+            .next()
+            .map(|t| &t.supervisor)
+            .ok_or_else(|| {
+                PluginError::Permanent(format!(
+                    "{verb:?} received but no active custody on the warden — \
+                     the framework's source-verb dispatcher should have \
+                     acquired custody before invoking handle_request"
+                ))
+            })
     }
 }
 
+/// Parse the request's payload as a JSON envelope of type `T`
+/// and validate the `v` field equals [`PAYLOAD_VERSION`].
+/// Every source-verb payload struct embeds `v: u32` so the
+/// version check is uniform across the surface.
+fn parse_versioned_payload<T>(
+    req: &Request,
+    verb: &str,
+) -> Result<T, PluginError>
+where
+    T: serde::de::DeserializeOwned + HasPayloadVersion,
+{
+    let parsed: T = serde_json::from_slice(&req.payload).map_err(|e| {
+        PluginError::Permanent(format!(
+            "{verb:?} payload is not valid JSON for the expected shape: {e}"
+        ))
+    })?;
+    if parsed.payload_version() != PAYLOAD_VERSION {
+        return Err(PluginError::Permanent(format!(
+            "{verb:?} payload version {} unsupported; expected {}",
+            parsed.payload_version(),
+            PAYLOAD_VERSION
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Common shape across every source-verb payload struct: a
+/// `v: u32` envelope field. Implemented mechanically.
+trait HasPayloadVersion {
+    fn payload_version(&self) -> u32;
+}
+
+fn encode_simple_ok(req: &Request) -> Result<Response, PluginError> {
+    let body = serde_json::to_vec(&SimpleResponse {
+        v: PAYLOAD_VERSION,
+        status: "ok",
+    })
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "{verb} response JSON encode failed: {e}",
+            verb = req.request_type
+        ))
+    })?;
+    Ok(Response::for_request(req, body))
+}
+
+fn encode_play_now_ok(
+    req: &Request,
+    uri: String,
+) -> Result<Response, PluginError> {
+    let body = serde_json::to_vec(&PlayNowResponse {
+        v: PAYLOAD_VERSION,
+        status: "ok",
+        uri,
+    })
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "play_now response JSON encode failed: {e}"
+        ))
+    })?;
+    Ok(Response::for_request(req, body))
+}
+
 /// Wire shape of the `play_now` request payload. Carries
-/// the full URI; the plugin validates the scheme prefix
-/// matches one it owns and strips the prefix to form an
-/// MPD library-relative path.
+/// the envelope `v` and the full URI; the plugin validates
+/// the scheme prefix matches one it owns and strips the
+/// prefix to form an MPD library-relative path.
 #[derive(Debug, serde::Deserialize)]
 struct PlayNowPayload {
+    v: u32,
     uri: String,
+}
+
+impl HasPayloadVersion for PlayNowPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Wire shape of a `seek` request payload.
+#[derive(Debug, serde::Deserialize)]
+struct SeekPayload {
+    v: u32,
+    position_ms: u64,
+}
+
+impl HasPayloadVersion for SeekPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Wire shape of a `set_volume` request payload.
+#[derive(Debug, serde::Deserialize)]
+struct SetVolumePayload {
+    v: u32,
+    volume: u8,
+}
+
+impl HasPayloadVersion for SetVolumePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Wire shape of a bare-envelope request payload (`{ "v":
+/// 1 }`). Used by every source verb whose action carries no
+/// parameters: `play` / `pause` / `resume` / `stop` /
+/// `next` / `previous`.
+#[derive(Debug, serde::Deserialize)]
+struct EmptyPayload {
+    v: u32,
+}
+
+impl HasPayloadVersion for EmptyPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
 }
 
 /// Wire shape of the `play_now` success response. Echoes
@@ -1312,8 +1500,20 @@ struct PlayNowPayload {
 /// check; useful for dispatch-tracing diagnostics).
 #[derive(Debug, serde::Serialize)]
 struct PlayNowResponse {
+    v: u32,
     status: &'static str,
     uri: String,
+}
+
+/// Wire shape of the bare-envelope success response every
+/// non-`play_now` source verb returns. Caller correlates
+/// against the request via the framework's correlation_id;
+/// the response body confirms the verb executed without
+/// echoing any verb-specific data.
+#[derive(Debug, serde::Serialize)]
+struct SimpleResponse {
+    v: u32,
+    status: &'static str,
 }
 
 /// Strip the `mpd-path:` URI scheme prefix and return the
@@ -1450,6 +1650,43 @@ mod tests {
                  COURSE_CORRECT_VERBS {:?}",
                 verb,
                 COURSE_CORRECT_VERBS
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_request_types_match_runtime() {
+        let m = manifest();
+        let respondent = m
+            .capabilities
+            .respondent
+            .as_ref()
+            .expect("manifest must declare [capabilities.respondent]");
+        let manifest_types: Vec<&str> = respondent
+            .request_types
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // Round-trip: every const-table type appears in the
+        // manifest, and every manifest type appears in the
+        // const table. Drift caught at unit-test time
+        // rather than at admission.
+        for declared in SOURCE_REQUEST_TYPES {
+            assert!(
+                manifest_types.contains(declared),
+                "SOURCE_REQUEST_TYPES entry {:?} missing from \
+                 manifest types {:?}",
+                declared,
+                manifest_types
+            );
+        }
+        for t in &manifest_types {
+            assert!(
+                SOURCE_REQUEST_TYPES.contains(t),
+                "manifest type {:?} missing from \
+                 SOURCE_REQUEST_TYPES {:?}",
+                t,
+                SOURCE_REQUEST_TYPES
             );
         }
     }
@@ -2539,6 +2776,265 @@ mod tests {
         assert_eq!(subjects.count(), 0);
         assert_eq!(relations.count(), 0);
 
+        p.release_custody(handle).await.unwrap();
+    }
+
+    // ===== F4 source-verb surface tests =====
+
+    use crate::playback_supervisor::test_mock::ConnBehaviour as F4Conn;
+    use serde_json::{json, Value};
+
+    /// Build a respondent request for the supplied verb +
+    /// JSON payload. Mirrors how the framework's source-verb
+    /// dispatcher constructs the wire envelope.
+    fn source_request(verb: &str, payload: Value) -> Request {
+        Request {
+            request_type: verb.to_string(),
+            payload: payload.to_string().into_bytes(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+        }
+    }
+
+    /// Spawn a mock-MPD-backed plugin with one supervisor
+    /// custody equipped. Used by every F4 source-verb test
+    /// that needs to dispatch through the active custody.
+    async fn loaded_plugin_with_active_custody(
+        behaviours: Vec<F4Conn>,
+    ) -> (
+        MpdPlaybackPlugin,
+        CustodyHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (mut p, mock) = loaded_plugin_with_mock(behaviours).await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 1)).await.unwrap();
+        (p, handle, mock)
+    }
+
+    #[tokio::test]
+    async fn play_now_dispatches_load_and_play() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request(
+            "play_now",
+            json!({ "v": 1, "uri": "mpd-path:Music/A/01.flac" }),
+        );
+        let resp = p.handle_request(&req).await.unwrap();
+        let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["uri"], "mpd-path:Music/A/01.flac");
+
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn play_now_refuses_bad_payload_version() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req =
+            source_request("play_now", json!({ "v": 99, "uri": "mpd-path:x" }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("payload version 99 unsupported"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn play_now_refuses_wrong_scheme() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request(
+            "play_now",
+            json!({ "v": 1, "uri": "file:/Music/x.flac" }),
+        );
+        let err = p.handle_request(&req).await.unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn play_refuses_when_no_active_custody() {
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+        // Intentionally skip take_custody so the source-verb
+        // dispatcher has nothing to route into.
+
+        let req = source_request("play", json!({ "v": 1 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("no active custody"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    /// Verify every bare-envelope verb round-trips: parses
+    /// the payload, dispatches through the supervisor,
+    /// returns the typed `SimpleResponse`. Exercises the
+    /// shared `handle_simple_command` path against each of
+    /// the six verbs.
+    #[tokio::test]
+    async fn bare_envelope_verbs_dispatch_and_respond() {
+        for verb in ["play", "pause", "resume", "stop", "next", "previous"] {
+            let (mut p, handle, _mock) =
+                loaded_plugin_with_active_custody(vec![
+                    F4Conn::Standard,
+                    F4Conn::HoldAfterWelcome,
+                ])
+                .await;
+
+            let req = source_request(verb, json!({ "v": 1 }));
+            let resp = p.handle_request(&req).await.unwrap_or_else(|e| {
+                panic!("verb {verb} failed unexpectedly: {e:?}")
+            });
+            let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+            assert_eq!(body["status"], "ok", "verb {verb}");
+            assert_eq!(body["v"], 1, "verb {verb}");
+
+            p.release_custody(handle).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_envelope_verbs_refuse_bad_version() {
+        for verb in ["play", "pause", "resume", "stop", "next", "previous"] {
+            let (mut p, handle, _mock) =
+                loaded_plugin_with_active_custody(vec![
+                    F4Conn::Standard,
+                    F4Conn::HoldAfterWelcome,
+                ])
+                .await;
+
+            let req = source_request(verb, json!({ "v": 99 }));
+            let err = p.handle_request(&req).await.unwrap_err();
+            assert!(
+                matches!(err, PluginError::Permanent(_)),
+                "verb {verb} expected Permanent, got {err:?}"
+            );
+            p.release_custody(handle).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn seek_dispatches_with_position_ms() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req =
+            source_request("seek", json!({ "v": 1, "position_ms": 1250 }));
+        let resp = p.handle_request(&req).await.unwrap();
+        let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(body["status"], "ok");
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seek_refuses_missing_position() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("seek", json!({ "v": 1 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_volume_dispatches_with_clamped_byte() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("set_volume", json!({ "v": 1, "volume": 50 }));
+        let resp = p.handle_request(&req).await.unwrap();
+        let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(body["status"], "ok");
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_volume_refuses_out_of_range() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        // u8 max is 255; 256 doesn't fit -> serde
+        // deserialization error -> Permanent.
+        let req =
+            source_request("set_volume", json!({ "v": 1, "volume": 256 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_verb_refused() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("jitter", json!({ "v": 1 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("unknown request type"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_handled_counter_advances_per_verb() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        assert_eq!(p.requests_handled(), 0);
+        let req = source_request("play", json!({ "v": 1 }));
+        p.handle_request(&req).await.unwrap();
+        assert_eq!(p.requests_handled(), 1);
+        let req = source_request("pause", json!({ "v": 1 }));
+        p.handle_request(&req).await.unwrap();
+        assert_eq!(p.requests_handled(), 2);
         p.release_custody(handle).await.unwrap();
     }
 }
