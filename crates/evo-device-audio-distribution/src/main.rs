@@ -82,8 +82,8 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .context("admitting composition.alsa")?;
 
             // 2. delivery.alsa: singleton respondent on
-            //    audio.delivery shape 2. Owns the AAMPP
-            //    modular ALSA pipeline (pcm.evo definition in
+            //    audio.delivery shape 2. Owns the modular ALSA
+            //    pipeline (pcm.evo definition in
             //    /etc/asound.conf); declares the WriteEndpoint
             //    upstream plugins write into; exposes
             //    operator-facing hardware probing verbs
@@ -127,7 +127,7 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    volume_normalization). Persists state
             //    across restarts; emits
             //    Happening::PluginEvent on every change so
-            //    delivery.alsa can re-render the AAMPP
+            //    delivery.alsa can re-render the modular ALSA
             //    pipeline. Admit AFTER delivery.alsa so the
             //    cross-plugin reaction chain is in place
             //    when the first settings-changed happening
@@ -158,13 +158,13 @@ fn audio_distribution_admission() -> AdmissionSetup {
 /// fragment-writer worker) fires from boot. Without this, the
 /// audio_routing handles each plugin receives return
 /// `EndpointNotConfigured` until an operator manually
-/// publishes a topology via the wire op — the AAMPP demo's
-/// dynamic chain stays inert.
+/// publishes a topology via the wire op — the reference audio
+/// chain's dynamic configuration stays inert.
 ///
 /// The default topology is intentionally minimal:
 ///
 /// - Source: `org.evoframework.playback.mpd` writing
-///   PCM/s16le/44.1k/2ch to `pcm.evo` (the AAMPP entry the
+///   PCM/s16le/44.1k/2ch to `pcm.evo` (the pipeline entry the
 ///   delivery plugin declares).
 /// - Delivery: `org.evoframework.delivery.alsa` reading the
 ///   same format from the same endpoint.
@@ -235,7 +235,7 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
             };
             let topology = ActiveAudioTopology {
                 target_key: "evo-device-audio:default".to_string(),
-                display_name: "AAMPP default chain (44.1kHz/16-bit/stereo)"
+                display_name: "Default delivery chain (44.1kHz/16-bit/stereo)"
                     .to_string(),
                 chain: vec![source_stage, delivery_stage],
                 volume_mode: VolumeMode::Software,
@@ -251,15 +251,15 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 target_key = %topology.target_key,
                 source = "org.evoframework.playback.mpd",
                 delivery = "org.evoframework.delivery.alsa",
-                "post-admission: publishing default AAMPP topology"
+                "post-admission: publishing default audio topology"
             );
             ctx.audio
                 .topology_store
                 .publish(topology, "evo-device-audio:post-admission")
                 .await
-                .context("publishing default AAMPP topology")?;
+                .context("publishing default audio topology")?;
             tracing::info!(
-                "post-admission: default AAMPP topology published; \
+                "post-admission: default audio topology published; \
                  route-change reactor cycle is now live"
             );
 

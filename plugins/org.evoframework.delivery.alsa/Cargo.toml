@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ALSA delivery plugin for the evo audio data plane. Owns the AAMPP modular ALSA pipeline (pcm.evo); probes the host's audio hardware; declares the WriteEndpoint other plugins write into. Stocks the audio.delivery shelf at shape 2."
+description = "ALSA delivery plugin for the evo audio data plane. Owns the modular ALSA pipeline (pcm.evo); probes the host's audio hardware; declares the WriteEndpoint other plugins write into. Stocks the audio.delivery shelf at shape 2."
 
 [lib]
 path = "src/lib.rs"

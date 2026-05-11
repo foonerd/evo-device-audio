@@ -10,7 +10,7 @@ isolation: in_process
 
 capability_intent:
   - id: alsa_hardware_probe
-    need: probe the host's ALSA hardware via `aplay -L` and `amixer -c <N>` to enumerate playback cards + their available mixer controls. Used by the delivery plugin to surface the operator-visible card / mixer choice (driven by the playback.options plugin) and to validate that the AAMPP pipeline's terminus card is present on the host.
+    need: probe the host's ALSA hardware via `aplay -L` and `amixer -c <N>` to enumerate playback cards + their available mixer controls. Used by the delivery plugin to surface the operator-visible card / mixer choice (driven by the playback.options plugin) and to validate that the modular ALSA pipeline's terminus card is present on the host.
     access_path: binary/aplay-amixer
     failure_mode: probe verbs respond with structured empty list + diagnostic; plugin admits and continues with the static pcm.evo definition the bootstrap script installed; operator-visible card-selection UI shows no cards but the previously-installed pipeline keeps audio flowing on the existing card.
   - id: alsa_pipeline_definition_read
@@ -34,7 +34,7 @@ verification:
     - "test -r /etc/asound.conf"
     - "test -d /proc/asound"
   expected:
-    - asound.conf readable (operator-visible AAMPP pipeline definition)
+    - asound.conf readable (operator-visible modular ALSA pipeline definition)
     - ALSA proc tree present (kernel snd subsystem loaded)
 
 host_provisioning: {}

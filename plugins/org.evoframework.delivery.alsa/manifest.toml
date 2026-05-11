@@ -36,7 +36,7 @@ restart_on_crash = true
 restart_budget = 5
 
 # Respondent capabilities. Operator-facing introspection of the
-# AAMPP pipeline state: which cards / mixers / formats the host
+# modular ALSA pipeline state: which cards / mixers / formats the host
 # supports right now. The settings layer (playback.options) drives
 # this plugin via the same surface to bind a chosen output device.
 [capabilities.respondent]
@@ -49,7 +49,7 @@ request_types = [
 response_budget_ms = 5000
 
 # Audio data plane: delivery stage. This plugin owns the
-# AAMPP-style modular ALSA pipeline (`pcm.evo` defined in
+# modular ALSA pipeline (`pcm.evo` defined in
 # /etc/asound.conf) and declares it as the WriteEndpoint other
 # audio-producing plugins write into. The framework's
 # reconciliation engine intersects this plugin's declared

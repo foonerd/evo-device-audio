@@ -18,20 +18,20 @@ target host.
   distributions include this fragment in their full
   catalogue alongside any other racks they admit.
 - `mpd/evo-fragment.conf` — boot-time MPD fragment. Carries
-  the AAMPP-compliant `device "evo"` pointing at the
-  `pcm.evo` pipeline (see `alsa/99-evo.conf`). The
+  the modular-pipeline `device "evo"` pointing at the
+  `pcm.evo` entry (see `alsa/asound.conf`). The
   fragment-writer worker rewrites `/etc/evo/mpd.conf` at
   every route-change from the framework-negotiated
   WriteEndpoint once a topology is published; this static
   form keeps MPD operational at boot before reconciliation
   has run.
-- `alsa/asound.conf` — AAMPP modular ALSA pipeline.
+- `alsa/asound.conf` — modular ALSA pipeline.
   Defines `pcm.evo` as the single entry point every
   audio-producing plugin writes to: `plug` (handles format
   negotiation) → `hw:CARD=DAC,DEV=0` (hardware terminus,
   kernel-stable card name). The bootstrap script installs
   this file at `/etc/asound.conf` (system-wide; ALSA reads
-  it at every PCM open). Future AAMPP modules (soxr
+  it at every PCM open). Future pipeline stages (soxr
   resampler, EQ, room correction, peppyalsa visualisation)
   are layered in via the same file under operator control,
   or via the `delivery.alsa` plugin's authority once it

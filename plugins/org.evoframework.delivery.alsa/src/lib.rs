@@ -1,9 +1,9 @@
 //! # org-evoframework-delivery-alsa
 //!
 //! Delivery-stage plugin for the evo audio data plane. Owns the
-//! AAMPP-style modular ALSA pipeline (`pcm.evo`) and declares it
-//! as the [`WriteEndpoint`] other audio-producing plugins write
-//! into. Stocks the `audio.delivery` shelf at shape 2.
+//! modular ALSA pipeline (`pcm.evo`) and declares it as the
+//! [`WriteEndpoint`] other audio-producing plugins write into.
+//! Stocks the `audio.delivery` shelf at shape 2.
 //!
 //! ## What this plugin is
 //!
@@ -456,7 +456,7 @@ impl Plugin for AlsaDeliveryPlugin {
             self.spawn_reactor().await?;
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                "plugin loaded; AAMPP delivery surface ready; \
+                "plugin loaded; modular ALSA delivery surface ready; \
                  route-change reactor running"
             );
             Ok(())
@@ -602,9 +602,9 @@ impl AlsaDeliveryPlugin {
         )
     }
 
-    /// `delivery.active_endpoint` — surface the current AAMPP
-    /// pipeline state: the asound.conf path, whether it contains
-    /// a `pcm.evo` definition, and the WriteEndpoint the
+    /// `delivery.active_endpoint` — surface the current modular
+    /// ALSA pipeline state: the asound.conf path, whether it
+    /// contains a `pcm.evo` definition, and the WriteEndpoint the
     /// framework has currently published (if any) to this
     /// plugin. Settings UI uses this to render "currently
     /// playing through: ALSA card X via pipeline Y".
