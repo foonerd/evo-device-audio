@@ -23,16 +23,28 @@ capability_intent:
     need: invoke `nmcli` to query and modify NetworkManager state — connection profile control (list / activate / deactivate / edit), Wi-Fi radio toggle, connectivity-check read, scan, captive-portal helpers. Under root the plugin exec's nmcli directly; under a non-root service identity it dispatches via `sudo -n nmcli` against a narrow NOPASSWD drop-in shipped by the distribution's bootstrap. The framework's preflight runner probes whichever path the calling identity needs and populates `LoadContext::capabilities` so the plugin's dispatcher reads the resolved strategy at load time instead of re-probing.
     access_path: sudoers/command
     failure_mode: every nmcli-backed verb responds with PluginError::Transient carrying the strategy name + the underlying sudo / nmcli stderr; the steward keeps running; networking-shelf state degrades to "unreachable" with the framework's remedy string surfaced to operators.
+  - id: iw_invocation
+    need: invoke `iw` for per-PHY capability detection (concurrent managed+AP support, supported interface modes, channel-count limits) and for the virtual AP interface lifecycle (`iw dev <sta> interface add <ap> type __ap` and `iw dev <ap> del`). Single-PHY concurrent STA+AP on chipsets that support it relies on this surface. Same dispatch shape as `nmcli_invocation` — direct under root, `sudo -n iw` under a non-root service identity against a NOPASSWD drop-in.
+    access_path: sudoers/command
+    failure_mode: PHY capability probes degrade to "single-radio assumed" (concurrent STA+AP refused at apply time with operator-readable rationale); ensure_ap_vif_* helpers return PluginError::Transient with the underlying iw stderr; the steward keeps running.
+  - id: rfkill_invocation
+    need: invoke `rfkill` to set hardware/software radio block state at the kernel level. Used by the runtime supervisor to enforce flight-mode across radio families (Wi-Fi + Bluetooth) when nmcli's Wi-Fi-only toggle is insufficient, and to coordinate with the bluetooth plugin via the shared `RadioPolicy.flight_mode` bit. Read-only state lookups stay sysfs-direct via `/sys/class/rfkill` (no privilege required).
+    access_path: sudoers/command
+    failure_mode: structured event names the family that could not be blocked/unblocked; the steward keeps running; sysfs-read state continues to surface accurately for diagnostics.
+  - id: curl_invocation
+    need: invoke `curl` for connectivity probes (RFC 8910 / HTTP-204 captive-portal detection) and captive-portal credential submission. The runtime supervisor reads the probe outcome to distinguish online / portal-detected / full-loss state and to drive the UI escalation contract. Probes are bound to reasonable timeouts via the dispatcher's per-call timeout argument.
+    access_path: sudoers/command
+    failure_mode: connectivity probes return "unknown" rather than asserting online/offline; captive-portal flow surfaces structured event naming the probe failure; no panic.
   - id: nm_connection_control
     need: query and modify NetworkManager connection profiles (list, activate, deactivate, edit). Implementation routes through `nmcli_invocation`; the intent stays declared independently so operator-facing tooling can surface what the plugin requires from the host.
     access_path: sudoers/command
     failure_mode: degraded networking-shelf state; structured event names the missing profile; no panic.
   - id: wifi_radio_control
-    need: toggle Wi-Fi soft-block / unblock (the flight-mode signal device plugins consume). Implementation routes through `nmcli_invocation`; rfkill state is read via `nmcli radio`.
+    need: toggle Wi-Fi soft-block / unblock (the flight-mode signal device plugins consume). Implementation routes through `nmcli_invocation` for the operator-visible path plus `rfkill_invocation` when the supervisor needs to enforce a multi-family block (Wi-Fi + Bluetooth in lockstep for flight mode).
     access_path: sudoers/command
     failure_mode: warning + recoverable operator action; structured event distinguishes hardware-vs-software block; no panic.
   - id: connectivity_query
-    need: read NetworkManager connectivity-check state (online / limited / portal / none) for shelf state reporting. Implementation routes through `nmcli_invocation` with read-only `general` / `connection show` argv shapes.
+    need: read NetworkManager connectivity-check state (online / limited / portal / none) for shelf state reporting. Implementation routes through `nmcli_invocation` with read-only `general` / `connection show` argv shapes plus `curl_invocation` for the active connectivity probe layer.
     access_path: sudoers/command
     failure_mode: report unknown connectivity; structured event; no panic.
 
@@ -40,6 +52,15 @@ required_binaries:
   - name: nmcli
     min_version: "1.30"
     failure_mode: refuse to admit; structured admission error names the missing binary.
+  - name: iw
+    min_version: "5.16"
+    failure_mode: refuse to admit; PHY capability detection + virtual AP vif lifecycle have no fallback at this version.
+  - name: rfkill
+    min_version: "2.36"
+    failure_mode: warn at admission and degrade flight-mode coordination to the Wi-Fi-only nmcli path; structured event names the missing binary; the steward keeps running.
+  - name: curl
+    min_version: "7.74"
+    failure_mode: warn at admission and degrade connectivity / captive-portal probes to the nmcli-only connectivity-check; the steward keeps running.
 
 required_kernel_modules: []
 
