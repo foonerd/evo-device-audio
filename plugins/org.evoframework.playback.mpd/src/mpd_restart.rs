@@ -268,18 +268,20 @@ pub(crate) fn process_needs_sudo() -> bool {
 ///    when the map is empty or the resolution doesn't carry a
 ///    strategy hint.
 ///
-/// The composite delegates to one of the leaf strategies for
-/// the lifetime of the plugin admission. Hot-tightening
-/// (Phase B) will swap the inner strategy on capability
-/// state changes.
+/// The composite delegates to one of the leaf strategies. The
+/// inner strategy is held behind a [`Mutex`] so the plugin's
+/// capabilities-watch reactor can swap it on PPAG resolution
+/// updates without re-admission (hot-tightening, Phase B).
 #[derive(Debug)]
 pub struct AutoMpdRestarter {
-    inner: Arc<dyn MpdRestarter>,
+    inner: std::sync::Mutex<Arc<dyn MpdRestarter>>,
     /// Operator-readable rationale for the chosen strategy,
     /// surfaced in the plugin's load-time log so operators see
     /// why the framework selected sudo vs direct (or
-    /// fell-back to no-op).
-    rationale: String,
+    /// fell-back to no-op). Behind the same mutex shape as
+    /// [`Self::inner`] so a re-resolve atomically updates
+    /// both.
+    rationale: std::sync::Mutex<String>,
 }
 
 impl AutoMpdRestarter {
@@ -288,147 +290,203 @@ impl AutoMpdRestarter {
     /// `LoadContext::capabilities` map.
     pub fn resolve(map: &CapabilityResolutionMap) -> Self {
         let resolution = map.get(INTENT_MPD_SYSTEMCTL_RESTART);
-        Self::resolve_with_eject(resolution, process_needs_sudo)
+        let (inner, rationale) =
+            resolve_inner_and_rationale(resolution, process_needs_sudo);
+        Self {
+            inner: std::sync::Mutex::new(inner),
+            rationale: std::sync::Mutex::new(rationale),
+        }
+    }
+
+    /// Re-resolve from a new capability resolution map and
+    /// swap the inner strategy + rationale in place. Called by
+    /// the plugin's capabilities-watch reactor when the
+    /// framework's re-probe loop publishes a change. Lock
+    /// scope is tiny (one Arc swap + one String swap); the
+    /// next `restart()` observes the new strategy.
+    pub fn re_resolve(&self, map: &CapabilityResolutionMap) {
+        let resolution = map.get(INTENT_MPD_SYSTEMCTL_RESTART);
+        let (new_inner, new_rationale) =
+            resolve_inner_and_rationale(resolution, process_needs_sudo);
+        *self
+            .inner
+            .lock()
+            .expect("AutoMpdRestarter inner mutex poisoned") = new_inner;
+        *self
+            .rationale
+            .lock()
+            .expect("AutoMpdRestarter rationale mutex poisoned") =
+            new_rationale;
     }
 
     /// Resolution path isolated from the EUID-detection
     /// syscall so unit tests can inject a deterministic answer.
     /// `needs_sudo_fn` is consulted only when the framework
     /// resolution does not carry a strategy hint.
+    #[cfg(test)]
     fn resolve_with_eject(
         resolution: Option<&CapabilityResolution>,
         needs_sudo_fn: fn() -> bool,
     ) -> Self {
-        match resolution {
-            Some(CapabilityResolution::Available {
-                strategy: Some(s),
-                evidence,
-            }) => match s.as_str() {
-                "direct" => Self {
-                    inner: Arc::new(DirectSystemctlRestarter::new()),
-                    rationale: format!(
-                        "framework-resolved strategy=direct ({evidence})"
-                    ),
-                },
-                "sudo" => Self {
-                    inner: Arc::new(SudoSystemctlRestarter::new()),
-                    rationale: format!(
-                        "framework-resolved strategy=sudo ({evidence})"
-                    ),
-                },
-                other => {
-                    // Unknown strategy name from the framework
-                    // — defer to EUID-based fallback so we
-                    // don't refuse admission over an
-                    // unrecognised string.
-                    Self::fallback(
-                        needs_sudo_fn,
-                        format!(
-                            "framework-resolved strategy={other:?} not \
-                             recognised by this build; falling back to EUID \
-                             detection"
-                        ),
-                    )
-                }
-            },
-            Some(CapabilityResolution::Available {
-                strategy: None,
-                evidence,
-            }) => Self::fallback(
-                needs_sudo_fn,
-                format!(
-                    "framework resolution Available without strategy hint \
-                     ({evidence}); falling back to EUID detection"
-                ),
-            ),
-            Some(CapabilityResolution::Unavailable { reason, remedy }) => {
-                Self {
-                    inner: Arc::new(NoOpProductionRestarter::new(
-                        reason.clone(),
-                        remedy.clone(),
-                    )),
-                    rationale: format!(
-                        "framework refused mpd_systemctl_restart: {reason}; \
-                         restart leg disabled (remedy: {remedy})"
-                    ),
-                }
-            }
-            Some(CapabilityResolution::Degraded {
-                fallback_strategy,
-                reason,
-            }) => {
-                if fallback_strategy == "no_op" {
-                    Self {
-                        inner: Arc::new(NoOpProductionRestarter::new(
-                            reason.clone(),
-                            "no remedy declared".to_string(),
-                        )),
-                        rationale: format!(
-                            "framework degraded mpd_systemctl_restart to \
-                             no_op fallback: {reason}"
-                        ),
-                    }
-                } else {
-                    Self::fallback(
-                        needs_sudo_fn,
-                        format!(
-                            "framework degraded with fallback_strategy=\
-                             {fallback_strategy:?} not recognised; \
-                             falling back to EUID detection ({reason})"
-                        ),
-                    )
-                }
-            }
-            Some(CapabilityResolution::NotProbed { reason }) => Self::fallback(
-                needs_sudo_fn,
-                format!(
-                    "framework did not probe mpd_systemctl_restart \
-                         ({reason}); falling back to EUID detection"
-                ),
-            ),
-            None => Self::fallback(
-                needs_sudo_fn,
-                "framework resolution map did not contain \
-                 mpd_systemctl_restart; falling back to EUID detection"
-                    .to_string(),
-            ),
-        }
-    }
-
-    /// Internal constructor for the EUID-detection path.
-    fn fallback(needs_sudo_fn: fn() -> bool, rationale_prefix: String) -> Self {
-        if needs_sudo_fn() {
-            Self {
-                inner: Arc::new(SudoSystemctlRestarter::new()),
-                rationale: format!(
-                    "{rationale_prefix}; EUID detection selected sudo"
-                ),
-            }
-        } else {
-            Self {
-                inner: Arc::new(DirectSystemctlRestarter::new()),
-                rationale: format!(
-                    "{rationale_prefix}; EUID detection selected direct"
-                ),
-            }
+        let (inner, rationale) =
+            resolve_inner_and_rationale(resolution, needs_sudo_fn);
+        Self {
+            inner: std::sync::Mutex::new(inner),
+            rationale: std::sync::Mutex::new(rationale),
         }
     }
 
     /// Operator-readable rationale for the chosen strategy.
     /// The plugin logs this at INFO once at load time so the
-    /// journal carries an audit trail of the resolution.
-    pub fn rationale(&self) -> &str {
-        &self.rationale
+    /// journal carries an audit trail of the resolution. Each
+    /// call returns a fresh clone — the mutex scope stays
+    /// tight and the caller never holds a reference into the
+    /// lock.
+    pub fn rationale(&self) -> String {
+        self.rationale
+            .lock()
+            .expect("AutoMpdRestarter rationale mutex poisoned")
+            .clone()
+    }
+
+    /// Current strategy name. Forwards to the inner leaf
+    /// strategy's `strategy_name()`, dropping the lock before
+    /// returning.
+    pub fn current_strategy_name(&self) -> &'static str {
+        self.inner
+            .lock()
+            .expect("AutoMpdRestarter inner mutex poisoned")
+            .strategy_name()
+    }
+}
+
+/// Pure resolver returning the leaf strategy + rationale for a
+/// given resolution. Shared between `resolve`, `resolve_with_eject`
+/// (test path), and `re_resolve` so a single source of truth
+/// drives the policy.
+fn resolve_inner_and_rationale(
+    resolution: Option<&CapabilityResolution>,
+    needs_sudo_fn: fn() -> bool,
+) -> (Arc<dyn MpdRestarter>, String) {
+    match resolution {
+        Some(CapabilityResolution::Available {
+            strategy: Some(s),
+            evidence,
+        }) => match s.as_str() {
+            "direct" => (
+                Arc::new(DirectSystemctlRestarter::new()),
+                format!("framework-resolved strategy=direct ({evidence})"),
+            ),
+            "sudo" => (
+                Arc::new(SudoSystemctlRestarter::new()),
+                format!("framework-resolved strategy=sudo ({evidence})"),
+            ),
+            other => fallback_inner_and_rationale(
+                needs_sudo_fn,
+                format!(
+                    "framework-resolved strategy={other:?} not \
+                     recognised by this build; falling back to EUID \
+                     detection"
+                ),
+            ),
+        },
+        Some(CapabilityResolution::Available {
+            strategy: None,
+            evidence,
+        }) => fallback_inner_and_rationale(
+            needs_sudo_fn,
+            format!(
+                "framework resolution Available without strategy hint \
+                 ({evidence}); falling back to EUID detection"
+            ),
+        ),
+        Some(CapabilityResolution::Unavailable { reason, remedy }) => (
+            Arc::new(NoOpProductionRestarter::new(
+                reason.clone(),
+                remedy.clone(),
+            )),
+            format!(
+                "framework refused mpd_systemctl_restart: {reason}; \
+                 restart leg disabled (remedy: {remedy})"
+            ),
+        ),
+        Some(CapabilityResolution::Degraded {
+            fallback_strategy,
+            reason,
+        }) => {
+            if fallback_strategy == "no_op" {
+                (
+                    Arc::new(NoOpProductionRestarter::new(
+                        reason.clone(),
+                        "no remedy declared".to_string(),
+                    )),
+                    format!(
+                        "framework degraded mpd_systemctl_restart to \
+                         no_op fallback: {reason}"
+                    ),
+                )
+            } else {
+                fallback_inner_and_rationale(
+                    needs_sudo_fn,
+                    format!(
+                        "framework degraded with fallback_strategy=\
+                         {fallback_strategy:?} not recognised; \
+                         falling back to EUID detection ({reason})"
+                    ),
+                )
+            }
+        }
+        Some(CapabilityResolution::NotProbed { reason }) => {
+            fallback_inner_and_rationale(
+                needs_sudo_fn,
+                format!(
+                    "framework did not probe mpd_systemctl_restart \
+                         ({reason}); falling back to EUID detection"
+                ),
+            )
+        }
+        None => fallback_inner_and_rationale(
+            needs_sudo_fn,
+            "framework resolution map did not contain \
+             mpd_systemctl_restart; falling back to EUID detection"
+                .to_string(),
+        ),
+    }
+}
+
+fn fallback_inner_and_rationale(
+    needs_sudo_fn: fn() -> bool,
+    rationale_prefix: String,
+) -> (Arc<dyn MpdRestarter>, String) {
+    if needs_sudo_fn() {
+        (
+            Arc::new(SudoSystemctlRestarter::new()),
+            format!("{rationale_prefix}; EUID detection selected sudo"),
+        )
+    } else {
+        (
+            Arc::new(DirectSystemctlRestarter::new()),
+            format!("{rationale_prefix}; EUID detection selected direct"),
+        )
     }
 }
 
 impl MpdRestarter for AutoMpdRestarter {
     fn restart(&self) -> RestartFuture<'_> {
-        self.inner.restart()
+        // Clone the inner Arc under the lock, drop the lock,
+        // and call through the clone. The await scope sees no
+        // mutex guard so a parallel `re_resolve` does not block
+        // and the future's send semantics stay intact.
+        let inner = self
+            .inner
+            .lock()
+            .expect("AutoMpdRestarter inner mutex poisoned")
+            .clone();
+        Box::pin(async move { inner.restart().await })
     }
 
     fn strategy_name(&self) -> &'static str {
-        self.inner.strategy_name()
+        self.current_strategy_name()
     }
 }
 
@@ -743,5 +801,94 @@ mod tests {
         let err = r.restart().await.unwrap_err();
         assert!(err.contains("MPD restart disabled"));
         assert!(err.contains("sudoers absent"));
+    }
+
+    // ===== AutoMpdRestarter::re_resolve =====
+    // Hot-tightening: when the framework's re-probe loop
+    // publishes an updated resolution map, the composite
+    // should swap its inner strategy in place without
+    // requiring re-construction.
+
+    fn map_with_strategy(
+        intent: &str,
+        strategy: &str,
+    ) -> CapabilityResolutionMap {
+        let mut map = CapabilityResolutionMap::new();
+        map.insert(
+            intent.to_string(),
+            CapabilityResolution::Available {
+                evidence: format!("test fixture: {strategy}"),
+                strategy: Some(strategy.into()),
+            },
+        );
+        map
+    }
+
+    fn map_with_unavailable(intent: &str) -> CapabilityResolutionMap {
+        let mut map = CapabilityResolutionMap::new();
+        map.insert(
+            intent.to_string(),
+            CapabilityResolution::Unavailable {
+                reason: "test: drop-in removed".into(),
+                remedy: "reinstall the drop-in".into(),
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn re_resolve_swaps_sudo_to_direct() {
+        let initial = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "sudo");
+        let auto = AutoMpdRestarter::resolve(&initial);
+        assert_eq!(auto.current_strategy_name(), "sudo");
+        let updated = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "direct");
+        auto.re_resolve(&updated);
+        assert_eq!(auto.current_strategy_name(), "direct");
+        assert!(auto.rationale().contains("direct"));
+    }
+
+    #[test]
+    fn re_resolve_swaps_direct_to_sudo() {
+        let initial = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "direct");
+        let auto = AutoMpdRestarter::resolve(&initial);
+        assert_eq!(auto.current_strategy_name(), "direct");
+        let updated = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "sudo");
+        auto.re_resolve(&updated);
+        assert_eq!(auto.current_strategy_name(), "sudo");
+        assert!(auto.rationale().contains("sudo"));
+    }
+
+    #[test]
+    fn re_resolve_to_unavailable_installs_no_op_with_remedy() {
+        let initial = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "sudo");
+        let auto = AutoMpdRestarter::resolve(&initial);
+        let updated = map_with_unavailable(INTENT_MPD_SYSTEMCTL_RESTART);
+        auto.re_resolve(&updated);
+        // No-op variant identifies itself as "no_op_disabled".
+        assert_eq!(auto.current_strategy_name(), "no_op_disabled");
+        assert!(auto.rationale().contains("framework refused"));
+        assert!(auto.rationale().contains("reinstall the drop-in"));
+    }
+
+    #[test]
+    fn re_resolve_concurrent_with_restart_does_not_deadlock() {
+        // Smoke check: the Mutex<inner> swap is short enough
+        // that overlapping a restart future construction with
+        // a re_resolve never deadlocks. We construct the auto
+        // restarter, take an async future from restart(),
+        // re_resolve mid-flight, and verify the future still
+        // completes against the cloned inner.
+        let initial = map_with_strategy(INTENT_MPD_SYSTEMCTL_RESTART, "sudo");
+        let auto = AutoMpdRestarter::resolve(&initial);
+        // Construct future before re-resolve.
+        let fut = MpdRestarter::restart(&auto);
+        // Swap the inner under us.
+        let updated = map_with_unavailable(INTENT_MPD_SYSTEMCTL_RESTART);
+        auto.re_resolve(&updated);
+        // The captured future used the previous inner; drop
+        // it without awaiting to avoid the real sudo call.
+        // Just make sure nothing panicked.
+        drop(fut);
+        assert_eq!(auto.current_strategy_name(), "no_op_disabled");
     }
 }

@@ -156,15 +156,21 @@ impl NmcliDispatcher for SudoNmcliDispatcher {
 /// construction time and installs the matching leaf strategy.
 /// Falls back to EUID detection when the map is silent.
 pub struct AutoNmcliDispatcher {
-    inner: Arc<dyn NmcliDispatcher>,
-    rationale: String,
+    /// Inner leaf strategy. Held behind a `Mutex` so the
+    /// plugin's capabilities-watch reactor (PPAG hot-tightening)
+    /// can swap it on framework re-probe publications.
+    inner: std::sync::Mutex<Arc<dyn NmcliDispatcher>>,
+    /// Operator-readable rationale for the current strategy,
+    /// kept in lockstep with [`Self::inner`] under the same
+    /// mutex discipline.
+    rationale: std::sync::Mutex<String>,
 }
 
 impl Debug for AutoNmcliDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutoNmcliDispatcher")
-            .field("strategy", &self.inner.strategy_name())
-            .field("rationale", &self.rationale)
+            .field("strategy", &self.current_strategy_name())
+            .field("rationale", &self.rationale())
             .finish()
     }
 }
@@ -174,133 +180,177 @@ impl AutoNmcliDispatcher {
     /// Plugin entry: pass `&ctx.capabilities` at load time.
     pub fn resolve(map: &CapabilityResolutionMap) -> Self {
         let resolution = map.get(INTENT_NMCLI_INVOCATION);
-        Self::resolve_with_eject(resolution, process_needs_sudo)
+        let (inner, rationale) =
+            resolve_inner_and_rationale(resolution, process_needs_sudo);
+        Self {
+            inner: std::sync::Mutex::new(inner),
+            rationale: std::sync::Mutex::new(rationale),
+        }
+    }
+
+    /// Re-resolve from a new capability resolution map and
+    /// swap the inner strategy + rationale in place. Called by
+    /// the plugin's capabilities-watch reactor when the
+    /// framework's re-probe loop publishes a change.
+    pub fn re_resolve(&self, map: &CapabilityResolutionMap) {
+        let resolution = map.get(INTENT_NMCLI_INVOCATION);
+        let (new_inner, new_rationale) =
+            resolve_inner_and_rationale(resolution, process_needs_sudo);
+        *self
+            .inner
+            .lock()
+            .expect("AutoNmcliDispatcher inner mutex poisoned") = new_inner;
+        *self
+            .rationale
+            .lock()
+            .expect("AutoNmcliDispatcher rationale mutex poisoned") =
+            new_rationale;
     }
 
     /// Resolution path isolated from the EUID-detection syscall
     /// so unit tests can inject a deterministic answer.
     /// `needs_sudo_fn` is consulted only when the framework
     /// resolution does not carry a strategy hint.
+    #[cfg(test)]
     fn resolve_with_eject(
         resolution: Option<&CapabilityResolution>,
         needs_sudo_fn: fn() -> bool,
     ) -> Self {
-        match resolution {
-            Some(CapabilityResolution::Available {
-                strategy: Some(s),
-                evidence,
-            }) => match s.as_str() {
-                "direct" => Self {
-                    inner: Arc::new(DirectNmcliDispatcher::new()),
-                    rationale: format!(
-                        "framework-resolved strategy=direct ({evidence})"
-                    ),
-                },
-                "sudo" => Self {
-                    inner: Arc::new(SudoNmcliDispatcher::new()),
-                    rationale: format!(
-                        "framework-resolved strategy=sudo ({evidence})"
-                    ),
-                },
-                other => Self::fallback(
-                    needs_sudo_fn,
-                    format!(
-                        "framework-resolved strategy={other:?} not \
-                         recognised by this build; falling back to EUID \
-                         detection"
-                    ),
-                ),
-            },
-            Some(CapabilityResolution::Available {
-                strategy: None,
-                evidence,
-            }) => Self::fallback(
+        let (inner, rationale) =
+            resolve_inner_and_rationale(resolution, needs_sudo_fn);
+        Self {
+            inner: std::sync::Mutex::new(inner),
+            rationale: std::sync::Mutex::new(rationale),
+        }
+    }
+
+    /// Operator-readable rationale for the current strategy.
+    /// Cloned out under the mutex so callers never hold a
+    /// reference into the lock.
+    pub fn rationale(&self) -> String {
+        self.rationale
+            .lock()
+            .expect("AutoNmcliDispatcher rationale mutex poisoned")
+            .clone()
+    }
+
+    /// Current leaf strategy name. Forwards to the inner
+    /// strategy's `strategy_name()`, dropping the lock before
+    /// returning the `'static` string.
+    pub fn current_strategy_name(&self) -> &'static str {
+        self.inner
+            .lock()
+            .expect("AutoNmcliDispatcher inner mutex poisoned")
+            .strategy_name()
+    }
+}
+
+/// Pure resolver returning the leaf strategy + rationale for a
+/// given resolution. Shared between `resolve`, `resolve_with_eject`
+/// (test path), and `re_resolve` so the policy lives in one place.
+fn resolve_inner_and_rationale(
+    resolution: Option<&CapabilityResolution>,
+    needs_sudo_fn: fn() -> bool,
+) -> (Arc<dyn NmcliDispatcher>, String) {
+    match resolution {
+        Some(CapabilityResolution::Available {
+            strategy: Some(s),
+            evidence,
+        }) => match s.as_str() {
+            "direct" => (
+                Arc::new(DirectNmcliDispatcher::new()),
+                format!("framework-resolved strategy=direct ({evidence})"),
+            ),
+            "sudo" => (
+                Arc::new(SudoNmcliDispatcher::new()),
+                format!("framework-resolved strategy=sudo ({evidence})"),
+            ),
+            other => fallback_inner_and_rationale(
                 needs_sudo_fn,
                 format!(
-                    "framework resolution Available without strategy hint \
-                     ({evidence}); falling back to EUID detection"
+                    "framework-resolved strategy={other:?} not \
+                     recognised by this build; falling back to EUID \
+                     detection"
                 ),
             ),
-            Some(CapabilityResolution::Unavailable { reason, remedy }) => {
-                // Nmcli unreachable through any privilege path the
-                // framework probed. The plugin still attempts direct
-                // exec — under sandboxed test or hardened-host
-                // configurations the leg may still work despite the
-                // preflight refusal; the rationale carries the
-                // remedy so operators see the actionable next step.
-                Self {
-                    inner: Arc::new(DirectNmcliDispatcher::new()),
-                    rationale: format!(
-                        "framework refused nmcli_invocation: {reason}; \
-                         attempting direct exec anyway (remedy: {remedy})"
-                    ),
-                }
-            }
-            Some(CapabilityResolution::Degraded {
-                fallback_strategy,
-                reason,
-            }) => match fallback_strategy.as_str() {
-                "direct" => Self {
-                    inner: Arc::new(DirectNmcliDispatcher::new()),
-                    rationale: format!(
-                        "framework degraded nmcli_invocation to \
-                         direct fallback: {reason}"
-                    ),
-                },
-                "sudo" => Self {
-                    inner: Arc::new(SudoNmcliDispatcher::new()),
-                    rationale: format!(
-                        "framework degraded nmcli_invocation to \
-                         sudo fallback: {reason}"
-                    ),
-                },
-                other => Self::fallback(
-                    needs_sudo_fn,
-                    format!(
-                        "framework degraded nmcli_invocation with \
-                         unrecognised fallback={other:?}: {reason}; \
-                         falling back to EUID detection"
-                    ),
+        },
+        Some(CapabilityResolution::Available {
+            strategy: None,
+            evidence,
+        }) => fallback_inner_and_rationale(
+            needs_sudo_fn,
+            format!(
+                "framework resolution Available without strategy hint \
+                 ({evidence}); falling back to EUID detection"
+            ),
+        ),
+        Some(CapabilityResolution::Unavailable { reason, remedy }) => (
+            Arc::new(DirectNmcliDispatcher::new()),
+            format!(
+                "framework refused nmcli_invocation: {reason}; \
+                 attempting direct exec anyway (remedy: {remedy})"
+            ),
+        ),
+        Some(CapabilityResolution::Degraded {
+            fallback_strategy,
+            reason,
+        }) => match fallback_strategy.as_str() {
+            "direct" => (
+                Arc::new(DirectNmcliDispatcher::new()),
+                format!(
+                    "framework degraded nmcli_invocation to \
+                     direct fallback: {reason}"
                 ),
-            },
-            Some(CapabilityResolution::NotProbed { reason }) => Self::fallback(
+            ),
+            "sudo" => (
+                Arc::new(SudoNmcliDispatcher::new()),
+                format!(
+                    "framework degraded nmcli_invocation to \
+                     sudo fallback: {reason}"
+                ),
+            ),
+            other => fallback_inner_and_rationale(
+                needs_sudo_fn,
+                format!(
+                    "framework degraded nmcli_invocation with \
+                     unrecognised fallback={other:?}: {reason}; \
+                     falling back to EUID detection"
+                ),
+            ),
+        },
+        Some(CapabilityResolution::NotProbed { reason }) => {
+            fallback_inner_and_rationale(
                 needs_sudo_fn,
                 format!(
                     "framework did not probe nmcli_invocation \
                          ({reason}); falling back to EUID detection"
                 ),
-            ),
-            None => Self::fallback(
-                needs_sudo_fn,
-                "framework resolution map did not contain \
-                 nmcli_invocation; falling back to EUID detection"
-                    .to_string(),
-            ),
+            )
         }
+        None => fallback_inner_and_rationale(
+            needs_sudo_fn,
+            "framework resolution map did not contain \
+             nmcli_invocation; falling back to EUID detection"
+                .to_string(),
+        ),
     }
+}
 
-    fn fallback(needs_sudo_fn: fn() -> bool, reason_prefix: String) -> Self {
-        let needs_sudo = needs_sudo_fn();
-        let (inner, strategy): (Arc<dyn NmcliDispatcher>, &'static str) =
-            if needs_sudo {
-                (Arc::new(SudoNmcliDispatcher::new()), "sudo")
-            } else {
-                (Arc::new(DirectNmcliDispatcher::new()), "direct")
-            };
-        Self {
-            inner,
-            rationale: format!(
-                "{reason_prefix}; EUID detection selected {strategy}"
-            ),
-        }
-    }
-
-    /// Operator-readable rationale: shown in the load-time log
-    /// line so the journal explains which strategy the
-    /// dispatcher installed and why.
-    pub fn rationale(&self) -> &str {
-        &self.rationale
-    }
+fn fallback_inner_and_rationale(
+    needs_sudo_fn: fn() -> bool,
+    reason_prefix: String,
+) -> (Arc<dyn NmcliDispatcher>, String) {
+    let needs_sudo = needs_sudo_fn();
+    let (inner, strategy): (Arc<dyn NmcliDispatcher>, &'static str) =
+        if needs_sudo {
+            (Arc::new(SudoNmcliDispatcher::new()), "sudo")
+        } else {
+            (Arc::new(DirectNmcliDispatcher::new()), "direct")
+        };
+    (
+        inner,
+        format!("{reason_prefix}; EUID detection selected {strategy}"),
+    )
 }
 
 impl NmcliDispatcher for AutoNmcliDispatcher {
@@ -310,11 +360,21 @@ impl NmcliDispatcher for AutoNmcliDispatcher {
         args: &'a [&'a str],
         timeout: Duration,
     ) -> DispatchFuture<'a> {
-        self.inner.dispatch(bin, args, timeout)
+        // Clone the inner Arc under the lock, drop the lock,
+        // then run the dispatch through the clone. The async
+        // block doesn't borrow from `self` once `inner` is
+        // captured, so a parallel `re_resolve` never races
+        // with an in-flight nmcli invocation.
+        let inner = self
+            .inner
+            .lock()
+            .expect("AutoNmcliDispatcher inner mutex poisoned")
+            .clone();
+        Box::pin(async move { inner.dispatch(bin, args, timeout).await })
     }
 
     fn strategy_name(&self) -> &'static str {
-        self.inner.strategy_name()
+        self.current_strategy_name()
     }
 }
 
@@ -565,5 +625,60 @@ mod tests {
             }
             other => panic!("expected Transient timeout, got {other:?}"),
         }
+    }
+
+    // ===== AutoNmcliDispatcher::re_resolve =====
+
+    fn map_with_strategy_hint(strategy: &str) -> CapabilityResolutionMap {
+        let mut map = CapabilityResolutionMap::new();
+        map.insert(
+            INTENT_NMCLI_INVOCATION.to_string(),
+            CapabilityResolution::Available {
+                evidence: format!("test fixture: {strategy}"),
+                strategy: Some(strategy.into()),
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn re_resolve_swaps_sudo_to_direct() {
+        let auto =
+            AutoNmcliDispatcher::resolve(&map_with_strategy_hint("sudo"));
+        assert_eq!(auto.current_strategy_name(), "sudo");
+        auto.re_resolve(&map_with_strategy_hint("direct"));
+        assert_eq!(auto.current_strategy_name(), "direct");
+        assert!(auto.rationale().contains("direct"));
+    }
+
+    #[test]
+    fn re_resolve_swaps_direct_to_sudo() {
+        let auto =
+            AutoNmcliDispatcher::resolve(&map_with_strategy_hint("direct"));
+        assert_eq!(auto.current_strategy_name(), "direct");
+        auto.re_resolve(&map_with_strategy_hint("sudo"));
+        assert_eq!(auto.current_strategy_name(), "sudo");
+        assert!(auto.rationale().contains("sudo"));
+    }
+
+    #[test]
+    fn re_resolve_to_unavailable_keeps_direct_with_remedy() {
+        let auto =
+            AutoNmcliDispatcher::resolve(&map_with_strategy_hint("sudo"));
+        let mut updated = CapabilityResolutionMap::new();
+        updated.insert(
+            INTENT_NMCLI_INVOCATION.to_string(),
+            CapabilityResolution::Unavailable {
+                reason: "test: drop-in removed".into(),
+                remedy: "reinstall sudoers".into(),
+            },
+        );
+        auto.re_resolve(&updated);
+        // network.nm policy on Unavailable: keep direct
+        // dispatcher (hardened hosts may still allow direct
+        // exec); carry the remedy in rationale.
+        assert_eq!(auto.current_strategy_name(), "direct");
+        assert!(auto.rationale().contains("framework refused"));
+        assert!(auto.rationale().contains("reinstall sudoers"));
     }
 }
