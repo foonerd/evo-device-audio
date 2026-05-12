@@ -51,13 +51,13 @@ pub enum Preset {
     /// Linux distribution without NM, with systemd-networkd
     /// (typical server posture). Candidates: rtnetlink +
     /// systemd-networkd + Polling. systemd-networkd source
-    /// is reserved for a follow-on backend; today the preset
+    /// is planned for a later backend; today the preset
     /// falls through to rtnetlink + polling alone.
     LinuxSystemdNetworkd,
 
     /// Embedded Yocto distribution with ConnMan. Candidates:
     /// rtnetlink + ConnMan + Polling. ConnMan source is
-    /// reserved for a follow-on backend; today the preset
+    /// planned for a later backend; today the preset
     /// falls through to rtnetlink + polling alone.
     LinuxYoctoConnman,
 
@@ -67,7 +67,7 @@ pub enum Preset {
     LinuxBare,
 
     /// FreeBSD posture. Candidates: devd + Polling. The devd
-    /// source is reserved for a follow-on backend; today the
+    /// source is planned for a later backend; today the
     /// preset falls through to polling alone.
     Bsd,
 
