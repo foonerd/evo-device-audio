@@ -23,6 +23,7 @@
 
 pub mod nmcli_dispatch;
 pub mod rfkill;
+pub mod source;
 pub mod supervisor;
 pub mod wifi_phy;
 pub mod wifi_radio;
