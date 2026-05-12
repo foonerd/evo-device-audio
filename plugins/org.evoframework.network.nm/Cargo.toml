@@ -16,7 +16,7 @@ path = "src/bin/network-nm-wire.rs"
 
 [features]
 # Polling source is always compiled — universal correctness floor.
-default = ["source-rtnetlink"]
+default = ["source-rtnetlink", "source-nm"]
 # Linux kernel netlink subscriber. Observes layer-2 carrier state
 # and layer-3 address attach / detach via RTMGRP_LINK +
 # RTMGRP_IPV4_IFADDR + RTMGRP_IPV6_IFADDR. Linux-only; cfg-gated
@@ -28,6 +28,15 @@ source-rtnetlink = [
     "dep:netlink-packet-core",
     "dep:netlink-proto",
     "dep:netlink-sys",
+    "dep:futures",
+]
+# NetworkManager D-Bus subscriber. Observes the NM
+# `Connectivity` property + per-device `StateChanged` signals
+# via `org.freedesktop.NetworkManager` on the system bus.
+# Linux-only; the source's module is cfg-gated alongside
+# the dependency tree.
+source-nm = [
+    "dep:zbus",
     "dep:futures",
 ]
 
@@ -55,6 +64,12 @@ netlink-packet-core = { version = "0.7", optional = true }
 netlink-proto = { version = "0.11", optional = true }
 netlink-sys = { version = "0.8", optional = true }
 futures = { version = "0.3", optional = true }
+
+# NetworkManager D-Bus subscriber. Pure-Rust async D-Bus
+# client; the system-bus connection backs `org.freedesktop
+# .NetworkManager` PropertiesChanged + Device.StateChanged
+# subscriptions.
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
 
 [lints]
 workspace = true

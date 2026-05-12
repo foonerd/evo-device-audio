@@ -205,6 +205,13 @@ pub mod polling;
 #[cfg(all(feature = "source-rtnetlink", target_os = "linux"))]
 pub mod rtnetlink;
 
+// NetworkManager D-Bus event source. Same gating posture as
+// rtnetlink — feature flag plus `target_os = "linux"` cfg, so
+// non-Linux builds of the plugin compile without the
+// dependency tree.
+#[cfg(all(feature = "source-nm", target_os = "linux"))]
+pub mod nm;
+
 #[cfg(test)]
 mod tests {
     use super::*;
