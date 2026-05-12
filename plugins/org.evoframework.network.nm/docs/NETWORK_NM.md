@@ -284,6 +284,138 @@ Two grace windows gate the recovery actions:
 Both actions emit log lines and reactive events (see
 [Reactive events](#reactive-events)).
 
+## Multi-source event-driven substrate
+
+The supervisor is built on a `LinkEventSource` trait
+abstraction: a stream of typed `LinkEvent`s drives the
+supervisor's wakes, and each wake runs the existing
+compose-observations → state-machine → publish pipeline
+unchanged. Today's `spawn` mounts a single polling source as
+the universal correctness floor; vendor distributions opting
+into the multi-source mode mount additional typed sources
+alongside the polling floor.
+
+### Source set
+
+Three event sources ship in the workspace:
+
+- **Polling.** The universal correctness floor. Wakes every
+  `interval_ms` (default 10 000 ms; bounded below by 5 000 ms
+  per the adaptive-tick hard floor) regardless of what
+  changed on the device. Cgf-free, no dependencies, every
+  platform that can host a shell can host the polling source.
+- **rtnetlink.** Linux kernel netlink subscriber. Observes
+  layer-2 carrier (RTMGRP_LINK) and layer-3 address attach /
+  detach (RTMGRP_IPV4_IFADDR + RTMGRP_IPV6_IFADDR). Cargo
+  feature `source-rtnetlink`, gated on `target_os = "linux"`.
+- **NetworkManager D-Bus.** zbus subscriber to
+  `org.freedesktop.NetworkManager`'s `PropertiesChanged`
+  signal. Surfaces NM's `Connectivity` verdict + the
+  `PrimaryConnection` family of activation-lifecycle
+  changes. Cargo feature `source-nm`, gated on
+  `target_os = "linux"`.
+
+The supervisor's `spawn_with_sources(config, actions, sources)`
+consumes any `Vec<Box<dyn LinkEventSource>>`; each source is
+pumped by its own fan-in task and feeds a shared `mpsc`. The
+compose-observations callback runs after every wake regardless
+of which source produced the event — events are timing,
+observations are data.
+
+### Cross-source reconciliation
+
+The `reconcile::RULES` static slice is the framework's
+explicit rule table for catching userspace-daemon confusion
+modes:
+
+| Rule | Detects |
+| --- | --- |
+| `carrier_down_but_daemon_full` | Kernel reports no carrier but NM advertises Full / Portal / Limited. Trust the kernel; flag the daemon. |
+| `carrier_up_but_daemon_none` | Kernel reports carrier-up + IP attached but NM reports None. Daemon is mid-converge. |
+| `daemons_disagree` | Two userspace daemons report contradictory verdicts. Surface without preferring either. |
+
+Each rule produces a typed `Discrepancy` that surfaces as a
+`LinkSourceDiscrepancy` observation when the rule fires. The
+rule table is *data*, not code — operators read the active
+rules via `describe_capabilities` without source-code access.
+
+### Per-source health monitoring
+
+Every active source runs a `health_probe()` on its own cadence
+(default 60 s). A source that fails its probe transitions to
+`SourceAdmissionState::Demoted` with an
+exponentially-backed-off `next_attempt_at`. Demoted sources
+no longer contribute events; the polling floor + remaining
+sources carry the load. The backoff schedule climbs 30 s →
+60 s → 2 min → 5 min → 15 min → 1 h, capped at 6 h. A
+successful re-probe re-admits the source.
+
+State transitions emit typed observations:
+`LinkSourceDemoted { source, reason }` on demotion,
+`LinkSourceAdmitted { source }` on re-admission.
+
+### Adaptive safety tick
+
+The polling source's tick interval is not a static config
+constant. It is recomputed before every wake from the
+supervisor's recent observations:
+
+- Boot path → `tick_min` (default 10 s).
+- Silence past `silence_threshold` (default 120 s) → shrink
+  to `tick_min`.
+- Otherwise → linear interpolation between `tick_min` and
+  `tick_max` (default 5 min) driven by the
+  healthy / active source ratio.
+
+Hard floor: 5 000 ms. The framework refuses lower values at
+config-validate time. Operators who genuinely need faster
+cadence install another typed source rather than ratcheting
+polling.
+
+### Source-set presets
+
+`presets::Preset` enumerates seven canonical presets:
+
+| Preset | Source candidates |
+| --- | --- |
+| `linux-systemd-nm` | rtnetlink + NetworkManager + polling |
+| `linux-systemd-networkd` | rtnetlink + (planned systemd-networkd) + polling |
+| `linux-yocto-connman` | rtnetlink + (planned ConnMan) + polling |
+| `linux-bare` | rtnetlink + polling |
+| `bsd` | (planned devd) + polling |
+| `polling-only` | polling alone |
+| `embedded-rtos` | native platform source only |
+
+`presets::default_preset()` selects per build target.
+Operators override at config. `build_sources(preset,
+polling_interval_ms)` is the async builder that walks the
+preset's candidate list, attempts to mount each, and returns
+the admitted sources alongside a per-candidate
+`CandidateOutcome` (Admitted or Refused with diagnostic).
+Per-source construction failure is never fatal — the polling
+floor + whatever else admitted carries the load.
+
+### Operational invariants
+
+- The state machine (`classify_reachability` + `step`) is a
+  pure function of `(SupervisorObservations, SupervisorView,
+  SupervisorConfig)`. Multi-source code sits upstream of
+  `step`, composing observations + detecting discrepancies +
+  scoring source health. The state machine consumes the
+  reconciled observation and decides recovery.
+- The polling source is included in every shipping
+  configuration on platforms where it is implementable.
+  Removing it for the sake of "we have D-Bus, we don't need
+  polling" recreates the silent-failure mode the design
+  exists to eliminate.
+- Source `health_probe` failures demote rather than fail the
+  supervisor. A degraded supervisor running on the polling
+  floor is correct; a crashed supervisor is not.
+- Reconciliation rules are data. New rules append to the
+  static `RULES` slice; the source code stays untouched.
+- The `safety_tick_min_ms` hard floor of 5 000 ms is enforced
+  at config-validate time.
+
 ## Wire-op surface
 
 Single-claimant respondent on `networking.link`. Verbs:

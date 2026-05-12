@@ -200,8 +200,9 @@ pub static RULES: &[ReconciliationRule] = &[
     ReconciliationRule {
         id: "daemons_disagree",
         description: "Two userspace daemon sources report contradictory \
-             connectivity verdicts. Surface the disagreement; defer \
-             trust to the kernel-side reconciliation rules above.",
+             connectivity verdicts. Surface the disagreement; the \
+             kernel-side reconciliation rules above carry the trust \
+             decision when one daemon also contradicts the kernel.",
         sources: &["network-manager", "connman", "systemd-networkd"],
         kind: DiscrepancyKind::DaemonsDisagree,
     },
@@ -261,9 +262,9 @@ pub fn detect_discrepancies(
     // Rule 3: two userspace daemons disagree (no kernel
     // preference; the supervisor's downstream rules handle
     // which to trust when one is also contradicting the
-    // kernel). For this iteration only `network-manager` is shipped;
-    // the rule is in place for the future ConnMan +
-    // systemd-networkd backends.
+    // kernel). Only `network-manager` ships as a daemon
+    // source today; the rule sits in place for the planned
+    // ConnMan + systemd-networkd backends.
     let candidate_daemons: &[&'static str] =
         &["network-manager", "connman", "systemd-networkd"];
     let active_daemons: Vec<(&'static str, ConnectivityVerdict)> =
