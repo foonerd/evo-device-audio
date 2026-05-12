@@ -1344,10 +1344,20 @@ impl NetworkNmPlugin {
     /// Spawn the runtime supervisor. Builds probe + recovery
     /// closures that capture Arc-cloned dispatcher state so the
     /// task body is `Send + 'static`. Critical-recovery and
-    /// STA-restore callbacks log the decision and rely on the
-    /// reactive view + wire-op surface — the autonomous-recovery
-    /// apply path wires in the next sub-primitive.
-    fn spawn_supervisor(&mut self) {
+    /// STA-restore callbacks rely on the `Arc<NmInner>` handle
+    /// so the autonomous-recovery apply path is in-process.
+    ///
+    /// The supervisor is wired through `presets::build_sources`
+    /// and `supervisor::spawn_with_sources`, so the multi-source
+    /// fan-in (rtnetlink, NetworkManager D-Bus, polling floor on
+    /// the default Linux preset) is the runtime default. The
+    /// per-candidate `CandidateOutcome` set is logged at INFO so
+    /// operators see what was attempted and what admitted.
+    /// Operators may pin a different preset via the
+    /// `EVO_NETWORK_SUPERVISOR_PRESET` environment variable;
+    /// preset names are the wire identifiers carried in
+    /// `describe_capabilities`.
+    async fn spawn_supervisor(&mut self) {
         let nmcli_exec = self.dispatcher.clone();
         let nmcli_path = self.config.nmcli_path.clone();
         let nmcli_timeout = Duration::from_millis(self.config.nmcli_timeout_ms);
@@ -1357,11 +1367,11 @@ impl NetworkNmPlugin {
         let iw_exec = self.effective_iw_exec();
         let iw_path = self.config.iw_path.clone();
         let iw_timeout = Duration::from_millis(self.config.iw_timeout_ms);
-        let probe_url = supervisor::SupervisorConfig::from_env().probe_url;
         let config = supervisor::SupervisorConfig::from_env();
+        let probe_url = config.probe_url.clone();
         let plugin_tag: &'static str = PLUGIN_NAME;
 
-        let probe: supervisor::SupervisorActions =
+        let actions: supervisor::SupervisorActions =
             supervisor::SupervisorActions {
                 probe: Arc::new(move || {
                     let nmcli_exec = nmcli_exec.clone();
@@ -1407,7 +1417,63 @@ impl NetworkNmPlugin {
                 },
             };
 
-        let task = supervisor::spawn(config, probe, plugin_tag);
+        // Resolve the source preset: env override > target default.
+        // Unknown names fall back to the target default with a
+        // warning so a typo never silently drops the supervisor to
+        // a less-capable preset.
+        let preset = match std::env::var("EVO_NETWORK_SUPERVISOR_PRESET").ok() {
+            Some(name) => match presets::Preset::from_name(name.trim()) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        plugin = plugin_tag,
+                        requested = %name,
+                        fallback = %presets::default_preset(),
+                        "EVO_NETWORK_SUPERVISOR_PRESET unknown; using target default",
+                    );
+                    presets::default_preset()
+                }
+            },
+            None => presets::default_preset(),
+        };
+
+        let (sources, outcomes) =
+            presets::build_sources(preset, config.interval_ms).await;
+
+        for outcome in &outcomes {
+            match &outcome.result {
+                presets::CandidateResult::Admitted => {
+                    tracing::info!(
+                        plugin = plugin_tag,
+                        preset = %preset,
+                        candidate = outcome.name,
+                        "supervisor source admitted",
+                    );
+                }
+                presets::CandidateResult::Refused { reason } => {
+                    tracing::info!(
+                        plugin = plugin_tag,
+                        preset = %preset,
+                        candidate = outcome.name,
+                        reason = %reason,
+                        "supervisor source refused; preset falls through",
+                    );
+                }
+            }
+        }
+
+        if sources.is_empty() {
+            tracing::error!(
+                plugin = plugin_tag,
+                preset = %preset,
+                "supervisor preset admitted zero sources; supervisor not spawned",
+            );
+            return;
+        }
+
+        let task = supervisor::spawn_with_sources(
+            config, actions, sources, plugin_tag,
+        );
         self.supervisor_view_rx = Some(task.view.subscribe());
         self.supervisor = Some(task);
     }
@@ -4098,7 +4164,7 @@ impl Plugin for NetworkNmPlugin {
                 .store(intent.radio_policy.flight_mode, Relaxed);
             self.wifi_preference_enabled
                 .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
-            self.spawn_supervisor();
+            self.spawn_supervisor().await;
             if let Some(rx) = self.supervisor_view_rx.clone() {
                 self.spawn_supervisor_emitter(rx);
             }
