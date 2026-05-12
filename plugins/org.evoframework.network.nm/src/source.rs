@@ -195,6 +195,16 @@ impl fmt::Debug for dyn LinkEventSource {
 
 pub mod polling;
 
+// Linux kernel netlink event source. The `source-rtnetlink`
+// cargo feature gates BOTH the module compilation AND the
+// dependency tree; cross-builds for non-Linux targets disable
+// the feature and the module is absent. Inside the module,
+// `#[cfg(target_os = "linux")]` is an extra defence so a
+// mis-configured feature combination on a non-Linux target
+// produces a compile error rather than a silent stub.
+#[cfg(all(feature = "source-rtnetlink", target_os = "linux"))]
+pub mod rtnetlink;
+
 #[cfg(test)]
 mod tests {
     use super::*;
