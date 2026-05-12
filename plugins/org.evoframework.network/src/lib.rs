@@ -1,7 +1,16 @@
-//! NetworkManager-backed network plugin for the evo framework.
+//! Multi-source network plugin for the evo framework.
 //!
-//! This plugin exposes a NetworkManager-backed control surface to
-//! the evo framework with durable intent persistence:
+//! Stocks the `networking.link` shelf. Composes a unified reachability
+//! verdict by fanning in events from a per-platform source preset
+//! (rtnetlink + NetworkManager D-Bus + universal polling floor on the
+//! default Linux preset; preset selection is env-overridable via
+//! `EVO_NETWORK_SUPERVISOR_PRESET`). Durable intent persistence is
+//! carried in the plugin's state directory.
+//!
+//! Request types are the v1 wire contract carried unchanged across
+//! the canonical-name rename — operators and clients calling
+//! `network.nm.status` / `network.nm.intent.*` / `network.nm.captive.*`
+//! continue to work without a wire-protocol bump:
 //! - `network.nm.status`
 //! - `network.nm.scan`
 //! - `network.nm.intent.get`
@@ -13,9 +22,9 @@
 //! - `network.nm.captive.complete`
 //!
 //! Request/response contracts and scenario coverage live under:
-//! - `docs/NETWORK_NM_REQUESTS_V1.md`
+//! - `docs/NETWORK_REQUESTS_V1.md`
 //! - `docs/CAPTIVE_PORTAL_WORKFLOW.md`
-//! - `docs/NETWORK_NM_RUNBOOK.md`
+//! - `docs/NETWORK_RUNBOOK.md`
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -69,7 +78,7 @@ use std::os::unix::fs::PermissionsExt;
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 /// Reverse-DNS plugin name.
-pub const PLUGIN_NAME: &str = "org.evoframework.network.nm";
+pub const PLUGIN_NAME: &str = "org.evoframework.network";
 
 const REQUEST_NETWORK_STATUS: &str = "network.nm.status";
 const REQUEST_NETWORK_SCAN: &str = "network.nm.scan";
@@ -110,7 +119,7 @@ const ENV_SECRET_REQUIRE: &str = "EVO_NETWORK_SECRET_REQUIRE";
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML)
-        .expect("org-evoframework-network-nm: embedded manifest must parse")
+        .expect("org-evoframework-network: embedded manifest must parse")
 }
 
 fn plugin_crate_version() -> semver::Version {
@@ -712,7 +721,7 @@ fn default_secret_schema_version() -> u32 {
 
 fn derive_secret_key(raw: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"org.evoframework.network.nm:secret-key:v1:");
+    hasher.update(b"org.evoframework.network:secret-key:v1:");
     hasher.update(raw.trim().as_bytes());
     let digest = hasher.finalize();
     let mut key = [0u8; 32];
@@ -1162,7 +1171,7 @@ pub struct NmInner {
 /// state and the apply pipeline live on `NmInner`; this struct
 /// auto-dereferences to it so wire-op handlers continue to read
 /// state and call helpers via `self.X` unchanged.
-pub struct NetworkNmPlugin {
+pub struct NetworkPlugin {
     /// Shared I/O state + behaviour. Cloned into the supervisor
     /// task's closures so autonomous recovery can invoke the
     /// apply pipeline.
@@ -1187,7 +1196,7 @@ struct SupervisorEmitterHandle {
     shutdown: Arc<tokio::sync::Notify>,
 }
 
-impl std::ops::Deref for NetworkNmPlugin {
+impl std::ops::Deref for NetworkPlugin {
     type Target = NmInner;
     fn deref(&self) -> &NmInner {
         &self.inner
@@ -1237,7 +1246,7 @@ struct CapabilitiesWatcherHandle {
     refresh_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl NetworkNmPlugin {
+impl NetworkPlugin {
     /// Construct a plugin instance.
     pub fn new() -> Self {
         Self {
@@ -3948,13 +3957,13 @@ impl NmInner {
     }
 }
 
-impl Default for NetworkNmPlugin {
+impl Default for NetworkPlugin {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Plugin for NetworkNmPlugin {
+impl Plugin for NetworkPlugin {
     fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
         use evo_plugin_sdk::privileges::{
             BinaryPresentProbe, ProbePlan, SudoersCommandProbe,
@@ -4268,7 +4277,7 @@ impl Plugin for NetworkNmPlugin {
     }
 }
 
-impl Respondent for NetworkNmPlugin {
+impl Respondent for NetworkPlugin {
     fn handle_request<'a>(
         &'a mut self,
         req: &'a Request,
@@ -5499,7 +5508,7 @@ mod tests {
 
     #[tokio::test]
     async fn describe_matches_manifest() {
-        let p = NetworkNmPlugin::new();
+        let p = NetworkPlugin::new();
         let d = p.describe().await;
         let m = manifest();
         assert_eq!(d.identity.name, m.plugin.name);
@@ -5509,7 +5518,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_unhealthy_before_load() {
-        let p = NetworkNmPlugin::new();
+        let p = NetworkPlugin::new();
         assert!(matches!(
             p.health_check().await.status,
             HealthStatus::Unhealthy
@@ -5613,7 +5622,7 @@ hotspot_fallback = true
 
     #[test]
     fn select_sta_candidate_honors_lock_bssid() {
-        let plugin = NetworkNmPlugin::new();
+        let plugin = NetworkPlugin::new();
         let wifi = WifiIntent {
             sta_ssid: "HotelWiFi".to_string(),
             sta_lock_bssid: "AA:BB:CC:DD:EE:FF".to_string(),
@@ -5645,7 +5654,7 @@ hotspot_fallback = true
 
     #[test]
     fn select_sta_candidate_prefers_performance_band() {
-        let plugin = NetworkNmPlugin::new();
+        let plugin = NetworkPlugin::new();
         let wifi = WifiIntent {
             sta_ssid: "HotelWiFi".to_string(),
             sta_selection_mode: StaSelectionMode::AutoPerformance,
@@ -5893,7 +5902,7 @@ require_encrypted = true
     #[tokio::test]
     async fn load_intent_falls_back_to_lkg_shadow_on_primary_parse_error() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         let primary = p.intent_path().expect("intent path");
         let lkg = lkg_shadow_path(&primary);
@@ -5990,7 +5999,7 @@ version = 1
     #[tokio::test]
     async fn save_intent_and_captive_state_write_schema_envelopes() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
 
         let intent = NetworkIntent::default();
@@ -6026,7 +6035,7 @@ version = 1
     #[tokio::test]
     async fn write_secret_encrypts_when_key_configured() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config.secret_key = Some(derive_secret_key("test-key"));
         p.write_optional_secret(
@@ -6050,7 +6059,7 @@ version = 1
     #[tokio::test]
     async fn read_plaintext_secret_rejected_when_encryption_required() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().require_encrypted_secrets.store(true, Relaxed);
         let path = p.sta_psk_path().expect("path");
@@ -6082,7 +6091,7 @@ version = 1
     #[tokio::test]
     async fn request_flow_intent_set_and_get_roundtrip() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6178,7 +6187,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6247,7 +6256,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6313,7 +6322,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6421,7 +6430,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6475,7 +6484,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6523,7 +6532,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6569,7 +6578,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6630,7 +6639,7 @@ exit 0\n",
         )
         .expect("chmod");
 
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().config = PluginConfig::defaults();
         p.inner_mut().config.nmcli_path =
             nmcli_path.to_string_lossy().to_string();
@@ -6645,7 +6654,7 @@ exit 0\n",
     #[tokio::test]
     async fn request_flow_security_status_and_harden_encrypts_plaintext() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();
@@ -6703,7 +6712,7 @@ exit 0\n",
     #[tokio::test]
     async fn request_flow_security_harden_rejects_without_key() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut p = NetworkNmPlugin::new();
+        let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
         p.inner_mut().config = PluginConfig::defaults();

@@ -31,7 +31,7 @@ org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.com
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
 org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
-org-evoframework-network-nm = { path = "../../plugins/org.evoframework.network.nm" }
+org-evoframework-network = { path = "../../plugins/org.evoframework.network" }
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.

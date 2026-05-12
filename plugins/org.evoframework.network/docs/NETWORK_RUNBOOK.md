@@ -1,6 +1,6 @@
 # `network.nm` operations runbook
 
-This runbook is for operators maintaining `org.evoframework.network.nm` in field
+This runbook is for operators maintaining `org.evoframework.network` in field
 deployments (from constrained SBC targets to high-core servers).
 
 ## 1) Quick triage

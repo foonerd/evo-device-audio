@@ -25,7 +25,7 @@ isolation: oop
 #   - org.evoframework.artwork.local (filesystem/library + state)
 #   - org.evoframework.composition.alsa (alsa/control via `audio` group)
 #   - org.evoframework.playback.mpd (mpd binary + mpd.service control socket)
-#   - org.evoframework.network.nm (NetworkManager via D-Bus + polkit + `netdev` group)
+#   - org.evoframework.network (NetworkManager via D-Bus + polkit + `netdev` group)
 
 capability_intent:
   - id: bootstrap_steward_unit
@@ -56,7 +56,7 @@ capability_intent:
 required_binaries:
   - name: nmcli
     min_version: "1.30"
-    failure_mode: org.evoframework.network.nm refuses to admit; structured event.
+    failure_mode: org.evoframework.network refuses to admit; structured event.
   - name: mpd
     failure_mode: org.evoframework.playback.mpd refuses to admit; structured event.
 

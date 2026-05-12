@@ -1,6 +1,6 @@
 # Captive portal workflow
 
-This document defines what `org.evoframework.network.nm` handles directly and
+This document defines what `org.evoframework.network` handles directly and
 which cases require UI/browser support.
 
 ## Supported plugin-side flow
