@@ -1,4 +1,4 @@
-# `org.evoframework.network.nm`
+# `org.evoframework.network`
 
 NetworkManager-backed link-control plugin for the evo framework.
 Owns the `networking.link` shelf at shape 1; single-claimant per
@@ -441,7 +441,7 @@ Single-claimant respondent on `networking.link`. Verbs:
 | `network.nm.wifi_devices` | read | Live multi-radio inventory — one row per kernel netdev with PHY capability + per-band support + connection class |
 
 Per-verb payload contracts are documented in
-`NETWORK_NM_REQUESTS_V1.md` (existing); the schema-repo
+`NETWORK_REQUESTS_V1.md` (existing); the schema-repo
 descriptor declares each verb with `payload_in = "tbd-review"`
 pending the cross-plugin payload review.
 
@@ -570,4 +570,4 @@ authentication required, etc.).
 
 For step-by-step operational procedures — provisioning a fresh
 device, recovering from a misconfigured intent, migrating PSK
-sidecars to encrypted form — see `NETWORK_NM_RUNBOOK.md`.
+sidecars to encrypted form — see `NETWORK_RUNBOOK.md`.

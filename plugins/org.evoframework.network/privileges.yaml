@@ -1,5 +1,5 @@
 schema_version: "1.0"
-plugin: org.evoframework.network.nm
+plugin: org.evoframework.network
 owner: evo-device-audio
 isolation: in_process
 

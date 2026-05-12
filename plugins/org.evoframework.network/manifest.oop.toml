@@ -1,5 +1,5 @@
 [plugin]
-name = "org.evoframework.network.nm"
+name = "org.evoframework.network"
 version = "0.1.0"
 contract = 1
 
@@ -12,8 +12,8 @@ instance = "singleton"
 interaction = "respondent"
 
 [transport]
-type = "in-process"
-exec = "<compiled-in>"
+type = "out-of-process"
+exec = "plugin.bin"
 
 [trust]
 class = "standard"
@@ -49,9 +49,5 @@ request_types = [
     "network.nm.security.harden",
     "network.nm.flight_mode.get",
     "network.nm.flight_mode.set",
-    "network.nm.radio.status",
-    "network.nm.radio.set",
-    "network.nm.supervisor.status",
-    "network.nm.wifi_devices",
 ]
 response_budget_ms = 15000

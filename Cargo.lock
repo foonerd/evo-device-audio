@@ -1303,7 +1303,7 @@ dependencies = [
  "evo-plugin-sdk",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
- "org-evoframework-network-nm",
+ "org-evoframework-network",
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
  "tokio",
@@ -3150,7 +3150,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "org-evoframework-network-nm"
+name = "org-evoframework-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",

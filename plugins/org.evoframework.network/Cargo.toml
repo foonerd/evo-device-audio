@@ -1,18 +1,18 @@
 [package]
-name = "org-evoframework-network-nm"
+name = "org-evoframework-network"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NetworkManager-based network plugin for the evo framework. Stocks the networking.link shelf."
+description = "Multi-source network plugin for the evo framework. Stocks the networking.link shelf; fans in from rtnetlink (kernel netlink), NetworkManager D-Bus, and a universal polling floor under a per-platform source preset."
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "network-nm-wire"
-path = "src/bin/network-nm-wire.rs"
+name = "network-wire"
+path = "src/bin/network-wire.rs"
 
 [features]
 # Polling source is always compiled — universal correctness floor.

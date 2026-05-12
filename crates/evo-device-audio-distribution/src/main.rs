@@ -33,11 +33,14 @@
 //!   audiophile-grade settings; emits a `PluginEvent` on
 //!   every change that delivery.alsa consumes to re-render
 //!   the pipeline.
-//! - `org.evoframework.network.nm` — NetworkManager-backed
-//!   networking surface; consumes the framework's PPAG
-//!   resolution for the `nmcli_invocation` intent to install
-//!   an EUID-aware dispatch composite (direct under root,
-//!   `sudo -n` under a non-root service user).
+//! - `org.evoframework.network` — multi-source network
+//!   surface; fans in from rtnetlink, NetworkManager D-Bus,
+//!   and a universal polling floor under a per-platform
+//!   source preset (env-overridable via
+//!   `EVO_NETWORK_SUPERVISOR_PRESET`); consumes the framework's
+//!   PPAG resolution for the `nmcli_invocation` intent to
+//!   install an EUID-aware dispatch composite (direct under
+//!   root, `sudo -n` under a non-root service user).
 //!
 //! The remaining plugins (metadata.local / artwork.local)
 //! join the admission setup as their reshape lands.
@@ -64,7 +67,7 @@ use evo::AdmissionSetup;
 use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
-use org_evoframework_network_nm::NetworkNmPlugin;
+use org_evoframework_network::NetworkPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 use org_evoframework_playback_options::PlaybackOptionsPlugin;
 
@@ -157,11 +160,13 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting playback.options")?;
 
-            // 5. network.nm: singleton respondent on
-            //    networking.link shape 1. NetworkManager-
-            //    backed networking surface (status / scan /
-            //    intent / captive-portal / security /
-            //    flight-mode). Holds an
+            // 5. network: singleton respondent on
+            //    networking.link shape 1. Multi-source
+            //    networking surface (status / scan / intent /
+            //    captive-portal / security / flight-mode);
+            //    fans in from rtnetlink + NetworkManager
+            //    D-Bus + universal polling floor under a
+            //    per-platform source preset. Holds an
             //    [`NmcliDispatcher`] composite that the
             //    framework's PPAG runner stamps from the
             //    `nmcli_invocation` resolution at admission
@@ -171,15 +176,15 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    NOPASSWD drop-in without re-probing on each
             //    call.
             let network_nm_manifest =
-                Manifest::from_toml(org_evoframework_network_nm::MANIFEST_TOML)
-                    .context("parsing network.nm manifest")?;
+                Manifest::from_toml(org_evoframework_network::MANIFEST_TOML)
+                    .context("parsing network manifest")?;
             engine
                 .admit_singleton_respondent(
-                    NetworkNmPlugin::new(),
+                    NetworkPlugin::new(),
                     network_nm_manifest,
                 )
                 .await
-                .context("admitting network.nm")?;
+                .context("admitting network")?;
 
             Ok(())
         })

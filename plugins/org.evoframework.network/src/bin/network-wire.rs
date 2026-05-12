@@ -1,11 +1,11 @@
-//! Out-of-process wire binary for `org.evoframework.network.nm`.
+//! Out-of-process wire binary for `org.evoframework.network`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use anyhow::{anyhow, Result};
 use evo_plugin_sdk::host::{run_oop, HostConfig};
-use org_evoframework_network_nm::{NetworkNmPlugin, PLUGIN_NAME};
+use org_evoframework_network::{NetworkPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -16,15 +16,15 @@ async fn main() -> Result<()> {
     tracing::info!(
         plugin = PLUGIN_NAME,
         socket = %socket_path.display(),
-        "network-nm-wire starting"
+        "network-wire starting"
     );
     run_oop(
-        NetworkNmPlugin::new(),
+        NetworkPlugin::new(),
         HostConfig::new(PLUGIN_NAME),
         &socket_path,
     )
     .await?;
-    tracing::info!("network-nm-wire: steward disconnected, exiting");
+    tracing::info!("network-wire: steward disconnected, exiting");
     Ok(())
 }
 
@@ -42,10 +42,10 @@ fn parse_args() -> Result<PathBuf> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .ok_or_else(|| anyhow!("usage: network-nm-wire <socket-path>"))?;
+        .ok_or_else(|| anyhow!("usage: network-wire <socket-path>"))?;
     if args.next().is_some() {
         return Err(anyhow!(
-            "usage: network-nm-wire <socket-path> (too many arguments)"
+            "usage: network-wire <socket-path> (too many arguments)"
         ));
     }
     Ok(PathBuf::from(path))
