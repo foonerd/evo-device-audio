@@ -21,6 +21,7 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+pub mod adaptive_tick;
 pub mod health;
 pub mod nmcli_dispatch;
 pub mod reconcile;
