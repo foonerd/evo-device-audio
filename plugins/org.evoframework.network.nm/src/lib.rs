@@ -24,6 +24,7 @@
 pub mod adaptive_tick;
 pub mod health;
 pub mod nmcli_dispatch;
+pub mod presets;
 pub mod reconcile;
 pub mod rfkill;
 pub mod source;
