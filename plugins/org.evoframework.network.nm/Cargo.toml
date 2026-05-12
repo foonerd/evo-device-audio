@@ -16,10 +16,12 @@ path = "src/bin/network-nm-wire.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = "0.1"
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = "1"
 tokio = { workspace = true, features = ["process", "fs"] }
 toml = { workspace = true }
 tracing = { workspace = true }
