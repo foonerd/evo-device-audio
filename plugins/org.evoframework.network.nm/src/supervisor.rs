@@ -33,7 +33,7 @@
 //! futures so unit tests can substitute deterministic fakes.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
@@ -382,59 +382,153 @@ impl SupervisorTask {
     }
 }
 
-/// Spawn the supervisor's probe loop. Returns a handle the
-/// plugin owns and shuts down at unload time. The task ticks
-/// every `config.interval_ms` until `shutdown.notify_one()` is
-/// called or the watch receiver count drops to zero (sender
-/// would still be live; the loop guards against panic in the
-/// observed action callbacks by catching `JoinError` upstream).
+/// Spawn the supervisor with today's default single-source
+/// configuration: a polling event source at
+/// `config.interval_ms`. Equivalent to
+/// [`spawn_with_sources`] called with one
+/// [`crate::source::polling::PollingEventSource`].
+///
+/// External behaviour matches today exactly: an initial
+/// probe at startup, subsequent probes every
+/// `interval_ms`, recovery callbacks fired on
+/// state-machine decisions.
 pub fn spawn(
     config: SupervisorConfig,
     actions: SupervisorActions,
     plugin_log_tag: &'static str,
 ) -> SupervisorTask {
+    let polling =
+        crate::source::polling::PollingEventSource::new(config.interval_ms);
+    spawn_with_sources(config, actions, vec![Box::new(polling)], plugin_log_tag)
+}
+
+/// Spawn the supervisor consuming an arbitrary set of
+/// [`crate::source::LinkEventSource`] implementations.
+///
+/// Each source runs in its own fan-in task and pushes
+/// every emitted event into a shared `mpsc` queue. The
+/// supervisor's main loop awaits on the queue, runs the
+/// `compose_observations` callback after every wake, and
+/// applies the existing `step` state machine. Wire-side
+/// behaviour is identical whether one source or many drive
+/// the wakes — events are timing, observations are data.
+///
+/// The supervisor fires an explicit initial probe at boot
+/// before entering the source-consumption loop, so the
+/// first wire-op-readable snapshot reflects the device's
+/// current state without waiting on a source.
+///
+/// Sources are *consumed* by the supervisor; the caller
+/// hands them in as `Vec<Box<dyn LinkEventSource>>`.
+/// Empty source lists are refused — at least the polling
+/// source must be present, or the supervisor never wakes.
+pub fn spawn_with_sources(
+    config: SupervisorConfig,
+    actions: SupervisorActions,
+    mut sources: Vec<Box<dyn crate::source::LinkEventSource>>,
+    plugin_log_tag: &'static str,
+) -> SupervisorTask {
+    assert!(
+        !sources.is_empty(),
+        "supervisor: at least one LinkEventSource is required \
+         (the polling source is the universal-floor implementation)"
+    );
+
     let (view_tx, _view_rx_initial) = watch::channel(SupervisorView::default());
     let shutdown = Arc::new(Notify::new());
+    // Separate notifier for source-task shutdown. The main
+    // task fans wakes out to every parked source on exit;
+    // `notify_one` on the main shutdown is consumed by the
+    // main task only, and `notify_waiters` on the source
+    // shutdown wakes every parked source at once. Splitting
+    // the surfaces avoids the multi-waiter starvation that
+    // a single shared `Notify` exhibits when more than one
+    // task awaits it.
+    let source_shutdown = Arc::new(Notify::new());
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<SourceEvent>(128);
+
+    // One fan-in task per source. Each pumps its events
+    // into the shared channel until the source returns
+    // `None` (shutdown signalled or stream ended) or the
+    // channel's receiver drops.
+    for source in sources.drain(..) {
+        let source_name = source.name();
+        let s_shutdown = Arc::clone(&source_shutdown);
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut source = source;
+            while let Some(event) = source.next_event(&s_shutdown).await {
+                if tx
+                    .send(SourceEvent {
+                        source: source_name,
+                        event,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            tracing::debug!(
+                plugin = plugin_log_tag,
+                source = source_name,
+                "supervisor: source stream ended"
+            );
+        });
+    }
+    drop(event_tx);
+
     let task_shutdown = Arc::clone(&shutdown);
+    let task_source_shutdown = Arc::clone(&source_shutdown);
     let task_view = view_tx.clone();
+    let actions_for_task = actions.clone();
     let task = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(config.interval_ms));
-        // First tick fires immediately; subsequent ticks honour
-        // the configured cadence. Skip if a previous tick took
-        // longer than the interval (no burst-catchup).
-        interval
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Initial probe — guarantees the first wire-op
+        // `network.nm.supervisor.status` read sees a
+        // populated SupervisorView regardless of how slowly
+        // the first source produces its first event.
+        run_probe_cycle(
+            &actions_for_task,
+            &task_view,
+            &config,
+            plugin_log_tag,
+            "boot",
+        )
+        .await;
+
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    let obs = (actions.probe)().await;
-                    let prev = task_view.borrow().clone();
-                    let (next, decision) = step(&prev, obs, &config);
-                    // Best-effort publish — receivers dropping
-                    // is fine; the task carries on.
-                    let _ = task_view.send(next.clone());
-                    match decision {
-                        SupervisorDecision::NoAction => {}
-                        SupervisorDecision::RaiseCriticalRecovery => {
-                            tracing::warn!(
-                                plugin = plugin_log_tag,
-                                reachability = ?next.reachability,
-                                state_ticks = next.state_ticks,
-                                "supervisor: raising critical-recovery hotspot"
-                            );
-                            (actions.raise_critical_recovery)().await;
-                        }
-                        SupervisorDecision::RestoreSta => {
-                            tracing::info!(
-                                plugin = plugin_log_tag,
-                                reachability = ?next.reachability,
-                                state_ticks = next.state_ticks,
-                                "supervisor: restoring STA after recovery"
-                            );
-                            (actions.restore_sta)().await;
-                        }
-                    }
+                maybe_event = event_rx.recv() => {
+                    let Some(SourceEvent { source, event }) = maybe_event
+                    else {
+                        // All fan-in tasks dropped their senders —
+                        // sources are gone. Continue running on the
+                        // shutdown channel only; existing wire-op
+                        // readers still see the last published view.
+                        tracing::warn!(
+                            plugin = plugin_log_tag,
+                            "supervisor: all sources ended; entering shutdown-only mode"
+                        );
+                        // Without sources we have nothing else to do
+                        // until shutdown signals.
+                        let _ = task_shutdown.notified().await;
+                        break;
+                    };
+                    tracing::trace!(
+                        plugin = plugin_log_tag,
+                        source = source,
+                        kind = event.kind(),
+                        "supervisor: source event"
+                    );
+                    run_probe_cycle(
+                        &actions_for_task,
+                        &task_view,
+                        &config,
+                        plugin_log_tag,
+                        source,
+                    )
+                    .await;
                 }
                 _ = task_shutdown.notified() => {
                     tracing::debug!(
@@ -445,11 +539,62 @@ pub fn spawn(
                 }
             }
         }
+        // Fan the shutdown out to every parked source task
+        // so the runtime doesn't orphan them.
+        task_source_shutdown.notify_waiters();
     });
+
     SupervisorTask {
         task,
         shutdown,
         view: view_tx,
+    }
+}
+
+/// One event fanned in from a per-source task.
+#[derive(Debug, Clone)]
+struct SourceEvent {
+    source: &'static str,
+    event: crate::source::LinkEvent,
+}
+
+/// Run one probe → step → publish cycle. Extracted so the
+/// boot probe and the event-driven probe share one
+/// pipeline, satisfying the ADR invariant that every wake
+/// exits through the same compose-step-publish path.
+async fn run_probe_cycle(
+    actions: &SupervisorActions,
+    view_tx: &watch::Sender<SupervisorView>,
+    config: &SupervisorConfig,
+    plugin_log_tag: &'static str,
+    trigger: &'static str,
+) {
+    let obs = (actions.probe)().await;
+    let prev = view_tx.borrow().clone();
+    let (next, decision) = step(&prev, obs, config);
+    let _ = view_tx.send(next.clone());
+    match decision {
+        SupervisorDecision::NoAction => {}
+        SupervisorDecision::RaiseCriticalRecovery => {
+            tracing::warn!(
+                plugin = plugin_log_tag,
+                trigger,
+                reachability = ?next.reachability,
+                state_ticks = next.state_ticks,
+                "supervisor: raising critical-recovery hotspot"
+            );
+            (actions.raise_critical_recovery)().await;
+        }
+        SupervisorDecision::RestoreSta => {
+            tracing::info!(
+                plugin = plugin_log_tag,
+                trigger,
+                reachability = ?next.reachability,
+                state_ticks = next.state_ticks,
+                "supervisor: restoring STA after recovery"
+            );
+            (actions.restore_sta)().await;
+        }
     }
 }
 
@@ -617,5 +762,176 @@ mod tests {
         let (view, _) = step(&prev, obs_online(), &config);
         assert_eq!(view.reachability, ReachabilityState::Online);
         assert!(view.portal.is_none());
+    }
+
+    // -----------------------------------------------------
+    // spawn_with_sources integration tests — verify the
+    // multi-source consumer composes the trait + state
+    // machine pipeline correctly.
+    // -----------------------------------------------------
+
+    use crate::source::{LinkEvent, LinkEventSource, LinkSourceCapabilities};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory test source that fires `count` events then
+    /// stops responding (returns `None` on subsequent
+    /// next_event calls). Drives deterministic supervisor
+    /// tests without sleeping.
+    struct ScriptedSource {
+        name: &'static str,
+        events: std::sync::Mutex<std::collections::VecDeque<LinkEvent>>,
+        capabilities: LinkSourceCapabilities,
+    }
+
+    impl ScriptedSource {
+        fn new(name: &'static str, events: Vec<LinkEvent>) -> Self {
+            Self {
+                name,
+                events: std::sync::Mutex::new(events.into_iter().collect()),
+                capabilities: LinkSourceCapabilities::polling(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LinkEventSource for ScriptedSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn capabilities(&self) -> LinkSourceCapabilities {
+            self.capabilities
+        }
+        async fn next_event(&mut self, shutdown: &Notify) -> Option<LinkEvent> {
+            // Pop one event; on empty, wait for shutdown.
+            let event = self.events.lock().unwrap().pop_front();
+            match event {
+                Some(e) => Some(e),
+                None => {
+                    shutdown.notified().await;
+                    None
+                }
+            }
+        }
+    }
+
+    fn echo_actions(probe_count: Arc<AtomicUsize>) -> SupervisorActions {
+        let probe = Arc::new(move || {
+            let probe_count = Arc::clone(&probe_count);
+            Box::pin(async move {
+                probe_count.fetch_add(1, Ordering::Relaxed);
+                obs_online()
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = SupervisorObservations>
+                            + Send,
+                    >,
+                >
+        });
+        let noop = Arc::new(|| {
+            Box::pin(async {})
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                >
+        });
+        SupervisorActions {
+            probe,
+            raise_critical_recovery: noop.clone(),
+            restore_sta: noop,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_with_sources_fires_boot_probe_before_any_event() {
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let actions = echo_actions(Arc::clone(&probe_count));
+        // Source that never produces an event — its events
+        // queue is empty, so it parks on shutdown.
+        let source = Box::new(ScriptedSource::new("scripted-empty", vec![]));
+        let task = spawn_with_sources(
+            SupervisorConfig::default(),
+            actions,
+            vec![source],
+            "test",
+        );
+        // Yield enough for the boot probe to run.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            probe_count.load(Ordering::Relaxed) >= 1,
+            "boot probe must fire exactly once before any source event"
+        );
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_with_sources_runs_probe_per_event() {
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let actions = echo_actions(Arc::clone(&probe_count));
+        let source = Box::new(ScriptedSource::new(
+            "scripted-three",
+            vec![
+                LinkEvent::InterfaceStateChanged {
+                    interface: Some("wlan0".into()),
+                },
+                LinkEvent::ConnectivityChanged,
+                LinkEvent::WifiAssociationChanged { associated: true },
+            ],
+        ));
+        let task = spawn_with_sources(
+            SupervisorConfig::default(),
+            actions,
+            vec![source],
+            "test",
+        );
+        // Let the boot probe + 3 event-driven probes run.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // 1 boot + 3 events = 4 probes minimum.
+        assert!(
+            probe_count.load(Ordering::Relaxed) >= 4,
+            "expected ≥4 probes (boot + 3 events); got {}",
+            probe_count.load(Ordering::Relaxed)
+        );
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_with_sources_multi_source_fans_in_independently() {
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let actions = echo_actions(Arc::clone(&probe_count));
+        let source_a = Box::new(ScriptedSource::new(
+            "source-a",
+            vec![LinkEvent::ConnectivityChanged; 3],
+        ));
+        let source_b = Box::new(ScriptedSource::new(
+            "source-b",
+            vec![LinkEvent::InterfaceStateChanged { interface: None }; 2],
+        ));
+        let task = spawn_with_sources(
+            SupervisorConfig::default(),
+            actions,
+            vec![source_a, source_b],
+            "test",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // 1 boot + 5 events = 6 probes minimum.
+        assert!(
+            probe_count.load(Ordering::Relaxed) >= 6,
+            "expected ≥6 probes (boot + 3 from a + 2 from b); got {}",
+            probe_count.load(Ordering::Relaxed)
+        );
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "at least one LinkEventSource is required")]
+    async fn spawn_with_sources_refuses_empty_source_list() {
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let actions = echo_actions(probe_count);
+        let _ = spawn_with_sources(
+            SupervisorConfig::default(),
+            actions,
+            vec![],
+            "test",
+        );
     }
 }
