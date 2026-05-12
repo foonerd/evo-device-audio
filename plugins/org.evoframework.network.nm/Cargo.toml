@@ -14,6 +14,23 @@ path = "src/lib.rs"
 name = "network-nm-wire"
 path = "src/bin/network-nm-wire.rs"
 
+[features]
+# Polling source is always compiled — universal correctness floor.
+default = ["source-rtnetlink"]
+# Linux kernel netlink subscriber. Observes layer-2 carrier state
+# and layer-3 address attach / detach via RTMGRP_LINK +
+# RTMGRP_IPV4_IFADDR + RTMGRP_IPV6_IFADDR. Linux-only; cfg-gated
+# at the module level so non-Linux builds of the plugin compile
+# without the dependency.
+source-rtnetlink = [
+    "dep:rtnetlink",
+    "dep:netlink-packet-route",
+    "dep:netlink-packet-core",
+    "dep:netlink-proto",
+    "dep:netlink-sys",
+    "dep:futures",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = "0.1"
@@ -30,6 +47,14 @@ base64 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
+
+# Rtnetlink event source (Linux only, feature-gated).
+rtnetlink = { version = "0.14", optional = true }
+netlink-packet-route = { version = "0.19", optional = true }
+netlink-packet-core = { version = "0.7", optional = true }
+netlink-proto = { version = "0.11", optional = true }
+netlink-sys = { version = "0.8", optional = true }
+futures = { version = "0.3", optional = true }
 
 [lints]
 workspace = true
