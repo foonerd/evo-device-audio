@@ -22,6 +22,7 @@
 #![allow(clippy::manual_async_fn)]
 
 pub mod nmcli_dispatch;
+pub mod reconcile;
 pub mod rfkill;
 pub mod source;
 pub mod supervisor;
