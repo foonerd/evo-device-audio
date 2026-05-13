@@ -124,10 +124,10 @@ use evo_plugin_sdk::contract::audio_routing::{
     WriteEndpoint,
 };
 use evo_plugin_sdk::contract::{
-    Assignment, BuildInfo, CourseCorrection, CustodyHandle, HealthReport,
-    LoadContext, Plugin, PluginDescription, PluginError, PluginIdentity,
-    RelationAnnouncer, Request, Respondent, Response, RuntimeCapabilities,
-    SubjectAnnouncer, Warden,
+    Assignment, BuildInfo, CourseCorrection, CustodyHandle, ExternalAddressing,
+    HealthReport, LoadContext, Plugin, PluginDescription, PluginError,
+    PluginIdentity, RelationAnnouncer, Request, Respondent, Response,
+    RuntimeCapabilities, SubjectAnnouncer, SubjectStateStreamError, Warden,
 };
 use evo_plugin_sdk::Manifest;
 use tokio::sync::{watch, Notify};
@@ -671,6 +671,163 @@ impl MpdPlaybackPlugin {
         }
     }
 
+    /// Subscribe to the `audio.options.settings` subject the
+    /// `playback.options` plugin announces; pipe operator
+    /// mixer-mode changes into `mixer_config_tx` so the
+    /// fragment-writer worker re-renders mpd.conf on every
+    /// change.
+    ///
+    /// Reads the initial settings via the subject querier so
+    /// the worker has the operator's choice on first render,
+    /// then loops on the state stream for subsequent changes.
+    /// Hardware-mode degrade: a `MixerType::Hardware` choice
+    /// with an empty `mixer_device` or `mixer_control` is
+    /// translated to `MixerConfig::Software` plus an operator-
+    /// visible WARN-level log; the framework's
+    /// happening-emitter / observability layer surfaces the
+    /// downgrade through the audit chain.
+    ///
+    /// Best-effort: if the subscriber handle is absent (OOP
+    /// transport before the wire surface lands) or the
+    /// addressing does not resolve yet (admission ordering
+    /// race where playback.mpd loads before playback.options),
+    /// the function logs and returns. The plugin's own
+    /// config-table fallback continues to honour `mixer_type`
+    /// from `/etc/evo/plugins.d/playback.mpd.toml`.
+    async fn spawn_options_settings_subscriber(&self, ctx: &LoadContext) {
+        let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_state_subscriber not populated (OOP transport \
+                 pre-wire-surface); skipping audio-options subscription"
+            );
+            return;
+        };
+        let Some(querier) = ctx.subject_querier.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_querier not populated; skipping audio-options \
+                 subscription"
+            );
+            return;
+        };
+
+        let addressing = ExternalAddressing {
+            scheme: "evo.audio.options".to_string(),
+            value: "settings".to_string(),
+        };
+        let canonical_id =
+            match querier.resolve_addressing(addressing.clone()).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    // playback.options has not announced yet —
+                    // expected on admission orderings where
+                    // playback.mpd admits first. The subject-
+                    // state subscriber accepts subscriptions for
+                    // future canonical ids, but resolve_addressing
+                    // returns None until announce lands. For v1
+                    // close-out we skip; operator mixer-mode
+                    // changes via wire op after both plugins are
+                    // up rely on the next steward restart picking
+                    // up the subscription. The dynamic-update
+                    // surface for THIS startup cycle stays on the
+                    // plugin's own config-table fallback.
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "audio-options settings subject not yet announced; \
+                     subscriber not wired this cycle (plugin's config \
+                     table remains the operator surface)"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "resolve_addressing for audio-options settings failed"
+                    );
+                    return;
+                }
+            };
+
+        // Subscribe FIRST so we cannot miss a state change
+        // that lands between current_state and subscribe; then
+        // read current_state to seed the initial mixer config.
+        let mut stream =
+            match subscriber.subscribe_subject(canonical_id.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "subscribe to audio-options settings subject failed"
+                    );
+                    return;
+                }
+            };
+        let initial_state =
+            match subscriber.current_state(canonical_id.clone()).await {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "read audio-options settings current_state failed; \
+                         subscription continues without initial seed"
+                    );
+                    None
+                }
+            };
+
+        let mixer_tx = self.mixer_config_tx.clone();
+        // Seed mixer_config_tx from the initial subject state
+        // (if any) BEFORE spawning the loop. This guarantees
+        // the fragment-writer renders the operator's choice on
+        // its first cycle.
+        if let Some(state) = initial_state {
+            if let Some(cfg) = parse_mixer_config_from_settings_state(&state) {
+                let _ = mixer_tx.send(cfg);
+            }
+        }
+
+        tokio::spawn(async move {
+            loop {
+                match stream.recv().await {
+                    Ok(update) => {
+                        if let Some(state) = update.state.as_ref() {
+                            if let Some(cfg) =
+                                parse_mixer_config_from_settings_state(state)
+                            {
+                                let _ = mixer_tx.send(cfg);
+                            }
+                        }
+                    }
+                    Err(SubjectStateStreamError::Lagged { dropped }) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            dropped = dropped,
+                            "audio-options subject stream lagged; \
+                             continuing at the live frame"
+                        );
+                        // Stream auto-rejoins on next recv;
+                        // missed updates surface via the next
+                        // state change.
+                    }
+                    Err(SubjectStateStreamError::Closed) => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "audio-options subject stream closed; \
+                             subscriber task exiting"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     /// Spawn the PPAG capabilities-watch reactor.
     fn spawn_capabilities_watcher(
         &mut self,
@@ -770,6 +927,74 @@ impl MpdPlaybackPlugin {
 impl Default for MpdPlaybackPlugin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Extract a [`MixerConfig`] from the `audio.options.settings`
+/// subject state payload. Returns `None` when the payload
+/// has no mixer block or the block is malformed.
+///
+/// Hardware-mode degrade: if `mixer_type = "Hardware"` but the
+/// payload's `output_device` does not include both an ALSA
+/// device path AND a non-empty mixer-control name, the
+/// function returns `MixerConfig::Software` with a WARN log.
+/// This matches the Volumio Rust port's safety net at
+/// `volumio-evo/crates/core/src/playback_options.rs:184-187`
+/// and 196-199 — operators should not lose audio output to a
+/// misconfigured hardware-mixer choice.
+fn parse_mixer_config_from_settings_state(
+    state: &serde_json::Value,
+) -> Option<MixerConfig> {
+    // The playback.options Settings struct serialises as a TOML
+    // table; serde_json::to_value picks the same field names.
+    // Mixer config in v1 lives under the top-level fields
+    // `mixer_type` / `mixer_device` / `mixer_control` (the
+    // latter two are absent in the v1 playback.options schema
+    // but the parser is forward-compatible: if they appear,
+    // they wire Hardware mode; if not, Hardware degrades).
+    let mixer_type = state
+        .get("mixer_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "software".to_string());
+    let mixer_device = state
+        .get("mixer_device")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mixer_control = state
+        .get("mixer_control")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match mixer_type.as_str() {
+        "software" => Some(MixerConfig::Software),
+        "none" => Some(MixerConfig::None),
+        "hardware" => match (mixer_device, mixer_control) {
+            (Some(dev), Some(ctrl)) if !dev.is_empty() && !ctrl.is_empty() => {
+                Some(MixerConfig::Hardware {
+                    mixer_device: dev,
+                    mixer_control: ctrl,
+                })
+            }
+            _ => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "operator selected mixer_type = Hardware without a \
+                     mixer_device + mixer_control; degrading to Software \
+                     to keep audio output (matches Volumio Rust port's \
+                     safety net)"
+                );
+                Some(MixerConfig::Software)
+            }
+        },
+        other => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                mixer_type = other,
+                "operator settings carry an unknown mixer_type; \
+                 falling back to Software"
+            );
+            Some(MixerConfig::Software)
+        }
     }
 }
 
@@ -1277,6 +1502,17 @@ impl Plugin for MpdPlaybackPlugin {
             // MPD on every snapshot.
             self.spawn_reactor().await?;
             self.spawn_fragment_worker().await?;
+
+            // Subscribe to the audio-options settings subject
+            // so operator mixer-mode changes propagate to the
+            // fragment-writer without restarting the steward.
+            // The framework's subject_state_subscriber is
+            // populated for in-process plugins; OOP plugins
+            // see None until the wire surface lands. Failure
+            // to wire the subscription does NOT fail the
+            // load — operators can still pick a mode via the
+            // plugin's own config table.
+            self.spawn_options_settings_subscriber(ctx).await;
 
             self.loaded = true;
 
