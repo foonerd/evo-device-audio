@@ -136,7 +136,7 @@ use tokio::task::JoinHandle;
 use crate::config::PluginConfig;
 use crate::mpd::{ConnectTimeouts, MpdEndpoint};
 use crate::mpd_fragment::{
-    atomic_write_fragment, render_audio_output_fragment,
+    atomic_write_fragment, render_audio_output_fragment, MixerConfig,
 };
 use crate::mpd_restart::{
     AutoMpdRestarter, MpdRestarter, SudoSystemctlRestarter,
@@ -315,6 +315,15 @@ pub struct MpdPlaybackPlugin {
     /// MPD audio_output fragment, and asks the restarter to
     /// recycle MPD on every snapshot.
     fragment_worker: Option<FragmentWorkerHandle>,
+    /// Watch channel carrying the operator's currently-selected
+    /// mixer configuration. Seeded with `MixerConfig::Software`
+    /// at construction (the framework's bit-perfect-compatible
+    /// default); updated by the `playback.options` settings
+    /// subscriber when the operator changes mixer_type via the
+    /// options plugin. The fragment-worker selects on both this
+    /// channel AND the endpoint reactor's snapshot channel,
+    /// re-rendering the mpd_fragment on either change.
+    mixer_config_tx: watch::Sender<MixerConfig>,
     /// Concrete handle on the auto-restarter composite so a
     /// future capabilities-watch reactor can call `re_resolve`
     /// on it without going through the `Arc<dyn MpdRestarter>`
@@ -407,6 +416,7 @@ impl MpdPlaybackPlugin {
         endpoint: MpdEndpoint,
         timeouts: ConnectTimeouts,
     ) -> Self {
+        let (mixer_config_tx, _) = watch::channel(MixerConfig::Software);
         Self {
             loaded: false,
             endpoint,
@@ -421,6 +431,7 @@ impl MpdPlaybackPlugin {
             restarter: Arc::new(SudoSystemctlRestarter::new()),
             reactor: None,
             fragment_worker: None,
+            mixer_config_tx,
             auto_restarter: None,
             capabilities_watcher: None,
         }
@@ -532,6 +543,17 @@ impl MpdPlaybackPlugin {
         self.endpoint = config.endpoint;
         self.timeouts = config.timeouts;
         self.fragment_path = config.fragment_path;
+        // Seed the mixer-config watch channel from the operator's
+        // configuration. Default (no config entry) is `Software`
+        // to match the legacy hard-coded behaviour. The framework's
+        // `playback.options` policy plugin owns the operator-
+        // facing surface; dynamic propagation rides the subject-
+        // state subscription wire-up (R-021 substrate already
+        // lit). Operators picking Hardware or None today set
+        // [mixer_type] in /etc/evo/plugins.d/playback.mpd.toml
+        // and bounce the steward.
+        let mixer_cfg = mixer_config_from_toml(table)?;
+        let _ = self.mixer_config_tx.send(mixer_cfg);
         Ok(())
     }
 
@@ -615,6 +637,7 @@ impl MpdPlaybackPlugin {
             .expect("reactor populated")
             .endpoints_rx
             .clone();
+        let mixer_rx = self.mixer_config_tx.subscribe();
         let (status_tx, status_rx) = watch::channel(FragmentWorkerStatus::Idle);
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
@@ -623,6 +646,7 @@ impl MpdPlaybackPlugin {
         let task = tokio::spawn(async move {
             run_fragment_worker(
                 endpoints_rx,
+                mixer_rx,
                 task_shutdown,
                 status_tx,
                 task_fragment_path,
@@ -749,6 +773,69 @@ impl Default for MpdPlaybackPlugin {
     }
 }
 
+/// Parse the operator's mixer-mode selection out of the
+/// plugin config TOML table. Three flat keys are read at the
+/// top of the table:
+///
+/// - `mixer_type` ∈ `{ "hardware", "software", "none" }`
+///   (default: `"software"` matching legacy behaviour).
+/// - `mixer_device` — required when `mixer_type = "hardware"`;
+///   passed verbatim to MPD as the `mixer_device` line. Typical
+///   shape `"hw:<card>"` matching the card name in
+///   `/etc/asound.conf`.
+/// - `mixer_control` — required when `mixer_type = "hardware"`;
+///   passed verbatim as the `mixer_control` line. Typical
+///   values `"Master"`, `"PCM"`, or DAC-specific control names
+///   visible via `amixer scontrols`.
+///
+/// Refuses Hardware mode without `mixer_device` + `mixer_control`
+/// rather than silently degrading: the operator picked Hardware
+/// for a reason; a missing knob is a config error to surface.
+fn mixer_config_from_toml(
+    table: &toml::Table,
+) -> Result<MixerConfig, PluginError> {
+    let raw = match table.get("mixer_type").and_then(|v| v.as_str()) {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return Ok(MixerConfig::Software),
+    };
+    match raw.as_str() {
+        "software" => Ok(MixerConfig::Software),
+        "none" => Ok(MixerConfig::None),
+        "hardware" => {
+            let mixer_device = table
+                .get("mixer_device")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    PluginError::Permanent(
+                        "mixer_type = \"hardware\" requires `mixer_device` \
+                         in plugin config (e.g. mixer_device = \"hw:0\")"
+                            .into(),
+                    )
+                })?
+                .to_string();
+            let mixer_control = table
+                .get("mixer_control")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    PluginError::Permanent(
+                        "mixer_type = \"hardware\" requires `mixer_control` \
+                         in plugin config (e.g. mixer_control = \"Master\")"
+                            .into(),
+                    )
+                })?
+                .to_string();
+            Ok(MixerConfig::Hardware {
+                mixer_device,
+                mixer_control,
+            })
+        }
+        other => Err(PluginError::Permanent(format!(
+            "mixer_type must be one of {{hardware, software, none}}; got \
+             {other:?}"
+        ))),
+    }
+}
+
 /// One-shot endpoint fetch over the AudioRouting handle.
 /// Returns `Some(endpoint)` when topology is configured,
 /// `None` for the benign pre-reconciliation state, and `None`
@@ -811,20 +898,23 @@ async fn run_reactor(
 /// published to the watch channel for observability.
 async fn run_fragment_worker(
     mut endpoints_rx: watch::Receiver<Option<WriteEndpoint>>,
+    mut mixer_rx: watch::Receiver<MixerConfig>,
     shutdown: Arc<Notify>,
     status_tx: watch::Sender<FragmentWorkerStatus>,
     fragment_path: PathBuf,
     restarter: Arc<dyn MpdRestarter>,
 ) {
     loop {
-        let snapshot = endpoints_rx.borrow_and_update().clone();
-        match snapshot {
+        let endpoint_snapshot = endpoints_rx.borrow_and_update().clone();
+        let mixer_snapshot = mixer_rx.borrow_and_update().clone();
+        match endpoint_snapshot {
             None => {
                 let _ = status_tx.send(FragmentWorkerStatus::Idle);
             }
             Some(endpoint) => {
                 let status = apply_fragment_cycle(
                     &endpoint,
+                    &mixer_snapshot,
                     &fragment_path,
                     restarter.as_ref(),
                 )
@@ -841,6 +931,11 @@ async fn run_fragment_worker(
                     return;
                 }
             }
+            res = mixer_rx.changed() => {
+                if res.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -849,10 +944,11 @@ async fn run_fragment_worker(
 /// status the caller should publish.
 async fn apply_fragment_cycle(
     endpoint: &WriteEndpoint,
+    mixer: &MixerConfig,
     fragment_path: &std::path::Path,
     restarter: &dyn MpdRestarter,
 ) -> FragmentWorkerStatus {
-    let rendered = match render_audio_output_fragment(endpoint) {
+    let rendered = match render_audio_output_fragment(endpoint, mixer) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
