@@ -11,13 +11,22 @@
 //!
 //! - `role = "source"` — emit audio frames out to receivers
 //!   via [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::fan_out_audio_frame`].
-//!   v0.1.13 baseline: synthesises a 440 Hz sine-wave test
-//!   tone at `pcm_s16_le` / 48000 Hz / stereo so the
-//!   substrate is observable without depending on the
-//!   operator wiring `snd-aloop` / `pcm.tee` to capture the
-//!   local audio chain. The real-audio capture (snd-aloop
-//!   tap of `pcm.evo`) rides a subsequent iteration of this
-//!   same plugin once the ALSA config is operator-deployed.
+//!   Two source modes:
+//!   - Capture mode (`source_pcm = "<alsa-pcm-name>"`, with
+//!     the `alsa-substrate` Cargo feature on): the plugin
+//!     opens the named ALSA capture PCM and reads
+//!     `pcm_s16_le` / 48000 Hz / stereo in 20 ms chunks,
+//!     emitting each chunk as one `AudioFrame`. Apex showcase
+//!     mode — the operator wires `/etc/asound.conf` so the
+//!     local audio chain (`pcm.evo`) forks through a
+//!     `pcm.tee` plug into the receiver hardware DAC AND a
+//!     `snd-aloop` loopback playback half; the multiroom
+//!     plugin reads the loopback capture half, fanning out
+//!     whatever MPD (or any audio producer) is rendering.
+//!   - Synthetic mode (`source_pcm = ""` or unset, default):
+//!     synthesises a 440 Hz sine-wave test tone at
+//!     `pcm_s16_le` / 48000 Hz / stereo. Diagnostic floor —
+//!     the substrate is observable without any ALSA config.
 //! - `role = "receiver"` — subscribe to incoming audio
 //!   frames via [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::subscribe_audio_frames`]
 //!   and write the decoded PCM bytes to the local ALSA
@@ -39,7 +48,8 @@
 //! - Codec: raw `pcm_s16_le` (no encoder dependency).
 //! - Sample rate: 48 kHz stereo (matches the synthetic tone
 //!   AND the typical ALSA hardware default).
-//! - Source: synthetic 440 Hz sine generator (v0.1.13 baseline).
+//! - Source: ALSA capture PCM when `source_pcm` is set;
+//!   synthetic 440 Hz sine generator as diagnostic fallback.
 //! - Receiver: ALSA writei to the configured playback PCM
 //!   when the `alsa-substrate` Cargo feature is enabled; on
 //!   builds without the feature the receiver counts frames
@@ -51,6 +61,8 @@
 //! role = "source"             # "source" | "receiver" | "auto"
 //! group_id = "<uuid>"         # required when role = "source"
 //! alsa_pcm = "evo"            # ALSA playback device (receiver)
+//! source_pcm = "evo_loopback" # ALSA capture device (source);
+//!                             # empty/unset => synthetic 440 Hz
 //! ```
 //!
 //! Production-quality additions (FEC / adaptive jitter
@@ -127,6 +139,20 @@ struct PluginConfig {
     /// or non-default routing override here.
     #[serde(default = "default_alsa_pcm")]
     alsa_pcm: String,
+    /// ALSA capture device the source reads from in capture
+    /// mode. When set (and the `alsa-substrate` Cargo feature
+    /// is on), `role = "source"` opens this PCM and reads
+    /// `pcm_s16_le` / 48000 Hz / stereo in 20 ms chunks,
+    /// fanning each chunk out as one audio frame. Typical
+    /// operator-deployed value is `"evo_loopback"`, paired
+    /// with an `asound.conf` `pcm.tee` plug that forks
+    /// `pcm.evo` between the local DAC and the loopback
+    /// playback half (`hw:Loopback,0`); the capture half
+    /// (`hw:Loopback,1`) is what this plugin reads. When
+    /// empty / unset, source role falls back to the
+    /// synthetic 440 Hz tone generator (diagnostic floor).
+    #[serde(default)]
+    source_pcm: String,
 }
 
 impl Default for PluginConfig {
@@ -135,6 +161,7 @@ impl Default for PluginConfig {
             role: default_role(),
             group_id: None,
             alsa_pcm: default_alsa_pcm(),
+            source_pcm: String::new(),
         }
     }
 }
@@ -310,18 +337,57 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let sent = Arc::clone(&self.frames_sent);
                     let shutdown = Arc::clone(&self.shutdown);
                     let handle = Arc::clone(&audio_plane);
-                    let task = tokio::spawn(async move {
-                        run_source_tone_generator(
-                            handle, group_id, sent, shutdown,
-                        )
-                        .await;
-                    });
+                    let source_pcm = self.config.source_pcm.clone();
+                    let task = if source_pcm.is_empty() {
+                        tokio::spawn(async move {
+                            run_source_tone_generator(
+                                handle, group_id, sent, shutdown,
+                            )
+                            .await;
+                        })
+                    } else {
+                        #[cfg(feature = "alsa-substrate")]
+                        {
+                            let pcm = source_pcm.clone();
+                            tokio::spawn(async move {
+                                run_source_capture_task(
+                                    handle, group_id, sent, shutdown, pcm,
+                                )
+                                .await;
+                            })
+                        }
+                        #[cfg(not(feature = "alsa-substrate"))]
+                        {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                source_pcm = %source_pcm,
+                                "source_pcm set but alsa-substrate feature \
+                                 disabled at build time; falling back to \
+                                 synthetic tone"
+                            );
+                            tokio::spawn(async move {
+                                run_source_tone_generator(
+                                    handle, group_id, sent, shutdown,
+                                )
+                                .await;
+                            })
+                        }
+                    };
                     self.source_task = Some(task);
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        group_id = %self.config.group_id.as_deref().unwrap_or(""),
-                        "source role engaged: 440 Hz test tone fan-out running"
-                    );
+                    if source_pcm.is_empty() {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            group_id = %self.config.group_id.as_deref().unwrap_or(""),
+                            "source role engaged: synthetic 440 Hz tone fan-out running"
+                        );
+                    } else {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            group_id = %self.config.group_id.as_deref().unwrap_or(""),
+                            source_pcm = %source_pcm,
+                            "source role engaged: ALSA capture fan-out running"
+                        );
+                    }
                 }
                 Role::Receiver | Role::Auto => {
                     let counter = Arc::clone(&self.frames_received);
@@ -519,6 +585,266 @@ async fn run_source_tone_generator(
         sequence = sequence.saturating_add(1);
         next_tick += chunk_period;
     }
+}
+
+/// Source-side ALSA capture task. Opens the operator-supplied
+/// capture PCM (typically `evo_loopback` — the capture half of
+/// a `pcm.tee`-forked chain that mirrors `pcm.evo` into a
+/// `snd-aloop` loopback playback half), reads
+/// `pcm_s16_le` / 48000 Hz / stereo in 20 ms chunks, and
+/// fans each chunk out as one `AudioFrame`. The blocking ALSA
+/// read runs on a dedicated OS thread to keep the tokio
+/// runtime free; chunks are bridged into the async side via
+/// a bounded mpsc channel (back-pressure: drops the oldest
+/// chunk on overflow rather than blocking the capture thread,
+/// because reading slow from a loopback half causes the
+/// loopback playback half to underrun, which corrupts the
+/// real-time chain).
+#[cfg(feature = "alsa-substrate")]
+async fn run_source_capture_task(
+    audio_plane: Arc<dyn AudioPlaneHandle>,
+    group_id: String,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<Notify>,
+    source_pcm: String,
+) {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    // Capacity covers ~0.5 s of frames; if we fall further
+    // behind than that the loopback playback half is corrupt
+    // already.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+
+    let capture_shutdown = Arc::clone(&shutdown);
+    let capture_pcm = source_pcm.clone();
+    let capture_thread = std::thread::Builder::new()
+        .name("multiroom-capture".into())
+        .spawn(move || {
+            run_capture_thread(capture_pcm, tx, capture_shutdown);
+        });
+    let capture_thread = match capture_thread {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "spawn ALSA capture thread failed; source task exiting"
+            );
+            return;
+        }
+    };
+
+    let mut sequence: u64 = 0;
+    let start_monotonic = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "source capture task: shutdown received"
+                );
+                break;
+            }
+            chunk = rx.recv() => {
+                let pcm = match chunk {
+                    Some(p) => p,
+                    None => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "capture channel closed; source task exiting"
+                        );
+                        break;
+                    }
+                };
+                let presentation_time_ms =
+                    (start_monotonic.elapsed().as_millis() as u64)
+                        .saturating_add(
+                            sequence
+                                .saturating_mul(20)
+                                .saturating_add(100),
+                        );
+                let seed = AudioFrameSeed {
+                    sequence,
+                    presentation_time_ms,
+                    codec: "pcm_s16_le".to_string(),
+                    rate_hz: BASELINE_SAMPLE_RATE_HZ,
+                    channels: BASELINE_CHANNELS,
+                    payload_b64: B64.encode(&pcm),
+                };
+                if let Err(e) = audio_plane
+                    .fan_out_audio_frame(group_id.clone(), seed)
+                    .await
+                {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "fan_out_audio_frame failed; continuing"
+                    );
+                } else {
+                    sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                sequence = sequence.saturating_add(1);
+            }
+        }
+    }
+
+    // Best-effort join: the capture thread sees the shutdown
+    // Notify and the dropped tx, both of which signal exit.
+    let _ = capture_thread.join();
+}
+
+/// OS-thread body that owns the ALSA capture handle. Loops
+/// reading `FRAMES_PER_CHUNK` frames at a time, pushing each
+/// chunk onto the async-side channel. Drops the oldest chunk
+/// on channel pressure rather than blocking the capture loop
+/// — see `run_source_capture_task`'s docblock for why.
+#[cfg(feature = "alsa-substrate")]
+fn run_capture_thread(
+    source_pcm: String,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    shutdown: Arc<Notify>,
+) {
+    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, false)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                source_pcm = %source_pcm,
+                "ALSA capture open failed; source task will starve"
+            );
+            return;
+        }
+    };
+    {
+        let hwp = match alsa::pcm::HwParams::any(&pcm) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "alsa::pcm::HwParams::any (capture) failed"
+                );
+                return;
+            }
+        };
+        if let Err(e) = hwp.set_channels(BASELINE_CHANNELS as u32) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_channels (capture) failed"
+            );
+            return;
+        }
+        if let Err(e) =
+            hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_rate (capture) failed"
+            );
+            return;
+        }
+        if let Err(e) = hwp.set_format(alsa::pcm::Format::S16LE) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_format (capture) failed"
+            );
+            return;
+        }
+        if let Err(e) = hwp.set_access(alsa::pcm::Access::RWInterleaved) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_access (capture) failed"
+            );
+            return;
+        }
+        if let Err(e) = pcm.hw_params(&hwp) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "pcm.hw_params (capture) failed"
+            );
+            return;
+        }
+    }
+    if let Err(e) = pcm.prepare() {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "pcm.prepare (capture) failed"
+        );
+        return;
+    }
+    let io = match pcm.io_i16() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "pcm.io_i16 (capture) failed"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        source_pcm = %source_pcm,
+        "ALSA capture opened at 48 kHz / 2 ch / pcm_s16_le"
+    );
+
+    let mut buf: Vec<i16> =
+        vec![0; FRAMES_PER_CHUNK * BASELINE_CHANNELS as usize];
+    loop {
+        // shutdown.notified() is the async-side notifier. Poll
+        // it by ticking off small reads + checking the channel
+        // periodically — the closed channel + shutdown signal
+        // both terminate the loop.
+        let _ = &shutdown;
+        match io.readi(&mut buf) {
+            Ok(frames_read) => {
+                if frames_read == 0 {
+                    continue;
+                }
+                let mut pcm_bytes = Vec::with_capacity(
+                    frames_read * BASELINE_CHANNELS as usize * 2,
+                );
+                for s in &buf[..frames_read * BASELINE_CHANNELS as usize] {
+                    pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                // Try non-blocking; on pressure drop oldest
+                // (we are the producer, the async side is the
+                // consumer; backpressure here would corrupt
+                // the loopback playback half).
+                if tx.try_send(pcm_bytes).is_err() {
+                    // Either channel full (drop) or closed
+                    // (exit). Treat full as soft-drop, closed
+                    // as termination.
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "ALSA readi (capture) failed; recovering"
+                );
+                let _ = pcm.prepare();
+            }
+        }
+        if tx.is_closed() {
+            break;
+        }
+    }
+    tracing::info!(plugin = PLUGIN_NAME, "ALSA capture thread exiting");
 }
 
 /// Receiver-side task: subscribe to incoming audio frames,
