@@ -115,6 +115,18 @@ name = "track"
 [[subjects]]
 name = "album"
 
+# Subject type the playback.options plugin announces as a
+# durable projection of the operator's audiophile-grade
+# settings (resampling / mixer_type / dop / output_device /
+# volume_normalization). Other plugins (playback.mpd's
+# mixer-mode reactor, future UI plugins) subscribe to this
+# subject's state changes via the framework's
+# SubjectStateSubscriber to react to operator updates
+# without restarting the steward. The plugin uses
+# `evo.audio.options:settings` as the canonical addressing.
+[[subjects]]
+name = "audio_options_settings"
+
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from
 # the playing track to its album on every song change;

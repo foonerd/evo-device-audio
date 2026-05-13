@@ -112,7 +112,9 @@ const SETTINGS_SCHEME: &str = "evo.audio.options";
 const SETTINGS_VALUE: &str = "settings";
 
 /// Subject type the framework records on the settings subject.
-const SETTINGS_SUBJECT_TYPE: &str = "audio.options.settings";
+/// Underscored form because the framework's catalogue parser
+/// rejects subject-type names containing `.`.
+const SETTINGS_SUBJECT_TYPE: &str = "audio_options_settings";
 
 /// Filename for the persisted operator state under
 /// [`LoadContext::state_dir`].
