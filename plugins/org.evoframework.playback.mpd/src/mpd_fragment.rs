@@ -12,9 +12,32 @@
 //!   loopback substrate composition.alsa drives).
 //! - `format` — MPD's `<rate>:<bits>:<channels>` form, derived
 //!   from [`AudioFormat`](evo_plugin_sdk::audio::AudioFormat).
-//! - `mixer_type` — `"software"` so MPD's `set_volume` reaches
-//!   the negotiated stream without coupling to a specific
-//!   hardware mixer control.
+//! - `mixer_type` — one of `"hardware"`, `"software"`, or `"none"`
+//!   per the operator's selected [`MixerConfig`]. Hardware mode
+//!   additionally emits the `mixer_device` + `mixer_control`
+//!   lines that name the ALSA mixer the operator wants MPD to
+//!   drive; software + none modes omit those lines (MPD 0.24+
+//!   rejects them outside hardware mode).
+//!
+//! ## Audiophile-grade three-mode model
+//!
+//! Hardware mode: MPD drives the DAC's hardware mixer control
+//! directly; the PCM stream stays bit-perfect; the analog volume
+//! changes at the DAC. Requires the card to expose an ALSA mixer
+//! control. This is the audiophile-correct mode when the
+//! hardware supports it.
+//!
+//! Software mode: MPD applies a digital gain stage internally
+//! before writing to ALSA. Compatible with every card. NOT bit-
+//! perfect at non-100% gain because the gain stage rescales
+//! samples. The framework's topology scorer surfaces this in
+//! the topology projection so operators see when bit-perfect
+//! is lost.
+//!
+//! None mode: MPD does not interpret volume calls. Downstream
+//! device (preamp / AVR / line-out + analog volume on the DAC
+//! face) handles gain. The PCM stream is bit-perfect; volume
+//! control is outside MPD's surface.
 //!
 //! Only [`EndpointKind::AlsaPcm`] is rendered. Source-plugin
 //! topologies whose `WriteEndpoint` is a non-ALSA substrate
@@ -28,6 +51,51 @@ use std::path::Path;
 
 use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
 use evo_plugin_sdk::contract::audio_routing::{EndpointKind, WriteEndpoint};
+
+/// Three-mode mixer selection projected into the MPD
+/// `audio_output` block. Mirrors `playback.options::MixerType`
+/// at the rendering boundary; the renderer owns the per-mode
+/// MPD syntax (hardware vs software vs none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MixerConfig {
+    /// MPD drives the DAC's ALSA mixer control directly.
+    /// Renders `mixer_type "hardware"` + `mixer_device` +
+    /// `mixer_control` lines. PCM stream stays bit-perfect.
+    Hardware {
+        /// ALSA mixer device the operator selected. Matches
+        /// MPD's `mixer_device` line; typically `"hw:<card>"`
+        /// where `<card>` is the kernel-stable card name.
+        mixer_device: String,
+        /// ALSA mixer control name. Matches MPD's
+        /// `mixer_control` line; typical values include
+        /// `"Master"`, `"PCM"`, or DAC-specific control names
+        /// visible via `amixer scontrols`.
+        mixer_control: String,
+    },
+    /// MPD applies a digital gain stage before writing to
+    /// ALSA. Renders `mixer_type "software"` only. Compatible
+    /// with every card; not bit-perfect at non-100% gain.
+    Software,
+    /// MPD does not interpret volume calls. Renders
+    /// `mixer_type "none"` only. PCM stream is bit-perfect;
+    /// volume control is the downstream device's concern
+    /// (preamp / AVR / DAC analog volume).
+    None,
+}
+
+impl MixerConfig {
+    /// Wire-string ("hardware" / "software" / "none") used by
+    /// MPD's config parser. Idempotent with
+    /// `playback.options::MixerType::as_wire_str` so the
+    /// settings projection and the rendered fragment agree.
+    fn mpd_mixer_type_str(&self) -> &'static str {
+        match self {
+            Self::Hardware { .. } => "hardware",
+            Self::Software => "software",
+            Self::None => "none",
+        }
+    }
+}
 
 /// Failure modes of [`render_audio_output_fragment`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -57,28 +125,54 @@ pub enum FragmentError {
 }
 
 /// Render an MPD `audio_output` configuration block targeting
-/// the supplied [`WriteEndpoint`].
+/// the supplied [`WriteEndpoint`] with the supplied
+/// [`MixerConfig`].
 ///
 /// The output is a complete MPD config fragment terminated by a
 /// trailing newline; concatenation into a larger file is the
 /// caller's concern.
 pub fn render_audio_output_fragment(
     ep: &WriteEndpoint,
+    mixer: &MixerConfig,
 ) -> Result<String, FragmentError> {
     if ep.kind != EndpointKind::AlsaPcm {
         return Err(FragmentError::UnsupportedKind(ep.kind));
     }
     let format_str = render_format_string(&ep.format)?;
     let device = ep.path.to_string_lossy();
+    let mixer_block = render_mixer_block(mixer);
     Ok(format!(
         "audio_output {{\n    \
          type            \"alsa\"\n    \
          name            \"evo-device-audio\"\n    \
          device          \"{device}\"\n    \
-         format          \"{format_str}\"\n    \
-         mixer_type      \"software\"\n\
+         format          \"{format_str}\"\n\
+         {mixer_block}\
          }}\n"
     ))
+}
+
+/// Render the mixer-related portion of an audio_output block.
+/// Hardware mode emits three lines (mixer_type plus mixer_device
+/// plus mixer_control); software and none modes emit one line
+/// (mixer_type only). MPD 0.24+ rejects the mixer_device and
+/// mixer_control lines outside hardware mode so the omission
+/// is required, not aesthetic.
+fn render_mixer_block(mixer: &MixerConfig) -> String {
+    let mixer_type_str = mixer.mpd_mixer_type_str();
+    match mixer {
+        MixerConfig::Hardware {
+            mixer_device,
+            mixer_control,
+        } => format!(
+            "    mixer_type      \"{mixer_type_str}\"\n    \
+             mixer_device    \"{mixer_device}\"\n    \
+             mixer_control   \"{mixer_control}\"\n"
+        ),
+        MixerConfig::Software | MixerConfig::None => {
+            format!("    mixer_type      \"{mixer_type_str}\"\n")
+        }
+    }
 }
 
 /// Render an [`AudioFormat`] into MPD's `<rate>:<bits>:<channels>`
@@ -183,7 +277,8 @@ mod tests {
     #[test]
     fn render_pcm_s16_44100_stereo() {
         let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS16Le, 44_100, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("type            \"alsa\""));
         assert!(out.contains("device          \"hw:2,0\""));
         assert!(out.contains("format          \"44100:16:2\""));
@@ -197,28 +292,32 @@ mod tests {
     #[test]
     fn render_pcm_s24_192000_stereo() {
         let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS24Le, 192_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"192000:24:2\""));
     }
 
     #[test]
     fn render_pcm_s32_96000_stereo() {
         let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS32Le, 96_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"96000:32:2\""));
     }
 
     #[test]
     fn render_pcm_f32_uses_f_marker() {
         let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmF32, 48_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"48000:f:2\""));
     }
 
     #[test]
     fn render_pcm_s16_mono() {
         let ep = pcm_endpoint("evo", PcmCodec::PcmS16Le, 44_100, 1);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"44100:16:1\""));
     }
 
@@ -228,7 +327,8 @@ mod tests {
         // count through verbatim; MPD's format-line parser
         // accepts any 1..=255 channel count.
         let ep = pcm_endpoint("evo", PcmCodec::PcmS24Le, 96_000, 6);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"96000:24:6\""));
     }
 
@@ -238,7 +338,8 @@ mod tests {
         // PCM at this rate; the renderer must pass it through
         // verbatim.
         let ep = pcm_endpoint("evo", PcmCodec::PcmS32Le, 352_800, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"352800:32:2\""));
     }
 
@@ -246,7 +347,8 @@ mod tests {
     fn render_pcm_s32_ultra_high_rate_384000() {
         // Studio / DXD rate. Common audiophile high end.
         let ep = pcm_endpoint("evo", PcmCodec::PcmS32Le, 384_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"384000:32:2\""));
     }
 
@@ -255,14 +357,16 @@ mod tests {
         // PcmF32 maps to MPD's `f` marker; rate is independent
         // of the bit-depth marker.
         let ep = pcm_endpoint("evo", PcmCodec::PcmF32, 192_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("format          \"192000:f:2\""));
     }
 
     #[test]
     fn render_alsa_loopback_path() {
         let ep = pcm_endpoint("hw:Loopback,1,0", PcmCodec::PcmS24Le, 48_000, 2);
-        let out = render_audio_output_fragment(&ep).unwrap();
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
         assert!(out.contains("device          \"hw:Loopback,1,0\""));
     }
 
@@ -278,7 +382,8 @@ mod tests {
             },
             buffer_frames: 1024,
         };
-        let err = render_audio_output_fragment(&ep).unwrap_err();
+        let err = render_audio_output_fragment(&ep, &MixerConfig::Software)
+            .unwrap_err();
         match err {
             FragmentError::UnsupportedKind(kind) => {
                 assert_eq!(kind, EndpointKind::NamedPipe);
@@ -299,7 +404,8 @@ mod tests {
             },
             buffer_frames: 1024,
         };
-        let err = render_audio_output_fragment(&ep).unwrap_err();
+        let err = render_audio_output_fragment(&ep, &MixerConfig::Software)
+            .unwrap_err();
         assert!(matches!(err, FragmentError::UnsupportedKind(_)));
     }
 
@@ -315,7 +421,8 @@ mod tests {
             },
             buffer_frames: 1024,
         };
-        let err = render_audio_output_fragment(&ep).unwrap_err();
+        let err = render_audio_output_fragment(&ep, &MixerConfig::Software)
+            .unwrap_err();
         assert!(matches!(err, FragmentError::UnsupportedKind(_)));
     }
 
@@ -332,7 +439,8 @@ mod tests {
             },
             buffer_frames: 1024,
         };
-        let err = render_audio_output_fragment(&ep).unwrap_err();
+        let err = render_audio_output_fragment(&ep, &MixerConfig::Software)
+            .unwrap_err();
         assert!(matches!(err, FragmentError::DsdNotSupported));
     }
 
@@ -348,7 +456,8 @@ mod tests {
             },
             buffer_frames: 1024,
         };
-        let err = render_audio_output_fragment(&ep).unwrap_err();
+        let err = render_audio_output_fragment(&ep, &MixerConfig::Software)
+            .unwrap_err();
         assert!(matches!(err, FragmentError::EncodedPassthroughNotSupported));
     }
 
