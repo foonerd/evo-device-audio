@@ -1304,6 +1304,7 @@ dependencies = [
  "evo-plugin-sdk",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
+ "org-evoframework-multiroom-evo-native",
  "org-evoframework-network",
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
@@ -3162,6 +3163,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "org-evoframework-multiroom-evo-native"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "toml",

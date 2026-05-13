@@ -67,6 +67,7 @@ use evo::AdmissionSetup;
 use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
+use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
 use org_evoframework_network::NetworkPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 use org_evoframework_playback_options::PlaybackOptionsPlugin;
@@ -215,6 +216,30 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting network")?;
+
+            // 6. multiroom.evo-native: singleton respondent on
+            //    audio.multiroom shape 1. Bridges the local
+            //    audio chain to the framework's audio-plane
+            //    TCP transport. Role flips dynamically per
+            //    source-host election: source-host nodes
+            //    capture from the local audio chain + fan
+            //    frames out; receivers subscribe to incoming
+            //    frames + render to local ALSA. v0.1.13
+            //    baseline lit at the receiver-observation +
+            //    fan-out-substrate layer; the audio-chain
+            //    capture + render bridges land as substrate
+            //    iterations on the same plugin.
+            let multiroom_manifest = Manifest::from_toml(
+                org_evoframework_multiroom_evo_native::MANIFEST_TOML,
+            )
+            .context("parsing multiroom.evo-native manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    MultiroomEvoNativePlugin::new(),
+                    multiroom_manifest,
+                )
+                .await
+                .context("admitting multiroom.evo-native")?;
 
             Ok(())
         })

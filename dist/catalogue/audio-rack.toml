@@ -79,6 +79,20 @@ on every setter so the delivery plugin re-renders the modular \
 ALSA pipeline and the UI surfaces stay coherent.
 """
 
+[[racks.shelves]]
+name = "multiroom"
+shape = 1
+description = """
+Multi-room audio-frame fan-out + receiver-side render plugin. \
+Bridges the local audio chain to the framework's audio-plane \
+TCP transport. Source-host role: capture from the local audio \
+chain, encode into AudioFrame envelopes, fan to receivers via \
+the framework's audio-plane handle. Receiver role: subscribe \
+to incoming frames, decode, render to local ALSA at the \
+scheduling target the envelope's presentation_time_ms declares. \
+Role flips dynamically per the framework's source-host election.
+"""
+
 [[racks]]
 name = "networking"
 family = "domain"
