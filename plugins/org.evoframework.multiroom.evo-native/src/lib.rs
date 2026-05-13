@@ -723,9 +723,14 @@ async fn run_source_tone_generator(
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let presentation_time_ms = (start_monotonic.elapsed().as_millis()
-            as u64)
-            .saturating_add(sequence.saturating_mul(20).saturating_add(100));
+        // PTS = source-local monotonic time at this frame's
+        // emission. `elapsed` already advances at the emit
+        // cadence (one tick = chunk_period); adding
+        // `sequence * 20` on top double-counts and stretches
+        // the receiver's timeline (one wall-clock second of
+        // audio becomes two seconds of scheduled render → 2×
+        // slow-mo at the receiver).
+        let presentation_time_ms = start_monotonic.elapsed().as_millis() as u64;
 
         let seed = AudioFrameSeed {
             sequence,
@@ -825,13 +830,12 @@ async fn run_source_capture_task(
                         break;
                     }
                 };
+                // PTS = source-local monotonic time at this
+                // frame's emission. See run_source_tone_generator
+                // for the bit-perfect contract — `elapsed`
+                // already advances at the emit cadence.
                 let presentation_time_ms =
-                    (start_monotonic.elapsed().as_millis() as u64)
-                        .saturating_add(
-                            sequence
-                                .saturating_mul(20)
-                                .saturating_add(100),
-                        );
+                    start_monotonic.elapsed().as_millis() as u64;
                 let seed = AudioFrameSeed {
                     sequence,
                     presentation_time_ms,
