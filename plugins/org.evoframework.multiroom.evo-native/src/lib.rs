@@ -122,6 +122,25 @@ const BASELINE_TONE_HZ: f32 = 440.0;
 /// time audio packet size.
 const FRAMES_PER_CHUNK: usize = 960;
 
+/// Periods the receiver's ALSA buffer holds. Four periods @
+/// 20 ms per period = ~80 ms tolerance, enough for typical
+/// LAN jitter without audible queue-back drift between
+/// source-host playback and receiver render.
+#[cfg(feature = "alsa-substrate")]
+const RENDER_BUFFER_PERIODS: usize = 4;
+
+/// Backlog threshold (in ALSA frames available-to-write
+/// queue depth) above which the receiver drops the inbound
+/// frame instead of writing it. When the ALSA queue is
+/// already deeper than this, writing more would compound
+/// drift; dropping shortens the latency at the cost of
+/// momentary discontinuity. Set to one period less than the
+/// configured buffer so the drop kicks in only when the
+/// buffer is nearly full.
+#[cfg(feature = "alsa-substrate")]
+const RENDER_BACKLOG_DROP_FRAMES: usize =
+    FRAMES_PER_CHUNK * (RENDER_BUFFER_PERIODS - 1);
+
 /// Operator config persisted at
 /// `/etc/evo/plugins.d/multiroom.evo-native.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -926,12 +945,33 @@ async fn run_receiver_task(
                         }
                         #[cfg(feature = "alsa-substrate")]
                         if let Some(render) = alsa_render.as_mut() {
-                            if let Err(e) = render.write(&frame.payload) {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    error = %e,
-                                    "ALSA writei failed"
-                                );
+                            match render.write(&frame.payload) {
+                                Ok(WriteOutcome::Rendered) => {}
+                                Ok(WriteOutcome::DroppedDeepBacklog {
+                                    queued_frames,
+                                }) => {
+                                    // Drift defence kicked in.
+                                    // Log at debug so the trace
+                                    // is available without
+                                    // spamming the log on a
+                                    // sustained drift event.
+                                    tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        queued_frames = queued_frames,
+                                        drop_threshold =
+                                            RENDER_BACKLOG_DROP_FRAMES,
+                                        "audio frame dropped at receiver: \
+                                         ALSA backlog deeper than drift \
+                                         threshold"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %e,
+                                        "ALSA writei failed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -990,14 +1030,64 @@ impl AlsaRender {
                 .map_err(|e| format!("set_format(S16LE): {e}"))?;
             hwp.set_access(alsa::pcm::Access::RWInterleaved)
                 .map_err(|e| format!("set_access(RWInterleaved): {e}"))?;
+            // Pin the period to one source-frame's worth of
+            // samples (20 ms) and the buffer to four periods.
+            // ALSA's default is the hardware's largest buffer
+            // (typically ~500 ms on consumer DACs), which
+            // creates a half-second accumulation between
+            // source playback and receiver render — the
+            // "drift" the operator hears. Four periods @ 20 ms
+            // gives ~80 ms of tolerance which is enough for
+            // typical LAN jitter without audible queue-back
+            // accumulation.
+            hwp.set_period_size(
+                FRAMES_PER_CHUNK as alsa::pcm::Frames,
+                alsa::ValueOr::Nearest,
+            )
+            .map_err(|e| {
+                format!("set_period_size({FRAMES_PER_CHUNK}, Nearest): {e}")
+            })?;
+            hwp.set_buffer_size(
+                (FRAMES_PER_CHUNK * RENDER_BUFFER_PERIODS) as alsa::pcm::Frames,
+            )
+            .map_err(|e| format!("set_buffer_size: {e}"))?;
             pcm.hw_params(&hwp)
                 .map_err(|e| format!("hw_params commit: {e}"))?;
+        }
+        // Software params: start playback as soon as the
+        // first period is buffered (don't wait for full
+        // buffer fill, which would re-introduce the start-of-
+        // playback latency the hardware-params tightening
+        // just eliminated).
+        {
+            let swp = pcm
+                .sw_params_current()
+                .map_err(|e| format!("sw_params_current: {e}"))?;
+            swp.set_start_threshold(FRAMES_PER_CHUNK as alsa::pcm::Frames)
+                .map_err(|e| {
+                    format!("set_start_threshold({FRAMES_PER_CHUNK}): {e}")
+                })?;
+            swp.set_avail_min(FRAMES_PER_CHUNK as alsa::pcm::Frames)
+                .map_err(|e| {
+                    format!("set_avail_min({FRAMES_PER_CHUNK}): {e}")
+                })?;
+            pcm.sw_params(&swp)
+                .map_err(|e| format!("sw_params commit: {e}"))?;
         }
         pcm.prepare().map_err(|e| format!("pcm.prepare(): {e}"))?;
         Ok(Self { pcm })
     }
 
-    fn write(&mut self, payload: &[u8]) -> Result<(), String> {
+    /// Frames currently queued in the ALSA playback buffer
+    /// (i.e. audio not yet rendered). Used by the receiver
+    /// loop to detect backlog accumulation and drop frames
+    /// when the queue is deep enough to introduce audible
+    /// drift between source-host playback and local render.
+    fn delay_frames(&self) -> alsa::pcm::Frames {
+        self.pcm.status().map(|s| s.get_delay()).unwrap_or(0)
+    }
+
+    fn write(&mut self, payload: &[u8]) -> Result<WriteOutcome, String> {
         // Interleaved s16le: 4 bytes per stereo frame (2 ch
         // * 2 bytes). Decode in place — alsa::pcm::IO::<i16>
         // takes a &[i16] of length frames * channels.
@@ -1006,6 +1096,20 @@ impl AlsaRender {
                 "payload length {} not aligned to s16le stereo frame (4 bytes)",
                 payload.len()
             ));
+        }
+        // Backlog-aware drift defence. If the ALSA playback
+        // queue already holds more than RENDER_BACKLOG_DROP_FRAMES
+        // worth of unrendered audio, the source-host's
+        // emission cadence has run ahead of the receiver's
+        // playback cadence (clock skew, network jitter burst,
+        // or initial-fill effect). Writing this frame would
+        // compound the drift; dropping shortens the latency.
+        // The next frame is checked on the same basis.
+        let queued = self.delay_frames();
+        if queued > RENDER_BACKLOG_DROP_FRAMES as alsa::pcm::Frames {
+            return Ok(WriteOutcome::DroppedDeepBacklog {
+                queued_frames: queued as usize,
+            });
         }
         let frame_count = payload.len() / 4;
         let mut samples = Vec::with_capacity(payload.len() / 2);
@@ -1017,7 +1121,7 @@ impl AlsaRender {
             .io_i16()
             .map_err(|e| format!("pcm.io_i16(): {e}"))?;
         match io.writei(&samples) {
-            Ok(n) if n == frame_count => Ok(()),
+            Ok(n) if n == frame_count => Ok(WriteOutcome::Rendered),
             Ok(short) => Err(format!(
                 "short write: requested {} frames, wrote {}",
                 frame_count, short
@@ -1031,7 +1135,7 @@ impl AlsaRender {
                 // discrimination + escalation.
                 let _ = self.pcm.prepare();
                 match io.writei(&samples) {
-                    Ok(n) if n == frame_count => Ok(()),
+                    Ok(n) if n == frame_count => Ok(WriteOutcome::Rendered),
                     Ok(short) => Err(format!(
                         "post-recover short write: requested {} \
                          frames, wrote {}",
@@ -1042,6 +1146,17 @@ impl AlsaRender {
             }
         }
     }
+}
+
+/// Receiver-side write outcome. Either the frame went into
+/// the ALSA buffer for render, or the buffer's queue was
+/// already deeper than the drop threshold and the frame was
+/// dropped to bound drift.
+#[cfg(feature = "alsa-substrate")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Rendered,
+    DroppedDeepBacklog { queued_frames: usize },
 }
 
 #[cfg(test)]
