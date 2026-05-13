@@ -3173,6 +3173,7 @@ dependencies = [
 name = "org-evoframework-multiroom-evo-native"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "base64",
  "evo-plugin-sdk",
  "semver",
