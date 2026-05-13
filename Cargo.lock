@@ -1300,6 +1300,7 @@ dependencies = [
  "anyhow",
  "clap",
  "evo",
+ "evo-device-audio-shared",
  "evo-plugin-sdk",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
@@ -1314,6 +1315,7 @@ dependencies = [
 name = "evo-device-audio-shared"
 version = "0.1.0"
 dependencies = [
+ "evo-plugin-sdk",
  "lofty",
  "tempfile",
 ]
