@@ -141,38 +141,20 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting delivery.alsa")?;
 
-            // 3. playback.mpd: warden + respondent on
-            //    audio.playback shape 1. Owns the `mpd-path`
-            //    URI scheme; the framework's source-verb
-            //    dispatcher routes play_now / etc. to its
-            //    respondent surface, while the steward's
-            //    custody-aware dispatcher routes
-            //    course_correct verbs (play / pause / seek /
-            //    set_volume / etc.) to the warden surface.
-            let playback_manifest = Manifest::from_toml(
-                org_evoframework_playback_mpd::MANIFEST_TOML,
-            )
-            .context("parsing playback.mpd manifest")?;
-            engine
-                .admit_singleton_warden_with_respondent(
-                    MpdPlaybackPlugin::new(),
-                    playback_manifest,
-                )
-                .await
-                .context("admitting playback.mpd")?;
-
-            // 4. playback.options: singleton respondent on
+            // 3. playback.options: singleton respondent on
             //    audio.options shape 1. Operator-facing
             //    audiophile-grade settings (resampling /
             //    mixer_type / DOP / output_device /
             //    volume_normalization). Persists state
             //    across restarts; emits
-            //    Happening::PluginEvent on every change so
-            //    delivery.alsa can re-render the modular ALSA
-            //    pipeline. Admit AFTER delivery.alsa so the
-            //    cross-plugin reaction chain is in place
-            //    when the first settings-changed happening
-            //    fires.
+            //    Happening::PluginEvent on every change AND
+            //    publishes the settings as a subject so
+            //    downstream consumers (playback.mpd's
+            //    mixer-mode reactor, future UI plugins) can
+            //    subscribe via the framework's
+            //    SubjectStateSubscriber. Admit BEFORE
+            //    playback.mpd so the subject already exists
+            //    when playback.mpd's load-time resolve runs.
             let options_manifest = Manifest::from_toml(
                 org_evoframework_playback_options::MANIFEST_TOML,
             )
@@ -184,6 +166,29 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting playback.options")?;
+
+            // 4. playback.mpd: warden + respondent on
+            //    audio.playback shape 1. Owns the `mpd-path`
+            //    URI scheme; the framework's source-verb
+            //    dispatcher routes play_now / etc. to its
+            //    respondent surface, while the steward's
+            //    custody-aware dispatcher routes
+            //    course_correct verbs (play / pause / seek /
+            //    set_volume / etc.) to the warden surface.
+            //    Admit AFTER playback.options so the
+            //    audio.options.settings subject already
+            //    exists when playback.mpd subscribes.
+            let playback_manifest = Manifest::from_toml(
+                org_evoframework_playback_mpd::MANIFEST_TOML,
+            )
+            .context("parsing playback.mpd manifest")?;
+            engine
+                .admit_singleton_warden_with_respondent(
+                    MpdPlaybackPlugin::new(),
+                    playback_manifest,
+                )
+                .await
+                .context("admitting playback.mpd")?;
 
             // 5. network: singleton respondent on
             //    networking.link shape 1. Multi-source
