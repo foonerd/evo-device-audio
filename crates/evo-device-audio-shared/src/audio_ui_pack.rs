@@ -2,7 +2,7 @@
 //!
 //! The framework owns Tier 1 universals (`evo.prompt.*`,
 //! `evo.theme.picker`, `evo.status.badge`, `evo.wizard.*`,
-//! operator-tile entries) in `the framework SDK ui_tier1 module`. The audio
+//! operator-tile entries) in the framework SDK's Tier 1 module. The audio
 //! reference device adds Tier 2 — concrete audio-domain shelves
 //! the operator interacts with (transport, queue, metering, browse,
 //! search, signal path) plus the widget kinds that paint on them.
