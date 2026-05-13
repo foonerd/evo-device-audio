@@ -861,9 +861,28 @@ async fn run_source_capture_task(
         }
     }
 
-    // Best-effort join: the capture thread sees the shutdown
-    // Notify and the dropped tx, both of which signal exit.
-    let _ = capture_thread.join();
+    // Do NOT join the capture thread on the async unload
+    // path. Joining would block the async task waiting for
+    // the OS thread to exit; the thread polls `tx.is_closed()`
+    // between reads to detect that exit signal — but `rx`
+    // lives in THIS task's frame, so closing the channel
+    // only happens after this function returns. Joining
+    // here is a deadlock: thread waits on the channel
+    // closing, channel closing waits on the function
+    // returning, function returning waits on the join. The
+    // framework's 10 s plugin-shutdown deadline expires,
+    // SIGKILL fires, systemd's 90 s TimeoutStopSec runs
+    // out, the restart takes ~90 s.
+    //
+    // Drop the JoinHandle instead — std::thread detaches.
+    // When this function returns, the local `rx` drops,
+    // `tx.is_closed()` becomes true, and the thread exits
+    // on its next loop iteration. With cooperative ALSA
+    // capture (non-blocking PCM + `pcm.wait(100ms)`), the
+    // thread polls the closed-channel signal within 100 ms
+    // regardless of whether MPD is still feeding the
+    // loopback. ALSA PCM handle drops at thread scope exit.
+    drop(capture_thread);
 }
 
 /// OS-thread body that owns the ALSA capture handle. Loops
@@ -877,7 +896,16 @@ fn run_capture_thread(
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     shutdown: Arc<Notify>,
 ) {
-    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, false)
+    // Open the capture PCM NON-BLOCKING. In blocking mode
+    // `io.readi()` parks indefinitely waiting for samples
+    // (e.g. when MPD stops feeding the loopback playback
+    // half); the thread can never reach the `tx.is_closed()`
+    // poll between iterations and the async unload path
+    // hangs until the framework's 10 s plugin-shutdown
+    // deadline fires SIGKILL, then systemd's 90 s
+    // TimeoutStopSec runs out. Combined with `pcm.wait`
+    // below, this thread polls cooperatively every 100 ms.
+    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, true)
     {
         Ok(p) => p,
         Err(e) => {
@@ -936,6 +964,37 @@ fn run_capture_thread(
             );
             return;
         }
+        // Explicit period + buffer time on capture. Without
+        // this snd-aloop's defaults yield a ~10-second
+        // capture buffer (524288 frames @ 48 kHz observed
+        // empirically) which makes capture-side audible
+        // latency dependent on a startup-timing race between
+        // MPD's first writei and the capture-thread's first
+        // readi — sometimes ~10 ms (Perfect), sometimes
+        // ~1 second (way behind), nothing deterministic in
+        // between. Target ALSA period+buffer in TIME (us)
+        // so each device tier picks its tightest natively-
+        // supported size; snd-aloop honours 20 ms / 80 ms
+        // cleanly. The audible-latency budget is now
+        // structural, not random.
+        if let Err(e) = hwp.set_period_time_near(20_000, alsa::ValueOr::Nearest)
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_period_time_near (capture) failed"
+            );
+            return;
+        }
+        if let Err(e) = hwp.set_buffer_time_near(80_000, alsa::ValueOr::Nearest)
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "set_buffer_time_near (capture) failed"
+            );
+            return;
+        }
         if let Err(e) = pcm.hw_params(&hwp) {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -944,12 +1003,55 @@ fn run_capture_thread(
             );
             return;
         }
+        // Read back the actually-negotiated values + log.
+        // Operators see capture-side audible latency =
+        // buffer_ms here. Combined with leader_ms (200 ms)
+        // and the renderer's own buffer_ms, this is the
+        // honest end-to-end budget.
+        match pcm.hw_params_current() {
+            Ok(current) => {
+                let pf = current.get_period_size().unwrap_or(0);
+                let bf = current.get_buffer_size().unwrap_or(0);
+                let pm = (pf as u64 * 1000) / BASELINE_SAMPLE_RATE_HZ as u64;
+                let bm = (bf as u64 * 1000) / BASELINE_SAMPLE_RATE_HZ as u64;
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    source_pcm = %source_pcm,
+                    period_frames = pf,
+                    period_ms = pm,
+                    buffer_frames = bf,
+                    buffer_ms = bm,
+                    "ALSA capture hw_params negotiated"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "hw_params_current readback (capture) failed"
+                );
+            }
+        }
     }
     if let Err(e) = pcm.prepare() {
         tracing::warn!(
             plugin = PLUGIN_NAME,
             error = %e,
             "pcm.prepare (capture) failed"
+        );
+        return;
+    }
+    // Non-blocking capture requires explicit start() to
+    // transition from Prepared to Running. In blocking mode
+    // the first `readi()` implicitly starts the stream; in
+    // non-blocking mode `readi()` returns EAGAIN immediately
+    // without starting, so `wait()` perpetually times out
+    // and no audio ever flows.
+    if let Err(e) = pcm.start() {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "pcm.start (capture) failed"
         );
         return;
     }
@@ -970,49 +1072,79 @@ fn run_capture_thread(
         "ALSA capture opened at 48 kHz / 2 ch / pcm_s16_le"
     );
 
+    // shutdown.notified() is an async Notify — we cannot
+    // await it from this sync std::thread. The cooperative
+    // shutdown signal is the closed channel (`tx.is_closed()`
+    // becomes true when the async receiver_task returns and
+    // drops `rx`). `pcm.wait(Some(100))` parks for at most
+    // 100 ms before returning, so the closed-channel check
+    // runs at least every 100 ms even when the loopback
+    // playback half has no producer (MPD stopped).
+    let _ = &shutdown;
     let mut buf: Vec<i16> =
         vec![0; FRAMES_PER_CHUNK * BASELINE_CHANNELS as usize];
     loop {
-        // shutdown.notified() is the async-side notifier. Poll
-        // it by ticking off small reads + checking the channel
-        // periodically — the closed channel + shutdown signal
-        // both terminate the loop.
-        let _ = &shutdown;
-        match io.readi(&mut buf) {
-            Ok(frames_read) => {
-                if frames_read == 0 {
-                    continue;
-                }
-                let mut pcm_bytes = Vec::with_capacity(
-                    frames_read * BASELINE_CHANNELS as usize * 2,
-                );
-                for s in &buf[..frames_read * BASELINE_CHANNELS as usize] {
-                    pcm_bytes.extend_from_slice(&s.to_le_bytes());
-                }
-                // Try non-blocking; on pressure drop oldest
-                // (we are the producer, the async side is the
-                // consumer; backpressure here would corrupt
-                // the loopback playback half).
-                if tx.try_send(pcm_bytes).is_err() {
-                    // Either channel full (drop) or closed
-                    // (exit). Treat full as soft-drop, closed
-                    // as termination.
-                    if tx.is_closed() {
-                        break;
+        if tx.is_closed() {
+            break;
+        }
+        match pcm.wait(Some(100)) {
+            Ok(true) => {
+                // Data ready; non-blocking readi returns
+                // whatever's available (or EAGAIN if the
+                // wait/read raced).
+                match io.readi(&mut buf) {
+                    Ok(frames_read) if frames_read > 0 => {
+                        let mut pcm_bytes = Vec::with_capacity(
+                            frames_read * BASELINE_CHANNELS as usize * 2,
+                        );
+                        for s in
+                            &buf[..frames_read * BASELINE_CHANNELS as usize]
+                        {
+                            pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                        }
+                        // Soft-drop on channel full: we are
+                        // the producer of a real-time stream;
+                        // back-pressuring would corrupt the
+                        // loopback playback half upstream.
+                        let _ = tx.try_send(pcm_bytes);
+                    }
+                    Ok(_) => {
+                        // Zero frames — try again on next
+                        // wait cycle.
+                    }
+                    Err(e) => {
+                        // EAGAIN (errno 11) is expected on
+                        // non-blocking PCM when no data is
+                        // ready — silent skip. Other errors
+                        // (EPIPE underrun / ESTRPIPE suspend
+                        // / etc.) recover via prepare().
+                        if e.errno() != 11 {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "ALSA readi (capture) failed; recovering"
+                            );
+                            let _ = pcm.prepare();
+                            let _ = pcm.start();
+                        }
                     }
                 }
+            }
+            Ok(false) => {
+                // wait timeout — loop, recheck closed
+                // channel, wait again. This is the
+                // cooperative-shutdown path when no audio
+                // is flowing through the loopback.
             }
             Err(e) => {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "ALSA readi (capture) failed; recovering"
+                    "ALSA pcm.wait (capture) failed; recovering"
                 );
                 let _ = pcm.prepare();
+                let _ = pcm.start();
             }
-        }
-        if tx.is_closed() {
-            break;
         }
     }
     tracing::info!(plugin = PLUGIN_NAME, "ALSA capture thread exiting");

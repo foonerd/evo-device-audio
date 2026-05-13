@@ -224,9 +224,9 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    source-host election: source-host nodes
             //    capture from the local audio chain + fan
             //    frames out; receivers subscribe to incoming
-            //    frames + render to local ALSA. this iteration
-            //    baseline lit at the receiver-observation +
-            //    fan-out-substrate layer; the audio-chain
+            //    frames + render to local ALSA. The initial
+            //    plugin shape lights up the receiver-observation
+            //    + fan-out-substrate layer; the audio-chain
             //    capture + render bridges land as substrate
             //    iterations on the same plugin.
             let multiroom_manifest = Manifest::from_toml(
