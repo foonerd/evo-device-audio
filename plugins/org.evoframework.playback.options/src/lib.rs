@@ -80,9 +80,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::{
-    BuildInfo, HappeningEmitter, HealthReport, LoadContext, Plugin,
-    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
+    Plugin, PluginDescription, PluginError, PluginIdentity, Request,
+    Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
+    SubjectAnnouncer,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,17 @@ const PAYLOAD_VERSION: u32 = 1;
 /// peers) subscribe to this on the happenings bus.
 const HAPPENING_EVENT_TYPE: &str = "audio.options.changed";
 
+/// External-addressing scheme + value the plugin uses for its
+/// canonical settings subject. Plugins observing operator
+/// option changes resolve this addressing to the canonical id
+/// via `SubjectQuerier::resolve_addressing` and subscribe to
+/// state updates via `SubjectStateSubscriber::subscribe_subject`.
+const SETTINGS_SCHEME: &str = "evo.audio.options";
+const SETTINGS_VALUE: &str = "settings";
+
+/// Subject type the framework records on the settings subject.
+const SETTINGS_SUBJECT_TYPE: &str = "audio.options.settings";
+
 /// Filename for the persisted operator state under
 /// [`LoadContext::state_dir`].
 const STATE_FILENAME: &str = "state.toml";
@@ -117,6 +129,8 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_dop",
     "options.set_output_device",
     "options.set_volume_normalization",
+    "options.restore_last_known_good",
+    "options.reset_to_defaults",
 ];
 
 /// Parse the embedded plugin manifest.
@@ -268,6 +282,15 @@ pub struct PlaybackOptionsPlugin {
     settings: Settings,
     state_path: Option<PathBuf>,
     happening_emitter: Option<Arc<dyn HappeningEmitter>>,
+    /// Subject-announcer handle from `LoadContext`. The plugin
+    /// announces its settings as a subject at load time and
+    /// publishes a fresh state payload after every setter so
+    /// downstream consumers (playback.mpd's mixer-mode reactor,
+    /// future UI plugins) observe operator changes via the
+    /// framework's `SubjectStateSubscriber` rather than
+    /// reaching into this plugin's state file or wire-op
+    /// surface.
+    subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
     requests_handled: u64,
 }
 
@@ -279,6 +302,7 @@ impl PlaybackOptionsPlugin {
             settings: Settings::default(),
             state_path: None,
             happening_emitter: None,
+            subject_announcer: None,
             requests_handled: 0,
         }
     }
@@ -332,6 +356,30 @@ impl PlaybackOptionsPlugin {
                 "state_path is None; plugin not fully loaded".to_string(),
             ));
         };
+        // Before overwriting the live state.toml, copy its
+        // current bytes to the last-known-good sidecar so an
+        // operator (or the auto-recovery path) can restore the
+        // prior settings if the new config breaks audio. This
+        // is the lower-cost half of the safety story; the
+        // operator-facing restore_last_known_good and
+        // reset_to_defaults verbs land in
+        // handle_restore_last_known_good +
+        // handle_reset_to_defaults.
+        if path.exists() {
+            let lkg_path = Self::last_known_good_path(path);
+            // Best-effort: a copy failure here does NOT fail
+            // the setter (the operator's change must still
+            // land). The next successful persist re-snapshots.
+            if let Err(e) = tokio::fs::copy(path, &lkg_path).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    lkg_path = %lkg_path.display(),
+                    "last-known-good snapshot failed; setter continues \
+                     but auto-recovery may be unavailable until next persist"
+                );
+            }
+        }
         let body = toml::to_string_pretty(&self.settings).map_err(|e| {
             PluginError::Permanent(format!("settings serialise error: {e}"))
         })?;
@@ -372,30 +420,205 @@ impl PlaybackOptionsPlugin {
         Ok(())
     }
 
-    /// Emit a `Happening::PluginEvent` carrying the operator-
-    /// readable diff. Best-effort: emit failures are logged at
-    /// warn level and do not fail the setter.
-    async fn emit_changed(&self, field: &str, new_value: serde_json::Value) {
-        let Some(emitter) = self.happening_emitter.as_ref() else {
+    /// Compute the last-known-good sidecar path for a given
+    /// live state file. We use `<state_filename>.lkg` in the
+    /// same directory; that keeps the sidecar inside the
+    /// plugin's own state dir (operator-owned) and avoids any
+    /// path traversal across plugin boundaries.
+    fn last_known_good_path(state_path: &std::path::Path) -> PathBuf {
+        let mut path = state_path.to_path_buf();
+        let file_name = state_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| STATE_FILENAME.to_string());
+        path.set_file_name(format!("{file_name}.lkg"));
+        path
+    }
+
+    /// Restore the last-known-good snapshot in place over the
+    /// live state file. The next setter (or this method's
+    /// own follow-on persist) re-snapshots the now-live state.
+    /// Returns the restored Settings so the caller can update
+    /// `self.settings` + drive the subject-state publish.
+    async fn restore_from_last_known_good(
+        &self,
+    ) -> Result<Settings, PluginError> {
+        let Some(path) = self.state_path.as_ref() else {
+            return Err(PluginError::Permanent(
+                "state_path is None; plugin not fully loaded".to_string(),
+            ));
+        };
+        let lkg_path = Self::last_known_good_path(path);
+        if !lkg_path.exists() {
+            return Err(PluginError::Permanent(format!(
+                "no last-known-good snapshot at {}",
+                lkg_path.display()
+            )));
+        }
+        // Stage the LKG copy into a temp file, fsync, then
+        // rename onto the live path. This is the same atomic-
+        // write recipe persist_settings uses; readers
+        // (subsequent load_settings_from_disk) see either the
+        // prior contents or the restored contents — never a
+        // torn write.
+        let body = tokio::fs::read_to_string(&lkg_path).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "read last-known-good at {}: {e}",
+                lkg_path.display()
+            ))
+        })?;
+        let settings: Settings = toml::from_str(&body).map_err(|e| {
+            PluginError::Permanent(format!(
+                "last-known-good at {} failed to parse: {e}",
+                lkg_path.display()
+            ))
+        })?;
+        let parent = path.parent().ok_or_else(|| {
+            PluginError::Permanent(format!(
+                "state_path {path:?} has no parent directory"
+            ))
+        })?;
+        let staging = parent.join(format!(
+            ".{}.tmp",
+            path.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| STATE_FILENAME.to_string())
+        ));
+        tokio::fs::write(&staging, &body).await.map_err(|e| {
+            PluginError::Permanent(format!("write {staging:?}: {e}"))
+        })?;
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&staging)
+                .await
+                .map_err(|e| {
+                    PluginError::Permanent(format!("open {staging:?}: {e}"))
+                })?;
+            f.sync_all().await.map_err(|e| {
+                PluginError::Permanent(format!("fsync {staging:?}: {e}"))
+            })?;
+        }
+        tokio::fs::rename(&staging, path).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "rename {staging:?} -> {path:?}: {e}"
+            ))
+        })?;
+        Ok(settings)
+    }
+
+    /// Build the external addressing for the plugin's settings
+    /// subject. Consumers resolve the same `(scheme, value)`
+    /// pair against the framework's subject querier to learn
+    /// the canonical id they should subscribe to.
+    fn settings_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: SETTINGS_SCHEME.to_string(),
+            value: SETTINGS_VALUE.to_string(),
+        }
+    }
+
+    /// Announce the settings subject at load time with the
+    /// current settings as state. Idempotent on re-announce
+    /// (the framework's registry treats this as Updated on the
+    /// existing canonical id, preserving the addressing). Emit
+    /// failures are logged at warn level and do not fail the
+    /// load — the plugin's wire-op surface continues to work
+    /// even if the subject channel is unavailable.
+    async fn announce_settings_subject(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
             return;
         };
-        let payload = serde_json::json!({
-            "v": PAYLOAD_VERSION,
-            "field": field,
-            "new_value": new_value,
-            "settings": self.settings.clone(),
-        });
-        if let Err(e) = emitter
-            .emit_plugin_event(HAPPENING_EVENT_TYPE.to_string(), payload)
+        let state = match serde_json::to_value(&self.settings) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to serialise settings for subject state"
+                );
+                return;
+            }
+        };
+        let announcement = SubjectAnnouncement {
+            subject_type: SETTINGS_SUBJECT_TYPE.to_string(),
+            addressings: vec![Self::settings_addressing()],
+            claims: Vec::new(),
+            state,
+            announced_at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = announcer.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "announce settings subject failed"
+            );
+        }
+    }
+
+    /// Publish a fresh subject-state payload after a setter
+    /// has updated `self.settings`. Best-effort: failures log
+    /// at warn level so the setter's persist + happening
+    /// emission paths are unaffected.
+    async fn publish_settings_state(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        let state = match serde_json::to_value(&self.settings) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to serialise settings for subject state update"
+                );
+                return;
+            }
+        };
+        if let Err(e) = announcer
+            .update_state(Self::settings_addressing(), state)
             .await
         {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
-                field = field,
                 error = %e,
-                "emit happening failed"
+                "update settings subject state failed"
             );
         }
+    }
+
+    /// Emit a `Happening::PluginEvent` carrying the operator-
+    /// readable diff AND publish a fresh subject-state payload
+    /// so subject-stream consumers (playback.mpd's mixer-mode
+    /// reactor, UI plugins) observe the change.
+    ///
+    /// Both side-effects are best-effort: emit / publish
+    /// failures are logged at warn level and do not fail the
+    /// setter. Order: happening first (operator-visible audit
+    /// trail), subject state second (consumer plumbing). A
+    /// failed subject-state update with a successful happening
+    /// is recoverable by the next setter; the reverse is not.
+    async fn emit_changed(&self, field: &str, new_value: serde_json::Value) {
+        if let Some(emitter) = self.happening_emitter.as_ref() {
+            let payload = serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "field": field,
+                "new_value": new_value,
+                "settings": self.settings.clone(),
+            });
+            if let Err(e) = emitter
+                .emit_plugin_event(HAPPENING_EVENT_TYPE.to_string(), payload)
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    field = field,
+                    error = %e,
+                    "emit happening failed"
+                );
+            }
+        }
+        self.publish_settings_state().await;
     }
 }
 
@@ -452,6 +675,16 @@ impl Plugin for PlaybackOptionsPlugin {
             }
             self.settings = self.load_settings_from_disk().await?;
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
+            self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
+            // Announce the settings subject so consumers
+            // (playback.mpd, future UI plugins) can resolve
+            // its canonical id + subscribe to state changes
+            // via the framework's SubjectStateSubscriber. The
+            // announce carries the current settings as state
+            // so consumers seeing the SubjectRegistered
+            // happening have the initial value without a
+            // separate round-trip.
+            self.announce_settings_subject().await;
             self.loaded = true;
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -528,6 +761,12 @@ impl Respondent for PlaybackOptionsPlugin {
                 }
                 "options.set_volume_normalization" => {
                     self.handle_set_volume_normalization(req).await
+                }
+                "options.restore_last_known_good" => {
+                    self.handle_restore_last_known_good(req).await
+                }
+                "options.reset_to_defaults" => {
+                    self.handle_reset_to_defaults(req).await
                 }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired"
@@ -666,6 +905,80 @@ impl PlaybackOptionsPlugin {
         self.emit_changed(
             "volume_normalization",
             serde_json::Value::Bool(payload.value),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Roll the live settings back to the last-known-good
+    /// snapshot. The snapshot was written by the previous
+    /// successful `persist_settings` call (every setter
+    /// invokes it before overwriting the live file).
+    ///
+    /// Returns `Permanent` if no snapshot exists (no prior
+    /// successful setter run since plugin install) or if the
+    /// snapshot file is malformed. Operators reading the
+    /// error message see the snapshot path so they can
+    /// inspect it.
+    ///
+    /// On success: settings are restored in memory, the live
+    /// state.toml is rewritten atomically, the change
+    /// propagates via emit_changed → subject state publish.
+    /// Consumers (playback.mpd's mixer-mode reactor, UI
+    /// surfaces) observe the rollback the same way they
+    /// observe any other operator change.
+    async fn handle_restore_last_known_good(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        let restored = self.restore_from_last_known_good().await?;
+        self.settings = restored;
+        // We do NOT call self.persist_settings() here: the
+        // restore_from_last_known_good already atomic-wrote
+        // the live state.toml in place; a follow-on persist
+        // would clobber the LKG snapshot we just restored
+        // from. The next setter call rewrites the LKG snapshot
+        // as part of its normal persist path.
+        self.emit_changed(
+            "restore_last_known_good",
+            serde_json::to_value(&self.settings).map_err(map_json_err)?,
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Reset the live settings to documented defaults
+    /// (`Settings::default()`). Useful for first-boot
+    /// rescue + operator-explicit reset.
+    ///
+    /// Resets BOTH the in-memory settings AND the persisted
+    /// state.toml; the previous live state becomes the new
+    /// last-known-good snapshot so operators can immediately
+    /// `restore_last_known_good` to undo the reset if it was
+    /// accidental.
+    async fn handle_reset_to_defaults(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        self.settings = Settings::default();
+        self.persist_settings().await?;
+        self.emit_changed(
+            "reset_to_defaults",
+            serde_json::to_value(&self.settings).map_err(map_json_err)?,
         )
         .await;
         encode(
