@@ -61,5 +61,7 @@ subscribe_subjects = true
 request_types = [
     "multiroom.get_status",
     "multiroom.set_leader_ms",
+    "multiroom.set_profile",
+    "multiroom.set_leader_mode",
 ]
 response_budget_ms = 1000

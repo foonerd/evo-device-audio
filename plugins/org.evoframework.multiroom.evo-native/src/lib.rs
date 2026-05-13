@@ -87,7 +87,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use evo_plugin_sdk::contract::audio_plane::{AudioFrameSeed, AudioPlaneHandle};
+use evo_plugin_sdk::contract::audio_plane::{
+    AudioFrameSeed, AudioPlaneHandle, ReceiverTelemetry,
+};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -111,8 +113,12 @@ const PAYLOAD_VERSION: u32 = 1;
 /// Request types this plugin honours. Mirrors
 /// `manifest.toml`'s `[capabilities.respondent].request_types`;
 /// admission would refuse a mismatch.
-const REQUEST_TYPES: &[&str] =
-    &["multiroom.get_status", "multiroom.set_leader_ms"];
+const REQUEST_TYPES: &[&str] = &[
+    "multiroom.get_status",
+    "multiroom.set_leader_ms",
+    "multiroom.set_profile",
+    "multiroom.set_leader_mode",
+];
 
 /// Lower bound for operator-set `leader_ms`. Below this the
 /// network-jitter budget collapses and the receiver underruns
@@ -169,6 +175,158 @@ const DEFAULT_LEADER_MS: u64 = 200;
 /// sub-period precision.
 const SCHEDULER_TICK_MS: u64 = 5;
 
+/// Auto-decay profile: how aggressively the source aggregates
+/// per-receiver telemetry into the group-wide `group_leader_ms`
+/// it stamps on every frame. Conservative is the default; the
+/// auto-decay loop escalates one step when underruns are
+/// observed in the current window and decays one step when
+/// the window passes with zero underruns.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Profile {
+    /// Tight end-to-end latency (~120 ms on healthy LAN).
+    /// `max(p95) × 1.5 + 30 ms` floor. More underruns on
+    /// borderline networks; best for very-low-latency demos.
+    Aggressive,
+    /// Default. `max(p95) × 2.0 + 50 ms` floor. End-to-end
+    /// latency ~200 ms on a healthy LAN. Matches Roon RAAT's
+    /// posture.
+    Conservative,
+    /// Few underruns even on noisy WiFi. `max(p99) × 3.0 +
+    /// 100 ms` floor. End-to-end latency 400-600 ms typical.
+    Defensive,
+}
+
+impl Profile {
+    fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::Aggressive => "aggressive",
+            Self::Conservative => "conservative",
+            Self::Defensive => "defensive",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Aggressive,
+            2 => Self::Defensive,
+            _ => Self::Conservative,
+        }
+    }
+
+    /// Multiplier applied to the per-peer jitter-percentile.
+    fn safety_factor(self) -> f64 {
+        match self {
+            Self::Aggressive => 1.5,
+            Self::Conservative => 2.0,
+            Self::Defensive => 3.0,
+        }
+    }
+
+    /// Floor (ms) added to the multiplied jitter so even
+    /// near-zero-jitter peers get a small absolute budget.
+    fn floor_ms(self) -> u64 {
+        match self {
+            Self::Aggressive => 30,
+            Self::Conservative => 50,
+            Self::Defensive => 100,
+        }
+    }
+
+    /// Decay direction: next-safer profile when underruns
+    /// observed. `Defensive` is the terminal escalation.
+    fn escalate(self) -> Self {
+        match self {
+            Self::Aggressive => Self::Conservative,
+            Self::Conservative => Self::Defensive,
+            Self::Defensive => Self::Defensive,
+        }
+    }
+
+    /// Decay direction: next-tighter profile when the window
+    /// passes underrun-free. `Aggressive` is the terminal
+    /// tightening.
+    fn decay(self) -> Self {
+        match self {
+            Self::Aggressive => Self::Aggressive,
+            Self::Conservative => Self::Aggressive,
+            Self::Defensive => Self::Conservative,
+        }
+    }
+}
+
+/// Leader-control mode the source-host plugin operates in.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderMode {
+    /// Auto-decay: source computes `group_leader_ms` from per-
+    /// peer telemetry under the configured `Profile`. The
+    /// profile itself escalates / decays based on observed
+    /// underrun counts.
+    AutoDecay,
+    /// Source pins the profile to the operator's choice. No
+    /// auto-decay between profiles. Telemetry still drives the
+    /// `group_leader_ms` within the pinned profile.
+    AutoPinned,
+    /// Manual: operator sets `manual_leader_ms` directly. The
+    /// source stamps that fixed value on every frame; profile
+    /// + telemetry are visible but not authoritative.
+    Manual,
+}
+
+impl LeaderMode {
+    fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::AutoDecay => "auto_decay",
+            Self::AutoPinned => "auto_pinned",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::AutoPinned,
+            2 => Self::Manual,
+            _ => Self::AutoDecay,
+        }
+    }
+}
+
+/// Window (in source-aggregation ticks) over which the auto-
+/// decay loop reads the underrun counter deltas. Source
+/// recomputes group_leader_ms every
+/// `SOURCE_AGGREGATION_TICK_MS` (250 ms) so a 120-tick window
+/// = 30 s of quiet → decay one step. Asymmetric: escalation
+/// on a single underrun is immediate (one tick); decay back
+/// requires a sustained quiet window. The asymmetry stops
+/// profile-flapping when the network sits on the edge of a
+/// profile boundary — a one-off underrun escalates the
+/// profile and the network must prove sustained quiet before
+/// tightening again.
+const AUTO_DECAY_WINDOW_TICKS: u32 = 120;
+
+/// Source-side aggregation tick. The source-host plugin
+/// recomputes `group_leader_ms` from peer telemetry every
+/// `SOURCE_AGGREGATION_TICK_MS` ms and stamps subsequent
+/// frames with the latest value. 250 ms is a balance between
+/// responsiveness to network-condition changes and aggregation
+/// stability.
+const SOURCE_AGGREGATION_TICK_MS: u64 = 250;
+
+/// Receiver-side telemetry publish cadence. The receiver task
+/// pushes its current telemetry into the framework's
+/// heartbeat-piggyback channel every
+/// `RECEIVER_TELEMETRY_PUBLISH_MS` ms (3 s) so source-host
+/// plugins see fresh data without flooding the wire.
+const RECEIVER_TELEMETRY_PUBLISH_MS: u64 = 3000;
+
+/// Receiver-side jitter-sample retention window (ms). The
+/// receiver computes its observed_jitter_p95_ms over the most
+/// recent `RECEIVER_JITTER_WINDOW_MS` worth of samples; older
+/// samples are dropped so the percentile tracks current
+/// network conditions, not stale ones.
+const RECEIVER_JITTER_WINDOW_MS: u64 = 10_000;
+
 /// Operator config persisted at
 /// `/etc/evo/plugins.d/multiroom.evo-native.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -200,20 +358,35 @@ struct PluginConfig {
     /// synthetic 440 Hz tone generator (diagnostic floor).
     #[serde(default)]
     source_pcm: String,
-    /// Presentation-time leader in milliseconds: how far
-    /// ahead of audible render the source emits each frame,
-    /// and the network-latency + jitter budget the receiver
-    /// allocates before scheduling each frame's writei into
-    /// ALSA. Lower = lower end-to-end latency, less
-    /// tolerance for slow networks. Higher = more tolerance
-    /// for slow networks, slightly higher latency. The
-    /// receiver schedules every frame against its
-    /// presentation_time_ms anchor so playback is
-    /// bit-perfect (no sample drops, no sample inserts)
-    /// regardless of jitter inside the budget. Operators
-    /// tune live via `multiroom.set_leader_ms`.
+    /// Presentation-time leader in milliseconds. In
+    /// `LeaderMode::Manual` this is the value the source-host
+    /// stamps on every frame; receivers honour it directly.
+    /// In auto modes this serves as the fallback when no
+    /// peer telemetry has been observed yet, and as the
+    /// effective value receivers apply on builds without the
+    /// audio_plane wire field (forward-compat with v0 of the
+    /// wire).
     #[serde(default = "default_leader_ms")]
     leader_ms: u64,
+    /// Leader-control mode. Default `AutoDecay` — the source-
+    /// host plugin recomputes the group's `group_leader_ms`
+    /// every aggregation tick, and the profile escalates /
+    /// decays based on observed underrun counts.
+    #[serde(default = "default_leader_mode")]
+    leader_mode: LeaderMode,
+    /// Profile (Aggressive / Conservative / Defensive). In
+    /// `AutoDecay` mode the auto-decay loop walks this value
+    /// up + down within the [Aggressive, Defensive] range. In
+    /// `AutoPinned` mode the operator's value stays put. In
+    /// `Manual` mode the profile is informational only.
+    #[serde(default = "default_profile")]
+    profile: Profile,
+    /// Render-buffer capacity (ms) the receiver advertises to
+    /// the source-host so the source can clamp group_leader_ms
+    /// to what the slowest receiver can actually buffer. Set
+    /// per device-tier at install time.
+    #[serde(default = "default_render_buffer_capacity_ms")]
+    render_buffer_capacity_ms: u64,
 }
 
 impl Default for PluginConfig {
@@ -224,6 +397,9 @@ impl Default for PluginConfig {
             alsa_pcm: default_alsa_pcm(),
             source_pcm: String::new(),
             leader_ms: default_leader_ms(),
+            leader_mode: default_leader_mode(),
+            profile: default_profile(),
+            render_buffer_capacity_ms: default_render_buffer_capacity_ms(),
         }
     }
 }
@@ -238,6 +414,21 @@ fn default_alsa_pcm() -> String {
 
 fn default_leader_ms() -> u64 {
     DEFAULT_LEADER_MS
+}
+
+fn default_leader_mode() -> LeaderMode {
+    LeaderMode::AutoDecay
+}
+
+fn default_profile() -> Profile {
+    Profile::Conservative
+}
+
+/// Default render-buffer capacity (ms) advertised on receiver
+/// telemetry. 2000 ms = LEADER_MS_MAX, which the source uses
+/// as the upper clamp on `group_leader_ms`.
+fn default_render_buffer_capacity_ms() -> u64 {
+    LEADER_MS_MAX
 }
 
 /// Plugin role. Set via operator config.
@@ -289,20 +480,50 @@ pub struct MultiroomEvoNativePlugin {
     frames_received: Arc<std::sync::atomic::AtomicU64>,
     frames_sent: Arc<std::sync::atomic::AtomicU64>,
     /// Operator-tunable presentation-time leader in ms.
-    /// Shared with the source + receiver tasks so live
-    /// updates via `multiroom.set_leader_ms` take effect
-    /// without a plugin reload.
+    /// In Manual mode, the source stamps this on every
+    /// frame. In auto modes, this is the seed value used
+    /// until peer telemetry refines it.
     leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The group-wide `group_leader_ms` the source-host most
+    /// recently computed (or, on a receiver, the most recent
+    /// value extracted from incoming frames). Read by
+    /// `multiroom.get_status`.
+    group_leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Current effective Profile (Aggressive / Conservative /
+    /// Defensive). Source-host's auto-decay loop walks this
+    /// up + down within the [Aggressive, Defensive] range
+    /// when in `LeaderMode::AutoDecay`; pinned in
+    /// `AutoPinned`; informational only in `Manual`. Stored
+    /// as u8 so it fits an AtomicU8 (Aggressive=0,
+    /// Conservative=1, Defensive=2).
+    profile: Arc<std::sync::atomic::AtomicU8>,
+    /// Current LeaderMode (AutoDecay / AutoPinned / Manual).
+    /// AutoDecay=0, AutoPinned=1, Manual=2.
+    leader_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Receiver-side underrun counter: incremented every
-    /// time the scheduler reaches a render tick with no
-    /// frame in the queue at or before the due time. Each
-    /// underrun is one period of silence written to ALSA
-    /// to keep playback continuous.
+    /// time `AlsaRender::write` recovered from an xrun
+    /// (EPIPE underrun). Published to source-host plugins
+    /// via heartbeat-piggybacked telemetry; operators
+    /// observe via `multiroom.get_status`.
     receiver_underruns: Arc<std::sync::atomic::AtomicU64>,
     /// Receiver-side queue depth (most recent observed).
     /// Snapshot for `multiroom.get_status`; updated by the
     /// receiver scheduler each tick.
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver-side observed jitter p95 (ms). Computed over
+    /// the most recent `RECEIVER_JITTER_WINDOW_MS` worth of
+    /// samples; the receiver task updates this every tick.
+    receiver_jitter_p95_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Operator-set render-buffer capacity (ms). Advertised
+    /// on telemetry so the source-host plugin clamps
+    /// group_leader_ms to what the slowest receiver can hold.
+    render_buffer_capacity_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Source-side aggregation task. Spawned for source role
+    /// only.
+    source_aggregator_task: Option<JoinHandle<()>>,
+    /// Receiver-side telemetry-publish task. Spawned for
+    /// receiver + auto roles.
+    receiver_telemetry_task: Option<JoinHandle<()>>,
 }
 
 impl MultiroomEvoNativePlugin {
@@ -320,10 +541,29 @@ impl MultiroomEvoNativePlugin {
             leader_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 DEFAULT_LEADER_MS,
             )),
+            group_leader_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_LEADER_MS,
+            )),
+            profile: Arc::new(std::sync::atomic::AtomicU8::new(
+                Profile::Conservative as u8,
+            )),
+            leader_mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                LeaderMode::AutoDecay as u8,
+            )),
             receiver_underruns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             receiver_queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            receiver_jitter_p95_ms: Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
+            render_buffer_capacity_ms: Arc::new(
+                std::sync::atomic::AtomicU64::new(
+                    default_render_buffer_capacity_ms(),
+                ),
+            ),
+            source_aggregator_task: None,
+            receiver_telemetry_task: None,
         }
     }
 
@@ -375,6 +615,19 @@ impl MultiroomEvoNativePlugin {
             ));
         }
         self.leader_ms
+            .store(cfg.leader_ms, std::sync::atomic::Ordering::Relaxed);
+        self.profile
+            .store(cfg.profile as u8, std::sync::atomic::Ordering::Relaxed);
+        self.leader_mode
+            .store(cfg.leader_mode as u8, std::sync::atomic::Ordering::Relaxed);
+        self.render_buffer_capacity_ms.store(
+            cfg.render_buffer_capacity_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // The group-wide leader seeds at the operator's
+        // plugin-local leader_ms; the source's first aggregation
+        // tick replaces it from peer telemetry.
+        self.group_leader_ms
             .store(cfg.leader_ms, std::sync::atomic::Ordering::Relaxed);
         self.config = cfg;
         Ok(())
@@ -447,10 +700,12 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let shutdown = Arc::clone(&self.shutdown);
                     let handle = Arc::clone(&audio_plane);
                     let source_pcm = self.config.source_pcm.clone();
+                    let group_leader_ms = Arc::clone(&self.group_leader_ms);
                     let task = if source_pcm.is_empty() {
+                        let glm = Arc::clone(&group_leader_ms);
                         tokio::spawn(async move {
                             run_source_tone_generator(
-                                handle, group_id, sent, shutdown,
+                                handle, group_id, sent, shutdown, glm,
                             )
                             .await;
                         })
@@ -458,9 +713,10 @@ impl Plugin for MultiroomEvoNativePlugin {
                         #[cfg(feature = "alsa-substrate")]
                         {
                             let pcm = source_pcm.clone();
+                            let glm = Arc::clone(&group_leader_ms);
                             tokio::spawn(async move {
                                 run_source_capture_task(
-                                    handle, group_id, sent, shutdown, pcm,
+                                    handle, group_id, sent, shutdown, pcm, glm,
                                 )
                                 .await;
                             })
@@ -474,19 +730,52 @@ impl Plugin for MultiroomEvoNativePlugin {
                                  disabled at build time; falling back to \
                                  synthetic tone"
                             );
+                            let glm = Arc::clone(&group_leader_ms);
                             tokio::spawn(async move {
                                 run_source_tone_generator(
-                                    handle, group_id, sent, shutdown,
+                                    handle, group_id, sent, shutdown, glm,
                                 )
                                 .await;
                             })
                         }
                     };
                     self.source_task = Some(task);
+                    // Spawn the source-side aggregator that
+                    // recomputes `group_leader_ms` every
+                    // SOURCE_AGGREGATION_TICK_MS from per-peer
+                    // telemetry, drives the auto-decay state
+                    // machine, and updates the shared atomic
+                    // the source-emitter reads on each frame.
+                    let agg_handle = Arc::clone(&audio_plane);
+                    let agg_shutdown = Arc::clone(&self.shutdown);
+                    let agg_group_id = self
+                        .config
+                        .group_id
+                        .clone()
+                        .expect("role = source enforces group_id");
+                    let agg_glm = Arc::clone(&self.group_leader_ms);
+                    let agg_leader_ms = Arc::clone(&self.leader_ms);
+                    let agg_profile = Arc::clone(&self.profile);
+                    let agg_mode = Arc::clone(&self.leader_mode);
+                    self.source_aggregator_task =
+                        Some(tokio::spawn(async move {
+                            run_source_aggregator(
+                                agg_handle,
+                                agg_group_id,
+                                agg_shutdown,
+                                agg_glm,
+                                agg_leader_ms,
+                                agg_profile,
+                                agg_mode,
+                            )
+                            .await;
+                        }));
                     if source_pcm.is_empty() {
                         tracing::info!(
                             plugin = PLUGIN_NAME,
                             group_id = %self.config.group_id.as_deref().unwrap_or(""),
+                            leader_mode = self.config.leader_mode.as_wire_str(),
+                            profile = self.config.profile.as_wire_str(),
                             "source role engaged: synthetic 440 Hz tone fan-out running"
                         );
                     } else {
@@ -494,6 +783,8 @@ impl Plugin for MultiroomEvoNativePlugin {
                             plugin = PLUGIN_NAME,
                             group_id = %self.config.group_id.as_deref().unwrap_or(""),
                             source_pcm = %source_pcm,
+                            leader_mode = self.config.leader_mode.as_wire_str(),
+                            profile = self.config.profile.as_wire_str(),
                             "source role engaged: ALSA capture fan-out running"
                         );
                     }
@@ -505,8 +796,11 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let alsa_pcm = self.config.alsa_pcm.clone();
                     let role = self.config.role;
                     let leader_ms = Arc::clone(&self.leader_ms);
+                    let group_leader_ms = Arc::clone(&self.group_leader_ms);
+                    let mode = Arc::clone(&self.leader_mode);
                     let underruns = Arc::clone(&self.receiver_underruns);
                     let queue_depth = Arc::clone(&self.receiver_queue_depth);
+                    let jitter_p95 = Arc::clone(&self.receiver_jitter_p95_ms);
                     let task = tokio::spawn(async move {
                         run_receiver_task(
                             handle,
@@ -515,17 +809,45 @@ impl Plugin for MultiroomEvoNativePlugin {
                             alsa_pcm,
                             role,
                             leader_ms,
+                            group_leader_ms,
+                            mode,
                             underruns,
                             queue_depth,
+                            jitter_p95,
                         )
                         .await;
                     });
                     self.receiver_task = Some(task);
+                    // Spawn the telemetry-publisher: every few
+                    // seconds push (jitter_p95, underrun_count,
+                    // applied_leader_ms, render_buffer_capacity_ms)
+                    // through the audio-plane heartbeat seam so
+                    // source-host plugins on remote peers
+                    // aggregate it.
+                    let pub_handle = Arc::clone(&audio_plane);
+                    let pub_shutdown = Arc::clone(&self.shutdown);
+                    let pub_jitter = Arc::clone(&self.receiver_jitter_p95_ms);
+                    let pub_underruns = Arc::clone(&self.receiver_underruns);
+                    let pub_leader = Arc::clone(&self.group_leader_ms);
+                    let pub_cap = Arc::clone(&self.render_buffer_capacity_ms);
+                    self.receiver_telemetry_task =
+                        Some(tokio::spawn(async move {
+                            run_receiver_telemetry_publisher(
+                                pub_handle,
+                                pub_shutdown,
+                                pub_jitter,
+                                pub_underruns,
+                                pub_leader,
+                                pub_cap,
+                            )
+                            .await;
+                        }));
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         role = self.config.role.as_wire_str(),
                         alsa_pcm = %self.config.alsa_pcm,
                         leader_ms = self.config.leader_ms,
+                        leader_mode = self.config.leader_mode.as_wire_str(),
                         "receiver-side task running"
                     );
                 }
@@ -550,6 +872,12 @@ impl Plugin for MultiroomEvoNativePlugin {
                 let _ = task.await;
             }
             if let Some(task) = self.receiver_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = self.source_aggregator_task.take() {
+                let _ = task.await;
+            }
+            if let Some(task) = self.receiver_telemetry_task.take() {
                 let _ = task.await;
             }
             self.audio_plane = None;
@@ -594,6 +922,32 @@ impl Respondent for MultiroomEvoNativePlugin {
             }
             match req.request_type.as_str() {
                 "multiroom.get_status" => {
+                    let cur_profile = Profile::from_u8(
+                        self.profile.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    let cur_mode = LeaderMode::from_u8(
+                        self.leader_mode
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    let peers = if let Some(h) = self.audio_plane.as_ref() {
+                        h.list_audio_plane_peers().await.unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let peer_telemetry: Vec<serde_json::Value> = peers
+                        .into_iter()
+                        .filter_map(|p| {
+                            p.receiver_telemetry.map(|t| {
+                                serde_json::json!({
+                                    "remote_device_id": p.remote_device_id,
+                                    "observed_jitter_p95_ms": t.observed_jitter_p95_ms,
+                                    "underrun_count": t.underrun_count,
+                                    "applied_leader_ms": t.applied_leader_ms,
+                                    "render_buffer_capacity_ms": t.render_buffer_capacity_ms,
+                                })
+                            })
+                        })
+                        .collect();
                     let payload = serde_json::json!({
                         "v": PAYLOAD_VERSION,
                         "role": self.config.role.as_wire_str(),
@@ -603,14 +957,122 @@ impl Respondent for MultiroomEvoNativePlugin {
                         "leader_ms": self.leader_ms(),
                         "leader_ms_min": LEADER_MS_MIN,
                         "leader_ms_max": LEADER_MS_MAX,
+                        "leader_mode": cur_mode.as_wire_str(),
+                        "profile": cur_profile.as_wire_str(),
+                        "group_leader_ms": self.group_leader_ms.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
                         "frames_sent": self.frames_sent(),
                         "frames_received": self.frames_received(),
                         "receiver_queue_depth": self.receiver_queue_depth(),
                         "receiver_underruns": self.receiver_underruns(),
+                        "receiver_jitter_p95_ms": self.receiver_jitter_p95_ms.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
+                        "render_buffer_capacity_ms": self.render_buffer_capacity_ms.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
+                        "peer_telemetry": peer_telemetry,
                     });
                     let body = serde_json::to_vec(&payload).map_err(|e| {
                         PluginError::Permanent(format!(
                             "encode multiroom.get_status response: {e}"
+                        ))
+                    })?;
+                    Ok(Response::for_request(req, body))
+                }
+                "multiroom.set_profile" => {
+                    let body_json: serde_json::Value =
+                        serde_json::from_slice(&req.payload).map_err(|e| {
+                            PluginError::Permanent(format!(
+                                "multiroom.set_profile: payload not JSON: {e}"
+                            ))
+                        })?;
+                    let value = body_json
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            PluginError::Permanent(
+                                "multiroom.set_profile: payload must contain \
+                                 string 'value' ∈ {aggressive, conservative, \
+                                 defensive}"
+                                    .to_string(),
+                            )
+                        })?;
+                    let new_profile: Profile = match value {
+                        "aggressive" => Profile::Aggressive,
+                        "conservative" => Profile::Conservative,
+                        "defensive" => Profile::Defensive,
+                        other => {
+                            return Err(PluginError::Permanent(format!(
+                                "multiroom.set_profile: unknown profile {other:?}"
+                            )));
+                        }
+                    };
+                    self.profile.store(
+                        new_profile as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        profile = new_profile.as_wire_str(),
+                        "profile updated by operator"
+                    );
+                    let payload = serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "profile": new_profile.as_wire_str(),
+                    });
+                    let body = serde_json::to_vec(&payload).map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "encode multiroom.set_profile response: {e}"
+                        ))
+                    })?;
+                    Ok(Response::for_request(req, body))
+                }
+                "multiroom.set_leader_mode" => {
+                    let body_json: serde_json::Value =
+                        serde_json::from_slice(&req.payload).map_err(|e| {
+                            PluginError::Permanent(format!(
+                            "multiroom.set_leader_mode: payload not JSON: {e}"
+                        ))
+                        })?;
+                    let value = body_json
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            PluginError::Permanent(
+                                "multiroom.set_leader_mode: payload must \
+                                 contain string 'value' ∈ {auto_decay, \
+                                 auto_pinned, manual}"
+                                    .to_string(),
+                            )
+                        })?;
+                    let new_mode: LeaderMode = match value {
+                        "auto_decay" => LeaderMode::AutoDecay,
+                        "auto_pinned" => LeaderMode::AutoPinned,
+                        "manual" => LeaderMode::Manual,
+                        other => {
+                            return Err(PluginError::Permanent(format!(
+                                "multiroom.set_leader_mode: unknown mode {other:?}"
+                            )));
+                        }
+                    };
+                    self.leader_mode.store(
+                        new_mode as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        leader_mode = new_mode.as_wire_str(),
+                        "leader_mode updated by operator"
+                    );
+                    let payload = serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "leader_mode": new_mode.as_wire_str(),
+                    });
+                    let body = serde_json::to_vec(&payload).map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "encode multiroom.set_leader_mode response: {e}"
                         ))
                     })?;
                     Ok(Response::for_request(req, body))
@@ -674,6 +1136,7 @@ async fn run_source_tone_generator(
     group_id: String,
     sent: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
+    group_leader_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -723,9 +1186,18 @@ async fn run_source_tone_generator(
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let presentation_time_ms = (start_monotonic.elapsed().as_millis()
-            as u64)
-            .saturating_add(sequence.saturating_mul(20).saturating_add(100));
+        // PTS = source-local monotonic time at this frame's
+        // emission. The receiver anchors its playback timeline
+        // on the first frame's PTS and schedules subsequent
+        // frames at (anchor_local + delta_pts + leader_ms);
+        // the receiver-side leader is what bounds drift. The
+        // source must NOT add its own per-frame offset on top
+        // of elapsed-since-start — elapsed already advances at
+        // the emit cadence, and double-counting it stretches
+        // the receiver's timeline (one wall-clock second of
+        // audio becomes two seconds of scheduled render → 2×
+        // slow-mo at the receiver).
+        let presentation_time_ms = start_monotonic.elapsed().as_millis() as u64;
 
         let seed = AudioFrameSeed {
             sequence,
@@ -734,6 +1206,8 @@ async fn run_source_tone_generator(
             rate_hz: BASELINE_SAMPLE_RATE_HZ,
             channels: BASELINE_CHANNELS,
             payload_b64: B64.encode(&pcm),
+            group_leader_ms: group_leader_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
         };
 
         if let Err(e) = audio_plane
@@ -774,6 +1248,7 @@ async fn run_source_capture_task(
     sent: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
     source_pcm: String,
+    group_leader_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -825,13 +1300,13 @@ async fn run_source_capture_task(
                         break;
                     }
                 };
+                // PTS = source-local monotonic time at this
+                // frame's emission. Receiver anchors on the
+                // first frame's PTS + delta to schedule
+                // subsequent renders. See the synthetic-tone
+                // generator for the bit-perfect contract.
                 let presentation_time_ms =
-                    (start_monotonic.elapsed().as_millis() as u64)
-                        .saturating_add(
-                            sequence
-                                .saturating_mul(20)
-                                .saturating_add(100),
-                        );
+                    start_monotonic.elapsed().as_millis() as u64;
                 let seed = AudioFrameSeed {
                     sequence,
                     presentation_time_ms,
@@ -839,6 +1314,8 @@ async fn run_source_capture_task(
                     rate_hz: BASELINE_SAMPLE_RATE_HZ,
                     channels: BASELINE_CHANNELS,
                     payload_b64: B64.encode(&pcm),
+                    group_leader_ms: group_leader_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 };
                 if let Err(e) = audio_plane
                     .fan_out_audio_frame(group_id.clone(), seed)
@@ -1045,8 +1522,11 @@ async fn run_receiver_task(
     alsa_pcm: String,
     role: Role,
     leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    group_leader_ms_shared: Arc<std::sync::atomic::AtomicU64>,
+    leader_mode: Arc<std::sync::atomic::AtomicU8>,
     underruns: Arc<std::sync::atomic::AtomicU64>,
     queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    jitter_p95_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut stream = match audio_plane.subscribe_audio_frames().await {
         Ok(s) => s,
@@ -1094,6 +1574,14 @@ async fn run_receiver_task(
     let mut queue: std::collections::VecDeque<
         evo_plugin_sdk::contract::AudioFrameReceived,
     > = std::collections::VecDeque::new();
+    // Rolling jitter window: (sampled_at, jitter_ms). Pruned
+    // to the most recent RECEIVER_JITTER_WINDOW_MS each tick;
+    // p95 over the window is published as the receiver's
+    // observed_jitter_p95_ms telemetry.
+    let mut jitter_samples: std::collections::VecDeque<(
+        std::time::Instant,
+        u64,
+    )> = std::collections::VecDeque::new();
 
     let tick = std::time::Duration::from_millis(SCHEDULER_TICK_MS);
     let mut next_tick = std::time::Instant::now() + tick;
@@ -1138,6 +1626,18 @@ async fn run_receiver_task(
                                 "receiver scheduler: playback anchor established"
                             );
                         }
+                        // Publish the source-stamped
+                        // group_leader_ms into the shared
+                        // atomic the tick arm reads each
+                        // scheduler tick. Zero = source has
+                        // not stamped (e.g. v0 wire form);
+                        // tick arm falls back to local.
+                        if frame.group_leader_ms > 0 {
+                            group_leader_ms_shared.store(
+                                frame.group_leader_ms,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         queue.push_back(frame);
                         queue_depth.store(
                             queue.len() as u64,
@@ -1171,9 +1671,35 @@ async fn run_receiver_task(
             )) => {
                 next_tick += tick;
                 let now = std::time::Instant::now();
-                let leader = leader_ms.load(
+                // Effective leader: in Manual mode use the
+                // operator-set local leader; in auto modes
+                // honour the source-stamped group_leader_ms.
+                // The source-published value is updated in the
+                // stream-recv arm (above) every frame; here we
+                // just consume it.
+                let mode_u8 = leader_mode.load(
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                let leader = match LeaderMode::from_u8(mode_u8) {
+                    LeaderMode::Manual => leader_ms.load(
+                        std::sync::atomic::Ordering::Relaxed,
+                    ),
+                    LeaderMode::AutoDecay | LeaderMode::AutoPinned => {
+                        let g = group_leader_ms_shared.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if g == 0 {
+                            // Source hasn't published yet
+                            // (v0 wire / first-frame race).
+                            // Fall back to local.
+                            leader_ms.load(
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                        } else {
+                            g
+                        }
+                    }
+                };
                 let mut rendered_this_tick = 0usize;
                 while let (Some(anchor_l), Some(anchor_p)) =
                     (anchor_local, anchor_pts_ms)
@@ -1189,6 +1715,20 @@ async fn run_receiver_task(
                     if render_at > now {
                         break;
                     }
+                    // Jitter sample: absolute deviation of
+                    // actual-render-time from scheduled-render-
+                    // time. The sample is bounded below by zero
+                    // (early frames are not jitter) and above
+                    // by leader (a late frame past leader is an
+                    // underrun).
+                    let actual_offset = now.saturating_duration_since(
+                        anchor_l,
+                    )
+                    .as_millis() as u64;
+                    let scheduled_offset = offset_ms + leader;
+                    let jitter_ms = actual_offset
+                        .saturating_sub(scheduled_offset);
+                    jitter_samples.push_back((now, jitter_ms));
                     let frame = queue.pop_front().unwrap();
                     queue_depth.store(
                         queue.len() as u64,
@@ -1203,49 +1743,53 @@ async fn run_receiver_task(
                                 error = %e,
                                 "ALSA writei failed (scheduled render)"
                             );
+                        } else if render.take_xrun_recovered() {
+                            underruns.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                     }
                     #[cfg(not(feature = "alsa-substrate"))]
                     let _ = &frame;
                 }
-                // Underrun guard: if the anchor is established
-                // and we ticked past at least one period budget
-                // without rendering anything, write silence so
-                // ALSA stays primed.
-                #[cfg(feature = "alsa-substrate")]
-                if rendered_this_tick == 0
-                    && anchor_local.is_some()
-                    && alsa_render.is_some()
-                {
-                    if let Some(render) = alsa_render.as_mut() {
-                        if render
-                            .queued_frames_below(FRAMES_PER_CHUNK as i64)
-                        {
-                            let silence =
-                                vec![
-                                    0u8;
-                                    FRAMES_PER_CHUNK
-                                        * BASELINE_CHANNELS as usize
-                                        * 2
-                                ];
-                            if let Err(e) = render.write(&silence) {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    error = %e,
-                                    "ALSA silence write failed (underrun)"
-                                );
-                            } else {
-                                underruns.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                        }
+                // No underrun guard. Bit-perfect contract: the
+                // receiver never inserts samples. If the
+                // scheduler ticks with no frame due AND the
+                // ALSA buffer is empty, ALSA's native xrun
+                // handling kicks in on the next writei; the
+                // existing prepare()-and-retry path in
+                // AlsaRender::write recovers. Operators observe
+                // underruns via the receiver_underruns counter,
+                // bumped only by ALSA-reported xruns rather
+                // than by silence-on-tick speculation.
+                let _ = rendered_this_tick;
+                let _ = &underruns;
+
+                // Prune jitter window + recompute p95.
+                let window = std::time::Duration::from_millis(
+                    RECEIVER_JITTER_WINDOW_MS,
+                );
+                while let Some(&(t, _)) = jitter_samples.front() {
+                    if now.saturating_duration_since(t) > window {
+                        jitter_samples.pop_front();
+                    } else {
+                        break;
                     }
                 }
-                #[cfg(not(feature = "alsa-substrate"))]
-                let _ = &underruns;
-                let _ = rendered_this_tick;
+                if !jitter_samples.is_empty() {
+                    let mut vals: Vec<u64> = jitter_samples
+                        .iter()
+                        .map(|&(_, v)| v)
+                        .collect();
+                    vals.sort_unstable();
+                    let idx = (vals.len() as f64 * 0.95) as usize;
+                    let p95 = vals[idx.min(vals.len() - 1)];
+                    jitter_p95_ms.store(
+                        p95,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
         }
     }
@@ -1259,6 +1803,11 @@ async fn run_receiver_task(
 #[cfg(feature = "alsa-substrate")]
 struct AlsaRender {
     pcm: alsa::PCM,
+    /// Set to `true` by `write` when the inner `writei`
+    /// hit an xrun and was recovered via prepare()+retry.
+    /// Read by the receiver task to bump the operator-
+    /// visible `receiver_underruns` counter.
+    xrun_recovered: bool,
 }
 
 #[cfg(feature = "alsa-substrate")]
@@ -1325,27 +1874,23 @@ impl AlsaRender {
                 .map_err(|e| format!("sw_params commit: {e}"))?;
         }
         pcm.prepare().map_err(|e| format!("pcm.prepare(): {e}"))?;
-        Ok(Self { pcm })
+        Ok(Self {
+            pcm,
+            xrun_recovered: false,
+        })
     }
 
-    /// `snd_pcm_status::get_delay` — frames currently queued
-    /// in the ALSA playback buffer that have not yet been
-    /// rendered to the DAC. Returns `i64` because ALSA's
-    /// delay can be slightly negative during initial-fill /
-    /// xrun recovery; the scheduler treats negative as
-    /// "needs priming".
-    fn queued_frames(&self) -> i64 {
-        self.pcm.status().map(|s| s.get_delay() as i64).unwrap_or(0)
-    }
-
-    /// Convenience: `true` when the ALSA queue is shallower
-    /// than `threshold` frames — the scheduler's signal to
-    /// write a silence period to keep playback continuous.
-    fn queued_frames_below(&self, threshold: i64) -> bool {
-        self.queued_frames() < threshold
+    /// `true` when the most recent writei recovered from an
+    /// ALSA xrun (EPIPE underrun). The receiver task bumps an
+    /// operator-visible counter on each occurrence so the
+    /// operator can correlate audible glitches with the
+    /// `leader_ms` setting + the network's actual jitter.
+    fn take_xrun_recovered(&mut self) -> bool {
+        std::mem::take(&mut self.xrun_recovered)
     }
 
     fn write(&mut self, payload: &[u8]) -> Result<(), String> {
+        self.xrun_recovered = false;
         // Interleaved s16le: 4 bytes per stereo frame (2 ch
         // * 2 bytes). Decode in place — alsa::pcm::IO::<i16>
         // takes a &[i16] of length frames * channels.
@@ -1373,10 +1918,11 @@ impl AlsaRender {
             Err(_) => {
                 // Most write errors are EPIPE (underrun) or
                 // ESTRPIPE (suspended). Both recover via
-                // pcm.prepare() and a retry. v0.1.13 baseline
-                // treats every writei error as recoverable-
-                // once; production hardening adds explicit
-                // discrimination + escalation.
+                // pcm.prepare() and a retry. The xrun is
+                // recorded for the operator-visible underrun
+                // counter — bit-perfect contract: every xrun
+                // means a glitch the operator should observe.
+                self.xrun_recovered = true;
                 let _ = self.pcm.prepare();
                 match io.writei(&samples) {
                     Ok(n) if n == frame_count => Ok(()),
@@ -1388,6 +1934,261 @@ impl AlsaRender {
                     Err(e2) => Err(format!("post-recover write error: {e2}")),
                 }
             }
+        }
+    }
+}
+
+/// Source-side aggregator. Every `SOURCE_AGGREGATION_TICK_MS`,
+/// queries `list_audio_plane_peers`, aggregates per-peer
+/// telemetry into a group-wide `group_leader_ms` under the
+/// current `Profile`, and updates the shared atomic the source
+/// emitter reads on each frame. Also drives the auto-decay
+/// state machine when in `LeaderMode::AutoDecay`.
+#[allow(clippy::too_many_arguments)]
+async fn run_source_aggregator(
+    audio_plane: Arc<dyn AudioPlaneHandle>,
+    group_id: String,
+    shutdown: Arc<Notify>,
+    group_leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    local_leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    profile: Arc<std::sync::atomic::AtomicU8>,
+    mode: Arc<std::sync::atomic::AtomicU8>,
+) {
+    let tick = std::time::Duration::from_millis(SOURCE_AGGREGATION_TICK_MS);
+    let mut next_tick = std::time::Instant::now() + tick;
+    // Auto-decay state. `prev_underrun_total` is the previous
+    // tick's group-wide cumulative underrun count; the loop
+    // compares against the current count to detect *new*
+    // underruns since the last tick. The auto-decay reactor
+    // engages only after `WARMUP_GRACE_MS` since the first
+    // peer telemetry arrived: receiver render-warmup
+    // typically produces a small burst of underruns in the
+    // first few seconds (ALSA buffer shallow before steady-
+    // state) that would otherwise escalate the profile to
+    // Defensive on every restart for no real network reason.
+    const WARMUP_GRACE_MS: u64 = 10_000;
+    let mut quiet_ticks: u32 = 0;
+    let mut prev_underrun_total: u64 = 0;
+    let mut first_telemetry_at: Option<std::time::Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "source aggregator: shutdown received"
+                );
+                return;
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                next_tick,
+            )) => {
+                next_tick += tick;
+            }
+        }
+
+        let mode_u8 = mode.load(std::sync::atomic::Ordering::Relaxed);
+        let current_mode = LeaderMode::from_u8(mode_u8);
+
+        // Manual mode: the source emits the operator's
+        // local_leader_ms verbatim; telemetry is not
+        // authoritative.
+        if matches!(current_mode, LeaderMode::Manual) {
+            let manual =
+                local_leader_ms.load(std::sync::atomic::Ordering::Relaxed);
+            group_leader_ms.store(
+                manual.clamp(LEADER_MS_MIN, LEADER_MS_MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            continue;
+        }
+
+        // Auto mode: gather per-peer telemetry.
+        let peers = match audio_plane.list_audio_plane_peers().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "list_audio_plane_peers failed in aggregator"
+                );
+                continue;
+            }
+        };
+        // Peers whose telemetry has actually landed. No-
+        // telemetry peers are excluded so the bootstrap
+        // window (after restart, before any heartbeat has
+        // carried a payload) doesn't look like "no
+        // underruns" and prematurely decay the profile.
+        let group_peers: Vec<_> = peers
+            .into_iter()
+            .filter(|p| p.receiver_telemetry.is_some())
+            .collect();
+        let _ = &group_id;
+
+        // Bootstrap guard: hold profile + group_leader_ms
+        // unchanged until at least one peer has reported.
+        if group_peers.is_empty() {
+            prev_underrun_total = 0;
+            quiet_ticks = 0;
+            first_telemetry_at = None;
+            continue;
+        }
+        if first_telemetry_at.is_none() {
+            first_telemetry_at = Some(std::time::Instant::now());
+        }
+        let in_warmup = first_telemetry_at
+            .map(|t| {
+                std::time::Instant::now()
+                    .saturating_duration_since(t)
+                    .as_millis()
+                    < WARMUP_GRACE_MS as u128
+            })
+            .unwrap_or(true);
+
+        let max_jitter_p95: u64 = group_peers
+            .iter()
+            .filter_map(|p| {
+                p.receiver_telemetry
+                    .as_ref()
+                    .map(|t| t.observed_jitter_p95_ms)
+            })
+            .max()
+            .unwrap_or(0);
+        let min_buffer_capacity: u64 = group_peers
+            .iter()
+            .filter_map(|p| {
+                p.receiver_telemetry
+                    .as_ref()
+                    .map(|t| t.render_buffer_capacity_ms)
+            })
+            .min()
+            .unwrap_or(LEADER_MS_MAX);
+        let cumulative_underruns: u64 = group_peers
+            .iter()
+            .filter_map(|p| {
+                p.receiver_telemetry.as_ref().map(|t| t.underrun_count)
+            })
+            .sum();
+
+        // Auto-decay state machine: when in AutoDecay AND new
+        // underruns arrived this tick, escalate the profile.
+        // When AUTO_DECAY_WINDOW_TICKS pass with zero new
+        // underruns, decay one step.
+        if matches!(current_mode, LeaderMode::AutoDecay) {
+            if in_warmup {
+                // Warmup grace: bootstrap glitches don't
+                // count. Update baseline only.
+                prev_underrun_total = cumulative_underruns;
+                quiet_ticks = 0;
+            } else {
+                let new_underruns =
+                    cumulative_underruns.saturating_sub(prev_underrun_total);
+                if new_underruns > 0 {
+                    let cur = Profile::from_u8(
+                        profile.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    let escalated = cur.escalate();
+                    if escalated != cur {
+                        profile.store(
+                            escalated as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            from = cur.as_wire_str(),
+                            to = escalated.as_wire_str(),
+                            new_underruns = new_underruns,
+                            "auto-decay: escalating profile on underruns"
+                        );
+                    }
+                    quiet_ticks = 0;
+                } else {
+                    quiet_ticks = quiet_ticks.saturating_add(1);
+                    if quiet_ticks >= AUTO_DECAY_WINDOW_TICKS {
+                        let cur = Profile::from_u8(
+                            profile.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        let decayed = cur.decay();
+                        if decayed != cur {
+                            profile.store(
+                                decayed as u8,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            from = cur.as_wire_str(),
+                            to = decayed.as_wire_str(),
+                            "auto-decay: decaying profile after quiet window"
+                        );
+                        }
+                        quiet_ticks = 0;
+                    }
+                }
+                prev_underrun_total = cumulative_underruns;
+            }
+        }
+
+        // Compute new group_leader_ms under current profile.
+        let cur_profile = Profile::from_u8(
+            profile.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let raw = (max_jitter_p95 as f64 * cur_profile.safety_factor()) as u64
+            + cur_profile.floor_ms();
+        let clamped = raw
+            .clamp(LEADER_MS_MIN, LEADER_MS_MAX)
+            .min(min_buffer_capacity);
+        group_leader_ms.store(clamped, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Receiver-side telemetry publisher. Every
+/// `RECEIVER_TELEMETRY_PUBLISH_MS`, reads the receiver-task-
+/// maintained atomics + the most recent applied leader_ms and
+/// publishes via `AudioPlaneHandle::update_receiver_telemetry`
+/// so the framework piggybacks the payload on the next
+/// outbound `Heartbeat` to every peer.
+async fn run_receiver_telemetry_publisher(
+    audio_plane: Arc<dyn AudioPlaneHandle>,
+    shutdown: Arc<Notify>,
+    jitter_p95_ms: Arc<std::sync::atomic::AtomicU64>,
+    underruns: Arc<std::sync::atomic::AtomicU64>,
+    applied_leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    render_buffer_capacity_ms: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let tick = std::time::Duration::from_millis(RECEIVER_TELEMETRY_PUBLISH_MS);
+    let mut next_tick = std::time::Instant::now() + tick;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "receiver telemetry publisher: shutdown received"
+                );
+                return;
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                next_tick,
+            )) => {
+                next_tick += tick;
+            }
+        }
+        let telemetry = ReceiverTelemetry {
+            observed_jitter_p95_ms: jitter_p95_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            underrun_count: underruns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            applied_leader_ms: applied_leader_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            render_buffer_capacity_ms: render_buffer_capacity_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+        if let Err(e) = audio_plane.update_receiver_telemetry(telemetry).await {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "update_receiver_telemetry failed"
+            );
         }
     }
 }
