@@ -168,12 +168,13 @@ const RENDER_BUFFER_PERIODS: usize = 4;
 /// `multiroom.set_leader_ms` runtime verb.
 const DEFAULT_LEADER_MS: u64 = 200;
 
-/// Scheduler tick period. The receiver wakes every
-/// `SCHEDULER_TICK_MS` milliseconds to push any frames whose
-/// scheduled render time has arrived into ALSA. Tighter than
-/// the 20 ms frame budget so the scheduler can hit
-/// sub-period precision.
-const SCHEDULER_TICK_MS: u64 = 5;
+// SCHEDULER_TICK_MS retired in the R1 refactor. The async
+// coordinator no longer drives a periodic tick: per-frame
+// `render_at_local` is computed at stream-recv time and the
+// renderer OS thread (`run_render_thread`) blocks on
+// `blocking_recv`, sleeps until that instant, then writei.
+// No queue VecDeque, no per-tick render budget — the OS
+// thread isolates blocking ALSA I/O from the async runtime.
 
 /// Auto-decay profile: how aggressively the source aggregates
 /// per-receiver telemetry into the group-wide `group_leader_ms`
@@ -358,6 +359,26 @@ struct PluginConfig {
     /// synthetic 440 Hz tone generator (diagnostic floor).
     #[serde(default)]
     source_pcm: String,
+    /// ALSA playback device the source's local-render task
+    /// writes to (when set). When the source-host node also
+    /// has speakers attached and the operator wants source-
+    /// local playback to be in phase with remote receivers,
+    /// the source plugin opens this PCM and schedules every
+    /// emitted chunk at the same `group_leader_ms` timing the
+    /// remote receivers use. MPD's direct audio_output to
+    /// this device should be disabled (otherwise two writers
+    /// will conflict on the ALSA pipeline); MPD writes only
+    /// to `source_pcm`'s loopback half, the multiroom plugin
+    /// distributes to local DAC + remote receivers from
+    /// there with identical scheduling.
+    ///
+    /// Bit-perfect-synced-multi-room shape: source-host and every
+    /// receiver render at the same `anchor + delta_pts +
+    /// group_leader_ms` so all speakers stay in phase across the
+    /// group, with the only per-node deviation being LAN
+    /// propagation delay (~1 ms typical).
+    #[serde(default)]
+    local_render_pcm: String,
     /// Presentation-time leader in milliseconds. In
     /// `LeaderMode::Manual` this is the value the source-host
     /// stamps on every frame; receivers honour it directly.
@@ -396,6 +417,7 @@ impl Default for PluginConfig {
             group_id: None,
             alsa_pcm: default_alsa_pcm(),
             source_pcm: String::new(),
+            local_render_pcm: String::new(),
             leader_ms: default_leader_ms(),
             leader_mode: default_leader_mode(),
             profile: default_profile(),
@@ -521,6 +543,17 @@ pub struct MultiroomEvoNativePlugin {
     /// Source-side aggregation task. Spawned for source role
     /// only.
     source_aggregator_task: Option<JoinHandle<()>>,
+    /// Source-host's local-render receiver task. Spawned when
+    /// the source role is engaged and `local_render_pcm` is
+    /// set. It is a normal `run_receiver_task` instance
+    /// (role=Receiver) subscribed to the audio-plane
+    /// broadcast — the framework's `fan_out_audio_frame`
+    /// broadcasts every emitted frame locally too, so the
+    /// source-host's own speaker output renders through the
+    /// same anchor + leader scheduler every remote receiver
+    /// uses. Symmetric architecture: source-host is "a node
+    /// that happens to also emit". No bespoke scheduler.
+    source_local_render_task: Option<JoinHandle<()>>,
     /// Receiver-side telemetry-publish task. Spawned for
     /// receiver + auto roles.
     receiver_telemetry_task: Option<JoinHandle<()>>,
@@ -563,6 +596,7 @@ impl MultiroomEvoNativePlugin {
                 ),
             ),
             source_aggregator_task: None,
+            source_local_render_task: None,
             receiver_telemetry_task: None,
         }
     }
@@ -700,7 +734,9 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let shutdown = Arc::clone(&self.shutdown);
                     let handle = Arc::clone(&audio_plane);
                     let source_pcm = self.config.source_pcm.clone();
+                    let local_render_pcm = self.config.local_render_pcm.clone();
                     let group_leader_ms = Arc::clone(&self.group_leader_ms);
+
                     let task = if source_pcm.is_empty() {
                         let glm = Arc::clone(&group_leader_ms);
                         tokio::spawn(async move {
@@ -740,6 +776,54 @@ impl Plugin for MultiroomEvoNativePlugin {
                         }
                     };
                     self.source_task = Some(task);
+
+                    // Source-host's own audible-render path:
+                    // a normal receiver task subscribed to the
+                    // audio-plane broadcast. The framework's
+                    // `fan_out_audio_frame` broadcasts each
+                    // emitted frame locally too, so this task
+                    // schedules the source's own emissions
+                    // through the same anchor + leader path
+                    // remote receivers use. No bespoke
+                    // scheduler — every node is symmetric.
+                    if !local_render_pcm.is_empty() {
+                        let lr_handle = Arc::clone(&audio_plane);
+                        let lr_counter = Arc::clone(&self.frames_received);
+                        let lr_shutdown = Arc::clone(&self.shutdown);
+                        let lr_alsa_pcm = local_render_pcm.clone();
+                        let lr_leader_ms = Arc::clone(&self.leader_ms);
+                        let lr_group_leader_ms =
+                            Arc::clone(&self.group_leader_ms);
+                        let lr_mode = Arc::clone(&self.leader_mode);
+                        let lr_underruns = Arc::clone(&self.receiver_underruns);
+                        let lr_queue_depth =
+                            Arc::clone(&self.receiver_queue_depth);
+                        let lr_jitter_p95 =
+                            Arc::clone(&self.receiver_jitter_p95_ms);
+                        self.source_local_render_task =
+                            Some(tokio::spawn(async move {
+                                run_receiver_task(
+                                    lr_handle,
+                                    lr_counter,
+                                    lr_shutdown,
+                                    lr_alsa_pcm,
+                                    Role::Receiver,
+                                    lr_leader_ms,
+                                    lr_group_leader_ms,
+                                    lr_mode,
+                                    lr_underruns,
+                                    lr_queue_depth,
+                                    lr_jitter_p95,
+                                )
+                                .await;
+                            }));
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            local_render_pcm = %local_render_pcm,
+                            "source-host local renderer attached: receiver \
+                             task subscribing to own audio-plane broadcast"
+                        );
+                    }
                     // Spawn the source-side aggregator that
                     // recomputes `group_leader_ms` every
                     // SOURCE_AGGREGATION_TICK_MS from per-peer
@@ -877,6 +961,9 @@ impl Plugin for MultiroomEvoNativePlugin {
             if let Some(task) = self.source_aggregator_task.take() {
                 let _ = task.await;
             }
+            if let Some(task) = self.source_local_render_task.take() {
+                let _ = task.await;
+            }
             if let Some(task) = self.receiver_telemetry_task.take() {
                 let _ = task.await;
             }
@@ -954,6 +1041,7 @@ impl Respondent for MultiroomEvoNativePlugin {
                         "group_id": self.config.group_id,
                         "alsa_pcm": self.config.alsa_pcm,
                         "source_pcm": self.config.source_pcm,
+                        "local_render_pcm": self.config.local_render_pcm,
                         "leader_ms": self.leader_ms(),
                         "leader_ms_min": LEADER_MS_MIN,
                         "leader_ms_max": LEADER_MS_MAX,
@@ -1334,9 +1422,23 @@ async fn run_source_capture_task(
         }
     }
 
-    // Best-effort join: the capture thread sees the shutdown
-    // Notify and the dropped tx, both of which signal exit.
-    let _ = capture_thread.join();
+    // Do NOT join the capture thread synchronously here:
+    // `std::thread::JoinHandle::join` would block this async
+    // task (and the tokio worker) until the OS thread returns,
+    // and the OS thread is in a blocking ALSA `readi()` that
+    // only returns on the next period boundary OR when ALSA
+    // observes the handle going away. The framework's plugin-
+    // shutdown deadline is bounded (default 10 s); blocking
+    // here for even one period budget per unload eats into it
+    // and risks SIGKILL when other peers stop producing audio.
+    //
+    // The capture thread polls `tx.is_closed()` between each
+    // readi; the channel is closed when this future returns
+    // (the `tx` half held by this task drops on return). The
+    // thread exits on its own within one period (~20 ms) and
+    // the ALSA handle drops as the thread's local owner is
+    // freed.
+    drop(capture_thread);
 }
 
 /// OS-thread body that owns the ALSA capture handle. Loops
@@ -1350,7 +1452,16 @@ fn run_capture_thread(
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     shutdown: Arc<Notify>,
 ) {
-    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, false)
+    // Open the capture PCM in NON-BLOCKING mode. `readi` would
+    // otherwise block indefinitely whenever the loopback
+    // playback half stops being fed (MPD stopped, paused,
+    // restarted by playback.mpd, etc.). Combined with
+    // `pcm.wait(Some(timeout_ms))` below, the thread now polls
+    // `tx.is_closed()` cooperatively at most every 100 ms even
+    // when no audio is flowing — so plugin unload releases the
+    // ALSA handle promptly and avoids the framework's 10 s
+    // shutdown deadline / systemd's TimeoutStopSec fallback.
+    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, true)
     {
         Ok(p) => p,
         Err(e) => {
@@ -1426,6 +1537,20 @@ fn run_capture_thread(
         );
         return;
     }
+    // Non-blocking capture needs an explicit start(). In
+    // blocking mode the first readi() implicitly transitions
+    // the PCM from Prepared to Running; in non-blocking mode
+    // readi returns EAGAIN immediately and never starts the
+    // stream, so wait() perpetually times out and no audio
+    // ever flows.
+    if let Err(e) = pcm.start() {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "pcm.start (capture) failed"
+        );
+        return;
+    }
     let io = match pcm.io_i16() {
         Ok(i) => i,
         Err(e) => {
@@ -1443,49 +1568,80 @@ fn run_capture_thread(
         "ALSA capture opened at 48 kHz / 2 ch / pcm_s16_le"
     );
 
+    // The shutdown Notify is intentionally NOT awaited here:
+    // sync ALSA code cannot await tokio primitives. The
+    // closed-channel test below is the cooperative exit
+    // signal (the async side drops its `rx` on shutdown);
+    // `pcm.wait(timeout)` gives us the polling cadence to
+    // notice within ~100 ms.
+    let _ = &shutdown;
     let mut buf: Vec<i16> =
         vec![0; FRAMES_PER_CHUNK * BASELINE_CHANNELS as usize];
     loop {
-        // shutdown.notified() is the async-side notifier. Poll
-        // it by ticking off small reads + checking the channel
-        // periodically — the closed channel + shutdown signal
-        // both terminate the loop.
-        let _ = &shutdown;
-        match io.readi(&mut buf) {
-            Ok(frames_read) => {
-                if frames_read == 0 {
-                    continue;
-                }
-                let mut pcm_bytes = Vec::with_capacity(
-                    frames_read * BASELINE_CHANNELS as usize * 2,
-                );
-                for s in &buf[..frames_read * BASELINE_CHANNELS as usize] {
-                    pcm_bytes.extend_from_slice(&s.to_le_bytes());
-                }
-                // Try non-blocking; on pressure drop oldest
-                // (we are the producer, the async side is the
-                // consumer; backpressure here would corrupt
-                // the loopback playback half).
-                if tx.try_send(pcm_bytes).is_err() {
-                    // Either channel full (drop) or closed
-                    // (exit). Treat full as soft-drop, closed
-                    // as termination.
-                    if tx.is_closed() {
-                        break;
+        if tx.is_closed() {
+            break;
+        }
+        // Wait up to 100 ms for capture data. `pcm.wait`
+        // returns immediately when data is available (steady-
+        // state); otherwise it returns at the timeout so the
+        // closed-channel check above runs cooperatively.
+        match pcm.wait(Some(100)) {
+            Ok(true) => {
+                // Data ready; readi is non-blocking and will
+                // return whatever's available (or EAGAIN).
+                match io.readi(&mut buf) {
+                    Ok(frames_read) if frames_read > 0 => {
+                        let mut pcm_bytes = Vec::with_capacity(
+                            frames_read * BASELINE_CHANNELS as usize * 2,
+                        );
+                        for s in
+                            &buf[..frames_read * BASELINE_CHANNELS as usize]
+                        {
+                            pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                        }
+                        // Soft-drop on channel full: we are
+                        // the producer of a real-time stream;
+                        // back-pressuring would corrupt the
+                        // loopback playback half upstream.
+                        let _ = tx.try_send(pcm_bytes);
+                    }
+                    Ok(_) => {
+                        // Zero frames — try again on next
+                        // wait cycle.
+                    }
+                    Err(e) => {
+                        // EAGAIN (11) is expected on non-
+                        // blocking PCM when no data is ready
+                        // — wait() may return Ok(true) just
+                        // before the buffer drains. Silent
+                        // skip; loop iterates and waits again.
+                        // Anything else (EPIPE underrun /
+                        // ESTRPIPE suspend / etc.) recovers
+                        // via prepare().
+                        if e.errno() != 11 {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "ALSA readi (capture) failed; recovering"
+                            );
+                            let _ = pcm.prepare();
+                        }
                     }
                 }
+            }
+            Ok(false) => {
+                // wait timeout — loop back, check close, wait
+                // again. This is the cooperative-shutdown path
+                // when no audio is flowing.
             }
             Err(e) => {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "ALSA readi (capture) failed; recovering"
+                    "ALSA pcm.wait (capture) failed; recovering"
                 );
                 let _ = pcm.prepare();
             }
-        }
-        if tx.is_closed() {
-            break;
         }
     }
     tracing::info!(plugin = PLUGIN_NAME, "ALSA capture thread exiting");
@@ -1543,55 +1699,93 @@ async fn run_receiver_task(
     let mut seen_peers: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // ALSA render runs on a dedicated OS thread (R1 design).
+    // The async coordinator computes per-frame
+    // `render_at_local` and pushes `RenderItem`s onto a bounded
+    // mpsc; the render thread blocks on `rx.blocking_recv()`,
+    // sleeps until `render_at_local`, then `writei`s with
+    // bit-perfect retry. Cooperative shutdown: on async return
+    // the Sender drops, `blocking_recv` yields None, the
+    // render thread exits cleanly. ALSA writei (blocking sync
+    // syscall) is OFF the tokio runtime.
     #[cfg(feature = "alsa-substrate")]
-    let mut alsa_render = if role == Role::Receiver {
-        match AlsaRender::open(&alsa_pcm) {
-            Ok(r) => Some(r),
+    let render_tx: Option<tokio::sync::mpsc::Sender<RenderItem>> = if role
+        == Role::Receiver
+    {
+        // Capacity sized at ~1.3 s of audio at 50 fps
+        // — comfortable backpressure budget for slow
+        // hardware (Intel ICH virtualised etc.). The
+        // mpsc usage doubles as the operator-visible
+        // queue-depth telemetry.
+        let (tx, rx) = tokio::sync::mpsc::channel::<RenderItem>(64);
+        let thread_pcm = alsa_pcm.clone();
+        let thread_underruns = Arc::clone(&underruns);
+        // The render OS thread needs the tokio runtime
+        // context to drive `Receiver::blocking_recv`'s
+        // internal waker machinery. Capture the current
+        // runtime handle here (we ARE inside the runtime),
+        // pass it into the thread, enter it before calling
+        // blocking_recv. Without the guard, the first
+        // blocking_recv mis-fires and the channel reports
+        // closed immediately.
+        let runtime_handle = tokio::runtime::Handle::current();
+        let thread_name =
+            format!("multiroom-render-{}", thread_pcm.replace([':', ','], "_"));
+        match std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let _guard = runtime_handle.enter();
+                run_render_thread(thread_pcm, rx, thread_underruns);
+            }) {
+            Ok(_handle) => {
+                // JoinHandle dropped intentionally —
+                // std::thread detaches on drop.
+                // Cooperative shutdown via Sender drop.
+            }
             Err(e) => {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    alsa_pcm = %alsa_pcm,
-                    "ALSA playback open failed; receiver counts frames \
-                     without rendering"
+                    "spawn render thread failed; output silent"
                 );
-                None
             }
         }
+        Some(tx)
     } else {
         None
     };
-    // role consumed only behind the cfg gate; silence the
-    // unused warning on builds without the feature.
+    // role, alsa_pcm, underruns, queue_depth consumed only
+    // behind the alsa-substrate feature gate (the render-
+    // thread spawn block above + the tx.send branch in the
+    // recv arm). Silence unused-variable warnings on builds
+    // without the feature.
     let _ = role;
     let _ = alsa_pcm;
+    #[cfg(not(feature = "alsa-substrate"))]
+    let _ = (&underruns, &queue_depth);
 
     // Presentation-time anchor: set on first received frame.
-    // Future frames' scheduled local time is computed as
-    //   anchor_local + (frame.pts_ms - anchor_pts_ms)
+    // `render_at_local = anchor_local + delta_pts + leader_ms`.
     let mut anchor_local: Option<std::time::Instant> = None;
     let mut anchor_pts_ms: Option<u64> = None;
-    let mut queue: std::collections::VecDeque<
-        evo_plugin_sdk::contract::AudioFrameReceived,
-    > = std::collections::VecDeque::new();
     // Rolling jitter window: (sampled_at, jitter_ms). Pruned
-    // to the most recent RECEIVER_JITTER_WINDOW_MS each tick;
-    // p95 over the window is published as the receiver's
-    // observed_jitter_p95_ms telemetry.
+    // to the most recent RECEIVER_JITTER_WINDOW_MS on each
+    // sample; p95 over the window is published as
+    // observed_jitter_p95_ms telemetry. Sample is "how late
+    // is this frame arriving relative to its scheduled render
+    // time" — captures network jitter + queueing.
     let mut jitter_samples: std::collections::VecDeque<(
         std::time::Instant,
         u64,
     )> = std::collections::VecDeque::new();
-
-    let tick = std::time::Duration::from_millis(SCHEDULER_TICK_MS);
-    let mut next_tick = std::time::Instant::now() + tick;
 
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
                 tracing::debug!(
                     plugin = PLUGIN_NAME,
-                    "receiver task shutting down on unload notify"
+                    "receiver task: shutdown notified; render Sender drops \
+                     on return, render thread exits on next blocking_recv"
                 );
                 return;
             }
@@ -1628,21 +1822,127 @@ async fn run_receiver_task(
                         }
                         // Publish the source-stamped
                         // group_leader_ms into the shared
-                        // atomic the tick arm reads each
-                        // scheduler tick. Zero = source has
-                        // not stamped (e.g. v0 wire form);
-                        // tick arm falls back to local.
+                        // atomic. Zero = source not stamped
+                        // (v0 wire form / first-frame race).
                         if frame.group_leader_ms > 0 {
                             group_leader_ms_shared.store(
                                 frame.group_leader_ms,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         }
-                        queue.push_back(frame);
-                        queue_depth.store(
-                            queue.len() as u64,
+
+                        // Effective leader: Manual = operator-
+                        // set local; auto modes = source-stamped
+                        // group_leader_ms (fallback to local
+                        // when source hasn't stamped yet).
+                        let mode_u8 = leader_mode.load(
                             std::sync::atomic::Ordering::Relaxed,
                         );
+                        let leader = match LeaderMode::from_u8(mode_u8) {
+                            LeaderMode::Manual => leader_ms.load(
+                                std::sync::atomic::Ordering::Relaxed,
+                            ),
+                            LeaderMode::AutoDecay
+                            | LeaderMode::AutoPinned => {
+                                let g = group_leader_ms_shared.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if g == 0 {
+                                    leader_ms.load(
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    )
+                                } else {
+                                    g
+                                }
+                            }
+                        };
+
+                        // Compute scheduled render time.
+                        let (anchor_l, anchor_p) = (
+                            anchor_local.expect("anchor just set"),
+                            anchor_pts_ms.expect("anchor just set"),
+                        );
+                        let offset_ms = frame
+                            .presentation_time_ms
+                            .saturating_sub(anchor_p);
+                        let render_at_local = anchor_l
+                            + std::time::Duration::from_millis(
+                                offset_ms + leader,
+                            );
+
+                        // Jitter sample: lateness of this
+                        // arrival relative to its scheduled
+                        // render time. Zero when arriving early
+                        // (good); positive when arriving past
+                        // schedule (late = network jitter ate
+                        // into the leader_ms budget).
+                        let now = std::time::Instant::now();
+                        let jitter_ms = if render_at_local > now {
+                            0
+                        } else {
+                            (now - render_at_local).as_millis() as u64
+                        };
+                        jitter_samples.push_back((now, jitter_ms));
+                        let window = std::time::Duration::from_millis(
+                            RECEIVER_JITTER_WINDOW_MS,
+                        );
+                        while let Some(&(t, _)) = jitter_samples.front() {
+                            if now.saturating_duration_since(t) > window {
+                                jitter_samples.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if !jitter_samples.is_empty() {
+                            let mut vals: Vec<u64> = jitter_samples
+                                .iter()
+                                .map(|&(_, v)| v)
+                                .collect();
+                            vals.sort_unstable();
+                            let idx = (vals.len() as f64 * 0.95) as usize;
+                            let p95 = vals[idx.min(vals.len() - 1)];
+                            jitter_p95_ms.store(
+                                p95,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+
+                        // Hand the frame to the render thread.
+                        // `tx.send().await` blocks naturally
+                        // when mpsc is full — back-pressure
+                        // upstream; the shutdown branch in
+                        // the outer select! interrupts cleanly.
+                        #[cfg(feature = "alsa-substrate")]
+                        if let Some(tx) = render_tx.as_ref() {
+                            let item = RenderItem {
+                                payload: frame.payload,
+                                render_at_local,
+                            };
+                            tokio::select! {
+                                _ = shutdown.notified() => return,
+                                send_res = tx.send(item) => {
+                                    if send_res.is_err() {
+                                        tracing::warn!(
+                                            plugin = PLUGIN_NAME,
+                                            "render thread channel closed; \
+                                             frame dropped (render thread \
+                                             died early)"
+                                        );
+                                    }
+                                }
+                            }
+                            // Telemetry: mpsc usage = max -
+                            // available. Approximates depth.
+                            let used = tx
+                                .max_capacity()
+                                .saturating_sub(tx.capacity());
+                            queue_depth.store(
+                                used as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        #[cfg(not(feature = "alsa-substrate"))]
+                        let _ = frame.payload;
                     }
                     Err(
                         evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged {
@@ -1664,131 +1964,6 @@ async fn run_receiver_task(
                         );
                         return;
                     }
-                }
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                next_tick,
-            )) => {
-                next_tick += tick;
-                let now = std::time::Instant::now();
-                // Effective leader: in Manual mode use the
-                // operator-set local leader; in auto modes
-                // honour the source-stamped group_leader_ms.
-                // The source-published value is updated in the
-                // stream-recv arm (above) every frame; here we
-                // just consume it.
-                let mode_u8 = leader_mode.load(
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                let leader = match LeaderMode::from_u8(mode_u8) {
-                    LeaderMode::Manual => leader_ms.load(
-                        std::sync::atomic::Ordering::Relaxed,
-                    ),
-                    LeaderMode::AutoDecay | LeaderMode::AutoPinned => {
-                        let g = group_leader_ms_shared.load(
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        if g == 0 {
-                            // Source hasn't published yet
-                            // (v0 wire / first-frame race).
-                            // Fall back to local.
-                            leader_ms.load(
-                                std::sync::atomic::Ordering::Relaxed,
-                            )
-                        } else {
-                            g
-                        }
-                    }
-                };
-                let mut rendered_this_tick = 0usize;
-                while let (Some(anchor_l), Some(anchor_p)) =
-                    (anchor_local, anchor_pts_ms)
-                {
-                    let Some(head) = queue.front() else { break };
-                    let offset_ms = head
-                        .presentation_time_ms
-                        .saturating_sub(anchor_p);
-                    let render_at = anchor_l
-                        + std::time::Duration::from_millis(
-                            offset_ms + leader,
-                        );
-                    if render_at > now {
-                        break;
-                    }
-                    // Jitter sample: absolute deviation of
-                    // actual-render-time from scheduled-render-
-                    // time. The sample is bounded below by zero
-                    // (early frames are not jitter) and above
-                    // by leader (a late frame past leader is an
-                    // underrun).
-                    let actual_offset = now.saturating_duration_since(
-                        anchor_l,
-                    )
-                    .as_millis() as u64;
-                    let scheduled_offset = offset_ms + leader;
-                    let jitter_ms = actual_offset
-                        .saturating_sub(scheduled_offset);
-                    jitter_samples.push_back((now, jitter_ms));
-                    let frame = queue.pop_front().unwrap();
-                    queue_depth.store(
-                        queue.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    rendered_this_tick += 1;
-                    #[cfg(feature = "alsa-substrate")]
-                    if let Some(render) = alsa_render.as_mut() {
-                        if let Err(e) = render.write(&frame.payload) {
-                            tracing::warn!(
-                                plugin = PLUGIN_NAME,
-                                error = %e,
-                                "ALSA writei failed (scheduled render)"
-                            );
-                        } else if render.take_xrun_recovered() {
-                            underruns.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                    }
-                    #[cfg(not(feature = "alsa-substrate"))]
-                    let _ = &frame;
-                }
-                // No underrun guard. Bit-perfect contract: the
-                // receiver never inserts samples. If the
-                // scheduler ticks with no frame due AND the
-                // ALSA buffer is empty, ALSA's native xrun
-                // handling kicks in on the next writei; the
-                // existing prepare()-and-retry path in
-                // AlsaRender::write recovers. Operators observe
-                // underruns via the receiver_underruns counter,
-                // bumped only by ALSA-reported xruns rather
-                // than by silence-on-tick speculation.
-                let _ = rendered_this_tick;
-                let _ = &underruns;
-
-                // Prune jitter window + recompute p95.
-                let window = std::time::Duration::from_millis(
-                    RECEIVER_JITTER_WINDOW_MS,
-                );
-                while let Some(&(t, _)) = jitter_samples.front() {
-                    if now.saturating_duration_since(t) > window {
-                        jitter_samples.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                if !jitter_samples.is_empty() {
-                    let mut vals: Vec<u64> = jitter_samples
-                        .iter()
-                        .map(|&(_, v)| v)
-                        .collect();
-                    vals.sort_unstable();
-                    let idx = (vals.len() as f64 * 0.95) as usize;
-                    let p95 = vals[idx.min(vals.len() - 1)];
-                    jitter_p95_ms.store(
-                        p95,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
                 }
             }
         }
@@ -1901,6 +2076,7 @@ impl AlsaRender {
             ));
         }
         let frame_count = payload.len() / 4;
+        let channels = BASELINE_CHANNELS as usize;
         let mut samples = Vec::with_capacity(payload.len() / 2);
         for chunk in payload.chunks_exact(2) {
             samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
@@ -1909,33 +2085,151 @@ impl AlsaRender {
             .pcm
             .io_i16()
             .map_err(|e| format!("pcm.io_i16(): {e}"))?;
-        match io.writei(&samples) {
-            Ok(n) if n == frame_count => Ok(()),
-            Ok(short) => Err(format!(
-                "short write: requested {} frames, wrote {}",
-                frame_count, short
-            )),
-            Err(_) => {
-                // Most write errors are EPIPE (underrun) or
-                // ESTRPIPE (suspended). Both recover via
-                // pcm.prepare() and a retry. The xrun is
-                // recorded for the operator-visible underrun
-                // counter — bit-perfect contract: every xrun
-                // means a glitch the operator should observe.
-                self.xrun_recovered = true;
-                let _ = self.pcm.prepare();
-                match io.writei(&samples) {
-                    Ok(n) if n == frame_count => Ok(()),
-                    Ok(short) => Err(format!(
-                        "post-recover short write: requested {} \
-                         frames, wrote {}",
-                        frame_count, short
-                    )),
-                    Err(e2) => Err(format!("post-recover write error: {e2}")),
+
+        // Bit-perfect contract: every sample must reach the
+        // DAC. ALSA `writei` is documented to write all
+        // requested frames in blocking mode, but in practice
+        // virtualized devices (Intel ICH AC97 on QEMU, some
+        // USB DAC bridges, plug-converted chains) return
+        // short writes when their internal buffer can only
+        // accept a fraction of the request at that instant.
+        // Looping until every frame lands preserves the
+        // contract; ALSA xrun recovery (prepare + retry) is
+        // applied if writei surfaces an error.
+        let mut frames_written = 0usize;
+        let mut xrun_observed = false;
+        while frames_written < frame_count {
+            let remaining = &samples[frames_written * channels..];
+            match io.writei(remaining) {
+                Ok(n) if n > 0 => {
+                    frames_written += n;
+                }
+                Ok(_) => {
+                    // Zero progress — bail to avoid spin.
+                    return Err(format!(
+                        "writei stalled at 0 frames; requested {} \
+                         frames total, wrote {}",
+                        frame_count, frames_written
+                    ));
+                }
+                Err(_) => {
+                    // EPIPE (underrun) / ESTRPIPE (suspend) /
+                    // related — prepare and retry the
+                    // remaining frames. Record xrun for the
+                    // operator-visible underrun counter.
+                    xrun_observed = true;
+                    let _ = self.pcm.prepare();
+                    // One retry-after-prepare. If that also
+                    // fails, surface the error to the caller
+                    // (which logs + counts).
+                    match io.writei(remaining) {
+                        Ok(n) if n > 0 => {
+                            frames_written += n;
+                        }
+                        Ok(_) => {
+                            return Err(format!(
+                                "post-prepare writei stalled at 0 frames; \
+                                 requested {} total, wrote {}",
+                                frame_count, frames_written
+                            ));
+                        }
+                        Err(e2) => {
+                            return Err(format!(
+                                "post-prepare writei error: {e2}; \
+                                 requested {} total, wrote {}",
+                                frame_count, frames_written
+                            ));
+                        }
+                    }
                 }
             }
         }
+        if xrun_observed {
+            self.xrun_recovered = true;
+        }
+        Ok(())
     }
+}
+
+/// One frame queued for the renderer OS thread. The async
+/// coordinator computes `render_at_local` from the receiver-
+/// task's anchor + delta_pts + effective leader_ms and pushes
+/// items via a bounded tokio mpsc. The render thread blocks on
+/// `blocking_recv`, sleeps until `render_at_local`, then
+/// writes the payload via the bit-perfect `AlsaRender::write`.
+///
+/// This isolates the blocking ALSA writei syscall on a
+/// dedicated OS thread so the tokio runtime is never starved
+/// by slow hardware (Intel ICH AC97 virtualised, USB DAC
+/// bridges with quirky short-writes, plug-converted chains).
+#[cfg(feature = "alsa-substrate")]
+struct RenderItem {
+    payload: Vec<u8>,
+    render_at_local: std::time::Instant,
+}
+
+/// Renderer OS-thread body. Consumes scheduled `RenderItem`s
+/// from the async coordinator, sleeps until each item's
+/// scheduled wall-clock instant, and writes the payload to
+/// ALSA with bit-perfect retry. Cooperative shutdown: when
+/// the async-side Sender drops, `blocking_recv` yields None
+/// and the thread exits; the ALSA PCM handle drops naturally
+/// at scope exit.
+///
+/// Bit-perfect contract preserved at the syscall layer: every
+/// sample reaches the DAC. Late frames (network jitter ate
+/// into the leader_ms budget) still render — they catch up
+/// against the ALSA hardware buffer's headroom. Underruns are
+/// reported via the shared atomic only when ALSA's xrun-
+/// recovery path engages.
+#[cfg(feature = "alsa-substrate")]
+fn run_render_thread(
+    alsa_pcm: String,
+    mut rx: tokio::sync::mpsc::Receiver<RenderItem>,
+    underruns: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let mut render = match AlsaRender::open(&alsa_pcm) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                alsa_pcm = %alsa_pcm,
+                "render thread: ALSA playback open failed; output silent"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        alsa_pcm = %alsa_pcm,
+        "render thread: ALSA playback opened"
+    );
+
+    while let Some(item) = rx.blocking_recv() {
+        let now = std::time::Instant::now();
+        if item.render_at_local > now {
+            let dur = item.render_at_local.saturating_duration_since(now);
+            std::thread::sleep(dur);
+        }
+        // Late frames render immediately — bit-perfect.
+        if let Err(e) = render.write(&item.payload) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "render thread: ALSA writei failed"
+            );
+        } else if render.take_xrun_recovered() {
+            underruns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        alsa_pcm = %alsa_pcm,
+        "render thread: channel closed; exiting cleanly"
+    );
+    drop(render);
 }
 
 /// Source-side aggregator. Every `SOURCE_AGGREGATION_TICK_MS`,
