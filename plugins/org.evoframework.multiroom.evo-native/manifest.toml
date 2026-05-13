@@ -60,5 +60,6 @@ subscribe_subjects = true
 [capabilities.respondent]
 request_types = [
     "multiroom.get_status",
+    "multiroom.set_leader_ms",
 ]
 response_budget_ms = 1000

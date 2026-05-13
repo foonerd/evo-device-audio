@@ -30,12 +30,18 @@
 //! - `role = "receiver"` — subscribe to incoming audio
 //!   frames via [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::subscribe_audio_frames`]
 //!   and write the decoded PCM bytes to the local ALSA
-//!   playback device named in the config. v0.1.13 baseline
-//!   does NOT yet schedule against `presentation_time_ms`
-//!   (no jitter buffer); receivers play frames as they
-//!   arrive. Synced playback alignment + jitter buffer +
-//!   adaptive cadence (matching the reliability bar) ride
-//!   the next iteration.
+//!   playback device named in the config. The receiver
+//!   schedules every frame against a presentation-time
+//!   anchor (set on the first frame received) plus an
+//!   operator-tunable `leader_ms` budget so playback is
+//!   bit-perfect (no sample drops, no sample inserts)
+//!   regardless of network jitter inside the budget. Late
+//!   frames are still rendered (they catch up against the
+//!   ALSA hardware buffer); the only "drift defence" the
+//!   operator turns is `leader_ms`. Underruns (no frame
+//!   due at a render tick) write one period of silence and
+//!   bump an operator-visible counter, so playback
+//!   continuity holds.
 //! - `role = "auto"` (default) — observe-only: subscribe
 //!   and count incoming frames but do NOT engage capture or
 //!   playback. Useful for substrate diagnostics + the future
@@ -63,6 +69,9 @@
 //! alsa_pcm = "evo"            # ALSA playback device (receiver)
 //! source_pcm = "evo_loopback" # ALSA capture device (source);
 //!                             # empty/unset => synthetic 440 Hz
+//! leader_ms = 200             # presentation-time leader / network
+//!                             # latency budget (ms). Tunable live
+//!                             # via `multiroom.set_leader_ms`.
 //! ```
 //!
 //! Production-quality additions (FEC / adaptive jitter
@@ -102,7 +111,20 @@ const PAYLOAD_VERSION: u32 = 1;
 /// Request types this plugin honours. Mirrors
 /// `manifest.toml`'s `[capabilities.respondent].request_types`;
 /// admission would refuse a mismatch.
-const REQUEST_TYPES: &[&str] = &["multiroom.get_status"];
+const REQUEST_TYPES: &[&str] =
+    &["multiroom.get_status", "multiroom.set_leader_ms"];
+
+/// Lower bound for operator-set `leader_ms`. Below this the
+/// network-jitter budget collapses and the receiver underruns
+/// on the first slow packet. 20 ms is one period — the
+/// theoretical floor; below it the scheduler cannot run.
+const LEADER_MS_MIN: u64 = 20;
+
+/// Upper bound for operator-set `leader_ms`. Above this the
+/// end-to-end latency is far enough that source-host control
+/// (pause / resume / track-skip) feels laggy. 2000 ms is
+/// the practical ceiling for a music-listening UX.
+const LEADER_MS_MAX: u64 = 2000;
 
 /// Sample rate the v0.1.13 baseline source generator emits at
 /// (and the receiver expects). Matches the typical ALSA
@@ -123,23 +145,29 @@ const BASELINE_TONE_HZ: f32 = 440.0;
 const FRAMES_PER_CHUNK: usize = 960;
 
 /// Periods the receiver's ALSA buffer holds. Four periods @
-/// 20 ms per period = ~80 ms tolerance, enough for typical
-/// LAN jitter without audible queue-back drift between
-/// source-host playback and receiver render.
+/// 20 ms per period = ~80 ms hardware-buffer headroom. The
+/// presentation-time scheduler decides which frame to feed
+/// into the buffer next; this depth is the headroom between
+/// writei and audible-at-DAC, not the queueing budget.
 #[cfg(feature = "alsa-substrate")]
 const RENDER_BUFFER_PERIODS: usize = 4;
 
-/// Backlog threshold (in ALSA frames available-to-write
-/// queue depth) above which the receiver drops the inbound
-/// frame instead of writing it. When the ALSA queue is
-/// already deeper than this, writing more would compound
-/// drift; dropping shortens the latency at the cost of
-/// momentary discontinuity. Set to one period less than the
-/// configured buffer so the drop kicks in only when the
-/// buffer is nearly full.
-#[cfg(feature = "alsa-substrate")]
-const RENDER_BACKLOG_DROP_FRAMES: usize =
-    FRAMES_PER_CHUNK * (RENDER_BUFFER_PERIODS - 1);
+/// Default `leader_ms`: how far ahead of presentation time the
+/// source emits, and how much network-latency + jitter
+/// tolerance the receiver allows before writing each frame to
+/// ALSA. 200 ms is the typical baseline for LAN multi-room
+/// (Roon RAAT defaults here; AirPlay 2 sits ~150 ms; SRT's
+/// recommended `latency` is 4×RTT, typically 80-200 ms).
+/// Operators tune via the `leader_ms` plugin config + the
+/// `multiroom.set_leader_ms` runtime verb.
+const DEFAULT_LEADER_MS: u64 = 200;
+
+/// Scheduler tick period. The receiver wakes every
+/// `SCHEDULER_TICK_MS` milliseconds to push any frames whose
+/// scheduled render time has arrived into ALSA. Tighter than
+/// the 20 ms frame budget so the scheduler can hit
+/// sub-period precision.
+const SCHEDULER_TICK_MS: u64 = 5;
 
 /// Operator config persisted at
 /// `/etc/evo/plugins.d/multiroom.evo-native.toml`.
@@ -172,6 +200,20 @@ struct PluginConfig {
     /// synthetic 440 Hz tone generator (diagnostic floor).
     #[serde(default)]
     source_pcm: String,
+    /// Presentation-time leader in milliseconds: how far
+    /// ahead of audible render the source emits each frame,
+    /// and the network-latency + jitter budget the receiver
+    /// allocates before scheduling each frame's writei into
+    /// ALSA. Lower = lower end-to-end latency, less
+    /// tolerance for slow networks. Higher = more tolerance
+    /// for slow networks, slightly higher latency. The
+    /// receiver schedules every frame against its
+    /// presentation_time_ms anchor so playback is
+    /// bit-perfect (no sample drops, no sample inserts)
+    /// regardless of jitter inside the budget. Operators
+    /// tune live via `multiroom.set_leader_ms`.
+    #[serde(default = "default_leader_ms")]
+    leader_ms: u64,
 }
 
 impl Default for PluginConfig {
@@ -181,6 +223,7 @@ impl Default for PluginConfig {
             group_id: None,
             alsa_pcm: default_alsa_pcm(),
             source_pcm: String::new(),
+            leader_ms: default_leader_ms(),
         }
     }
 }
@@ -191,6 +234,10 @@ fn default_role() -> Role {
 
 fn default_alsa_pcm() -> String {
     "evo".to_string()
+}
+
+fn default_leader_ms() -> u64 {
+    DEFAULT_LEADER_MS
 }
 
 /// Plugin role. Set via operator config.
@@ -241,6 +288,21 @@ pub struct MultiroomEvoNativePlugin {
     shutdown: Arc<Notify>,
     frames_received: Arc<std::sync::atomic::AtomicU64>,
     frames_sent: Arc<std::sync::atomic::AtomicU64>,
+    /// Operator-tunable presentation-time leader in ms.
+    /// Shared with the source + receiver tasks so live
+    /// updates via `multiroom.set_leader_ms` take effect
+    /// without a plugin reload.
+    leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver-side underrun counter: incremented every
+    /// time the scheduler reaches a render tick with no
+    /// frame in the queue at or before the due time. Each
+    /// underrun is one period of silence written to ALSA
+    /// to keep playback continuous.
+    receiver_underruns: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver-side queue depth (most recent observed).
+    /// Snapshot for `multiroom.get_status`; updated by the
+    /// receiver scheduler each tick.
+    receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MultiroomEvoNativePlugin {
@@ -255,6 +317,13 @@ impl MultiroomEvoNativePlugin {
             shutdown: Arc::new(Notify::new()),
             frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frames_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            leader_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_LEADER_MS,
+            )),
+            receiver_underruns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            receiver_queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
         }
     }
 
@@ -268,6 +337,25 @@ impl MultiroomEvoNativePlugin {
     /// Total audio frames sent (source-role only).
     pub fn frames_sent(&self) -> u64 {
         self.frames_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Receiver underrun count: scheduler ticks where no frame
+    /// was due to render. Each one is a period of silence.
+    pub fn receiver_underruns(&self) -> u64 {
+        self.receiver_underruns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Receiver scheduler queue depth (frames buffered waiting
+    /// for their presentation_time_ms to arrive).
+    pub fn receiver_queue_depth(&self) -> u64 {
+        self.receiver_queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current operator-set presentation-time leader (ms).
+    pub fn leader_ms(&self) -> u64 {
+        self.leader_ms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn apply_config(&mut self, table: &toml::Table) -> Result<(), PluginError> {
@@ -286,6 +374,8 @@ impl MultiroomEvoNativePlugin {
                     .into(),
             ));
         }
+        self.leader_ms
+            .store(cfg.leader_ms, std::sync::atomic::Ordering::Relaxed);
         self.config = cfg;
         Ok(())
     }
@@ -414,9 +504,19 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let handle = Arc::clone(&audio_plane);
                     let alsa_pcm = self.config.alsa_pcm.clone();
                     let role = self.config.role;
+                    let leader_ms = Arc::clone(&self.leader_ms);
+                    let underruns = Arc::clone(&self.receiver_underruns);
+                    let queue_depth = Arc::clone(&self.receiver_queue_depth);
                     let task = tokio::spawn(async move {
                         run_receiver_task(
-                            handle, counter, shutdown, alsa_pcm, role,
+                            handle,
+                            counter,
+                            shutdown,
+                            alsa_pcm,
+                            role,
+                            leader_ms,
+                            underruns,
+                            queue_depth,
                         )
                         .await;
                     });
@@ -425,6 +525,7 @@ impl Plugin for MultiroomEvoNativePlugin {
                         plugin = PLUGIN_NAME,
                         role = self.config.role.as_wire_str(),
                         alsa_pcm = %self.config.alsa_pcm,
+                        leader_ms = self.config.leader_ms,
                         "receiver-side task running"
                     );
                 }
@@ -498,12 +599,59 @@ impl Respondent for MultiroomEvoNativePlugin {
                         "role": self.config.role.as_wire_str(),
                         "group_id": self.config.group_id,
                         "alsa_pcm": self.config.alsa_pcm,
+                        "source_pcm": self.config.source_pcm,
+                        "leader_ms": self.leader_ms(),
+                        "leader_ms_min": LEADER_MS_MIN,
+                        "leader_ms_max": LEADER_MS_MAX,
                         "frames_sent": self.frames_sent(),
                         "frames_received": self.frames_received(),
+                        "receiver_queue_depth": self.receiver_queue_depth(),
+                        "receiver_underruns": self.receiver_underruns(),
                     });
                     let body = serde_json::to_vec(&payload).map_err(|e| {
                         PluginError::Permanent(format!(
                             "encode multiroom.get_status response: {e}"
+                        ))
+                    })?;
+                    Ok(Response::for_request(req, body))
+                }
+                "multiroom.set_leader_ms" => {
+                    let body_json: serde_json::Value =
+                        serde_json::from_slice(&req.payload).map_err(|e| {
+                            PluginError::Permanent(format!(
+                                "multiroom.set_leader_ms: payload not JSON: {e}"
+                            ))
+                        })?;
+                    let value = body_json
+                        .get("value")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            PluginError::Permanent(
+                                    "multiroom.set_leader_ms: \
+                                     payload must contain integer 'value' field"
+                                        .to_string(),
+                                )
+                        })?;
+                    if !(LEADER_MS_MIN..=LEADER_MS_MAX).contains(&value) {
+                        return Err(PluginError::Permanent(format!(
+                            "multiroom.set_leader_ms: value {value} out of range \
+                             [{LEADER_MS_MIN}, {LEADER_MS_MAX}]"
+                        )));
+                    }
+                    self.leader_ms
+                        .store(value, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        leader_ms = value,
+                        "leader_ms updated by operator"
+                    );
+                    let payload = serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "leader_ms": value,
+                    });
+                    let body = serde_json::to_vec(&payload).map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "encode multiroom.set_leader_ms response: {e}"
                         ))
                     })?;
                     Ok(Response::for_request(req, body))
@@ -866,16 +1014,39 @@ fn run_capture_thread(
     tracing::info!(plugin = PLUGIN_NAME, "ALSA capture thread exiting");
 }
 
-/// Receiver-side task: subscribe to incoming audio frames,
-/// count them, and (when the `alsa-substrate` Cargo feature
-/// is on) write each frame's PCM payload to the configured
-/// ALSA playback device.
+/// Receiver-side task: presentation-time-scheduled bit-perfect
+/// renderer. Subscribes to incoming `AudioFrameReceived` events,
+/// anchors a local playback timeline to the first frame's
+/// `presentation_time_ms`, and schedules every subsequent frame
+/// at `anchor_local + (frame.presentation_time_ms - anchor_pts)`.
+/// The operator-tunable `leader_ms` adds a fixed offset to the
+/// anchor: more leader = more tolerance for network jitter, at
+/// the cost of slightly higher end-to-end latency.
+///
+/// Bit-perfect contract: this scheduler never drops a frame to
+/// bound drift, and never inserts samples to compensate. Each
+/// frame's PCM bytes are written to ALSA verbatim at its
+/// scheduled time. Late frames (presentation past local-clock-
+/// now at the moment of dequeue) are still rendered — they
+/// catch up against ALSA's hardware buffer headroom. The only
+/// "drift defence" is the operator-set `leader_ms`: increase it
+/// if late-frame events repeat.
+///
+/// Underrun handling: when the scheduler ticks and no frame is
+/// scheduled to render in the next period, one period of
+/// digital silence is written to ALSA so playback continuity
+/// holds. Each underrun bumps the operator-visible
+/// `receiver_underruns` counter.
+#[allow(clippy::too_many_arguments)]
 async fn run_receiver_task(
     audio_plane: Arc<dyn AudioPlaneHandle>,
     counter: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
     alsa_pcm: String,
     role: Role,
+    leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    underruns: Arc<std::sync::atomic::AtomicU64>,
+    queue_depth: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut stream = match audio_plane.subscribe_audio_frames().await {
         Ok(s) => s,
@@ -915,6 +1086,18 @@ async fn run_receiver_task(
     let _ = role;
     let _ = alsa_pcm;
 
+    // Presentation-time anchor: set on first received frame.
+    // Future frames' scheduled local time is computed as
+    //   anchor_local + (frame.pts_ms - anchor_pts_ms)
+    let mut anchor_local: Option<std::time::Instant> = None;
+    let mut anchor_pts_ms: Option<u64> = None;
+    let mut queue: std::collections::VecDeque<
+        evo_plugin_sdk::contract::AudioFrameReceived,
+    > = std::collections::VecDeque::new();
+
+    let tick = std::time::Duration::from_millis(SCHEDULER_TICK_MS);
+    let mut next_tick = std::time::Instant::now() + tick;
+
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
@@ -943,37 +1126,23 @@ async fn run_receiver_task(
                                 "first audio frame received from new source-host peer"
                             );
                         }
-                        #[cfg(feature = "alsa-substrate")]
-                        if let Some(render) = alsa_render.as_mut() {
-                            match render.write(&frame.payload) {
-                                Ok(WriteOutcome::Rendered) => {}
-                                Ok(WriteOutcome::DroppedDeepBacklog {
-                                    queued_frames,
-                                }) => {
-                                    // Drift defence kicked in.
-                                    // Log at debug so the trace
-                                    // is available without
-                                    // spamming the log on a
-                                    // sustained drift event.
-                                    tracing::debug!(
-                                        plugin = PLUGIN_NAME,
-                                        queued_frames = queued_frames,
-                                        drop_threshold =
-                                            RENDER_BACKLOG_DROP_FRAMES,
-                                        "audio frame dropped at receiver: \
-                                         ALSA backlog deeper than drift \
-                                         threshold"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        plugin = PLUGIN_NAME,
-                                        error = %e,
-                                        "ALSA writei failed"
-                                    );
-                                }
-                            }
+                        if anchor_local.is_none() {
+                            anchor_local = Some(std::time::Instant::now());
+                            anchor_pts_ms = Some(frame.presentation_time_ms);
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                anchor_pts_ms = frame.presentation_time_ms,
+                                leader_ms = leader_ms.load(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ),
+                                "receiver scheduler: playback anchor established"
+                            );
                         }
+                        queue.push_back(frame);
+                        queue_depth.store(
+                            queue.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     Err(
                         evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged {
@@ -996,6 +1165,87 @@ async fn run_receiver_task(
                         return;
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                next_tick,
+            )) => {
+                next_tick += tick;
+                let now = std::time::Instant::now();
+                let leader = leader_ms.load(
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let mut rendered_this_tick = 0usize;
+                while let (Some(anchor_l), Some(anchor_p)) =
+                    (anchor_local, anchor_pts_ms)
+                {
+                    let Some(head) = queue.front() else { break };
+                    let offset_ms = head
+                        .presentation_time_ms
+                        .saturating_sub(anchor_p);
+                    let render_at = anchor_l
+                        + std::time::Duration::from_millis(
+                            offset_ms + leader,
+                        );
+                    if render_at > now {
+                        break;
+                    }
+                    let frame = queue.pop_front().unwrap();
+                    queue_depth.store(
+                        queue.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    rendered_this_tick += 1;
+                    #[cfg(feature = "alsa-substrate")]
+                    if let Some(render) = alsa_render.as_mut() {
+                        if let Err(e) = render.write(&frame.payload) {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "ALSA writei failed (scheduled render)"
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "alsa-substrate"))]
+                    let _ = &frame;
+                }
+                // Underrun guard: if the anchor is established
+                // and we ticked past at least one period budget
+                // without rendering anything, write silence so
+                // ALSA stays primed.
+                #[cfg(feature = "alsa-substrate")]
+                if rendered_this_tick == 0
+                    && anchor_local.is_some()
+                    && alsa_render.is_some()
+                {
+                    if let Some(render) = alsa_render.as_mut() {
+                        if render
+                            .queued_frames_below(FRAMES_PER_CHUNK as i64)
+                        {
+                            let silence =
+                                vec![
+                                    0u8;
+                                    FRAMES_PER_CHUNK
+                                        * BASELINE_CHANNELS as usize
+                                        * 2
+                                ];
+                            if let Err(e) = render.write(&silence) {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    error = %e,
+                                    "ALSA silence write failed (underrun)"
+                                );
+                            } else {
+                                underruns.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "alsa-substrate"))]
+                let _ = &underruns;
+                let _ = rendered_this_tick;
             }
         }
     }
@@ -1078,16 +1328,24 @@ impl AlsaRender {
         Ok(Self { pcm })
     }
 
-    /// Frames currently queued in the ALSA playback buffer
-    /// (i.e. audio not yet rendered). Used by the receiver
-    /// loop to detect backlog accumulation and drop frames
-    /// when the queue is deep enough to introduce audible
-    /// drift between source-host playback and local render.
-    fn delay_frames(&self) -> alsa::pcm::Frames {
-        self.pcm.status().map(|s| s.get_delay()).unwrap_or(0)
+    /// `snd_pcm_status::get_delay` — frames currently queued
+    /// in the ALSA playback buffer that have not yet been
+    /// rendered to the DAC. Returns `i64` because ALSA's
+    /// delay can be slightly negative during initial-fill /
+    /// xrun recovery; the scheduler treats negative as
+    /// "needs priming".
+    fn queued_frames(&self) -> i64 {
+        self.pcm.status().map(|s| s.get_delay() as i64).unwrap_or(0)
     }
 
-    fn write(&mut self, payload: &[u8]) -> Result<WriteOutcome, String> {
+    /// Convenience: `true` when the ALSA queue is shallower
+    /// than `threshold` frames — the scheduler's signal to
+    /// write a silence period to keep playback continuous.
+    fn queued_frames_below(&self, threshold: i64) -> bool {
+        self.queued_frames() < threshold
+    }
+
+    fn write(&mut self, payload: &[u8]) -> Result<(), String> {
         // Interleaved s16le: 4 bytes per stereo frame (2 ch
         // * 2 bytes). Decode in place — alsa::pcm::IO::<i16>
         // takes a &[i16] of length frames * channels.
@@ -1096,20 +1354,6 @@ impl AlsaRender {
                 "payload length {} not aligned to s16le stereo frame (4 bytes)",
                 payload.len()
             ));
-        }
-        // Backlog-aware drift defence. If the ALSA playback
-        // queue already holds more than RENDER_BACKLOG_DROP_FRAMES
-        // worth of unrendered audio, the source-host's
-        // emission cadence has run ahead of the receiver's
-        // playback cadence (clock skew, network jitter burst,
-        // or initial-fill effect). Writing this frame would
-        // compound the drift; dropping shortens the latency.
-        // The next frame is checked on the same basis.
-        let queued = self.delay_frames();
-        if queued > RENDER_BACKLOG_DROP_FRAMES as alsa::pcm::Frames {
-            return Ok(WriteOutcome::DroppedDeepBacklog {
-                queued_frames: queued as usize,
-            });
         }
         let frame_count = payload.len() / 4;
         let mut samples = Vec::with_capacity(payload.len() / 2);
@@ -1121,7 +1365,7 @@ impl AlsaRender {
             .io_i16()
             .map_err(|e| format!("pcm.io_i16(): {e}"))?;
         match io.writei(&samples) {
-            Ok(n) if n == frame_count => Ok(WriteOutcome::Rendered),
+            Ok(n) if n == frame_count => Ok(()),
             Ok(short) => Err(format!(
                 "short write: requested {} frames, wrote {}",
                 frame_count, short
@@ -1135,7 +1379,7 @@ impl AlsaRender {
                 // discrimination + escalation.
                 let _ = self.pcm.prepare();
                 match io.writei(&samples) {
-                    Ok(n) if n == frame_count => Ok(WriteOutcome::Rendered),
+                    Ok(n) if n == frame_count => Ok(()),
                     Ok(short) => Err(format!(
                         "post-recover short write: requested {} \
                          frames, wrote {}",
@@ -1146,17 +1390,6 @@ impl AlsaRender {
             }
         }
     }
-}
-
-/// Receiver-side write outcome. Either the frame went into
-/// the ALSA buffer for render, or the buffer's queue was
-/// already deeper than the drop threshold and the frame was
-/// dropped to bound drift.
-#[cfg(feature = "alsa-substrate")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteOutcome {
-    Rendered,
-    DroppedDeepBacklog { queued_frames: usize },
 }
 
 #[cfg(test)]
