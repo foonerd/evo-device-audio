@@ -83,6 +83,31 @@ async fn main() -> anyhow::Result<()> {
 fn audio_distribution_admission() -> AdmissionSetup {
     Box::new(|engine: &mut AdmissionEngine, _config: &StewardConfig| {
         Box::pin(async move {
+            // 0. Tier 2 reference-device UI substrate: register
+            //    the six audio shelves (playback transport / queue
+            //    / metering / browse / search / signal path) and
+            //    the six widget kinds the renderer paints onto
+            //    them. Runs BEFORE plugin admissions so the
+            //    admission gate validates `[[ui.stocks]]`
+            //    declarations against the combined Tier 1 + Tier
+            //    2 set. The framework's
+            //    `describe_ui_stockings` wire op then projects
+            //    all 15 shelves + all 29 widget kinds in one
+            //    round trip; the schema-first UI consumes the
+            //    response directly.
+            let audio_shelves =
+                evo_device_audio_shared::audio_ui_pack::audio_shelves();
+            engine
+                .register_ui_shelves(&audio_shelves)
+                .await
+                .context("registering Tier 2 audio shelves")?;
+            let audio_widget_kinds =
+                evo_device_audio_shared::audio_ui_pack::audio_widget_kinds();
+            engine
+                .register_ui_widget_kinds(&audio_widget_kinds)
+                .await
+                .context("registering Tier 2 audio widget kinds")?;
+
             // 1. composition.alsa: singleton respondent on
             //    audio.composition shape 2.
             let composition_manifest = Manifest::from_toml(

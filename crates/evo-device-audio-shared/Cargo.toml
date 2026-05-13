@@ -12,6 +12,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+evo-plugin-sdk = { workspace = true }
 lofty = { workspace = true }
 
 [dev-dependencies]

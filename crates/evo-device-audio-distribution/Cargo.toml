@@ -20,6 +20,7 @@ path = "src/main.rs"
 # admission.
 evo = { path = "../../../evo-core-eng/crates/evo" }
 evo-plugin-sdk = { workspace = true }
+evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 
 # Plugin set this distribution links in-process. Each plugin
 # crate exports its public Plugin type and the embedded
