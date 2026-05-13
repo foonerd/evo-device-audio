@@ -51,7 +51,10 @@ default = []
 # as Unsupported and the NamedPipe substrate covers byte-
 # flow. See the plugin's Cargo.toml for the feature
 # definition.
-alsa-substrate = ["org-evoframework-composition-alsa/alsa-substrate"]
+alsa-substrate = [
+    "org-evoframework-composition-alsa/alsa-substrate",
+    "org-evoframework-multiroom-evo-native/alsa-substrate",
+]
 
 [lints]
 workspace = true

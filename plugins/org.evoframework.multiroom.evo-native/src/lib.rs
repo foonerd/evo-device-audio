@@ -6,42 +6,57 @@
 //! evo-native multi-room audio-frame fan-out plugin.
 //!
 //! Bridges the local audio chain to the framework's
-//! audio-plane TCP transport. Role flips dynamically as the
-//! framework's source-host election arbitrates: when the
-//! local node is elected source-host for a multi-room group,
-//! this plugin captures from the local audio chain (mpd
-//! output via ALSA loopback / pcm.tee) and fans encoded PCM
-//! frames out via the framework's
-//! [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::fan_out_audio_frame`]
-//! seam. When the local node is a receiver, the plugin
-//! subscribes to incoming frames via
-//! [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::subscribe_audio_frames`]
-//! and renders payloads to the local ALSA playback chain at
-//! the scheduling target the source-host's
-//! `presentation_time_ms` declares.
+//! audio-plane TCP transport. The plugin operates in one of
+//! three roles selected via its TOML config:
+//!
+//! - `role = "source"` — emit audio frames out to receivers
+//!   via [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::fan_out_audio_frame`].
+//!   baseline: synthesises a 440 Hz sine-wave test
+//!   tone at `pcm_s16_le` / 48000 Hz / stereo so the
+//!   substrate is observable without depending on the
+//!   operator wiring `snd-aloop` / `pcm.tee` to capture the
+//!   local audio chain. The real-audio capture (snd-aloop
+//!   tap of `pcm.evo`) rides a subsequent iteration of this
+//!   same plugin once the ALSA config is operator-deployed.
+//! - `role = "receiver"` — subscribe to incoming audio
+//!   frames via [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle::subscribe_audio_frames`]
+//!   and write the decoded PCM bytes to the local ALSA
+//!   playback device named in the config. baseline
+//!   does NOT yet schedule against `presentation_time_ms`
+//!   (no jitter buffer); receivers play frames as they
+//!   arrive. Synced playback alignment + jitter buffer +
+//!   adaptive cadence (matching the reliability bar) ride
+//!   the next iteration.
+//! - `role = "auto"` (default) — observe-only: subscribe
+//!   and count incoming frames but do NOT engage capture or
+//!   playback. Useful for substrate diagnostics + the future
+//!   election-driven role flipping that will replace the
+//!   manual `source`/`receiver` config once the GroupStore
+//!   handle on `LoadContext` lands.
 //!
 //! ## Initial scope
 //!
-//! - Codec: raw `pcm_s16_le` (no encoder dependency; matches
-//!   the framework substrate's bit-exact round-trip
-//!   guarantee).
-//! - Source-side capture: ALSA capture device the operator
-//!   wires via `/etc/asound.conf` (`pcm.evo_capture` fed by
-//!   `pcm.tee` or `snd-aloop`).
-//! - Receiver-side playback: ALSA playback device the
-//!   operator wires (typically the same hardware target that
-//!   delivery.alsa drives).
-//! - Sync: receivers honour the source-host's
-//!   `presentation_time_ms` against their own monotonic
-//!   clock + the framework's NTP-lite offset (the
-//!   [`evo_plugin_sdk::contract::audio_plane::AudioFrameReceived`]
-//!   envelope's `presentation_time_ms` is already in the
-//!   source-host's monotonic ms; receivers transform via the
-//!   measured sync offset before scheduling the write).
+//! - Codec: raw `pcm_s16_le` (no encoder dependency).
+//! - Sample rate: 48 kHz stereo (matches the synthetic tone
+//!   AND the typical ALSA hardware default).
+//! - Source: synthetic 440 Hz sine generator (baseline).
+//! - Receiver: ALSA writei to the configured playback PCM
+//!   when the `alsa-substrate` Cargo feature is enabled; on
+//!   builds without the feature the receiver counts frames
+//!   without rendering.
+//!
+//! Operator config (`/etc/evo/plugins.d/multiroom.evo-native.toml`):
+//!
+//! ```toml
+//! role = "source"             # "source" | "receiver" | "auto"
+//! group_id = "<uuid>"         # required when role = "source"
+//! alsa_pcm = "evo"            # ALSA playback device (receiver)
+//! ```
 //!
 //! Production-quality additions (FEC / adaptive jitter
 //! buffering / predictive buffering / network-class auto-
-//! tuning / cooperative peer recovery) ride later iterations per the
+//! tuning / cooperative peer recovery / source-host election
+//! follow / encoded codecs) ride later iterations per the
 //! reliability bar in `project-multiroom-position` memory.
 
 #![forbid(unsafe_code)]
@@ -51,13 +66,14 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle;
+use evo_plugin_sdk::contract::audio_plane::{AudioFrameSeed, AudioPlaneHandle};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
     RuntimeCapabilities,
 };
 use evo_plugin_sdk::Manifest;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -76,6 +92,85 @@ const PAYLOAD_VERSION: u32 = 1;
 /// admission would refuse a mismatch.
 const REQUEST_TYPES: &[&str] = &["multiroom.get_status"];
 
+/// Sample rate the baseline source generator emits at
+/// (and the receiver expects). Matches the typical ALSA
+/// hardware default; resampling lands as a later improvement.
+const BASELINE_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Channel count the baseline emits + renders.
+const BASELINE_CHANNELS: u16 = 2;
+
+/// Tone frequency the baseline source generator emits. 440 Hz
+/// is concert A — universally recognisable when the operator
+/// hears it from the receiver.
+const BASELINE_TONE_HZ: f32 = 440.0;
+
+/// Frames per audio chunk emitted by the source generator.
+/// 960 samples at 48 kHz = 20 ms per chunk — typical real-
+/// time audio packet size.
+const FRAMES_PER_CHUNK: usize = 960;
+
+/// Operator config persisted at
+/// `/etc/evo/plugins.d/multiroom.evo-native.toml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginConfig {
+    /// Role this node should adopt. See module-level docs.
+    #[serde(default = "default_role")]
+    role: Role,
+    /// Group id frames are fanned out to (required when
+    /// `role = "source"`).
+    #[serde(default)]
+    group_id: Option<String>,
+    /// ALSA playback device the receiver writes to. Defaults
+    /// to `"evo"` — the modular pipeline pcm name
+    /// delivery.alsa stocks. Operators with multiple cards
+    /// or non-default routing override here.
+    #[serde(default = "default_alsa_pcm")]
+    alsa_pcm: String,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            role: default_role(),
+            group_id: None,
+            alsa_pcm: default_alsa_pcm(),
+        }
+    }
+}
+
+fn default_role() -> Role {
+    Role::Auto
+}
+
+fn default_alsa_pcm() -> String {
+    "evo".to_string()
+}
+
+/// Plugin role. Set via operator config.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Role {
+    /// Generate audio frames and fan them out to receivers
+    /// of `group_id`.
+    Source,
+    /// Subscribe to incoming audio frames and render to local
+    /// ALSA.
+    Receiver,
+    /// Observe only — count frames, do nothing else.
+    Auto,
+}
+
+impl Role {
+    fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Receiver => "receiver",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML).expect(
@@ -91,17 +186,15 @@ fn plugin_crate_version() -> semver::Version {
 /// Multi-room audio-frame fan-out plugin.
 pub struct MultiroomEvoNativePlugin {
     loaded: bool,
+    config: PluginConfig,
     audio_plane: Option<Arc<dyn AudioPlaneHandle>>,
-    /// Receiver-side task that consumes the audio-plane's
-    /// broadcast stream and reports observable progress. The
-    /// baseline counts every received frame and logs
-    /// the first frame per source peer so the substrate is
-    /// observable end-to-end; subsequent iterations of the
-    /// same plugin add PCM decode plus local ALSA render at
-    /// the scheduling target the envelope declares.
+    /// Receiver-side task; spawned for Receiver + Auto roles.
     receiver_task: Option<JoinHandle<()>>,
-    receiver_shutdown: Arc<Notify>,
+    /// Source-side task; spawned for Source role only.
+    source_task: Option<JoinHandle<()>>,
+    shutdown: Arc<Notify>,
     frames_received: Arc<std::sync::atomic::AtomicU64>,
+    frames_sent: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MultiroomEvoNativePlugin {
@@ -109,18 +202,46 @@ impl MultiroomEvoNativePlugin {
     pub fn new() -> Self {
         Self {
             loaded: false,
+            config: PluginConfig::default(),
             audio_plane: None,
             receiver_task: None,
-            receiver_shutdown: Arc::new(Notify::new()),
+            source_task: None,
+            shutdown: Arc::new(Notify::new()),
             frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            frames_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// Observed total of audio frames received across every
-    /// connected source-host peer since plugin load.
+    /// Total audio frames received across every connected
+    /// source-host peer since plugin load.
     pub fn frames_received(&self) -> u64 {
         self.frames_received
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total audio frames sent (source-role only).
+    pub fn frames_sent(&self) -> u64 {
+        self.frames_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn apply_config(&mut self, table: &toml::Table) -> Result<(), PluginError> {
+        // toml::Table -> PluginConfig via serde. Unknown keys
+        // are silently dropped (default serde behaviour); the
+        // documented keys above are the operator-facing
+        // surface.
+        let cfg: PluginConfig =
+            toml::Value::Table(table.clone()).try_into().map_err(|e| {
+                PluginError::Permanent(format!("invalid plugin config: {e}"))
+            })?;
+        if cfg.role == Role::Source && cfg.group_id.is_none() {
+            return Err(PluginError::Permanent(
+                "role = \"source\" requires group_id = \"<uuid>\" in plugin \
+                 config"
+                    .into(),
+            ));
+        }
+        self.config = cfg;
+        Ok(())
     }
 }
 
@@ -164,12 +285,8 @@ impl Plugin for MultiroomEvoNativePlugin {
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
             tracing::info!(plugin = PLUGIN_NAME, "plugin load beginning");
+            self.apply_config(&ctx.config)?;
 
-            // Equip the audio-plane handle the framework
-            // populated via the manifest's
-            // `capabilities.audio_plane = true` declaration.
-            // Refuse loudly when the handle is None — that
-            // signals a manifest / admission misconfiguration.
             let audio_plane = ctx
                 .audio_plane
                 .as_ref()
@@ -185,31 +302,55 @@ impl Plugin for MultiroomEvoNativePlugin {
                 .clone();
             self.audio_plane = Some(Arc::clone(&audio_plane));
 
-            // Spawn the receiver-side observation task. This
-            // task subscribes to the framework's audio-plane
-            // broadcast and counts every received frame. In
-            // subsequent iterations it decodes + renders to
-            // local ALSA at the scheduling target the
-            // envelope declares; for baseline the
-            // count + the per-peer first-frame log are the
-            // operator-observable signal that the substrate
-            // is flowing.
-            let counter = Arc::clone(&self.frames_received);
-            let shutdown = Arc::clone(&self.receiver_shutdown);
-            let handle = Arc::clone(&audio_plane);
-            let task = tokio::spawn(async move {
-                run_receiver_task(handle, counter, shutdown).await;
-            });
-            self.receiver_task = Some(task);
+            match self.config.role {
+                Role::Source => {
+                    let group_id = self.config.group_id.clone().expect(
+                        "role = source enforces group_id in apply_config",
+                    );
+                    let sent = Arc::clone(&self.frames_sent);
+                    let shutdown = Arc::clone(&self.shutdown);
+                    let handle = Arc::clone(&audio_plane);
+                    let task = tokio::spawn(async move {
+                        run_source_tone_generator(
+                            handle, group_id, sent, shutdown,
+                        )
+                        .await;
+                    });
+                    self.source_task = Some(task);
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        group_id = %self.config.group_id.as_deref().unwrap_or(""),
+                        "source role engaged: 440 Hz test tone fan-out running"
+                    );
+                }
+                Role::Receiver | Role::Auto => {
+                    let counter = Arc::clone(&self.frames_received);
+                    let shutdown = Arc::clone(&self.shutdown);
+                    let handle = Arc::clone(&audio_plane);
+                    let alsa_pcm = self.config.alsa_pcm.clone();
+                    let role = self.config.role;
+                    let task = tokio::spawn(async move {
+                        run_receiver_task(
+                            handle, counter, shutdown, alsa_pcm, role,
+                        )
+                        .await;
+                    });
+                    self.receiver_task = Some(task);
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        role = self.config.role.as_wire_str(),
+                        alsa_pcm = %self.config.alsa_pcm,
+                        "receiver-side task running"
+                    );
+                }
+            }
 
             self.loaded = true;
-
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                "plugin loaded; audio-plane handle equipped; \
-                 receiver-side observation task running"
+                role = self.config.role.as_wire_str(),
+                "plugin loaded; audio-plane handle equipped"
             );
-
             Ok(())
         }
     }
@@ -218,7 +359,10 @@ impl Plugin for MultiroomEvoNativePlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
-            self.receiver_shutdown.notify_one();
+            self.shutdown.notify_waiters();
+            if let Some(task) = self.source_task.take() {
+                let _ = task.await;
+            }
             if let Some(task) = self.receiver_task.take() {
                 let _ = task.await;
             }
@@ -227,6 +371,7 @@ impl Plugin for MultiroomEvoNativePlugin {
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 frames_received = self.frames_received(),
+                frames_sent = self.frames_sent(),
                 "plugin unload"
             );
             Ok(())
@@ -238,8 +383,10 @@ impl Plugin for MultiroomEvoNativePlugin {
             HealthReport {
                 status: evo_plugin_sdk::contract::HealthStatus::Healthy,
                 detail: Some(format!(
-                    "frames_received={}",
-                    self.frames_received()
+                    "role={} frames_sent={} frames_received={}",
+                    self.config.role.as_wire_str(),
+                    self.frames_sent(),
+                    self.frames_received(),
                 )),
                 checks: Vec::new(),
                 reported_at: std::time::SystemTime::now(),
@@ -263,8 +410,11 @@ impl Respondent for MultiroomEvoNativePlugin {
                 "multiroom.get_status" => {
                     let payload = serde_json::json!({
                         "v": PAYLOAD_VERSION,
+                        "role": self.config.role.as_wire_str(),
+                        "group_id": self.config.group_id,
+                        "alsa_pcm": self.config.alsa_pcm,
+                        "frames_sent": self.frames_sent(),
                         "frames_received": self.frames_received(),
-                        "role": "receiver",
                     });
                     let body = serde_json::to_vec(&payload).map_err(|e| {
                         PluginError::Permanent(format!(
@@ -281,18 +431,106 @@ impl Respondent for MultiroomEvoNativePlugin {
     }
 }
 
-/// Run the receiver-side observation task: subscribe to the
-/// framework's audio-plane broadcast, count every received
-/// frame, log the first frame per source-host peer.
-///
-/// baseline does NOT yet decode + render to ALSA.
-/// The substrate is observable via the frame counter +
-/// per-peer first-frame log; the audio-chain rendering work
-/// rides a subsequent iteration of this same plugin.
+/// Source-side synthetic-tone generator. Emits PCM frames at
+/// the baseline format, 20 ms chunks, monotonic sequence,
+/// `presentation_time_ms` set to local-monotonic-now + 100 ms
+/// (a small fixed leader for the receiver's jitter buffer to
+/// absorb network latency without underrun).
+async fn run_source_tone_generator(
+    audio_plane: Arc<dyn AudioPlaneHandle>,
+    group_id: String,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<Notify>,
+) {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    let chunk_period = std::time::Duration::from_micros(
+        1_000_000 * FRAMES_PER_CHUNK as u64 / BASELINE_SAMPLE_RATE_HZ as u64,
+    );
+    let mut sequence: u64 = 0;
+    let mut phase: f32 = 0.0;
+    let phase_step = 2.0 * std::f32::consts::PI * BASELINE_TONE_HZ
+        / BASELINE_SAMPLE_RATE_HZ as f32;
+    // Amplitude at ~−12 dBFS so the tone is comfortable but
+    // clearly audible.
+    let amplitude: f32 = 0.25 * i16::MAX as f32;
+
+    let start_monotonic = std::time::Instant::now();
+    let mut next_tick = start_monotonic;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "source tone generator: shutdown received"
+                );
+                return;
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                next_tick,
+            )) => {}
+        }
+
+        // Build one PCM chunk: FRAMES_PER_CHUNK frames * 2
+        // channels * 2 bytes-per-sample. Interleaved stereo:
+        // L0, R0, L1, R1, ... (mono tone duplicated on both
+        // channels).
+        let mut pcm = Vec::with_capacity(
+            FRAMES_PER_CHUNK * BASELINE_CHANNELS as usize * 2,
+        );
+        for _ in 0..FRAMES_PER_CHUNK {
+            let sample = (phase.sin() * amplitude) as i16;
+            phase += phase_step;
+            if phase > 2.0 * std::f32::consts::PI {
+                phase -= 2.0 * std::f32::consts::PI;
+            }
+            pcm.extend_from_slice(&sample.to_le_bytes());
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let presentation_time_ms = (start_monotonic.elapsed().as_millis()
+            as u64)
+            .saturating_add(sequence.saturating_mul(20).saturating_add(100));
+
+        let seed = AudioFrameSeed {
+            sequence,
+            presentation_time_ms,
+            codec: "pcm_s16_le".to_string(),
+            rate_hz: BASELINE_SAMPLE_RATE_HZ,
+            channels: BASELINE_CHANNELS,
+            payload_b64: B64.encode(&pcm),
+        };
+
+        if let Err(e) = audio_plane
+            .fan_out_audio_frame(group_id.clone(), seed)
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "fan_out_audio_frame failed; continuing"
+            );
+        } else {
+            sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        sequence = sequence.saturating_add(1);
+        next_tick += chunk_period;
+    }
+}
+
+/// Receiver-side task: subscribe to incoming audio frames,
+/// count them, and (when the `alsa-substrate` Cargo feature
+/// is on) write each frame's PCM payload to the configured
+/// ALSA playback device.
 async fn run_receiver_task(
     audio_plane: Arc<dyn AudioPlaneHandle>,
     counter: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
+    alsa_pcm: String,
+    role: Role,
 ) {
     let mut stream = match audio_plane.subscribe_audio_frames().await {
         Ok(s) => s,
@@ -308,6 +546,29 @@ async fn run_receiver_task(
 
     let mut seen_peers: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+
+    #[cfg(feature = "alsa-substrate")]
+    let mut alsa_render = if role == Role::Receiver {
+        match AlsaRender::open(&alsa_pcm) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    alsa_pcm = %alsa_pcm,
+                    "ALSA playback open failed; receiver counts frames \
+                     without rendering"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // role consumed only behind the cfg gate; silence the
+    // unused warning on builds without the feature.
+    let _ = role;
+    let _ = alsa_pcm;
 
     loop {
         tokio::select! {
@@ -337,6 +598,16 @@ async fn run_receiver_task(
                                 "first audio frame received from new source-host peer"
                             );
                         }
+                        #[cfg(feature = "alsa-substrate")]
+                        if let Some(render) = alsa_render.as_mut() {
+                            if let Err(e) = render.write(&frame.payload) {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    error = %e,
+                                    "ALSA writei failed"
+                                );
+                            }
+                        }
                     }
                     Err(
                         evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged {
@@ -364,6 +635,89 @@ async fn run_receiver_task(
     }
 }
 
+/// ALSA playback handle. Opens the configured PCM at the
+/// baseline format and writes interleaved `pcm_s16_le` frames
+/// via `snd_pcm_writei`. Underruns prepare + retry once; a
+/// second underrun in a row is surfaced to the receiver loop
+/// as a write error.
+#[cfg(feature = "alsa-substrate")]
+struct AlsaRender {
+    pcm: alsa::PCM,
+}
+
+#[cfg(feature = "alsa-substrate")]
+impl AlsaRender {
+    fn open(name: &str) -> Result<Self, String> {
+        let pcm = alsa::PCM::new(name, alsa::Direction::Playback, false)
+            .map_err(|e| format!("alsa::PCM::new({name:?}, Playback): {e}"))?;
+        {
+            let hwp = alsa::pcm::HwParams::any(&pcm)
+                .map_err(|e| format!("alsa::pcm::HwParams::any: {e}"))?;
+            hwp.set_channels(BASELINE_CHANNELS as u32).map_err(|e| {
+                format!("set_channels({}): {e}", BASELINE_CHANNELS)
+            })?;
+            hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
+                .map_err(|e| {
+                    format!("set_rate({BASELINE_SAMPLE_RATE_HZ}, Nearest): {e}")
+                })?;
+            hwp.set_format(alsa::pcm::Format::s16())
+                .map_err(|e| format!("set_format(S16LE): {e}"))?;
+            hwp.set_access(alsa::pcm::Access::RWInterleaved)
+                .map_err(|e| format!("set_access(RWInterleaved): {e}"))?;
+            pcm.hw_params(&hwp)
+                .map_err(|e| format!("hw_params commit: {e}"))?;
+        }
+        pcm.prepare().map_err(|e| format!("pcm.prepare(): {e}"))?;
+        Ok(Self { pcm })
+    }
+
+    fn write(&mut self, payload: &[u8]) -> Result<(), String> {
+        // Interleaved s16le: 4 bytes per stereo frame (2 ch
+        // * 2 bytes). Decode in place — alsa::pcm::IO::<i16>
+        // takes a &[i16] of length frames * channels.
+        if payload.len() % 4 != 0 {
+            return Err(format!(
+                "payload length {} not aligned to s16le stereo frame (4 bytes)",
+                payload.len()
+            ));
+        }
+        let frame_count = payload.len() / 4;
+        let mut samples = Vec::with_capacity(payload.len() / 2);
+        for chunk in payload.chunks_exact(2) {
+            samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        let io = self
+            .pcm
+            .io_i16()
+            .map_err(|e| format!("pcm.io_i16(): {e}"))?;
+        match io.writei(&samples) {
+            Ok(n) if n == frame_count => Ok(()),
+            Ok(short) => Err(format!(
+                "short write: requested {} frames, wrote {}",
+                frame_count, short
+            )),
+            Err(_) => {
+                // Most write errors are EPIPE (underrun) or
+                // ESTRPIPE (suspended). Both recover via
+                // pcm.prepare() and a retry. baseline
+                // treats every writei error as recoverable-
+                // once; production hardening adds explicit
+                // discrimination + escalation.
+                let _ = self.pcm.prepare();
+                match io.writei(&samples) {
+                    Ok(n) if n == frame_count => Ok(()),
+                    Ok(short) => Err(format!(
+                        "post-recover short write: requested {} \
+                         frames, wrote {}",
+                        frame_count, short
+                    )),
+                    Err(e2) => Err(format!("post-recover write error: {e2}")),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +733,47 @@ mod tests {
         let p = MultiroomEvoNativePlugin::new();
         assert!(!p.loaded);
         assert_eq!(p.frames_received(), 0);
+        assert_eq!(p.frames_sent(), 0);
+    }
+
+    #[test]
+    fn default_role_is_auto() {
+        let cfg = PluginConfig::default();
+        assert_eq!(cfg.role, Role::Auto);
+    }
+
+    #[test]
+    fn parse_source_config() {
+        let toml_str = r#"
+role = "source"
+group_id = "abc-123"
+"#;
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let mut p = MultiroomEvoNativePlugin::new();
+        p.apply_config(&table).unwrap();
+        assert_eq!(p.config.role, Role::Source);
+        assert_eq!(p.config.group_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn parse_source_without_group_id_refuses() {
+        let toml_str = r#"role = "source""#;
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let mut p = MultiroomEvoNativePlugin::new();
+        let err = p.apply_config(&table).unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[test]
+    fn parse_receiver_config() {
+        let toml_str = r#"
+role = "receiver"
+alsa_pcm = "evo"
+"#;
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let mut p = MultiroomEvoNativePlugin::new();
+        p.apply_config(&table).unwrap();
+        assert_eq!(p.config.role, Role::Receiver);
+        assert_eq!(p.config.alsa_pcm, "evo");
     }
 }

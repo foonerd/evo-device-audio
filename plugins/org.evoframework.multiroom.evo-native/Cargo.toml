@@ -11,6 +11,19 @@ description = "evo-native multi-room audio-frame fan-out plugin. Bridges the loc
 [lib]
 path = "src/lib.rs"
 
+# `alsa-substrate` (off by default) pulls in the `alsa` crate
+# and turns on the receiver-side ALSA playback path. Without
+# the feature the plugin still admits, equips the audio-plane
+# handle, and counts incoming frames — the substrate proves
+# the wire-up; audible playback requires the substrate
+# feature. Production builds (Pi 5, amd64 with audio
+# hardware) build with the feature on; CI host builds skip
+# it to avoid the libasound2-dev dependency.
+
+[features]
+default = []
+alsa-substrate = ["dep:alsa"]
+
 [dependencies]
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
@@ -21,6 +34,7 @@ tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros
 toml = "0.8"
 tracing = { workspace = true }
 base64 = { workspace = true }
+alsa = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
