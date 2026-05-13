@@ -39,6 +39,10 @@
 #   EVO_INSTALL_MPD_FRAGMENT=0         — skip /etc/evo/mpd.conf bootstrap (empty file)
 #   EVO_INSTALL_ASOUND_CONF=0          — skip /etc/asound.conf install
 #   EVO_INSTALL_CATALOGUE=0            — skip /opt/evo/catalogue/default.toml install
+#   EVO_INSTALL_MPD_INCLUDE=0          — skip injecting include of /etc/evo/mpd.conf
+#                                       into /etc/mpd.conf
+#   EVO_AUDIO_CARD=<name>              — override auto-detected ALSA card name
+#                                       (env-var form; also available as --card)
 #
 # Per-step toggles let operators disable individual install
 # legs without editing this script — useful when a vendor
@@ -60,8 +64,10 @@ NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
 NMCLI_BIN="/usr/bin/nmcli"
 SYSTEMD_DROPIN_DIR="/etc/systemd/system/evo.service.d"
 MPD_FRAGMENT_PATH="/etc/evo/mpd.conf"
+MPD_CONF_PATH="/etc/mpd.conf"
 ASOUND_CONF_PATH="/etc/asound.conf"
 SKIP_SYSTEMD=0
+AUDIO_CARD="${EVO_AUDIO_CARD:-}"
 
 # Argument parsing — minimal; positional args not supported.
 while [[ $# -gt 0 ]]; do
@@ -74,6 +80,14 @@ while [[ $# -gt 0 ]]; do
             SERVICE_USER="${1#--service-user=}"
             shift
             ;;
+        --card)
+            AUDIO_CARD="$2"
+            shift 2
+            ;;
+        --card=*)
+            AUDIO_CARD="${1#--card=}"
+            shift
+            ;;
         --skip-systemd)
             SKIP_SYSTEMD=1
             shift
@@ -84,7 +98,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "unknown argument: $1" >&2
-            echo "usage: $0 [--service-user <name>] [--skip-systemd]" >&2
+            echo "usage: $0 [--service-user <name>] [--card <NAME>] [--skip-systemd]" >&2
             exit 1
             ;;
     esac
@@ -128,6 +142,58 @@ if [[ ! -x "$SYSTEMCTL_BIN" ]]; then
     fi
 fi
 echo "[bootstrap] systemctl binary: $SYSTEMCTL_BIN"
+
+# ----------------------------------------------------------
+# Resolve the ALSA card name the modular pipeline targets.
+# Operator override wins (env var EVO_AUDIO_CARD or --card
+# flag); otherwise pick the first playback card reported by
+# `aplay -l`. Refuse the install with an operator-readable
+# error when no playback card is available (e.g. headless
+# container, audio kernel modules absent). Reference
+# distribution uses the I-Sabre Q2M card (name `DAC`); every
+# other deployment substitutes its detected card.
+# ----------------------------------------------------------
+if [[ -z "$AUDIO_CARD" ]]; then
+    if ! command -v aplay >/dev/null 2>&1; then
+        echo "aplay not found on PATH; install alsa-utils or pass --card <NAME>" >&2
+        exit 1
+    fi
+    # `aplay -l` prints lines like:
+    #   card 0: I82801AAICH [Intel 82801AA-ICH], device 0: Intel ICH [Intel 82801AA-ICH]
+    # The card NAME (kernel-stable, hot-plug-stable) sits
+    # between `card N: ` and the next `[`. Prefer non-HDMI
+    # cards (external DAC / USB / on-board analog) over HDMI
+    # outputs — Pi-class boards enumerate HDMI before the
+    # attached DAC, and the operator's intent for a music
+    # appliance is the DAC, not the display's speakers.
+    # Operators with HDMI-as-intended-output (e.g. AVR via
+    # HDMI) override with --card.
+    AUDIO_CARD="$(aplay -l 2>/dev/null | awk -F'[: ]+' '
+        /^card [0-9]+/ {
+            name = $3
+            if (name !~ /^vc4hdmi/ && name !~ /HDMI/i) {
+                print name
+                exit
+            }
+        }
+    ')"
+    # Fall back to the first card when only HDMI cards are
+    # available (HDMI display with speakers is a valid music
+    # appliance target).
+    if [[ -z "$AUDIO_CARD" ]]; then
+        AUDIO_CARD="$(aplay -l 2>/dev/null \
+            | awk -F'[: ]+' '/^card [0-9]+/ { print $3; exit }')"
+    fi
+    if [[ -z "$AUDIO_CARD" ]]; then
+        echo "no ALSA playback card detected via aplay -l; pass --card <NAME> to override" >&2
+        echo "  (current aplay -l output:)" >&2
+        aplay -l 2>&1 | sed 's/^/  /' >&2
+        exit 2
+    fi
+    echo "[bootstrap] detected ALSA playback card: $AUDIO_CARD"
+else
+    echo "[bootstrap] ALSA playback card (operator override): $AUDIO_CARD"
+fi
 
 # ----------------------------------------------------------
 # Step 1: /etc/sudoers.d/evo-mpd-restart (narrow NOPASSWD)
@@ -333,6 +399,60 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 3.7: inject `include "/etc/evo/mpd.conf"` into the
+# distro's /etc/mpd.conf so MPD reads the audio_output block
+# the audio reference distribution ships at $MPD_FRAGMENT_PATH.
+#
+# Why this step exists: Debian's mpd package writes
+# /etc/mpd.conf at install with NO audio_output block; MPD's
+# auto-detection then picks the first plugin that probes
+# successfully (often `sndio` on Debian — a plugin that
+# claims to detect a device even when the sndio daemon is
+# absent, causing playback to fail at first play). Injecting
+# the include wires MPD to the audio dist's own
+# audio_output block, eliminating the auto-detect race.
+#
+# Idempotent: a sentinel-delimited block marks the injection
+# so re-running replaces the block in place rather than
+# stacking duplicates. Operators that prefer the
+# MPDCONF=/etc/evo/mpd.conf shape (set in /etc/default/mpd)
+# disable this step via EVO_INSTALL_MPD_INCLUDE=0 and manage
+# the merge externally.
+# ----------------------------------------------------------
+if [[ "${EVO_INSTALL_MPD_INCLUDE:-1}" != "0" ]]; then
+    if [[ ! -f "$MPD_CONF_PATH" ]]; then
+        echo "  [skip]  $MPD_CONF_PATH absent — install mpd package or set EVO_INSTALL_MPD_INCLUDE=0" >&2
+    else
+        SENTINEL_BEGIN="# >>> evo-device-audio (bootstrap.sh) — DO NOT EDIT >>>"
+        SENTINEL_END="# <<< evo-device-audio (bootstrap.sh) — DO NOT EDIT <<<"
+        # Strip any prior block (idempotent re-run).
+        TMP_MPD="$(mktemp)"
+        trap 'rm -f "$TMP_MPD"' EXIT
+        awk -v b="$SENTINEL_BEGIN" -v e="$SENTINEL_END" '
+            $0 == b { in_block = 1; next }
+            $0 == e { in_block = 0; next }
+            !in_block { print }
+        ' "$MPD_CONF_PATH" > "$TMP_MPD"
+        # Append the fresh sentinel-delimited include block.
+        {
+            cat "$TMP_MPD"
+            echo
+            echo "$SENTINEL_BEGIN"
+            echo "include \"$MPD_FRAGMENT_PATH\""
+            echo "$SENTINEL_END"
+        } > "$TMP_MPD.new"
+        # Preserve original owner/mode; the file is root-owned
+        # mode 0644 on Debian.
+        install -m 0644 -o root -g root "$TMP_MPD.new" "$MPD_CONF_PATH"
+        rm -f "$TMP_MPD" "$TMP_MPD.new"
+        trap - EXIT
+        echo "[bootstrap] injected include \"$MPD_FRAGMENT_PATH\" into $MPD_CONF_PATH"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_MPD_INCLUDE=0 — skipping mpd.conf include injection"
+fi
+
+# ----------------------------------------------------------
 # Step 4: /etc/asound.conf — modular ALSA pipeline (pcm.evo)
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
@@ -341,18 +461,30 @@ if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
         echo "asound template not found at $ASOUND_TEMPLATE" >&2
         exit 2
     fi
+    # Render the template, substituting @EVO_AUDIO_CARD@ with
+    # the operator's (or auto-detected) card name. The template
+    # ships the placeholder so the bootstrap is the single
+    # authoritative point of substitution; vendor distributions
+    # that re-template differently swap out this step.
+    ASOUND_RENDERED="$(mktemp)"
+    trap 'rm -f "$ASOUND_RENDERED"' EXIT
+    sed -e "s|@EVO_AUDIO_CARD@|$AUDIO_CARD|g" \
+        "$ASOUND_TEMPLATE" > "$ASOUND_RENDERED"
     # If an existing /etc/asound.conf is present with different
-    # contents, back it up first so the operator never loses
+    # contents (compared against the rendered form, not the
+    # template), back it up first so the operator never loses
     # state silently. Idempotent: re-running after a clean
     # install does not stack backups.
     if [[ -f "$ASOUND_CONF_PATH" ]] && \
-       ! cmp -s "$ASOUND_TEMPLATE" "$ASOUND_CONF_PATH"; then
+       ! cmp -s "$ASOUND_RENDERED" "$ASOUND_CONF_PATH"; then
         backup="$ASOUND_CONF_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
         cp -a "$ASOUND_CONF_PATH" "$backup"
         echo "[bootstrap] backed up prior $ASOUND_CONF_PATH to $backup"
     fi
-    install -m 0644 -o root -g root "$ASOUND_TEMPLATE" "$ASOUND_CONF_PATH"
-    echo "[bootstrap] installed $ASOUND_CONF_PATH"
+    install -m 0644 -o root -g root "$ASOUND_RENDERED" "$ASOUND_CONF_PATH"
+    rm -f "$ASOUND_RENDERED"
+    trap - EXIT
+    echo "[bootstrap] installed $ASOUND_CONF_PATH (card=$AUDIO_CARD)"
     # ALSA reads /etc/asound.conf at every PCM open, so no
     # daemon reload is needed for ALSA itself. MPD caches the
     # asound state at startup though, so bounce it to pick up
@@ -410,6 +542,47 @@ if [[ -f /etc/evo/client_acl.toml ]]; then
     echo "  [ok]    /etc/evo/client_acl.toml installed (plans_admin + plugins_admin + reconciliation_admin granted to matching-UID local peers)"
 else
     echo "  [WARN]  /etc/evo/client_acl.toml absent — operator wire-ops (evo-plugin-tool plan / admin) will be refused until installed"
+fi
+
+# Audio chain probe: confirm the rendered `ctl.evo` opens
+# against the detected/operator-selected card via amixer.
+# The control interface is the cheap probe — it opens the
+# card's mixer (mirroring the path mpd's hardware mixer
+# walks) without acquiring the playback PCM (which mpd may
+# already hold post-restart). Failure here is the exact
+# class of break the operator otherwise discovers later via
+# mpd's `default detected output (sndio)` cascade — a
+# misconfigured card name surfaces as an amixer open error.
+if command -v amixer >/dev/null 2>&1; then
+    PROBE_OUT=""
+    if PROBE_OUT="$(amixer -D evo info 2>&1)"; then
+        echo "  [ok]    ctl.evo opens against card '$AUDIO_CARD' (amixer probe)"
+    else
+        echo "  [WARN]  ctl.evo failed to open against card '$AUDIO_CARD'"
+        echo "          (review $ASOUND_CONF_PATH; verify card name matches \`aplay -l\`)"
+        echo "$PROBE_OUT" | head -5 | sed 's/^/          /'
+    fi
+else
+    echo "  [skip]  amixer not available — ctl.evo probe skipped"
+fi
+
+# MPD audio_output probe: after the include + asound.conf are
+# in place, mpd's `outputs` listing must show the
+# evo-device-audio output (proves /etc/evo/mpd.conf's
+# audio_output block is actually being read). Probe only when
+# mpd is running; the asound.conf install step bounces mpd so
+# this typically reads the freshly-loaded config.
+if command -v mpc >/dev/null 2>&1 \
+   && "$SYSTEMCTL_BIN" is-active mpd.service >/dev/null 2>&1; then
+    if mpc outputs 2>/dev/null \
+            | grep -q "evo-device-audio"; then
+        echo "  [ok]    mpd reads $MPD_FRAGMENT_PATH (output 'evo-device-audio' listed)"
+    else
+        echo "  [WARN]  mpd does not list output 'evo-device-audio'"
+        echo "          (verify $MPD_CONF_PATH includes $MPD_FRAGMENT_PATH; check 'mpc outputs')"
+    fi
+else
+    echo "  [skip]  mpc/mpd not active — audio_output probe skipped"
 fi
 
 echo
