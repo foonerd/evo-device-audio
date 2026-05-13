@@ -10,6 +10,7 @@ members = [
     "plugins/org.evoframework.delivery.alsa",
     "plugins/org.evoframework.playback.options",
     "plugins/org.evoframework.network",
+    "plugins/org.evoframework.multiroom.evo-native",
 ]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching

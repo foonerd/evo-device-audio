@@ -33,6 +33,7 @@ org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delive
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
 org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
 org-evoframework-network = { path = "../../plugins/org.evoframework.network" }
+org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.
