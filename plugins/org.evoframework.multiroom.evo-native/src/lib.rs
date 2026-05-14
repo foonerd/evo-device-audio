@@ -475,8 +475,7 @@ impl Plugin for MultiroomEvoNativePlugin {
                             // records (one record per (sequence,
                             // receiver) tuple); operator-tunable
                             // via plugin config in a future commit.
-                            let trace_state =
-                                Arc::new(TraceState::new(100));
+                            let trace_state = Arc::new(TraceState::new(100));
                             self.trace_state = Some(Arc::clone(&trace_state));
                             let task_trace_state =
                                 Some(Arc::clone(&trace_state));
@@ -522,6 +521,56 @@ impl Plugin for MultiroomEvoNativePlugin {
                             group_id = %self.config.group_id.as_deref().unwrap_or(""),
                             source_pcm = %source_pcm,
                             "source role engaged: ALSA capture fan-out running"
+                        );
+                    }
+                    // One-renderer-pipeline: when the source
+                    // role is configured with an alsa_pcm
+                    // (the source-local DAC target), ALSO
+                    // spawn the receiver task. The framework
+                    // self-loopbacks source frames onto
+                    // `audio_frame_tx` with from_device_id =
+                    // local_id; the receiver task subscribed
+                    // here renders them through the same
+                    // scheduler the remote receivers use, so
+                    // source-local DAC + every remote
+                    // receiver share one render path. The
+                    // MPD config that feeds snd-aloop should
+                    // narrow to a single audio_output
+                    // (evo-aloop only); the source-local DAC
+                    // is no longer driven by a parallel MPD
+                    // audio_output but by this receiver task
+                    // reading the same scheduled frames.
+                    if !self.config.alsa_pcm.is_empty() {
+                        let counter = Arc::clone(&self.frames_received);
+                        let recv_shutdown = Arc::clone(&self.shutdown);
+                        let recv_handle = Arc::clone(&audio_plane);
+                        let alsa_pcm = self.config.alsa_pcm.clone();
+                        let role = self.config.role;
+                        let leader_ms = Arc::clone(&self.leader_ms);
+                        let underruns = Arc::clone(&self.receiver_underruns);
+                        let queue_depth =
+                            Arc::clone(&self.receiver_queue_depth);
+                        let task = tokio::spawn(async move {
+                            run_receiver_task(
+                                recv_handle,
+                                counter,
+                                recv_shutdown,
+                                alsa_pcm,
+                                role,
+                                leader_ms,
+                                underruns,
+                                queue_depth,
+                            )
+                            .await;
+                        });
+                        self.receiver_task = Some(task);
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            alsa_pcm = %self.config.alsa_pcm,
+                            leader_ms = self.config.leader_ms,
+                            "source-local DAC receiver-task engaged: \
+                             one-renderer-pipeline (source frames \
+                             self-loopback onto the local broadcast)"
                         );
                     }
                 }
@@ -852,8 +901,7 @@ async fn run_source_capture_task(
     // capture-thread's timestamps reference the same epoch
     // every other audible-time-trace observation on this
     // node uses (the framework runtime's epoch).
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<CaptureChunk>(32);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<CaptureChunk>(32);
 
     let capture_shutdown = Arc::clone(&shutdown);
     let capture_pcm = source_pcm.clone();
@@ -1239,19 +1287,26 @@ async fn try_complete_record(
     trace_state: Option<&TraceState>,
 ) {
     let Some(state) = trace_state else { return };
-    let Some(rec_partial) = recipient_pending.get(key) else { return };
-    let (Some(wire_send_ns),
-         Some(wire_recv_ns),
-         Some(scheduler_dequeue_ns),
-         Some(writei_return_ns)) = (
+    let Some(rec_partial) = recipient_pending.get(key) else {
+        return;
+    };
+    let (
+        Some(wire_send_ns),
+        Some(wire_recv_ns),
+        Some(scheduler_dequeue_ns),
+        Some(writei_return_ns),
+    ) = (
         rec_partial.wire_send_ns,
         rec_partial.wire_recv_ns,
         rec_partial.scheduler_dequeue_ns,
         rec_partial.writei_return_ns,
-    ) else {
+    )
+    else {
         return;
     };
-    let Some(src_partial) = source_pending.get(&key.0) else { return };
+    let Some(src_partial) = source_pending.get(&key.0) else {
+        return;
+    };
     let record = FrameTraceRecord {
         sequence: key.0,
         receiver_device_id: key.1.clone(),
@@ -1627,7 +1682,7 @@ async fn run_receiver_task(
         std::collections::HashSet::new();
 
     #[cfg(feature = "alsa-substrate")]
-    let mut alsa_render = if role == Role::Receiver {
+    let mut alsa_render = if !alsa_pcm.is_empty() {
         match AlsaRender::open(&alsa_pcm) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -1644,8 +1699,6 @@ async fn run_receiver_task(
     } else {
         None
     };
-    // role consumed only behind the cfg gate; silence the
-    // unused warning on builds without the feature.
     let _ = role;
     let _ = alsa_pcm;
 
