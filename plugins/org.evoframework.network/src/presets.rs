@@ -337,9 +337,8 @@ fn add_polling(
         let ceiling = crate::adaptive_tick::DEFAULT_TICK_MAX.as_millis() as u64;
         interval_ms.max(ceiling)
     };
-    let polling = crate::source::polling::PollingEventSource::new(
-        effective_interval_ms,
-    );
+    let polling =
+        crate::source::polling::PollingEventSource::new(effective_interval_ms);
     sources.push(Box::new(polling));
     outcomes.push(CandidateOutcome {
         name: "polling",

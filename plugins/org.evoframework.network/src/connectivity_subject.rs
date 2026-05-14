@@ -176,8 +176,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let s =
-            NetworkConnectivityState::from_supervisor_view(&view, ConnectivitySource::Rtnetlink);
+        let s = NetworkConnectivityState::from_supervisor_view(
+            &view,
+            ConnectivitySource::Rtnetlink,
+        );
         assert!(s.carrier);
         assert!(s.interface_up);
         assert_eq!(s.internet_reachable, Some(true));
@@ -191,8 +193,10 @@ mod tests {
             last_observations: SupervisorObservations::default(),
             ..Default::default()
         };
-        let s =
-            NetworkConnectivityState::from_supervisor_view(&view, ConnectivitySource::Polling);
+        let s = NetworkConnectivityState::from_supervisor_view(
+            &view,
+            ConnectivitySource::Polling,
+        );
         assert!(!s.carrier);
         assert_eq!(s.internet_reachable, Some(false));
     }
