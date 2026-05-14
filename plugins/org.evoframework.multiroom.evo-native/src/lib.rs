@@ -1327,14 +1327,17 @@ async fn try_complete_record(
         // it manually from the sync-probe wire-op until then.
         clock_offset_ns: 0,
     };
-    // Emit a compact one-line trace alongside the rolling-
-    // window push. The wire-op `audio.multiroom.frame_trace.
-    // snapshot` is the canonical operator surface for this
-    // data; the journal echo here lets the first-measurement
-    // audit extract the trace without an operator CLI for
-    // the wire-op (the snapshot wire-op + subject are still
-    // the surface every other consumer reads through).
-    tracing::info!(
+    // High-frequency per-frame trace surface. Canonical
+    // operator path is the `audio.multiroom.frame_trace`
+    // published subject + the `audio.multiroom.frame_trace.
+    // snapshot` wire-op (operator CLI: `evo-plugin-tool
+    // admin group frame-trace`). This `trace!` exists as an
+    // opt-in debugging surface only, enabled by
+    // `RUST_LOG=org_evoframework_multiroom_evo_native=trace`;
+    // it must NOT fire at default log levels because at
+    // 50 fps × N receivers it would flood the journal and
+    // contend with the realtime audio runtime.
+    tracing::trace!(
         plugin = PLUGIN_NAME,
         seq = record.sequence,
         recv = %record.receiver_device_id,
