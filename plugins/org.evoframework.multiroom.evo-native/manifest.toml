@@ -61,5 +61,6 @@ subscribe_subjects = true
 request_types = [
     "multiroom.get_status",
     "multiroom.set_leader_ms",
+    "audio.multiroom.frame_trace.snapshot",
 ]
 response_budget_ms = 1000
