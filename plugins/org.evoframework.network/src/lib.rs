@@ -31,6 +31,7 @@
 #![allow(clippy::manual_async_fn)]
 
 pub mod adaptive_tick;
+pub mod connectivity_subject;
 pub mod health;
 pub mod nmcli_dispatch;
 pub mod presets;
@@ -59,9 +60,9 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use evo_plugin_sdk::contract::{
-    BuildInfo, HappeningEmitter, HealthReport, LoadContext, Plugin,
-    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
+    Plugin, PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities, SubjectAnnouncement, SubjectAnnouncer,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,15 @@ const REQUEST_NETWORK_RADIO_STATUS: &str = "network.nm.radio.status";
 const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
 const REQUEST_NETWORK_SUPERVISOR_STATUS: &str = "network.nm.supervisor.status";
 const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
+/// Read-side wire-op (no admin scope). Returns the freshly-
+/// published `networking.link.connectivity` subject value. When
+/// the plugin's `probe_kind` is `off` (the default), the
+/// response carries the supervisor's non-HTTP-derived view
+/// without performing any HTTP I/O; when `probe_kind` is set,
+/// the response carries the latest classification — a future
+/// chunk can wire this to inject a fresh probe trigger into the
+/// supervisor's event channel.
+const REQUEST_NETWORK_REFRESH_CONNECTIVITY: &str = "network.refresh_connectivity";
 
 /// Reactive-event names emitted on `Happening::PluginEvent`. The
 /// network plugin's taxonomy lives under `network.*` so cross-
@@ -1137,6 +1147,12 @@ pub struct NmInner {
     // probes are GETs on public endpoints that need no elevation. A
     // future captive-portal credential-submission flow will declare
     // its own elevation-justified capability intent.
+    /// Framework subject announcer; populated at load. Used to
+    /// announce + update the `networking.link.connectivity`
+    /// subject so consumers (UI, online-metadata plugins,
+    /// share-mount controllers, operator wire-ops) read the
+    /// current verdict instead of grepping happenings / journal.
+    pub(crate) subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
     /// Runtime mirror of `PluginConfig.require_encrypted_secrets`,
     /// promoted to interior-mutable so the `network.nm.security.harden`
     /// verb can flip it without rebuilding the whole `NmInner`.
@@ -1221,6 +1237,7 @@ impl NmInner {
             auto_dispatcher: None,
             iw_exec: None,
             rfkill_exec: None,
+            subject_announcer: None,
             require_encrypted_secrets,
             loaded: std::sync::atomic::AtomicBool::new(false),
             wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -3375,6 +3392,102 @@ impl NmInner {
     /// every operator-visible state change publishes onto the
     /// framework bus alongside the existing `tokio::sync::watch`
     /// channel that wire-op handlers read.
+    /// External addressing of the published
+    /// `networking.link.connectivity` subject. Consumers resolve
+    /// this against the framework's subject querier to find the
+    /// canonical id they subscribe to.
+    fn connectivity_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: connectivity_subject::CONNECTIVITY_SCHEME.to_string(),
+            value: connectivity_subject::CONNECTIVITY_VALUE.to_string(),
+        }
+    }
+
+    /// Announce the connectivity subject at load time with the
+    /// boot-default state (`source = Boot`). Idempotent on
+    /// re-announce — the framework's registry treats this as
+    /// `Updated` against the existing canonical id, preserving
+    /// the addressing. Announce failures are logged at warn but
+    /// do not fail plugin load.
+    pub(crate) async fn announce_connectivity_subject(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        let initial = connectivity_subject::NetworkConnectivityState::default();
+        let state = match serde_json::to_value(&initial) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to serialise initial connectivity subject state"
+                );
+                return;
+            }
+        };
+        let announcement = SubjectAnnouncement {
+            subject_type: connectivity_subject::CONNECTIVITY_SUBJECT_TYPE
+                .to_string(),
+            addressings: vec![Self::connectivity_addressing()],
+            claims: Vec::new(),
+            state,
+            announced_at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = announcer.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "announce connectivity subject failed"
+            );
+        } else {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                scheme = connectivity_subject::CONNECTIVITY_SCHEME,
+                value = connectivity_subject::CONNECTIVITY_VALUE,
+                "networking.link.connectivity subject announced"
+            );
+        }
+    }
+
+    /// Publish a fresh connectivity-subject state derived from
+    /// the supervisor's current view. Called on every supervisor
+    /// transition (the supervisor-emitter task). Best-effort —
+    /// announce failures are logged at warn but do not propagate.
+    pub(crate) async fn publish_connectivity_state(
+        &self,
+        view: &supervisor::SupervisorView,
+        source: connectivity_subject::ConnectivitySource,
+    ) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        let snapshot =
+            connectivity_subject::NetworkConnectivityState::from_supervisor_view(
+                view, source,
+            );
+        let state = match serde_json::to_value(&snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to serialise connectivity subject state"
+                );
+                return;
+            }
+        };
+        if let Err(e) = announcer
+            .update_state(Self::connectivity_addressing(), state)
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "update connectivity subject state failed"
+            );
+        }
+    }
+
     pub(crate) async fn emit_supervisor_transition(
         &self,
         prev: &supervisor::SupervisorView,
@@ -3432,6 +3545,23 @@ impl NmInner {
             )
             .await;
         }
+        // Publish the connectivity subject on every supervisor
+        // transition so subject-state consumers (UI, online-
+        // metadata plugins, share-mount controllers) read the
+        // current verdict without subscribing to the happenings
+        // stream. Source is reported as `Rtnetlink` here because
+        // the supervisor-emitter loop only fires when a
+        // SupervisorView change has been observed, and the
+        // observation upstream of that change came from one of
+        // the admitted sources (rtnetlink in the absence of NM
+        // D-Bus). When the supervisor wires source-attribution
+        // into the view itself, this call site reads it from the
+        // view instead of defaulting to `Rtnetlink`.
+        self.publish_connectivity_state(
+            next,
+            connectivity_subject::ConnectivitySource::Rtnetlink,
+        )
+        .await;
     }
 
     /// Autonomous critical-recovery action invoked by the
@@ -4048,6 +4178,7 @@ impl Plugin for NetworkPlugin {
                         REQUEST_NETWORK_RADIO_SET.to_string(),
                         REQUEST_NETWORK_SUPERVISOR_STATUS.to_string(),
                         REQUEST_NETWORK_WIFI_DEVICES.to_string(),
+                        REQUEST_NETWORK_REFRESH_CONNECTIVITY.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -4124,6 +4255,7 @@ impl Plugin for NetworkPlugin {
                 auto_dispatcher: Some(nmcli_auto.clone()),
                 iw_exec: Some(iw_auto.clone()),
                 rfkill_exec: Some(rfkill_auto.clone()),
+                subject_announcer: Some(Arc::clone(&ctx.subject_announcer)),
                 require_encrypted_secrets,
                 happening_emitter: Some(ctx.happening_emitter.clone()),
                 loaded: std::sync::atomic::AtomicBool::new(false),
@@ -4163,6 +4295,12 @@ impl Plugin for NetworkPlugin {
             if let Some(rx) = self.supervisor_view_rx.clone() {
                 self.spawn_supervisor_emitter(rx);
             }
+            // Announce the connectivity subject so consumers can
+            // resolve its canonical id + subscribe to state
+            // changes via the framework's SubjectStateSubscriber.
+            // Best-effort: announce failures log at warn level
+            // and do not fail the plugin load.
+            self.inner.announce_connectivity_subject().await;
             self.loaded.store(true, Relaxed);
             self.scan_cache.lock().await.clear();
             tracing::info!(
@@ -4872,6 +5010,37 @@ impl Respondent for NetworkPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "radios": radios,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_REFRESH_CONNECTIVITY => {
+                    let view = self.latest_supervisor_view();
+                    let snapshot = connectivity_subject::NetworkConnectivityState::from_supervisor_view(
+                        &view,
+                        connectivity_subject::ConnectivitySource::OnDemand,
+                    );
+                    // Republish the snapshot so any active
+                    // subject subscribers see the on-demand
+                    // update too. The source field on the
+                    // subject differs from the
+                    // supervisor-emitter path's default
+                    // `Rtnetlink` value, letting subscribers
+                    // distinguish event-driven updates from
+                    // operator-triggered refreshes.
+                    self.publish_connectivity_state(
+                        &view,
+                        connectivity_subject::ConnectivitySource::OnDemand,
+                    )
+                    .await;
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "connectivity": snapshot,
                             }),
                         ),
                     )
