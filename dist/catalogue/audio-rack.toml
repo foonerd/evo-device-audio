@@ -141,6 +141,19 @@ name = "album"
 [[subjects]]
 name = "audio_options_settings"
 
+# Subject type the network plugin announces as the read-able
+# surface for the device's connectivity verdict. Consumers
+# (UI, online-metadata plugins, share-mount controllers,
+# operator wire-ops) resolve the canonical id by querying
+# the subject querier with addressing
+# `evo.networking.link:connectivity` and subscribe to state
+# changes via the framework's SubjectStateSubscriber. The
+# field set mirrors the schema declaration in the
+# catalogue-schemas repo under
+# `schemas/org.evoframework/networking/link.v1.toml`.
+[[subjects]]
+name = "network_connectivity_state"
+
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from
 # the playing track to its album on every song change;

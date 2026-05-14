@@ -314,7 +314,32 @@ fn add_polling(
     outcomes: &mut Vec<CandidateOutcome>,
     interval_ms: u64,
 ) {
-    let polling = crate::source::polling::PollingEventSource::new(interval_ms);
+    // Adaptive-tick at admission: when other event sources have
+    // already admitted, the polling source is a cold-start
+    // fallback whose cadence rides the adaptive-tick ceiling
+    // (`DEFAULT_TICK_MAX`, 5 min). When polling is the sole
+    // source, it ticks at the operator-configured / preset-
+    // default interval (typically the adaptive-tick floor of
+    // `DEFAULT_TICK_MIN` = 60 s) so the supervisor still gets
+    // periodic state updates on hosts where no kernel / D-Bus
+    // event source admitted.
+    //
+    // Per-event re-adaptation (recomputing the interval as
+    // sources admit + go healthy) wires through a
+    // `tokio::sync::watch::Receiver<Duration>` between the
+    // supervisor and the polling source; today the supervisor's
+    // cold-start-window filter on the receive side already drops
+    // every polling tick fired while event sources are healthy,
+    // so the at-admission choice is the practical decision.
+    let effective_interval_ms = if sources.is_empty() {
+        interval_ms
+    } else {
+        let ceiling = crate::adaptive_tick::DEFAULT_TICK_MAX.as_millis() as u64;
+        interval_ms.max(ceiling)
+    };
+    let polling = crate::source::polling::PollingEventSource::new(
+        effective_interval_ms,
+    );
     sources.push(Box::new(polling));
     outcomes.push(CandidateOutcome {
         name: "polling",

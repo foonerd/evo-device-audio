@@ -53,5 +53,6 @@ request_types = [
     "network.nm.radio.set",
     "network.nm.supervisor.status",
     "network.nm.wifi_devices",
+    "network.refresh_connectivity",
 ]
 response_budget_ms = 15000
