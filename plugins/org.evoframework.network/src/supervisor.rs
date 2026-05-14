@@ -209,19 +209,20 @@ impl SupervisorConfig {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .filter(|v| *v >= 1000)
                 .unwrap_or(15_000);
-        let probe_kind = match std::env::var("EVO_NETWORK_SUPERVISOR_PROBE_KIND")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
-            Some("https_self_hosted") => ProbeKind::HttpsSelfHosted,
-            Some("captive_portal_detection") => {
-                ProbeKind::CaptivePortalDetection
-            }
-            // Anything else, including unset, empty, or "off",
-            // resolves to Off — the secure default per the connectivity-check redesign.
-            _ => ProbeKind::Off,
-        };
+        let probe_kind =
+            match std::env::var("EVO_NETWORK_SUPERVISOR_PROBE_KIND")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("https_self_hosted") => ProbeKind::HttpsSelfHosted,
+                Some("captive_portal_detection") => {
+                    ProbeKind::CaptivePortalDetection
+                }
+                // Anything else, including unset, empty, or "off",
+                // resolves to Off — the secure default per the connectivity-check redesign.
+                _ => ProbeKind::Off,
+            };
         let probe_url = std::env::var("EVO_NETWORK_SUPERVISOR_PROBE_URL")
             .ok()
             .map(|v| v.trim().to_string())

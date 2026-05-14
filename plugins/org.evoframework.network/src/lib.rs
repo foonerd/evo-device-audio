@@ -61,8 +61,9 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
-    Plugin, PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, SubjectAnnouncement, SubjectAnnouncer,
+    Plugin, PluginDescription, PluginError, PluginIdentity, Request,
+    Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
+    SubjectAnnouncer,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -106,7 +107,8 @@ const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
 /// the response carries the latest classification — a future
 /// chunk can wire this to inject a fresh probe trigger into the
 /// supervisor's event channel.
-const REQUEST_NETWORK_REFRESH_CONNECTIVITY: &str = "network.refresh_connectivity";
+const REQUEST_NETWORK_REFRESH_CONNECTIVITY: &str =
+    "network.refresh_connectivity";
 
 /// Reactive-event names emitted on `Happening::PluginEvent`. The
 /// network plugin's taxonomy lives under `network.*` so cross-
@@ -4227,11 +4229,9 @@ impl Plugin for NetworkPlugin {
             ));
             // `curl_auto` retired per the connectivity-check redesign — direct exec, no PPAG
             // strategy resolution for routine connectivity probes.
-            for auto in [
-                nmcli_auto.as_ref(),
-                iw_auto.as_ref(),
-                rfkill_auto.as_ref(),
-            ] {
+            for auto in
+                [nmcli_auto.as_ref(), iw_auto.as_ref(), rfkill_auto.as_ref()]
+            {
                 tracing::info!(
                     plugin = PLUGIN_NAME,
                     intent = auto.intent_id(),
@@ -5511,11 +5511,11 @@ async fn probe_connectivity_url(
         Ok(c) => c,
         Err(_) => return (None, None),
     };
-    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await
-    {
-        Ok(Ok(out)) => out,
-        Ok(Err(_)) | Err(_) => return (None, None),
-    };
+    let out =
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(_)) | Err(_) => return (None, None),
+        };
     if !out.status.success() {
         return (None, None);
     }
