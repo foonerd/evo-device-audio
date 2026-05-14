@@ -111,8 +111,11 @@ const PAYLOAD_VERSION: u32 = 1;
 /// Request types this plugin honours. Mirrors
 /// `manifest.toml`'s `[capabilities.respondent].request_types`;
 /// admission would refuse a mismatch.
-const REQUEST_TYPES: &[&str] =
-    &["multiroom.get_status", "multiroom.set_leader_ms"];
+const REQUEST_TYPES: &[&str] = &[
+    "multiroom.get_status",
+    "multiroom.set_leader_ms",
+    "audio.multiroom.frame_trace.snapshot",
+];
 
 /// Lower bound for operator-set `leader_ms`. Below this the
 /// network-jitter budget collapses and the receiver underruns
@@ -303,6 +306,12 @@ pub struct MultiroomEvoNativePlugin {
     /// Snapshot for `multiroom.get_status`; updated by the
     /// receiver scheduler each tick.
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    /// Source-host audible-time trace aggregator state.
+    /// Populated when the plugin loads in source role; the
+    /// wire-op `audio.multiroom.frame_trace.snapshot` reads
+    /// from here; the source-capture task writes through.
+    #[cfg(feature = "alsa-substrate")]
+    trace_state: Option<Arc<TraceState>>,
 }
 
 impl MultiroomEvoNativePlugin {
@@ -324,6 +333,8 @@ impl MultiroomEvoNativePlugin {
             receiver_queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            #[cfg(feature = "alsa-substrate")]
+            trace_state: None,
         }
     }
 
@@ -458,9 +469,25 @@ impl Plugin for MultiroomEvoNativePlugin {
                         #[cfg(feature = "alsa-substrate")]
                         {
                             let pcm = source_pcm.clone();
+                            // Construct the audible-time trace
+                            // aggregator state for this source-
+                            // role admission. Window size 100
+                            // records (one record per (sequence,
+                            // receiver) tuple); operator-tunable
+                            // via plugin config in a future commit.
+                            let trace_state =
+                                Arc::new(TraceState::new(100));
+                            self.trace_state = Some(Arc::clone(&trace_state));
+                            let task_trace_state =
+                                Some(Arc::clone(&trace_state));
                             tokio::spawn(async move {
                                 run_source_capture_task(
-                                    handle, group_id, sent, shutdown, pcm,
+                                    handle,
+                                    group_id,
+                                    sent,
+                                    shutdown,
+                                    pcm,
+                                    task_trace_state,
                                 )
                                 .await;
                             })
@@ -656,6 +683,34 @@ impl Respondent for MultiroomEvoNativePlugin {
                     })?;
                     Ok(Response::for_request(req, body))
                 }
+                "audio.multiroom.frame_trace.snapshot" => {
+                    #[cfg(feature = "alsa-substrate")]
+                    let (records, window_size) = match &self.trace_state {
+                        Some(state) => (state.snapshot(), state.window_size),
+                        None => (Vec::new(), 0),
+                    };
+                    #[cfg(not(feature = "alsa-substrate"))]
+                    let (records, window_size): (
+                        Vec<serde_json::Value>,
+                        usize,
+                    ) = (Vec::new(), 0);
+                    let payload = serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "group_id": self.config.group_id,
+                        "window_size": window_size,
+                        "records": records,
+                        "last_update_at_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0),
+                    });
+                    let body = serde_json::to_vec(&payload).map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "encode frame_trace.snapshot response: {e}"
+                        ))
+                    })?;
+                    Ok(Response::for_request(req, body))
+                }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired"
                 ))),
@@ -779,6 +834,7 @@ async fn run_source_capture_task(
     sent: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
     source_pcm: String,
+    trace_state: Option<Arc<TraceState>>,
 ) {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -786,14 +842,31 @@ async fn run_source_capture_task(
     // Capacity covers ~0.5 s of frames; if we fall further
     // behind than that the loopback playback half is corrupt
     // already.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    // Channel item carries the captured chunk + the source-
+    // side audible-time-trace stage timestamps the capture
+    // thread observed at its own call sites: stage 3a is
+    // the moment `io.readi` returned with this chunk's
+    // samples; stage 3b is the moment immediately before
+    // `tx.send` queues the chunk onto this channel. Both
+    // are computed via `audio_plane.monotonic_ns()` so the
+    // capture-thread's timestamps reference the same epoch
+    // every other audible-time-trace observation on this
+    // node uses (the framework runtime's epoch).
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<CaptureChunk>(32);
 
     let capture_shutdown = Arc::clone(&shutdown);
     let capture_pcm = source_pcm.clone();
+    let capture_audio_plane = Arc::clone(&audio_plane);
     let capture_thread = std::thread::Builder::new()
         .name("multiroom-capture".into())
         .spawn(move || {
-            run_capture_thread(capture_pcm, tx, capture_shutdown);
+            run_capture_thread(
+                capture_pcm,
+                tx,
+                capture_shutdown,
+                capture_audio_plane,
+            );
         });
     let capture_thread = match capture_thread {
         Ok(h) => h,
@@ -810,6 +883,64 @@ async fn run_source_capture_task(
     let mut sequence: u64 = 0;
     let start_monotonic = std::time::Instant::now();
 
+    // Audible-time trace state. The source task captures
+    // stages 3a / 3b (via the CaptureChunk it receives), 4a /
+    // 4b / 5a (locally), then subscribes to the framework's
+    // FrameSendEvent broadcast to refine stage 5a per
+    // recipient + the FrameTraceReport broadcast to complete
+    // each (sequence, receiver) record with stages 5b / 6 /
+    // 7. Completed records land in the shared TraceState's
+    // rolling window — the wire-op `audio.multiroom.frame_
+    // trace.snapshot` reads from there. The state Arc is
+    // injected via `trace_state`; when `None` (e.g. unit
+    // tests bypassing the aggregator wire-up) the per-frame
+    // accounting is skipped without affecting fan-out.
+    use std::collections::HashMap;
+
+    let mut source_pending: HashMap<u64, SourceTracePartial> = HashMap::new();
+    let mut recipient_pending: HashMap<(u64, String), RecipientTracePartial> =
+        HashMap::new();
+
+    let mut frame_send_rx = if trace_state.is_some() {
+        match audio_plane.subscribe_frame_send_events().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "subscribe_frame_send_events failed; trace records \
+                     will omit stage 5a (wire_send_ns)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut frame_trace_rx = if trace_state.is_some() {
+        match audio_plane.subscribe_frame_trace_reports().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "subscribe_frame_trace_reports failed; trace records \
+                     will be source-only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Bounded eviction: at most TRACE_PENDING_MAX entries in
+    // each pending map; oldest sequence drops first when an
+    // entry is inserted past the bound. Keeps memory + Map
+    // ops constant-time regardless of how long the source
+    // role runs.
+    const TRACE_PENDING_MAX: usize = 256;
+
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
@@ -820,8 +951,12 @@ async fn run_source_capture_task(
                 break;
             }
             chunk = rx.recv() => {
-                let pcm = match chunk {
-                    Some(p) => p,
+                let CaptureChunk {
+                    capture_readi_return_ns,
+                    mpsc_send_ns,
+                    pcm,
+                } = match chunk {
+                    Some(c) => c,
                     None => {
                         tracing::debug!(
                             plugin = PLUGIN_NAME,
@@ -830,6 +965,9 @@ async fn run_source_capture_task(
                         break;
                     }
                 };
+                // Audible-time trace stage 4a: `rx.recv`
+                // returned with the chunk.
+                let mpsc_recv_ns = audio_plane.monotonic_ns();
                 // PTS = source-local monotonic time at this
                 // frame's emission. See run_source_tone_generator
                 // for the bit-perfect contract — `elapsed`
@@ -844,6 +982,9 @@ async fn run_source_capture_task(
                     channels: BASELINE_CHANNELS,
                     payload_b64: B64.encode(&pcm),
                 };
+                // Audible-time trace stage 4b: immediately
+                // before invoking `fan_out_audio_frame`.
+                let fanout_enter_ns = audio_plane.monotonic_ns();
                 if let Err(e) = audio_plane
                     .fan_out_audio_frame(group_id.clone(), seed)
                     .await
@@ -856,7 +997,83 @@ async fn run_source_capture_task(
                 } else {
                     sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Record the source-side partial. The aggregator
+                // matches FrameSendEvent + FrameTraceReport
+                // entries against this by sequence.
+                if trace_state.is_some() {
+                    if source_pending.len() >= TRACE_PENDING_MAX {
+                        if let Some(&oldest_seq) =
+                            source_pending.keys().min()
+                        {
+                            source_pending.remove(&oldest_seq);
+                        }
+                    }
+                    source_pending.insert(
+                        sequence,
+                        SourceTracePartial {
+                            presentation_time_ms,
+                            capture_readi_return_ns,
+                            mpsc_send_ns,
+                            mpsc_recv_ns,
+                            fanout_enter_ns,
+                        },
+                    );
+                }
                 sequence = sequence.saturating_add(1);
+            }
+            // FrameSendEvent — per-recipient stage 5a (wire_send_ns).
+            Ok(ev) = async {
+                match frame_send_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if frame_send_rx.is_some() => {
+                let key = (ev.sequence, ev.receiver_device_id.clone());
+                if recipient_pending.len() >= TRACE_PENDING_MAX {
+                    if let Some(oldest) =
+                        recipient_pending.keys().min_by_key(|k| k.0).cloned()
+                    {
+                        recipient_pending.remove(&oldest);
+                    }
+                }
+                let entry = recipient_pending
+                    .entry(key.clone())
+                    .or_insert_with(RecipientTracePartial::default);
+                entry.wire_send_ns = Some(ev.wire_send_ns);
+                try_complete_record(
+                    &key,
+                    &source_pending,
+                    &mut recipient_pending,
+                    trace_state.as_deref(),
+                ).await;
+            }
+            // FrameTraceReport — receiver back-report stages 5b / 6 / 7.
+            Ok(rep) = async {
+                match frame_trace_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if frame_trace_rx.is_some() => {
+                let key = (rep.sequence, rep.from_device_id.clone());
+                if recipient_pending.len() >= TRACE_PENDING_MAX {
+                    if let Some(oldest) =
+                        recipient_pending.keys().min_by_key(|k| k.0).cloned()
+                    {
+                        recipient_pending.remove(&oldest);
+                    }
+                }
+                let entry = recipient_pending
+                    .entry(key.clone())
+                    .or_insert_with(RecipientTracePartial::default);
+                entry.wire_recv_ns = Some(rep.wire_recv_ns);
+                entry.scheduler_dequeue_ns = Some(rep.scheduler_dequeue_ns);
+                entry.writei_return_ns = Some(rep.writei_return_ns);
+                try_complete_record(
+                    &key,
+                    &source_pending,
+                    &mut recipient_pending,
+                    trace_state.as_deref(),
+                ).await;
             }
         }
     }
@@ -885,6 +1102,203 @@ async fn run_source_capture_task(
     drop(capture_thread);
 }
 
+/// One capture-thread chunk plus the source-side stage 3a /
+/// 3b audible-time trace timestamps the capture thread
+/// observed at its own call sites. The async source-capture
+/// task picks up the chunk + the two timestamps from the
+/// channel and adds stage 4a / 4b at its own call sites
+/// before handing the encoded payload to
+/// `fan_out_audio_frame`.
+#[cfg(feature = "alsa-substrate")]
+#[derive(Debug, Clone)]
+struct CaptureChunk {
+    /// Framework-monotonic ns at which `io.readi(&buf)`
+    /// returned with this chunk's samples. Stage 3a.
+    capture_readi_return_ns: u64,
+    /// Framework-monotonic ns immediately before
+    /// `tx.try_send(this_chunk)` queued the chunk onto the
+    /// async channel. Stage 3b.
+    mpsc_send_ns: u64,
+    /// PCM samples (pcm_s16_le, interleaved).
+    pcm: Vec<u8>,
+}
+
+/// Source-side partial trace record observed at the moment
+/// the source-capture async task hands the chunk to
+/// `fan_out_audio_frame`. Carries every stage the source
+/// node observes for this sequence; the per-recipient
+/// `wire_send_ns` + the receiver-back-reported triple
+/// (wire_recv_ns / scheduler_dequeue_ns / writei_return_ns)
+/// arrive separately via the audio-plane's broadcast streams
+/// and are joined in [`TraceState`].
+#[derive(Debug, Clone)]
+struct SourceTracePartial {
+    presentation_time_ms: u64,
+    capture_readi_return_ns: u64,
+    mpsc_send_ns: u64,
+    mpsc_recv_ns: u64,
+    fanout_enter_ns: u64,
+}
+
+/// Per-recipient partial trace record. Built incrementally
+/// as the source observes the framework's `FrameSendEvent`
+/// for this `(sequence, receiver_device_id)` pair (stage 5a)
+/// and then as the receiver back-reports its post-decode +
+/// post-dequeue + post-writei timestamps (stages 5b / 6 / 7).
+#[derive(Debug, Clone, Default)]
+struct RecipientTracePartial {
+    wire_send_ns: Option<u64>,
+    wire_recv_ns: Option<u64>,
+    scheduler_dequeue_ns: Option<u64>,
+    writei_return_ns: Option<u64>,
+}
+
+/// Complete per-frame, per-recipient audible-time trace
+/// record. The rolling-window state in [`TraceState`]
+/// publishes these via the `audio.multiroom.frame_trace`
+/// subject + the `audio.multiroom.frame_trace.snapshot`
+/// wire-op.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FrameTraceRecord {
+    sequence: u64,
+    receiver_device_id: String,
+    presentation_time_ms: u64,
+    source_capture_readi_return_ns: u64,
+    source_mpsc_send_ns: u64,
+    source_mpsc_recv_ns: u64,
+    source_fanout_enter_ns: u64,
+    source_wire_send_ns: u64,
+    receiver_wire_recv_ns: u64,
+    receiver_scheduler_dequeue_ns: u64,
+    receiver_writei_return_ns: u64,
+    clock_offset_ns: i64,
+}
+
+/// Source-host audible-time trace aggregator state. Holds a
+/// bounded rolling window of completed [`FrameTraceRecord`]
+/// instances. The source-capture task writes through here;
+/// the wire-op handler `audio.multiroom.frame_trace.snapshot`
+/// reads from it; a separate publisher task observes its
+/// updates and emits the canonical
+/// `audio.multiroom.frame_trace` subject value.
+#[derive(Debug)]
+struct TraceState {
+    window: std::sync::Mutex<std::collections::VecDeque<FrameTraceRecord>>,
+    /// Maximum count of records retained in the rolling
+    /// window. Operator-configurable in a future commit;
+    /// default 100 today.
+    window_size: usize,
+}
+
+#[cfg(feature = "alsa-substrate")]
+impl TraceState {
+    fn new(window_size: usize) -> Self {
+        Self {
+            window: std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(window_size),
+            ),
+            window_size,
+        }
+    }
+
+    fn push(&self, rec: FrameTraceRecord) {
+        if let Ok(mut w) = self.window.lock() {
+            if w.len() >= self.window_size {
+                w.pop_front();
+            }
+            w.push_back(rec);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<FrameTraceRecord> {
+        self.window
+            .lock()
+            .map(|w| w.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Helper used by the source-capture task on every
+/// `FrameSendEvent` and every `FrameTraceReport` arrival.
+/// Looks at the `(sequence, receiver_device_id)` recipient
+/// partial: if every receiver-side field is populated AND the
+/// source-side partial for the same sequence still exists,
+/// composes a [`FrameTraceRecord`], pushes into the rolling
+/// window, and removes the recipient entry. The source-side
+/// partial stays in place because multiple recipients may
+/// reference the same sequence; the bounded eviction in the
+/// caller handles the per-sequence cleanup.
+#[cfg(feature = "alsa-substrate")]
+async fn try_complete_record(
+    key: &(u64, String),
+    source_pending: &std::collections::HashMap<u64, SourceTracePartial>,
+    recipient_pending: &mut std::collections::HashMap<
+        (u64, String),
+        RecipientTracePartial,
+    >,
+    trace_state: Option<&TraceState>,
+) {
+    let Some(state) = trace_state else { return };
+    let Some(rec_partial) = recipient_pending.get(key) else { return };
+    let (Some(wire_send_ns),
+         Some(wire_recv_ns),
+         Some(scheduler_dequeue_ns),
+         Some(writei_return_ns)) = (
+        rec_partial.wire_send_ns,
+        rec_partial.wire_recv_ns,
+        rec_partial.scheduler_dequeue_ns,
+        rec_partial.writei_return_ns,
+    ) else {
+        return;
+    };
+    let Some(src_partial) = source_pending.get(&key.0) else { return };
+    let record = FrameTraceRecord {
+        sequence: key.0,
+        receiver_device_id: key.1.clone(),
+        presentation_time_ms: src_partial.presentation_time_ms,
+        source_capture_readi_return_ns: src_partial.capture_readi_return_ns,
+        source_mpsc_send_ns: src_partial.mpsc_send_ns,
+        source_mpsc_recv_ns: src_partial.mpsc_recv_ns,
+        source_fanout_enter_ns: src_partial.fanout_enter_ns,
+        source_wire_send_ns: wire_send_ns,
+        receiver_wire_recv_ns: wire_recv_ns,
+        receiver_scheduler_dequeue_ns: scheduler_dequeue_ns,
+        receiver_writei_return_ns: writei_return_ns,
+        // TODO: source the sync probe's per-peer offset from
+        // the audio-plane's ClockSyncRuntime when the SDK
+        // surfaces it for plugins. For now this field reports
+        // 0 — the same-node deltas (capture -> fanout, etc.)
+        // are useful without it; cross-node analyses subtract
+        // it manually from the sync-probe wire-op until then.
+        clock_offset_ns: 0,
+    };
+    // Emit a compact one-line trace alongside the rolling-
+    // window push. The wire-op `audio.multiroom.frame_trace.
+    // snapshot` is the canonical operator surface for this
+    // data; the journal echo here lets the first-measurement
+    // audit extract the trace without an operator CLI for
+    // the wire-op (the snapshot wire-op + subject are still
+    // the surface every other consumer reads through).
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        seq = record.sequence,
+        recv = %record.receiver_device_id,
+        pts_ms = record.presentation_time_ms,
+        s3a_ns = record.source_capture_readi_return_ns,
+        s3b_ns = record.source_mpsc_send_ns,
+        s4a_ns = record.source_mpsc_recv_ns,
+        s4b_ns = record.source_fanout_enter_ns,
+        s5a_ns = record.source_wire_send_ns,
+        s5b_ns = record.receiver_wire_recv_ns,
+        s6_ns = record.receiver_scheduler_dequeue_ns,
+        s7_ns = record.receiver_writei_return_ns,
+        clk_off_ns = record.clock_offset_ns,
+        "frame-trace record completed"
+    );
+    state.push(record);
+    recipient_pending.remove(key);
+}
+
 /// OS-thread body that owns the ALSA capture handle. Loops
 /// reading `FRAMES_PER_CHUNK` frames at a time, pushing each
 /// chunk onto the async-side channel. Drops the oldest chunk
@@ -893,8 +1307,9 @@ async fn run_source_capture_task(
 #[cfg(feature = "alsa-substrate")]
 fn run_capture_thread(
     source_pcm: String,
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<CaptureChunk>,
     shutdown: Arc<Notify>,
+    audio_plane: Arc<dyn AudioPlaneHandle>,
 ) {
     // Open the capture PCM NON-BLOCKING. In blocking mode
     // `io.readi()` parks indefinitely waiting for samples
@@ -1094,6 +1509,10 @@ fn run_capture_thread(
                 // wait/read raced).
                 match io.readi(&mut buf) {
                     Ok(frames_read) if frames_read > 0 => {
+                        // Audible-time trace stage 3a:
+                        // `io.readi` returned with samples.
+                        let capture_readi_return_ns =
+                            audio_plane.monotonic_ns();
                         let mut pcm_bytes = Vec::with_capacity(
                             frames_read * BASELINE_CHANNELS as usize * 2,
                         );
@@ -1102,11 +1521,19 @@ fn run_capture_thread(
                         {
                             pcm_bytes.extend_from_slice(&s.to_le_bytes());
                         }
+                        // Audible-time trace stage 3b:
+                        // immediately before queueing onto
+                        // the async channel.
+                        let mpsc_send_ns = audio_plane.monotonic_ns();
                         // Soft-drop on channel full: we are
                         // the producer of a real-time stream;
                         // back-pressuring would corrupt the
                         // loopback playback half upstream.
-                        let _ = tx.try_send(pcm_bytes);
+                        let _ = tx.try_send(CaptureChunk {
+                            capture_readi_return_ns,
+                            mpsc_send_ns,
+                            pcm: pcm_bytes,
+                        });
                     }
                     Ok(_) => {
                         // Zero frames — try again on next
@@ -1331,6 +1758,12 @@ async fn run_receiver_task(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     rendered_this_tick += 1;
+                    // Audible-time trace stage 6: scheduler
+                    // dequeue moment. Captured before the
+                    // writei call so the stage_6 -> stage_7
+                    // delta isolates the writei cost from
+                    // the scheduler-internal cost.
+                    let scheduler_dequeue_ns = audio_plane.monotonic_ns();
                     #[cfg(feature = "alsa-substrate")]
                     if let Some(render) = alsa_render.as_mut() {
                         if let Err(e) = render.write(&frame.payload) {
@@ -1343,6 +1776,32 @@ async fn run_receiver_task(
                     }
                     #[cfg(not(feature = "alsa-substrate"))]
                     let _ = &frame;
+                    // Audible-time trace stage 7: writei
+                    // return. Receiver back-reports the
+                    // (wire_recv_ns from the frame envelope,
+                    // scheduler_dequeue_ns, writei_return_ns)
+                    // triple to the source-host so the
+                    // source-host's aggregator can complete
+                    // each per-frame record.
+                    let writei_return_ns = audio_plane.monotonic_ns();
+                    let report = evo_plugin_sdk::contract::audio_plane::ReceiverFrameTraceReport {
+                        source_device_id: frame.from_device_id.clone(),
+                        group_id: frame.group_id.clone(),
+                        sequence: frame.sequence,
+                        wire_recv_ns: frame.wire_recv_ns,
+                        scheduler_dequeue_ns,
+                        writei_return_ns,
+                    };
+                    if let Err(e) = audio_plane
+                        .report_frame_trace(report)
+                        .await
+                    {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "report_frame_trace failed; continuing"
+                        );
+                    }
                 }
                 // Underrun guard: if the anchor is established
                 // and we ticked past at least one period budget
