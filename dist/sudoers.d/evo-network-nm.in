@@ -4,21 +4,30 @@
 #
 # Grants the steward service user (substituted at install
 # time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
-# access to the binaries the network.nm plugin invokes
-# (nmcli, iw, curl). Two scopes:
+# access to the binaries the network plugin invokes
+# (nmcli, iw). Two scopes:
 #
-# 1. `EVO_NM_POLL` `Cmnd_Alias` — the read-side polling
-#    commands the supervisor invokes on a periodic cadence
-#    (NetworkManager connectivity probe, fallback HTTP
-#    connectivity probe against `connectivitycheck.gstatic.com`,
-#    Wi-Fi device enumeration, per-interface link state).
-#    The `Defaults!EVO_NM_POLL !pam_session, !syslog` line
-#    below suppresses PAM session open/close lines and the
-#    sudo invocation log line for this alias only. The
-#    suppression is scoped to read-side polling argv
-#    patterns; any nmcli argv outside the alias falls through
-#    to the broader rule below and retains full audit
-#    logging.
+# 1. `EVO_NM_POLL` `Cmnd_Alias` — the read-side enumeration
+#    commands the supervisor invokes when an rtnetlink event,
+#    a NetworkManager D-Bus signal, or the on-demand
+#    `refresh_connectivity` wire-op fires (NetworkManager
+#    connectivity verdict, Wi-Fi device enumeration,
+#    per-interface link state). These commands are NOT polled
+#    on a fixed cadence in steady state — the
+#    connectivity-check redesign retired the 10-Hz tick. The
+#    polling source remains as a cold-start fallback only,
+#    governed by `adaptive_tick` (60 s floor / 5 min ceiling),
+#    and the `Defaults!EVO_NM_POLL !pam_session, !syslog`
+#    line below suppresses PAM session open/close lines for
+#    this alias for the rare bursts when many event triggers
+#    arrive in quick succession (e.g. interface re-up). Any
+#    nmcli argv outside the alias falls through to the
+#    broader rule below and retains full audit logging.
+#
+#    `curl` is intentionally NOT in this alias. The
+#    reachability probe (when the operator opts into a
+#    non-`off` `probe_kind`) is a GET on a public endpoint and
+#    runs without elevation via direct exec.
 #
 # 2. Broad `/usr/bin/nmcli` grant — covers state-changing
 #    invocations (`connection up`, `connection down`,
@@ -36,17 +45,9 @@
 # `PluginConfig.nmcli_path` (default `/usr/bin/nmcli`,
 # overridable via the plugin's `nmcli_path` config field).
 # The bootstrap script substitutes this path verbatim at
-# install time. iw + curl paths in the polling alias are
-# hardcoded to the canonical Debian locations; non-standard
-# distributions add new substitutions to the bootstrap
-# script.
-#
-# Operator override of the connectivity-check URL (the
-# plugin's `connectivity_check_url` config field) requires
-# updating this template's URL pattern and re-running the
-# bootstrap; otherwise the new URL falls through to the
-# broader rule and is rejected (curl is not granted outside
-# the alias).
+# install time. iw path in the polling alias is hardcoded to
+# the canonical Debian location; non-standard distributions
+# add new substitutions to the bootstrap script.
 #
 # Apply via the bootstrap script:
 #   scripts/bootstrap.sh --install-network-nm-sudoers
@@ -62,7 +63,6 @@
 
 Cmnd_Alias EVO_NM_POLL = \
     /usr/bin/nmcli -t -f CONNECTIVITY general, \
-    /usr/bin/curl -sS -L -o /dev/null -w * --max-time * http\://connectivitycheck.gstatic.com/generate_204, \
     /usr/sbin/iw dev, \
     /usr/sbin/iw dev * link
 

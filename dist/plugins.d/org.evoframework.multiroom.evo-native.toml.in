@@ -1,0 +1,28 @@
+# Plugin config template — installed by the bootstrap script
+# at /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml
+# (mode 0644, owned by the steward service user).
+#
+# Codifies the multiroom plugin's per-device role +
+# topology participation. Operator role choices:
+#
+#   - source: device captures audio from a local PCM (typically
+#             the playback chain's snd-aloop loopback) and fans
+#             frames out to receivers in the same group via the
+#             audio plane. Set `--multiroom-source-pcm` to the
+#             ALSA PCM the capture half binds (e.g.
+#             `hw:Loopback,1,0` for a standard snd-aloop wiring).
+#   - receiver: device renders frames received from the group's
+#               source host through `--multiroom-alsa-pcm` (the
+#               configured ALSA PCM, e.g. `evo` for the
+#               distribution's standard pcm alias).
+#   - none: device participates in discovery + group composition
+#           but neither captures nor renders. Useful for devices
+#           that route through a downstream stage.
+#
+# The `@MULTIROOM_*@` placeholders are substituted at install
+# time by bootstrap.sh from operator-provided flags.
+
+role = "@MULTIROOM_ROLE@"
+group_id = "@MULTIROOM_GROUP_ID@"
+@MULTIROOM_PCM_LINE@
+leader_ms = 200

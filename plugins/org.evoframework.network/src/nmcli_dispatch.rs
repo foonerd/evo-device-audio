@@ -63,9 +63,12 @@ pub const INTENT_IW_INVOCATION: &str = "iw_invocation";
 /// supervisor + flight-mode plumbing.
 pub const INTENT_RFKILL_INVOCATION: &str = "rfkill_invocation";
 
-/// Capability-intent id for `curl` reachability — used by the
-/// captive-portal detector + connectivity probes.
-pub const INTENT_CURL_INVOCATION: &str = "curl_invocation";
+// `INTENT_CURL_INVOCATION` retired per the connectivity-check redesign: routine
+// connectivity probes are read-only GETs that need no elevation
+// and run via direct exec. A future captive-portal
+// credential-submission flow will declare its own
+// `captive_portal_credential_submit` capability intent at that
+// time, with the elevation rationale recorded in the manifest.
 
 /// Future returned by [`PrivilegedExec::dispatch`]. The trait is
 /// object-safe at the cost of explicit pinning; the
@@ -685,9 +688,6 @@ mod tests {
         let rfkill =
             AutoPrivilegedExec::resolve(INTENT_RFKILL_INVOCATION, &map);
         assert_eq!(rfkill.intent_id(), "rfkill_invocation");
-
-        let curl = AutoPrivilegedExec::resolve(INTENT_CURL_INVOCATION, &map);
-        assert_eq!(curl.intent_id(), "curl_invocation");
     }
 
     #[tokio::test]

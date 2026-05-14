@@ -51,8 +51,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::nmcli_dispatch::{
-    AutoPrivilegedExec, DirectExec, PrivilegedExec, INTENT_CURL_INVOCATION,
-    INTENT_IW_INVOCATION, INTENT_NMCLI_INVOCATION, INTENT_RFKILL_INVOCATION,
+    AutoPrivilegedExec, DirectExec, PrivilegedExec, INTENT_IW_INVOCATION,
+    INTENT_NMCLI_INVOCATION, INTENT_RFKILL_INVOCATION,
 };
 
 use base64::Engine;
@@ -1133,9 +1133,10 @@ pub struct NmInner {
     pub(crate) iw_exec: Option<Arc<AutoPrivilegedExec>>,
     /// Privilege dispatcher for every `rfkill` invocation.
     pub(crate) rfkill_exec: Option<Arc<AutoPrivilegedExec>>,
-    /// Privilege dispatcher for every `curl` invocation
-    /// (connectivity + captive-portal probes).
-    pub(crate) curl_exec: Option<Arc<AutoPrivilegedExec>>,
+    // `curl_exec` field retired per the connectivity-check redesign: routine connectivity
+    // probes are GETs on public endpoints that need no elevation. A
+    // future captive-portal credential-submission flow will declare
+    // its own elevation-justified capability intent.
     /// Runtime mirror of `PluginConfig.require_encrypted_secrets`,
     /// promoted to interior-mutable so the `network.nm.security.harden`
     /// verb can flip it without rebuilding the whole `NmInner`.
@@ -1220,7 +1221,6 @@ impl NmInner {
             auto_dispatcher: None,
             iw_exec: None,
             rfkill_exec: None,
-            curl_exec: None,
             require_encrypted_secrets,
             loaded: std::sync::atomic::AtomicBool::new(false),
             wifi_flight_mode_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -1281,7 +1281,6 @@ impl NetworkPlugin {
         nmcli_auto: Arc<AutoPrivilegedExec>,
         iw_auto: Arc<AutoPrivilegedExec>,
         rfkill_auto: Arc<AutoPrivilegedExec>,
-        curl_auto: Arc<AutoPrivilegedExec>,
         mut rx: tokio::sync::watch::Receiver<
             Arc<evo_plugin_sdk::privileges::CapabilityResolutionMap>,
         >,
@@ -1307,7 +1306,6 @@ impl NetworkPlugin {
                             nmcli_auto.as_ref(),
                             iw_auto.as_ref(),
                             rfkill_auto.as_ref(),
-                            curl_auto.as_ref(),
                         ] {
                             auto.re_resolve(&new_map);
                             tracing::info!(
@@ -1370,13 +1368,13 @@ impl NetworkPlugin {
         let nmcli_exec = self.dispatcher.clone();
         let nmcli_path = self.config.nmcli_path.clone();
         let nmcli_timeout = Duration::from_millis(self.config.nmcli_timeout_ms);
-        let curl_exec = self.effective_curl_exec();
         let curl_path = self.config.curl_path.clone();
         let curl_timeout = Duration::from_millis(self.config.curl_timeout_ms);
         let iw_exec = self.effective_iw_exec();
         let iw_path = self.config.iw_path.clone();
         let iw_timeout = Duration::from_millis(self.config.iw_timeout_ms);
         let config = supervisor::SupervisorConfig::from_env();
+        let probe_kind = config.probe_kind;
         let probe_url = config.probe_url.clone();
         let plugin_tag: &'static str = PLUGIN_NAME;
 
@@ -1385,7 +1383,6 @@ impl NetworkPlugin {
                 probe: Arc::new(move || {
                     let nmcli_exec = nmcli_exec.clone();
                     let nmcli_path = nmcli_path.clone();
-                    let curl_exec = curl_exec.clone();
                     let curl_path = curl_path.clone();
                     let iw_exec = iw_exec.clone();
                     let iw_path = iw_path.clone();
@@ -1395,13 +1392,13 @@ impl NetworkPlugin {
                             nmcli_exec.as_ref(),
                             &nmcli_path,
                             nmcli_timeout,
-                            curl_exec.as_ref(),
+                            probe_kind,
                             &curl_path,
                             curl_timeout,
                             iw_exec.as_ref(),
                             &iw_path,
                             iw_timeout,
-                            &probe_url,
+                            probe_url.as_deref(),
                         )
                         .await
                     })
@@ -2390,16 +2387,12 @@ impl NmInner {
         }
     }
 
-    /// Active `curl` privilege dispatcher. Same fallback shape
-    /// as [`Self::effective_iw_exec`].
-    #[allow(dead_code)]
-    fn effective_curl_exec(&self) -> Arc<dyn PrivilegedExec> {
-        if let Some(auto) = self.curl_exec.as_ref() {
-            auto.clone() as Arc<dyn PrivilegedExec>
-        } else {
-            Arc::new(DirectExec::new())
-        }
-    }
+    // `effective_curl_exec()` retired per the connectivity-check redesign: the routine
+    // connectivity probe is a GET on a public endpoint that runs
+    // unprivileged via `tokio::process::Command` directly. A future
+    // captive-portal credential-submission flow will declare its own
+    // elevation-justified capability intent and bring its own
+    // dispatcher.
 
     /// Probe the PHY backing `sta_if` for concurrent
     /// `managed + AP` support via the `wifi_phy` module. Honours
@@ -3976,7 +3969,7 @@ impl Plugin for NetworkPlugin {
         // so the probe checks the sudoers entry directly. Same
         // EUID floor as playback.mpd's probe-plan shape.
         let needs_sudo = nmcli_dispatch::process_needs_sudo();
-        let entries: [(&str, String, &str); 4] = [
+        let entries: [(&str, String, &str); 3] = [
             (
                 INTENT_NMCLI_INVOCATION,
                 self.config.nmcli_path.clone(),
@@ -3992,11 +3985,9 @@ impl Plugin for NetworkPlugin {
                 self.config.rfkill_path.clone(),
                 "`rfkill` (kernel-level radio block toggle)",
             ),
-            (
-                INTENT_CURL_INVOCATION,
-                self.config.curl_path.clone(),
-                "`curl` (connectivity + captive-portal probes)",
-            ),
+            // `curl_invocation` probe-plan retired per the connectivity-check redesign:
+            // the routine connectivity probe runs unprivileged via
+            // direct exec; no PPAG strategy resolution is required.
         ];
 
         let mut plans: Vec<ProbePlan> = Vec::with_capacity(entries.len());
@@ -4103,15 +4094,12 @@ impl Plugin for NetworkPlugin {
                 INTENT_RFKILL_INVOCATION,
                 &ctx.capabilities,
             ));
-            let curl_auto = Arc::new(AutoPrivilegedExec::resolve(
-                INTENT_CURL_INVOCATION,
-                &ctx.capabilities,
-            ));
+            // `curl_auto` retired per the connectivity-check redesign — direct exec, no PPAG
+            // strategy resolution for routine connectivity probes.
             for auto in [
                 nmcli_auto.as_ref(),
                 iw_auto.as_ref(),
                 rfkill_auto.as_ref(),
-                curl_auto.as_ref(),
             ] {
                 tracing::info!(
                     plugin = PLUGIN_NAME,
@@ -4136,7 +4124,6 @@ impl Plugin for NetworkPlugin {
                 auto_dispatcher: Some(nmcli_auto.clone()),
                 iw_exec: Some(iw_auto.clone()),
                 rfkill_exec: Some(rfkill_auto.clone()),
-                curl_exec: Some(curl_auto.clone()),
                 require_encrypted_secrets,
                 happening_emitter: Some(ctx.happening_emitter.clone()),
                 loaded: std::sync::atomic::AtomicBool::new(false),
@@ -4163,7 +4150,6 @@ impl Plugin for NetworkPlugin {
                     nmcli_auto,
                     iw_auto,
                     rfkill_auto,
-                    curl_auto,
                     rx,
                 );
             }
@@ -5255,31 +5241,38 @@ fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
     seq.push(ch.to_string());
 }
 
-/// Build one [`supervisor::SupervisorObservations`] snapshot for
-/// the supervisor's tick. Probes NetworkManager connectivity,
-/// runs the connectivity-check `curl` against `probe_url`, walks
-/// `iw dev` for Wi-Fi association state, and reads sysfs for
-/// Ethernet carrier state. All I/O is best-effort: a failed
-/// probe surfaces as `None` / `false` in the snapshot rather
-/// than aborting the tick.
+/// Build one [`supervisor::SupervisorObservations`] snapshot when
+/// the supervisor receives a classification-relevant event
+/// (rtnetlink carrier/route change, NM D-Bus connectivity signal,
+/// on-demand `refresh_connectivity` wire-op call, or polling-source
+/// adaptive-tick fallback). Probes NetworkManager connectivity,
+/// optionally runs a curl reachability check (only when
+/// `probe_kind != Off` and `probe_url` is `Some`; the curl call
+/// is unprivileged direct exec per the connectivity-check redesign), walks `iw dev` for
+/// Wi-Fi association state, and reads sysfs for Ethernet carrier
+/// state. All I/O is best-effort: a failed probe surfaces as
+/// `None` / `false` in the snapshot rather than aborting.
 #[allow(clippy::too_many_arguments)]
 async fn probe_observations(
     nmcli_exec: &dyn PrivilegedExec,
     nmcli_path: &str,
     nmcli_timeout: Duration,
-    curl_exec: &dyn PrivilegedExec,
+    probe_kind: supervisor::ProbeKind,
     curl_path: &str,
     curl_timeout: Duration,
     iw_exec: &dyn PrivilegedExec,
     iw_path: &str,
     iw_timeout: Duration,
-    probe_url: &str,
+    probe_url: Option<&str>,
 ) -> supervisor::SupervisorObservations {
     let nm_connectivity =
         probe_nm_connectivity(nmcli_exec, nmcli_path, nmcli_timeout).await;
-    let (probe_http_code, probe_effective_url) =
-        probe_connectivity_url(curl_exec, curl_path, curl_timeout, probe_url)
-            .await;
+    let (probe_http_code, probe_effective_url) = match (probe_kind, probe_url) {
+        (supervisor::ProbeKind::Off, _) | (_, None) => (None, None),
+        (_, Some(url)) => {
+            probe_connectivity_url(curl_path, curl_timeout, url).await
+        }
+    };
     let wifi_associated =
         probe_any_wifi_associated(iw_exec, iw_path, iw_timeout).await;
     let ethernet_carrier_up = probe_ethernet_carrier();
@@ -5317,8 +5310,13 @@ async fn probe_nm_connectivity(
     }
 }
 
+/// Direct-exec connectivity probe per the connectivity-check redesign. A GET on a public
+/// HTTPS / captive-portal-detection endpoint needs no elevation;
+/// the `tokio::process::Command` path here invokes curl as the
+/// steward service identity without any sudo wrapper. Caller is
+/// responsible for honouring `ProbeKind::Off` — this function
+/// assumes the caller already decided a probe should run.
 async fn probe_connectivity_url(
-    exec: &dyn PrivilegedExec,
     curl_path: &str,
     timeout: Duration,
     probe_url: &str,
@@ -5334,9 +5332,20 @@ async fn probe_connectivity_url(
         "20",
         probe_url,
     ];
-    let out = match exec.dispatch(curl_path, &args, timeout).await {
-        Ok(v) => v,
+    let mut cmd = tokio::process::Command::new(curl_path);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
         Err(_) => return (None, None),
+    };
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return (None, None),
     };
     if !out.status.success() {
         return (None, None);
