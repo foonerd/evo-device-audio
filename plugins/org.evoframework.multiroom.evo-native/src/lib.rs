@@ -1179,6 +1179,7 @@ struct CaptureChunk {
 /// (wire_recv_ns / scheduler_dequeue_ns / writei_return_ns)
 /// arrive separately via the audio-plane's broadcast streams
 /// and are joined in [`TraceState`].
+#[cfg(feature = "alsa-substrate")]
 #[derive(Debug, Clone)]
 struct SourceTracePartial {
     presentation_time_ms: u64,
@@ -1193,6 +1194,7 @@ struct SourceTracePartial {
 /// for this `(sequence, receiver_device_id)` pair (stage 5a)
 /// and then as the receiver back-reports its post-decode +
 /// post-dequeue + post-writei timestamps (stages 5b / 6 / 7).
+#[cfg(feature = "alsa-substrate")]
 #[derive(Debug, Clone, Default)]
 struct RecipientTracePartial {
     wire_send_ns: Option<u64>,
@@ -1206,6 +1208,7 @@ struct RecipientTracePartial {
 /// publishes these via the `audio.multiroom.frame_trace`
 /// subject + the `audio.multiroom.frame_trace.snapshot`
 /// wire-op.
+#[cfg(feature = "alsa-substrate")]
 #[derive(Debug, Clone, serde::Serialize)]
 struct FrameTraceRecord {
     sequence: u64,
@@ -1229,6 +1232,7 @@ struct FrameTraceRecord {
 /// reads from it; a separate publisher task observes its
 /// updates and emits the canonical
 /// `audio.multiroom.frame_trace` subject value.
+#[cfg(feature = "alsa-substrate")]
 #[derive(Debug)]
 struct TraceState {
     window: std::sync::Mutex<std::collections::VecDeque<FrameTraceRecord>>,
