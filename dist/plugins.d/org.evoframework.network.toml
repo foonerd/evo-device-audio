@@ -1,0 +1,32 @@
+# Distribution-tier default config for the network plugin.
+#
+# Per the connectivity-check redesign declares that the audio reference distribution does not probe
+# a third-party reachability endpoint by default. The connectivity
+# verdict is sourced from rtnetlink (carrier) + NetworkManager
+# D-Bus signals (verdict, when NM is present) + sysfs (Ethernet
+# carrier) + iw (Wi-Fi association) — all kernel / system-local
+# inputs, no outbound traffic. Operators wanting active reach
+# probing opt in by editing this file:
+#
+#   - `https_self_hosted` + a `https://<operator-owned>/healthz`
+#     `probe_url`: TLS probe against operator-controlled
+#     infrastructure. No plaintext, no third-party endpoint
+#     exposure.
+#   - `captive_portal_detection` + a `http://<portal-probe>` URL:
+#     plaintext probe scoped to Wi-Fi-join captive-portal
+#     detection. Governed by the (future)
+#     `captive_portal_credential_submit` capability intent for
+#     the credential-submission step.
+#
+# `probe_url` is `None` (omitted) when `probe_kind = "off"`. The
+# plugin's `refresh_connectivity` wire-op honours `probe_kind` —
+# when `off`, it returns the connectivity subject without
+# performing any HTTP I/O.
+#
+# Environment-variable overrides (loaded at admission time):
+#   EVO_NETWORK_SUPERVISOR_PROBE_KIND      (off | https_self_hosted | captive_portal_detection)
+#   EVO_NETWORK_SUPERVISOR_PROBE_URL       (string)
+#   EVO_NETWORK_SUPERVISOR_INTERVAL_MS     (u64; default 60 000)
+#   EVO_NETWORK_SUPERVISOR_COLD_START_WINDOW_MS  (u64; default 30 000)
+
+probe_kind = "off"

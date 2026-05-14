@@ -22,9 +22,13 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Default cadence the polling source ticks at when not
-/// overridden. Matches today's supervisor interval so the
-/// refactor is behaviour-preserving.
-pub const DEFAULT_POLLING_INTERVAL_MS: u64 = 10_000;
+/// overridden. Per the connectivity-check redesign declares that the polling source is a
+/// cold-start / event-source-quiescent fallback, not a
+/// steady-state probe loop. The default 60 s floor matches
+/// the cold-start window; the supervisor stretches this to
+/// `adaptive_tick::DEFAULT_TICK_MAX` (5 min) once admitted
+/// event sources are healthy.
+pub const DEFAULT_POLLING_INTERVAL_MS: u64 = 60_000;
 
 /// Hard floor enforced at construction. Operators may
 /// shorten the polling cadence but not below 5 000 ms —

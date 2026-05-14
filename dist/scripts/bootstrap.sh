@@ -66,8 +66,13 @@ SYSTEMD_DROPIN_DIR="/etc/systemd/system/evo.service.d"
 MPD_FRAGMENT_PATH="/etc/evo/mpd.conf"
 MPD_CONF_PATH="/etc/mpd.conf"
 ASOUND_CONF_PATH="/etc/asound.conf"
+PLUGINS_D_DIR="/etc/evo/plugins.d"
 SKIP_SYSTEMD=0
 AUDIO_CARD="${EVO_AUDIO_CARD:-}"
+MULTIROOM_ROLE=""
+MULTIROOM_GROUP_ID=""
+MULTIROOM_SOURCE_PCM=""
+MULTIROOM_ALSA_PCM=""
 
 # Argument parsing — minimal; positional args not supported.
 while [[ $# -gt 0 ]]; do
@@ -92,13 +97,47 @@ while [[ $# -gt 0 ]]; do
             SKIP_SYSTEMD=1
             shift
             ;;
+        --multiroom-role)
+            MULTIROOM_ROLE="$2"
+            shift 2
+            ;;
+        --multiroom-role=*)
+            MULTIROOM_ROLE="${1#--multiroom-role=}"
+            shift
+            ;;
+        --multiroom-group-id)
+            MULTIROOM_GROUP_ID="$2"
+            shift 2
+            ;;
+        --multiroom-group-id=*)
+            MULTIROOM_GROUP_ID="${1#--multiroom-group-id=}"
+            shift
+            ;;
+        --multiroom-source-pcm)
+            MULTIROOM_SOURCE_PCM="$2"
+            shift 2
+            ;;
+        --multiroom-source-pcm=*)
+            MULTIROOM_SOURCE_PCM="${1#--multiroom-source-pcm=}"
+            shift
+            ;;
+        --multiroom-alsa-pcm)
+            MULTIROOM_ALSA_PCM="$2"
+            shift 2
+            ;;
+        --multiroom-alsa-pcm=*)
+            MULTIROOM_ALSA_PCM="${1#--multiroom-alsa-pcm=}"
+            shift
+            ;;
         -h|--help)
             grep -E '^# ' "$0" | sed 's/^# //'
             exit 0
             ;;
         *)
             echo "unknown argument: $1" >&2
-            echo "usage: $0 [--service-user <name>] [--card <NAME>] [--skip-systemd]" >&2
+            echo "usage: $0 [--service-user <name>] [--card <NAME>] [--skip-systemd] \\" >&2
+            echo "    [--multiroom-role source|receiver|none] [--multiroom-group-id <uuid>] \\" >&2
+            echo "    [--multiroom-source-pcm <alsa-pcm>] [--multiroom-alsa-pcm <alsa-pcm>]" >&2
             exit 1
             ;;
     esac
@@ -269,6 +308,11 @@ fi
 if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; then
     install -d -m 0755 "$SYSTEMD_DROPIN_DIR"
     install -m 0644 -o root -g root \
+        "$DIST_DIR/systemd/evo.service.d/exec-start.conf" \
+        "$SYSTEMD_DROPIN_DIR/exec-start.conf"
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/exec-start.conf"
+
+    install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/state-dir-mode.conf" \
         "$SYSTEMD_DROPIN_DIR/state-dir-mode.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/state-dir-mode.conf"
@@ -282,6 +326,126 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
     echo "[bootstrap] systemctl daemon-reload"
 else
     echo "[bootstrap] systemd drop-ins skipped (EVO_INSTALL_SYSTEMD_DROP_INS=0 or --skip-systemd)"
+fi
+
+# ----------------------------------------------------------
+# Step 2.6: /etc/evo/plugins.d/ — distribution-tier plugin configs
+# ----------------------------------------------------------
+# The audio reference distribution ships per-plugin default
+# configurations under /etc/evo/plugins.d/. Each file is the
+# plugin's distribution-tier default; the steward reads these at
+# admission time and merges them with operator overrides.
+#
+# Per the connectivity-check redesign declares that the network plugin's distribution-tier default
+# declares `probe_kind = "off"` — no third-party connectivity
+# probing without explicit operator opt-in.
+#
+# The multi-room plugin's distribution-tier default is rendered from
+# `--multiroom-role` / `--multiroom-group-id` /
+# `--multiroom-source-pcm` / `--multiroom-alsa-pcm` flags. When
+# `--multiroom-role` is unset, no multi-room config is written
+# (the operator configures it later via the UI's first-boot
+# wizard or by re-running the bootstrap with the flags).
+install -d -m 0755 -o root -g root "$PLUGINS_D_DIR"
+chown "$SERVICE_USER:$SERVICE_USER" "$PLUGINS_D_DIR"
+
+# 2.6a — network plugin distribution-tier default
+if [[ "${EVO_INSTALL_NETWORK_PLUGIN_CONFIG:-1}" != "0" ]]; then
+    NETWORK_PLUGIN_TEMPLATE="$DIST_DIR/plugins.d/org.evoframework.network.toml"
+    NETWORK_PLUGIN_PATH="$PLUGINS_D_DIR/org.evoframework.network.toml"
+    if [[ -f "$NETWORK_PLUGIN_TEMPLATE" ]]; then
+        install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            "$NETWORK_PLUGIN_TEMPLATE" "$NETWORK_PLUGIN_PATH"
+        echo "[bootstrap] installed $NETWORK_PLUGIN_PATH (probe_kind=off per the connectivity-check redesign)"
+    else
+        echo "[bootstrap] WARN: network plugin template not found at $NETWORK_PLUGIN_TEMPLATE; skipping"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_NETWORK_PLUGIN_CONFIG=0 — skipping network plugin config"
+fi
+
+# 2.6b — multiroom plugin config (rendered from flags)
+if [[ -n "$MULTIROOM_ROLE" ]]; then
+    case "$MULTIROOM_ROLE" in
+        source|receiver|none) ;;
+        *)
+            echo "--multiroom-role must be one of: source, receiver, none (got: $MULTIROOM_ROLE)" >&2
+            exit 1
+            ;;
+    esac
+    if [[ -z "$MULTIROOM_GROUP_ID" ]]; then
+        echo "--multiroom-role $MULTIROOM_ROLE requires --multiroom-group-id <uuid>" >&2
+        exit 1
+    fi
+    MULTIROOM_TEMPLATE="$DIST_DIR/plugins.d/org.evoframework.multiroom.evo-native.toml.in"
+    MULTIROOM_PATH="$PLUGINS_D_DIR/org.evoframework.multiroom.evo-native.toml"
+    if [[ ! -f "$MULTIROOM_TEMPLATE" ]]; then
+        echo "multiroom template not found at $MULTIROOM_TEMPLATE" >&2
+        exit 2
+    fi
+    case "$MULTIROOM_ROLE" in
+        source)
+            if [[ -z "$MULTIROOM_SOURCE_PCM" ]]; then
+                echo "--multiroom-role source requires --multiroom-source-pcm <alsa-pcm>" >&2
+                exit 1
+            fi
+            MULTIROOM_PCM_LINE="source_pcm = \"$MULTIROOM_SOURCE_PCM\""
+            ;;
+        receiver)
+            if [[ -z "$MULTIROOM_ALSA_PCM" ]]; then
+                echo "--multiroom-role receiver requires --multiroom-alsa-pcm <alsa-pcm>" >&2
+                exit 1
+            fi
+            MULTIROOM_PCM_LINE="alsa_pcm = \"$MULTIROOM_ALSA_PCM\""
+            ;;
+        none)
+            MULTIROOM_PCM_LINE="# no PCM (role=none)"
+            ;;
+    esac
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@MULTIROOM_ROLE@|$MULTIROOM_ROLE|g" \
+        -e "s|@MULTIROOM_GROUP_ID@|$MULTIROOM_GROUP_ID|g" \
+        -e "s|@MULTIROOM_PCM_LINE@|$MULTIROOM_PCM_LINE|g" \
+        "$MULTIROOM_TEMPLATE" > "$TMP"
+    install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+        "$TMP" "$MULTIROOM_PATH"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $MULTIROOM_PATH (role=$MULTIROOM_ROLE, group=$MULTIROOM_GROUP_ID)"
+else
+    echo "[bootstrap] --multiroom-role unset — skipping multiroom plugin config (configure later via UI wizard or re-run bootstrap with --multiroom-role)"
+fi
+
+# ----------------------------------------------------------
+# Step 2.7: disable avahi-daemon (it fights evo's own mDNS on 5353)
+# ----------------------------------------------------------
+# The evo steward binds its own mDNS responder to UDP 5353 for
+# multi-room peer discovery. avahi-daemon (commonly installed on
+# Debian / Raspberry Pi OS) also binds 5353 by default; the two
+# fight for the multicast group and audio-plane peer discovery
+# becomes flaky. Default behaviour: stop + disable avahi-daemon
+# when present. Vendor distributions that need avahi for non-evo
+# services flip `EVO_DISABLE_AVAHI=0`.
+if [[ "${EVO_DISABLE_AVAHI:-1}" != "0" ]]; then
+    if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
+        | grep -q '^avahi-daemon\.service'; then
+        if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null \
+            || "$SYSTEMCTL_BIN" is-enabled --quiet avahi-daemon.service \
+                2>/dev/null; then
+            "$SYSTEMCTL_BIN" disable --now avahi-daemon.service \
+                >/dev/null 2>&1 || true
+            "$SYSTEMCTL_BIN" disable --now avahi-daemon.socket \
+                >/dev/null 2>&1 || true
+            echo "[bootstrap] disabled avahi-daemon (evo binds UDP 5353 directly)"
+        else
+            echo "[bootstrap] avahi-daemon already inactive + disabled"
+        fi
+    else
+        echo "[bootstrap] avahi-daemon not present — no action"
+    fi
+else
+    echo "[bootstrap] EVO_DISABLE_AVAHI=0 — avahi-daemon left as-is"
 fi
 
 # ----------------------------------------------------------
@@ -502,6 +666,55 @@ fi
 # ----------------------------------------------------------
 echo
 echo "[verify] preflight checks:"
+
+# Network plugin config: probe_kind = off connectivity-check-redesign invariant.
+if [[ -f /etc/evo/plugins.d/org.evoframework.network.toml ]]; then
+    NETWORK_PROBE_KIND="$(grep -E '^probe_kind' \
+        /etc/evo/plugins.d/org.evoframework.network.toml 2>/dev/null \
+        | head -1 | sed -E 's/.*=\s*"([^"]+)".*/\1/')"
+    if [[ "$NETWORK_PROBE_KIND" == "off" ]]; then
+        echo "  [ok]    network plugin probe_kind=off (no third-party probing)"
+    else
+        echo "  [WARN]  network plugin probe_kind='${NETWORK_PROBE_KIND}' (default per the connectivity-check redesign is 'off')"
+    fi
+else
+    echo "  [WARN]  /etc/evo/plugins.d/org.evoframework.network.toml not installed (plugin uses code defaults)"
+fi
+
+# Multiroom plugin config: presence + role honesty.
+if [[ -f /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml ]]; then
+    MR_ROLE="$(grep -E '^role' \
+        /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml \
+        2>/dev/null | head -1 | sed -E 's/.*=\s*"([^"]+)".*/\1/')"
+    echo "  [ok]    multiroom plugin config installed (role=${MR_ROLE:-?})"
+else
+    echo "  [skip]  multiroom plugin config not installed (configure via UI wizard or re-run with --multiroom-role)"
+fi
+
+# avahi-daemon must NOT hold UDP 5353 — evo binds it directly.
+if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null; then
+    echo "  [WARN]  avahi-daemon is active — it fights evo's mDNS on UDP 5353"
+    echo "          (set EVO_DISABLE_AVAHI=1 and re-run bootstrap, or disable manually)"
+else
+    echo "  [ok]    avahi-daemon inactive (UDP 5353 free for evo's mDNS responder)"
+fi
+
+# ExecStart override resolves to this distribution's steward
+# binary. The framework reference unit bakes
+# ExecStart=/opt/evo/bin/evo; the exec-start.conf drop-in
+# clears that and substitutes /opt/evo/bin/evo-device-audio.
+# A bare reference unit (no drop-in, or drop-in skipped)
+# would launch the wrong binary on next start. The next-start
+# answer is what matters here, not whether the live PID has
+# the right binary (that reflects the previous unit state).
+EXEC_START_RESOLVED="$("$SYSTEMCTL_BIN" show evo --no-pager -p ExecStart \
+    2>/dev/null | sed -n 's/.*path=\([^ ]*\).*/\1/p' | head -1)"
+if [[ "$EXEC_START_RESOLVED" == "/opt/evo/bin/evo-device-audio" ]]; then
+    echo "  [ok]    evo.service ExecStart resolves to /opt/evo/bin/evo-device-audio"
+else
+    echo "  [WARN]  evo.service ExecStart resolves to '${EXEC_START_RESOLVED:-<unset>}' (expected /opt/evo/bin/evo-device-audio)"
+    echo "          (next \`systemctl restart evo\` will launch the wrong binary; check $SYSTEMD_DROPIN_DIR/exec-start.conf)"
+fi
 
 # MPD-restart sudoers drop-in present + the service user can
 # dry-run the exact command.

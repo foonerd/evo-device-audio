@@ -133,11 +133,35 @@ pub struct SupervisorView {
     pub state_ticks: u32,
 }
 
+/// Connectivity-probe mode. Selects what the on-trigger
+/// `probe_observations` does with the HTTP-reachability leg of
+/// the connectivity verdict. Default is `Off` per the connectivity-check redesign: the
+/// audio reference distribution does not phone any third-party
+/// endpoint without operator opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// No HTTP reachability probe runs. The connectivity verdict
+    /// derives from rtnetlink carrier + NM connectivity verdict +
+    /// Wi-Fi association alone. `internet_reachable` on the
+    /// published subject reports `None`.
+    Off,
+    /// TLS probe against an operator-configured self-hosted
+    /// endpoint (typically `https://<operator-owned>/healthz`).
+    /// No plaintext, no third-party endpoint exposure.
+    HttpsSelfHosted,
+    /// Plaintext HTTP probe against an operator-configured
+    /// captive-portal-detection endpoint. Opt-in for the
+    /// Wi-Fi-join captive-portal flow only.
+    CaptivePortalDetection,
+}
+
 /// Configuration for the supervisor task. Each field is
 /// overridable via `EVO_NETWORK_SUPERVISOR_*` env vars.
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
-    /// Tick period in milliseconds. Default 10 000 ms; min 1000.
+    /// Tick period in milliseconds for the supervisor's safety
+    /// tick (the polling-source cadence is governed separately
+    /// per the connectivity-check redesign). Default 60 000 ms; min 1000.
     pub interval_ms: u64,
     /// How long the supervisor must observe `Offline` before
     /// firing the critical-recovery action. Default 30 000 ms.
@@ -146,10 +170,23 @@ pub struct SupervisorConfig {
     /// after a critical-recovery before firing the STA-restore
     /// action. Default 15 000 ms.
     pub restore_grace_ms: u64,
-    /// Default URL for the connectivity probe. RFC-8910-style
-    /// HTTP 204 endpoint. Default
-    /// `http://connectivitycheck.gstatic.com/generate_204`.
-    pub probe_url: String,
+    /// What kind of HTTP-reachability probe (if any) runs on
+    /// connectivity-classification triggers. Default `Off` per
+    /// the connectivity-check redesign.
+    pub probe_kind: ProbeKind,
+    /// URL for the connectivity probe. Required when `probe_kind`
+    /// is not `Off`. Default `None` (no third-party endpoint
+    /// baked into the distribution; operators configuring a
+    /// probe mode also configure their endpoint).
+    pub probe_url: Option<String>,
+    /// Cold-start window: time since the last non-polling source
+    /// event during which the polling source's `PeriodicTick` is
+    /// honoured as the supervisor's trigger. Beyond this window
+    /// the polling source remains admitted (so a sudden loss of
+    /// all event sources still gets a fallback probe) but its
+    /// `PeriodicTick` events are filtered when an event source
+    /// has fired recently. Default 30 000 ms per the connectivity-check redesign.
+    pub cold_start_window_ms: u64,
 }
 
 impl SupervisorConfig {
@@ -159,7 +196,7 @@ impl SupervisorConfig {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v >= 1000)
-            .unwrap_or(10_000);
+            .unwrap_or(60_000);
         let critical_grace_ms =
             std::env::var("EVO_NETWORK_SUPERVISOR_CRITICAL_GRACE_MS")
                 .ok()
@@ -172,18 +209,36 @@ impl SupervisorConfig {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .filter(|v| *v >= 1000)
                 .unwrap_or(15_000);
+        let probe_kind = match std::env::var("EVO_NETWORK_SUPERVISOR_PROBE_KIND")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("https_self_hosted") => ProbeKind::HttpsSelfHosted,
+            Some("captive_portal_detection") => {
+                ProbeKind::CaptivePortalDetection
+            }
+            // Anything else, including unset, empty, or "off",
+            // resolves to Off — the secure default per the connectivity-check redesign.
+            _ => ProbeKind::Off,
+        };
         let probe_url = std::env::var("EVO_NETWORK_SUPERVISOR_PROBE_URL")
             .ok()
             .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                "http://connectivitycheck.gstatic.com/generate_204".to_string()
-            });
+            .filter(|v| !v.is_empty());
+        let cold_start_window_ms =
+            std::env::var("EVO_NETWORK_SUPERVISOR_COLD_START_WINDOW_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v >= 1000)
+                .unwrap_or(30_000);
         Self {
             interval_ms,
             critical_grace_ms,
             restore_grace_ms,
+            probe_kind,
             probe_url,
+            cold_start_window_ms,
         }
     }
 }
@@ -497,6 +552,22 @@ pub fn spawn_with_sources(
         )
         .await;
 
+        // Track when the last non-polling source emitted an
+        // event. Used to filter the polling source's
+        // `PeriodicTick` per the connectivity-check redesign: when an event source has
+        // fired within `cold_start_window_ms`, the
+        // `PeriodicTick` is redundant and is dropped. When the
+        // window elapses without any non-polling event, the
+        // polling source's tick is honoured as the supervisor's
+        // fallback trigger.
+        //
+        // Initial value `now()` so that the first
+        // `cold_start_window_ms` after boot suppresses polling
+        // ticks (the boot probe already ran above; further
+        // ticks should only fire after event sources have had a
+        // chance to admit and emit).
+        let mut last_non_polling_event_at = std::time::Instant::now();
+
         loop {
             tokio::select! {
                 maybe_event = event_rx.recv() => {
@@ -515,6 +586,38 @@ pub fn spawn_with_sources(
                         let _ = task_shutdown.notified().await;
                         break;
                     };
+                    // Filter the polling source's `PeriodicTick`
+                    // when event sources are healthy: drop if
+                    // the most recent non-polling event was
+                    // within `cold_start_window_ms`.
+                    let is_polling_tick = source == "polling"
+                        && matches!(
+                            event,
+                            crate::source::LinkEvent::PeriodicTick
+                        );
+                    if is_polling_tick {
+                        let elapsed =
+                            last_non_polling_event_at.elapsed().as_millis()
+                                as u64;
+                        if elapsed < config.cold_start_window_ms {
+                            tracing::trace!(
+                                plugin = plugin_log_tag,
+                                source = source,
+                                elapsed_ms = elapsed,
+                                cold_start_window_ms =
+                                    config.cold_start_window_ms,
+                                "supervisor: polling tick filtered — \
+                                 event source fired within cold-start \
+                                 window"
+                            );
+                            continue;
+                        }
+                    } else {
+                        // Any non-polling event resets the
+                        // window.
+                        last_non_polling_event_at =
+                            std::time::Instant::now();
+                    }
                     tracing::trace!(
                         plugin = plugin_log_tag,
                         source = source,

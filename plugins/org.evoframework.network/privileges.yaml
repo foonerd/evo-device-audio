@@ -31,10 +31,16 @@ capability_intent:
     need: invoke `rfkill` to set hardware/software radio block state at the kernel level. Used by the runtime supervisor to enforce flight-mode across radio families (Wi-Fi + Bluetooth) when nmcli's Wi-Fi-only toggle is insufficient, and to coordinate with the bluetooth plugin via the shared `RadioPolicy.flight_mode` bit. Read-only state lookups stay sysfs-direct via `/sys/class/rfkill` (no privilege required).
     access_path: sudoers/command
     failure_mode: structured event names the family that could not be blocked/unblocked; the steward keeps running; sysfs-read state continues to surface accurately for diagnostics.
-  - id: curl_invocation
-    need: invoke `curl` for connectivity probes (RFC 8910 / HTTP-204 captive-portal detection) and captive-portal credential submission. The runtime supervisor reads the probe outcome to distinguish online / portal-detected / full-loss state and to drive the UI escalation contract. Probes are bound to reasonable timeouts via the dispatcher's per-call timeout argument.
-    access_path: sudoers/command
-    failure_mode: connectivity probes return "unknown" rather than asserting online/offline; captive-portal flow surfaces structured event naming the probe failure; no panic.
+  # NOTE: `curl_invocation` was historically declared here as a privileged
+  # capability intent. That declaration was retired by the connectivity-check
+  # event-driven redesign: the routine reachability probe is a GET on a public
+  # endpoint that needs no root, and the default `probe_kind = off` means no
+  # probe runs at all without explicit operator opt-in. The plugin invokes
+  # `curl` (when needed by an opt-in probe mode) via direct exec; sudoers
+  # surface no longer covers it. If a future captive-portal credential-submit
+  # flow needs to bind a specific source interface that requires elevation,
+  # it will declare its own `captive_portal_credential_submit` intent with
+  # the elevation rationale recorded in the manifest at that time.
   - id: nm_connection_control
     need: query and modify NetworkManager connection profiles (list, activate, deactivate, edit). Implementation routes through `nmcli_invocation`; the intent stays declared independently so operator-facing tooling can surface what the plugin requires from the host.
     access_path: sudoers/command
@@ -44,7 +50,7 @@ capability_intent:
     access_path: sudoers/command
     failure_mode: warning + recoverable operator action; structured event distinguishes hardware-vs-software block; no panic.
   - id: connectivity_query
-    need: read NetworkManager connectivity-check state (online / limited / portal / none) for shelf state reporting. Implementation routes through `nmcli_invocation` with read-only `general` / `connection show` argv shapes plus `curl_invocation` for the active connectivity probe layer.
+    need: read NetworkManager connectivity-check state (online / limited / portal / none) for shelf state reporting. Implementation routes through `nmcli_invocation` with read-only `general` / `connection show` argv shapes; the optional reachability probe (when the operator opted into a non-`off` `probe_kind`) invokes curl via direct exec without elevation.
     access_path: sudoers/command
     failure_mode: report unknown connectivity; structured event; no panic.
 
@@ -60,7 +66,7 @@ required_binaries:
     failure_mode: warn at admission and degrade flight-mode coordination to the Wi-Fi-only nmcli path; structured event names the missing binary; the steward keeps running.
   - name: curl
     min_version: "7.74"
-    failure_mode: warn at admission and degrade connectivity / captive-portal probes to the nmcli-only connectivity-check; the steward keeps running.
+    failure_mode: warn at admission. The default `probe_kind = off` means curl is unused at steady state; absence is benign. When the operator opts into a non-`off` `probe_kind` and curl is absent, the on-demand `refresh_connectivity` wire-op returns the subject with `internet_reachable = None` and the structured event names the missing binary; the steward keeps running.
 
 required_kernel_modules: []
 
