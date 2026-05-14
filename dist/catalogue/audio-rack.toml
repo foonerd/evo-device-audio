@@ -154,6 +154,24 @@ name = "audio_options_settings"
 [[subjects]]
 name = "network_connectivity_state"
 
+# Subject type the multi-room source-host plugin announces
+# per group whose source-host role is admitted on the local
+# node. Carries a rolling-window of per-frame audible-time
+# trace records bracketing the in-code stages of the
+# audio path between source-host's frame capture and
+# receiver's `writei` return. The source-host aggregates
+# each receiver's back-report (over the audio-plane
+# control channel) into combined records keyed by
+# `(sequence, receiver_device_id)`. The schema's
+# canonical declaration lives in `evo-catalogue-schemas`
+# under `schemas/org.evoframework/audio/multiroom.v1.toml`.
+# Operators read the current snapshot via the wire-op
+# `audio.multiroom.frame_trace.snapshot` for multi-room
+# verification evidence; the subject is also subscribable
+# for live render in operator UI.
+[[subjects]]
+name = "audio_multiroom_frame_trace"
+
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from
 # the playing track to its album on every song change;
