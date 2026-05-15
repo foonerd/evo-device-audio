@@ -88,6 +88,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::audio_plane::{AudioFrameSeed, AudioPlaneHandle};
+use evo_plugin_sdk::contract::context::SubjectAnnouncer;
+use evo_plugin_sdk::contract::subjects::{
+    ExternalAddressing, SubjectAnnouncement,
+};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -97,6 +101,8 @@ use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+mod device_card;
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -312,6 +318,18 @@ pub struct MultiroomEvoNativePlugin {
     /// from here; the source-capture task writes through.
     #[cfg(feature = "alsa-substrate")]
     trace_state: Option<Arc<TraceState>>,
+    /// Subject announcer handed by the framework at load
+    /// time. Used to publish per-device card envelopes on
+    /// the `audio.multiroom.device_card` subject, one
+    /// instance per entity the plugin cares for. `None`
+    /// until plugin load completes; cleared on unload so a
+    /// re-admission flow starts clean.
+    subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
+    /// Local device id captured at load time from the
+    /// load context. Used as the addressing value for the
+    /// local device's card envelope and as a comparator in
+    /// audio-plane self-loopback paths.
+    local_device_id: Option<String>,
 }
 
 impl MultiroomEvoNativePlugin {
@@ -335,6 +353,8 @@ impl MultiroomEvoNativePlugin {
             )),
             #[cfg(feature = "alsa-substrate")]
             trace_state: None,
+            subject_announcer: None,
+            local_device_id: None,
         }
     }
 
@@ -390,6 +410,90 @@ impl MultiroomEvoNativePlugin {
         self.config = cfg;
         Ok(())
     }
+
+    /// Publish the initial per-device card envelope for the
+    /// local device on the `audio.multiroom.device_card`
+    /// subject. Called once at plugin load with the state the
+    /// plugin can observe immediately (the role badge derived
+    /// from the plugin's configured role, the local device
+    /// id from the audio-plane handle, and the Idle transport
+    /// state as the publish-on-load floor). Subsequent
+    /// publish-on-happening paths fold richer state into the
+    /// envelope as audio-plane / source-host / clock-sync /
+    /// group-membership transitions fire.
+    ///
+    /// Best-effort: announce failures are logged at WARN and
+    /// do not fail plugin load. The card surface degrades
+    /// honestly per the universal honest-degradation contract;
+    /// an unannounced subject is a UI degradation symptom an
+    /// operator surface can render as such.
+    async fn announce_local_device_card(&self) {
+        let (Some(announcer), Some(device_id)) = (
+            self.subject_announcer.as_ref(),
+            self.local_device_id.as_ref(),
+        ) else {
+            return;
+        };
+        let role_badge = match self.config.role {
+            Role::Source => device_card::StateBadge::LeaderOfGroup,
+            Role::Receiver => device_card::StateBadge::MemberOfGroup,
+            Role::Auto => device_card::StateBadge::Solo,
+        };
+        // The display name mirrors the device id prefix in the
+        // current first cut (the framework's device-identity
+        // wire op surfaces the operator-editable display name;
+        // threading it onto the plugin's load context lands as
+        // part of the publish-on-happening iteration). The card
+        // envelope's display_name field is operator-visible;
+        // rendering surfaces fall back to the device-id prefix
+        // until the richer plumbing lands.
+        let display_name = format!(
+            "evo-{}",
+            device_id.split('-').next().unwrap_or(device_id.as_str())
+        );
+        let envelope =
+            device_card::MultiroomDeviceCardEnvelope::initial_for_local_device(
+                device_id.clone(),
+                display_name,
+                role_badge,
+            );
+        let state = match serde_json::to_value(&envelope) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "failed to serialise initial device-card envelope"
+                );
+                return;
+            }
+        };
+        let addressing = ExternalAddressing::new(
+            device_card::DEVICE_CARD_SCHEME,
+            device_id.clone(),
+        );
+        let announcement = SubjectAnnouncement {
+            subject_type: device_card::DEVICE_CARD_SUBJECT_TYPE.to_string(),
+            addressings: vec![addressing],
+            claims: Vec::new(),
+            state,
+            announced_at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = announcer.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                device_or_group_id = %device_id,
+                "announce audio.multiroom.device_card subject failed"
+            );
+        } else {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                device_or_group_id = %device_id,
+                "audio.multiroom.device_card subject announced for local device"
+            );
+        }
+    }
 }
 
 impl Default for MultiroomEvoNativePlugin {
@@ -434,6 +538,8 @@ impl Plugin for MultiroomEvoNativePlugin {
             tracing::info!(plugin = PLUGIN_NAME, "plugin load beginning");
             self.apply_config(&ctx.config)?;
 
+            self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
+
             let audio_plane = ctx
                 .audio_plane
                 .as_ref()
@@ -448,6 +554,7 @@ impl Plugin for MultiroomEvoNativePlugin {
                 })?
                 .clone();
             self.audio_plane = Some(Arc::clone(&audio_plane));
+            self.local_device_id = Some(audio_plane.local_device_id());
 
             match self.config.role {
                 Role::Source => {
@@ -607,6 +714,8 @@ impl Plugin for MultiroomEvoNativePlugin {
                 }
             }
 
+            self.announce_local_device_card().await;
+
             self.loaded = true;
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -629,6 +738,8 @@ impl Plugin for MultiroomEvoNativePlugin {
                 let _ = task.await;
             }
             self.audio_plane = None;
+            self.subject_announcer = None;
+            self.local_device_id = None;
             self.loaded = false;
             tracing::info!(
                 plugin = PLUGIN_NAME,
