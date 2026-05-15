@@ -172,6 +172,23 @@ name = "network_connectivity_state"
 [[subjects]]
 name = "audio_multiroom_frame_trace"
 
+# Subject type the multi-room plugin announces per
+# device-or-group entity it cares for. The envelope carries
+# the unified rendering shape for the multi-room UI card
+# surface (state-to-visual mapping per transport state +
+# unified shape across solo / group / subgroup / master
+# cases); UI cards subscribe once per entity and receive
+# every transition reactively through the framework's
+# subject-state subscription substrate. The schema's
+# canonical declaration lives in `evo-catalogue-schemas`
+# under `schemas/org.evoframework/audio/multiroom.v1.toml`;
+# the public design source-of-truth covering state-to-visual
+# mapping, list/tile geometry, theme placeholder rules, and
+# breadcrumb composition lives in `evo-ui-eng/docs/
+# CARD-DESIGN-SOURCE.md`.
+[[subjects]]
+name = "audio_multiroom_device_card"
+
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from
 # the playing track to its album on every song change;
