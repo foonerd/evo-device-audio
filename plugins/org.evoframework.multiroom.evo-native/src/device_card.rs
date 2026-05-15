@@ -102,7 +102,7 @@ pub enum TransportState {
     /// recently.
     Offline,
     /// Entity is discovered via mDNS but not yet admitted
-    /// to the household.
+    /// to the domain.
     Unpaired,
     /// Entity was previously admitted and has been
     /// operator-revoked.
@@ -152,7 +152,7 @@ pub struct MasterGroupContext {
 }
 
 /// Per-device card envelope. One instance per device-or-group
-/// entity in the household; published on the
+/// entity in the domain; published on the
 /// `audio.multiroom.device_card` subject. Shape matches the
 /// schema declaration in the catalogue-schemas repo.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
