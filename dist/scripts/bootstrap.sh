@@ -322,6 +322,11 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
         "$SYSTEMD_DROPIN_DIR/mpd-restart-privileges.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/mpd-restart-privileges.conf"
 
+    install -m 0644 -o root -g root \
+        "$DIST_DIR/systemd/evo.service.d/https.conf" \
+        "$SYSTEMD_DROPIN_DIR/https.conf"
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/https.conf"
+
     "$SYSTEMCTL_BIN" daemon-reload
     echo "[bootstrap] systemctl daemon-reload"
 else
@@ -755,6 +760,28 @@ if [[ -f /etc/evo/client_acl.toml ]]; then
     echo "  [ok]    /etc/evo/client_acl.toml installed (plans_admin + plugins_admin + reconciliation_admin granted to matching-UID local peers)"
 else
     echo "  [WARN]  /etc/evo/client_acl.toml absent — operator wire-ops (evo-plugin-tool plan / admin) will be refused until installed"
+fi
+
+# HTTPS substrate drop-in: the framework reference unit
+# declares no HTTPS environment because the framework binary
+# is transport-agnostic; the distribution layers an
+# `https.conf` drop-in that wires EVO_HTTPS_LISTEN_ADDR +
+# EVO_HTTPS_STATE_DIR + EVO_HTTPS_STATIC_DIR. Verify the
+# drop-in is in place and the listen address resolves;
+# without it the operator UI's browser cannot reach the
+# device because there is no HTTPS listener bound.
+if [[ -f "$SYSTEMD_DROPIN_DIR/https.conf" ]]; then
+    HTTPS_LISTEN_RESOLVED="$("$SYSTEMCTL_BIN" show evo --no-pager -p Environment \
+        2>/dev/null | tr ' ' '\n' | grep -oE 'EVO_HTTPS_LISTEN_ADDR=[^[:space:]]+' \
+        | head -1 | cut -d= -f2)"
+    if [[ -n "$HTTPS_LISTEN_RESOLVED" ]]; then
+        echo "  [ok]    evo HTTPS drop-in installed; EVO_HTTPS_LISTEN_ADDR=$HTTPS_LISTEN_RESOLVED"
+    else
+        echo "  [WARN]  evo HTTPS drop-in present but EVO_HTTPS_LISTEN_ADDR not resolved from unit env"
+        echo "          (review $SYSTEMD_DROPIN_DIR/https.conf)"
+    fi
+else
+    echo "  [WARN]  evo HTTPS drop-in absent — operator browser cannot reach the device; bootstrap should install $SYSTEMD_DROPIN_DIR/https.conf"
 fi
 
 # Audio chain probe: confirm the rendered `ctl.evo` opens
