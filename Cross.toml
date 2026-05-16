@@ -41,11 +41,17 @@
 #    on every fresh container start. Other targets that do
 #    not enable `alsa-substrate` are unaffected.
 
+[build.env]
+volumes = ["EVO_CORE_ENG"]
+
 [target.x86_64-unknown-linux-gnu]
 pre-build = [
     "apt-get update",
     "apt-get install --assume-yes libasound2-dev pkg-config",
 ]
+
+[target.x86_64-unknown-linux-gnu.env]
+volumes = ["EVO_CORE_ENG"]
 
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
@@ -54,9 +60,15 @@ pre-build = [
     "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
 ]
 
+[target.aarch64-unknown-linux-gnu.env]
+volumes = ["EVO_CORE_ENG"]
+
 [target.armv7-unknown-linux-gnueabihf]
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update",
     "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
 ]
+
+[target.armv7-unknown-linux-gnueabihf.env]
+volumes = ["EVO_CORE_ENG"]
