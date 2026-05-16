@@ -43,6 +43,13 @@
 #                                       into /etc/mpd.conf
 #   EVO_AUDIO_CARD=<name>              — override auto-detected ALSA card name
 #                                       (env-var form; also available as --card)
+#   EVO_PRESERVE_MULTIROOM_TOML=1      — skip overwriting an existing
+#                                       /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml.
+#                                       Default (unset or 0) overwrites from the
+#                                       bootstrap flags every run, matching the
+#                                       fresh-install ergonomic. Set to 1 in
+#                                       binary-upgrade flows to preserve operator-
+#                                       tuned member lists across bootstrap re-runs.
 #
 # Per-step toggles let operators disable individual install
 # legs without editing this script — useful when a vendor
@@ -73,6 +80,8 @@ MULTIROOM_ROLE=""
 MULTIROOM_GROUP_ID=""
 MULTIROOM_SOURCE_PCM=""
 MULTIROOM_ALSA_PCM=""
+MULTIROOM_GROUP_MEMBERS=""
+MULTIROOM_GROUP_MEMBER_ADDRESSES=""
 
 # Argument parsing — minimal; positional args not supported.
 while [[ $# -gt 0 ]]; do
@@ -129,6 +138,22 @@ while [[ $# -gt 0 ]]; do
             MULTIROOM_ALSA_PCM="${1#--multiroom-alsa-pcm=}"
             shift
             ;;
+        --multiroom-group-members)
+            MULTIROOM_GROUP_MEMBERS="$2"
+            shift 2
+            ;;
+        --multiroom-group-members=*)
+            MULTIROOM_GROUP_MEMBERS="${1#--multiroom-group-members=}"
+            shift
+            ;;
+        --multiroom-group-member-addresses)
+            MULTIROOM_GROUP_MEMBER_ADDRESSES="$2"
+            shift 2
+            ;;
+        --multiroom-group-member-addresses=*)
+            MULTIROOM_GROUP_MEMBER_ADDRESSES="${1#--multiroom-group-member-addresses=}"
+            shift
+            ;;
         -h|--help)
             grep -E '^# ' "$0" | sed 's/^# //'
             exit 0
@@ -137,7 +162,9 @@ while [[ $# -gt 0 ]]; do
             echo "unknown argument: $1" >&2
             echo "usage: $0 [--service-user <name>] [--card <NAME>] [--skip-systemd] \\" >&2
             echo "    [--multiroom-role source|receiver|none] [--multiroom-group-id <uuid>] \\" >&2
-            echo "    [--multiroom-source-pcm <alsa-pcm>] [--multiroom-alsa-pcm <alsa-pcm>]" >&2
+            echo "    [--multiroom-source-pcm <alsa-pcm>] [--multiroom-alsa-pcm <alsa-pcm>] \\" >&2
+            echo "    [--multiroom-group-members \"<dev-id>,<dev-id>,...\"] \\" >&2
+            echo "    [--multiroom-group-member-addresses \"<host>:<port>,<host>:<port>,...\"]" >&2
             exit 1
             ;;
     esac
@@ -370,6 +397,37 @@ else
 fi
 
 # 2.6b — multiroom plugin config (rendered from flags)
+#
+# Convert a comma-separated list ("a,b,c") to a TOML array
+# literal (["a", "b", "c"]). Trims whitespace around each
+# element; emits an empty array literal for an empty input.
+# Used to render --multiroom-group-members and
+# --multiroom-group-member-addresses into the template.
+csv_to_toml_array() {
+    local input="$1"
+    if [[ -z "$input" ]]; then
+        echo "[]"
+        return
+    fi
+    local out="["
+    local first=1
+    local item
+    local IFS=','
+    for item in $input; do
+        # Trim surrounding whitespace.
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        if [[ $first -eq 1 ]]; then
+            first=0
+        else
+            out+=", "
+        fi
+        out+="\"$item\""
+    done
+    out+="]"
+    echo "$out"
+}
+
 if [[ -n "$MULTIROOM_ROLE" ]]; then
     case "$MULTIROOM_ROLE" in
         source|receiver|none) ;;
@@ -388,6 +446,21 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
         echo "multiroom template not found at $MULTIROOM_TEMPLATE" >&2
         exit 2
     fi
+    # Source role mandates the receiver-list pair. The plugin's
+    # apply_config refuses to load a source-role config missing
+    # either field; fail at bootstrap time with the same
+    # contract so operator-visible breakage stays at install
+    # time, not at first plugin admission.
+    if [[ "$MULTIROOM_ROLE" == "source" ]]; then
+        if [[ -z "$MULTIROOM_GROUP_MEMBERS" ]]; then
+            echo "--multiroom-role source requires --multiroom-group-members \"<device-id>,<device-id>,...\"" >&2
+            exit 1
+        fi
+        if [[ -z "$MULTIROOM_GROUP_MEMBER_ADDRESSES" ]]; then
+            echo "--multiroom-role source requires --multiroom-group-member-addresses \"<host>:<port>,<host>:<port>,...\"" >&2
+            exit 1
+        fi
+    fi
     case "$MULTIROOM_ROLE" in
         source)
             if [[ -z "$MULTIROOM_SOURCE_PCM" ]]; then
@@ -395,6 +468,8 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
                 exit 1
             fi
             MULTIROOM_PCM_LINE="source_pcm = \"$MULTIROOM_SOURCE_PCM\""
+            MULTIROOM_GROUP_MEMBERS_LINE="group_members = $(csv_to_toml_array "$MULTIROOM_GROUP_MEMBERS")"
+            MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="group_member_addresses = $(csv_to_toml_array "$MULTIROOM_GROUP_MEMBER_ADDRESSES")"
             ;;
         receiver)
             if [[ -z "$MULTIROOM_ALSA_PCM" ]]; then
@@ -402,22 +477,47 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
                 exit 1
             fi
             MULTIROOM_PCM_LINE="alsa_pcm = \"$MULTIROOM_ALSA_PCM\""
+            # group_members + group_member_addresses are source-
+            # role-only. Receivers render every frame that
+            # arrives on the audio plane regardless of group, so
+            # they do not need the membership list. Emit empty
+            # placeholder lines (the comment keeps the line non-
+            # empty so the template stays well-formed).
+            MULTIROOM_GROUP_MEMBERS_LINE="# group_members (source role only)"
+            MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
         none)
             MULTIROOM_PCM_LINE="# no PCM (role=none)"
+            MULTIROOM_GROUP_MEMBERS_LINE="# group_members (source role only)"
+            MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
     esac
-    TMP="$(mktemp)"
-    trap 'rm -f "$TMP"' EXIT
-    sed -e "s|@MULTIROOM_ROLE@|$MULTIROOM_ROLE|g" \
-        -e "s|@MULTIROOM_GROUP_ID@|$MULTIROOM_GROUP_ID|g" \
-        -e "s|@MULTIROOM_PCM_LINE@|$MULTIROOM_PCM_LINE|g" \
-        "$MULTIROOM_TEMPLATE" > "$TMP"
-    install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-        "$TMP" "$MULTIROOM_PATH"
-    rm -f "$TMP"
-    trap - EXIT
-    echo "[bootstrap] installed $MULTIROOM_PATH (role=$MULTIROOM_ROLE, group=$MULTIROOM_GROUP_ID)"
+    # Preservation gate: when EVO_PRESERVE_MULTIROOM_TOML=1 and
+    # the target file already exists, skip the overwrite so
+    # operator-tuned member lists survive bootstrap re-runs
+    # (e.g. on binary upgrade). Default behaviour (unset or 0)
+    # overwrites unconditionally — matches the fresh-install
+    # ergonomic. The plugin's load-time validation still kicks
+    # in on the preserved file, so a stale source-role config
+    # missing the new fields fails loudly on next admission.
+    if [[ -f "$MULTIROOM_PATH" \
+        && "${EVO_PRESERVE_MULTIROOM_TOML:-0}" == "1" ]]; then
+        echo "[bootstrap] preserved existing $MULTIROOM_PATH (EVO_PRESERVE_MULTIROOM_TOML=1)"
+    else
+        TMP="$(mktemp)"
+        trap 'rm -f "$TMP"' EXIT
+        sed -e "s|@MULTIROOM_ROLE@|$MULTIROOM_ROLE|g" \
+            -e "s|@MULTIROOM_GROUP_ID@|$MULTIROOM_GROUP_ID|g" \
+            -e "s|@MULTIROOM_GROUP_MEMBERS_LINE@|$MULTIROOM_GROUP_MEMBERS_LINE|g" \
+            -e "s|@MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE@|$MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE|g" \
+            -e "s|@MULTIROOM_PCM_LINE@|$MULTIROOM_PCM_LINE|g" \
+            "$MULTIROOM_TEMPLATE" > "$TMP"
+        install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            "$TMP" "$MULTIROOM_PATH"
+        rm -f "$TMP"
+        trap - EXIT
+        echo "[bootstrap] installed $MULTIROOM_PATH (role=$MULTIROOM_ROLE, group=$MULTIROOM_GROUP_ID)"
+    fi
 else
     echo "[bootstrap] --multiroom-role unset — skipping multiroom plugin config (configure later via UI wizard or re-run bootstrap with --multiroom-role)"
 fi

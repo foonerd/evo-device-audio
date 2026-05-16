@@ -11,6 +11,16 @@
 #             audio plane. Set `--multiroom-source-pcm` to the
 #             ALSA PCM the capture half binds (e.g.
 #             `hw:Loopback,1,0` for a standard snd-aloop wiring).
+#             Source role additionally requires
+#             `--multiroom-group-members` (the receiver device
+#             ids it fans out to) and
+#             `--multiroom-group-member-addresses` (each
+#             receiver's audio-plane host:port). The plugin
+#             instantiates the group from `group_members` on
+#             load and dials each address in
+#             `group_member_addresses` directly — the source-
+#             host is the active dialer, receivers stay passive
+#             listeners.
 #   - receiver: device renders frames received from the group's
 #               source host through `--multiroom-alsa-pcm` (the
 #               configured ALSA PCM, e.g. `evo` for the
@@ -24,5 +34,7 @@
 
 role = "@MULTIROOM_ROLE@"
 group_id = "@MULTIROOM_GROUP_ID@"
+@MULTIROOM_GROUP_MEMBERS_LINE@
+@MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE@
 @MULTIROOM_PCM_LINE@
 leader_ms = 200
