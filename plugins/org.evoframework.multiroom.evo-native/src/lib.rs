@@ -66,6 +66,14 @@
 //! ```toml
 //! role = "source"             # "source" | "receiver" | "auto"
 //! group_id = "<uuid>"         # required when role = "source"
+//! group_members = [           # required when role = "source"
+//!   "<device-id-a>",          # every receiver's device id; the
+//!   "<device-id-b>",          # source-host instantiates the group
+//! ]                           # locally from this list at load
+//! group_member_addresses = [  # required when role = "source"
+//!   "<host>:<port>",          # every receiver's audio-plane TCP
+//!   "<host>:<port>",          # address; the source-host dials each
+//! ]                           # one at load (unidirectional dial)
 //! alsa_pcm = "evo"            # ALSA playback device (receiver)
 //! source_pcm = "evo_loopback" # ALSA capture device (source);
 //!                             # empty/unset => synthetic 440 Hz
@@ -189,6 +197,33 @@ struct PluginConfig {
     /// `role = "source"`).
     #[serde(default)]
     group_id: Option<String>,
+    /// Group member device ids (required when
+    /// `role = "source"`; ignored when `role = "receiver"` or
+    /// `role = "auto"`). The source-host plugin instantiates
+    /// the group locally on load using this list — operator
+    /// declares membership in plugin config rather than
+    /// having to call the `create_group` wire op separately.
+    /// Single source of truth for group membership lives in
+    /// the source-host's plugin TOML; receivers do not need
+    /// the list because the audio-plane receive path renders
+    /// every frame that arrives regardless of group.
+    #[serde(default)]
+    group_members: Vec<String>,
+    /// Reachable address (`host:port`) of every receiver the
+    /// source-host should dial on load. Required when
+    /// `role = "source"`; ignored when `role = "receiver"` or
+    /// `role = "auto"`. Order is irrelevant. The source-host
+    /// is the active dialer (receivers stay passive
+    /// listeners), so the dial direction is unambiguous and
+    /// the audio-plane TCP session is owned by exactly one
+    /// peer — eliminates the duplicate-connect race where two
+    /// peers race to open the same control channel and one
+    /// silently wins. Each address is fed to
+    /// `audio_plane.dial_peer()` once per plugin load.
+    /// Idempotent: an already-established peer connection is a
+    /// successful no-op.
+    #[serde(default)]
+    group_member_addresses: Vec<String>,
     /// ALSA playback device the receiver writes to. Defaults
     /// to `"evo"` — the modular pipeline pcm name
     /// delivery.alsa stocks. Operators with multiple cards
@@ -230,6 +265,8 @@ impl Default for PluginConfig {
         Self {
             role: default_role(),
             group_id: None,
+            group_members: Vec::new(),
+            group_member_addresses: Vec::new(),
             alsa_pcm: default_alsa_pcm(),
             source_pcm: String::new(),
             leader_ms: default_leader_ms(),
@@ -405,6 +442,24 @@ impl MultiroomEvoNativePlugin {
                     .into(),
             ));
         }
+        if cfg.role == Role::Source && cfg.group_members.is_empty() {
+            return Err(PluginError::Permanent(
+                "role = \"source\" requires group_members = [\"<device-id>\", \
+                 ...] in plugin config (single source of truth for group \
+                 membership on the source-host)"
+                    .into(),
+            ));
+        }
+        if cfg.role == Role::Source && cfg.group_member_addresses.is_empty() {
+            return Err(PluginError::Permanent(
+                "role = \"source\" requires group_member_addresses = \
+                 [\"<host>:<port>\", ...] in plugin config (each receiver's \
+                 audio-plane TCP address; source-host dials these directly on \
+                 load so audio-plane fan-out has a connected target before \
+                 the first frame)"
+                    .into(),
+            ));
+        }
         self.leader_ms
             .store(cfg.leader_ms, std::sync::atomic::Ordering::Relaxed);
         self.config = cfg;
@@ -561,6 +616,67 @@ impl Plugin for MultiroomEvoNativePlugin {
                     let group_id = self.config.group_id.clone().expect(
                         "role = source enforces group_id in apply_config",
                     );
+                    // Instantiate the group from operator
+                    // config — single source of truth lives in
+                    // this plugin's TOML, the framework's
+                    // GroupStore is the implementation. Idempotent
+                    // upsert: re-loads with the same config are
+                    // no-ops; config changes (membership churn)
+                    // are picked up by the framework's next
+                    // fan-out without operator intervention. No
+                    // wire-op call required.
+                    audio_plane
+                        .upsert_group(
+                            group_id.clone(),
+                            format!("multiroom:{group_id}"),
+                            self.config.group_members.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            PluginError::Permanent(format!(
+                                "source-host failed to instantiate group \
+                                 {group_id}: {e}"
+                            ))
+                        })?;
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        group_id = %group_id,
+                        members = ?self.config.group_members,
+                        "source-host instantiated multi-room group from \
+                         operator config"
+                    );
+                    // Dial each receiver's audio-plane address
+                    // declared in operator config. Source-host is
+                    // the active dialer; receivers stay passive
+                    // listeners — unambiguous TCP-session
+                    // ownership eliminates the duplicate-connect
+                    // race where two peers race to open the same
+                    // control channel. Idempotent: already-
+                    // connected peers are no-ops. A failed dial
+                    // is logged and the next plugin load retries.
+                    for addr in &self.config.group_member_addresses {
+                        match audio_plane.dial_peer(addr.clone()).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    plugin = PLUGIN_NAME,
+                                    group_id = %group_id,
+                                    addr = %addr,
+                                    "source-host dialed receiver"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    group_id = %group_id,
+                                    addr = %addr,
+                                    error = %e,
+                                    "source-host dial_peer failed; will not \
+                                     reach this receiver until next plugin \
+                                     load"
+                                );
+                            }
+                        }
+                    }
                     let sent = Arc::clone(&self.frames_sent);
                     let shutdown = Arc::clone(&self.shutdown);
                     let handle = Arc::clone(&audio_plane);
@@ -682,6 +798,31 @@ impl Plugin for MultiroomEvoNativePlugin {
                     }
                 }
                 Role::Receiver | Role::Auto => {
+                    // Spawn the receiver task only when the
+                    // plugin has been wired into a multi-room
+                    // group. `Role::Auto` with no group is the
+                    // default (no operator multi-room
+                    // configuration); in that state the plugin
+                    // must NOT open the local DAC, otherwise
+                    // MPD's local-playback path is locked out.
+                    // `Role::Receiver` is an explicit operator
+                    // gesture and always opens the DAC even
+                    // when group state has not yet replicated
+                    // to this node — the operator intent to
+                    // render incoming network audio is
+                    // unambiguous.
+                    let has_group = self.config.group_id.is_some();
+                    let auto_no_group =
+                        matches!(self.config.role, Role::Auto) && !has_group;
+                    if auto_no_group {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            "Role::Auto with no group_id; receiver task NOT \
+                             spawned (local DAC stays free for MPD)"
+                        );
+                        self.loaded = true;
+                        return Ok(());
+                    }
                     let counter = Arc::clone(&self.frames_received);
                     let shutdown = Arc::clone(&self.shutdown);
                     let handle = Arc::clone(&audio_plane);
@@ -2187,12 +2328,22 @@ mod tests {
         let toml_str = r#"
 role = "source"
 group_id = "abc-123"
+group_members = ["device-a", "device-b"]
+group_member_addresses = ["10.0.0.2:7331", "10.0.0.3:7331"]
 "#;
         let table: toml::Table = toml::from_str(toml_str).unwrap();
         let mut p = MultiroomEvoNativePlugin::new();
         p.apply_config(&table).unwrap();
         assert_eq!(p.config.role, Role::Source);
         assert_eq!(p.config.group_id.as_deref(), Some("abc-123"));
+        assert_eq!(
+            p.config.group_members,
+            vec!["device-a".to_string(), "device-b".to_string()],
+        );
+        assert_eq!(
+            p.config.group_member_addresses,
+            vec!["10.0.0.2:7331".to_string(), "10.0.0.3:7331".to_string()],
+        );
     }
 
     #[test]
@@ -2202,6 +2353,47 @@ group_id = "abc-123"
         let mut p = MultiroomEvoNativePlugin::new();
         let err = p.apply_config(&table).unwrap_err();
         assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[test]
+    fn parse_source_without_group_members_refuses() {
+        let toml_str = r#"
+role = "source"
+group_id = "abc-123"
+"#;
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let mut p = MultiroomEvoNativePlugin::new();
+        let err = p.apply_config(&table).unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("group_members"),
+                    "expected error to name group_members; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent error; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_source_without_group_member_addresses_refuses() {
+        let toml_str = r#"
+role = "source"
+group_id = "abc-123"
+group_members = ["device-a", "device-b"]
+"#;
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let mut p = MultiroomEvoNativePlugin::new();
+        let err = p.apply_config(&table).unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("group_member_addresses"),
+                    "expected error to name group_member_addresses; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent error; got {other:?}"),
+        }
     }
 
     #[test]
