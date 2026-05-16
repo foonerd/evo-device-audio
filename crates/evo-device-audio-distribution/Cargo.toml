@@ -41,6 +41,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# Parse the multi-room plugin's TOML at the post-admission
+# hook so the audio topology can mirror the operator-declared
+# role (source-host vs receiver/auto). Single source of truth
+# is the plugin's TOML; this dep is how the distribution reads
+# it.
+toml = { workspace = true }
 
 [features]
 default = []
