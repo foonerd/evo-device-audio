@@ -243,7 +243,7 @@ fn linux_effective_uid() -> Option<u32> {
 /// systemctl. Mirrors volumio-evo's
 /// `restart_mpd_use_sudo_only` heuristic: on Linux read
 /// `/proc/self/status`; on other platforms or when `/proc` is
-/// unreadable, defer to `EVO_RUNTIME_USER` set by the
+/// unreadable, fall back to `EVO_RUNTIME_USER` set by the
 /// distribution's bootstrap script.
 pub(crate) fn process_needs_sudo() -> bool {
     #[cfg(target_os = "linux")]

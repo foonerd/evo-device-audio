@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
 # Cross-compile evo-device-audio plugins for non-host targets,
 # wrapping `cross` (https://github.com/cross-rs/cross) with the
-# v0.1.13 path-dep workaround.
+# path-dep workaround the current development tree needs.
 #
 # Why this script exists:
 #
 #   evo-device-audio's [workspace.dependencies] pins
 #   evo-plugin-sdk via a path dep on the sibling
-#   evo-core-eng clone for v0.1.13 development. cross-rs
-#   auto-mounts each path-dep crate directory into the
-#   container at the host-canonical path, but does NOT mount
-#   the path-dep's workspace root. evo-plugin-sdk inherits
+#   evo-core-eng clone during development. cross-rs auto-mounts
+#   each path-dep crate directory into the container at the
+#   host-canonical path, but does NOT mount the path-dep's
+#   workspace root. evo-plugin-sdk inherits
 #   `edition.workspace = true`; cargo must walk up to
 #   evo-core-eng's Cargo.toml to resolve the inheritance.
 #
 #   This script supplies the missing volume mount via
-#   CROSS_CONTAINER_OPTS. At v0.1.13 release-cut the SDK pin
-#   flips back to a git+tag form and this script's workaround
-#   can be removed.
+#   CROSS_CONTAINER_OPTS. When the SDK pin flips back to a
+#   git+tag form, this script's workaround can be removed.
 #
 # Usage:
 #

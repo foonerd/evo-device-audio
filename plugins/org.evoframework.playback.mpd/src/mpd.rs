@@ -66,8 +66,8 @@
 //!   the module.
 //!
 //! Removing the module-level attribute requires a per-item
-//! `#[cfg(test)]` or `#[allow(dead_code)]` audit and is deferred
-//! to a later housekeeping commit.
+//! `#[cfg(test)]` or `#[allow(dead_code)]` audit; that audit
+//! lands in a later housekeeping commit.
 
 #![allow(dead_code)]
 
