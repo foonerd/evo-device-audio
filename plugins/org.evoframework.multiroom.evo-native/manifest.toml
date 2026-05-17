@@ -35,6 +35,41 @@ hot_reload = "restart"
 autostart = true
 restart_on_crash = true
 restart_budget = 5
+# Reactive-only mode declares this plugin observes its
+# operator-mutable state from framework substrate (group
+# composition, per-device role, per-group leader_ms,
+# peer-endpoint discovery, presence) via subscription rather
+# than re-reading TOML on every config gesture. The framework
+# admits the plugin once at boot; subsequent operator
+# gestures land via wire ops (`admin.group.*`,
+# `admin.multiroom.*`) that mutate the substrate; the plugin
+# observes the mutations on its subscription loop and
+# reconfigures in place — release DAC, open different DAC,
+# drop subscriptions to old group's frames, subscribe to new
+# group's frames — all without lifecycle churn.
+mode = "reactive-only"
+# Per-plugin teardown + admit deadlines (defaults are 5000ms
+# each). The reactive-only mode never tears down post-admit,
+# so `teardown_deadline_ms` applies only to operator-
+# gestured plugin disable; `admit_deadline_ms` bounds the
+# admit-time substrate-read + subscription-registration work.
+teardown_deadline_ms = 5000
+admit_deadline_ms = 5000
+
+# Non-disruptive defaults — the framework substitutes these
+# when both the operator-supplied TOML and the prior-known-
+# good TOML fail to admit. The defaults admit the plugin in
+# `role = auto` mode (no multi-room engagement, DAC stays
+# free for local-only MPD); operator gestures engage
+# multi-room when ready. Field shape is plugin-specific; the
+# framework treats this block opaquely and feeds the fields
+# to the plugin's load() path on the fall-back path.
+[lifecycle.defaults]
+alsa_pcm = "evo"
+# Source role unsupported under defaults — operator-installed
+# loopback PCM is required for capture, and the default has
+# no operator gesture to engage source role.
+source_pcm = ""
 
 # This plugin participates in the multi-room audio-plane: it
 # fans audio frames out to receivers when the local node is
