@@ -860,7 +860,8 @@ async fn recover_from_substrate(
 
 /// Determine the plugin's initial engagement at load() time.
 ///
-/// Grace-period semantics per ADR-0130 §Decision 6:
+/// Grace-period semantics — TOML serves as the bootstrap
+/// source until substrate gestures supersede it:
 /// 1. If substrate is wired AND has a role for this device →
 ///    substrate wins. Group + members come from substrate.
 /// 2. If substrate is wired but empty for this device → use
@@ -1273,10 +1274,10 @@ impl Plugin for MultiroomEvoNativePlugin {
                 trace_state_slot,
             });
 
-            // Determine initial role + group from substrate
-            // (per ADR-0130 Decision 6 grace period: substrate
-            // wins on conflict; fall back to TOML when
-            // substrate is empty for this device).
+            // Determine initial role + group: substrate wins
+            // on conflict; fall back to TOML when substrate is
+            // empty for this device (bootstrap grace period
+            // until first operator-issued substrate gesture).
             let (initial_role, group_id, members, member_addresses) =
                 resolve_initial_engagement(
                     ctx.multiroom_substrate.as_ref(),
