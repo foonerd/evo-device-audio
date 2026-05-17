@@ -723,9 +723,43 @@ fi
 
 # ----------------------------------------------------------
 # Step 4: /etc/asound.conf — modular ALSA pipeline (pcm.evo)
+#
+# Two templates ship in dist/alsa/:
+#
+#   - asound.conf         — receiver / auto default: pcm.evo
+#                           writes straight to the local DAC.
+#   - asound.conf.source  — source-host variant: pcm.evo fans
+#                           the same stereo signal to BOTH the
+#                           local DAC AND a snd-aloop playback
+#                           subdevice. The evo multiroom plugin's
+#                           source-side capture task reads from
+#                           the matching loopback capture
+#                           subdevice and fans across the multi-
+#                           room fabric while the local DAC keeps
+#                           playing. Requires the `snd-aloop`
+#                           kernel module loaded (handled below).
+#
+# Selection: when `--multiroom-role=source` was supplied, use
+# the source-host variant. Otherwise the receiver / auto default.
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
-    ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
+    if [[ "${MULTIROOM_ROLE:-}" == "source" ]]; then
+        ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf.source"
+        # Source-host fan-out wiring needs the `snd-aloop`
+        # kernel module. Load it now AND persist via
+        # /etc/modules-load.d/ so the module reloads across
+        # reboots without operator intervention.
+        if ! lsmod | grep -q '^snd_aloop'; then
+            modprobe snd-aloop
+            echo "[bootstrap] loaded snd-aloop kernel module"
+        fi
+        install -d -m 0755 /etc/modules-load.d
+        echo "snd-aloop" > /etc/modules-load.d/evo-snd-aloop.conf
+        chmod 0644 /etc/modules-load.d/evo-snd-aloop.conf
+        echo "[bootstrap] persisted snd-aloop in /etc/modules-load.d/evo-snd-aloop.conf"
+    else
+        ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
+    fi
     if [[ ! -f "$ASOUND_TEMPLATE" ]]; then
         echo "asound template not found at $ASOUND_TEMPLATE" >&2
         exit 2
