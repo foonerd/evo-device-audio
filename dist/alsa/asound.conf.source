@@ -1,0 +1,86 @@
+# Modular ALSA pipeline definition for evo-device-audio source-hosts.
+# Installed at `/etc/asound.conf` by the distribution's bootstrap
+# script when `--multiroom-role=source` is supplied. ALSA reads
+# `/etc/asound.conf` (system-wide) at every PCM open; no include
+# glob needed — this is the canonical place for the system's audio
+# pipeline definition.
+#
+# Source-host distinction: `pcm.evo` fans the same stereo signal
+# to TWO destinations simultaneously so the evo multiroom plugin's
+# source-side capture task can read the live mix and fan it across
+# the multi-room fabric while the local DAC continues to play.
+#
+# Pipeline shape:
+#
+#   MPD (or any evo producer)
+#       → pcm.evo
+#           → plug (format / rate / channel normalisation)
+#           → route (stereo duplicated to 4 channels)
+#           → multi
+#               → channels 0,1 → plug → hw:CARD=@EVO_AUDIO_CARD@,DEV=0
+#               → channels 2,3 → plug → hw:CARD=Loopback,DEV=0,SUBDEV=0
+#                                          ↓ (kernel mirror)
+#                                       hw:CARD=Loopback,DEV=1,SUBDEV=0
+#                                          ↓
+#                                  evo multiroom plugin's
+#                                  `source_pcm` capture target
+#                                          ↓
+#                                  fans frames across the
+#                                  multi-room fabric to receivers
+#
+# `@EVO_AUDIO_CARD@` is substituted at install time by
+# bootstrap.sh from the operator-supplied (or auto-detected) ALSA
+# card name. The `Loopback` card name is the kernel-stable name
+# the `snd-aloop` module exposes; bootstrap.sh loads the module
+# at install time and persists it via /etc/modules-load.d/.
+#
+# Subdevice convention: this template binds source-host capture
+# to `SUBDEV=0`. snd-aloop exposes 8 subdevices per direction;
+# the playback subdevice N mirrors to the capture subdevice N.
+# Future pipeline stages (per-room volume, EQ, room correction)
+# may use additional subdevices; this template ships with the
+# minimum wiring v0.1 needs.
+
+pcm.evo {
+    type plug
+    slave.pcm {
+        type route
+        slave {
+            pcm {
+                type multi
+                slaves.a {
+                    channels 2
+                    pcm {
+                        type plug
+                        slave.pcm "hw:CARD=@EVO_AUDIO_CARD@,DEV=0"
+                    }
+                }
+                slaves.b {
+                    channels 2
+                    pcm {
+                        type plug
+                        slave.pcm "hw:CARD=Loopback,DEV=0,SUBDEV=0"
+                    }
+                }
+                bindings.0 { slave a channel 0 }
+                bindings.1 { slave a channel 1 }
+                bindings.2 { slave b channel 0 }
+                bindings.3 { slave b channel 1 }
+            }
+            channels 4
+        }
+        ttable.0.0 1
+        ttable.1.1 1
+        ttable.0.2 1
+        ttable.1.3 1
+    }
+    hint {
+        show on
+        description "evo: source-host fan-out to local DAC + snd-aloop"
+    }
+}
+
+ctl.evo {
+    type hw
+    card "@EVO_AUDIO_CARD@"
+}
