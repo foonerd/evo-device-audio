@@ -2310,6 +2310,65 @@ mod tests {
     }
 
     #[test]
+    fn manifest_declares_reactive_only_lifecycle_mode() {
+        // Multi-room plugin's lifecycle contract is reactive-only:
+        // observe substrate (group composition, role, leader_ms,
+        // endpoint cache, presence) via subscription, reconfigure
+        // in place, never tear down for operator-config gestures.
+        let m = manifest();
+        let life = m
+            .lifecycle
+            .as_ref()
+            .expect("multi-room manifest declares [lifecycle]");
+        assert_eq!(
+            life.mode,
+            evo_plugin_sdk::manifest::LifecycleMode::ReactiveOnly
+        );
+    }
+
+    #[test]
+    fn manifest_declares_non_disruptive_defaults() {
+        // The defaults admit the plugin in `auto` mode (no
+        // multi-room engagement; DAC free for local MPD) so a
+        // substrate-empty / config-broken fall-back is
+        // non-disruptive.
+        let m = manifest();
+        let life = m
+            .lifecycle
+            .as_ref()
+            .expect("multi-room manifest declares [lifecycle]");
+        let defaults = life
+            .defaults
+            .as_ref()
+            .expect("multi-room manifest declares [lifecycle.defaults]");
+        assert_eq!(
+            defaults.fields.get("alsa_pcm"),
+            Some(&toml::Value::String("evo".to_string()))
+        );
+        // source_pcm is "" — operator must install a loopback
+        // PCM + gesture into source role to enable capture.
+        assert_eq!(
+            defaults.fields.get("source_pcm"),
+            Some(&toml::Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn manifest_bounds_lifecycle_deadlines() {
+        // Per-plugin teardown + admit deadlines are bounded;
+        // 5000ms each covers the plugin's substrate-read +
+        // subscription-registration work on every supported
+        // tier.
+        let m = manifest();
+        let life = m
+            .lifecycle
+            .as_ref()
+            .expect("multi-room manifest declares [lifecycle]");
+        assert_eq!(life.teardown_deadline_ms, 5000);
+        assert_eq!(life.admit_deadline_ms, 5000);
+    }
+
+    #[test]
     fn plugin_construction_is_unloaded() {
         let p = MultiroomEvoNativePlugin::new();
         assert!(!p.loaded);
