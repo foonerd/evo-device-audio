@@ -184,6 +184,7 @@ const DEFAULT_LEADER_MS: u64 = 200;
 /// scheduled render time has arrived into ALSA. Tighter than
 /// the 20 ms frame budget so the scheduler can hit
 /// sub-period precision.
+#[cfg(feature = "alsa-substrate")]
 const SCHEDULER_TICK_MS: u64 = 5;
 
 /// Operator config persisted at
@@ -374,10 +375,20 @@ struct RoleEngagementContext {
     audio_plane: Arc<dyn AudioPlaneHandle>,
     alsa_pcm: String,
     source_pcm: String,
+    // Receiver-side counters live in this context so the
+    // spawn sites (gated on the alsa-substrate feature) can
+    // hand them to `run_receiver_task`. Without that feature
+    // there is no receiver task and these fields are unread,
+    // but the plugin still constructs and exports the counters
+    // via wire-op responses, so the fields must remain.
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
     frames_received: Arc<std::sync::atomic::AtomicU64>,
     frames_sent: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
     leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
     receiver_underruns: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
     /// Plugin's trace-state slot. Source-role engagement
     /// fills it on capture-mode startup; receiver / auto
@@ -553,6 +564,10 @@ async fn engage_role(
             // One-renderer-pipeline: when source has alsa_pcm
             // configured, also spawn the receiver task to
             // render the source-local DAC via self-loopback.
+            // Requires the alsa-substrate feature; without it
+            // there is no rendering path so the receiver task
+            // is not built.
+            #[cfg(feature = "alsa-substrate")]
             if !ctx.alsa_pcm.is_empty() {
                 let counter = Arc::clone(&ctx.frames_received);
                 let recv_shutdown = Arc::clone(&shutdown);
@@ -588,28 +603,38 @@ async fn engage_role(
             // is unambiguous). Group_id may be None if
             // substrate has not replicated the group to this
             // node yet; the receiver path renders incoming
-            // frames regardless of group.
-            let counter = Arc::clone(&ctx.frames_received);
-            let recv_shutdown = Arc::clone(&shutdown);
-            let recv_handle = Arc::clone(&ctx.audio_plane);
-            let alsa_pcm = ctx.alsa_pcm.clone();
-            let leader_ms = Arc::clone(&ctx.leader_ms);
-            let underruns = Arc::clone(&ctx.receiver_underruns);
-            let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
-            let recv_task = tokio::spawn(async move {
-                run_receiver_task(
-                    recv_handle,
-                    counter,
-                    recv_shutdown,
-                    alsa_pcm,
-                    Role::Receiver,
-                    leader_ms,
-                    underruns,
-                    queue_depth,
-                )
-                .await;
-            });
-            engaged.receiver_task = Some(recv_task);
+            // frames regardless of group. Requires the
+            // alsa-substrate feature for the rendering path.
+            #[cfg(feature = "alsa-substrate")]
+            {
+                let counter = Arc::clone(&ctx.frames_received);
+                let recv_shutdown = Arc::clone(&shutdown);
+                let recv_handle = Arc::clone(&ctx.audio_plane);
+                let alsa_pcm = ctx.alsa_pcm.clone();
+                let leader_ms = Arc::clone(&ctx.leader_ms);
+                let underruns = Arc::clone(&ctx.receiver_underruns);
+                let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
+                let recv_task = tokio::spawn(async move {
+                    run_receiver_task(
+                        recv_handle,
+                        counter,
+                        recv_shutdown,
+                        alsa_pcm,
+                        Role::Receiver,
+                        leader_ms,
+                        underruns,
+                        queue_depth,
+                    )
+                    .await;
+                });
+                engaged.receiver_task = Some(recv_task);
+            }
+            #[cfg(not(feature = "alsa-substrate"))]
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                "Receiver role requested but alsa-substrate feature is \
+                 not enabled at build time; no rendering task spawned"
+            );
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 alsa_pcm = %ctx.alsa_pcm,
@@ -2364,6 +2389,7 @@ fn run_capture_thread(
 /// digital silence is written to ALSA so playback continuity
 /// holds. Each underrun bumps the operator-visible
 /// `receiver_underruns` counter.
+#[cfg(feature = "alsa-substrate")]
 #[allow(clippy::too_many_arguments)]
 async fn run_receiver_task(
     audio_plane: Arc<dyn AudioPlaneHandle>,
@@ -2390,8 +2416,20 @@ async fn run_receiver_task(
     let mut seen_peers: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    #[cfg(feature = "alsa-substrate")]
-    let mut alsa_render = if !alsa_pcm.is_empty() {
+    // Without a usable local DAC the receiver task has no
+    // audible work to do; staying alive would only subscribe
+    // to the audio-frame broadcast and emit "audio-frame
+    // stream lagged" warnings as the broadcast accumulates
+    // faster than the unproductive tick can drain it. Exit
+    // early instead.
+    let mut alsa_render = if alsa_pcm.is_empty() {
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            role = ?role,
+            "receiver task exits: no alsa_pcm configured"
+        );
+        return;
+    } else {
         match AlsaRender::open(&alsa_pcm) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -2399,17 +2437,15 @@ async fn run_receiver_task(
                     plugin = PLUGIN_NAME,
                     error = %e,
                     alsa_pcm = %alsa_pcm,
-                    "ALSA playback open failed; receiver counts frames \
-                     without rendering"
+                    role = ?role,
+                    "ALSA playback open failed; receiver task exits — \
+                     without a usable DAC the task has no audible work \
+                     to do and would only burn the audio-frame broadcast"
                 );
-                None
+                return;
             }
         }
-    } else {
-        None
     };
-    let _ = role;
-    let _ = alsa_pcm;
 
     // Presentation-time anchor: set on first received frame.
     // Future frames' scheduled local time is computed as
