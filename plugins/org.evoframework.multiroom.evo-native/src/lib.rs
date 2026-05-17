@@ -443,6 +443,18 @@ async fn engage_role(
     if let Some(t) = engaged.receiver_task.take() {
         let _ = t.await;
     }
+    // When the prior engagement was Source, the audio plane's
+    // outbound peer connections were dialed by the source-host
+    // task. With the source task gone, those connections are
+    // stale: they would otherwise persist as ESTABLISHED TCP
+    // with their write tasks alive, holding socket fds for no
+    // audible purpose. Close them explicitly. Inbound
+    // connections (other peers' source-hosts dialing us) are
+    // preserved — those belong to the remote source-hosts and
+    // survive local role changes.
+    if engaged.role == Role::Source {
+        ctx.audio_plane.close_outbound_connections().await.ok();
+    }
     // Clear any source-role trace state — the new engagement
     // either replaces it (Source w/ capture) or leaves it
     // cleared (Receiver / Auto).
@@ -1630,9 +1642,24 @@ async fn run_source_capture_task(
     // node uses (the framework runtime's epoch).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CaptureChunk>(32);
 
+    // Deterministic-exit signal for the OS-level capture
+    // thread. The thread polls this atomic in its tight loop
+    // (cheap, lock-free) and exits IMMEDIATELY on observe.
+    // The async wrapper sets it during shutdown teardown then
+    // joins the OS thread (via spawn_blocking) before
+    // returning — this guarantees the ALSA capture handle is
+    // released before engage_role moves on to the next
+    // engagement, eliminating the 100 ms wait-cycle race
+    // window where the next engagement's `AlsaRender::open`
+    // (or the next source-engagement's capture open) could
+    // collide with the prior thread's still-held handle.
+    let capture_should_exit =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let capture_shutdown = Arc::clone(&shutdown);
     let capture_pcm = source_pcm.clone();
     let capture_audio_plane = Arc::clone(&audio_plane);
+    let capture_exit_flag = Arc::clone(&capture_should_exit);
     let capture_thread = std::thread::Builder::new()
         .name("multiroom-capture".into())
         .spawn(move || {
@@ -1641,6 +1668,7 @@ async fn run_source_capture_task(
                 tx,
                 capture_shutdown,
                 capture_audio_plane,
+                capture_exit_flag,
             );
         });
     let capture_thread = match capture_thread {
@@ -1866,15 +1894,32 @@ async fn run_source_capture_task(
     // SIGKILL fires, systemd's 90 s TimeoutStopSec runs
     // out, the restart takes ~90 s.
     //
-    // Drop the JoinHandle instead — std::thread detaches.
-    // When this function returns, the local `rx` drops,
-    // `tx.is_closed()` becomes true, and the thread exits
-    // on its next loop iteration. With cooperative ALSA
-    // capture (non-blocking PCM + `pcm.wait(100ms)`), the
-    // thread polls the closed-channel signal within 100 ms
-    // regardless of whether MPD is still feeding the
-    // loopback. ALSA PCM handle drops at thread scope exit.
-    drop(capture_thread);
+    // Deterministic join: set the exit flag, drop the rx
+    // (closes the channel as a belt-and-braces secondary
+    // signal), then await the OS thread's join on a blocking
+    // scheduler task. This guarantees the ALSA capture handle
+    // is fully released before this function returns — so
+    // engage_role's `source_task.await` has the contract that
+    // the next engagement can re-open ALSA capture without
+    // racing the prior thread's wait cycle.
+    //
+    // Why this is no longer a deadlock (cf. the prior
+    // detach-and-drop shape's docblock): the OS thread now
+    // observes `capture_should_exit` directly, not just
+    // `tx.is_closed()`. The flag is set synchronously here
+    // before the join, so the thread's next 100 ms wait
+    // cycle wakes, sees the flag, exits, releases ALSA.
+    // Worst-case join wait is bounded by one `pcm.wait(100)`
+    // tick (~100 ms) — well within the framework's plugin-
+    // shutdown deadline and orders of magnitude shorter than
+    // the SIGKILL window the prior detach shape worried
+    // about.
+    capture_should_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(rx);
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = capture_thread.join();
+    })
+    .await;
 }
 
 /// One capture-thread chunk plus the source-side stage 3a /
@@ -2099,6 +2144,7 @@ fn run_capture_thread(
     tx: tokio::sync::mpsc::Sender<CaptureChunk>,
     shutdown: Arc<Notify>,
     audio_plane: Arc<dyn AudioPlaneHandle>,
+    should_exit: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Open the capture PCM NON-BLOCKING. In blocking mode
     // `io.readi()` parks indefinitely waiting for samples
@@ -2288,6 +2334,13 @@ fn run_capture_thread(
     let mut buf: Vec<i16> =
         vec![0; FRAMES_PER_CHUNK * BASELINE_CHANNELS as usize];
     loop {
+        // Deterministic-exit poll: the async wrapper sets
+        // `should_exit` before joining this thread. The flag
+        // is checked first so we exit promptly without
+        // entering another `pcm.wait` window.
+        if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         if tx.is_closed() {
             break;
         }
