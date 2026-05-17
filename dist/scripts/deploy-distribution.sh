@@ -21,8 +21,8 @@
 #   - `cross` (https://github.com/cross-rs/cross) installed
 #     OR the host's stable toolchain + matching cross-link
 #     blocks in `.cargo/config.toml` (the rig's existing setup).
-#   - SSH access to the target as the operator-configured user
-#     (default `evoproto`).
+#   - SSH access to the target as the operator-configured
+#     service user.
 #
 # Usage:
 #
@@ -56,7 +56,7 @@ set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
     echo "usage: $0 <target-host> <target-user> <target-triple>" >&2
-    echo "example: $0 host.lan evoproto aarch64-unknown-linux-gnu" >&2
+    echo "example: $0 host.lan <service-user> aarch64-unknown-linux-gnu" >&2
     exit 1
 fi
 
