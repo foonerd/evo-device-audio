@@ -125,7 +125,7 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 4 | Filesystem scopes (`filesystem_scopes` manifest) | Parsed, not enforced; distribution-owned | Map to `ReadWritePaths=` per plugin; rely on `ProtectSystem=strict` for the negative. |
 | 5 | Empty-catalogue refusal at startup | Permanently out of scope (framework starts; logs the situation) | Optional packaging-time gate (postinst refuses install of an empty catalogue). Default: accept the framework's "starts anyway" behaviour. |
 | 6 | Plugins administration operator verbs (enable / disable / uninstall / purge) | Implemented in evo-core a prior release | Audio distribution decides whether its frontend surfaces these verbs as operator-facing controls. |
-| 7 | Flight mode for hardware radios (Bluetooth / WiFi / FM / cellular) | Implemented in evo-core v0.1.12: framework provides signal bus + no-panic invariant; the device plugin owns the hardware switch | Audio distribution authors a per-distribution hardware-control plugin if its target devices ship controllable radios. Consumer plugins (streaming, library scanners) honour the framework's no-panic invariant on dependency loss. |
+| 7 | Flight mode for hardware radios (Bluetooth / WiFi / FM / cellular) | Implemented in evo-core a prior release: framework provides signal bus + no-panic invariant; the device plugin owns the hardware switch | Audio distribution authors a per-distribution hardware-control plugin if its target devices ship controllable radios. Consumer plugins (streaming, library scanners) honour the framework's no-panic invariant on dependency loss. |
 | 8 | User Interaction Routing (auth flow, credential prompts, etc.) | Implemented in evo-core a prior release | Audio distribution authors a prompt-receiver surface (kiosk UI, frontend modal, remote bridge) if any admitted plugin issues `request_user_interaction`. |
 | 9 | Appointments rack (time-driven plugins) | Implemented in evo-core a prior release | Audio distribution decides whether it admits time-driven audio plugins (alarms, scheduled playback). |
 | 10 | Watches rack (condition-driven plugins) | Implemented in evo-core a prior release | Audio distribution authors sensor / hardware-event plugins (CEC ARC detection, BT peer manager, jack-insertion handler, USB DAC enumerator, CPU temp reader, motion sensor, etc.) per its target hardware; the framework provides the watch primitive that subscribes to whatever events the plugins emit. Audio-path-switching (BT peer connect / HDMI ARC active / headphone jack / USB DAC plug → switch output) is the canonical audio-domain use case. See "Watches — implications for plugins and UI" section below. |
@@ -137,9 +137,9 @@ Every item below is **either** explicitly out of scope for evo-core (distributio
 | 16 | Happenings coalescing (per-subscriber rate limit) | Implemented in evo-core a prior release — label-based keying via `CoalesceLabels` trait + derive macro; subscribers declare label lists on `subscribe_happenings.coalesce`; `describe_capabilities` advertises per-variant label sets; new `Happening::PluginEvent` variant lets sensor / hardware-event plugins emit structured events that participate in coalescing | Audio distribution: consumers (frontend, voice agent, MQTT bridge) declare coalesce label lists per subscription based on their use case (per-handle for custody bursts, per-subject for cross-variant collapse, per-watch / per-appointment / per-pair for the a prior release trigger primitives). Sensor and hardware-event plugins emit through `PluginEvent` with structured payloads; coalescing keys on flattened payload fields like `sensor_id`. See "Happenings coalescing" subsection below for guidance. |
 | 17 | Subject-grammar orphan migration verb | Implemented in evo-core a prior release — three operator wire ops (`list_grammar_orphans`, `migrate_grammar_orphans` with `Rename` / `Map` / `Filter` strategies, `accept_grammar_orphans`); always-mint-new-IDs identity model reusing merge/split alias machinery; `pending_grammar_orphans` table; batched-commit + background-mode + dry-run for ARM-SBC operability | Audio distribution: catalogue authors planning subject-type renames or splits (e.g., `audio_track` → `track`, or `media_item` → `audio_track` + `video_track`) ship the catalogue change under a major version bump and document the migration call operators must issue. Distribution-side admin tooling consumes the three verbs and surfaces grammar-orphan state to the operator UI. See "Subject-grammar orphan migration — implications for catalogue authors and operators" subsection below. |
 | 18 | Reload-catalogue / reload-manifest operator verbs | Implemented in evo-core a prior release — two operator-trust-class wire ops (`reload_catalogue`, `reload_manifest`) distinct from `reload_plugin` (which reloads code); atomic-swap semantics with six-stage validation; idempotent-by-default with hash-skip; `dry_run` plan preview; five new Reserved happening subclasses for structured success/failure signaling; LKG updated only on success | Audio distribution: catalogue and manifest updates no longer require steward restart. Distribution-side admin tooling consumes both verbs to apply config rollouts live. CI/CD pipelines call the verbs sequentially for compose-and-apply distribution updates. See "Reload-catalogue / reload-manifest — implications for catalogue authors and operators" subsection below. |
-| 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core v0.1.12; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
+| 19 | Time and Clock Trust — framework trust signal over OS-sync'd clock | Implemented in evo-core a prior release; framework consumes OS state, signals trust transitions, gates time-dependent subsystems. NTP / chrony / PTP daemon configuration remains distribution-owned (item 1-5 territory) | Audio distribution: configure an NTP daemon to keep clock fresh on cold start, reboot, network-up events, and periodically (recommended max staleness 24h). Declare `has_battery_rtc` in `evo.toml`. Author the distribution-side power warden's RTC-wake callback if hardware supports RTC. Document the chosen NTP source in this distribution's own `DEVELOPING.md`. |
 
-Items 6 through 19 land in evo-core v0.1.12. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
+Items 6 through 19 are landed in prior framework releases. Audio distributions consume each as it ships; the column above names the consumer-side decision each one forces, not whether the framework feature itself is delivered. Items 1 through 5 are permanent splits where the distribution owns the answer regardless of evo-core release cycle.
 
 ### User Interaction Routing — implications for plugins and UI
 
@@ -421,7 +421,7 @@ The pattern: plugins with **plugin-owned state** opt in to Live; plugins with **
 
 evo-core a prior release ships three related refinements to the existing dispatch-time capability gate:
 
-**1. Warden-side capability gate** (parallel to the respondent gate shipped in v0.1.10):
+**1. Warden-side capability gate** (parallel to the respondent gate shipped in a prior release):
 
 Every warden's manifest now declares `capabilities.warden.course_correct_verbs: [...]` listing every verb the warden's `course_correct` accepts. The framework refuses any incoming dispatch whose verb is not in the list with a structured `StewardError::Dispatch` — the warden's `course_correct` body never sees undeclared verbs.
 
@@ -458,20 +458,20 @@ Plus a time-decoupled refinement: plugins whose required minimum framework versi
 
 For audio plugins specifically, this means:
 
--   Plugins built against v0.1.11 or v0.1.12: full strict enforcement under a prior release framework. Drift caught and refused at admit.
--   Plugins built against v0.1.10: admitted with version-skew warning. Drift caught and warned about. Plugin author has a one-cycle window to refresh the plugin.
--   Plugins built against v0.1.9 or older: refused. Plugin author must rebuild against a newer framework before deployment.
+-   Plugins built against the current or one-back framework version: full strict enforcement. Drift caught and refused at admit.
+-   Plugins built against the two-back framework version: admitted with version-skew warning. Drift caught and warned about. Plugin author has a one-cycle window to refresh the plugin.
+-   Plugins built against framework versions three or more back: refused. Plugin author must rebuild against a newer framework before deployment.
 
 This gives plugin authors **two minor-version cycles of grace** between framework release and forced plugin refresh. Operationally proven (Kubernetes pattern); ecosystem hygiene forced over time without breaking deployment headroom.
 
 **For audio distributions:**
 
--   When this distribution publishes a new audio reference plugin set built against framework v0.1.12, set `evo_min_version = "0.1.12"` in each plugin's manifest. The framework will apply strict enforcement to these plugins.
--   When the framework moves to v0.1.13, these plugins will continue admitting under strict enforcement (one-version-behind is in-window).
--   When the framework moves to v0.1.14, these plugins will move into the warn-band — at which point the audio reference's release cycle should produce a refresh.
+-   When this distribution publishes a new audio reference plugin set built against the current framework version, set `evo_min_version` in each plugin's manifest to the current framework's `MAJOR.MINOR.PATCH`. The framework will apply strict enforcement to these plugins.
+-   When the framework moves one version forward, these plugins will continue admitting under strict enforcement (one-version-behind is in-window).
+-   When the framework moves two versions forward, these plugins will move into the warn-band — at which point the audio reference's release cycle should produce a refresh.
 -   Plugin authors targeting older devices (long-life embedded systems that may not refresh quickly) should consider declaring the OLDEST `evo_min_version` their plugin actually requires — not the version they happen to be building against.
 
-**Migration impact for v0.1.12:**
+**Migration impact:**
 
 Audio reference plugins (org.evoframework.playback.mpd, metadata.local, artwork.local, future composition.alsa) gain their `course_correct_verbs` declarations in a prior release implementation. Vendor distributions update their manifests in the same cycle — check this distribution's `Upgrading the evo-core pin` section for the migration steps when a prior release lands.
 
@@ -479,7 +479,7 @@ Audio reference plugins (org.evoframework.playback.mpd, metadata.local, artwork.
 
 Subject types are part of a catalogue's public contract. The framework treats type stability as a major-version concern: renaming or removing a subject type is a breaking change that requires a catalogue major-version bump. Existing subjects of a removed type become **orphans** — they remain in the registry, no rack opines on them, and no plugin can announce a new subject of that type.
 
-In v0.1.11 and earlier, the only signal the framework offered was a boot-time diagnostic warning. a prior release ships the operator-callable structured migration surface that lets orphans join the new grammar without losing identity, relations, custody, or history.
+In earlier framework releases, the only signal the framework offered was a boot-time diagnostic warning. A prior release ships the operator-callable structured migration surface that lets orphans join the new grammar without losing identity, relations, custody, or history.
 
 **For audio distribution catalogue authors:**
 
@@ -700,7 +700,7 @@ The framework runtime does NOT consume the schemas at admission — the steward 
 
 **Validation tooling on the audio reference's CI:**
 
-Once `evo-plugin-tool validate-shelf-schema` ships in evo-core v0.1.12, the audio reference's CI workflow adds a step that validates each plugin's manifest against the pinned schemas-repo version. The check runs on every PR and gates merge.
+Once `evo-plugin-tool validate-shelf-schema` ships in a framework release, the audio reference's CI workflow adds a step that validates each plugin's manifest against the pinned schemas-repo version. The check runs on every PR and gates merge.
 
 ## Cross-compiling for the target hardware
 

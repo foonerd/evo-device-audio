@@ -60,8 +60,9 @@
 //! Phase 3.4 is additive only. Tracks and albums accumulate in
 //! the steward's registry as they are played; relations
 //! accumulate alongside. When a plugin deregisters, the steward
-//! handles claimant cleanup. Per-song retractions are deferred
-//! to a future phase where the cost-benefit is clear.
+//! handles claimant cleanup. Per-song retractions are not
+//! emitted by this primitive; a future phase adds them when
+//! the cost-benefit is clear.
 
 use std::sync::Arc;
 

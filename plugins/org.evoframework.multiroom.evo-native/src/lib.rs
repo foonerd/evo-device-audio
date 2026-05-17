@@ -934,8 +934,8 @@ async fn resolve_local_group_state(
 ) -> (Option<String>, Vec<String>, Vec<String>) {
     match handle.list_groups_for_device(local_device_id).await {
         Ok(groups) => {
-            // For v0.1.13 a device belongs to at most one
-            // group operationally (multi-group membership is
+            // A device belongs to at most one group
+            // operationally (multi-group membership is
             // a substrate-permitted-but-operationally-rare
             // shape). Take the first; expand on findings.
             if let Some(g) = groups.into_iter().next() {
