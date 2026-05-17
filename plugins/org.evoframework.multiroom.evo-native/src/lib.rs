@@ -310,6 +310,606 @@ impl Role {
     }
 }
 
+/// Translate the SDK substrate's `Role` into the plugin's
+/// internal `Role` enum. The two are wire-string-equivalent;
+/// the framework's adapter guarantees the strings match, and
+/// the substrate-side `Role` is the same three-variant enum
+/// the plugin uses.
+fn role_from_substrate(r: evo_plugin_sdk::multiroom_substrate::Role) -> Role {
+    match r {
+        evo_plugin_sdk::multiroom_substrate::Role::Source => Role::Source,
+        evo_plugin_sdk::multiroom_substrate::Role::Receiver => Role::Receiver,
+        evo_plugin_sdk::multiroom_substrate::Role::Auto => Role::Auto,
+    }
+}
+
+/// Role-engaged state — what the plugin tracks while a role
+/// is active. Moves out of the plugin struct's `&mut self` so
+/// a substrate-subscriber task can lock the Mutex and
+/// reconfigure on operator gestures without going through the
+/// plugin trait's call surface.
+///
+/// `shutdown` is replaced on every engagement: notifying the
+/// old `Notify` releases the prior role's source/receiver
+/// tasks; the new `Notify` is the signal for the new tasks
+/// just spawned.
+struct RoleEngagement {
+    /// Role currently engaged. `Role::Auto` means no DAC /
+    /// audio-plane engagement; DAC stays free for local MPD.
+    role: Role,
+    /// Group id currently engaged (Some only when role is
+    /// Source or Receiver and a group exists in substrate).
+    group_id: Option<String>,
+    /// Source-side task; spawned for Source role only.
+    source_task: Option<JoinHandle<()>>,
+    /// Receiver-side task; spawned for Receiver role + for
+    /// the source-local DAC one-renderer-pipeline.
+    receiver_task: Option<JoinHandle<()>>,
+    /// Shutdown signal for the currently-engaged tasks. A
+    /// `notify_waiters()` releases both source + receiver
+    /// task; the engage_role function replaces this with a
+    /// fresh `Arc<Notify>` on every engagement so a newly
+    /// spawned task sees a clean signal.
+    shutdown: Arc<Notify>,
+}
+
+impl RoleEngagement {
+    fn idle() -> Self {
+        Self {
+            role: Role::Auto,
+            group_id: None,
+            source_task: None,
+            receiver_task: None,
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+}
+
+/// Bundle of `Arc`-shared handles the role-engagement code
+/// needs to spawn source / receiver tasks. Cloned once per
+/// engagement (cheap — every field is already an `Arc`).
+/// Lets the substrate-subscriber task carry one struct
+/// instead of a dozen captured `Arc`s.
+struct RoleEngagementContext {
+    audio_plane: Arc<dyn AudioPlaneHandle>,
+    alsa_pcm: String,
+    source_pcm: String,
+    frames_received: Arc<std::sync::atomic::AtomicU64>,
+    frames_sent: Arc<std::sync::atomic::AtomicU64>,
+    leader_ms: Arc<std::sync::atomic::AtomicU64>,
+    receiver_underruns: Arc<std::sync::atomic::AtomicU64>,
+    receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    /// Plugin's trace-state slot. Source-role engagement
+    /// fills it on capture-mode startup; receiver / auto
+    /// engagement clears it. Mutex'd so the substrate
+    /// subscriber can swap the slot atomically.
+    #[cfg(feature = "alsa-substrate")]
+    trace_state_slot: Arc<tokio::sync::Mutex<Option<Arc<TraceState>>>>,
+}
+
+/// Engage the plugin in the supplied role, reconfiguring
+/// DAC / capture / audio-plane in place. Idempotent on
+/// unchanged `(role, group_id)`; tears down current
+/// engagement and spawns fresh tasks when either changes.
+///
+/// This is the function the substrate-subscriber task calls
+/// on every `RoleChange` / `GroupChange` affecting the local
+/// device. The plugin's `load()` also calls it once with the
+/// substrate-derived (or TOML-fallback) initial values, so
+/// the engagement path is identical at admit-time and at
+/// every subsequent operator gesture.
+///
+/// `members` and `member_addresses` are used only when the
+/// new role is `Source` (the source-host upserts the group +
+/// dials each receiver). Receiver / Auto engagement ignores
+/// them.
+async fn engage_role(
+    state: &Arc<tokio::sync::Mutex<RoleEngagement>>,
+    ctx: &RoleEngagementContext,
+    role: Role,
+    group_id: Option<String>,
+    members: Vec<String>,
+    member_addresses: Vec<String>,
+) {
+    let mut engaged = state.lock().await;
+    // Idempotent no-op on unchanged engagement. Comparing role
+    // + group_id captures the substrate's mutation surface
+    // (member churn within the same group is handled by the
+    // audio-plane fan-out; per-member redial only happens on
+    // group change).
+    if engaged.role == role && engaged.group_id == group_id {
+        return;
+    }
+
+    // Tear down prior engagement: notify the prior tasks'
+    // shutdown signal, await their exit. The order matters —
+    // notifying releases tokio::select! arms inside the tasks
+    // so the next .await on the JoinHandle resolves promptly.
+    engaged.shutdown.notify_waiters();
+    if let Some(t) = engaged.source_task.take() {
+        let _ = t.await;
+    }
+    if let Some(t) = engaged.receiver_task.take() {
+        let _ = t.await;
+    }
+    // Clear any source-role trace state — the new engagement
+    // either replaces it (Source w/ capture) or leaves it
+    // cleared (Receiver / Auto).
+    #[cfg(feature = "alsa-substrate")]
+    {
+        *ctx.trace_state_slot.lock().await = None;
+    }
+    // Fresh shutdown signal for the about-to-be-spawned tasks.
+    let shutdown = Arc::new(Notify::new());
+    engaged.shutdown = Arc::clone(&shutdown);
+    engaged.role = role;
+    engaged.group_id = group_id.clone();
+
+    // Spawn the role-appropriate tasks. Logic mirrors what
+    // load() does inline today (Stage 11C.3 extracts the
+    // load() role-branch body into this function so the
+    // substrate-subscriber task can re-run engagement on
+    // operator gestures).
+    match role {
+        Role::Source => {
+            let Some(gid) = group_id.clone() else {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "engage_role(Source) called with no group_id; \
+                     source-host engagement refused"
+                );
+                return;
+            };
+            // Source-host instantiates the group locally,
+            // dials each receiver. Idempotent against the
+            // framework's group store + audio-plane handle —
+            // re-engaging with the same group is a no-op at
+            // the framework substrate level.
+            if let Err(e) = ctx
+                .audio_plane
+                .upsert_group(
+                    gid.clone(),
+                    format!("multiroom:{gid}"),
+                    members.clone(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    group_id = %gid,
+                    error = %e,
+                    "source-host upsert_group failed during engagement; \
+                     proceeding without group instantiation"
+                );
+            }
+            for addr in &member_addresses {
+                if let Err(e) = ctx.audio_plane.dial_peer(addr.clone()).await {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        group_id = %gid,
+                        addr = %addr,
+                        error = %e,
+                        "source-host dial_peer failed during engagement"
+                    );
+                }
+            }
+            // Spawn the source task — synthetic tone or ALSA
+            // capture per source_pcm config.
+            let frames_sent = Arc::clone(&ctx.frames_sent);
+            let source_shutdown = Arc::clone(&shutdown);
+            let handle = Arc::clone(&ctx.audio_plane);
+            let source_pcm = ctx.source_pcm.clone();
+            let gid_for_task = gid.clone();
+            let source_task = if source_pcm.is_empty() {
+                tokio::spawn(async move {
+                    run_source_tone_generator(
+                        handle,
+                        gid_for_task,
+                        frames_sent,
+                        source_shutdown,
+                    )
+                    .await;
+                })
+            } else {
+                #[cfg(feature = "alsa-substrate")]
+                {
+                    let pcm = source_pcm.clone();
+                    let trace_state = Arc::new(TraceState::new(100));
+                    *ctx.trace_state_slot.lock().await =
+                        Some(Arc::clone(&trace_state));
+                    let task_trace_state = Some(Arc::clone(&trace_state));
+                    tokio::spawn(async move {
+                        run_source_capture_task(
+                            handle,
+                            gid_for_task,
+                            frames_sent,
+                            source_shutdown,
+                            pcm,
+                            task_trace_state,
+                        )
+                        .await;
+                    })
+                }
+                #[cfg(not(feature = "alsa-substrate"))]
+                {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        source_pcm = %source_pcm,
+                        "source_pcm set but alsa-substrate feature disabled \
+                         at build time; falling back to synthetic tone"
+                    );
+                    tokio::spawn(async move {
+                        run_source_tone_generator(
+                            handle,
+                            gid_for_task,
+                            frames_sent,
+                            source_shutdown,
+                        )
+                        .await;
+                    })
+                }
+            };
+            engaged.source_task = Some(source_task);
+            // One-renderer-pipeline: when source has alsa_pcm
+            // configured, also spawn the receiver task to
+            // render the source-local DAC via self-loopback.
+            if !ctx.alsa_pcm.is_empty() {
+                let counter = Arc::clone(&ctx.frames_received);
+                let recv_shutdown = Arc::clone(&shutdown);
+                let recv_handle = Arc::clone(&ctx.audio_plane);
+                let alsa_pcm = ctx.alsa_pcm.clone();
+                let leader_ms = Arc::clone(&ctx.leader_ms);
+                let underruns = Arc::clone(&ctx.receiver_underruns);
+                let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
+                let recv_task = tokio::spawn(async move {
+                    run_receiver_task(
+                        recv_handle,
+                        counter,
+                        recv_shutdown,
+                        alsa_pcm,
+                        Role::Source,
+                        leader_ms,
+                        underruns,
+                        queue_depth,
+                    )
+                    .await;
+                });
+                engaged.receiver_task = Some(recv_task);
+            }
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                group_id = %gid,
+                source_pcm = %ctx.source_pcm,
+                "engaged Source role"
+            );
+        }
+        Role::Receiver => {
+            // Receiver always opens the DAC (operator intent
+            // is unambiguous). Group_id may be None if
+            // substrate has not replicated the group to this
+            // node yet; the receiver path renders incoming
+            // frames regardless of group.
+            let counter = Arc::clone(&ctx.frames_received);
+            let recv_shutdown = Arc::clone(&shutdown);
+            let recv_handle = Arc::clone(&ctx.audio_plane);
+            let alsa_pcm = ctx.alsa_pcm.clone();
+            let leader_ms = Arc::clone(&ctx.leader_ms);
+            let underruns = Arc::clone(&ctx.receiver_underruns);
+            let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
+            let recv_task = tokio::spawn(async move {
+                run_receiver_task(
+                    recv_handle,
+                    counter,
+                    recv_shutdown,
+                    alsa_pcm,
+                    Role::Receiver,
+                    leader_ms,
+                    underruns,
+                    queue_depth,
+                )
+                .await;
+            });
+            engaged.receiver_task = Some(recv_task);
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                alsa_pcm = %ctx.alsa_pcm,
+                "engaged Receiver role"
+            );
+        }
+        Role::Auto => {
+            // No DAC engagement; DAC stays free for local MPD.
+            // The plugin admits cleanly with no audio-plane
+            // tasks; substrate gestures may later transition
+            // it to Source or Receiver.
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "engaged Auto role (no DAC, no audio-plane tasks)"
+            );
+        }
+    }
+}
+
+/// Spawn the substrate-subscriber task that drains
+/// `RoleChange` + `GroupChange` events from the framework
+/// substrate and calls `engage_role` on the role-engagement
+/// Mutex for events affecting the local device.
+///
+/// The task loops until `shutdown` is notified. On lag
+/// (subscriber fell behind), the task continues — substrate
+/// reads via `get_role` / `list_groups_for_device` recover
+/// the current state on the next event.
+#[allow(clippy::too_many_arguments)]
+fn spawn_substrate_subscriber(
+    state: Arc<tokio::sync::Mutex<RoleEngagement>>,
+    ctx: Arc<RoleEngagementContext>,
+    handle: Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    local_device_id: String,
+    shutdown: Arc<Notify>,
+) -> JoinHandle<()> {
+    let mut role_rx = handle.subscribe_role_changes();
+    let mut group_rx = handle.subscribe_group_changes();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        "substrate subscriber: shutdown received"
+                    );
+                    return;
+                }
+                role_evt = role_rx.recv() => {
+                    match role_evt {
+                        Ok(evt) => {
+                            handle_role_event(
+                                &state,
+                                &ctx,
+                                &handle,
+                                &local_device_id,
+                                evt,
+                            )
+                            .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Slow subscriber — read substrate
+                            // to recover.
+                            recover_from_substrate(
+                                &state,
+                                &ctx,
+                                &handle,
+                                &local_device_id,
+                            )
+                            .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "substrate subscriber: role channel closed"
+                            );
+                            return;
+                        }
+                    }
+                }
+                group_evt = group_rx.recv() => {
+                    match group_evt {
+                        Ok(evt) => {
+                            handle_group_event(
+                                &state,
+                                &ctx,
+                                &handle,
+                                &local_device_id,
+                                evt,
+                            )
+                            .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            recover_from_substrate(
+                                &state,
+                                &ctx,
+                                &handle,
+                                &local_device_id,
+                            )
+                            .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                "substrate subscriber: group channel closed"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn handle_role_event(
+    state: &Arc<tokio::sync::Mutex<RoleEngagement>>,
+    ctx: &RoleEngagementContext,
+    handle: &Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    local_device_id: &str,
+    evt: evo_plugin_sdk::multiroom_substrate::RoleChange,
+) {
+    // Filter to events for the local device only.
+    let new_role = match &evt {
+        evo_plugin_sdk::multiroom_substrate::RoleChange::Set {
+            device_id,
+            new_role,
+            ..
+        } if device_id == local_device_id => role_from_substrate(*new_role),
+        evo_plugin_sdk::multiroom_substrate::RoleChange::Cleared {
+            device_id,
+            ..
+        } if device_id == local_device_id => Role::Auto,
+        _ => return,
+    };
+    // Look up the local device's current group (if any) +
+    // member metadata.
+    let (group_id, members, member_addresses) =
+        resolve_local_group_state(handle, local_device_id).await;
+    engage_role(state, ctx, new_role, group_id, members, member_addresses)
+        .await;
+}
+
+async fn handle_group_event(
+    state: &Arc<tokio::sync::Mutex<RoleEngagement>>,
+    ctx: &RoleEngagementContext,
+    handle: &Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    local_device_id: &str,
+    evt: evo_plugin_sdk::multiroom_substrate::GroupChange,
+) {
+    use evo_plugin_sdk::multiroom_substrate::GroupChange;
+    // Filter: only events for a group containing the local
+    // device matter for engagement decisions.
+    let affects_local = match &evt {
+        GroupChange::Created(g) | GroupChange::Updated(g) => {
+            g.members.iter().any(|m| m == local_device_id)
+        }
+        GroupChange::Deleted(_) => {
+            // Deletion of the local device's group: re-read
+            // substrate to see if the local is in any other
+            // group; engage_role will disengage if not.
+            true
+        }
+    };
+    if !affects_local {
+        return;
+    }
+    let current_role = handle
+        .get_role(local_device_id)
+        .await
+        .map(role_from_substrate)
+        .unwrap_or(Role::Auto);
+    let (group_id, members, member_addresses) =
+        resolve_local_group_state(handle, local_device_id).await;
+    engage_role(
+        state,
+        ctx,
+        current_role,
+        group_id,
+        members,
+        member_addresses,
+    )
+    .await;
+}
+
+/// Recover engagement state by re-reading substrate after a
+/// missed-event lag on the subscribe channel.
+async fn recover_from_substrate(
+    state: &Arc<tokio::sync::Mutex<RoleEngagement>>,
+    ctx: &RoleEngagementContext,
+    handle: &Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    local_device_id: &str,
+) {
+    let role = handle
+        .get_role(local_device_id)
+        .await
+        .map(role_from_substrate)
+        .unwrap_or(Role::Auto);
+    let (group_id, members, member_addresses) =
+        resolve_local_group_state(handle, local_device_id).await;
+    engage_role(state, ctx, role, group_id, members, member_addresses).await;
+}
+
+/// Determine the plugin's initial engagement at load() time.
+///
+/// Grace-period semantics per ADR-0130 §Decision 6:
+/// 1. If substrate is wired AND has a role for this device →
+///    substrate wins. Group + members come from substrate.
+/// 2. If substrate is wired but empty for this device → use
+///    TOML role + group_id + group_members; the substrate
+///    later gestures supersede.
+/// 3. If substrate is not wired (OOP plugin path; no
+///    `multiroom_substrate` in LoadContext) → TOML is the
+///    only source.
+async fn resolve_initial_engagement(
+    handle: Option<
+        &Arc<dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle>,
+    >,
+    local_device_id: &str,
+    config: &PluginConfig,
+) -> (Role, Option<String>, Vec<String>, Vec<String>) {
+    if let Some(handle) = handle {
+        // Check substrate first.
+        let substrate_role = handle.get_role(local_device_id).await.ok();
+        let (substrate_group_id, substrate_members) =
+            match handle.list_groups_for_device(local_device_id).await {
+                Ok(groups) => {
+                    if let Some(g) = groups.into_iter().next() {
+                        (Some(g.group_id), g.members)
+                    } else {
+                        (None, Vec::new())
+                    }
+                }
+                Err(_) => (None, Vec::new()),
+            };
+        // If substrate has an explicit role for this device,
+        // use it. Else fall back to TOML role.
+        let role = match substrate_role {
+            Some(r) => role_from_substrate(r),
+            None => config.role,
+        };
+        // Group precedence: substrate group wins; fall back to
+        // TOML group_id + group_members.
+        let (group_id, members, member_addresses) = match substrate_group_id {
+            Some(gid) => (Some(gid), substrate_members, Vec::new()),
+            None => (
+                config.group_id.clone(),
+                config.group_members.clone(),
+                config.group_member_addresses.clone(),
+            ),
+        };
+        (role, group_id, members, member_addresses)
+    } else {
+        // No substrate handle — TOML-only.
+        (
+            config.role,
+            config.group_id.clone(),
+            config.group_members.clone(),
+            config.group_member_addresses.clone(),
+        )
+    }
+}
+
+/// Read the local device's current group (if any) from
+/// substrate. Returns (group_id, member_device_ids,
+/// member_addresses). Member addresses are NOT in substrate
+/// today (auto-discovered via heartbeat / sticky cache);
+/// returned empty so the source-host's dial path becomes a
+/// no-op — the audio-plane reaches receivers via mDNS-SD +
+/// heartbeat discovery instead.
+async fn resolve_local_group_state(
+    handle: &Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    local_device_id: &str,
+) -> (Option<String>, Vec<String>, Vec<String>) {
+    match handle.list_groups_for_device(local_device_id).await {
+        Ok(groups) => {
+            // For v0.1.13 a device belongs to at most one
+            // group operationally (multi-group membership is
+            // a substrate-permitted-but-operationally-rare
+            // shape). Take the first; expand on findings.
+            if let Some(g) = groups.into_iter().next() {
+                (Some(g.group_id), g.members, Vec::new())
+            } else {
+                (None, Vec::new(), Vec::new())
+            }
+        }
+        Err(_) => (None, Vec::new(), Vec::new()),
+    }
+}
+
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML).expect(
@@ -327,11 +927,26 @@ pub struct MultiroomEvoNativePlugin {
     loaded: bool,
     config: PluginConfig,
     audio_plane: Option<Arc<dyn AudioPlaneHandle>>,
-    /// Receiver-side task; spawned for Receiver + Auto roles.
-    receiver_task: Option<JoinHandle<()>>,
-    /// Source-side task; spawned for Source role only.
-    source_task: Option<JoinHandle<()>>,
-    shutdown: Arc<Notify>,
+    /// Role-engaged state. Held behind an `Arc<Mutex<>>` so a
+    /// substrate-subscriber task can lock + reconfigure on
+    /// operator gestures without `&mut self` access through
+    /// the Plugin trait surface. `RoleEngagement::idle()` at
+    /// construction; populated by `engage_role` calls from
+    /// load() + the subscriber loop.
+    role_engagement: Arc<tokio::sync::Mutex<RoleEngagement>>,
+    /// Substrate-subscriber task — drains `RoleChange` +
+    /// `GroupChange` events from the framework and calls
+    /// `engage_role` on the role-engagement Mutex for events
+    /// affecting the local device. `None` when no
+    /// `multiroom_substrate` handle was wired into the
+    /// `LoadContext`; the plugin falls back to TOML-only
+    /// engagement.
+    substrate_subscriber: Option<JoinHandle<()>>,
+    /// Shutdown signal for the substrate-subscriber task.
+    /// Notifying it terminates the subscriber loop without
+    /// affecting the currently-engaged role tasks (those have
+    /// their own `shutdown` inside `RoleEngagement`).
+    subscriber_shutdown: Arc<Notify>,
     frames_received: Arc<std::sync::atomic::AtomicU64>,
     frames_sent: Arc<std::sync::atomic::AtomicU64>,
     /// Operator-tunable presentation-time leader in ms.
@@ -349,12 +964,15 @@ pub struct MultiroomEvoNativePlugin {
     /// Snapshot for `multiroom.get_status`; updated by the
     /// receiver scheduler each tick.
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
-    /// Source-host audible-time trace aggregator state.
-    /// Populated when the plugin loads in source role; the
-    /// wire-op `audio.multiroom.frame_trace.snapshot` reads
-    /// from here; the source-capture task writes through.
+    /// Source-host audible-time trace aggregator state slot.
+    /// Populated when the plugin engages source role with
+    /// capture mode; the wire-op
+    /// `audio.multiroom.frame_trace.snapshot` reads from here.
+    /// Held behind `Arc<Mutex<>>` so the substrate subscriber
+    /// can swap the slot atomically when the role transitions
+    /// to a non-source state.
     #[cfg(feature = "alsa-substrate")]
-    trace_state: Option<Arc<TraceState>>,
+    trace_state: Arc<tokio::sync::Mutex<Option<Arc<TraceState>>>>,
     /// Subject announcer handed by the framework at load
     /// time. Used to publish per-device card envelopes on
     /// the `audio.multiroom.device_card` subject, one
@@ -376,9 +994,11 @@ impl MultiroomEvoNativePlugin {
             loaded: false,
             config: PluginConfig::default(),
             audio_plane: None,
-            receiver_task: None,
-            source_task: None,
-            shutdown: Arc::new(Notify::new()),
+            role_engagement: Arc::new(tokio::sync::Mutex::new(
+                RoleEngagement::idle(),
+            )),
+            substrate_subscriber: None,
+            subscriber_shutdown: Arc::new(Notify::new()),
             frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frames_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             leader_ms: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -389,7 +1009,7 @@ impl MultiroomEvoNativePlugin {
                 0,
             )),
             #[cfg(feature = "alsa-substrate")]
-            trace_state: None,
+            trace_state: Arc::new(tokio::sync::Mutex::new(None)),
             subject_announcer: None,
             local_device_id: None,
         }
@@ -431,35 +1051,21 @@ impl MultiroomEvoNativePlugin {
         // are silently dropped (default serde behaviour); the
         // documented keys above are the operator-facing
         // surface.
+        //
+        // Substrate-canonical operator-mutable fields (role,
+        // group_id, group_members, group_member_addresses,
+        // leader_ms) are no longer required from TOML — they
+        // live in the framework's RoleStore + GroupStore and
+        // operator gestures via the wire-op surface mutate
+        // them. TOML retains them as a grace-period advisory
+        // seed: when substrate is empty for this device at
+        // admit time, the plugin uses TOML-derived values to
+        // engage; when substrate is non-empty, substrate
+        // wins.
         let cfg: PluginConfig =
             toml::Value::Table(table.clone()).try_into().map_err(|e| {
                 PluginError::Permanent(format!("invalid plugin config: {e}"))
             })?;
-        if cfg.role == Role::Source && cfg.group_id.is_none() {
-            return Err(PluginError::Permanent(
-                "role = \"source\" requires group_id = \"<uuid>\" in plugin \
-                 config"
-                    .into(),
-            ));
-        }
-        if cfg.role == Role::Source && cfg.group_members.is_empty() {
-            return Err(PluginError::Permanent(
-                "role = \"source\" requires group_members = [\"<device-id>\", \
-                 ...] in plugin config (single source of truth for group \
-                 membership on the source-host)"
-                    .into(),
-            ));
-        }
-        if cfg.role == Role::Source && cfg.group_member_addresses.is_empty() {
-            return Err(PluginError::Permanent(
-                "role = \"source\" requires group_member_addresses = \
-                 [\"<host>:<port>\", ...] in plugin config (each receiver's \
-                 audio-plane TCP address; source-host dials these directly on \
-                 load so audio-plane fan-out has a connected target before \
-                 the first frame)"
-                    .into(),
-            ));
-        }
         self.leader_ms
             .store(cfg.leader_ms, std::sync::atomic::Ordering::Relaxed);
         self.config = cfg;
@@ -609,258 +1215,82 @@ impl Plugin for MultiroomEvoNativePlugin {
                 })?
                 .clone();
             self.audio_plane = Some(Arc::clone(&audio_plane));
-            self.local_device_id = Some(audio_plane.local_device_id());
+            let local_device_id = audio_plane.local_device_id();
+            self.local_device_id = Some(local_device_id.clone());
 
-            match self.config.role {
-                Role::Source => {
-                    let group_id = self.config.group_id.clone().expect(
-                        "role = source enforces group_id in apply_config",
-                    );
-                    // Instantiate the group from operator
-                    // config — single source of truth lives in
-                    // this plugin's TOML, the framework's
-                    // GroupStore is the implementation. Idempotent
-                    // upsert: re-loads with the same config are
-                    // no-ops; config changes (membership churn)
-                    // are picked up by the framework's next
-                    // fan-out without operator intervention. No
-                    // wire-op call required.
-                    audio_plane
-                        .upsert_group(
-                            group_id.clone(),
-                            format!("multiroom:{group_id}"),
-                            self.config.group_members.clone(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!(
-                                "source-host failed to instantiate group \
-                                 {group_id}: {e}"
-                            ))
-                        })?;
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        group_id = %group_id,
-                        members = ?self.config.group_members,
-                        "source-host instantiated multi-room group from \
-                         operator config"
-                    );
-                    // Dial each receiver's audio-plane address
-                    // declared in operator config. Source-host is
-                    // the active dialer; receivers stay passive
-                    // listeners — unambiguous TCP-session
-                    // ownership eliminates the duplicate-connect
-                    // race where two peers race to open the same
-                    // control channel. Idempotent: already-
-                    // connected peers are no-ops. A failed dial
-                    // is logged and the next plugin load retries.
-                    for addr in &self.config.group_member_addresses {
-                        match audio_plane.dial_peer(addr.clone()).await {
-                            Ok(()) => {
-                                tracing::info!(
-                                    plugin = PLUGIN_NAME,
-                                    group_id = %group_id,
-                                    addr = %addr,
-                                    "source-host dialed receiver"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    group_id = %group_id,
-                                    addr = %addr,
-                                    error = %e,
-                                    "source-host dial_peer failed; will not \
-                                     reach this receiver until next plugin \
-                                     load"
-                                );
-                            }
-                        }
-                    }
-                    let sent = Arc::clone(&self.frames_sent);
-                    let shutdown = Arc::clone(&self.shutdown);
-                    let handle = Arc::clone(&audio_plane);
-                    let source_pcm = self.config.source_pcm.clone();
-                    let task = if source_pcm.is_empty() {
-                        tokio::spawn(async move {
-                            run_source_tone_generator(
-                                handle, group_id, sent, shutdown,
-                            )
-                            .await;
-                        })
-                    } else {
-                        #[cfg(feature = "alsa-substrate")]
-                        {
-                            let pcm = source_pcm.clone();
-                            // Construct the audible-time trace
-                            // aggregator state for this source-
-                            // role admission. Window size 100
-                            // records (one record per (sequence,
-                            // receiver) tuple); operator-tunable
-                            // via plugin config in a future commit.
-                            let trace_state = Arc::new(TraceState::new(100));
-                            self.trace_state = Some(Arc::clone(&trace_state));
-                            let task_trace_state =
-                                Some(Arc::clone(&trace_state));
-                            tokio::spawn(async move {
-                                run_source_capture_task(
-                                    handle,
-                                    group_id,
-                                    sent,
-                                    shutdown,
-                                    pcm,
-                                    task_trace_state,
-                                )
-                                .await;
-                            })
-                        }
-                        #[cfg(not(feature = "alsa-substrate"))]
-                        {
-                            tracing::warn!(
-                                plugin = PLUGIN_NAME,
-                                source_pcm = %source_pcm,
-                                "source_pcm set but alsa-substrate feature \
-                                 disabled at build time; falling back to \
-                                 synthetic tone"
-                            );
-                            tokio::spawn(async move {
-                                run_source_tone_generator(
-                                    handle, group_id, sent, shutdown,
-                                )
-                                .await;
-                            })
-                        }
-                    };
-                    self.source_task = Some(task);
-                    if source_pcm.is_empty() {
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            group_id = %self.config.group_id.as_deref().unwrap_or(""),
-                            "source role engaged: synthetic 440 Hz tone fan-out running"
-                        );
-                    } else {
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            group_id = %self.config.group_id.as_deref().unwrap_or(""),
-                            source_pcm = %source_pcm,
-                            "source role engaged: ALSA capture fan-out running"
-                        );
-                    }
-                    // One-renderer-pipeline: when the source
-                    // role is configured with an alsa_pcm
-                    // (the source-local DAC target), ALSO
-                    // spawn the receiver task. The framework
-                    // self-loopbacks source frames onto
-                    // `audio_frame_tx` with from_device_id =
-                    // local_id; the receiver task subscribed
-                    // here renders them through the same
-                    // scheduler the remote receivers use, so
-                    // source-local DAC + every remote
-                    // receiver share one render path. The
-                    // MPD config that feeds snd-aloop should
-                    // narrow to a single audio_output
-                    // (evo-aloop only); the source-local DAC
-                    // is no longer driven by a parallel MPD
-                    // audio_output but by this receiver task
-                    // reading the same scheduled frames.
-                    if !self.config.alsa_pcm.is_empty() {
-                        let counter = Arc::clone(&self.frames_received);
-                        let recv_shutdown = Arc::clone(&self.shutdown);
-                        let recv_handle = Arc::clone(&audio_plane);
-                        let alsa_pcm = self.config.alsa_pcm.clone();
-                        let role = self.config.role;
-                        let leader_ms = Arc::clone(&self.leader_ms);
-                        let underruns = Arc::clone(&self.receiver_underruns);
-                        let queue_depth =
-                            Arc::clone(&self.receiver_queue_depth);
-                        let task = tokio::spawn(async move {
-                            run_receiver_task(
-                                recv_handle,
-                                counter,
-                                recv_shutdown,
-                                alsa_pcm,
-                                role,
-                                leader_ms,
-                                underruns,
-                                queue_depth,
-                            )
-                            .await;
-                        });
-                        self.receiver_task = Some(task);
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            alsa_pcm = %self.config.alsa_pcm,
-                            leader_ms = self.config.leader_ms,
-                            "source-local DAC receiver-task engaged: \
-                             one-renderer-pipeline (source frames \
-                             self-loopback onto the local broadcast)"
-                        );
-                    }
-                }
-                Role::Receiver | Role::Auto => {
-                    // Spawn the receiver task only when the
-                    // plugin has been wired into a multi-room
-                    // group. `Role::Auto` with no group is the
-                    // default (no operator multi-room
-                    // configuration); in that state the plugin
-                    // must NOT open the local DAC, otherwise
-                    // MPD's local-playback path is locked out.
-                    // `Role::Receiver` is an explicit operator
-                    // gesture and always opens the DAC even
-                    // when group state has not yet replicated
-                    // to this node — the operator intent to
-                    // render incoming network audio is
-                    // unambiguous.
-                    let has_group = self.config.group_id.is_some();
-                    let auto_no_group =
-                        matches!(self.config.role, Role::Auto) && !has_group;
-                    if auto_no_group {
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            "Role::Auto with no group_id; receiver task NOT \
-                             spawned (local DAC stays free for MPD)"
-                        );
-                        self.loaded = true;
-                        return Ok(());
-                    }
-                    let counter = Arc::clone(&self.frames_received);
-                    let shutdown = Arc::clone(&self.shutdown);
-                    let handle = Arc::clone(&audio_plane);
-                    let alsa_pcm = self.config.alsa_pcm.clone();
-                    let role = self.config.role;
-                    let leader_ms = Arc::clone(&self.leader_ms);
-                    let underruns = Arc::clone(&self.receiver_underruns);
-                    let queue_depth = Arc::clone(&self.receiver_queue_depth);
-                    let task = tokio::spawn(async move {
-                        run_receiver_task(
-                            handle,
-                            counter,
-                            shutdown,
-                            alsa_pcm,
-                            role,
-                            leader_ms,
-                            underruns,
-                            queue_depth,
-                        )
-                        .await;
-                    });
-                    self.receiver_task = Some(task);
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        role = self.config.role.as_wire_str(),
-                        alsa_pcm = %self.config.alsa_pcm,
-                        leader_ms = self.config.leader_ms,
-                        "receiver-side task running"
-                    );
-                }
+            // Bundle the Arc-shared handles + counters into a
+            // `RoleEngagementContext` the engage_role function
+            // + substrate subscriber both consume.
+            #[cfg(feature = "alsa-substrate")]
+            let trace_state_slot = Arc::clone(&self.trace_state);
+            let role_ctx = Arc::new(RoleEngagementContext {
+                audio_plane: Arc::clone(&audio_plane),
+                alsa_pcm: self.config.alsa_pcm.clone(),
+                source_pcm: self.config.source_pcm.clone(),
+                frames_received: Arc::clone(&self.frames_received),
+                frames_sent: Arc::clone(&self.frames_sent),
+                leader_ms: Arc::clone(&self.leader_ms),
+                receiver_underruns: Arc::clone(&self.receiver_underruns),
+                receiver_queue_depth: Arc::clone(&self.receiver_queue_depth),
+                #[cfg(feature = "alsa-substrate")]
+                trace_state_slot,
+            });
+
+            // Determine initial role + group from substrate
+            // (per ADR-0130 Decision 6 grace period: substrate
+            // wins on conflict; fall back to TOML when
+            // substrate is empty for this device).
+            let (initial_role, group_id, members, member_addresses) =
+                resolve_initial_engagement(
+                    ctx.multiroom_substrate.as_ref(),
+                    &local_device_id,
+                    &self.config,
+                )
+                .await;
+
+            // Initial engagement — the engage_role function is
+            // the same function the substrate subscriber will
+            // call on every operator gesture.
+            engage_role(
+                &self.role_engagement,
+                &role_ctx,
+                initial_role,
+                group_id,
+                members,
+                member_addresses,
+            )
+            .await;
+
+            // Spawn the substrate subscriber when the
+            // framework wired a handle (in-process admission
+            // path; OOP path leaves it None and the plugin
+            // operates in TOML-only mode for now).
+            if let Some(handle) = ctx.multiroom_substrate.as_ref() {
+                let handle = Arc::clone(handle);
+                self.substrate_subscriber = Some(spawn_substrate_subscriber(
+                    Arc::clone(&self.role_engagement),
+                    Arc::clone(&role_ctx),
+                    handle,
+                    local_device_id.clone(),
+                    Arc::clone(&self.subscriber_shutdown),
+                ));
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "substrate subscriber spawned; reactive-only mode active"
+                );
+            } else {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "LoadContext.multiroom_substrate = None; plugin running \
+                     in TOML-only engagement mode (no substrate subscriber)"
+                );
             }
 
             self.announce_local_device_card().await;
-
             self.loaded = true;
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                role = self.config.role.as_wire_str(),
+                role = initial_role.as_wire_str(),
                 "plugin loaded; audio-plane handle equipped"
             );
             Ok(())
@@ -871,13 +1301,28 @@ impl Plugin for MultiroomEvoNativePlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
-            self.shutdown.notify_waiters();
-            if let Some(task) = self.source_task.take() {
+            // Stop the substrate subscriber first — it could
+            // otherwise race the role-engagement teardown by
+            // spawning new role tasks during unload.
+            self.subscriber_shutdown.notify_waiters();
+            if let Some(task) = self.substrate_subscriber.take() {
                 let _ = task.await;
             }
-            if let Some(task) = self.receiver_task.take() {
+            // Disengage the current role: notify role tasks
+            // shutdown, await their exit. The role_engagement
+            // Mutex owns source_task + receiver_task + shutdown
+            // post-refactor.
+            let mut engaged = self.role_engagement.lock().await;
+            engaged.shutdown.notify_waiters();
+            if let Some(task) = engaged.source_task.take() {
                 let _ = task.await;
             }
+            if let Some(task) = engaged.receiver_task.take() {
+                let _ = task.await;
+            }
+            engaged.role = Role::Auto;
+            engaged.group_id = None;
+            drop(engaged);
             self.audio_plane = None;
             self.subject_announcer = None;
             self.local_device_id = None;
@@ -986,9 +1431,14 @@ impl Respondent for MultiroomEvoNativePlugin {
                 }
                 "audio.multiroom.frame_trace.snapshot" => {
                     #[cfg(feature = "alsa-substrate")]
-                    let (records, window_size) = match &self.trace_state {
-                        Some(state) => (state.snapshot(), state.window_size),
-                        None => (Vec::new(), 0),
+                    let (records, window_size) = {
+                        let guard = self.trace_state.lock().await;
+                        match guard.as_ref() {
+                            Some(state) => {
+                                (state.snapshot(), state.window_size)
+                            }
+                            None => (Vec::new(), 0),
+                        }
                     };
                     #[cfg(not(feature = "alsa-substrate"))]
                     let (records, window_size): (
@@ -2406,53 +2856,43 @@ group_member_addresses = ["10.0.0.2:7331", "10.0.0.3:7331"]
     }
 
     #[test]
-    fn parse_source_without_group_id_refuses() {
+    fn parse_source_without_group_fields_accepts() {
+        // Post-substrate-migration: TOML `role = "source"`
+        // without group_id / group_members / group_member_addresses
+        // is no longer refused. The substrate (RoleStore +
+        // GroupStore) is the canonical source of truth; TOML is
+        // an advisory grace-period seed. A source-role TOML
+        // without group fields admits cleanly; the plugin
+        // engages Auto mode at load (substrate-empty default)
+        // and waits for operator gestures via the wire-op
+        // surface to populate substrate.
         let toml_str = r#"role = "source""#;
         let table: toml::Table = toml::from_str(toml_str).unwrap();
         let mut p = MultiroomEvoNativePlugin::new();
-        let err = p.apply_config(&table).unwrap_err();
-        assert!(matches!(err, PluginError::Permanent(_)));
+        p.apply_config(&table)
+            .expect("source-role TOML without group fields admits");
+        assert_eq!(p.config.role, Role::Source);
+        assert!(p.config.group_id.is_none());
+        assert!(p.config.group_members.is_empty());
+        assert!(p.config.group_member_addresses.is_empty());
     }
 
     #[test]
-    fn parse_source_without_group_members_refuses() {
+    fn parse_source_with_partial_group_fields_accepts() {
+        // Partial TOML configuration (group_id without members
+        // or addresses) admits — the plugin will fall back to
+        // substrate or to Auto mode if substrate is empty.
         let toml_str = r#"
 role = "source"
 group_id = "abc-123"
 "#;
         let table: toml::Table = toml::from_str(toml_str).unwrap();
         let mut p = MultiroomEvoNativePlugin::new();
-        let err = p.apply_config(&table).unwrap_err();
-        match err {
-            PluginError::Permanent(msg) => {
-                assert!(
-                    msg.contains("group_members"),
-                    "expected error to name group_members; got: {msg}"
-                );
-            }
-            other => panic!("expected Permanent error; got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_source_without_group_member_addresses_refuses() {
-        let toml_str = r#"
-role = "source"
-group_id = "abc-123"
-group_members = ["device-a", "device-b"]
-"#;
-        let table: toml::Table = toml::from_str(toml_str).unwrap();
-        let mut p = MultiroomEvoNativePlugin::new();
-        let err = p.apply_config(&table).unwrap_err();
-        match err {
-            PluginError::Permanent(msg) => {
-                assert!(
-                    msg.contains("group_member_addresses"),
-                    "expected error to name group_member_addresses; got: {msg}"
-                );
-            }
-            other => panic!("expected Permanent error; got {other:?}"),
-        }
+        p.apply_config(&table)
+            .expect("partial source TOML admits under substrate-canonical");
+        assert_eq!(p.config.role, Role::Source);
+        assert_eq!(p.config.group_id.as_deref(), Some("abc-123"));
+        assert!(p.config.group_members.is_empty());
     }
 
     #[test]
