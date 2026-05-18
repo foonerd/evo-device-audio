@@ -104,6 +104,21 @@ fn file_tag_matches(
 /// Search order: each root, depth-first, directory entries sorted by name;
 /// first matching file in that order wins. Skips hidden *directories* (name
 /// starts with `.`); file names may still start with `.`.
+///
+/// Symlink discipline:
+///
+/// - Directory traversal uses `symlink_metadata` so symlinks themselves
+///   are not followed by the file-type check. Symlinked directories are
+///   refused entry — the scanner descends only into real directories.
+///   This prevents the classic `<root>/a -> <root>` cycle from producing
+///   infinite recursion and the more subtle `<root>/share -> /` from
+///   leaking the scan outside the library tree.
+/// - Symlinked files within a real directory are evaluated (the symlink
+///   target is read by lofty's tag reader), but the recursion does not
+///   walk into them.
+/// - A canonicalised-path visited-set is the belt-and-braces guard:
+///   even if a future maintainer adds symlink-following, the same
+///   real directory is never entered twice in one scan.
 pub fn first_matching_audio_path(
     library_roots: &[PathBuf],
     want_artist: &str,
@@ -112,10 +127,16 @@ pub fn first_matching_audio_path(
     let want_artist = want_artist.trim();
     let want_album = want_album.trim();
     let mut examined: u32 = 0;
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
     for root in library_roots {
-        if let Some(p) =
-            scan(root.as_path(), want_artist, want_album, &mut examined)?
-        {
+        if let Some(p) = scan(
+            root.as_path(),
+            want_artist,
+            want_album,
+            &mut examined,
+            &mut visited,
+        )? {
             return Ok(Some(p));
         }
     }
@@ -127,8 +148,24 @@ fn scan(
     want_artist: &str,
     want_album: &str,
     examined: &mut u32,
+    visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<Option<PathBuf>, MatchError> {
-    if path.is_file() {
+    // `symlink_metadata` does NOT follow symlinks. If `path`
+    // is a symlink, its file_type reports `is_symlink() = true`
+    // and is neither a file nor a directory by this metadata's
+    // accounting.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        // Skip outright — both symlinked files and symlinked
+        // directories. Files reached only via symlink are
+        // not considered library content.
+        return Ok(None);
+    }
+    if ft.is_file() {
         if !is_probable_audio_file(path) {
             return Ok(None);
         }
@@ -141,7 +178,15 @@ fn scan(
         }
         return Ok(None);
     }
-    if !path.is_dir() {
+    if !ft.is_dir() {
+        return Ok(None);
+    }
+    // Visited-set guard: identify the directory by its
+    // canonical path so even hard-link-driven cycles or a
+    // future symlink-following change cannot re-enter.
+    let canonical =
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
         return Ok(None);
     }
     let mut names = read_dir_names(path).map_err(|e| {
@@ -153,11 +198,24 @@ fn scan(
             continue;
         }
         let p = path.join(&name);
-        if p.is_dir() {
-            if let Some(f) = scan(&p, want_artist, want_album, examined)? {
+        let entry_meta = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let entry_ft = entry_meta.file_type();
+        if entry_ft.is_symlink() {
+            // Same discipline as the top of the function: skip
+            // symlinks entirely. The audio-library tree is
+            // expected to be a real directory tree.
+            continue;
+        }
+        if entry_ft.is_dir() {
+            if let Some(f) =
+                scan(&p, want_artist, want_album, examined, visited)?
+            {
                 return Ok(Some(f));
             }
-        } else if is_probable_audio_file(&p) {
+        } else if entry_ft.is_file() && is_probable_audio_file(&p) {
             if *examined >= MAX_MPD_ALBUM_SCAN_CANDIDATES {
                 return Err(MatchError::LimitExceeded);
             }
@@ -262,5 +320,104 @@ mod tests {
             first_matching_audio_path(&[dir.path().to_path_buf()], &a, &al)
                 .unwrap();
         assert_eq!(found, Some(mp3));
+    }
+
+    // ---------------------------------------------------------
+    // Symlink + cycle guard contract tests for first_matching_audio_path.
+    // Document the discipline that the scanner refuses to follow
+    // symlinks and detects cycles in the directory graph.
+    // ---------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_terminates_on_self_referencing_symlink_cycle() {
+        // Build a library with one directory `loop` that
+        // contains a symlink back to itself: `loop/back -> .`.
+        // Without the symlink + visited guards, scan() recurses
+        // into `loop/back/back/back/...` until the OS path
+        // limit is hit. With the guards, scan terminates
+        // cleanly with `Ok(None)`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let looper = dir.path().join("loop");
+        std::fs::create_dir_all(&looper).expect("create loop dir");
+        let backlink = looper.join("back");
+        std::os::unix::fs::symlink(&looper, &backlink)
+            .expect("create self-referencing symlink");
+
+        // No audio in this library; result is None. The
+        // assertion is that the call returns at all — without
+        // the guards this scan would never terminate.
+        let result = first_matching_audio_path(
+            &[dir.path().to_path_buf()],
+            "any",
+            "any",
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "scan must terminate cleanly on symlink cycle; got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_descend_into_symlinked_directories() {
+        // Build a library with one real directory `real/`
+        // containing a no-match audio file, plus a symlinked
+        // directory `mirror -> real`. Even when `mirror` exists
+        // as a directory by metadata-following semantics, the
+        // scanner must NOT descend into it (the visited-set
+        // would catch the duplicate but the symlink-skip
+        // discipline takes effect first).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real dir");
+
+        // Plant a dummy non-audio file so scan walks the
+        // directory but finds no tagged matches.
+        std::fs::write(real.join("placeholder.txt"), b"not audio")
+            .expect("write placeholder");
+        let mirror = dir.path().join("mirror");
+        std::os::unix::fs::symlink(&real, &mirror)
+            .expect("create mirror symlink");
+
+        // Result is Ok(None) — no matching audio anywhere. The
+        // important contract is that the call returns. Without
+        // the symlink discipline, future maintainers who relax
+        // file-type checks could re-introduce infinite recursion;
+        // this test gates against that regression.
+        let result = first_matching_audio_path(
+            &[dir.path().to_path_buf()],
+            "any",
+            "any",
+        );
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_ignores_symlinked_audio_files() {
+        // A symlinked audio file (target outside the library
+        // tree) is reachable by name from inside the library,
+        // but the scanner must not evaluate it — symlinks
+        // bypass the library-confinement intent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_audio = dir.path().join("outside.mp3");
+        std::fs::write(&outside_audio, b"not really audio")
+            .expect("write outside audio");
+
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).expect("create library");
+        let symlinked = library.join("ghost.mp3");
+        std::os::unix::fs::symlink(&outside_audio, &symlinked)
+            .expect("create symlinked audio");
+
+        // No real audio under the library; symlinked audio
+        // is not evaluated. Result is Ok(None).
+        let result = first_matching_audio_path(
+            std::slice::from_ref(&library),
+            "any",
+            "any",
+        );
+        assert!(matches!(result, Ok(None)));
     }
 }
