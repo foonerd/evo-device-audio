@@ -1377,16 +1377,131 @@ impl Plugin for MultiroomEvoNativePlugin {
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
-            HealthReport {
-                status: evo_plugin_sdk::contract::HealthStatus::Healthy,
-                detail: Some(format!(
-                    "role={} frames_sent={} frames_received={}",
-                    self.config.role.as_wire_str(),
-                    self.frames_sent(),
-                    self.frames_received(),
+            use evo_plugin_sdk::contract::{HealthCheck, HealthStatus};
+
+            let mut checks: Vec<HealthCheck> = Vec::new();
+            let now = std::time::SystemTime::now();
+
+            // Subsystem 1: plugin lifecycle state. Unhealthy if the
+            // SDK called health_check on a not-yet-loaded plugin
+            // (defensive — should never happen but worth surfacing).
+            checks.push(HealthCheck {
+                name: "plugin_loaded".to_string(),
+                status: if self.loaded {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unhealthy
+                },
+                message: Some(format!("loaded={}", self.loaded)),
+                last_success: if self.loaded { Some(now) } else { None },
+            });
+
+            // Subsystem 2: audio-plane binding. The plugin cannot
+            // participate in multi-room transport without an
+            // AudioPlaneRuntime handle; missing binding is a hard
+            // configuration error.
+            let audio_plane_bound = self.audio_plane.is_some();
+            checks.push(HealthCheck {
+                name: "audio_plane_binding".to_string(),
+                status: if audio_plane_bound {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unhealthy
+                },
+                message: Some(if audio_plane_bound {
+                    "audio-plane runtime bound".to_string()
+                } else {
+                    "audio-plane runtime not bound; plugin cannot \
+                     transport audio frames"
+                        .to_string()
+                }),
+                last_success: audio_plane_bound.then_some(now),
+            });
+
+            // Subsystem 3: role engagement consistency. The
+            // engaged role MUST match the configured role; a
+            // mismatch means a role transition is in flight or
+            // stuck. Brief mismatch is benign; persistent
+            // mismatch surfaces here as Degraded.
+            let engagement = self.role_engagement.lock().await;
+            let configured = self.config.role;
+            let engaged = engagement.role;
+            let engagement_matches = engaged == configured;
+            checks.push(HealthCheck {
+                name: "role_engagement".to_string(),
+                status: if engagement_matches {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Degraded
+                },
+                message: Some(format!(
+                    "configured={} engaged={} group_id={}",
+                    configured.as_wire_str(),
+                    engaged.as_wire_str(),
+                    engagement.group_id.as_deref().unwrap_or("<none>")
                 )),
-                checks: Vec::new(),
-                reported_at: std::time::SystemTime::now(),
+                last_success: engagement_matches.then_some(now),
+            });
+            drop(engagement);
+
+            // Subsystem 4: role-specific data-plane health.
+            // Receiver: report underruns relative to frames
+            // received. > 10% silence padding is Degraded.
+            // Source: report frame-flow snapshot.
+            let frames_received = self.frames_received();
+            let frames_sent = self.frames_sent();
+            let underruns = self
+                .receiver_underruns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match self.config.role {
+                Role::Receiver => {
+                    let underrun_ratio = if frames_received > 0 {
+                        underruns as f64 / frames_received as f64
+                    } else {
+                        0.0
+                    };
+                    let degraded = underrun_ratio > 0.10;
+                    checks.push(HealthCheck {
+                        name: "receiver_buffer".to_string(),
+                        status: if degraded {
+                            HealthStatus::Degraded
+                        } else {
+                            HealthStatus::Healthy
+                        },
+                        message: Some(format!(
+                            "frames_received={frames_received} \
+                             underruns={underruns} ratio={underrun_ratio:.3}"
+                        )),
+                        last_success: (!degraded).then_some(now),
+                    });
+                }
+                Role::Source => {
+                    checks.push(HealthCheck {
+                        name: "source_capture".to_string(),
+                        status: HealthStatus::Healthy,
+                        message: Some(format!("frames_sent={frames_sent}")),
+                        last_success: Some(now),
+                    });
+                }
+                Role::Auto => {
+                    // Solo / idle. No data-plane work expected;
+                    // omit the role-specific subsystem.
+                }
+            }
+
+            let status = HealthReport::aggregate(&checks);
+            HealthReport {
+                status,
+                detail: Some(format!(
+                    "role={} frames_sent={} frames_received={} \
+                     underruns={}",
+                    self.config.role.as_wire_str(),
+                    frames_sent,
+                    frames_received,
+                    underruns,
+                )),
+                checks,
+                reported_at: now,
             }
         }
     }
@@ -1917,10 +2032,43 @@ async fn run_source_capture_task(
     // about.
     capture_should_exit.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(rx);
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = capture_thread.join();
-    })
-    .await;
+    match tokio::task::spawn_blocking(move || capture_thread.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(panic_payload)) => {
+            let msg = panic_message_str(&panic_payload);
+            tracing::error!(
+                panic = %msg,
+                "multiroom source-capture: ALSA capture thread panicked during \
+                 teardown; ALSA handle may not be cleanly released"
+            );
+        }
+        Err(join_err) => {
+            tracing::error!(
+                error = %join_err,
+                "multiroom source-capture: spawn_blocking join failed during \
+                 capture-thread teardown"
+            );
+        }
+    }
+}
+
+/// Best-effort conversion of a thread panic payload into a
+/// human-readable string for diagnostics. Panic payloads are
+/// `Box<dyn Any + Send + 'static>`; the conventional payload
+/// shapes are `&'static str` and `String`. Anything else is
+/// rendered as a placeholder so the diagnostic remains
+/// non-empty.
+#[cfg(feature = "alsa-substrate")]
+fn panic_message_str(
+    payload: &Box<dyn std::any::Any + Send + 'static>,
+) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 /// One capture-thread chunk plus the source-side stage 3a /
