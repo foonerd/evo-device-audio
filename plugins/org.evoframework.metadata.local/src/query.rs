@@ -936,6 +936,31 @@ pub(crate) fn query_metadata(
     }
 }
 
+/// Resolve a request-supplied target value to an on-disk
+/// audio file, confined to the configured library roots.
+///
+/// Confinement rules:
+///
+/// - HTTP(S) schemes return `None` (this resolver handles
+///   on-disk files only; remote URIs flow through a separate
+///   path).
+/// - Absolute paths are accepted **only** when, after
+///   `canonicalize`, the result is a descendant of one of
+///   the canonicalised library roots. An absolute path
+///   pointing outside every library root (`/etc/passwd`,
+///   `/home/operator/.ssh/id_ed25519`, ...) is refused.
+/// - Relative paths are joined under each library root in
+///   turn; the joined result is canonicalised and the same
+///   descendant check applies, so a relative value
+///   containing `..` segments (`../../../etc/passwd`)
+///   cannot escape the root.
+/// - Both checks treat the library root's canonical form
+///   itself as a valid descendant (the root's own files at
+///   the top level are admissible).
+///
+/// Returns the canonicalised absolute path on success;
+/// `None` on any refusal (missing file, escape attempt,
+/// I/O error during canonicalize).
 fn resolve_audio_path(
     library_roots: &[PathBuf],
     value: &str,
@@ -952,14 +977,45 @@ fn resolve_audio_path(
         return None;
     }
 
-    let p = Path::new(value);
-    if p.is_absolute() {
-        return p.is_file().then(|| p.to_path_buf());
+    // Canonicalise library roots once per call. A root that
+    // cannot be canonicalised (missing directory, broken
+    // symlink) is treated as not-a-root for this call.
+    let canonical_roots: Vec<PathBuf> = library_roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    if canonical_roots.is_empty() {
+        return None;
     }
-    for root in library_roots {
+
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        return confine_to_roots(candidate, &canonical_roots);
+    }
+    for root in &canonical_roots {
         let joined = root.join(value);
-        if joined.is_file() {
-            return Some(joined);
+        if let Some(resolved) = confine_to_roots(&joined, &canonical_roots) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// Canonicalise `candidate` and accept it only when the
+/// canonical form is a descendant of (or equal to) any
+/// `canonical_root`. Refuses missing files, broken
+/// symlinks, and out-of-confinement paths.
+fn confine_to_roots(
+    candidate: &Path,
+    canonical_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    for root in canonical_roots {
+        if canonical == *root || canonical.starts_with(root) {
+            return Some(canonical);
         }
     }
     None
@@ -1089,5 +1145,141 @@ mod tests {
         assert_eq!(r.title.as_deref(), Some("T1"));
         assert_eq!(r.active_profile.as_deref(), Some("extended"));
         assert!(r.detail.as_deref().unwrap_or("").contains("mpd-album"));
+    }
+
+    // ---------------------------------------------------------
+    // resolve_audio_path confinement tests. Cover the contract
+    // documented above the function: absolute paths refused when
+    // they escape every library root, relative `..` segments
+    // refused, http(s) URIs always None, canonicalisation
+    // applied so symlink targets are checked rather than the
+    // symlink paths.
+    // ---------------------------------------------------------
+
+    fn write_dummy_audio_file(path: &Path) {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        let mut f = std::fs::File::create(path).expect("create dummy audio");
+        f.write_all(b"not really audio").expect("write dummy");
+    }
+
+    #[test]
+    fn resolve_audio_path_refuses_absolute_path_outside_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+        let inside = root.join("track.flac");
+        write_dummy_audio_file(&inside);
+        // An absolute path to a file outside the library must
+        // not resolve — even when the file exists.
+        let outside = tmp.path().join("outside.flac");
+        write_dummy_audio_file(&outside);
+
+        let resolved = resolve_audio_path(
+            std::slice::from_ref(&root),
+            outside.to_str().expect("utf8"),
+        );
+        assert!(
+            resolved.is_none(),
+            "absolute path outside the library root must not resolve; got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_audio_path_accepts_absolute_path_inside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+        let inside = root.join("artist/album/track.flac");
+        write_dummy_audio_file(&inside);
+
+        let resolved = resolve_audio_path(
+            std::slice::from_ref(&root),
+            inside.to_str().expect("utf8"),
+        );
+        let resolved =
+            resolved.expect("inside-root absolute path must resolve");
+        let canonical_root = std::fs::canonicalize(&root).expect("canon root");
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "resolved {resolved:?} must descend from canonical root {canonical_root:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_audio_path_refuses_relative_dotdot_escape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+        // A sibling file outside the library that the relative
+        // dot-dot would reach.
+        let escape_target = tmp.path().join("escape-target.flac");
+        write_dummy_audio_file(&escape_target);
+
+        // Relative value `../escape-target.flac` resolves to
+        // `<root>/../escape-target.flac` → `<tmp>/escape-target.flac`,
+        // which is outside the library root.
+        let resolved = resolve_audio_path(
+            std::slice::from_ref(&root),
+            "../escape-target.flac",
+        );
+        assert!(
+            resolved.is_none(),
+            "relative `..` escape must not resolve; got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_audio_path_accepts_relative_inside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+        let inside = root.join("artist/album/track.flac");
+        write_dummy_audio_file(&inside);
+
+        let resolved = resolve_audio_path(
+            std::slice::from_ref(&root),
+            "artist/album/track.flac",
+        );
+        let resolved =
+            resolved.expect("inside-root relative path must resolve");
+        let canonical_root = std::fs::canonicalize(&root).expect("canon root");
+        assert!(resolved.starts_with(&canonical_root));
+    }
+
+    #[test]
+    fn resolve_audio_path_returns_none_for_http_uris() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+
+        assert!(resolve_audio_path(
+            std::slice::from_ref(&root),
+            "http://example.invalid/track.flac",
+        )
+        .is_none());
+        assert!(resolve_audio_path(
+            std::slice::from_ref(&root),
+            "HTTPS://example.invalid/track.flac",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resolve_audio_path_returns_none_for_missing_file_inside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("library");
+        std::fs::create_dir_all(&root).expect("mk library root");
+
+        // Relative value names a file that does not exist —
+        // the resolver must refuse even though the path would
+        // be inside the root.
+        let resolved = resolve_audio_path(
+            std::slice::from_ref(&root),
+            "artist/missing.flac",
+        );
+        assert!(resolved.is_none());
     }
 }
