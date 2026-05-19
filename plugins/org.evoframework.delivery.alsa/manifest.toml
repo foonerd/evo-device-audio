@@ -30,7 +30,13 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# Reactive-only: the plugin's load-time work establishes the
+# modular ALSA pipeline + spawns the options-subject observer.
+# Operator changes flow through the options subject (publisher:
+# playback.options); the delivery plugin's observer task picks
+# up state diffs and re-renders the pipeline in place. No
+# teardown + re-admit cycle is needed on operator config changes.
+mode = "reactive-only"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

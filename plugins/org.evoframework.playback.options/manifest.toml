@@ -30,7 +30,14 @@ max_memory_mb = 16
 max_cpu_percent = 2
 
 [lifecycle]
-hot_reload = "restart"
+# Reactive-only: the plugin publishes the
+# evo.audio.options:settings subject and serves operator-facing
+# setters as wire ops (admin.audio_options.set_*). Operator state
+# lives in the persisted settings file + the subject substrate;
+# no teardown + re-admit cycle is required on TOML edit. The
+# substrate is the actuation path; subscribers (delivery.alsa,
+# playback.mpd) react via existing subject subscriptions.
+mode = "reactive-only"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

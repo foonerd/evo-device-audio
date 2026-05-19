@@ -30,7 +30,15 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# Reactive-only: the plugin is topology-driven via the
+# framework's audio_routing substrate. Composition mode changes
+# arrive as RouteChangeCallback invocations; no operator-tunable
+# TOML fields exist for this plugin, and any future operator
+# surface would land via wire ops + substrate subscriptions, not
+# TOML edits. Frozen would also be defensible but reactive-only
+# is the future-aligned shape (the plugin's reactivity is
+# already wired through the substrate).
+mode = "reactive-only"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

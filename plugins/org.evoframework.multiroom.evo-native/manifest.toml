@@ -31,7 +31,6 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

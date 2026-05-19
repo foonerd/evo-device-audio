@@ -30,7 +30,14 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# Reload-cleanable: operator-tunable state covers mpd-port +
+# library-roots projection. A TOML edit triggers teardown +
+# re-admit; the warden releases active custody on teardown and
+# re-establishes it with the new configuration on re-admit.
+# Custody release during reload is operator-visible (the
+# playback queue pauses for the teardown + admit window — bounded
+# by the manifest's admit/teardown deadlines).
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5
