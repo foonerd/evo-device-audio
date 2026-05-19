@@ -240,14 +240,29 @@ impl Respondent for ArtworkLocalPlugin {
                 "artwork.resolve"
             );
 
-            let out = match resolve::resolve_artwork(
-                &self.config.library_roots,
-                self.state_dir.as_deref(),
-                &req.payload,
-            ) {
-                Ok(r) => r,
+            // F6: image decode + lofty + std::fs are
+            // synchronous and the embedded-cover path opens
+            // arbitrary audio files for tag extraction. Run
+            // on a blocking thread so the shared tokio runtime
+            // isn't stalled.
+            let library_roots = self.config.library_roots.clone();
+            let state_dir = self.state_dir.clone();
+            let payload = req.payload.clone();
+            let out = match tokio::task::spawn_blocking(move || {
+                resolve::resolve_artwork(
+                    &library_roots,
+                    state_dir.as_deref(),
+                    &payload,
+                )
+            })
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(PluginError::Permanent(e)),
                 Err(e) => {
-                    return Err(PluginError::Permanent(e));
+                    return Err(PluginError::Permanent(format!(
+                        "artwork.resolve blocking task join failed: {e}"
+                    )));
                 }
             };
             let body = out.json_bytes().map_err(|e| {
