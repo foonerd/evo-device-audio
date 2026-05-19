@@ -16,8 +16,10 @@ path = "src/lib.rs"
 # clone. The reference device repo is sibling to the engineering
 # repo (`evo-device-audio/` and `evo-core-eng/` share the same
 # parent), so each path-dep walks up three levels then back
-# down into the engineering tree. The SDK pin flips back to a
-# git+tag form once the framework cuts its v0.1.13 release.
+# down into the engineering tree. The framework SDK pin
+# eventually flips to a git+tag form once the framework
+# publishes a release matching the contract this crate
+# compiles against.
 evo = { path = "../../../evo-core-eng/crates/evo" }
 evo-plugin-sdk = { path = "../../../evo-core-eng/crates/evo-plugin-sdk" }
 evo-primitives = { path = "../../../evo-core-eng/crates/evo-primitives" }

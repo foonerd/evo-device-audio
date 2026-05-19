@@ -511,10 +511,10 @@ fn audio_distribution_admission() -> AdmissionSetup {
 ///   only).
 ///
 /// Subsequent operator changes via playback.options' setters
-/// publish a new `audio.options.changed` happening; a
-/// subsequent chunk wires delivery.alsa to consume the
-/// happening, re-derive the topology from the operator's
-/// settings, and re-publish via the same store.
+/// publish a new `audio.options.changed` happening;
+/// delivery.alsa consumes the happening once the consumer
+/// path is wired, re-derives the topology from the operator's
+/// settings, and re-publishes via the same store.
 fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
     Box::new(|ctx: evo::PostAdmissionContext| {
         Box::pin(async move {
