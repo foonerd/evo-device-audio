@@ -1236,6 +1236,7 @@ dependencies = [
  "evo-os-clock",
  "evo-otel-export",
  "evo-plugin-sdk",
+ "evo-primitives",
  "evo-projection-core",
  "evo-runtime-http",
  "evo-sdk-genkit",
@@ -1306,7 +1307,9 @@ dependencies = [
  "clap",
  "evo",
  "evo-device-audio-shared",
+ "evo-multiroom",
  "evo-plugin-sdk",
+ "evo-primitives",
  "org-evoframework-artwork-local",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
@@ -1376,6 +1379,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-multiroom"
+version = "0.1.12"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "evo",
+ "evo-primitives",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evo-observatory"
 version = "0.1.12"
 dependencies = [
@@ -1424,6 +1442,16 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "evo-primitives"
+version = "0.1.12"
+dependencies = [
+ "async-trait",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]
