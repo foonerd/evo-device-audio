@@ -19,6 +19,18 @@ path = "src/main.rs"
 # the workspace gives us the `Manifest` type for in-process
 # admission.
 evo = { path = "../../../evo-core-eng/crates/evo" }
+# evo-multiroom hosts the source-host election runtime that
+# was previously inlined in the framework's `evo` crate. The
+# framework reads election state through the
+# `evo_primitives::SharedElectionState` trait-object handle; a
+# distribution that ships multi-room (this one) constructs the
+# concrete `ElectionRuntime` in its `RuntimeSetup` closure and
+# swaps it into the handle. The framework crate itself has no
+# production dep on this crate — the one-way edge is what
+# enforces the framework / domain separation at the build
+# system level.
+evo-multiroom = { path = "../../../evo-core-eng/crates/evo-multiroom" }
+evo-primitives = { path = "../../../evo-core-eng/crates/evo-primitives" }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 

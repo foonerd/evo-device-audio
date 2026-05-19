@@ -113,11 +113,12 @@
 #![allow(missing_docs)]
 
 use clap::Parser as _;
+use std::sync::Arc;
 
 use anyhow::Context;
 use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
-use evo::AdmissionSetup;
+use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 use evo_plugin_sdk::Manifest;
 use org_evoframework_artwork_local::ArtworkLocalPlugin;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
@@ -132,8 +133,107 @@ use org_evoframework_playback_options::PlaybackOptionsPlugin;
 async fn main() -> anyhow::Result<()> {
     let args = evo::cli::Args::parse();
     let opts = evo::RunOptions::new(args, audio_distribution_admission())
-        .with_post_admission(audio_distribution_post_admission());
+        .with_post_admission(audio_distribution_post_admission())
+        .with_runtime_setup(audio_distribution_runtime_setup());
     evo::run(opts).await
+}
+
+/// Build the audio distribution's runtime-setup closure. The
+/// framework invokes this once during boot after its data-
+/// plane substrates exist and the audio plane has started but
+/// before admission begins. We construct the multi-room
+/// crate's `ElectionRuntime` against the framework substrates
+/// exposed in [`RuntimeSetupContext`], rehydrate it from
+/// persistence, attach the audio-plane runtime (so election's
+/// liveness predicate sees in-flight channel activity), start
+/// it, install it into the framework's shared election-state
+/// handle, and register an async shutdown closure into the
+/// supplied registry. From this point every framework consumer
+/// (audio_plane, group_topology, server wire ops) reads
+/// election state through the multi-room runtime; the
+/// framework crate itself has no production dep on
+/// `evo-multiroom`.
+fn audio_distribution_runtime_setup() -> RuntimeSetup {
+    Box::new(|ctx: RuntimeSetupContext| {
+        Box::pin(async move {
+            let RuntimeSetupContext {
+                bus,
+                persistence,
+                group_store,
+                device_id,
+                shared_election_state,
+                audio_plane_runtime,
+                shutdown_registry,
+                ..
+            } = ctx;
+
+            let election_runtime = Arc::new(
+                evo_multiroom::ElectionRuntime::new(
+                    persistence,
+                    bus,
+                    group_store,
+                    device_id,
+                    evo_multiroom::ElectionConfig::default(),
+                ),
+            );
+
+            if let Err(e) = election_runtime.rehydrate().await {
+                tracing::warn!(
+                    error = %e,
+                    "election runtime: rehydrate failed; substrate may be \
+                     empty or corrupt"
+                );
+            }
+
+            // Attach the audio-plane runtime so election's
+            // liveness predicate accepts peers with an active
+            // audio-plane TCP connection as alive even when
+            // mDNS-SD record freshness has aged past the
+            // liveness window.
+            election_runtime
+                .with_audio_plane(Arc::clone(&audio_plane_runtime));
+
+            if let Err(e) = election_runtime.start().await {
+                tracing::warn!(
+                    error = %e,
+                    "election runtime: start failed; source-host election \
+                     will not function on this boot"
+                );
+            } else {
+                let elections = election_runtime.list().await.len();
+                tracing::info!(
+                    elections,
+                    "election runtime: ready"
+                );
+            }
+
+            // Install the concrete election runtime into the
+            // framework's shared handle. All framework
+            // consumers (audio_plane, group_topology, server
+            // wire ops) see the swap on their next
+            // `current()` read; no further framework-side
+            // rewiring is needed.
+            shared_election_state.set(
+                Arc::clone(&election_runtime)
+                    as Arc<dyn evo_primitives::ElectionState>,
+            );
+
+            // Register the shutdown closure. The framework's
+            // drain path invokes every registered hook in
+            // registration order before returning.
+            let runtime_for_shutdown = Arc::clone(&election_runtime);
+            shutdown_registry.register(Box::new(move || {
+                Box::pin(async move {
+                    runtime_for_shutdown.shutdown().await;
+                    tracing::info!(
+                        "election runtime: stopped"
+                    );
+                })
+            }));
+
+            Ok(())
+        })
+    })
 }
 
 /// Build the audio distribution's in-process admission setup.
