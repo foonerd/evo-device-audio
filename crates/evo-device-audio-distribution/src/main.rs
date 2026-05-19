@@ -123,26 +123,7 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting composition.alsa")?;
 
-            // 2. delivery.alsa: singleton respondent on
-            //    audio.delivery shape 2. Owns the modular ALSA
-            //    pipeline (pcm.evo definition in
-            //    /etc/asound.conf); declares the WriteEndpoint
-            //    upstream plugins write into; exposes
-            //    operator-facing hardware probing verbs
-            //    consumed by the playback.options plugin.
-            let delivery_manifest = Manifest::from_toml(
-                org_evoframework_delivery_alsa::MANIFEST_TOML,
-            )
-            .context("parsing delivery.alsa manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    AlsaDeliveryPlugin::new(),
-                    delivery_manifest,
-                )
-                .await
-                .context("admitting delivery.alsa")?;
-
-            // 3. playback.options: singleton respondent on
+            // 2. playback.options: singleton respondent on
             //    audio.options shape 1. Operator-facing
             //    audiophile-grade settings (resampling /
             //    mixer_type / DOP / output_device /
@@ -150,12 +131,13 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    across restarts; emits
             //    Happening::PluginEvent on every change AND
             //    publishes the settings as a subject so
-            //    downstream consumers (playback.mpd's
-            //    mixer-mode reactor, future UI plugins) can
-            //    subscribe via the framework's
-            //    SubjectStateSubscriber. Admit BEFORE
-            //    playback.mpd so the subject already exists
-            //    when playback.mpd's load-time resolve runs.
+            //    downstream consumers can subscribe via the
+            //    framework's SubjectStateSubscriber. Admit
+            //    BEFORE delivery.alsa + playback.mpd so the
+            //    settings subject already exists when those
+            //    plugins' load-time resolve runs (delivery
+            //    observes the subject per audit Finding F5;
+            //    playback.mpd consumes mixer_type from it).
             let options_manifest = Manifest::from_toml(
                 org_evoframework_playback_options::MANIFEST_TOML,
             )
@@ -167,6 +149,29 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting playback.options")?;
+
+            // 3. delivery.alsa: singleton respondent on
+            //    audio.delivery shape 2. Owns the modular ALSA
+            //    pipeline (pcm.evo definition in
+            //    /etc/asound.conf); declares the WriteEndpoint
+            //    upstream plugins write into; exposes
+            //    operator-facing hardware probing verbs
+            //    consumed by the playback.options plugin. At
+            //    load time, subscribes to the options subject
+            //    (now announced by step 2 above) and emits
+            //    `delivery.options_observed` happenings on
+            //    every settings change.
+            let delivery_manifest = Manifest::from_toml(
+                org_evoframework_delivery_alsa::MANIFEST_TOML,
+            )
+            .context("parsing delivery.alsa manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    AlsaDeliveryPlugin::new(),
+                    delivery_manifest,
+                )
+                .await
+                .context("admitting delivery.alsa")?;
 
             // 4. playback.mpd: warden + respondent on
             //    audio.playback shape 1. Owns the `mpd-path`
