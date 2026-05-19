@@ -220,14 +220,29 @@ impl Respondent for MetadataLocalPlugin {
                 "metadata.query"
             );
 
-            let out = match query::query_metadata(
-                self.config.metadata_profile,
-                &self.config.library_roots,
-                &req.payload,
-            ) {
-                Ok(r) => r,
+            // F6: lofty + std::fs are synchronous and can scan
+            // up to MAX_MPD_ALBUM_SCAN_CANDIDATES = 100_000
+            // files for tag-matching. Run on a blocking thread
+            // so the steward's shared tokio runtime isn't
+            // stalled by library-scan latency.
+            let metadata_profile = self.config.metadata_profile;
+            let library_roots = self.config.library_roots.clone();
+            let payload = req.payload.clone();
+            let out = match tokio::task::spawn_blocking(move || {
+                query::query_metadata(
+                    metadata_profile,
+                    &library_roots,
+                    &payload,
+                )
+            })
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(PluginError::Permanent(e)),
                 Err(e) => {
-                    return Err(PluginError::Permanent(e));
+                    return Err(PluginError::Permanent(format!(
+                        "metadata.query blocking task join failed: {e}"
+                    )));
                 }
             };
             let body = out.json_bytes().map_err(|e| {
