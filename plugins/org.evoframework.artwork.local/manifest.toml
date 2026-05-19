@@ -33,7 +33,11 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# Reload-cleanable: operator-tunable state is the library-roots
+# list (which paths the plugin scans for cover-art). A TOML
+# edit triggers teardown + re-admit; the plugin is stateless
+# across requests so the cycle is cheap.
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

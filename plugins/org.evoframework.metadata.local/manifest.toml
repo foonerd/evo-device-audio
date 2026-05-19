@@ -32,7 +32,14 @@ max_memory_mb = 64
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# Reload-cleanable: operator-tunable state is the library-roots
+# list + metadata profile (standard | extended). A TOML edit
+# triggers the file watcher → dispatcher → AdmissionEngine
+# reload chain: the plugin tears down its lofty handles +
+# library cache and re-admits with the new configuration. The
+# rebuild is bounded (no live state to preserve; the plugin is
+# stateless across requests).
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

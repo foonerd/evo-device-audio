@@ -29,7 +29,13 @@ max_memory_mb = 64
 max_cpu_percent = 10
 
 [lifecycle]
-hot_reload = "restart"
+# Reload-cleanable: operator-tunable state covers
+# NetworkManager binding + supervisor preset + connectivity-
+# check policy. A TOML edit triggers teardown + re-admit; the
+# plugin's source supervisor (rtnetlink / nmcli) drops its
+# subscriptions on teardown and re-establishes them with the
+# new configuration on re-admit.
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5
