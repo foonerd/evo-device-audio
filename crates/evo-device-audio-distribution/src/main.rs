@@ -51,31 +51,53 @@
 //!   over local-file libraries; sync I/O wrapped on the
 //!   blocking thread pool.
 //!
-//! ## Lifecycle posture (compile-link → runtime artefact)
+//! ## Admission posture
 //!
-//! Every plugin above is compile-linked into this binary
-//! today. Compile-link is one of four equal admission paths
-//! the framework documents (PLUGIN_PACKAGING.md §1+§3) — the
-//! other three being cdylib, OOP subprocess, and WASM. The
-//! framework already supports the full install / remove /
-//! update / enable / disable lifecycle for plugins admitted
-//! through any of the four paths; the OOP / cdylib / WASM
-//! variants additionally support those lifecycle operations
-//! WITHOUT a steward restart, which compile-link cannot.
+//! Two phases compose this distribution's admission setup:
 //!
-//! This distribution carries the compile-link shape pending
-//! per-plugin migration to runtime-loadable artefacts. The
-//! architectural property the migration unlocks is "every
-//! plugin's install / remove / update / enable / disable
-//! lifecycle reaches its runtime effect without restarting
-//! the steward process". The per-plugin retirement criterion
-//! is: when a plugin ships as a runtime-loadable artefact
-//! (cdylib, OOP subprocess, or WASM module), its admit call
-//! here is replaced with the framework's catalogue-driven
-//! admit path (manifest on disk, runtime-loadable artefact).
-//! The distribution then becomes a thin packaging layer
-//! (default plugin set on disk, systemd unit, bootstrap)
-//! rather than a binary with plugins baked in.
+//! Phase 1 — programmatic compile-link baseline. The eight
+//! reference plugins above are admitted in-process via the
+//! framework's `admit_singleton_*` entry points. Compile-link
+//! is one of four equal admission paths the framework
+//! documents (PLUGIN_PACKAGING.md §1+§3) — the other three
+//! being cdylib, OOP subprocess, and WASM. The compile-link
+//! path is the natural shape for the curated reference set:
+//! the plugins ship with the distribution binary and are
+//! covered by its release tests.
+//!
+//! Phase 2 — filesystem discovery for operator-installed
+//! plugins. After the baseline admits, the framework's
+//! [`evo::plugin_discovery::discover_and_admit`] walks
+//! `plugins.search_roots` (default `/opt/evo/plugins` then
+//! `/var/lib/evo/plugins`) and admits any out-of-process
+//! plugin bundle the operator has dropped in. Discovery
+//! honours the operator-disabled persistence record from the
+//! framework's `plugins.installed` registrar, so an operator
+//! who has disabled an OOP plugin via the operator shelf
+//! stays disabled across restarts. In-process bundles found
+//! in `search_roots` are skipped with a warning — the
+//! compile-link baseline is the only in-process source.
+//!
+//! ## Lifecycle property
+//!
+//! The architectural property the framework promises is
+//! "every plugin's install / remove / update / enable /
+//! disable lifecycle reaches its runtime effect". The
+//! reach-without-restart property is delivered by the
+//! framework already for plugins admitted through Phase 2
+//! (filesystem discovery + the operator shelf's
+//! `enable_plugin` / `disable_plugin` / `reload_plugin`
+//! verbs). The Phase 1 baseline carries the constraint that
+//! the compile-link path needs a steward restart for the
+//! same operations, because the plugin code is linked into
+//! the binary. The per-plugin closure criterion is: when a
+//! reference plugin ships as a runtime-loadable artefact
+//! (cdylib, OOP subprocess, or WASM module), its Phase 1
+//! admit call here is removed; Phase 2 picks it up from
+//! `search_roots` instead. The distribution then becomes a
+//! thin packaging layer (default plugin set on disk,
+//! systemd unit, bootstrap) rather than a binary with
+//! plugins baked in.
 //!
 //! ## Catalogue + boundary
 //!
@@ -116,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Build the audio distribution's in-process admission setup.
 fn audio_distribution_admission() -> AdmissionSetup {
-    Box::new(|engine: &mut AdmissionEngine, _config: &StewardConfig| {
+    Box::new(|engine: &mut AdmissionEngine, config: &StewardConfig| {
         Box::pin(async move {
             // 0. Tier 2 reference-device UI substrate: register
             //    the six audio shelves (playback transport / queue
@@ -311,6 +333,27 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting artwork.local")?;
+
+            // Phase 2 — filesystem discovery for operator-
+            // installed out-of-process plugins. Walks
+            // config.plugins.search_roots (default
+            // /opt/evo/plugins then /var/lib/evo/plugins) and
+            // admits each bundle whose manifest declares
+            // transport.kind = OutOfProcess. Honours the
+            // operator-disabled persistence record from the
+            // framework's plugins.installed registrar.
+            // In-process bundles found under search_roots are
+            // skipped with a warning — the compile-link
+            // baseline above is the only in-process source.
+            // Per-plugin admission failure inside discovery is
+            // already non-fatal at framework level (the failing
+            // bundle is skipped with a structured happening and
+            // boot continues), so the distribution baseline
+            // stays available even if an operator-installed
+            // plugin is broken.
+            evo::plugin_discovery::discover_and_admit(engine, config)
+                .await
+                .context("operator-installed plugin discovery")?;
 
             Ok(())
         })
