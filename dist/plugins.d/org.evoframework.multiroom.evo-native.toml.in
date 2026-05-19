@@ -25,9 +25,11 @@
 #               source host through `--multiroom-alsa-pcm` (the
 #               configured ALSA PCM, e.g. `evo` for the
 #               distribution's standard pcm alias).
-#   - none: device participates in discovery + group composition
-#           but neither captures nor renders. Useful for devices
-#           that route through a downstream stage.
+#   - auto: device admits with no role engaged. Plugin defers
+#           PCM choice; operator later flips to source or
+#           receiver via the `set_device_role` wire op (the
+#           framework's RoleStore substrate carries the live
+#           role, not this TOML).
 #
 # The `@MULTIROOM_*@` placeholders are substituted at install
 # time by bootstrap.sh from operator-provided flags.

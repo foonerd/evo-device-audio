@@ -279,28 +279,6 @@ fn audio_distribution_admission() -> AdmissionSetup {
 /// subsequent chunk wires delivery.alsa to consume the
 /// happening, re-derive the topology from the operator's
 /// settings, and re-publish via the same store.
-/// Read the operator-supplied multi-room plugin role from
-/// `/etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml`.
-/// Returns `Some("source" | "receiver" | "auto")` when the
-/// config file is present and contains a recognised `role`
-/// key; `None` otherwise.
-///
-/// Used by the post-admission topology hook to publish a
-/// role-aware default — the multi-room plugin's TOML is the
-/// single source of truth for the device's role; the audio
-/// topology mirrors it so MPD's audio_output device path is
-/// chosen automatically.
-fn read_multiroom_role() -> Option<String> {
-    const PATH: &str =
-        "/etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml";
-    let raw = std::fs::read_to_string(PATH).ok()?;
-    let parsed: toml::Value = toml::from_str(&raw).ok()?;
-    parsed
-        .get("role")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
 fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
     Box::new(|ctx: evo::PostAdmissionContext| {
         Box::pin(async move {
@@ -310,40 +288,28 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
             use evo_plugin_sdk::contract::audio_routing::EndpointKind;
             use std::path::PathBuf;
 
-            // Always publish on post-admission, derived from
-            // the current multi-room plugin TOML. The TOML is
-            // the operator's single source of truth for the
-            // device's role; if the role flipped between
-            // boots (e.g. source -> receiver), the persisted
-            // topology from the previous boot would otherwise
-            // pin the wrong MPD audio_output device. The
-            // store's publish path is idempotent on identical
-            // shape — re-publish of the same topology emits
-            // one route-change happening, which is acceptable
-            // boot-time noise. The route-change reactor in
-            // playback.mpd rewrites /etc/evo/mpd.conf
-            // accordingly so the operator's intent in TOML is
-            // realised on every boot.
-
-            // Read the multi-room plugin's operator config to
-            // decide whether this device is a source-host or a
-            // local-playback / receiver node. The multi-room
-            // plugin's TOML is the single source of truth for
-            // the device's role; the audio topology mirrors it
-            // so MPD's audio_output device path is correct
-            // automatically — no operator wire-op call required.
+            // Publish a stable, role-agnostic default topology
+            // pointing at the canonical PCM device `evo`. The
+            // operator's role choice manifests in `/etc/asound.conf`
+            // at bootstrap time, NOT in this binary: bootstrap
+            // wires `pcm.evo` to either the snd-aloop playback
+            // half (source role) or the hardware DAC
+            // (receiver/auto role). The topology here names the
+            // device by alias; ALSA resolves the alias per the
+            // operator's role-specific asound.conf.
             //
-            // Source-host: MPD writes into the snd-aloop playback
-            // half (`hw:Loopback,0,0`); the multi-room plugin's
-            // source role captures from the snd-aloop capture
-            // half (`hw:Loopback,1,0`) and broadcasts to
-            // receivers. Local-playback: MPD writes directly to
-            // `pcm.evo` → hardware DAC.
-            let multiroom_role = read_multiroom_role();
-            let source_endpoint_path = match multiroom_role.as_deref() {
-                Some("source") => PathBuf::from("hw:Loopback,0,0"),
-                _ => PathBuf::from("evo"),
-            };
+            // This binary intentionally does NOT read the
+            // multi-room plugin's TOML to decide endpoint
+            // wiring. Per docs/engineering/BOUNDARY.md, the
+            // framework binary does not own named-subsystem
+            // semantics (role / source / receiver / snd-aloop /
+            // hardware DAC); the multi-room plugin owns its own
+            // role state and engages role-specific tasks
+            // through its own substrate subscriptions. The
+            // route-change reactor in playback.mpd consumes
+            // this topology and rewrites mpd.conf to point at
+            // `pcm.evo`; the asound.conf the operator installed
+            // determines where `pcm.evo` ultimately resolves.
             let format = AudioFormat::Pcm {
                 codec: PcmCodec::PcmS16Le,
                 rate_hz: 44_100,
@@ -353,7 +319,7 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 plugin: "org.evoframework.playback.mpd".to_string(),
                 format: format.clone(),
                 endpoint_kind: EndpointKind::AlsaPcm,
-                endpoint_path: source_endpoint_path.clone(),
+                endpoint_path: PathBuf::from("evo"),
             };
             let delivery_stage = ActiveChainStage::Delivery {
                 plugin: "org.evoframework.delivery.alsa".to_string(),
@@ -361,16 +327,10 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 endpoint_kind: EndpointKind::AlsaPcm,
                 endpoint_path: PathBuf::from("evo"),
             };
-            let display_suffix = match multiroom_role.as_deref() {
-                Some("source") => " — multi-room source-host (MPD → snd-aloop)",
-                _ => " — local playback / receiver",
-            };
             let topology = ActiveAudioTopology {
                 target_key: "evo-device-audio:default".to_string(),
-                display_name: format!(
-                    "Default delivery chain (44.1kHz/16-bit/stereo){}",
-                    display_suffix,
-                ),
+                display_name: "Default delivery chain (44.1kHz/16-bit/stereo)"
+                    .to_string(),
                 chain: vec![source_stage, delivery_stage],
                 volume_mode: VolumeMode::Software,
                 volume_position: Some(0.5),
@@ -381,27 +341,16 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 warnings: Vec::new(),
             };
             tracing::info!(
-                multiroom_role = ?multiroom_role,
-                source_endpoint = %source_endpoint_path.display(),
-                "post-admission: topology shape selected per multi-room role"
-            );
-
-            tracing::info!(
                 target_key = %topology.target_key,
                 source = "org.evoframework.playback.mpd",
                 delivery = "org.evoframework.delivery.alsa",
-                "post-admission: publishing default audio topology"
+                "post-admission: publishing role-agnostic default audio topology"
             );
             ctx.audio
                 .topology_store
                 .publish(topology, "evo-device-audio:post-admission")
                 .await
                 .context("publishing default audio topology")?;
-            tracing::info!(
-                "post-admission: default audio topology published; \
-                 route-change reactor cycle is now live"
-            );
-
             Ok(())
         })
     })

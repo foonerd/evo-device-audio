@@ -430,9 +430,13 @@ csv_to_toml_array() {
 
 if [[ -n "$MULTIROOM_ROLE" ]]; then
     case "$MULTIROOM_ROLE" in
-        source|receiver|none) ;;
+        source|receiver|auto) ;;
         *)
-            echo "--multiroom-role must be one of: source, receiver, none (got: $MULTIROOM_ROLE)" >&2
+            echo "--multiroom-role must be one of: source, receiver, auto (got: $MULTIROOM_ROLE)" >&2
+            echo "" >&2
+            echo "Note: 'none' was previously accepted but produced TOML the plugin rejected at admission" >&2
+            echo "      (the plugin's Role enum has no None variant). Use 'auto' for a device that should" >&2
+            echo "      stay non-engaged unless the operator later sets a role." >&2
             exit 1
             ;;
     esac
@@ -486,8 +490,8 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
             MULTIROOM_GROUP_MEMBERS_LINE="# group_members (source role only)"
             MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
-        none)
-            MULTIROOM_PCM_LINE="# no PCM (role=none)"
+        auto)
+            MULTIROOM_PCM_LINE="# no PCM (role=auto — plugin defers PCM choice until engaged)"
             MULTIROOM_GROUP_MEMBERS_LINE="# group_members (source role only)"
             MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
