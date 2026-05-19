@@ -82,9 +82,9 @@ use evo_plugin_sdk::contract::audio_routing::{
     RouteChangeCallback,
 };
 use evo_plugin_sdk::contract::{
-    BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
+    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities, SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,19 @@ pub struct AlsaDeliveryPlugin {
     /// .alsa and playback.mpd ship — every audio-tier plugin
     /// reacts to topology rewires through the same primitive.
     reactor: Option<ReactorHandle>,
+    /// Options-subject observer task handle. `Some` after a
+    /// successful `Plugin::load` when LoadContext supplied the
+    /// subject_state_subscriber + the playback.options settings
+    /// subject was resolvable; `None` otherwise. The task drains
+    /// state updates from the
+    /// `(scheme: "evo.audio.options", value: "settings")`
+    /// subject and emits a `delivery.options_observed`
+    /// happening per update — making the cross-plugin reactivity
+    /// from playback.options to delivery.alsa operator-
+    /// verifiable. The full pcm.evo re-render in response to
+    /// settings changes is the next chunk; this commit lands
+    /// the observer wiring per audit Finding F5.
+    options_observer: Option<OptionsObserverHandle>,
 }
 
 /// Handle on the route-change reactor task spawned at load.
@@ -173,6 +186,12 @@ struct ReactorHandle {
     refresh_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Handle on the options-subject observer task spawned at load.
+struct OptionsObserverHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+}
+
 impl AlsaDeliveryPlugin {
     /// Construct a fresh plugin instance.
     pub fn new() -> Self {
@@ -182,6 +201,7 @@ impl AlsaDeliveryPlugin {
             asound_conf_path: PathBuf::from(ASOUND_CONF_PATH),
             requests_handled: 0,
             reactor: None,
+            options_observer: None,
         }
     }
 
@@ -327,6 +347,159 @@ impl AlsaDeliveryPlugin {
             .map(|r| r.refresh_count.load(std::sync::atomic::Ordering::SeqCst))
             .unwrap_or(0)
     }
+
+    /// Subscribe to the playback.options settings subject and
+    /// spawn an observer task that emits a
+    /// `delivery.options_observed` happening on every update.
+    ///
+    /// Returns silently when LoadContext doesn't expose the
+    /// `subject_state_subscriber` or `subject_querier` (out-
+    /// of-process transport before the wire surface lands), or
+    /// when the options subject hasn't been announced yet
+    /// (admission ordering puts delivery.alsa before
+    /// playback.options) — in either case the observer is not
+    /// wired this cycle and the operator surface continues to
+    /// work without it. A subsequent steward restart re-attempts.
+    ///
+    /// Per audit Finding F5: this method is the consumer path
+    /// for the `audio.options.changed` reactivity contract. The
+    /// full pcm.evo re-render in response to options changes
+    /// is the next chunk; this lands the observable consumer
+    /// wiring so the cross-plugin reactivity is operator-
+    /// verifiable rather than emit-into-the-void.
+    async fn spawn_options_observer(&mut self, ctx: &LoadContext) {
+        let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_state_subscriber not populated; skipping \
+                 audio-options observer"
+            );
+            return;
+        };
+        let Some(querier) = ctx.subject_querier.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_querier not populated; skipping audio-options \
+                 observer"
+            );
+            return;
+        };
+        let happening_emitter = Arc::clone(&ctx.happening_emitter);
+        let addressing = ExternalAddressing {
+            scheme: "evo.audio.options".to_string(),
+            value: "settings".to_string(),
+        };
+        let canonical_id =
+            match querier.resolve_addressing(addressing.clone()).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "audio-options settings subject not yet announced; \
+                         observer not wired this cycle"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "resolve_addressing for audio-options settings failed"
+                    );
+                    return;
+                }
+            };
+        let mut stream =
+            match subscriber.subscribe_subject(canonical_id.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "subscribe to audio-options settings subject failed"
+                    );
+                    return;
+                }
+            };
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "audio-options observer: shutdown received"
+                        );
+                        return;
+                    }
+                    update = stream.recv() => {
+                        match update {
+                            Ok(state_update) => {
+                                let payload = serde_json::json!({
+                                    "subject_canonical_id":
+                                        state_update.canonical_id,
+                                    "observed_at_ms":
+                                        std::time::SystemTime::now()
+                                            .duration_since(
+                                                std::time::UNIX_EPOCH,
+                                            )
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0),
+                                    "settings_state":
+                                        state_update.state,
+                                });
+                                if let Err(e) = happening_emitter
+                                    .emit_plugin_event(
+                                        "delivery.options_observed"
+                                            .to_string(),
+                                        payload,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %e,
+                                        "emit delivery.options_observed failed"
+                                    );
+                                }
+                            }
+                            Err(SubjectStateStreamError::Lagged {
+                                dropped,
+                            }) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    dropped = dropped,
+                                    "audio-options observer stream lagged"
+                                );
+                            }
+                            Err(SubjectStateStreamError::Closed) => {
+                                tracing::debug!(
+                                    plugin = PLUGIN_NAME,
+                                    "audio-options observer stream closed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        self.options_observer = Some(OptionsObserverHandle { task, shutdown });
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            canonical_id = %canonical_id,
+            "audio-options observer task spawned"
+        );
+    }
+
+    async fn stop_options_observer(&mut self) {
+        if let Some(handle) = self.options_observer.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+    }
 }
 
 /// One-shot endpoint fetch over the AudioRouting handle.
@@ -454,10 +627,21 @@ impl Plugin for AlsaDeliveryPlugin {
             // subscribe to. Same shape composition.alsa +
             // playback.mpd already ship.
             self.spawn_reactor().await?;
+            // Spawn the options-subject observer. Subscribes to
+            // the playback.options settings subject; on every
+            // operator change to mixer_type / output_device /
+            // resampling / etc. emits a
+            // `delivery.options_observed` happening so the
+            // cross-plugin reactivity from options -> delivery
+            // is operator-verifiable. The full pcm.evo
+            // re-render in response to settings changes is the
+            // next chunk; this wiring is the audit-required
+            // consumer path for `audio.options.changed`.
+            self.spawn_options_observer(ctx).await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "plugin loaded; modular ALSA delivery surface ready; \
-                 route-change reactor running"
+                 route-change reactor + options-subject observer running"
             );
             Ok(())
         }
@@ -473,6 +657,7 @@ impl Plugin for AlsaDeliveryPlugin {
                 "plugin unload"
             );
             self.stop_reactor().await;
+            self.stop_options_observer().await;
             self.audio_routing = None;
             self.loaded = false;
             Ok(())

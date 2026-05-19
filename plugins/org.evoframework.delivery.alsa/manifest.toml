@@ -35,6 +35,18 @@ autostart = true
 restart_on_crash = true
 restart_budget = 5
 
+# Capability flags. `subscribe_subjects = true` populates
+# LoadContext.subject_state_subscriber so the plugin can observe
+# operator changes to the playback.options settings subject and
+# emit a `delivery.options_observed` happening on every update.
+# The full asound.conf re-rendering response to settings changes
+# (pcm.evo rewriting based on mixer_type / output_device / etc.)
+# is the next phase of the delivery-side reactivity work; the
+# observer wiring lands here so the cross-plugin reactivity
+# contract is operator-verifiable rather than emit-into-the-void.
+[capabilities]
+subscribe_subjects = true
+
 # Respondent capabilities. Operator-facing introspection of the
 # modular ALSA pipeline state: which cards / mixers / formats the host
 # supports right now. The settings layer (playback.options) drives
