@@ -23,8 +23,9 @@
 //!   land at. The bootstrap script installs the canonical
 //!   `/etc/asound.conf` (plug → hw:CARD=DAC,DEV=0); this plugin
 //!   surfaces the active definition through the
-//!   `delivery.active_endpoint` verb and (in subsequent chunks)
-//!   re-renders it on operator-driven settings changes.
+//!   `delivery.active_endpoint` verb and re-renders it on
+//!   operator-driven settings changes when the renderer path
+//!   is wired.
 //!
 //! - **Probes the host's audio hardware.** `delivery.list_cards`
 //!   parses `aplay -L` to enumerate playback cards;
@@ -39,7 +40,8 @@
 //!   [`AudioRouting::read_endpoint`] to learn what topology the
 //!   framework's reconciliation engine has negotiated, and
 //!   registers a [`RouteChangeCallback`] so it can re-render the
-//!   asound.conf pipeline on every rewire (subsequent chunk).
+//!   asound.conf pipeline on every rewire once the renderer
+//!   path is wired.
 //!
 //! ## What this plugin does NOT do
 //!
@@ -172,8 +174,8 @@ pub struct AlsaDeliveryPlugin {
 
 /// Handle on the route-change reactor task spawned at load.
 /// Carries the shutdown signal, the join handle, and the
-/// receiver-end of the endpoint-snapshot channel consumers
-/// (asound.conf re-renderer when wired in a subsequent chunk)
+/// receiver-end of the endpoint-snapshot channel that
+/// downstream consumers (e.g. an asound.conf re-renderer)
 /// subscribe to.
 struct ReactorHandle {
     task: JoinHandle<()>,

@@ -46,10 +46,9 @@ evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 # the "install / remove / update without steward restart"
 # property the framework promises; full per-plugin lifecycle
 # requires migrating each plugin to a runtime-loadable artefact
-# (OOP or cdylib). That migration is the F1+F4 closure work
-# under v0.1.13's "every plugin lifecycle-able" architecture
-# commitment; this distribution carries the compile-link shape
-# until that migration lands per-plugin.
+# (OOP or cdylib). This distribution carries the compile-link
+# shape for the reference plugin set until each plugin moves
+# to a runtime-loadable shipping form.
 org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
