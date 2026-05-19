@@ -1,0 +1,30 @@
+[package]
+name = "evo-multiroom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-room domain crate for the reference audio device. Houses the source-host election runtime and the cross-device coordination primitives the framework treats as a plugged-in domain. Consumes framework substrates (HappeningBus, GroupStore, PersistenceStore, AudioPlaneRuntime) via evo's public types and implements the evo_primitives::ElectionState trait the framework reads through. The framework crate (`evo`) MUST NOT depend on this crate; the architectural line that distinguishes framework (data plane) from domain (multi-room) is enforced by that one-way edge — hence this crate lives in the device repo rather than the framework engineering repo."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Path-deps reach across to the framework engineering repo
+# clone. The reference device repo is sibling to the engineering
+# repo (`evo-device-audio/` and `evo-core-eng/` share the same
+# parent), so each path-dep walks up three levels then back
+# down into the engineering tree. The SDK pin flips back to a
+# git+tag form once the framework cuts its v0.1.13 release.
+evo = { path = "../../../evo-core-eng/crates/evo" }
+evo-plugin-sdk = { path = "../../../evo-core-eng/crates/evo-plugin-sdk" }
+evo-primitives = { path = "../../../evo-core-eng/crates/evo-primitives" }
+async-trait = "0.1"
+arc-swap = "1.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

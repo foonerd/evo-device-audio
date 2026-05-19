@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "evo-multiroom"
-version = "0.1.12"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1392,6 +1392,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "evo-multiroom-sdk"
+version = "0.1.12"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1431,6 +1440,7 @@ dependencies = [
  "base64",
  "ciborium",
  "evo-coalesce-labels",
+ "evo-multiroom-sdk",
  "jsonschema",
  "nix 0.30.1",
  "once_cell",

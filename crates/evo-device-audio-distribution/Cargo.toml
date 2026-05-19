@@ -29,7 +29,7 @@ evo = { path = "../../../evo-core-eng/crates/evo" }
 # production dep on this crate — the one-way edge is what
 # enforces the framework / domain separation at the build
 # system level.
-evo-multiroom = { path = "../../../evo-core-eng/crates/evo-multiroom" }
+evo-multiroom = { path = "../evo-multiroom" }
 evo-primitives = { path = "../../../evo-core-eng/crates/evo-primitives" }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { path = "../evo-device-audio-shared" }
