@@ -1385,6 +1385,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "evo",
+ "evo-plugin-sdk",
  "evo-primitives",
  "serde",
  "serde_json",

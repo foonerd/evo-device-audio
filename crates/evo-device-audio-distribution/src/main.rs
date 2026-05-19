@@ -162,20 +162,21 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
                 group_store,
                 device_id,
                 shared_election_state,
+                shared_role_store,
+                multiroom_substrate_slot,
                 audio_plane_runtime,
                 shutdown_registry,
                 ..
             } = ctx;
 
-            let election_runtime = Arc::new(
-                evo_multiroom::ElectionRuntime::new(
-                    persistence,
-                    bus,
-                    group_store,
+            let election_runtime =
+                Arc::new(evo_multiroom::ElectionRuntime::new(
+                    Arc::clone(&persistence),
+                    Arc::clone(&bus),
+                    Arc::clone(&group_store),
                     device_id,
                     evo_multiroom::ElectionConfig::default(),
-                ),
-            );
+                ));
 
             if let Err(e) = election_runtime.rehydrate().await {
                 tracing::warn!(
@@ -190,8 +191,7 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // audio-plane TCP connection as alive even when
             // mDNS-SD record freshness has aged past the
             // liveness window.
-            election_runtime
-                .with_audio_plane(Arc::clone(&audio_plane_runtime));
+            election_runtime.with_audio_plane(Arc::clone(&audio_plane_runtime));
 
             if let Err(e) = election_runtime.start().await {
                 tracing::warn!(
@@ -201,10 +201,7 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
                 );
             } else {
                 let elections = election_runtime.list().await.len();
-                tracing::info!(
-                    elections,
-                    "election runtime: ready"
-                );
+                tracing::info!(elections, "election runtime: ready");
             }
 
             // Install the concrete election runtime into the
@@ -213,10 +210,8 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // wire ops) see the swap on their next
             // `current()` read; no further framework-side
             // rewiring is needed.
-            shared_election_state.set(
-                Arc::clone(&election_runtime)
-                    as Arc<dyn evo_primitives::ElectionState>,
-            );
+            shared_election_state.set(Arc::clone(&election_runtime)
+                as Arc<dyn evo_primitives::ElectionState>);
 
             // Register the shutdown closure. The framework's
             // drain path invokes every registered hook in
@@ -225,11 +220,38 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             shutdown_registry.register(Box::new(move || {
                 Box::pin(async move {
                     runtime_for_shutdown.shutdown().await;
-                    tracing::info!(
-                        "election runtime: stopped"
-                    );
+                    tracing::info!("election runtime: stopped");
                 })
             }));
+
+            // Per-device multi-room role substrate. Operator-
+            // declared role (Source / Receiver / Auto); the
+            // substrate is the source of truth for the
+            // reactive-only multi-room plugin's role-transition
+            // state machine. Substrate-empty reads return
+            // `Auto`, so a fresh-boot device admits with the
+            // output substrate free until the operator
+            // engages multi-room.
+            let role_store = Arc::new(evo_multiroom::RoleStore::new(
+                Arc::clone(&persistence),
+                Arc::clone(&bus),
+            ));
+            shared_role_store.set(Arc::clone(&role_store)
+                as Arc<dyn evo_primitives::RoleStoreHandle>);
+            tracing::info!("role store: ready");
+
+            // Multi-room substrate adapter. Implements the
+            // SDK's `MultiroomSubstrateHandle` trait over
+            // `GroupStore` + `RoleStore`. Reactive-only
+            // multi-room plugins consume this through
+            // `LoadContext.multiroom_substrate`.
+            let multiroom_substrate =
+                evo_multiroom::MultiroomSubstrateAdapter::new(
+                    Arc::clone(&group_store),
+                    Arc::clone(&role_store),
+                );
+            multiroom_substrate_slot.set(multiroom_substrate);
+            tracing::info!("multi-room substrate adapter: ready");
 
             Ok(())
         })
