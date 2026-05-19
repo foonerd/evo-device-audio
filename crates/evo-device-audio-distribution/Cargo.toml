@@ -25,15 +25,27 @@ evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 # Plugin set this distribution links in-process. Each plugin
 # crate exports its public Plugin type and the embedded
 # `MANIFEST_TOML` constant; the distribution's admission setup
-# parses each manifest and admits the plugin. The remaining
-# plugins (metadata.local / artwork.local) join as their
-# reshape lands.
+# parses each manifest and admits the plugin.
+#
+# Compile-link admission is the current shape. Per the framework's
+# documented architecture (PLUGIN_PACKAGING.md §1+§3), plugins
+# admit through four equal paths: compile-link, cdylib, OOP
+# binary, WASM. Compile-link is structurally incompatible with
+# the "install / remove / update without steward restart"
+# property the framework promises; full per-plugin lifecycle
+# requires migrating each plugin to a runtime-loadable artefact
+# (OOP or cdylib). That migration is the F1+F4 closure work
+# under v0.1.13's "every plugin lifecycle-able" architecture
+# commitment; this distribution carries the compile-link shape
+# until that migration lands per-plugin.
 org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
 org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
 org-evoframework-network = { path = "../../plugins/org.evoframework.network" }
 org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
+org-evoframework-metadata-local = { path = "../../plugins/org.evoframework.metadata.local" }
+org-evoframework-artwork-local = { path = "../../plugins/org.evoframework.artwork.local" }
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.

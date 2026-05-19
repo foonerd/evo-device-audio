@@ -9,13 +9,17 @@
 # distribution composes a full catalogue from this and
 # whatever else it admits.
 #
-# The audio rack hosts two shelves: composition (audio
-# data plane composition stage; substrate-aware respondent)
-# and playback (warden + source for MPD-backed playback).
-# The subject + relation declarations cover the
-# subject-graph emission the audio playback warden makes
-# on every song change (track + album subjects with the
-# `album_of` relation, and its `tracks_of` inverse).
+# The fragment declares the racks the audio reference
+# distribution carries: `audio` (composition, playback,
+# delivery, options, multiroom), `networking` (link),
+# `metadata` (providers), and `artwork` (providers). The
+# subject + relation declarations cover the subject-graph
+# emission the audio playback warden makes on every song
+# change (track + album subjects with the `album_of`
+# relation, and its `tracks_of` inverse), the operator-
+# facing audio options projection, the network connectivity
+# verdict, and the multi-room frame-trace + device-card
+# projections.
 #
 # Reference plugins that stock these shelves live in
 # `evo-device-audio/plugins/` and are admitted in-process
@@ -117,6 +121,57 @@ dispatches every nmcli invocation through a privilege \
 composite that the framework's preflight runner resolves \
 at admission (direct under root, sudo -n under a non-root \
 service user).
+"""
+
+[[racks]]
+name = "metadata"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Track / album / artist metadata resolution surface. Each \
+provider answers `metadata.query` with v1 JSON for an \
+addressed target (mpd-path, mpd-album). Local reference \
+provider reads embedded tags via lofty; future providers \
+(online services, vendor catalogues) attach to the same \
+shelf without changing the consumer contract.
+"""
+
+[[racks.shelves]]
+name = "providers"
+shape = 1
+description = """
+Metadata respondent: answers `metadata.query` for an \
+addressed target (scheme + value). Reference implementation \
+reads embedded tags from local audio files via lofty; \
+supports `standard` and `extended` response profiles. \
+Consumer-facing schema lives in evo-catalogue-schemas \
+(metadata query v1).
+"""
+
+[[racks]]
+name = "artwork"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Cover-art and visual-material resolution surface. Each \
+provider answers `artwork.resolve` with binary payload and \
+metadata for an addressed target. Local reference provider \
+resolves embedded picture frames + sidecar files from the \
+operator's library; future providers (online services, \
+vendor caches) attach to the same shelf without changing \
+the consumer contract.
+"""
+
+[[racks.shelves]]
+name = "providers"
+shape = 1
+description = """
+Artwork respondent: answers `artwork.resolve` for an \
+addressed target (scheme + value). Reference implementation \
+resolves embedded ID3 / FLAC picture frames and sidecar \
+folder.jpg / cover.jpg / front.jpg files from the operator's \
+library. Consumer-facing schema lives in evo-catalogue-schemas \
+(artwork resolve v1).
 """
 
 # Subject types the audio playback warden announces on

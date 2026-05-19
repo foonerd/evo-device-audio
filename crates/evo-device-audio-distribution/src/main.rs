@@ -41,9 +41,41 @@
 //!   PPAG resolution for the `nmcli_invocation` intent to
 //!   install an EUID-aware dispatch composite (direct under
 //!   root, `sudo -n` under a non-root service user).
+//! - `org.evoframework.multiroom.evo-native` — multi-room
+//!   coordination plugin; consumes the audio-plane substrate
+//!   for source-host fan-out and receiver-side rendering.
+//! - `org.evoframework.metadata.local` — tag-based metadata
+//!   over local-file libraries; sync I/O wrapped on the
+//!   blocking thread pool.
+//! - `org.evoframework.artwork.local` — cover-art resolver
+//!   over local-file libraries; sync I/O wrapped on the
+//!   blocking thread pool.
 //!
-//! The remaining plugins (metadata.local / artwork.local)
-//! join the admission setup as their reshape lands.
+//! ## Lifecycle posture (compile-link → runtime artefact)
+//!
+//! Every plugin above is compile-linked into this binary
+//! today. Compile-link is one of four equal admission paths
+//! the framework documents (PLUGIN_PACKAGING.md §1+§3) — the
+//! other three being cdylib, OOP subprocess, and WASM. The
+//! framework already supports the full install / remove /
+//! update / enable / disable lifecycle for plugins admitted
+//! through any of the four paths; the OOP / cdylib / WASM
+//! variants additionally support those lifecycle operations
+//! WITHOUT a steward restart, which compile-link cannot.
+//!
+//! This distribution carries the compile-link shape pending
+//! per-plugin migration to runtime-loadable artefacts. The
+//! architectural property the migration unlocks is "every
+//! plugin's install / remove / update / enable / disable
+//! lifecycle reaches its runtime effect without restarting
+//! the steward process". The per-plugin retirement criterion
+//! is: when a plugin ships as a runtime-loadable artefact
+//! (cdylib, OOP subprocess, or WASM module), its admit call
+//! here is replaced with the framework's catalogue-driven
+//! admit path (manifest on disk, runtime-loadable artefact).
+//! The distribution then becomes a thin packaging layer
+//! (default plugin set on disk, systemd unit, bootstrap)
+//! rather than a binary with plugins baked in.
 //!
 //! ## Catalogue + boundary
 //!
@@ -65,8 +97,10 @@ use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::AdmissionSetup;
 use evo_plugin_sdk::Manifest;
+use org_evoframework_artwork_local::ArtworkLocalPlugin;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
+use org_evoframework_metadata_local::MetadataLocalPlugin;
 use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
 use org_evoframework_network::NetworkPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
@@ -229,11 +263,7 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    source-host election: source-host nodes
             //    capture from the local audio chain + fan
             //    frames out; receivers subscribe to incoming
-            //    frames + render to local ALSA. The initial
-            //    plugin shape lights up the receiver-observation
-            //    + fan-out-substrate layer; the audio-chain
-            //    capture + render bridges land as substrate
-            //    iterations on the same plugin.
+            //    frames + render to local ALSA.
             let multiroom_manifest = Manifest::from_toml(
                 org_evoframework_multiroom_evo_native::MANIFEST_TOML,
             )
@@ -245,6 +275,42 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting multiroom.evo-native")?;
+
+            // 7. metadata.local: singleton respondent on the
+            //    audio.metadata.providers shelf. Tag-based
+            //    metadata over local-file libraries; sync I/O
+            //    (lofty + std::fs) runs on the blocking thread
+            //    pool so the steward's shared async runtime is
+            //    not stalled by library-scan latency.
+            let metadata_local_manifest = Manifest::from_toml(
+                org_evoframework_metadata_local::MANIFEST_TOML,
+            )
+            .context("parsing metadata.local manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    MetadataLocalPlugin::new(),
+                    metadata_local_manifest,
+                )
+                .await
+                .context("admitting metadata.local")?;
+
+            // 8. artwork.local: singleton respondent on the
+            //    audio.artwork.providers shelf. Resolves
+            //    cover-art from local files; embedded-cover
+            //    extraction + image decode runs on the blocking
+            //    thread pool so the steward's shared async
+            //    runtime is not stalled by image-decode work.
+            let artwork_local_manifest = Manifest::from_toml(
+                org_evoframework_artwork_local::MANIFEST_TOML,
+            )
+            .context("parsing artwork.local manifest")?;
+            engine
+                .admit_singleton_respondent(
+                    ArtworkLocalPlugin::new(),
+                    artwork_local_manifest,
+                )
+                .await
+                .context("admitting artwork.local")?;
 
             Ok(())
         })
