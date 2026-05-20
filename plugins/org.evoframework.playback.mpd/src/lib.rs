@@ -1621,23 +1621,35 @@ impl Plugin for MpdPlaybackPlugin {
             // nothing to pause). Subject_state_subscriber +
             // subject_querier + subject_announcer are
             // required; missing any → skip (advisory mode).
-            if let (Some(sub), Some(q)) = (
+            match (
                 ctx.subject_state_subscriber.as_ref(),
                 ctx.subject_querier.as_ref(),
             ) {
-                self.envelope_subscriber = Some(envelope_subscriber::spawn(
-                    PLUGIN_NAME,
-                    Arc::clone(sub),
-                    Arc::clone(q),
-                    Arc::clone(&ctx.subject_announcer),
-                    Arc::clone(&self.active_command_sender),
-                ));
-            } else {
-                tracing::debug!(
-                    plugin = PLUGIN_NAME,
-                    "subject_state_subscriber or subject_querier unpopulated; \
-                     envelope subscriber not spawned (advisory mode)"
-                );
+                (Some(sub), Some(q)) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "envelope subscriber: subscriber + querier present; \
+                         spawning"
+                    );
+                    self.envelope_subscriber =
+                        Some(envelope_subscriber::spawn(
+                            PLUGIN_NAME,
+                            Arc::clone(sub),
+                            Arc::clone(q),
+                            Arc::clone(&ctx.subject_announcer),
+                            Arc::clone(&self.active_command_sender),
+                        ));
+                }
+                (sub, q) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        subscriber_present = sub.is_some(),
+                        querier_present = q.is_some(),
+                        "envelope subscriber NOT spawned; one or both of \
+                         subject_state_subscriber / subject_querier \
+                         unpopulated (likely OOP transport pre-wire-surface)"
+                    );
+                }
             }
 
             // Subscribe to the audio-options settings subject
