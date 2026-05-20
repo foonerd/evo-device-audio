@@ -59,7 +59,8 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
-pub mod dacs;
+pub mod evo_catalog;
+pub mod import;
 pub mod provider;
 pub mod provider_pi;
 
@@ -76,9 +77,7 @@ use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::dacs::{
-    dac_list_for_profile, find_dac, parse_dacs, DacEntry, DacsFile,
-};
+use crate::evo_catalog::{parse_evo_catalog, DacEntry, EvoCatalog};
 use crate::provider::{
     ActiveConfig, ApplyOutcome, HardwareAudioProvider, NoopProvider,
 };
@@ -87,21 +86,13 @@ use crate::provider_pi::PiProvider;
 /// Embedded plugin manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
-/// Embedded DAC catalogue — frozen provenance snapshot of Volumio's
-/// upstream `dacs.json`. Lives under `data/import/` to signal its
-/// non-load-bearing build-time-only role. ADR-0132 retires runtime
-/// Volumio JSON parsing in a follow-on commit; the current location
-/// already enforces the source-of-truth-is-frozen invariant.
-pub const EMBEDDED_DACS_JSON: &str =
-    include_str!("../data/import/volumio-dacs.json");
-
-/// Embedded Volumio dac_dsp.json — frozen provenance snapshot.
-/// Names-only filter (10 entries, each carrying card name +
-/// `dsp_options[]` ALSA mixer-control-name array). Joined with the
-/// curated DSP control pool + runtime amixer introspection by the
-/// DSP capability resolver landing in the next P0 sub-phase.
-pub const EMBEDDED_VOLUMIO_DAC_DSP_JSON: &str =
-    include_str!("../data/import/volumio-dac-dsp.json");
+/// Embedded evo-native catalog (the runtime source-of-truth). The
+/// importer in `src/import.rs` generates this artefact at developer
+/// time from the frozen Volumio sources under `data/import/`; the
+/// runtime parses ONLY this TOML, never the Volumio JSON shape
+/// (ADR-0132 §Invariant: one canonical parse path).
+pub const EMBEDDED_EVO_CATALOG_TOML: &str =
+    include_str!("../data/evo-catalog.toml");
 
 /// Plugin identity name (must match manifest).
 pub const PLUGIN_NAME: &str = "org.evoframework.hardware.audio-config";
@@ -161,7 +152,7 @@ fn plugin_crate_version() -> semver::Version {
 /// Hardware-audio configuration plugin.
 pub struct HardwareAudioConfigPlugin {
     loaded: bool,
-    catalogue: Option<DacsFile>,
+    catalogue: Option<EvoCatalog>,
     profile: String,
     profile_pinned: bool,
     provider: Arc<dyn HardwareAudioProvider>,
@@ -247,7 +238,7 @@ impl HardwareAudioConfigPlugin {
     /// loaded or the resolved profile has no entries.
     fn list_catalogue(&self) -> Vec<DacEntry> {
         match self.catalogue.as_ref() {
-            Some(c) => dac_list_for_profile(c, &self.profile),
+            Some(c) => c.dac_list_for_profile(&self.profile),
             None => Vec::new(),
         }
     }
@@ -260,18 +251,18 @@ impl HardwareAudioConfigPlugin {
             return cfg;
         }
         if let Some(catalogue) = self.catalogue.as_ref() {
-            for entry in dac_list_for_profile(catalogue, &self.profile) {
+            for entry in catalogue.dac_list_for_profile(&self.profile) {
                 if entry.overlay == cfg.overlay {
                     cfg.catalogue_id = Some(entry.id);
-                    cfg.alsacard_hint = if entry.alsacard.is_empty() {
+                    cfg.alsacard_hint = if entry.alsa_card_hint.is_empty() {
                         None
                     } else {
-                        Some(entry.alsacard)
+                        Some(entry.alsa_card_hint)
                     };
-                    cfg.mixer_hint = if entry.mixer.is_empty() {
+                    cfg.mixer_hint = if entry.in_card_mixer.is_empty() {
                         None
                     } else {
-                        Some(entry.mixer)
+                        Some(entry.in_card_mixer)
                     };
                     break;
                 }
@@ -487,11 +478,12 @@ impl Plugin for HardwareAudioConfigPlugin {
                 state_dir = %ctx.state_dir.display(),
                 "plugin load beginning"
             );
-            self.catalogue = match parse_dacs(EMBEDDED_DACS_JSON) {
+            self.catalogue = match parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML)
+            {
                 Ok(c) => Some(c),
                 Err(e) => {
                     return Err(PluginError::Permanent(format!(
-                        "embedded dacs.json parse error: {e}"
+                        "embedded evo-catalog.toml parse error: {e}"
                     )));
                 }
             };
@@ -627,7 +619,8 @@ impl HardwareAudioConfigPlugin {
         let catalogue = self.catalogue.as_ref().ok_or_else(|| {
             PluginError::Permanent("dac catalogue not loaded".to_string())
         })?;
-        let entry = find_dac(catalogue, &self.profile, &payload.id)
+        let entry = catalogue
+            .find_dac(&self.profile, &payload.id)
             .ok_or_else(|| {
                 PluginError::Permanent(format!(
                     "unknown dac id {:?} for profile {:?}",
@@ -864,12 +857,12 @@ mod tests {
 
     #[test]
     fn embedded_catalogue_parses() {
-        let parsed =
-            parse_dacs(EMBEDDED_DACS_JSON).expect("embedded dacs.json parses");
+        let parsed = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML)
+            .expect("embedded evo-catalog.toml parses");
         assert!(parsed
-            .devices
+            .boards
             .iter()
-            .any(|d| d.name == "Raspberry PI" && !d.data.is_empty()));
+            .any(|b| b.name == "Raspberry PI" && !b.dacs.is_empty()));
     }
 
     #[test]
@@ -879,14 +872,14 @@ mod tests {
         // Pre-load the catalogue without calling load() (which
         // would also touch the provider + announcer).
         let mut p = plugin;
-        p.catalogue = parse_dacs(EMBEDDED_DACS_JSON).ok();
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
         let list = p.list_catalogue();
         assert!(!list.is_empty(), "Pi profile non-empty");
         assert!(list.iter().any(|e| e.id == "hifiberry-dacplus"));
 
         let mut other =
             HardwareAudioConfigPlugin::new().with_profile("Unknown");
-        other.catalogue = parse_dacs(EMBEDDED_DACS_JSON).ok();
+        other.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
         assert!(other.list_catalogue().is_empty());
     }
 
@@ -900,7 +893,7 @@ mod tests {
         // returns the first matching row.
         let mut p =
             HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
-        p.catalogue = parse_dacs(EMBEDDED_DACS_JSON).ok();
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
         let cfg = ActiveConfig {
             overlay: "allo-katana-dac-audio".into(),
             catalogue_id: None,
@@ -918,7 +911,7 @@ mod tests {
     fn enrich_active_config_leaves_unmatched_overlay_unenriched() {
         let mut p =
             HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
-        p.catalogue = parse_dacs(EMBEDDED_DACS_JSON).ok();
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
         let cfg = ActiveConfig {
             overlay: "not-in-catalogue".into(),
             catalogue_id: None,
@@ -937,7 +930,7 @@ mod tests {
     fn enrich_active_config_unset_passes_through() {
         let mut p =
             HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
-        p.catalogue = parse_dacs(EMBEDDED_DACS_JSON).ok();
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
         let unset = ActiveConfig::unset("/boot/config.txt");
         let enriched = p.enrich_active_config(unset.clone());
         assert_eq!(enriched, unset);

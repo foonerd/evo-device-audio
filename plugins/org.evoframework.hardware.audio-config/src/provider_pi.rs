@@ -28,7 +28,7 @@ use regex::Regex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::dacs::DacEntry;
+use crate::evo_catalog::DacEntry;
 use crate::provider::{
     ActiveConfig, ApplyOutcome, HardwareAudioProvider, ProviderError,
 };
@@ -673,16 +673,22 @@ mod tests {
         let provider = PiProvider::for_tests("[all]\nenable_uart=1\n");
         let entry = DacEntry {
             id: "hifiberry-dacplus".into(),
-            name: "HiFiBerry DAC Plus".into(),
+            display_name: "HiFiBerry DAC Plus".into(),
             overlay: "hifiberry-dacplus".into(),
-            alsanum: "2".into(),
-            alsacard: "sndrpihifiberry".into(),
-            mixer: "Digital".into(),
-            modules: String::new(),
-            script: String::new(),
-            eeprom_name: vec!["HiFiBerry DAC+".into()],
+            alsa_card_hint: "sndrpihifiberry".into(),
+            alsa_num_hint: 2,
+            in_card_mixer: "Digital".into(),
+            companion_modules: Vec::new(),
+            init_script: String::new(),
+            eeprom_names: vec!["HiFiBerry DAC+".into()],
             i2c_address: "4d".into(),
-            needsreboot: "yes".into(),
+            needs_reboot_on_apply: true,
+            advanced_settings_enabled: true,
+            dsp_options: vec![
+                "DSP Program".into(),
+                "Clock Missing Period".into(),
+            ],
+            provenance: "volumio:dacs.json#hifiberry-dacplus".into(),
         };
         let outcome = provider.apply(&entry).await.expect("apply ok");
         assert_eq!(outcome.overlay, "hifiberry-dacplus");
@@ -704,16 +710,19 @@ mod tests {
         let provider = PiProvider::for_tests("[all]\n");
         let entry = DacEntry {
             id: "module-only".into(),
-            name: "Module-only DAC".into(),
+            display_name: "Module-only DAC".into(),
             overlay: String::new(),
-            alsanum: "1".into(),
-            alsacard: String::new(),
-            mixer: String::new(),
-            modules: "snd-soc-allo-piano-dac".into(),
-            script: String::new(),
-            eeprom_name: Vec::new(),
+            alsa_card_hint: String::new(),
+            alsa_num_hint: 1,
+            in_card_mixer: String::new(),
+            companion_modules: vec!["snd-soc-allo-piano-dac".into()],
+            init_script: String::new(),
+            eeprom_names: Vec::new(),
             i2c_address: String::new(),
-            needsreboot: "yes".into(),
+            needs_reboot_on_apply: true,
+            advanced_settings_enabled: true,
+            dsp_options: Vec::new(),
+            provenance: "test:module-only".into(),
         };
         let err = provider
             .apply(&entry)

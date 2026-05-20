@@ -16,7 +16,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::dacs::DacEntry;
+use crate::evo_catalog::DacEntry;
 
 /// Errors a provider may return. Variants are explicit so callers
 /// can surface board-class-aware diagnostics through verb responses.
@@ -267,16 +267,19 @@ mod tests {
         let p = NoopProvider::default();
         let entry = DacEntry {
             id: "x".into(),
-            name: "Y".into(),
+            display_name: "Y".into(),
             overlay: "hifiberry-dac".into(),
-            alsanum: String::new(),
-            alsacard: String::new(),
-            mixer: String::new(),
-            modules: String::new(),
-            script: String::new(),
-            eeprom_name: Vec::new(),
+            alsa_card_hint: String::new(),
+            alsa_num_hint: 0,
+            in_card_mixer: String::new(),
+            companion_modules: Vec::new(),
+            init_script: String::new(),
+            eeprom_names: Vec::new(),
             i2c_address: String::new(),
-            needsreboot: "yes".into(),
+            needs_reboot_on_apply: true,
+            advanced_settings_enabled: true,
+            dsp_options: Vec::new(),
+            provenance: String::new(),
         };
         let err = p.apply(&entry).await.expect_err("expected NotApplicable");
         assert!(matches!(err, ProviderError::NotApplicable));

@@ -1,0 +1,1794 @@
+schema_version = 1
+generated_at = "2026-05-20T00:00:00Z"
+imported_from = [
+    "data/import/volumio-dacs.json",
+    "data/import/volumio-dac-dsp.json",
+]
+
+[[boards]]
+name = "Raspberry PI"
+provider = "pi"
+
+[[boards.dacs]]
+id = "adafruit-max98357"
+display_name = "Adafruit MAX98357"
+overlay = "max98357a"
+alsa_card_hint = "MAX98357A"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#adafruit-max98357"
+
+[[boards.dacs]]
+id = "adafruit-uda1334a"
+display_name = "Adafruit UDA1334A"
+overlay = "hifiberry-dac,i2s-mmap"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#adafruit-uda1334a"
+
+[[boards.dacs]]
+id = "allo-boss-dac"
+display_name = "Allo BOSS"
+overlay = "allo-boss-dac-pcm512x-audio"
+alsa_card_hint = "BossDAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#allo-boss-dac"
+
+[[boards.dacs]]
+id = "allo-boss-dac-pi5"
+display_name = "Allo BOSS [Pi5]"
+overlay = "allo-boss-dac-pcm512x-audio,slave"
+alsa_card_hint = "BossDAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#allo-boss-dac-pi5"
+
+[[boards.dacs]]
+id = "allo-boss2-dac"
+display_name = "Allo BOSS2"
+overlay = "allo-boss2-dac-audio"
+alsa_card_hint = "Boss2"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#allo-boss2-dac"
+
+[[boards.dacs]]
+id = "allo-digione"
+display_name = "Allo DigiOne"
+overlay = "allo-digione"
+alsa_card_hint = "sndallodigione"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#allo-digione"
+
+[[boards.dacs]]
+id = "allo-katana-dac"
+display_name = "Allo Katana"
+overlay = "allo-katana-dac-audio"
+alsa_card_hint = "Katana"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "DSP Program",
+    "Deemphasis",
+    "DoP",
+]
+provenance = "volumio:dacs.json#allo-katana-dac"
+
+[[boards.dacs]]
+id = "audio-injector-stereo"
+display_name = "AudioInjector Stereo"
+overlay = "audioinjector-wm8731-audio"
+alsa_card_hint = "audioinjectorpi"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = "aistereo-unmute.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audio-injector-stereo"
+
+[[boards.dacs]]
+id = "audio-injector-bare"
+display_name = "AudioInjector bare I2S"
+overlay = "audioinjector-bare-i2s"
+alsa_card_hint = "audioinjectorba"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audio-injector-bare"
+
+[[boards.dacs]]
+id = "audio-injector-isolated"
+display_name = "AudioInjector Isolated"
+overlay = "audioinjector-isolated-soundcard"
+alsa_card_hint = "audioinjectoris"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audio-injector-isolated"
+
+[[boards.dacs]]
+id = "audio-injector-pro"
+display_name = "AudioInjector Pro"
+overlay = "audioinjector-isolated-soundcard"
+alsa_card_hint = "audioinjectoris"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audio-injector-pro"
+
+[[boards.dacs]]
+id = "audio-injector-ultra"
+display_name = "AudioInjector Ultra 2"
+overlay = "audioinjector-ultra"
+alsa_card_hint = "audioinjectorul"
+alsa_num_hint = 2
+in_card_mixer = "DAC"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audio-injector-ultra"
+
+[[boards.dacs]]
+id = "piano-dac"
+display_name = "Allo Piano"
+overlay = "allo-piano-dac-pcm512x-audio"
+alsa_card_hint = "PianoDAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#piano-dac"
+
+[[boards.dacs]]
+id = "piano-dac-plus"
+display_name = "Allo Piano 2.1"
+overlay = "allo-piano-dac-plus-pcm512x-audio"
+alsa_card_hint = "PianoDACPlus"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "Subwoofer mode",
+    "Lowpass",
+    "Dual Mode",
+    "DSP Program",
+]
+provenance = "volumio:dacs.json#piano-dac-plus"
+
+[[boards.dacs]]
+id = "applepi-dac"
+display_name = "ApplePi DAC"
+overlay = "applepi-dac"
+alsa_card_hint = "ApplePiDAC"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#applepi-dac"
+
+[[boards.dacs]]
+id = "audiophonics-es9028q2m-dac"
+display_name = "Audiophonics I-Sabre ES9028Q2M"
+overlay = "i-sabre-q2m"
+alsa_card_hint = "DAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#audiophonics-es9028q2m-dac"
+
+[[boards.dacs]]
+id = "bassfly"
+display_name = "BassFly-uHAT"
+overlay = "i2s-dac"
+alsa_card_hint = "sndrpirpidac"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "bassfly-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#bassfly"
+
+[[boards.dacs]]
+id = "bassfly-mic"
+display_name = "BassFly-uHAT with I2S Mic"
+overlay = "googlevoicehat-soundcard"
+alsa_card_hint = "sndrpigooglevoi"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "bassfly-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#bassfly-mic"
+
+[[boards.dacs]]
+id = "bassmantis"
+display_name = "BassMantis-uHAT"
+overlay = "i2s-dac"
+alsa_card_hint = "sndrpirpidac"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "bassmantis-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#bassmantis"
+
+[[boards.dacs]]
+id = "bassmantis-mic"
+display_name = "BassMantis-uHAT with I2S Mic"
+overlay = "googlevoicehat-soundcard"
+alsa_card_hint = "sndrpigooglevoi"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "bassmantis-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#bassmantis-mic"
+
+[[boards.dacs]]
+id = "bassowl"
+display_name = "BassOwl-HAT"
+overlay = "i2s-dac"
+alsa_card_hint = "sndrpirpidac"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "bassowl-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#bassowl"
+
+[[boards.dacs]]
+id = "chipdip-master-dac"
+display_name = "ChipDip DAC"
+overlay = "chipdip-dac"
+alsa_card_hint = "ChipDipDAC"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = ["DSP Machine"]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#chipdip-master-dac"
+
+[[boards.dacs]]
+id = "dionaudio-loco-v2"
+display_name = "Dion Audio Loco V2 DAC-AMP"
+overlay = "dionaudio-loco-v2"
+alsa_card_hint = "LOCOV2"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#dionaudio-loco-v2"
+
+[[boards.dacs]]
+id = "fe-pi-audio"
+display_name = "Fe-Pi Audio"
+overlay = "fe-pi-audio"
+alsa_card_hint = "Audio"
+alsa_num_hint = 2
+in_card_mixer = "PCM"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#fe-pi-audio"
+
+[[boards.dacs]]
+id = "generic-dac"
+display_name = "Generic I2S DAC"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#generic-dac"
+
+[[boards.dacs]]
+id = "googlevoicehat"
+display_name = "Google voiceHAT"
+overlay = "googlevoicehat-soundcard"
+alsa_card_hint = "sndrpigooglevoi"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#googlevoicehat"
+
+[[boards.dacs]]
+id = "hifiberry-amp"
+display_name = "HiFiBerry Amp"
+overlay = "hifiberry-amp"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp"
+
+[[boards.dacs]]
+id = "hifiberry-amp100"
+display_name = "HiFiBerry Amp100"
+overlay = "hifiberry-amp100"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp100"
+
+[[boards.dacs]]
+id = "hifiberry-amp100-pi5"
+display_name = "HiFiBerry Amp100 [Pi5]"
+overlay = "hifiberry-amp100,slave"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp100-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-amp2"
+display_name = "HiFiBerry Amp2"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp2"
+
+[[boards.dacs]]
+id = "hifiberry-amp2-pi5"
+display_name = "HiFiBerry Amp2 [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp2-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-amp3"
+display_name = "HiFiBerry Amp3"
+overlay = "hifiberry-amp3"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp3"
+
+[[boards.dacs]]
+id = "hifiberry-amp4"
+display_name = "HiFiBerry Amp4"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp4"
+
+[[boards.dacs]]
+id = "hifiberry-amp4-pi5"
+display_name = "HiFiBerry Amp4 [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp4-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-amp4-pro"
+display_name = "HiFiBerry Amp4 Pro"
+overlay = "hifiberry-amp4pro"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp4-pro"
+
+[[boards.dacs]]
+id = "hifiberry-amp4-pro-pi5"
+display_name = "HiFiBerry Amp4 Pro [Pi5]"
+overlay = "hifiberry-amp4pro,slave"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp4-pro-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-dac"
+display_name = "HiFiBerry DAC"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dac"
+
+[[boards.dacs]]
+id = "hifiberry-dacplus"
+display_name = "HiFiBerry DAC Plus"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "DSP Program",
+    "Clock Missing Period",
+]
+provenance = "volumio:dacs.json#hifiberry-dacplus"
+
+[[boards.dacs]]
+id = "hifiberry-dacplus-pi5"
+display_name = "HiFiBerry DAC Plus [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["HiFiBerry DAC+"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacplus-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-dacplusadc"
+display_name = "HiFiBerry DAC Plus ADC"
+overlay = "hifiberry-dacplusadc"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacplusadc"
+
+[[boards.dacs]]
+id = "hifiberry-dacpluspro"
+display_name = "HiFiBerry DAC+ Pro"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacpluspro"
+
+[[boards.dacs]]
+id = "hifiberry-dacpluspro-pi5"
+display_name = "HiFiBerry DAC+ Pro [Pi5]"
+overlay = "hifiberry-dacplus-pro"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacpluspro-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-dacplusadcpro"
+display_name = "HiFiBerry DAC Plus ADC PRO"
+overlay = "hifiberry-dacplusadcpro"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacplusadcpro"
+
+[[boards.dacs]]
+id = "hifiberry-dacplusadcpro-pi5"
+display_name = "HiFiBerry DAC Plus ADC PRO [Pi5]"
+overlay = "hifiberry-dacplusadcpro,slave"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacplusadcpro-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-dacplusdsp"
+display_name = "HiFiBerry DAC Plus DSP"
+overlay = "hifiberry-dacplusdsp"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dacplusdsp"
+
+[[boards.dacs]]
+id = "hifiberry-dac2hd"
+display_name = "HiFiBerry DAC2 HD"
+overlay = "hifiberry-dacplushd"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "DAC"
+companion_modules = []
+init_script = ""
+eeprom_names = ["DAC 2 HD"]
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dac2hd"
+
+[[boards.dacs]]
+id = "hifiberry-dac2pro"
+display_name = "HiFiBerry DAC2 Pro"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dac2pro"
+
+[[boards.dacs]]
+id = "hifiberry-dac2pro-pi5"
+display_name = "HiFiBerry DAC2 Pro [Pi5]"
+overlay = "hifiberry-dacplus-pro"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dac2pro-pi5"
+
+[[boards.dacs]]
+id = "hifiberry-digi"
+display_name = "HiFiBerry Digi"
+overlay = "hifiberry-digi"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-digi"
+
+[[boards.dacs]]
+id = "hifiberry-digi-pro"
+display_name = "HiFiBerry Digi+ Pro"
+overlay = "hifiberry-digi-pro"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-digi-pro"
+
+[[boards.dacs]]
+id = "hifibox-dac"
+display_name = "HiFiBox DAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = [
+    "HiFiBox DAC HAT",
+    "HiFiBox DAC HAT V1",
+    "HiFiBox DAC HAT V 10",
+]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifibox-dac"
+
+[[boards.dacs]]
+id = "hifibox-dac-pi5"
+display_name = "HiFiBox DAC [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = [
+    "HiFiBox DAC HAT",
+    "HiFiBox DAC HAT V1",
+    "HiFiBox DAC HAT V 10",
+]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifibox-dac-pi5"
+
+[[boards.dacs]]
+id = "innomaker-dac"
+display_name = "Innomaker Dac"
+overlay = "allo-boss-dac-pcm512x-audio"
+alsa_card_hint = "BossDAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#innomaker-dac"
+
+[[boards.dacs]]
+id = "innomaker-dac-pi5"
+display_name = "Innomaker Dac [Pi5]"
+overlay = "allo-boss-dac-pcm512x-audio,slave"
+alsa_card_hint = "BossDAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#innomaker-dac-pi5"
+
+[[boards.dacs]]
+id = "innomaker-dac-pro"
+display_name = "Innomaker Dac Pro"
+overlay = "allo-katana-dac-audio"
+alsa_card_hint = "Katana"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#innomaker-dac-pro"
+
+[[boards.dacs]]
+id = "innomaker-amp"
+display_name = "Innomaker Amp"
+overlay = "hifiberry-amp"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#innomaker-amp"
+
+[[boards.dacs]]
+id = "innomaker-amp-pro"
+display_name = "Innomaker Amp Pro"
+overlay = "merus-amp"
+alsa_card_hint = "sndrpimerusamp"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#innomaker-amp-pro"
+
+[[boards.dacs]]
+id = "interludeaudio-digital"
+display_name = "Interlude Audio Digital Hat"
+overlay = "interludeaudio-digital"
+alsa_card_hint = "snd_IA_Anlog_Hat"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#interludeaudio-digital"
+
+[[boards.dacs]]
+id = "interludeaudio-analog"
+display_name = "Interlude Audio Analog Hat"
+overlay = "interludeaudio-analog"
+alsa_card_hint = "snd_IA_Digital_Hat"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#interludeaudio-analog"
+
+[[boards.dacs]]
+id = "iqaudio-dacplus"
+display_name = "IQaudIO DAC Plus"
+overlay = "iqaudio-dacplus,unmute_amp "
+alsa_card_hint = "IQaudIODAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = "iqamp-unmute.sh"
+eeprom_names = []
+i2c_address = "4c"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#iqaudio-dacplus"
+
+[[boards.dacs]]
+id = "iqaudio-digiplus"
+display_name = "IQaudIO Pi-Digi+"
+overlay = "iqaudio-digi-wm8804-audio"
+alsa_card_hint = "IQAudIODigi"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#iqaudio-digiplus"
+
+[[boards.dacs]]
+id = "iqaudio-amp"
+display_name = "IQaudIO Pi-DigiAMP+"
+overlay = "iqaudio-dacplus,unmute_amp "
+alsa_card_hint = "IQaudIODAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = "iqamp-unmute.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#iqaudio-amp"
+
+[[boards.dacs]]
+id = "justboom-amp"
+display_name = "JustBoom Amp Boards"
+overlay = "justboom-dac"
+alsa_card_hint = "sndrpijustboomd"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = [
+    "JustBoom DAC HAT",
+    "JustBoom DAC HAT v1.1",
+]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#justboom-amp"
+
+[[boards.dacs]]
+id = "justboom-dac"
+display_name = "JustBoom DAC Boards"
+overlay = "justboom-dac"
+alsa_card_hint = "sndrpijustboomd"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = [
+    "JustBoom DAC HAT",
+    "JustBoom DAC HAT v1.1",
+]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "DSP Program",
+    "Clock Missing Period",
+]
+provenance = "volumio:dacs.json#justboom-dac"
+
+[[boards.dacs]]
+id = "justboom-digi"
+display_name = "JustBoom Digi Boards"
+overlay = "justboom-digi"
+alsa_card_hint = "sndrpijustboomd"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = [
+    "JustBoom Digi HAT",
+    "JustBoom Digi HAT v1.1",
+]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = ["Tx Source"]
+provenance = "volumio:dacs.json#justboom-digi"
+
+[[boards.dacs]]
+id = "mamboberry-dac"
+display_name = "Mamboberry LS DAC+"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#mamboberry-dac"
+
+[[boards.dacs]]
+id = "melopero-daczero"
+display_name = "Melopero DAC ZERO"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#melopero-daczero"
+
+[[boards.dacs]]
+id = "melopero-daczero-pi5"
+display_name = "Melopero DAC ZERO [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = "4d"
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#melopero-daczero-pi5"
+
+[[boards.dacs]]
+id = "merus-amp"
+display_name = "MERUS™ Amp piHAT ZW"
+overlay = "merus-amp"
+alsa_card_hint = "sndrpimerusamp"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#merus-amp"
+
+[[boards.dacs]]
+id = "nanosound-dac"
+display_name = "NanoSound DAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#nanosound-dac"
+
+[[boards.dacs]]
+id = "nanosound-dac-pi5"
+display_name = "NanoSound DAC [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#nanosound-dac-pi5"
+
+[[boards.dacs]]
+id = "pecan-dac"
+display_name = "Orchard Audio PecanPi DAC"
+overlay = "i2s-dac"
+alsa_card_hint = "sndrpirpidac"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#pecan-dac"
+
+[[boards.dacs]]
+id = "pecan-plus-dac"
+display_name = "Orchard Audio PecanPi+ DAC"
+overlay = "hifiberry-dacplusdsp"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#pecan-plus-dac"
+
+[[boards.dacs]]
+id = "osa-dacberry-one-plus"
+display_name = "OSA DACBerry ONE+"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#osa-dacberry-one-plus"
+
+[[boards.dacs]]
+id = "osa-dacberry-one-plus-pi5"
+display_name = "OSA DACBerry ONE+ [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#osa-dacberry-one-plus-pi5"
+
+[[boards.dacs]]
+id = "osa-dacberry-pro"
+display_name = "OSA DACBerry PRO"
+overlay = "iqaudio-dacplus"
+alsa_card_hint = "IQaudIODAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#osa-dacberry-pro"
+
+[[boards.dacs]]
+id = "phat-beat"
+display_name = "pHAT BEAT"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#phat-beat"
+
+[[boards.dacs]]
+id = "phat-dac"
+display_name = "pHAT DAC"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#phat-dac"
+
+[[boards.dacs]]
+id = "502-dac"
+display_name = "PI 2 Design 502DAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#502-dac"
+
+[[boards.dacs]]
+id = "502-dac-pi5"
+display_name = "PI 2 Design 502DAC [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#502-dac-pi5"
+
+[[boards.dacs]]
+id = "502-dac-pro"
+display_name = "PI 2 Design 502DAC Pro"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#502-dac-pro"
+
+[[boards.dacs]]
+id = "502-dac-pro-pi5"
+display_name = "PI 2 Design 502DAC Pro [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#502-dac-pro-pi5"
+
+[[boards.dacs]]
+id = "503hta-hybrid"
+display_name = "PI 2 Design 503HTA Hybrid Tube Amp"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#503hta-hybrid"
+
+[[boards.dacs]]
+id = "picade-hat"
+display_name = "Picade HAT"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = ["Picade HAT"]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#picade-hat"
+
+[[boards.dacs]]
+id = "pisound"
+display_name = "Pisound"
+overlay = "pisound"
+alsa_card_hint = "pisound"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = ["Pisound"]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#pisound"
+
+[[boards.dacs]]
+id = "i2s-dac"
+display_name = "R-PI DAC"
+overlay = "i2s-dac"
+alsa_card_hint = "sndrpirpidac"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#i2s-dac"
+
+[[boards.dacs]]
+id = "rpi-dacplus"
+display_name = "Raspberry Pi DAC+"
+overlay = "rpi-dacplus"
+alsa_card_hint = "DAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = ["Raspberry Pi DAC Plus"]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#rpi-dacplus"
+
+[[boards.dacs]]
+id = "soekris-dac"
+display_name = "Soekris dam 1021"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#soekris-dac"
+
+[[boards.dacs]]
+id = "speaker-phat"
+display_name = "Speaker pHAT"
+overlay = "hifiberry-dac"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#speaker-phat"
+
+[[boards.dacs]]
+id = "st400-dac-amp"
+display_name = "ST400 Dac (PCM5122) - Amp"
+overlay = "iqaudio-dacplus"
+alsa_card_hint = "IQaudIODAC"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#st400-dac-amp"
+
+[[boards.dacs]]
+id = "taudac"
+display_name = "TauDAC - DM101"
+overlay = "taudac"
+alsa_card_hint = "TauDACDM101"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = ["TauDAC-DM101"]
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "Anti-Clipping Mode",
+    "Dither",
+    "Filter",
+]
+provenance = "volumio:dacs.json#taudac"
+
+[[boards.dacs]]
+id = "terraberry-dac2"
+display_name = "Terra-Berry DAC 2/3"
+overlay = "i-sabre-q2m"
+alsa_card_hint = "DAC"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#terraberry-dac2"
+
+[[boards.dacs]]
+id = "waveshare-wm8960"
+display_name = "Waveshare WM8960 Audio HAT"
+overlay = "wm8960-soundcard"
+alsa_card_hint = "wm8960soundcard"
+alsa_num_hint = 2
+in_card_mixer = "Playback"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#waveshare-wm8960"
+
+[[boards.dacs]]
+id = "wisdpi-hifi-dac"
+display_name = "wisdPi Hifi DAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#wisdpi-hifi-dac"
+
+[[boards.dacs]]
+id = "wisdpi-hifi-dac-pi5"
+display_name = "wisdPi Hifi DAC [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#wisdpi-hifi-dac-pi5"
+
+[[boards.dacs]]
+id = "volumio-zero"
+display_name = "Volumio Zero ES9039 DAC"
+overlay = "es9039q2m-i2s"
+alsa_card_hint = "es9039q2m"
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = "volumio-zero-init.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#volumio-zero"
+
+[[boards.dacs]]
+id = "52pi-nvdac"
+display_name = "52Pi NVDAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#52pi-nvdac"
+
+[[boards.dacs]]
+id = "52pi-nvdac-pi5"
+display_name = "52Pi NVDAC [Pi5]"
+overlay = "hifiberry-dacplus-std"
+alsa_card_hint = "sndrpihifiberry"
+alsa_num_hint = 2
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#52pi-nvdac-pi5"
+
+[[boards]]
+name = "Odroid C1+"
+provider = "noop"
+
+[[boards.dacs]]
+id = "odroid-hifi-shield"
+display_name = "HiFi Shield"
+overlay = ""
+alsa_card_hint = ""
+alsa_num_hint = 2
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = false
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#odroid-hifi-shield"
+
+[[boards]]
+name = "Sparky"
+provider = "noop"
+
+[[boards.dacs]]
+id = "piano-dac"
+display_name = "Allo Piano"
+overlay = ""
+alsa_card_hint = ""
+alsa_num_hint = 1
+in_card_mixer = "Digital"
+companion_modules = ["snd-soc-allo-piano-dac"]
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#piano-dac"
+
+[[boards.dacs]]
+id = "piano-dac-plus"
+display_name = "Allo Piano 2.1"
+overlay = ""
+alsa_card_hint = ""
+alsa_num_hint = 1
+in_card_mixer = "Digital"
+companion_modules = ["snd-soc-allo-piano-dac-plus"]
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "Subwoofer mode",
+    "Lowpass",
+    "Dual Mode",
+    "DSP Program",
+]
+provenance = "volumio:dacs.json#piano-dac-plus"
+
+[[boards]]
+name = "Tinkerboard"
+provider = "noop"
+
+[[boards.dacs]]
+id = "hifiberry-amp"
+display_name = "HiFiBerry Amp"
+overlay = "hifiberry-amp"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Master"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-amp"
+
+[[boards.dacs]]
+id = "hifiberry-dac"
+display_name = "HiFiBerry DAC"
+overlay = "hifiberry-dac"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = ""
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#hifiberry-dac"
+
+[[boards.dacs]]
+id = "hifiberry-dacplus"
+display_name = "HiFiBerry DAC Plus"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = [
+    "DSP Program",
+    "Clock Missing Period",
+]
+provenance = "volumio:dacs.json#hifiberry-dacplus"
+
+[[boards.dacs]]
+id = "iqaudio-dacplus"
+display_name = "IQaudIO DAC Plus"
+overlay = "iqaudio-dacplus"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = "iqamp-unmute.sh"
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#iqaudio-dacplus"
+
+[[boards.dacs]]
+id = "rpi-dac"
+display_name = "R-PI DAC"
+overlay = "rpi-dac"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#rpi-dac"
+
+[[boards.dacs]]
+id = "wisdPi Hifi DAC"
+display_name = "wisdPi Hifi DAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#wisdPi Hifi DAC"
+
+[[boards.dacs]]
+id = "52Pi NVDAC"
+display_name = "52Pi NVDAC"
+overlay = "hifiberry-dacplus"
+alsa_card_hint = ""
+alsa_num_hint = 0
+in_card_mixer = "Digital"
+companion_modules = []
+init_script = ""
+eeprom_names = []
+i2c_address = ""
+needs_reboot_on_apply = true
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "volumio:dacs.json#52Pi NVDAC"
