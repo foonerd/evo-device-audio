@@ -19,6 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::dsp::{AmixerReadOutcome, AmixerReader};
 use crate::evo_catalog::DacEntry;
 
 /// Errors a provider may return. Variants are explicit so callers
@@ -131,7 +132,80 @@ pub struct ApplyOutcome {
 /// All methods are async-returning to admit `tokio::fs` /
 /// `tokio::process::Command` implementations without blocking the
 /// steward's executor.
-pub trait HardwareAudioProvider: Send + Sync {
+/// Live amixer-write abstraction. The wire-op layer's
+/// `set_dsp_control` handler invokes this once per operator
+/// gesture; the production implementation shells into
+/// `amixer -c <card> cset name='<control>' <value>` against the
+/// bound card; tests inject stubs.
+pub trait AmixerWriter: Send + Sync {
+    /// Set one ALSA mixer control's value on the bound card.
+    fn write_control<'a>(
+        &'a self,
+        card_hint: &'a str,
+        control_name: &'a str,
+        value: AmixerWriteValue,
+    ) -> Pin<Box<dyn Future<Output = AmixerWriteOutcome> + Send + 'a>>;
+}
+
+/// Operator-supplied value to write to an ALSA mixer control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmixerWriteValue {
+    /// For enum controls: the value as the human-readable label
+    /// (e.g. `"Slow Roll-Off"`). The provider's write impl
+    /// passes this verbatim to `amixer cset`; amixer accepts
+    /// enum values by label OR by zero-based index.
+    EnumLabel(String),
+    /// For integer / db_scale controls: the integer value.
+    Integer(i64),
+    /// For boolean controls: `true` or `false`. The provider's
+    /// write impl encodes as `on` / `off` for amixer.
+    Boolean(bool),
+}
+
+/// Outcome variant returned by [`AmixerWriter::write_control`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmixerWriteOutcome {
+    /// Write succeeded; amixer accepted the value.
+    Applied,
+    /// No ALSA card matches the supplied hint on this host.
+    CardUnknown {
+        /// Operator-readable diagnostic.
+        reason: String,
+    },
+    /// Amixer enumerates the card but does not expose this
+    /// control — operator likely has an overlay / driver mismatch.
+    NotPresent {
+        /// Operator-readable diagnostic.
+        reason: String,
+    },
+    /// Amixer refused the value (out of declared range, not a
+    /// legal enum value, type-mismatch, …). Carries the
+    /// amixer stderr verbatim so the operator-facing surface
+    /// preserves the debugging detail.
+    ValueRejected {
+        /// Operator-readable diagnostic.
+        reason: String,
+    },
+    /// Subprocess failed for some other reason (process exec
+    /// error, IO error, …).
+    InvocationFailed {
+        /// Operator-readable diagnostic.
+        reason: String,
+    },
+}
+
+/// Provider trait — the board-class-specific mechanism behind the
+/// plugin's wire-op surface. Implementations live in modules
+/// paired to the board class (`provider_pi`, future
+/// `provider_rockchip`, etc.); a single [`NoopProvider`] absorbs
+/// any unsupported class.
+///
+/// `AmixerReader` + `AmixerWriter` are supertraits so the DSP
+/// capability resolver depends on the narrower trait without
+/// needing the full provider surface.
+pub trait HardwareAudioProvider:
+    AmixerReader + AmixerWriter + Send + Sync
+{
     /// Board profile name keying the DAC catalogue (e.g.
     /// "Raspberry PI"). The plugin uses this to filter the
     /// catalogue at every list-or-select gesture.
@@ -205,6 +279,41 @@ impl NoopProvider {
 impl Default for NoopProvider {
     fn default() -> Self {
         Self::new("Unknown")
+    }
+}
+
+impl AmixerReader for NoopProvider {
+    fn read_control<'a>(
+        &'a self,
+        _card_hint: &'a str,
+        control_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AmixerReadOutcome> + Send + 'a>> {
+        let control = control_name.to_string();
+        Box::pin(async move {
+            AmixerReadOutcome::CardUnknown {
+                reason: format!(
+                    "noop provider has no bound ALSA card; cannot probe '{control}'"
+                ),
+            }
+        })
+    }
+}
+
+impl AmixerWriter for NoopProvider {
+    fn write_control<'a>(
+        &'a self,
+        _card_hint: &'a str,
+        control_name: &'a str,
+        _value: AmixerWriteValue,
+    ) -> Pin<Box<dyn Future<Output = AmixerWriteOutcome> + Send + 'a>> {
+        let control = control_name.to_string();
+        Box::pin(async move {
+            AmixerWriteOutcome::CardUnknown {
+                reason: format!(
+                    "noop provider has no bound ALSA card; cannot apply '{control}'"
+                ),
+            }
+        })
     }
 }
 
