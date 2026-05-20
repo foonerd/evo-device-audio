@@ -141,17 +141,25 @@ impl SupervisorHandle {
         &self,
         cmd: PlaybackCommand,
     ) -> Result<(), PlaybackError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(SupervisorMessage::Command {
-                cmd,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlaybackError::Shutdown)?;
-        match reply_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(PlaybackError::Shutdown),
+        SupervisorCommandSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .command(cmd)
+        .await
+    }
+
+    /// Return a cloneable command-side view of this handle.
+    /// The returned [`SupervisorCommandSender`] can dispatch
+    /// commands to the same supervisor but cannot initiate
+    /// shutdown — its lifecycle is decoupled from the
+    /// owning `SupervisorHandle`. Spawned tasks that need
+    /// to dispatch playback commands (e.g. the
+    /// mixer-transition envelope subscriber) clone one of
+    /// these at custody-acceptance time + drop it at
+    /// custody-release.
+    pub(crate) fn command_sender(&self) -> SupervisorCommandSender {
+        SupervisorCommandSender {
+            command_tx: self.command_tx.clone(),
         }
     }
 
@@ -163,6 +171,45 @@ impl SupervisorHandle {
         }
         if let Some(h) = self.task_handle.take() {
             let _ = h.await;
+        }
+    }
+}
+
+/// Cloneable command-side view of a [`SupervisorHandle`].
+///
+/// Holds only the `command_tx` half; can dispatch commands
+/// but cannot initiate shutdown. Spawned tasks that need to
+/// dispatch playback commands to the active custody hold
+/// one of these via a plugin-owned watch / mutex cell so
+/// they can react to custody lifecycle transitions without
+/// owning the supervisor itself.
+#[derive(Clone)]
+pub(crate) struct SupervisorCommandSender {
+    command_tx: mpsc::Sender<SupervisorMessage>,
+}
+
+impl SupervisorCommandSender {
+    /// Dispatch a command. Semantically identical to
+    /// [`SupervisorHandle::command`] — they share the
+    /// underlying mpsc + oneshot machinery. Returns once
+    /// the supervisor has either executed the command,
+    /// surfaced an ACK, reached the reconnection limit, or
+    /// shut down.
+    pub(crate) async fn command(
+        &self,
+        cmd: PlaybackCommand,
+    ) -> Result<(), PlaybackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorMessage::Command {
+                cmd,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlaybackError::Shutdown)?;
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(PlaybackError::Shutdown),
         }
     }
 }
