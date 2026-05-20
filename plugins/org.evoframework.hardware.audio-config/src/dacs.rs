@@ -183,7 +183,8 @@ pub fn find_dac<'a>(
 mod tests {
     use super::*;
 
-    const EMBEDDED_DACS: &str = include_str!("../data/dacs.json");
+    const EMBEDDED_DACS: &str =
+        include_str!("../data/import/volumio-dacs.json");
 
     #[test]
     fn embedded_dacs_json_parses() {
