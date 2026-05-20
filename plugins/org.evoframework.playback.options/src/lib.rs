@@ -94,6 +94,8 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 
+pub mod transition;
+
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
@@ -134,6 +136,8 @@ const REQUEST_TYPES: &[&str] = &[
     "options.get_settings",
     "options.set_resampling",
     "options.set_mixer_type",
+    "options.set_mixer_device",
+    "options.set_mixer_control",
     "options.set_dop",
     "options.set_output_device",
     "options.set_volume_normalization",
@@ -250,6 +254,21 @@ pub struct Settings {
     /// Mixer-type choice.
     #[serde(default)]
     pub mixer_type: MixerType,
+    /// ALSA mixer device coordinate for hardware-mixer mode
+    /// (typical shape `hw:<card>`). Required-when-
+    /// `mixer_type = hardware`; empty otherwise. Paired with
+    /// `mixer_control`: together they form the coordinate the
+    /// playback warden uses to bind hardware volume control.
+    /// Persisted alongside `mixer_type` so a restart restores
+    /// the binding without re-probing.
+    #[serde(default)]
+    pub mixer_device: String,
+    /// ALSA mixer control name (e.g. `Master`, `PCM`, DAC-
+    /// specific names visible via `amixer scontrols`).
+    /// Required-when-`mixer_type = hardware`; empty otherwise.
+    /// Paired with `mixer_device`.
+    #[serde(default)]
+    pub mixer_control: String,
     /// DSD-over-PCM enable for DSD-capable DACs.
     #[serde(default)]
     pub dop: bool,
@@ -305,6 +324,8 @@ impl Default for Settings {
             v: PAYLOAD_VERSION,
             resampling: ResamplingPolicy::default(),
             mixer_type: MixerType::default(),
+            mixer_device: String::new(),
+            mixer_control: String::new(),
             dop: false,
             output_device: String::new(),
             volume_normalization: false,
@@ -849,6 +870,12 @@ impl Respondent for PlaybackOptionsPlugin {
                 "options.set_mixer_type" => {
                     self.handle_set_mixer_type(req).await
                 }
+                "options.set_mixer_device" => {
+                    self.handle_set_mixer_device(req).await
+                }
+                "options.set_mixer_control" => {
+                    self.handle_set_mixer_control(req).await
+                }
                 "options.set_dop" => self.handle_set_dop(req).await,
                 "options.set_output_device" => {
                     self.handle_set_output_device(req).await
@@ -958,6 +985,66 @@ impl PlaybackOptionsPlugin {
         self.persist_settings().await?;
         self.emit_changed("dop", serde_json::Value::Bool(payload.value))
             .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    async fn handle_set_mixer_device(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetMixerDevicePayload = parse_versioned(req)?;
+        // Operator-readable refusal on whitespace-only typos;
+        // empty string is permitted (signals "clear the
+        // coordinate; hardware-mixer mode will refuse until
+        // the operator picks one").
+        if !payload.value.is_empty() && payload.value.trim().is_empty() {
+            return Err(PluginError::Permanent(
+                "mixer_device must not be whitespace-only; pass empty \
+                 string to clear the coordinate"
+                    .to_string(),
+            ));
+        }
+        self.settings.mixer_device = payload.value.clone();
+        self.persist_settings().await?;
+        self.emit_changed(
+            "mixer_device",
+            serde_json::Value::String(payload.value),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    async fn handle_set_mixer_control(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetMixerControlPayload = parse_versioned(req)?;
+        if !payload.value.is_empty() && payload.value.trim().is_empty() {
+            return Err(PluginError::Permanent(
+                "mixer_control must not be whitespace-only; pass empty \
+                 string to clear the coordinate"
+                    .to_string(),
+            ));
+        }
+        self.settings.mixer_control = payload.value.clone();
+        self.persist_settings().await?;
+        self.emit_changed(
+            "mixer_control",
+            serde_json::Value::String(payload.value),
+        )
+        .await;
         encode(
             req,
             &SimpleOk {
@@ -1304,6 +1391,32 @@ struct SetDopPayload {
 }
 
 impl HasPayloadVersion for SetDopPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetMixerDevicePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: String,
+}
+
+impl HasPayloadVersion for SetMixerDevicePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetMixerControlPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: String,
+}
+
+impl HasPayloadVersion for SetMixerControlPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -1679,6 +1792,113 @@ mod tests {
             }
             other => panic!("expected Permanent, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_mixer_device_persists_and_round_trips() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_mixer_device",
+            json!({ "v": 1, "value": "hw:CARD=Headphones" }),
+        ))
+        .await
+        .unwrap();
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["mixer_device"], "hw:CARD=Headphones");
+    }
+
+    #[tokio::test]
+    async fn set_mixer_device_refuses_whitespace_only_value() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_mixer_device",
+                json!({ "v": 1, "value": "   " }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("mixer_device"));
+                assert!(msg.contains("whitespace-only"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mixer_device_accepts_empty_for_clear() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Seed a non-empty value first; then clear it.
+        p.handle_request(&req(
+            "options.set_mixer_device",
+            json!({ "v": 1, "value": "hw:0" }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_mixer_device",
+            json!({ "v": 1, "value": "" }),
+        ))
+        .await
+        .unwrap();
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["mixer_device"], "");
+    }
+
+    #[tokio::test]
+    async fn set_mixer_control_persists_and_round_trips() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_mixer_control",
+            json!({ "v": 1, "value": "Master" }),
+        ))
+        .await
+        .unwrap();
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["mixer_control"], "Master");
+    }
+
+    #[tokio::test]
+    async fn set_mixer_control_refuses_whitespace_only_value() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_mixer_control",
+                json!({ "v": 1, "value": " \t" }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn settings_defaults_have_empty_mixer_device_and_control() {
+        // Contract: when mixer_type = hardware is requested but
+        // mixer_device + mixer_control aren't populated, the
+        // playback warden refuses (no silent degrade). The
+        // defaults MUST be empty strings so the absence is
+        // visible.
+        let (mut p, _dir) = loaded_plugin().await;
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["mixer_device"], "");
+        assert_eq!(v["mixer_control"], "");
     }
 
     #[tokio::test]

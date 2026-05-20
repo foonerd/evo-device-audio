@@ -61,6 +61,8 @@ request_types = [
     "options.get_settings",
     "options.set_resampling",
     "options.set_mixer_type",
+    "options.set_mixer_device",
+    "options.set_mixer_control",
     "options.set_dop",
     "options.set_output_device",
     "options.set_volume_normalization",
