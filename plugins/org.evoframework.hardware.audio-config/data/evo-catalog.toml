@@ -1676,7 +1676,7 @@ provenance = "volumio:dacs.json#piano-dac-plus"
 
 [[boards]]
 name = "Tinkerboard"
-provider = "noop"
+provider = "rockchip"
 
 [[boards.dacs]]
 id = "hifiberry-amp"
