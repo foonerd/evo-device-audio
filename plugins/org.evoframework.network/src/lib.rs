@@ -104,9 +104,8 @@ const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
 /// the plugin's `probe_kind` is `off` (the default), the
 /// response carries the supervisor's non-HTTP-derived view
 /// without performing any HTTP I/O; when `probe_kind` is set,
-/// the response carries the latest classification — a future
-/// chunk can wire this to inject a fresh probe trigger into the
-/// supervisor's event channel.
+/// the response carries the latest classification produced by
+/// the supervisor's event-driven probe pipeline.
 const REQUEST_NETWORK_REFRESH_CONNECTIVITY: &str =
     "network.refresh_connectivity";
 
@@ -5641,6 +5640,27 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    /// Cross-test serialization point for the mock-script `fs::write`
+    /// + `handle_request` sequence.
+    ///
+    /// Linux `exec(2)` returns ETXTBSY when the file has any open
+    /// writable descriptor anywhere on the system. The race we
+    /// serialize: test A is in the middle of `fs::write` for its
+    /// mock script (open-for-write fd briefly held); test B
+    /// concurrently spawns a subprocess via tokio (fork+exec); the
+    /// forked child inherits A's writable fd until it execs (the
+    /// child's CLOEXEC closes it then, but the window is too late);
+    /// during that window, A's own subsequent exec of its mock
+    /// script trips ETXTBSY because the kernel sees an open writer
+    /// (the inherited fd in B's child) on A's file.
+    ///
+    /// Any test that does `std::fs::write(<mock script>, ...)`
+    /// followed by `handle_request(...)` MUST hold this lock for
+    /// the duration of both calls — otherwise the suite flakes
+    /// sporadically under parallel execution.
+    static MOCK_EXEC_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     #[test]
     fn manifest_parses() {
         let m = manifest();
@@ -6387,6 +6407,7 @@ version = 1
 
     #[tokio::test]
     async fn request_flow_apply_works_with_mock_nmcli() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-mock.sh");
         let nmcli_log_path = dir.path().join("nmcli.log");
@@ -6471,6 +6492,7 @@ exit 0\n",
     #[tokio::test]
     async fn request_flow_apply_reports_nonfatal_when_flight_mode_blocks_wifi()
     {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-mock-flight-mode.sh");
         let nmcli_log_path = dir.path().join("nmcli-flight.log");
@@ -6534,6 +6556,7 @@ exit 0\n",
 
     #[tokio::test]
     async fn request_flow_flight_mode_set_get_and_apply_guard() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-mock-flight-set.sh");
         let nmcli_log_path = dir.path().join("nmcli-flight-set.log");
@@ -6638,6 +6661,7 @@ exit 0\n",
     #[tokio::test]
     async fn request_flow_status_treats_configured_flight_mode_as_intentional_block(
     ) {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-mock-status-flight.sh");
         std::fs::write(
@@ -6692,6 +6716,7 @@ exit 0\n",
 
     #[tokio::test]
     async fn request_flow_status_is_degraded_on_partial_backend_failure() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-mock-status.sh");
         std::fs::write(
@@ -6743,6 +6768,7 @@ exit 0\n",
 
     #[tokio::test]
     async fn request_flow_scan_uses_cache_until_refresh_requested() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-scan-cache.sh");
         let nmcli_log_path = dir.path().join("nmcli-cache.log");
@@ -6803,6 +6829,7 @@ exit 0\n",
 
     #[tokio::test]
     async fn request_flow_scan_returns_stale_cache_on_backend_error() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-scan-fail.sh");
         std::fs::write(
@@ -6864,6 +6891,7 @@ exit 0\n",
 
     #[tokio::test]
     async fn nmcli_output_times_out_on_slow_backend() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli_path = dir.path().join("nmcli-slow.sh");
         std::fs::write(
