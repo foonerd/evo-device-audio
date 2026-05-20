@@ -6,7 +6,7 @@ contract = 1
 
 [target]
 shelf = "audio.options"
-shape = 1
+shape = 2
 
 [kind]
 instance = "singleton"
@@ -64,6 +64,9 @@ request_types = [
     "options.set_dop",
     "options.set_output_device",
     "options.set_volume_normalization",
+    "options.set_startup_volume",
+    "options.set_max_volume",
+    "options.set_volume_curve",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ]
