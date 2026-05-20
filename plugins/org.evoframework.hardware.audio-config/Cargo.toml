@@ -21,11 +21,14 @@ path = "src/bin/hardware-audio-config-wire.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
 evo-plugin-sdk = { workspace = true }
+hex = { workspace = true }
 regex = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 # Async filesystem (boot-config read/write, modules-load.d drop-in)
 # + subprocess (sudo -n cat/tee for root-owned narrow paths). The

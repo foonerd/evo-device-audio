@@ -63,6 +63,7 @@ pub mod dsp;
 pub mod dsp_pool;
 pub mod evo_catalog;
 pub mod import;
+pub mod modder;
 pub mod provider;
 pub mod provider_pi;
 
@@ -1422,37 +1423,43 @@ mod tests {
         pi.stub_amixer_read(
             "Katana",
             "DSP Program",
-            crate::dsp::AmixerReadOutcome::Found(crate::dsp::LiveControlState {
-                control_type: crate::dsp_pool::ControlType::Enum,
-                current_value: serde_json::Value::String("None".into()),
-                enum_values: vec!["None".into(), "DAC".into()],
-                integer_min: None,
-                integer_max: None,
-            }),
+            crate::dsp::AmixerReadOutcome::Found(
+                crate::dsp::LiveControlState {
+                    control_type: crate::dsp_pool::ControlType::Enum,
+                    current_value: serde_json::Value::String("None".into()),
+                    enum_values: vec!["None".into(), "DAC".into()],
+                    integer_min: None,
+                    integer_max: None,
+                },
+            ),
         )
         .await;
         pi.stub_amixer_read(
             "Katana",
             "Deemphasis",
-            crate::dsp::AmixerReadOutcome::Found(crate::dsp::LiveControlState {
-                control_type: crate::dsp_pool::ControlType::Boolean,
-                current_value: serde_json::Value::Bool(false),
-                enum_values: vec![],
-                integer_min: None,
-                integer_max: None,
-            }),
+            crate::dsp::AmixerReadOutcome::Found(
+                crate::dsp::LiveControlState {
+                    control_type: crate::dsp_pool::ControlType::Boolean,
+                    current_value: serde_json::Value::Bool(false),
+                    enum_values: vec![],
+                    integer_min: None,
+                    integer_max: None,
+                },
+            ),
         )
         .await;
         pi.stub_amixer_read(
             "Katana",
             "DoP",
-            crate::dsp::AmixerReadOutcome::Found(crate::dsp::LiveControlState {
-                control_type: crate::dsp_pool::ControlType::Boolean,
-                current_value: serde_json::Value::Bool(false),
-                enum_values: vec![],
-                integer_min: None,
-                integer_max: None,
-            }),
+            crate::dsp::AmixerReadOutcome::Found(
+                crate::dsp::LiveControlState {
+                    control_type: crate::dsp_pool::ControlType::Boolean,
+                    current_value: serde_json::Value::Bool(false),
+                    enum_values: vec![],
+                    integer_min: None,
+                    integer_max: None,
+                },
+            ),
         )
         .await;
         pi.enable_amixer_write_capture();
