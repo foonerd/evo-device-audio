@@ -73,14 +73,22 @@ drive output-device selection.
 
 [[racks.shelves]]
 name = "options"
-shape = 1
+shape = 2
 description = """
 Operator-facing playback settings. Persists audiophile \
 preferences across steward restarts (resampling / mixer_type \
-/ DOP / output_device / volume_normalization). Emits \
-`Happening::PluginEvent` with event_type `audio.options.changed` \
-on every setter so the delivery plugin re-renders the modular \
-ALSA pipeline and the UI surfaces stay coherent.
+/ mixer_device / mixer_control / DOP / output_device / \
+volume_normalization / startup_volume / max_volume / \
+volume_curve). Emits `Happening::PluginEvent` with event_type \
+`audio.options.changed` on every setter so the delivery \
+plugin re-renders the modular ALSA pipeline and the UI \
+surfaces stay coherent. The orchestrator emits four \
+`audio.mixer_transition.{started, applied, rolled_back, failed}` \
+lifecycle happenings per mixer-mode gesture under a \
+per-plugin transition lock; the `envelope_requested` + \
+`envelope_observed` subject pair coordinates the safety \
+envelope's pre-mute / unmute steps across the audio.playback \
+warden.
 """
 
 [[racks.shelves]]
@@ -195,6 +203,26 @@ name = "album"
 # `evo.audio.options:settings` as the canonical addressing.
 [[subjects]]
 name = "audio_options_settings"
+
+# Subject types carried by the mixer-mode transition's
+# envelope-coordination protocol. The orchestrator
+# (playback.options-shape plugin) publishes
+# `envelope_requested` to engage / release the safety
+# envelope on each transition step (pre-mute at step 2;
+# unmute at step 7). The playback warden (playback.mpd-shape
+# plugin) subscribes to `envelope_requested`, transitions
+# its playback chain (Pause / Resume), and publishes
+# `envelope_observed` with the matching generation. The
+# orchestrator awaits the matching observation within a
+# bounded timeout; timeout routes to the rollback chain.
+# Schema reference: `schemas/org.evoframework/audio/
+# options.v2.toml` acceptance criterion
+# `mixer-transition-envelope-coordination`.
+[[subjects]]
+name = "audio_mixer_transition_envelope_requested"
+
+[[subjects]]
+name = "audio_mixer_transition_envelope_observed"
 
 # Subject type the network plugin announces as the read-able
 # surface for the device's connectivity verdict. Consumers

@@ -87,6 +87,10 @@ pub(crate) fn spawn(
     };
 
     let task = tokio::spawn(async move {
+        tracing::info!(
+            plugin = plugin_name,
+            "envelope subscriber task entered; announcing envelope_observed"
+        );
         // Announce envelope_observed so the orchestrator can
         // resolve its canonical id. The seed state's
         // generation = 0 lets the orchestrator know "warden
@@ -108,12 +112,16 @@ pub(crate) fn spawn(
             state: initial_observed,
             announced_at: SystemTime::now(),
         };
-        if let Err(e) = announcer.announce(announcement).await {
-            tracing::warn!(
+        match announcer.announce(announcement).await {
+            Ok(()) => tracing::info!(
+                plugin = plugin_name,
+                "envelope_observed announce ok"
+            ),
+            Err(e) => tracing::warn!(
                 plugin = plugin_name,
                 error = %e,
                 "announce envelope_observed failed"
-            );
+            ),
         }
 
         // Resolve envelope_requested with bounded backoff
