@@ -3217,11 +3217,14 @@ name = "org-evoframework-hardware-audio-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "evo-plugin-sdk",
+ "hex",
  "regex",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
