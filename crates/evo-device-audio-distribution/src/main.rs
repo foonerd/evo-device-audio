@@ -124,7 +124,6 @@ use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_metadata_local::MetadataLocalPlugin;
 use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
-use org_evoframework_network::NetworkPlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 use org_evoframework_playback_options::PlaybackOptionsPlugin;
 
@@ -374,30 +373,25 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .context("admitting playback.mpd")?;
 
             // 5. network: singleton respondent on
-            //    networking.link shape 1. Multi-source
-            //    networking surface (status / scan / intent /
-            //    captive-portal / security / flight-mode);
-            //    fans in from rtnetlink + NetworkManager
-            //    D-Bus + universal polling floor under a
-            //    per-platform source preset. Holds an
-            //    [`NmcliDispatcher`] composite that the
-            //    framework's PPAG runner stamps from the
-            //    `nmcli_invocation` resolution at admission
-            //    time, so under non-root service identities
-            //    every nmcli invocation goes through
-            //    `sudo -n nmcli` against the distribution's
-            //    NOPASSWD drop-in without re-probing on each
-            //    call.
-            let network_nm_manifest =
-                Manifest::from_toml(org_evoframework_network::MANIFEST_TOML)
-                    .context("parsing network manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    NetworkPlugin::new(),
-                    network_nm_manifest,
-                )
-                .await
-                .context("admitting network")?;
+            //    network moved to out-of-process shipping
+            //    form. The plugin is no longer admitted via
+            //    Phase 1 compile-link; the
+            //    `dist/scripts/deploy-distribution.sh` flow
+            //    cross-builds its wire binary
+            //    (`network-wire`), stages + signs a bundle
+            //    from
+            //    `plugins/org.evoframework.network/manifest.oop.toml`,
+            //    and installs it at
+            //    `/opt/evo/plugins/org.evoframework.network/`.
+            //    Phase 2 discovery (below) admits it from
+            //    the filesystem search root, the framework's
+            //    PPAG runner probes the `nmcli` / `iw` /
+            //    `rfkill` NOPASSWD drop-ins (provisioned by
+            //    `bootstrap.sh` Steps 1 + 1b), stamps the
+            //    dispatcher resolution on
+            //    `LoadContext::capabilities`, and the
+            //    plugin's subprocess reads the resolution to
+            //    pick its invocation strategy.
 
             // 6. multiroom.evo-native: singleton respondent on
             //    audio.multiroom shape 1. Bridges the local

@@ -53,7 +53,14 @@ org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.com
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
 org-evoframework-playback-options = { path = "../../plugins/org.evoframework.playback.options" }
-org-evoframework-network = { path = "../../plugins/org.evoframework.network" }
+# `org-evoframework-network` is no longer a production dep
+# of the distribution binary — it migrated to out-of-process
+# shipping form alongside artwork.local. The wire binary
+# (`network-wire`) is cross-built independently via the
+# deploy script and the plugin admits through framework
+# Phase 2 discovery from
+# `/opt/evo/plugins/org.evoframework.network/`. Workspace
+# membership keeps it cross-buildable from the device repo.
 org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
 org-evoframework-metadata-local = { path = "../../plugins/org.evoframework.metadata.local" }
 # `org-evoframework-artwork-local` is no longer a production

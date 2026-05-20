@@ -118,6 +118,7 @@ DIST_BIN="evo-device-audio"
 # reaches per-plugin without touching the steward binary.
 OOP_PLUGINS=(
     "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire"
+    "org.evoframework.network:org-evoframework-network:network-wire"
 )
 
 echo "=== deploy-distribution.sh ==="
