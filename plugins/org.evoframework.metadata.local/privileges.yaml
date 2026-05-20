@@ -1,12 +1,15 @@
 schema_version: "1.0"
 plugin: org.evoframework.metadata.local
 owner: evo-device-audio
-isolation: in_process
+isolation: oop
 
-# In-process plugin loaded into the steward identity per
-# manifest.toml (transport = "in-process"). Privileges declared here
-# union into the steward record at admission. Per-distribution
-# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml — that
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.metadata.local/`. The
+# steward spawns the wire binary as a subprocess and wires
+# the SDK contract over a Unix domain socket. Privileges
+# declared here describe what the plugin's process needs
+# from the host. Per-distribution host_provisioning lives in
+# evo-device-audio/PRIVILEGES.yaml — that
 # record translates this plugin's intent (read media library files)
 # into the steward identity's actual ReadOnlyPaths and any required
 # group memberships.

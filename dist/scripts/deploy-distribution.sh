@@ -119,6 +119,7 @@ DIST_BIN="evo-device-audio"
 OOP_PLUGINS=(
     "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire"
     "org.evoframework.network:org-evoframework-network:network-wire"
+    "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire"
 )
 
 echo "=== deploy-distribution.sh ==="
