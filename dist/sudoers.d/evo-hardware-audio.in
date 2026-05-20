@@ -8,15 +8,21 @@
 # `org.evoframework.hardware.audio-config` plugin invokes:
 #
 # 1. `EVO_HARDWARE_AUDIO_READ` `Cmnd_Alias` — read access
-#    to the host's boot-config file (`/boot/firmware/config.txt`
-#    on Bookworm/Trixie + Pi default, `/boot/config.txt` on
-#    older images). The plugin prefers a direct
-#    `tokio::fs::read_to_string` first; this grant only
-#    kicks in when the boot-config is not world-readable
-#    (some hardened images).
+#    to the host's boot-config file. Path varies by board
+#    class:
+#      - Raspberry Pi:   `/boot/firmware/config.txt`
+#                        (Bookworm/Trixie default) or
+#                        `/boot/config.txt` (older images)
+#      - Rockchip family
+#        (e.g. Tinker):  `/boot/hw_intf.conf`
+#    The plugin prefers a direct `tokio::fs::read_to_string`
+#    first; this grant only kicks in when the boot-config is
+#    not world-readable (some hardened images).
 #
 # 2. `EVO_HARDWARE_AUDIO_WRITE` `Cmnd_Alias` — `tee`
-#    against the boot-config locations and against the
+#    against the per-board boot-config locations (Pi:
+#    `/boot/firmware/config.txt` + `/boot/config.txt`;
+#    Rockchip: `/boot/hw_intf.conf`) and against the
 #    Pi-specific i2c-dev modules-load.d drop-in
 #    (`/etc/modules-load.d/evo-i2c-dev.conf`). The plugin
 #    writes the banner-fenced managed `dtoverlay=` block via
@@ -55,11 +61,13 @@
 
 Cmnd_Alias EVO_HARDWARE_AUDIO_READ = \
     /usr/bin/cat /boot/firmware/config.txt, \
-    /usr/bin/cat /boot/config.txt
+    /usr/bin/cat /boot/config.txt, \
+    /usr/bin/cat /boot/hw_intf.conf
 
 Cmnd_Alias EVO_HARDWARE_AUDIO_WRITE = \
     /usr/bin/tee /boot/firmware/config.txt, \
     /usr/bin/tee /boot/config.txt, \
+    /usr/bin/tee /boot/hw_intf.conf, \
     /usr/bin/tee /etc/modules-load.d/evo-i2c-dev.conf
 
 Cmnd_Alias EVO_HARDWARE_AUDIO_MODDER = \

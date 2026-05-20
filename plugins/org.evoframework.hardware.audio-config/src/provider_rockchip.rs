@@ -150,14 +150,36 @@ pub fn resolve_hw_intf_path() -> String {
     "/boot/hw_intf.conf".into()
 }
 
-/// Read the hw_intf.conf file. Direct read first; the file is
-/// world-readable on the standard Tinkerboard image so the sudo
-/// fallback the Pi provider needs is not required here. A
-/// failure surfaces as a `BootConfigReadFailed`.
+/// Read the hw_intf.conf file. Direct read first; on
+/// hardened images where the file is not world-readable, falls
+/// back to `sudo -n cat` against the narrow grant declared in
+/// `dist/sudoers.d/evo-hardware-audio.in`. Mirrors PiProvider's
+/// `read_boot_config` discipline so the two providers behave
+/// the same on permission-denied.
 async fn read_hw_intf(path: &str) -> Result<String, ProviderError> {
-    tokio::fs::read_to_string(path).await.map_err(|e| {
-        ProviderError::BootConfigReadFailed(format!("{path}: {e}"))
-    })
+    match tokio::fs::read_to_string(path).await {
+        Ok(s) => return Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(ProviderError::BootConfigReadFailed(format!(
+                "{path}: {e}"
+            )));
+        }
+    }
+    let out = tokio::process::Command::new("sudo")
+        .args(["-n", "cat", path])
+        .output()
+        .await
+        .map_err(|e| {
+            ProviderError::BootConfigReadFailed(format!("sudo cat {path}: {e}"))
+        })?;
+    if !out.status.success() {
+        return Err(ProviderError::BootConfigReadFailed(format!(
+            "sudo cat {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Concrete Rockchip provider — backed by the `hw_intf.conf`
