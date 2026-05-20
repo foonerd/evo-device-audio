@@ -179,12 +179,13 @@ pub struct AlsaDeliveryPlugin {
     /// subject was resolvable; `None` otherwise. The task drains
     /// state updates from the
     /// `(scheme: "evo.audio.options", value: "settings")`
-    /// subject and emits a `delivery.options_observed`
-    /// happening per update — making the cross-plugin reactivity
-    /// from playback.options to delivery.alsa operator-
-    /// verifiable. The full pcm.evo re-render in response to
-    /// settings changes is the next chunk; this commit lands
-    /// the observer wiring per audit Finding F5.
+    /// subject. On each update the observer renders the
+    /// `pcm.evo` drop-in via `options_render::render_drop_in`,
+    /// atomic-writes it to the drop-in path, and emits both
+    /// `delivery.options_observed` (the observer-visibility
+    /// signal) and `delivery.options_rendered` (the on-disk
+    /// drop-in's freshness signal). Subscribers serialise
+    /// re-bind work against the rendered happening.
     options_observer: Option<OptionsObserverHandle>,
     /// Hardware-audio active-config observer task handle. `Some`
     /// after a successful `Plugin::load` when LoadContext supplied
@@ -530,14 +531,6 @@ impl AlsaDeliveryPlugin {
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
         let task = tokio::spawn(async move {
-            // Track the last observed mixer_type so a transition
-            // between Hardware / Software / None can be detected
-            // and signalled via the audio.mixer.transition_applied
-            // happening. Outer Option = "no observation yet";
-            // inner Option mirrors OptionsSettings.mixer_type
-            // (None means "operator has not chosen").
-            let mut last_mixer_type: Option<Option<options_render::MixerType>> =
-                None;
             loop {
                 tokio::select! {
                     _ = task_shutdown.notified() => {
@@ -670,67 +663,28 @@ impl AlsaDeliveryPlugin {
                                     );
                                 }
 
-                                // Mixer-transition contract: when
-                                // the new state's mixer_type
-                                // differs from the previously-
-                                // observed value AND the drop-in
-                                // write succeeded (the rendered
-                                // pipeline is now on disk),
-                                // emit a dedicated
-                                // `audio.mixer.transition_applied`
-                                // happening. Downstream consumers
-                                // (the playback warden's mixer-
-                                // bind path, UI affordances)
-                                // serialise their re-bind work
-                                // against this signal so they do
-                                // not race delivery.alsa's
-                                // drop-in write.
-                                let transition_fired =
-                                    matches!(&last_mixer_type, Some(prev) if *prev != settings.mixer_type)
-                                        && write_outcome.is_ok();
-                                if transition_fired {
-                                    let from_label = last_mixer_type
-                                        .as_ref()
-                                        .and_then(|m| m.as_ref())
-                                        .map(mixer_type_wire_label)
-                                        .unwrap_or("unset");
-                                    let to_label = settings
-                                        .mixer_type
-                                        .as_ref()
-                                        .map(mixer_type_wire_label)
-                                        .unwrap_or("unset");
-                                    let transition_payload = serde_json::json!({
-                                        "subject_canonical_id":
-                                            state_update.canonical_id,
-                                        "observed_at_ms": observed_at_ms,
-                                        "drop_in_path":
-                                            drop_in_path.display().to_string(),
-                                        "from": from_label,
-                                        "to": to_label,
-                                    });
-                                    if let Err(e) = happening_emitter
-                                        .emit_plugin_event(
-                                            "audio.mixer.transition_applied"
-                                                .to_string(),
-                                            transition_payload,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            plugin = PLUGIN_NAME,
-                                            error = %e,
-                                            "emit audio.mixer.transition_applied failed"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            plugin = PLUGIN_NAME,
-                                            from = from_label,
-                                            to = to_label,
-                                            "audio mixer-mode transition applied"
-                                        );
-                                    }
-                                }
-                                last_mixer_type = Some(settings.mixer_type);
+                                // Mixer-transition lifecycle is
+                                // owned by the orchestrator
+                                // (the audio.options-shape
+                                // plugin), per the schema's
+                                // `mixer-transition-lifecycle-
+                                // emitter-is-orchestrator`
+                                // criterion. delivery.alsa
+                                // observes the settings subject
+                                // and renders the drop-in; the
+                                // orchestrator's eight-step
+                                // state machine emits the
+                                // canonical
+                                // `audio.mixer_transition.*`
+                                // happenings (started / applied
+                                // / rolled_back / failed). The
+                                // earlier per-delivery emission
+                                // of a `audio.mixer.transition_
+                                // applied` happening is retired
+                                // — it was a parallel-truth
+                                // path competing with the
+                                // orchestrator's canonical
+                                // lifecycle stream.
                             }
                             Err(SubjectStateStreamError::Lagged {
                                 dropped,
@@ -908,18 +862,6 @@ impl AlsaDeliveryPlugin {
     }
 }
 
-/// Stable wire label for a [`options_render::MixerType`]. Used in
-/// the `audio.mixer.transition_applied` happening payload's
-/// `from` / `to` fields so consumers can switch on a string
-/// without re-deriving the enum from JSON.
-fn mixer_type_wire_label(mt: &options_render::MixerType) -> &'static str {
-    match mt {
-        options_render::MixerType::Hardware => "hardware",
-        options_render::MixerType::Software => "software",
-        options_render::MixerType::None => "none",
-    }
-}
-
 /// Pull an [`ActiveDacConfig`] out of the published-state JSON the
 /// hardware.audio-config plugin emits. The wire shape carries the
 /// active config nested under `active`:
@@ -1078,13 +1020,13 @@ impl Plugin for AlsaDeliveryPlugin {
             // Spawn the options-subject observer. Subscribes to
             // the playback.options settings subject; on every
             // operator change to mixer_type / output_device /
-            // resampling / etc. emits a
-            // `delivery.options_observed` happening so the
-            // cross-plugin reactivity from options -> delivery
-            // is operator-verifiable. The full pcm.evo
-            // re-render in response to settings changes is the
-            // next chunk; this wiring is the audit-required
-            // consumer path for `audio.options.changed`.
+            // resampling / etc. drives a re-render of the
+            // pcm.evo drop-in (via render_drop_in +
+            // atomic_write_drop_in) followed by the
+            // observer-visibility + drop-in-freshness
+            // happenings so cross-plugin consumers can
+            // serialise their re-bind work against
+            // delivery.alsa's on-disk pipeline definition.
             self.spawn_options_observer(ctx).await;
             // Spawn the hardware.audio-config plugin's
             // active_config-subject observer. Caches the
@@ -2064,22 +2006,6 @@ pcm.evo {
         assert_eq!(parsed, ActiveDacConfig::default());
         assert!(parsed.overlay.is_empty());
         assert!(parsed.alsacard_hint.is_none());
-    }
-
-    #[test]
-    fn mixer_type_wire_label_round_trip() {
-        assert_eq!(
-            mixer_type_wire_label(&options_render::MixerType::Hardware),
-            "hardware"
-        );
-        assert_eq!(
-            mixer_type_wire_label(&options_render::MixerType::Software),
-            "software"
-        );
-        assert_eq!(
-            mixer_type_wire_label(&options_render::MixerType::None),
-            "none"
-        );
     }
 
     #[test]

@@ -21,12 +21,13 @@ path = "src/bin/playback-options-wire.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+evo-device-audio-shared = { path = "../../crates/evo-device-audio-shared" }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "time"] }
 toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
