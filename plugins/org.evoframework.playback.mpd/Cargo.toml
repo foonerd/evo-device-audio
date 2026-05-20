@@ -22,6 +22,7 @@ name = "playback-mpd-wire"
 path = "src/bin/playback-mpd-wire.rs"
 
 [dependencies]
+evo-device-audio-shared = { path = "../../crates/evo-device-audio-shared" }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 # Plugin-local tokio features: workspace baseline plus `fs`

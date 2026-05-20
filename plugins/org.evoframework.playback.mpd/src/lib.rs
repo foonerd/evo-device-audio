@@ -105,6 +105,7 @@
 #![allow(clippy::manual_async_fn)]
 
 mod config;
+mod envelope_subscriber;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
@@ -269,11 +270,10 @@ pub struct MpdPlaybackPlugin {
     /// Audio data plane routing handle pulled from
     /// [`LoadContext::audio_routing`] at load time. `None`
     /// before the first successful load and after every
-    /// `unload`. The plugin uses the handle in chunk F3
-    /// onwards to learn which ALSA pcm MPD's audio_output
-    /// should write to (the framework's negotiated
-    /// `WriteEndpoint`) and to react to topology rewires.
-    /// Composition plugins that declare
+    /// `unload`. The plugin uses the handle to learn which
+    /// ALSA pcm MPD's audio_output should write to (the
+    /// framework's negotiated `WriteEndpoint`) and to react
+    /// to topology rewires. Composition plugins that declare
     /// `[capabilities.composition]` and source plugins
     /// (this one) that declare `[capabilities.source]` with
     /// an audio `output_kind` MUST receive this handle;
@@ -283,6 +283,25 @@ pub struct MpdPlaybackPlugin {
     /// Cumulative count of custodies accepted since construction.
     /// Does not decrement on release.
     custodies_taken: u64,
+    /// Cloneable command-side view of the currently-active
+    /// custody's supervisor. Held by the envelope-subscriber
+    /// task so it can dispatch `PlaybackCommand::Pause` on
+    /// orchestrator-published envelope_requested updates
+    /// without owning the supervisor itself. Populated in
+    /// `take_custody` after the supervisor spawns;
+    /// cleared in `relinquish_custody` before shutdown.
+    /// `custody_exclusive = true` (per manifest) guarantees
+    /// at most one custody at a time, so a single
+    /// `Option`-cell tracks the active sender unambiguously.
+    active_command_sender: Arc<
+        tokio::sync::Mutex<
+            Option<playback_supervisor::SupervisorCommandSender>,
+        >,
+    >,
+    /// Mixer-transition envelope subscriber task handle.
+    /// Spawned at load; signals shutdown + awaits completion
+    /// in unload.
+    envelope_subscriber: Option<envelope_subscriber::EnvelopeSubscriberHandle>,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -425,6 +444,8 @@ impl MpdPlaybackPlugin {
             audio_routing: None,
             custodies: HashMap::new(),
             custodies_taken: 0,
+            active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
+            envelope_subscriber: None,
             corrections_dispatched: 0,
             requests_handled: 0,
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -1587,6 +1608,38 @@ impl Plugin for MpdPlaybackPlugin {
             self.spawn_reactor().await?;
             self.spawn_fragment_worker().await?;
 
+            // Spawn the mixer-transition envelope subscriber.
+            // Subscribes to the orchestrator-published
+            // envelope_requested subject and dispatches
+            // PlaybackCommand::Pause(true / false) to the
+            // active custody's supervisor (via the cloneable
+            // command-sender cell `active_command_sender`),
+            // then publishes envelope_observed so the
+            // orchestrator's await advances. When no
+            // custody is active the subscriber acks
+            // immediately (chain is already silent;
+            // nothing to pause). Subject_state_subscriber +
+            // subject_querier + subject_announcer are
+            // required; missing any → skip (advisory mode).
+            if let (Some(sub), Some(q)) = (
+                ctx.subject_state_subscriber.as_ref(),
+                ctx.subject_querier.as_ref(),
+            ) {
+                self.envelope_subscriber = Some(envelope_subscriber::spawn(
+                    PLUGIN_NAME,
+                    Arc::clone(sub),
+                    Arc::clone(q),
+                    Arc::clone(&ctx.subject_announcer),
+                    Arc::clone(&self.active_command_sender),
+                ));
+            } else {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "subject_state_subscriber or subject_querier unpopulated; \
+                     envelope subscriber not spawned (advisory mode)"
+                );
+            }
+
             // Subscribe to the audio-options settings subject
             // so operator mixer-mode changes propagate to the
             // fragment-writer without restarting the steward.
@@ -1650,6 +1703,14 @@ impl Plugin for MpdPlaybackPlugin {
             self.stop_capabilities_watcher().await;
             self.stop_fragment_worker().await;
             self.stop_reactor().await;
+            // Stop the envelope subscriber AFTER the fragment
+            // worker + reactor so any in-flight pause /
+            // resume dispatch completes against a still-live
+            // supervisor before unload tears the custody
+            // down.
+            if let Some(handle) = self.envelope_subscriber.take() {
+                handle.stop().await;
+            }
             self.audio_routing = None;
 
             self.loaded = false;
@@ -1724,6 +1785,16 @@ impl Warden for MpdPlaybackPlugin {
                     return Err(playback_error_to_plugin_error(e));
                 }
             };
+
+            // Capture the supervisor's cloneable command sender
+            // BEFORE moving it into the custodies map so the
+            // mixer-transition envelope subscriber can dispatch
+            // Pause(true / false) on orchestrator-published
+            // envelope_requested updates without owning the
+            // supervisor itself. The cell is cleared in
+            // relinquish_custody.
+            *self.active_command_sender.lock().await =
+                Some(supervisor.command_sender());
 
             self.custodies.insert(
                 handle.id.clone(),
@@ -1806,6 +1877,13 @@ impl Warden for MpdPlaybackPlugin {
                         handle.id
                     ))
                 })?;
+
+            // Clear the envelope-subscriber's command-sender
+            // cell BEFORE shutting the supervisor down — the
+            // subscriber's snapshot-then-dispatch pattern can
+            // race with shutdown if the cell still points at a
+            // shutting-down supervisor.
+            *self.active_command_sender.lock().await = None;
 
             tracing::info!(
                 plugin = PLUGIN_NAME,
