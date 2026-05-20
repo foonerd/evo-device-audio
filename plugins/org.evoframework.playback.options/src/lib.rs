@@ -18,8 +18,14 @@
 //!   DACs.
 //! - **Volume normalization** — MPD's `volume_normalization`
 //!   policy.
+//! - **Startup volume / max volume** — operator-facing safety
+//!   controls that govern the loud-on-boot / loud-by-accident
+//!   classes of incident.
+//! - **Volume curve** — perceived-loudness mapping (`linear` /
+//!   `log` / `natural`) the playback warden applies between the
+//!   operator's slider and the actual gain.
 //!
-//! Stocks the `audio.options` shelf at shape 1.
+//! Stocks the `audio.options` shelf at shape 2.
 //!
 //! ## What this plugin is
 //!
@@ -131,6 +137,9 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_dop",
     "options.set_output_device",
     "options.set_volume_normalization",
+    "options.set_startup_volume",
+    "options.set_max_volume",
+    "options.set_volume_curve",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ];
@@ -255,6 +264,39 @@ pub struct Settings {
     /// audiophile default (no in-chain post-processing).
     #[serde(default)]
     pub volume_normalization: bool,
+    /// Initial volume the playback plugin restores on plugin
+    /// load / steward restart. Valid range 0..=100. Default 30
+    /// — protects ears + speakers when the device boots after a
+    /// power cycle, since the operator may not remember the
+    /// pre-shutdown level. Capped at [`max_volume_percent`].
+    #[serde(default = "default_startup_volume_percent")]
+    pub startup_volume_percent: u8,
+    /// Operator-imposed maximum volume the playback plugin
+    /// refuses to exceed. Valid range 0..=100. Default 100
+    /// (no cap). Setting this below 100 protects sensitive
+    /// speakers or living arrangements from accidental
+    /// excursions. The playback warden's volume setter clamps
+    /// requests above this ceiling.
+    #[serde(default = "default_max_volume_percent")]
+    pub max_volume_percent: u8,
+    /// Perceived-loudness mapping from the operator's volume
+    /// slider to the actual gain applied to the audio chain.
+    /// Three options: `Linear` (direct mapping; classic Volumio
+    /// default), `Log` (logarithmic / dB-scale; sensible
+    /// audiophile pick when paired with hardware-mixer mode),
+    /// `Natural` (perceptual; matches human-ear loudness
+    /// response across the slider range). Default `Linear` for
+    /// existing-deployment compatibility.
+    #[serde(default)]
+    pub volume_curve: VolumeCurve,
+}
+
+fn default_startup_volume_percent() -> u8 {
+    30
+}
+
+fn default_max_volume_percent() -> u8 {
+    100
 }
 
 impl Default for Settings {
@@ -266,6 +308,56 @@ impl Default for Settings {
             dop: false,
             output_device: String::new(),
             volume_normalization: false,
+            startup_volume_percent: default_startup_volume_percent(),
+            max_volume_percent: default_max_volume_percent(),
+            volume_curve: VolumeCurve::default(),
+        }
+    }
+}
+
+/// Perceived-loudness mapping from operator-facing volume slider
+/// to applied gain.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeCurve {
+    /// Direct mapping: 50% slider = 50% applied gain. Classic
+    /// default; the gentlest learning curve for operators
+    /// migrating from prior systems.
+    #[default]
+    Linear,
+    /// Logarithmic (dB-scale) mapping. The audiophile choice
+    /// when paired with a hardware mixer that already gates the
+    /// signal in the analog domain.
+    Log,
+    /// Perceptual mapping tuned to human loudness response
+    /// across the slider range.
+    Natural,
+}
+
+impl VolumeCurve {
+    /// Parse a wire string into the typed enum. Errors carry the
+    /// operator-readable invalid-value diagnostic the setter
+    /// uses for refusal.
+    pub fn from_wire_str(value: &str) -> Result<Self, String> {
+        match value {
+            "linear" => Ok(Self::Linear),
+            "log" => Ok(Self::Log),
+            "natural" => Ok(Self::Natural),
+            other => Err(format!(
+                "volume_curve must be one of {{linear, log, natural}}; \
+                 got {other:?}"
+            )),
+        }
+    }
+
+    /// Stable wire string for the typed enum.
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Log => "log",
+            Self::Natural => "natural",
         }
     }
 }
@@ -764,6 +856,15 @@ impl Respondent for PlaybackOptionsPlugin {
                 "options.set_volume_normalization" => {
                     self.handle_set_volume_normalization(req).await
                 }
+                "options.set_startup_volume" => {
+                    self.handle_set_startup_volume(req).await
+                }
+                "options.set_max_volume" => {
+                    self.handle_set_max_volume(req).await
+                }
+                "options.set_volume_curve" => {
+                    self.handle_set_volume_curve(req).await
+                }
                 "options.restore_last_known_good" => {
                     self.handle_restore_last_known_good(req).await
                 }
@@ -907,6 +1008,124 @@ impl PlaybackOptionsPlugin {
         self.emit_changed(
             "volume_normalization",
             serde_json::Value::Bool(payload.value),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Set the operator-facing startup-volume floor. The value
+    /// must lie in 0..=100; the setter refuses anything outside
+    /// that domain. The setter ALSO clamps against the operator's
+    /// `max_volume_percent` ceiling — startup > max is incoherent
+    /// (it would be capped on actuation anyway), so the setter
+    /// refuses with an operator-readable error rather than
+    /// silently truncating.
+    async fn handle_set_startup_volume(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetVolumePercentPayload = parse_versioned(req)?;
+        if payload.value > 100 {
+            return Err(PluginError::Permanent(format!(
+                "startup_volume_percent must lie in 0..=100; got {}",
+                payload.value
+            )));
+        }
+        if payload.value > self.settings.max_volume_percent {
+            return Err(PluginError::Permanent(format!(
+                "startup_volume_percent {} cannot exceed max_volume_percent {}; \
+                 raise the ceiling first",
+                payload.value, self.settings.max_volume_percent
+            )));
+        }
+        self.settings.startup_volume_percent = payload.value;
+        self.persist_settings().await?;
+        self.emit_changed(
+            "startup_volume_percent",
+            serde_json::Value::Number(payload.value.into()),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Set the operator-imposed maximum volume ceiling. The
+    /// value must lie in 0..=100; the setter refuses anything
+    /// outside that domain. When the new ceiling is below the
+    /// current `startup_volume_percent`, the setter clamps the
+    /// startup value to the new ceiling so the relationship
+    /// `startup <= max` is maintained without a second operator
+    /// gesture. The clamp emits its own `audio.options.changed`
+    /// happening so subject-stream consumers observe both
+    /// fields' new values.
+    async fn handle_set_max_volume(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetVolumePercentPayload = parse_versioned(req)?;
+        if payload.value > 100 {
+            return Err(PluginError::Permanent(format!(
+                "max_volume_percent must lie in 0..=100; got {}",
+                payload.value
+            )));
+        }
+        self.settings.max_volume_percent = payload.value;
+        let startup_clamped =
+            self.settings.startup_volume_percent > payload.value;
+        if startup_clamped {
+            self.settings.startup_volume_percent = payload.value;
+        }
+        self.persist_settings().await?;
+        self.emit_changed(
+            "max_volume_percent",
+            serde_json::Value::Number(payload.value.into()),
+        )
+        .await;
+        if startup_clamped {
+            self.emit_changed(
+                "startup_volume_percent",
+                serde_json::Value::Number(payload.value.into()),
+            )
+            .await;
+        }
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Set the perceived-loudness mapping curve. Validates the
+    /// supplied wire string against the [`VolumeCurve`] domain;
+    /// persists; emits `audio.options.changed` + republishes the
+    /// settings subject so downstream consumers (the playback
+    /// warden's volume-curve binding, future audiophile UI
+    /// affordances) react.
+    async fn handle_set_volume_curve(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetVolumeCurvePayload = parse_versioned(req)?;
+        let curve = VolumeCurve::from_wire_str(&payload.value)
+            .map_err(PluginError::Permanent)?;
+        self.settings.volume_curve = curve;
+        self.persist_settings().await?;
+        self.emit_changed(
+            "volume_curve",
+            serde_json::Value::String(payload.value),
         )
         .await;
         encode(
@@ -1116,6 +1335,32 @@ impl HasPayloadVersion for SetVolumeNormalizationPayload {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SetVolumePercentPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: u8,
+}
+
+impl HasPayloadVersion for SetVolumePercentPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetVolumeCurvePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: String,
+}
+
+impl HasPayloadVersion for SetVolumeCurvePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SimpleOk {
     v: u32,
@@ -1237,7 +1482,7 @@ mod tests {
         let m = manifest();
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.target.shelf, "audio.options");
-        assert_eq!(m.target.shape, 1);
+        assert_eq!(m.target.shape, 2);
     }
 
     #[test]
@@ -1488,6 +1733,145 @@ mod tests {
         .await
         .unwrap();
         assert!(p.settings().volume_normalization);
+    }
+
+    #[tokio::test]
+    async fn set_startup_volume_persists_within_range() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_startup_volume",
+            json!({ "v": 1, "value": 25 }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().startup_volume_percent, 25);
+    }
+
+    #[tokio::test]
+    async fn set_startup_volume_refuses_out_of_range() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_startup_volume",
+                json!({ "v": 1, "value": 150 }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("0..=100"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_startup_volume_refuses_above_max_volume() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_max_volume",
+            json!({ "v": 1, "value": 40 }),
+        ))
+        .await
+        .unwrap();
+        let err = p
+            .handle_request(&req(
+                "options.set_startup_volume",
+                json!({ "v": 1, "value": 80 }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("cannot exceed max_volume_percent"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_max_volume_clamps_startup_when_below_it() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Raise startup to a known value first.
+        p.handle_request(&req(
+            "options.set_startup_volume",
+            json!({ "v": 1, "value": 60 }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().startup_volume_percent, 60);
+        // Now lower max below startup; setter should clamp startup
+        // down to the new ceiling.
+        p.handle_request(&req(
+            "options.set_max_volume",
+            json!({ "v": 1, "value": 50 }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().max_volume_percent, 50);
+        assert_eq!(p.settings().startup_volume_percent, 50);
+    }
+
+    #[tokio::test]
+    async fn set_max_volume_refuses_out_of_range() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_max_volume",
+                json!({ "v": 1, "value": 200 }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn set_volume_curve_persists_valid_value() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_volume_curve",
+            json!({ "v": 1, "value": "log" }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().volume_curve, VolumeCurve::Log);
+    }
+
+    #[tokio::test]
+    async fn set_volume_curve_refuses_invalid_value() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_volume_curve",
+                json!({ "v": 1, "value": "moonshot" }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("volume_curve must be one of"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_defaults_carry_safe_volume_baseline() {
+        let s = Settings::default();
+        assert_eq!(s.startup_volume_percent, 30);
+        assert_eq!(s.max_volume_percent, 100);
+        assert_eq!(s.volume_curve, VolumeCurve::Linear);
+    }
+
+    #[test]
+    fn volume_curve_wire_round_trip() {
+        for curve in
+            [VolumeCurve::Linear, VolumeCurve::Log, VolumeCurve::Natural]
+        {
+            let s = curve.as_wire_str();
+            let parsed = VolumeCurve::from_wire_str(s).expect("parse");
+            assert_eq!(parsed, curve);
+        }
     }
 
     #[tokio::test]
