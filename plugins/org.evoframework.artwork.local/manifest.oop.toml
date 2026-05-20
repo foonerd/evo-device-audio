@@ -60,7 +60,17 @@ max_memory_mb = 32
 max_cpu_percent = 5
 
 [lifecycle]
-hot_reload = "restart"
+# The framework's reload runtime checks `mode` to decide
+# which path to take on operator-gestured reload. `mode`
+# defaults to `Frozen` (refuses reload) when not declared.
+# This plugin's operator-tunable state (cache root,
+# filesystem-rooted artwork providers) requires a clean
+# teardown + re-admit cycle on reload, so we declare
+# `reload-cleanable`. The legacy `hot_reload = "restart"`
+# field this previously carried alone is now removed —
+# `mode` is the canonical surface; `hot_reload` is
+# documented as superseded.
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5

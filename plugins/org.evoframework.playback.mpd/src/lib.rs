@@ -687,13 +687,21 @@ impl MpdPlaybackPlugin {
     /// happening-emitter / observability layer surfaces the
     /// downgrade through the audit chain.
     ///
-    /// Best-effort: if the subscriber handle is absent (OOP
-    /// transport before the wire surface lands) or the
-    /// addressing does not resolve yet (admission ordering
-    /// race where playback.mpd loads before playback.options),
-    /// the function logs and returns. The plugin's own
-    /// config-table fallback continues to honour `mixer_type`
-    /// from `/etc/evo/plugins.d/playback.mpd.toml`.
+    /// When the addressing does not resolve yet (Phase 2
+    /// discovery admits playback.mpd before playback.options
+    /// alphabetically), the function spawns a background
+    /// resolver task that retries with bounded exponential
+    /// backoff until the addressing is announced, then
+    /// proceeds with the subscribe + initial-state seed flow.
+    /// The plugin's load() returns immediately; the reactive
+    /// path lights up within seconds of playback.options
+    /// announcing.
+    ///
+    /// The plugin's own config-table fallback continues to
+    /// honour `mixer_type` from
+    /// `/etc/evo/plugins.d/playback.mpd.toml` at boot until
+    /// the subscriber catches up — the substrate-driven
+    /// reconfiguration path is additive, not replacement.
     async fn spawn_options_settings_subscriber(&self, ctx: &LoadContext) {
         let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
             tracing::debug!(
@@ -712,51 +720,45 @@ impl MpdPlaybackPlugin {
             return;
         };
 
+        let subscriber = Arc::clone(subscriber);
+        let querier = Arc::clone(querier);
+        let mixer_tx = self.mixer_config_tx.clone();
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
         };
-        let canonical_id =
-            match querier.resolve_addressing(addressing.clone()).await {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    // playback.options has not announced yet —
-                    // expected on admission orderings where
-                    // playback.mpd admits first. The subject-
-                    // state subscriber accepts subscriptions for
-                    // future canonical ids, but resolve_addressing
-                    // returns None until announce lands. For v1
-                    // close-out we skip; operator mixer-mode
-                    // changes via wire op after both plugins are
-                    // up rely on the next steward restart picking
-                    // up the subscription. The dynamic-update
-                    // surface for THIS startup cycle stays on the
-                    // plugin's own config-table fallback.
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        "audio-options settings subject not yet announced; \
-                     subscriber not wired this cycle (plugin's config \
-                     table remains the operator surface)"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        "resolve_addressing for audio-options settings failed"
-                    );
-                    return;
-                }
+
+        tokio::spawn(async move {
+            // Resolve the canonical id, retrying with bounded
+            // exponential backoff if playback.options has not
+            // announced yet. Phase 2 discovery walks
+            // `/opt/evo/plugins/` alphabetically, so
+            // playback.mpd ALWAYS admits before playback.options
+            // on the reference distribution; the retry closes
+            // that admission-order window without depending on
+            // either ordering guarantees or operator restart.
+            let canonical_id = match resolve_options_addressing_with_backoff(
+                querier.as_ref(),
+                &addressing,
+            )
+            .await
+            {
+                Some(id) => id,
+                None => return,
             };
 
-        // Subscribe FIRST so we cannot miss a state change
-        // that lands between current_state and subscribe; then
-        // read current_state to seed the initial mixer config.
-        let mut stream =
-            match subscriber.subscribe_subject(canonical_id.clone()).await {
+            // Subscribe FIRST so we cannot miss a state change
+            // that lands between current_state and subscribe;
+            // then read current_state to seed the initial
+            // mixer config.
+            let mut stream = match subscriber
+                .subscribe_subject(canonical_id.clone())
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
+                    // LOGGING.md §2: warn (recoverable; mpd's
+                    // config-table fallback remains operative).
                     tracing::warn!(
                         plugin = PLUGIN_NAME,
                         error = %e,
@@ -766,33 +768,31 @@ impl MpdPlaybackPlugin {
                     return;
                 }
             };
-        let initial_state =
-            match subscriber.current_state(canonical_id.clone()).await {
-                Ok(state) => state,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        canonical_id = %canonical_id,
-                        "read audio-options settings current_state failed; \
-                         subscription continues without initial seed"
-                    );
-                    None
+            let initial_state =
+                match subscriber.current_state(canonical_id.clone()).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        // LOGGING.md §2: warn (recoverable; the
+                        // subscribe stream still runs).
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            canonical_id = %canonical_id,
+                            "read audio-options settings current_state failed; \
+                             subscription continues without initial seed"
+                        );
+                        None
+                    }
+                };
+
+            if let Some(state) = initial_state {
+                if let Some(cfg) =
+                    parse_mixer_config_from_settings_state(&state)
+                {
+                    let _ = mixer_tx.send(cfg);
                 }
-            };
-
-        let mixer_tx = self.mixer_config_tx.clone();
-        // Seed mixer_config_tx from the initial subject state
-        // (if any) BEFORE spawning the loop. This guarantees
-        // the fragment-writer renders the operator's choice on
-        // its first cycle.
-        if let Some(state) = initial_state {
-            if let Some(cfg) = parse_mixer_config_from_settings_state(&state) {
-                let _ = mixer_tx.send(cfg);
             }
-        }
 
-        tokio::spawn(async move {
             loop {
                 match stream.recv().await {
                     Ok(update) => {
@@ -805,15 +805,16 @@ impl MpdPlaybackPlugin {
                         }
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
+                        // LOGGING.md §2: warn (recoverable;
+                        // the stream auto-rejoins at the live
+                        // frame; missed updates surface via
+                        // the next state change).
                         tracing::warn!(
                             plugin = PLUGIN_NAME,
                             dropped = dropped,
                             "audio-options subject stream lagged; \
                              continuing at the live frame"
                         );
-                        // Stream auto-rejoins on next recv;
-                        // missed updates surface via the next
-                        // state change.
                     }
                     Err(SubjectStateStreamError::Closed) => {
                         tracing::debug!(
@@ -934,6 +935,89 @@ impl Default for MpdPlaybackPlugin {
 /// subject state payload. Returns `None` when the payload
 /// has no mixer block or the block is malformed.
 ///
+/// Resolve the audio-options settings addressing, retrying
+/// with bounded exponential backoff while the subject has
+/// not been announced yet. Returns the canonical id when the
+/// addressing resolves, or `None` after the retry budget is
+/// exhausted.
+///
+/// Backoff schedule: 100 ms, 200 ms, 400 ms, 800 ms, 1.6 s,
+/// 3.2 s capped at 6.4 s thereafter; 10 attempts total
+/// (cumulative ~25 s). At Phase 2 discovery scale (every
+/// reference plugin admits within a few seconds at boot) the
+/// resolve typically succeeds on attempt 2 or 3. A subject
+/// that has not announced after 25 s indicates a real
+/// playback.options failure that operator diagnostics will
+/// already be surfacing through other channels (admission
+/// failure happenings, journal traces) — the subscriber's
+/// silent exit is the correct shape there.
+async fn resolve_options_addressing_with_backoff(
+    querier: &dyn evo_plugin_sdk::contract::SubjectQuerier,
+    addressing: &ExternalAddressing,
+) -> Option<String> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 6_400;
+    let mut delay_ms = INITIAL_DELAY_MS;
+    for attempt in 0..MAX_ATTEMPTS {
+        match querier.resolve_addressing(addressing.clone()).await {
+            Ok(Some(id)) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        attempt = attempt + 1,
+                        canonical_id = %id,
+                        "audio-options settings subject resolved after \
+                         admission-order retry"
+                    );
+                }
+                return Some(id);
+            }
+            Ok(None) => {
+                if attempt == 0 {
+                    // First miss is expected on the canonical
+                    // alphabetical Phase 2 discovery order
+                    // (playback.mpd admits before playback.options);
+                    // a single info log explains the wait without
+                    // log spam, then the retries are silent until
+                    // resolution.
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        delay_ms,
+                        "audio-options settings subject not yet announced; \
+                         retrying with exponential backoff"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+            Err(e) => {
+                // LOGGING.md §2: warn (recoverable; we retry).
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    attempt = attempt + 1,
+                    "resolve_addressing for audio-options settings failed; \
+                     retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+        }
+    }
+    // LOGGING.md §2: warn (recoverable; the plugin's
+    // config-table fallback remains operative).
+    tracing::warn!(
+        plugin = PLUGIN_NAME,
+        "audio-options settings subject did not resolve within \
+         retry budget; subscriber not wired (plugin's config table \
+         remains the operator surface)"
+    );
+    None
+}
+
 /// Hardware-mode degrade: if `mixer_type = "Hardware"` but the
 /// payload's `output_device` does not include both an ALSA
 /// device path AND a non-empty mixer-control name, the
