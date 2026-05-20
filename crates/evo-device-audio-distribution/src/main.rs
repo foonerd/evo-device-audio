@@ -120,7 +120,6 @@ use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 use evo_plugin_sdk::Manifest;
-use org_evoframework_artwork_local::ArtworkLocalPlugin;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_metadata_local::MetadataLocalPlugin;
@@ -438,23 +437,20 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting metadata.local")?;
 
-            // 8. artwork.local: singleton respondent on the
-            //    audio.artwork.providers shelf. Resolves
-            //    cover-art from local files; embedded-cover
-            //    extraction + image decode runs on the blocking
-            //    thread pool so the steward's shared async
-            //    runtime is not stalled by image-decode work.
-            let artwork_local_manifest = Manifest::from_toml(
-                org_evoframework_artwork_local::MANIFEST_TOML,
-            )
-            .context("parsing artwork.local manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    ArtworkLocalPlugin::new(),
-                    artwork_local_manifest,
-                )
-                .await
-                .context("admitting artwork.local")?;
+            // 8. artwork.local moved to out-of-process shipping
+            //    form. The plugin is no longer admitted via
+            //    Phase 1 compile-link; the
+            //    `dist/scripts/deploy-distribution.sh` flow
+            //    cross-builds its wire binary
+            //    (`artwork-local-wire`), stages a bundle from
+            //    `plugins/org.evoframework.artwork.local/manifest.oop.toml`,
+            //    and installs it at
+            //    `/opt/evo/plugins/org.evoframework.artwork.local/`.
+            //    Phase 2 discovery (below) admits it from the
+            //    filesystem search root, and the operator's
+            //    install / remove / update / enable / disable
+            //    lifecycle reaches the plugin without a steward
+            //    restart.
 
             // Phase 2 — filesystem discovery for operator-
             // installed out-of-process plugins. Walks

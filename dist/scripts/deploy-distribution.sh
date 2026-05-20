@@ -65,8 +65,28 @@ TARGET_USER="$2"
 TARGET_TRIPLE="$3"
 SSH_TARGET="${TARGET_USER}@${TARGET_HOST}"
 
+# Required when OOP_PLUGINS is non-empty. Path to the PKCS#8
+# ed25519 private key matching a `*.pem` public key already
+# installed under `/etc/evo/trust.d/` on every target. The
+# script signs each staged bundle so the steward's discovery
+# admits it at the trust class the manifest declares; an
+# unsigned bundle is refused at admission with an explicit
+# error from the framework, so the only way to reach the
+# steady-state lifecycle property is to sign.
+#
+# Set this in the deploying operator's environment:
+#   export EVO_PLUGIN_SIGNING_KEY=/path/to/key.pem
+EVO_PLUGIN_SIGNING_KEY="${EVO_PLUGIN_SIGNING_KEY:-}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Sibling clone of `evo-core-eng` hosts the `evo-plugin-tool`
+# crate. The signing step shells into it via `--manifest-path`.
+ENG_ROOT="$(cd "${REPO_ROOT}/../evo-core-eng" 2>/dev/null && pwd)" || {
+    echo "WARN: sibling evo-core-eng clone not found at ${REPO_ROOT}/../evo-core-eng" >&2
+    ENG_ROOT=""
+}
 
 # The distribution binary's canonical install path on the target.
 TARGET_BIN_PATH="/opt/evo/bin/evo-device-audio"
@@ -77,6 +97,29 @@ TARGET_BIN_PREV="/opt/evo/bin/evo-device-audio.prev"
 DIST_CRATE="evo-device-audio-distribution"
 DIST_BIN="evo-device-audio"
 
+# Out-of-process plugin bundles shipped alongside the steward
+# binary. Each entry binds:
+#   <plugin-name>:<plugin-crate>:<wire-binary>
+# where <plugin-name> is the canonical name landing under
+# `/opt/evo/plugins/<plugin-name>/` on the target,
+# <plugin-crate> is the cargo `-p` package id, and
+# <wire-binary> is the binary cargo emits under
+# `target/<triple>/release/`.
+#
+# Each plugin's `manifest.oop.toml` is renamed to
+# `manifest.toml` and the wire binary is renamed to
+# `plugin.bin` (matching the manifest's `transport.exec`) when
+# the bundle is staged for shipment.
+#
+# Plugins listed here are NO LONGER admitted via the
+# distribution's Phase 1 compile-link path — Phase 2
+# discovery picks them up from the search root the framework
+# walks at boot, and the install / remove / update lifecycle
+# reaches per-plugin without touching the steward binary.
+OOP_PLUGINS=(
+    "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire"
+)
+
 echo "=== deploy-distribution.sh ==="
 echo "Target:        ${SSH_TARGET}"
 echo "Target triple: ${TARGET_TRIPLE}"
@@ -84,9 +127,52 @@ echo "Repo root:     ${REPO_ROOT}"
 echo
 
 # ----------------------------------------------------------
-# [0/5] Pre-flight: target reachable + base install present.
+# [0/5] Pre-flight: target reachable + base install present
+# + signing key resolvable when OOP plugins are shipped.
 # ----------------------------------------------------------
-echo "[0/5] pre-flight on target ..."
+echo "[0/5] pre-flight ..."
+
+if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
+    # Verify the commons-plugin trust root is on the target.
+    # The framework's discovery refuses an unsigned-or-
+    # signed-but-unauthorised bundle with an explicit error;
+    # this check fails the deploy upfront with a clear
+    # remediation hint instead of leaving the operator to read
+    # the journal post-restart.
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" \
+            "test -f /etc/evo/trust.d/commons-plugin-signing-public.pem \
+                && test -f /etc/evo/trust.d/commons-plugin-signing-public.meta.toml" \
+            >/dev/null 2>&1; then
+        echo "FAIL: commons-plugin trust root missing on target" >&2
+        echo "      Expected: /etc/evo/trust.d/commons-plugin-signing-public.{pem,meta.toml}" >&2
+        echo "      Remediation: (re-)run bootstrap.sh on the target — Step 2.8" >&2
+        echo "      installs the distribution-tier plugin trust root." >&2
+        exit 1
+    fi
+fi
+
+if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
+    if [[ -z "${EVO_PLUGIN_SIGNING_KEY}" ]]; then
+        echo "FAIL: OOP_PLUGINS is non-empty but EVO_PLUGIN_SIGNING_KEY is unset" >&2
+        echo "      The steward refuses unsigned bundles at admission. Set:" >&2
+        echo "        export EVO_PLUGIN_SIGNING_KEY=/path/to/private-key.pem" >&2
+        echo "      The matching public key must already be installed under" >&2
+        echo "      /etc/evo/trust.d/ on every target." >&2
+        exit 1
+    fi
+    if [[ ! -r "${EVO_PLUGIN_SIGNING_KEY}" ]]; then
+        echo "FAIL: EVO_PLUGIN_SIGNING_KEY=${EVO_PLUGIN_SIGNING_KEY} is not readable" >&2
+        exit 1
+    fi
+    if [[ -z "${ENG_ROOT}" ]]; then
+        echo "FAIL: cannot sign bundles — sibling evo-core-eng clone missing" >&2
+        echo "      expected at ${REPO_ROOT}/../evo-core-eng" >&2
+        exit 1
+    fi
+    echo "  ok (signing key: ${EVO_PLUGIN_SIGNING_KEY})"
+    echo "  ok (evo-plugin-tool source: ${ENG_ROOT})"
+fi
+
 if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" "
     set -e
     test -d /opt/evo/bin || {
@@ -108,36 +194,51 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [1/5] Cross-build the steward binary.
+# [1/5] Cross-build the steward binary + every OOP plugin's
+# wire binary listed in OOP_PLUGINS. Each build is invoked
+# independently so a failure in one bundle's wire binary
+# leaves the others' artefacts intact for inspection.
 # ----------------------------------------------------------
-echo "[1/5] cross-build ${DIST_CRATE} for ${TARGET_TRIPLE} ..."
+echo "[1/5] cross-build ${DIST_CRATE} + OOP wire binaries for ${TARGET_TRIPLE} ..."
 cd "${REPO_ROOT}"
 
 CROSS_HELPER="${REPO_ROOT}/scripts/cross-build.sh"
-if [[ -x "${CROSS_HELPER}" ]]; then
-    # Use the repo's cross helper (handles path-dep mount
-    # workaround, etc.). Forward the standard release +
-    # alsa-substrate build profile.
-    if ! "${CROSS_HELPER}" "${TARGET_TRIPLE}" --release \
-            --features alsa-substrate -p "${DIST_CRATE}" >/dev/null 2>&1; then
-        echo "FAIL: cross-build via scripts/cross-build.sh exited non-zero" >&2
-        exit 2
+
+run_cross_build() {
+    # Forward args directly to the cross helper or cargo
+    # fallback. Returns the build command's exit code.
+    if [[ -x "${CROSS_HELPER}" ]]; then
+        "${CROSS_HELPER}" "${TARGET_TRIPLE}" --release "$@" >/dev/null 2>&1
+    else
+        cargo build --release --target "${TARGET_TRIPLE}" "$@" >/dev/null 2>&1
     fi
-else
-    # Fallback: direct cargo build with --target.
-    if ! cargo build --release --target "${TARGET_TRIPLE}" \
-            --features alsa-substrate -p "${DIST_CRATE}" >/dev/null 2>&1; then
-        echo "FAIL: cargo build --target ${TARGET_TRIPLE} exited non-zero" >&2
-        exit 2
-    fi
+}
+
+if ! run_cross_build --features alsa-substrate -p "${DIST_CRATE}"; then
+    echo "FAIL: steward cross-build exited non-zero" >&2
+    exit 2
 fi
 
 LOCAL_BIN="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${DIST_BIN}"
 if [[ ! -x "${LOCAL_BIN}" ]]; then
-    echo "FAIL: expected binary missing at ${LOCAL_BIN}" >&2
+    echo "FAIL: expected steward binary missing at ${LOCAL_BIN}" >&2
     exit 2
 fi
-echo "  ok (binary: ${LOCAL_BIN})"
+echo "  ok (steward: ${LOCAL_BIN})"
+
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name p_crate p_wire <<< "${entry}"
+    if ! run_cross_build -p "${p_crate}" --bin "${p_wire}"; then
+        echo "FAIL: ${p_name} wire-binary cross-build exited non-zero" >&2
+        exit 2
+    fi
+    p_local_bin="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${p_wire}"
+    if [[ ! -x "${p_local_bin}" ]]; then
+        echo "FAIL: expected wire binary missing at ${p_local_bin}" >&2
+        exit 2
+    fi
+    echo "  ok (plugin ${p_name}: ${p_local_bin})"
+done
 echo
 
 # ----------------------------------------------------------
@@ -158,12 +259,20 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [3/5] scp the new binary + install in place.
+# [3/5] scp the new steward binary + every OOP plugin bundle
+# + install in place. Each plugin bundle is staged locally as
+# a directory containing `manifest.toml` (renamed from the
+# `manifest.oop.toml` template) and `plugin.bin` (the wire
+# binary renamed per the manifest's `transport.exec`), then
+# scp'd to a temp location and atomically promoted to
+# `/opt/evo/plugins/<plugin-name>/`. The steward's Phase 2
+# discovery walks `/opt/evo/plugins/` at boot and admits each
+# bundle.
 # ----------------------------------------------------------
-echo "[3/5] scp + install fresh binary ..."
+echo "[3/5] scp + install steward binary + OOP plugin bundles ..."
 TMP_REMOTE="/tmp/evo-device-audio.deploy.$$"
 if ! scp -q "${LOCAL_BIN}" "${SSH_TARGET}:${TMP_REMOTE}"; then
-    echo "FAIL: scp to target failed" >&2
+    echo "FAIL: scp steward binary to target failed" >&2
     exit 3
 fi
 if ! ssh "${SSH_TARGET}" "
@@ -171,10 +280,75 @@ if ! ssh "${SSH_TARGET}" "
     sudo -n install -m 0755 -o root -g root ${TMP_REMOTE} ${TARGET_BIN_PATH}
     rm -f ${TMP_REMOTE}
 "; then
-    echo "FAIL: install on target failed" >&2
+    echo "FAIL: install steward binary on target failed" >&2
     exit 3
 fi
-echo "  ok"
+echo "  ok (steward installed)"
+
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name p_crate p_wire <<< "${entry}"
+    p_local_bin="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${p_wire}"
+    p_manifest_src="${REPO_ROOT}/plugins/${p_name}/manifest.oop.toml"
+    if [[ ! -f "${p_manifest_src}" ]]; then
+        echo "FAIL: ${p_name} manifest.oop.toml missing at ${p_manifest_src}" >&2
+        exit 3
+    fi
+
+    # Stage the bundle locally so the layout matches what the
+    # framework's Phase 2 walks: <plugin-name>/{manifest.toml,
+    # plugin.bin}. The staging dir is per-target-triple so
+    # parallel deploys to different architectures don't trample
+    # each other.
+    p_stage_dir="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/bundles/${p_name}"
+    rm -rf "${p_stage_dir}"
+    mkdir -p "${p_stage_dir}"
+    cp "${p_manifest_src}" "${p_stage_dir}/manifest.toml"
+    cp "${p_local_bin}" "${p_stage_dir}/plugin.bin"
+    chmod 0755 "${p_stage_dir}/plugin.bin"
+
+    # Sign the bundle. The framework's discovery refuses
+    # unsigned bundles at admission with an explicit error;
+    # signing is the only path to the trust class the
+    # manifest declares. `evo-plugin-tool sign` writes
+    # `manifest.sig` next to `manifest.toml`.
+    if ! cargo run --quiet --release \
+            --manifest-path "${ENG_ROOT}/Cargo.toml" \
+            -p evo-plugin-tool -- \
+            sign "${p_stage_dir}" --key "${EVO_PLUGIN_SIGNING_KEY}" \
+            >/dev/null 2>&1; then
+        echo "FAIL: signing ${p_name} bundle failed" >&2
+        echo "      ran: cargo run --manifest-path ${ENG_ROOT}/Cargo.toml -p evo-plugin-tool -- sign ${p_stage_dir} --key ${EVO_PLUGIN_SIGNING_KEY}" >&2
+        exit 3
+    fi
+    if [[ ! -f "${p_stage_dir}/manifest.sig" ]]; then
+        echo "FAIL: ${p_stage_dir}/manifest.sig missing after sign" >&2
+        exit 3
+    fi
+
+    p_remote_tmp="/tmp/evo-plugin-${p_name}.deploy.$$"
+    if ! scp -qr "${p_stage_dir}" "${SSH_TARGET}:${p_remote_tmp}"; then
+        echo "FAIL: scp ${p_name} bundle to target failed" >&2
+        exit 3
+    fi
+    if ! ssh "${SSH_TARGET}" "
+        set -e
+        sudo -n mkdir -p /opt/evo/plugins/${p_name}
+        sudo -n install -m 0644 -o root -g root \
+            ${p_remote_tmp}/manifest.toml \
+            /opt/evo/plugins/${p_name}/manifest.toml
+        sudo -n install -m 0644 -o root -g root \
+            ${p_remote_tmp}/manifest.sig \
+            /opt/evo/plugins/${p_name}/manifest.sig
+        sudo -n install -m 0755 -o root -g root \
+            ${p_remote_tmp}/plugin.bin \
+            /opt/evo/plugins/${p_name}/plugin.bin
+        rm -rf ${p_remote_tmp}
+    "; then
+        echo "FAIL: install ${p_name} bundle on target failed" >&2
+        exit 3
+    fi
+    echo "  ok (plugin ${p_name} installed)"
+done
 echo
 
 # ----------------------------------------------------------
@@ -212,8 +386,31 @@ else
     echo "         (check 'journalctl -u evo --no-pager -n 80' on the target)"
 fi
 
+# Verify every OOP plugin in the bundle set admitted through
+# Phase 2 discovery on this boot. The framework's
+# `plugin_discovery::discover_and_admit` emits a per-bundle
+# admit line; presence of every plugin name in the recent
+# journal confirms the bundle layout was correct and the
+# admit handshake succeeded.
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name _ _ <<< "${entry}"
+    PLUGIN_HITS="$(ssh "${SSH_TARGET}" \
+        "sudo -n journalctl -u evo --since '30 seconds ago' --no-pager 2>&1 \
+            | grep -cE 'plugin.*${p_name}|${p_name}.*admit'")"
+    if [[ "${PLUGIN_HITS}" -ge 1 ]]; then
+        echo "  [ok]  plugin ${p_name} discovered + admitted (${PLUGIN_HITS} matching lines)"
+    else
+        echo "  [WARN] no discovery / admit signal for ${p_name} in the last 30 s"
+        echo "         (check 'journalctl -u evo --no-pager -n 80' on the target)"
+    fi
+done
+
 echo
 echo "=== deploy-distribution.sh complete ==="
-echo "Binary deployed to ${SSH_TARGET}:${TARGET_BIN_PATH}"
-echo "Previous binary preserved at ${SSH_TARGET}:${TARGET_BIN_PREV}"
+echo "Steward binary deployed to ${SSH_TARGET}:${TARGET_BIN_PATH}"
+echo "Previous steward binary preserved at ${SSH_TARGET}:${TARGET_BIN_PREV}"
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name _ _ <<< "${entry}"
+    echo "OOP plugin bundle deployed to ${SSH_TARGET}:/opt/evo/plugins/${p_name}/"
+done
 echo "Rollback: ssh ${SSH_TARGET} 'sudo -n cp ${TARGET_BIN_PREV} ${TARGET_BIN_PATH} && sudo -n systemctl restart evo'"
