@@ -86,10 +86,12 @@ use crate::dsp::{
 use crate::dsp_pool::{parse_dsp_control_pool, DspControlPool};
 use crate::evo_catalog::{parse_evo_catalog, DacEntry, EvoCatalog};
 use crate::modder::{
-    check_hash_against_allowlist, compute_dtbo_hash,
-    merge_user_overlay_into_catalog, validate_confirmation_token,
+    allowlist_path, check_hash_against_allowlist, compute_dtbo_hash,
+    dtbo_install_path, load_allowlist_from_disk, load_user_overlays_from_disk,
+    merge_user_overlay_into_catalog, persist_user_overlay,
+    remove_user_overlay_staging, validate_confirmation_token,
     verify_allowlist_signature, ModderError, ModderSurfaceState,
-    SignedAllowlist, UserOverlayRow, UserOverlayState,
+    SignedAllowlist, UserOverlayRow, UserOverlayState, USER_OVERLAY_DIR,
 };
 use crate::provider::{
     ActiveConfig, ApplyOutcome, HardwareAudioProvider, NoopProvider,
@@ -530,6 +532,61 @@ impl HardwareAudioConfigPlugin {
         })
     }
 
+    /// Load the operator-signed allowlist + every registered
+    /// user-overlay row from disk. Invoked at admission only.
+    /// Failures degrade gracefully: missing allowlist leaves
+    /// `modder_allowlist = None` (every register gesture refuses
+    /// with `AllowlistEntryMissing`); malformed / signature-
+    /// failed allowlist surfaces as a warn-level diagnostic and
+    /// the allowlist stays None; row-load failures land
+    /// individually as Refused entries in the subject so the
+    /// operator sees the diagnostic.
+    async fn load_modder_state_from_disk(&self) {
+        let allowlist_path = allowlist_path();
+        match load_allowlist_from_disk(&allowlist_path).await {
+            Ok(Some(al)) => {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    allowlist_path = %allowlist_path.display(),
+                    entries = al.entries.len(),
+                    "modder allowlist loaded and signature verified"
+                );
+                *self.modder_allowlist.write().await = Some(al);
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    allowlist_path = %allowlist_path.display(),
+                    "no modder allowlist installed; register gestures will refuse with AllowlistEntryMissing"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    allowlist_path = %allowlist_path.display(),
+                    error = %e,
+                    "modder allowlist load failed; surface remains uninitialised"
+                );
+            }
+        }
+        let overlay_dir = std::path::PathBuf::from(USER_OVERLAY_DIR);
+        let allowlist_snapshot = self.modder_allowlist.read().await.clone();
+        let rows = load_user_overlays_from_disk(
+            &overlay_dir,
+            allowlist_snapshot.as_ref(),
+        )
+        .await;
+        if !rows.is_empty() {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                overlay_dir = %overlay_dir.display(),
+                rows = rows.len(),
+                "modder overlay rows loaded from disk"
+            );
+        }
+        *self.modder_overlays.write().await = rows;
+    }
+
     async fn republish_modder_overlays(&self) {
         let Some(announcer) = self.subject_announcer.as_ref() else {
             return;
@@ -710,6 +767,11 @@ impl Plugin for HardwareAudioConfigPlugin {
             }
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
+            // Modder filesystem load: best-effort. Failure modes
+            // (missing allowlist, malformed JSON, signature
+            // failure) surface as a None / Refused state in the
+            // modder_overlays subject; admission proceeds.
+            self.load_modder_state_from_disk().await;
             self.announce_subjects().await;
             self.loaded = true;
             tracing::info!(
@@ -1218,11 +1280,29 @@ impl HardwareAudioConfigPlugin {
             )
         })?;
         let _merged = merge_user_overlay_into_catalog(base, &payload.row)?;
-        // (6) Record the row in the in-memory overlays list with
-        // Active state. Filesystem persistence + DTBO install land
-        // in the next sub-phase; this commit accepts the
-        // operator's register gesture into memory + emits the
-        // happening + republishes the subject.
+        // (6) Persist to disk under the staging directory, then
+        // install the DTBO into the boot-firmware overlays
+        // directory via the narrow sudoers grant. Failure here
+        // surfaces with a structured variant; the in-memory
+        // overlays list is NOT modified until both writes
+        // succeed (no partial-state).
+        let staging_dir = std::path::PathBuf::from(USER_OVERLAY_DIR);
+        persist_user_overlay(&staging_dir, &payload.row, &payload.dtbo_bytes)
+            .await?;
+        let install_path = dtbo_install_path(&payload.row.id);
+        let install_path_str = install_path.to_string_lossy().to_string();
+        crate::provider_pi::sudo_tee_write(
+            &install_path_str,
+            &payload.dtbo_bytes,
+        )
+        .await
+        .map_err(|e| {
+            ModderError::DtboWriteFailed(format!(
+                "sudo tee {install_path_str}: {e}"
+            ))
+        })?;
+        // (7) Record the row in the in-memory overlays list with
+        // Active state.
         let mut overlays = self.modder_overlays.write().await;
         overlays.retain(|(row, _)| row.id != payload.row.id);
         overlays.push((payload.row.clone(), UserOverlayState::Active));
@@ -1262,6 +1342,31 @@ impl HardwareAudioConfigPlugin {
                 )));
             }
             drop(overlays);
+        }
+        // Clean up staging files + the installed DTBO. Failures
+        // here surface as warnings; the in-memory removal already
+        // completed so the subject reflects the operator's intent.
+        let staging_dir = std::path::PathBuf::from(USER_OVERLAY_DIR);
+        if let Err(e) =
+            remove_user_overlay_staging(&staging_dir, &payload.id).await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                overlay_id = %payload.id,
+                error = %e,
+                "remove_overlay: staging cleanup failed"
+            );
+        }
+        let install_path = dtbo_install_path(&payload.id);
+        let install_path_str = install_path.to_string_lossy().to_string();
+        if let Err(e) = crate::provider_pi::sudo_rm(&install_path_str).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                overlay_id = %payload.id,
+                install_path = %install_path_str,
+                error = %e,
+                "remove_overlay: boot-firmware DTBO cleanup failed"
+            );
         }
         self.republish_modder_overlays().await;
         self.emit_happening(

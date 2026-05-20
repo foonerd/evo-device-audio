@@ -476,6 +476,196 @@ impl ModderSurfaceState {
     }
 }
 
+// =============================================================
+// Filesystem integration
+// =============================================================
+
+/// Asynchronously load the operator-signed allowlist from the
+/// supplied path. Returns:
+///
+/// * `Ok(Some(allowlist))` when the file exists, parses, and its
+///   Ed25519 signature verifies.
+/// * `Ok(None)` when the file is absent — operator has not
+///   installed an allowlist; modder gestures refuse downstream
+///   with `AllowlistEntryMissing`.
+/// * `Err(ModderError::MalformedDocument)` when the file exists
+///   but is not valid JSON.
+/// * `Err(ModderError::SignatureRefused)` when the signature
+///   fails verification.
+pub async fn load_allowlist_from_disk(
+    path: &std::path::Path,
+) -> Result<Option<SignedAllowlist>, ModderError> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(ModderError::MalformedDocument(format!(
+                "read {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let allowlist: SignedAllowlist =
+        serde_json::from_str(&raw).map_err(|e| {
+            ModderError::MalformedDocument(format!(
+                "parse {}: {e}",
+                path.display()
+            ))
+        })?;
+    verify_allowlist_signature(&allowlist)?;
+    Ok(Some(allowlist))
+}
+
+/// Load every user-overlay row from the supplied directory, pair
+/// each with its activation state (Active when its sibling DTBO's
+/// hash appears in the allowlist; Refused otherwise). Missing
+/// directory returns an empty Vec (operator has not registered any
+/// overlays yet). Malformed rows are skipped with a warn-level
+/// trace; the rest of the load proceeds.
+pub async fn load_user_overlays_from_disk(
+    dir: &std::path::Path,
+    allowlist: Option<&SignedAllowlist>,
+) -> Vec<(UserOverlayRow, UserOverlayState)> {
+    let mut out = Vec::new();
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "modder overlays dir unreadable; treating as empty"
+            );
+            return out;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        if path.file_stem().and_then(|s| s.to_str()) == Some("allowlist") {
+            continue;
+        }
+        let row_bytes = match tokio::fs::read_to_string(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "modder overlay row unreadable; skipping"
+                );
+                continue;
+            }
+        };
+        let row: UserOverlayRow = match toml::from_str(&row_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "modder overlay row parse failed; skipping"
+                );
+                continue;
+            }
+        };
+        // Verify against the allowlist (when present) by reading
+        // the sibling DTBO and recomputing its hash. Refuse if
+        // anything is amiss; the surface keeps the row visible
+        // so operators see the diagnostic.
+        let dtbo_path = path.with_extension("dtbo");
+        let state = match tokio::fs::read(&dtbo_path).await {
+            Ok(dtbo_bytes) => {
+                let actual_hash = compute_dtbo_hash(&dtbo_bytes);
+                if actual_hash != row.dtbo_sha256_hex {
+                    UserOverlayState::Refused {
+                        reason: format!(
+                            "DTBO hash {actual_hash} differs from row's declared {}",
+                            row.dtbo_sha256_hex
+                        ),
+                    }
+                } else if let Some(al) = allowlist {
+                    match check_hash_against_allowlist(al, &actual_hash) {
+                        Ok(_) => UserOverlayState::Active,
+                        Err(e) => UserOverlayState::Refused {
+                            reason: e.to_string(),
+                        },
+                    }
+                } else {
+                    UserOverlayState::Refused {
+                        reason: "no allowlist loaded".into(),
+                    }
+                }
+            }
+            Err(e) => UserOverlayState::Refused {
+                reason: format!(
+                    "DTBO sibling at {} unreadable: {e}",
+                    dtbo_path.display()
+                ),
+            },
+        };
+        out.push((row, state));
+    }
+    out
+}
+
+/// Persist a user-overlay row to disk: the TOML metadata to
+/// `<dir>/<id>.toml` and the DTBO bytes to `<dir>/<id>.dtbo`.
+/// Caller-supplied `<dir>` must exist + be writable by the plugin
+/// (the bootstrap script creates `/etc/evo/hardware/audio/overlays/`
+/// owned by the service user).
+pub async fn persist_user_overlay(
+    dir: &std::path::Path,
+    row: &UserOverlayRow,
+    dtbo_bytes: &[u8],
+) -> Result<(), ModderError> {
+    let row_path = dir.join(format!("{}.toml", row.id));
+    let dtbo_path = dir.join(format!("{}.dtbo", row.id));
+    let row_toml = toml::to_string_pretty(row).map_err(|e| {
+        ModderError::MalformedDocument(format!("serialise row: {e}"))
+    })?;
+    tokio::fs::write(&row_path, row_toml).await.map_err(|e| {
+        ModderError::DtboWriteFailed(format!(
+            "write {}: {e}",
+            row_path.display()
+        ))
+    })?;
+    tokio::fs::write(&dtbo_path, dtbo_bytes)
+        .await
+        .map_err(|e| {
+            ModderError::DtboWriteFailed(format!(
+                "write {}: {e}",
+                dtbo_path.display()
+            ))
+        })?;
+    Ok(())
+}
+
+/// Remove a user-overlay row's metadata + staging DTBO from the
+/// staging directory. Missing files are treated as already-removed
+/// (idempotent); any other IO error surfaces as
+/// `DtboWriteFailed` carrying the path.
+pub async fn remove_user_overlay_staging(
+    dir: &std::path::Path,
+    id: &str,
+) -> Result<(), ModderError> {
+    let row_path = dir.join(format!("{id}.toml"));
+    let dtbo_path = dir.join(format!("{id}.dtbo"));
+    for p in [row_path, dtbo_path] {
+        match tokio::fs::remove_file(&p).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ModderError::DtboWriteFailed(format!(
+                    "remove {}: {e}",
+                    p.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +974,235 @@ provenance = "vendor"
         assert_eq!(
             allowlist.to_string_lossy(),
             "/etc/evo/hardware/audio/overlays/allowlist.signed"
+        );
+    }
+
+    // ===== Filesystem load / persist (with tempdir) =====
+
+    #[tokio::test]
+    async fn load_allowlist_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.signed");
+        let result = load_allowlist_from_disk(&path).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_allowlist_round_trips_signed_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.signed");
+        let allowlist = build_signed_allowlist(vec![AllowlistEntry {
+            dtbo_sha256_hex: "ab".repeat(32),
+            display_name: "test".into(),
+            issued_at_ms: 0,
+        }]);
+        tokio::fs::write(&path, serde_json::to_string(&allowlist).unwrap())
+            .await
+            .unwrap();
+        let loaded = load_allowlist_from_disk(&path).await.unwrap().unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.signing_key_hex, allowlist.signing_key_hex);
+    }
+
+    #[tokio::test]
+    async fn load_allowlist_refuses_tampered_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.signed");
+        let mut allowlist = build_signed_allowlist(vec![AllowlistEntry {
+            dtbo_sha256_hex: "00".repeat(32),
+            display_name: "original".into(),
+            issued_at_ms: 0,
+        }]);
+        // Tamper after signing.
+        allowlist.entries[0].display_name = "tampered".into();
+        tokio::fs::write(&path, serde_json::to_string(&allowlist).unwrap())
+            .await
+            .unwrap();
+        let err = load_allowlist_from_disk(&path).await.unwrap_err();
+        assert!(matches!(err, ModderError::SignatureRefused(_)));
+    }
+
+    #[tokio::test]
+    async fn load_allowlist_refuses_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.signed");
+        tokio::fs::write(&path, b"not valid json {[").await.unwrap();
+        let err = load_allowlist_from_disk(&path).await.unwrap_err();
+        assert!(matches!(err, ModderError::MalformedDocument(_)));
+    }
+
+    #[tokio::test]
+    async fn load_user_overlays_handles_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = load_user_overlays_from_disk(dir.path(), None).await;
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_user_overlays_handles_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let rows = load_user_overlays_from_disk(&missing, None).await;
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_and_round_trip_user_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = b"dtbo bytes".to_vec();
+        let hash = compute_dtbo_hash(&blob);
+        let row = UserOverlayRow {
+            id: "my-custom".into(),
+            display_name: "My Custom".into(),
+            board_profile: "Raspberry PI".into(),
+            overlay: "my-custom-overlay".into(),
+            dtbo_sha256_hex: hash.clone(),
+            alsa_card_hint: "MyCard".into(),
+            in_card_mixer: String::new(),
+            dsp_options: vec!["DSP Program".into()],
+            override_base: false,
+        };
+        persist_user_overlay(dir.path(), &row, &blob)
+            .await
+            .expect("persist");
+        // Sibling files should both exist.
+        let toml_path = dir.path().join("my-custom.toml");
+        let dtbo_path = dir.path().join("my-custom.dtbo");
+        assert!(tokio::fs::metadata(&toml_path).await.is_ok());
+        assert!(tokio::fs::metadata(&dtbo_path).await.is_ok());
+        // Round-trip via load: allowlist must include the hash for
+        // Active state; absent allowlist surfaces Refused with
+        // "no allowlist loaded" diagnostic.
+        let allowlist = build_signed_allowlist(vec![AllowlistEntry {
+            dtbo_sha256_hex: hash,
+            display_name: "my-custom".into(),
+            issued_at_ms: 0,
+        }]);
+        let rows =
+            load_user_overlays_from_disk(dir.path(), Some(&allowlist)).await;
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].1, UserOverlayState::Active));
+        assert_eq!(rows[0].0.id, "my-custom");
+    }
+
+    #[tokio::test]
+    async fn load_user_overlays_surfaces_refused_when_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist a row whose declared hash differs from the
+        // actual DTBO contents.
+        let blob = b"actual bytes";
+        let row = UserOverlayRow {
+            id: "bad-row".into(),
+            display_name: "Bad Row".into(),
+            board_profile: "Raspberry PI".into(),
+            overlay: "bad-overlay".into(),
+            dtbo_sha256_hex: "ff".repeat(32),
+            alsa_card_hint: String::new(),
+            in_card_mixer: String::new(),
+            dsp_options: vec![],
+            override_base: false,
+        };
+        persist_user_overlay(dir.path(), &row, blob)
+            .await
+            .expect("persist");
+        let allowlist = build_signed_allowlist(vec![]);
+        let rows =
+            load_user_overlays_from_disk(dir.path(), Some(&allowlist)).await;
+        assert_eq!(rows.len(), 1);
+        match &rows[0].1 {
+            UserOverlayState::Refused { reason } => {
+                assert!(reason.contains("differs from row's declared"));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_user_overlays_surfaces_refused_when_allowlist_missing_entry()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = b"some bytes";
+        let hash = compute_dtbo_hash(blob);
+        let row = UserOverlayRow {
+            id: "row".into(),
+            display_name: "Row".into(),
+            board_profile: "Raspberry PI".into(),
+            overlay: "ovl".into(),
+            dtbo_sha256_hex: hash,
+            alsa_card_hint: String::new(),
+            in_card_mixer: String::new(),
+            dsp_options: vec![],
+            override_base: false,
+        };
+        persist_user_overlay(dir.path(), &row, blob).await.unwrap();
+        let allowlist = build_signed_allowlist(vec![]); // empty allowlist
+        let rows =
+            load_user_overlays_from_disk(dir.path(), Some(&allowlist)).await;
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].1, UserOverlayState::Refused { .. }));
+    }
+
+    #[tokio::test]
+    async fn load_user_overlays_no_allowlist_marks_every_row_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = b"bytes";
+        let hash = compute_dtbo_hash(blob);
+        let row = UserOverlayRow {
+            id: "row".into(),
+            display_name: "Row".into(),
+            board_profile: "Raspberry PI".into(),
+            overlay: "ovl".into(),
+            dtbo_sha256_hex: hash,
+            alsa_card_hint: String::new(),
+            in_card_mixer: String::new(),
+            dsp_options: vec![],
+            override_base: false,
+        };
+        persist_user_overlay(dir.path(), &row, blob).await.unwrap();
+        let rows = load_user_overlays_from_disk(dir.path(), None).await;
+        assert_eq!(rows.len(), 1);
+        match &rows[0].1 {
+            UserOverlayState::Refused { reason } => {
+                assert!(reason.contains("no allowlist loaded"));
+            }
+            _ => panic!("expected Refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_user_overlay_staging_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Remove against a directory with no files succeeds.
+        remove_user_overlay_staging(dir.path(), "no-such")
+            .await
+            .expect("idempotent");
+        // Persist + remove + remove again all succeed.
+        let blob = b"bytes";
+        let row = UserOverlayRow {
+            id: "to-remove".into(),
+            display_name: "X".into(),
+            board_profile: "Raspberry PI".into(),
+            overlay: "ovl".into(),
+            dtbo_sha256_hex: compute_dtbo_hash(blob),
+            alsa_card_hint: String::new(),
+            in_card_mixer: String::new(),
+            dsp_options: vec![],
+            override_base: false,
+        };
+        persist_user_overlay(dir.path(), &row, blob).await.unwrap();
+        remove_user_overlay_staging(dir.path(), "to-remove")
+            .await
+            .expect("first remove");
+        remove_user_overlay_staging(dir.path(), "to-remove")
+            .await
+            .expect("idempotent second remove");
+        assert!(
+            !dir.path().join("to-remove.toml").exists(),
+            "toml should be deleted"
+        );
+        assert!(
+            !dir.path().join("to-remove.dtbo").exists(),
+            "dtbo should be deleted"
         );
     }
 }

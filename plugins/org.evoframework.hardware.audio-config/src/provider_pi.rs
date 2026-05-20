@@ -291,7 +291,38 @@ async fn read_boot_config(path: &str) -> Result<String, ProviderError> {
 
 /// Write the boot config via `sudo -n tee`. The grant in
 /// `dist/sudoers.d/evo-hardware-audio.in` is path-scoped.
-async fn sudo_tee_write(path: &str, bytes: &[u8]) -> Result<(), ProviderError> {
+/// `sudo -n rm <path>` runner — the cleanup counterpart to
+/// [`sudo_tee_write`]. Used by the modder remove path to clean
+/// up DTBO blobs from `/boot/firmware/overlays/`. Missing files
+/// (already-removed; idempotent) treated as success.
+pub(crate) async fn sudo_rm(path: &str) -> Result<(), ProviderError> {
+    let output = Command::new("sudo")
+        .args(["-n", "rm", "-f", path])
+        .output()
+        .await
+        .map_err(|e| {
+            ProviderError::BootConfigWriteFailed(format!(
+                "spawn sudo rm {path}: {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(ProviderError::BootConfigWriteFailed(format!(
+            "sudo rm {path} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// `sudo -n tee <path>` writer reused by both the boot-config
+/// dtoverlay path and the modder DTBO install path. Crate-public
+/// so the modder module can install user-uploaded DTBO blobs to
+/// `/boot/firmware/overlays/` via the narrow sudoers grant
+/// declared in `dist/sudoers.d/evo-hardware-audio.in`.
+pub(crate) async fn sudo_tee_write(
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), ProviderError> {
     let mut child = Command::new("sudo")
         .args(["-n", "tee", path])
         .stdin(Stdio::piped())
