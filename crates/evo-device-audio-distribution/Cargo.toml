@@ -50,32 +50,17 @@ evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 # shape only for plugins whose framework-side OOP transport is
 # still landing; everything else ships through Phase 2 discovery.
 #
-# Out-of-process today (no longer compile-linked here):
-#   * `org-evoframework-artwork-local`
-#   * `org-evoframework-network`
-#   * `org-evoframework-metadata-local`
-#   * `org-evoframework-playback-options`
-#   * `org-evoframework-composition-alsa`
-#   * `org-evoframework-delivery-alsa`
-#   * `org-evoframework-playback-mpd`
-#
-# Each ships a wire binary + `manifest.oop.toml`; the deploy
-# script (`dist/scripts/deploy-distribution.sh`) cross-builds
-# the wire binary, signs the bundle, and stages it under
+# Every reference-distribution plugin (artwork.local, network,
+# metadata.local, playback.options, composition.alsa,
+# delivery.alsa, playback.mpd, multiroom.evo-native) now ships
+# out-of-process. The deploy script
+# (`dist/scripts/deploy-distribution.sh`) cross-builds each
+# wire binary, signs the bundle, and stages it under
 # `/opt/evo/plugins/<name>/`. Workspace membership keeps them
-# cross-buildable from this repo.
-#
-# `org-evoframework-multiroom-evo-native` REMAINS a production
-# dep today because the plugin consumes
-# `LoadContext::audio_plane` (and `multiroom_substrate`) at
-# load() time, and the framework's OOP admission path does
-# not yet wire-proxy those handles to subprocess plugins.
-# `AudioRouting` itself is now wire-proxied — multiroom's
-# remaining gating is the high-frequency audio-frame fan-out
-# surface. The wire binary + OOP manifest are scaffolded
-# in-tree; the migration lands once that handle has a sound
-# cross-process transport.
-org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
+# cross-buildable from this repo without producing a
+# compile-link path in the distribution binary itself. Vendor
+# builds that want compile-link can re-add specific plugin
+# crates as path dependencies.
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.
@@ -92,20 +77,14 @@ toml = { workspace = true }
 
 [features]
 default = []
-# Cross-builds for target hardware enable this feature to
-# pull in the libasound-backed AlsaPcm substrate path inside
-# the still-compile-link-admitted multiroom.evo-native
-# plugin. composition.alsa and delivery.alsa have moved to
-# OOP shipping form; the deploy script passes
-# `--features alsa-substrate` directly to their wire-binary
-# cross-builds via the `OOP_PLUGINS` features column. Once
-# multiroom.evo-native also moves to OOP shipping form
-# (gated on the framework's OOP admission path provisioning
-# audio_plane + multiroom_substrate across the subprocess
-# boundary), this passthrough retires.
-alsa-substrate = [
-    "org-evoframework-multiroom-evo-native/alsa-substrate",
-]
+# The `alsa-substrate` feature is retained as a no-op for
+# backwards compatibility with vendor distributions that
+# enable it at workspace level. Every plugin that used to
+# consume this feature now ships OOP; the deploy script
+# passes `--features alsa-substrate` directly to each
+# wire-binary cross-build via the `OOP_PLUGINS` features
+# column.
+alsa-substrate = []
 
 [lints]
 workspace = true
