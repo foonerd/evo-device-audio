@@ -3,7 +3,7 @@
 #
 # This file is the LOAD-BEARING shipped artefact for the DSP
 # capability resolver's middle layer (catalog dsp_options[] →
-# curated pool → live amixer cget; see ADR-0132 §Decision 2).
+# curated pool → live amixer cget).
 #
 # Each entry binds an ALSA mixer-control name to operator-facing
 # metadata that the runtime cannot recover from amixer
@@ -14,9 +14,9 @@
 # (not in the pool) surface with `bound = true` and the raw mixer-
 # control name as the human label, never silently disappearing.
 #
-# Per ADR-0132 §Decision 2: future updates ship with plugin
-# releases. An online reference pool source is a recorded
-# future-architecture extension, not v0.1.13 scope.
+# Future updates ship with plugin releases. An online reference
+# pool source is a recorded future-architecture extension, out of
+# scope for the current release line.
 #
 # Curated controls land in this file when:
 #   1. Any DAC in data/evo-catalog.toml `dsp_options[]` references

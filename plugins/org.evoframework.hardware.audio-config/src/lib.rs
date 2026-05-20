@@ -90,8 +90,8 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Embedded evo-native catalog (the runtime source-of-truth). The
 /// importer in `src/import.rs` generates this artefact at developer
 /// time from the frozen Volumio sources under `data/import/`; the
-/// runtime parses ONLY this TOML, never the Volumio JSON shape
-/// (ADR-0132 §Invariant: one canonical parse path).
+/// runtime parses ONLY this TOML, never the Volumio JSON shape.
+/// One canonical parse path is the invariant.
 pub const EMBEDDED_EVO_CATALOG_TOML: &str =
     include_str!("../data/evo-catalog.toml");
 

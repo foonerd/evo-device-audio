@@ -21,9 +21,8 @@ use org_evoframework_hardware_audio_config::import::import_volumio_to_evo_catalo
 
 /// Volumio import source — frozen provenance, included into the
 /// example at build time. Not exposed on the plugin's public
-/// surface: the runtime never sees the Volumio shape (ADR-0132
-/// §Invariant). Re-running this example with the same inputs
-/// produces byte-identical output.
+/// surface: the runtime never sees the Volumio shape. Re-running
+/// this example with the same inputs produces byte-identical output.
 const VOLUMIO_DACS_JSON: &str =
     include_str!("../data/import/volumio-dacs.json");
 const VOLUMIO_DAC_DSP_JSON: &str =

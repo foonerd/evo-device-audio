@@ -3,8 +3,7 @@
 //! The runtime catalog source-of-truth is `data/evo-catalog.toml`,
 //! a build-time-generated artefact derived from the frozen Volumio
 //! sources under `data/import/`. The runtime never parses Volumio
-//! JSON shape; this module is the only catalog parser in the plugin
-//! after ADR-0132 §Decision 1.
+//! JSON shape; this module is the only catalog parser in the plugin.
 //!
 //! Compared to Volumio's `dacs.json` row, the evo-native [`DacEntry`]
 //! adds three load-bearing fields:

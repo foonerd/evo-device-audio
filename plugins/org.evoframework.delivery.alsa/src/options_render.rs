@@ -40,7 +40,7 @@
 //!
 //! ## Render coverage
 //!
-//! v0.1.13 covers three operator settings:
+//! The current release covers three operator settings:
 //!
 //! - `mixer_type` — `none` / `software` / `hardware`. Hardware
 //!   binds a specific ALSA mixer control via the `softvol`
