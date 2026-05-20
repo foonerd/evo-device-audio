@@ -1,0 +1,126 @@
+[plugin]
+name = "org.evoframework.playback.mpd"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.playback"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+# Reload-cleanable: operator-tunable state covers mpd-port +
+# library-roots projection. A TOML edit triggers teardown +
+# re-admit; the warden releases active custody on teardown and
+# re-establishes it with the new configuration on re-admit.
+# Custody release during reload is operator-visible (the
+# playback queue pauses for the teardown + admit window — bounded
+# by the manifest's admit/teardown deadlines).
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.warden]
+custody_domain = "playback"
+custody_exclusive = true
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+# course_correct verb set the warden honours. The framework
+# refuses any verb not in this list at the router boundary
+# before the warden's `course_correct` body is invoked.
+# Mirrors the audio.playback shape v1 contract; the runtime
+# constants in src/lib.rs hold the same list verbatim.
+course_correct_verbs = [
+    "play",
+    "pause",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+]
+
+# Source-plugin declaration. The plugin owns the `mpd-path`
+# URI scheme (paths the local MPD daemon's library knows
+# about) and bridges into the audio data plane: the
+# framework hands the plugin a typed WriteEndpoint via
+# LoadContext::audio_routing, and the plugin renders MPD's
+# audio_output config to point there (chunks F3 onwards).
+# bit_perfect_capable + preferred_topology = no_intermediate
+# tell the reconciliation engine that MPD writes directly
+# to the delivery hardware when format-aligned, no
+# intermediate composition stage required.
+[capabilities.source]
+uri_schemes = ["mpd-path"]
+output_kind = "audio.pcm"
+bit_perfect_capable = true
+preferred_topology = "no_intermediate"
+
+# Audio formats MPD can produce when wired through the
+# ALSA audio_output plugin. Standard PCM bit-depths at
+# common audiophile rate ladder. DSD output (DoP / native)
+# is a later improvement (gated on delivery's DSD capability and
+# operator policy).
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s16_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s24_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+[[capabilities.source.audio_formats]]
+kind = "pcm"
+codec = "pcm_s32_le"
+rate_hz = [44100, 48000, 88200, 96000, 176400, 192000]
+channels = 2
+
+# Respondent capabilities. Source plugins MUST also be
+# respondents — source verbs targeting the URI schemes
+# this plugin owns arrive via handle_request. The full
+# state-transition set ships here: play_now loads-and-plays
+# a specific mpd-path URI; play / pause / resume / stop /
+# next / previous / seek / set_volume drive the supervisor
+# through its existing PlaybackCommand surface so the
+# warden's course_correct path and the source-verb dispatch
+# path share the same execution machinery (different
+# entry points, identical outcome).
+[capabilities.respondent]
+request_types = [
+    "play_now",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "set_volume",
+]
+response_budget_ms = 2000

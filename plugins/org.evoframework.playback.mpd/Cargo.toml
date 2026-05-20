@@ -11,6 +11,16 @@ description = "MPD playback warden for the evo audio domain. Stocks the audio.pl
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP
+# entrypoint the framework's release plane cross-builds,
+# signs, packs, and publishes as a plugin bundle. The plugin
+# is a combined warden + respondent so the wire binary uses
+# `run_oop_warden_with_respondent` (which dispatches both
+# verb classes through a single connection).
+[[bin]]
+name = "playback-mpd-wire"
+path = "src/bin/playback-mpd-wire.rs"
+
 [dependencies]
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
@@ -34,6 +44,9 @@ serde_json = { workspace = true }
 # required to name `toml::Table` as a type in this crate. Not a workspace
 # dep because not every future plugin will want a configuration file.
 toml = "0.8"
+# Wire-binary stderr logging. Matches the artwork-local-wire +
+# network-wire + metadata-local-wire sibling plugins.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # Extra tokio features only needed by tests (duplex streams, test-util utilities).

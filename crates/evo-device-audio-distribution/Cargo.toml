@@ -59,25 +59,20 @@ evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 # device repo.
 #
 # `org-evoframework-composition-alsa`,
-# `org-evoframework-delivery-alsa`, and
-# `org-evoframework-multiroom-evo-native` REMAIN production
+# `org-evoframework-delivery-alsa`,
+# `org-evoframework-multiroom-evo-native`, and
+# `org-evoframework-playback-mpd` REMAIN production
 # deps today because their plugins consume framework audio
 # data-plane handles (`audio_routing`, `audio_plane`,
 # `multiroom_substrate`) at `load()` time, and the
 # framework's OOP admission path does not yet wire-proxy
-# those handles to subprocess plugins. Each plugin's wire
-# binary + manifest.oop.toml is scaffolded in-tree; the
+# those handles to subprocess plugins. The wire binary +
+# manifest.oop.toml for each is scaffolded in-tree (mpd's
+# wire binary uses the SDK's `run_oop_warden_with_respondent`
+# combined entry point landed in evo-core-eng); the
 # migration moves to Phase 2 once the framework's OOP path
 # provisions audio + multi-room handles across the
 # subprocess boundary.
-#
-# `org-evoframework-playback-mpd` remains compile-link
-# admitted today: it is a warden + respondent combined
-# plugin; the SDK's `run_oop` helper takes a respondent
-# only, `run_oop_warden` takes a warden only, and there is
-# no combined `run_oop_warden_with_respondent` entry point
-# yet. mpd migrates once the SDK gains the combined entry
-# point.
 org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
 org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
 org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
