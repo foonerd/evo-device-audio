@@ -195,6 +195,22 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
+/// Map a provider key (as declared in the catalogue's
+/// `board.provider` field) to a concrete
+/// [`HardwareAudioProvider`] instance. Unknown keys fall back to
+/// [`NoopProvider`] so the runtime stays usable on board classes
+/// where no concrete impl has been wired yet — the operator sees
+/// an empty DAC list + `NotApplicable` write outcomes rather than
+/// a hard refusal at admission.
+fn make_provider(provider_key: &str) -> Arc<dyn HardwareAudioProvider> {
+    match provider_key {
+        "pi" => Arc::new(PiProvider::new()),
+        // "rockchip" / other board-class keys land here as
+        // NoopProvider until their concrete impls are wired in.
+        _ => Arc::new(NoopProvider::default()),
+    }
+}
+
 // =============================================================
 // Plugin
 // =============================================================
@@ -759,12 +775,26 @@ impl Plugin for HardwareAudioConfigPlugin {
                 self.profile = provider_pi::resolve_board_profile().await;
             }
             // Provider selection: tests pre-set provider via
-            // with_provider; honour the override. Otherwise the Pi
-            // profile gets the PiProvider; every other class
-            // retains the NoopProvider that surfaces an empty
-            // catalogue + NotApplicable on writes.
-            if !self.provider_injected && self.profile == "Raspberry PI" {
-                self.provider = Arc::new(PiProvider::new());
+            // with_provider; honour the override. Otherwise look
+            // the profile up in the catalogue and dispatch on the
+            // declared `board.provider` key. Boards the runtime
+            // has no concrete impl for (and boards not in the
+            // catalogue at all) retain the NoopProvider that
+            // surfaces an empty catalogue + NotApplicable on writes.
+            if !self.provider_injected {
+                let provider_key = self
+                    .catalogue
+                    .as_ref()
+                    .and_then(|c| c.provider_key_for_profile(&self.profile))
+                    .unwrap_or("noop")
+                    .to_string();
+                self.provider = make_provider(&provider_key);
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    profile = %self.profile,
+                    provider_key = %provider_key,
+                    "hardware-audio provider selected by catalogue board.provider key"
+                );
             }
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
@@ -1641,6 +1671,29 @@ impl<'a> AmixerReader for ProviderAsAmixer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn make_provider_dispatches_pi_key_to_pi_provider() {
+        let provider = make_provider("pi");
+        assert_eq!(provider.board_profile().await.expect("ok"), "Raspberry PI");
+    }
+
+    #[tokio::test]
+    async fn make_provider_dispatches_noop_key_to_noop_provider() {
+        let provider = make_provider("noop");
+        assert_eq!(provider.board_profile().await.expect("ok"), "Unknown");
+    }
+
+    #[tokio::test]
+    async fn make_provider_unknown_key_falls_back_to_noop() {
+        // The dispatch table is the source of truth; unknown keys
+        // (a future board class declared in the catalogue before
+        // the runtime impl lands) must not panic admission — they
+        // resolve to NoopProvider so the operator sees an empty
+        // DAC list + NotApplicable writes rather than a refusal.
+        let provider = make_provider("rockchip");
+        assert_eq!(provider.board_profile().await.expect("ok"), "Unknown");
+    }
 
     #[test]
     fn manifest_request_types_match_runtime() {
