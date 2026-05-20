@@ -83,18 +83,35 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use evo_device_audio_shared::transition_envelope::{
+    observation_matches, parse_envelope_observed, EnvelopeRequested,
+    EnvelopeState, ENVELOPE_OBSERVED_VALUE, ENVELOPE_PAYLOAD_VERSION,
+    ENVELOPE_REQUESTED_SUBJECT_TYPE, ENVELOPE_REQUESTED_VALUE, ENVELOPE_SCHEME,
+};
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, PluginIdentity, Request,
     Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
-    SubjectAnnouncer,
+    SubjectAnnouncer, SubjectQuerier, SubjectStateStreamError,
+    SubjectStateSubscriber,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 
 pub mod transition;
+
+/// Timeout the orchestrator waits for the playback warden's
+/// envelope-observed acknowledgement at steps 2 (pre-mute)
+/// and 7 (unmute). The contract requires bounded waiting:
+/// on timeout the orchestrator routes to its rollback chain.
+/// Five seconds covers MPD's pause + resume round-trip with
+/// margin; substantially-slower wardens surface as a
+/// `rolled_back` outcome the operator sees.
+const ENVELOPE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -426,6 +443,33 @@ pub struct PlaybackOptionsPlugin {
     /// state machine is stateless; mutations route through
     /// the executor's persist call.
     transition_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Subject-state subscriber handle from `LoadContext`.
+    /// Used by the orchestrator's steps 2 + 7 to await the
+    /// playback warden's envelope_observed acknowledgement.
+    /// `Option` so OOP transport pre-wire-surface admission
+    /// doesn't fail load when the subscriber is unpopulated;
+    /// missing subscriber surfaces as the orchestrator
+    /// running the safety envelope in advisory-only mode (a
+    /// debug log on each transition; no rollback).
+    subject_state_subscriber: Option<Arc<dyn SubjectStateSubscriber>>,
+    /// Subject querier from `LoadContext`. Used by the
+    /// orchestrator to resolve the envelope_observed
+    /// addressing to a canonical id before subscribing.
+    /// Option for the same reason as
+    /// [`Self::subject_state_subscriber`].
+    subject_querier: Option<Arc<dyn SubjectQuerier>>,
+    /// Generation counter the orchestrator bumps per
+    /// envelope-coordination step. Each pre-mute / unmute
+    /// publishes a fresh generation so the warden can
+    /// disambiguate a stale observation from a fresh
+    /// request.
+    envelope_generation: Arc<AtomicU64>,
+    /// Per-instance override for the envelope-ack timeout.
+    /// Production paths leave this `None` and the
+    /// [`ENVELOPE_ACK_TIMEOUT`] default applies. Tests
+    /// override with shorter durations so the timeout-
+    /// routes-to-rollback test runs in milliseconds.
+    envelope_ack_timeout_override: Option<Duration>,
     requests_handled: u64,
 }
 
@@ -439,8 +483,25 @@ impl PlaybackOptionsPlugin {
             happening_emitter: None,
             subject_announcer: None,
             transition_lock: Arc::new(tokio::sync::Mutex::new(())),
+            subject_state_subscriber: None,
+            subject_querier: None,
+            envelope_generation: Arc::new(AtomicU64::new(0)),
+            envelope_ack_timeout_override: None,
             requests_handled: 0,
         }
+    }
+
+    /// Test-only override for the envelope-ack timeout. The
+    /// timeout-routes-to-rollback test sets a short duration
+    /// (e.g. 50ms) so the test runs in tens of milliseconds
+    /// rather than the production default of five seconds.
+    #[cfg(test)]
+    pub(crate) fn with_envelope_ack_timeout_override(
+        mut self,
+        timeout: Duration,
+    ) -> Self {
+        self.envelope_ack_timeout_override = Some(timeout);
+        self
     }
 
     /// Cumulative `handle_request` invocations.
@@ -692,6 +753,223 @@ impl PlaybackOptionsPlugin {
         }
     }
 
+    /// External addressing for the orchestrator-published
+    /// envelope_requested subject. Defined as a const-like
+    /// helper so the orchestrator's publish + the
+    /// (test-only) subject identity introspection both
+    /// reference the same source-of-truth shape.
+    fn envelope_requested_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: ENVELOPE_SCHEME.to_string(),
+            value: ENVELOPE_REQUESTED_VALUE.to_string(),
+        }
+    }
+
+    /// External addressing for the warden-published
+    /// envelope_observed subject. The orchestrator resolves
+    /// this addressing each gesture to discover the warden's
+    /// canonical id before subscribing.
+    fn envelope_observed_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: ENVELOPE_SCHEME.to_string(),
+            value: ENVELOPE_OBSERVED_VALUE.to_string(),
+        }
+    }
+
+    /// Announce the envelope_requested subject at load time
+    /// so the warden can resolve its canonical id ahead of
+    /// the first transition gesture. The subject's initial
+    /// state reflects "no transition in flight" — generation
+    /// 0, observation-style payload skipped (the warden
+    /// matches on generation + state in a fresh request,
+    /// not on the initial-announce payload).
+    async fn announce_envelope_requested_subject(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        // Seed payload: an idle request the warden treats as
+        // a no-op (the warden's subscriber matches new
+        // generations, not the initial-announce one).
+        let initial = serde_json::json!({
+            "v": ENVELOPE_PAYLOAD_VERSION,
+            "generation": 0_u64,
+            "requested_state": "unmuted",
+            "requested_at_ms": 0_u64,
+        });
+        let announcement = SubjectAnnouncement {
+            subject_type: ENVELOPE_REQUESTED_SUBJECT_TYPE.to_string(),
+            addressings: vec![Self::envelope_requested_addressing()],
+            claims: Vec::new(),
+            state: initial,
+            announced_at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = announcer.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "announce envelope_requested subject failed"
+            );
+        }
+    }
+
+    /// Publish an envelope-coordination request via the
+    /// settings subject's announcer. The orchestrator's pre-
+    /// mute (state = Muted) and unmute (state = Unmuted)
+    /// steps call this with a freshly-bumped generation.
+    ///
+    /// Returns the generation value the request was published
+    /// at, so the caller can match it against the warden's
+    /// ack.
+    async fn publish_envelope_requested(
+        &self,
+        state: EnvelopeState,
+    ) -> Result<u64, String> {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return Err(
+                "subject_announcer unpopulated; cannot publish envelope"
+                    .to_string(),
+            );
+        };
+        let generation =
+            self.envelope_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let payload = EnvelopeRequested {
+            v: ENVELOPE_PAYLOAD_VERSION,
+            generation,
+            requested_state: state,
+            requested_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let value = serde_json::to_value(&payload)
+            .map_err(|e| format!("serialise envelope_requested: {e}"))?;
+        announcer
+            .update_state(Self::envelope_requested_addressing(), value)
+            .await
+            .map_err(|e| format!("update envelope_requested state: {e:?}"))?;
+        Ok(generation)
+    }
+
+    /// Await the warden's envelope_observed acknowledgement
+    /// matching `(generation, expected_state)` within
+    /// [`ENVELOPE_ACK_TIMEOUT`]. Subscribes via
+    /// `subject_state_subscriber` + uses `subject_querier`
+    /// to resolve the warden's canonical id.
+    ///
+    /// Three terminal outcomes:
+    ///
+    /// * `Ok(())` — ack received within timeout (envelope
+    ///   honoured by a participating warden).
+    /// * `Ok(())` — addressing resolves to None (no warden
+    ///   participating; advisory mode). Logged at debug.
+    ///   This is NOT silent failure — the absence of a
+    ///   playback warden means no audio chain to protect.
+    ///   When a warden IS admitted the orchestrator
+    ///   gracefully escalates back to the await path.
+    /// * `Err(reason)` — subscribe failed, stream closed,
+    ///   or timeout exceeded. The orchestrator routes this
+    ///   to the rollback chain.
+    async fn await_envelope_ack(
+        &self,
+        generation: u64,
+        expected_state: EnvelopeState,
+    ) -> Result<(), String> {
+        let Some(subscriber) = self.subject_state_subscriber.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_state_subscriber unpopulated; safety envelope \
+                 advisory-only for this transition"
+            );
+            return Ok(());
+        };
+        let Some(querier) = self.subject_querier.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_querier unpopulated; safety envelope advisory-only \
+                 for this transition"
+            );
+            return Ok(());
+        };
+
+        let canonical_id = match querier
+            .resolve_addressing(Self::envelope_observed_addressing())
+            .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_observed subject not yet announced (no \
+                     participating playback warden); safety envelope \
+                     advisory-only for this transition"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "resolve envelope_observed addressing: {e:?}"
+                ));
+            }
+        };
+
+        let mut stream = subscriber
+            .subscribe_subject(canonical_id.clone())
+            .await
+            .map_err(|e| format!("subscribe envelope_observed: {e:?}"))?;
+
+        // Seed with current_state — the warden may already
+        // have published a matching ack between our publish
+        // call and this subscribe (would be a stale ack from
+        // a previous generation, but check for completeness).
+        if let Ok(Some(state)) = subscriber.current_state(canonical_id).await {
+            if let Some(obs) = parse_envelope_observed(&state) {
+                if observation_matches(&obs, generation, expected_state) {
+                    return Ok(());
+                }
+            }
+        }
+
+        let timeout = self
+            .envelope_ack_timeout_override
+            .unwrap_or(ENVELOPE_ACK_TIMEOUT);
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                match stream.recv().await {
+                    Ok(update) => {
+                        if let Some(state) = update.state.as_ref() {
+                            if let Some(obs) = parse_envelope_observed(state) {
+                                if observation_matches(
+                                    &obs,
+                                    generation,
+                                    expected_state,
+                                ) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(SubjectStateStreamError::Lagged { .. }) => continue,
+                    Err(SubjectStateStreamError::Closed) => {
+                        return Err(
+                            "envelope_observed stream closed before ack"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "envelope ack timeout after {}ms (generation={generation}, \
+                 expected_state={expected_state:?})",
+                timeout.as_millis()
+            )),
+        }
+    }
+
     /// Publish a fresh subject-state payload after a setter
     /// has updated `self.settings`. Best-effort: failures log
     /// at warn level so the setter's persist + happening
@@ -812,6 +1090,9 @@ impl Plugin for PlaybackOptionsPlugin {
             self.settings = self.load_settings_from_disk().await?;
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
+            self.subject_state_subscriber =
+                ctx.subject_state_subscriber.as_ref().map(Arc::clone);
+            self.subject_querier = ctx.subject_querier.as_ref().map(Arc::clone);
             // Announce the settings subject so consumers
             // (playback.mpd, future UI plugins) can resolve
             // its canonical id + subscribe to state changes
@@ -821,6 +1102,12 @@ impl Plugin for PlaybackOptionsPlugin {
             // happening have the initial value without a
             // separate round-trip.
             self.announce_settings_subject().await;
+            // Announce the envelope_requested subject so the
+            // playback warden can resolve its canonical id +
+            // subscribe to mute / unmute requests the
+            // orchestrator publishes on each safety-envelope
+            // step.
+            self.announce_envelope_requested_subject().await;
             self.loaded = true;
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -1107,12 +1394,29 @@ impl PlaybackOptionsPlugin {
         // work.
         let carried_level = self.settings.startup_volume_percent;
 
-        // Step 2 — pre-mute. No-op until the subordinate-
-        // coordinated mute mechanism lands (delivery.alsa
-        // softvol mute stage + completion-ack subject the
-        // orchestrator awaits). The orchestrator's gating
-        // shape is in place so the next commit only wires the
-        // subordinate side.
+        // Step 2 — pre-mute. Publishes envelope_requested
+        // with state=Muted + a fresh generation, then awaits
+        // the playback warden's matching envelope_observed
+        // ack. The warden pauses the playback chain on
+        // receipt; we proceed only after the chain is
+        // observably muted (or the addressing doesn't
+        // resolve — no participating warden — in which case
+        // we run advisory-only). Timeout → rollback chain.
+        let pre_mute_generation = match self
+            .publish_envelope_requested(EnvelopeState::Muted)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
+                return self.rollback_or_fail(from, to, "pre_mute", e).await;
+            }
+        };
+        if let Err(e) = self
+            .await_envelope_ack(pre_mute_generation, EnvelopeState::Muted)
+            .await
+        {
+            return self.rollback_or_fail(from, to, "pre_mute", e).await;
+        }
 
         // Step 3 — set new authority. Persists the new
         // mixer_type via the same persist + subject-publish
@@ -1158,8 +1462,39 @@ impl PlaybackOptionsPlugin {
         }
         let effective_level = carried_level;
 
-        // Step 7 — unmute. No-op until the subordinate-
-        // coordinated unmute mechanism lands.
+        // Step 7 — unmute. Symmetric to step 2: publish
+        // envelope_requested with state=Unmuted, await the
+        // warden's matching ack. Failure here is a rollback
+        // even though the new authority has already been
+        // persisted — the operator-facing behaviour is the
+        // chain remains muted with the prior settings
+        // restored; the operator can re-attempt the gesture
+        // once the underlying cause clears.
+        let unmute_generation = match self
+            .publish_envelope_requested(EnvelopeState::Unmuted)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
+                return self
+                    .rollback_or_fail_restore(
+                        from,
+                        to,
+                        "unmute",
+                        e,
+                        prior_settings,
+                    )
+                    .await;
+            }
+        };
+        if let Err(e) = self
+            .await_envelope_ack(unmute_generation, EnvelopeState::Unmuted)
+            .await
+        {
+            return self
+                .rollback_or_fail_restore(from, to, "unmute", e, prior_settings)
+                .await;
+        }
 
         // Step 8 — emit applied.
         self.emit_lifecycle_applied(from, to, carried_level, effective_level)
@@ -1896,6 +2231,279 @@ mod tests {
         }
     }
 
+    // ----- SubjectAnnouncer stub: captures every announce
+    //       and update_state call so tests can assert what the
+    //       orchestrator (or any setter) published. -----
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)]
+    struct CapturedSubjectUpdate {
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    }
+
+    #[derive(Default)]
+    struct CapturingAnnouncer {
+        announces: Mutex<Vec<SubjectAnnouncement>>,
+        updates: Mutex<Vec<CapturedSubjectUpdate>>,
+    }
+
+    impl std::fmt::Debug for CapturingAnnouncer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CapturingAnnouncer").finish_non_exhaustive()
+        }
+    }
+
+    impl SubjectAnnouncer for CapturingAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            announcement: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.announces.lock().unwrap().push(announcement);
+                Ok(())
+            })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.updates
+                    .lock()
+                    .unwrap()
+                    .push(CapturedSubjectUpdate { addressing, state });
+                Ok(())
+            })
+        }
+    }
+
+    #[allow(dead_code)]
+    impl CapturingAnnouncer {
+        fn announces(&self) -> Vec<SubjectAnnouncement> {
+            self.announces.lock().unwrap().clone()
+        }
+        fn updates(&self) -> Vec<CapturedSubjectUpdate> {
+            self.updates.lock().unwrap().clone()
+        }
+    }
+
+    // ----- SubjectQuerier + SubjectStateSubscriber stubs:
+    //       enough infrastructure to exercise the
+    //       envelope-coordination publish + await loop
+    //       end-to-end at code level. -----
+
+    use evo_device_audio_shared::transition_envelope::{
+        EnvelopeObserved, ENVELOPE_OBSERVED_SUBJECT_TYPE,
+    };
+    use evo_plugin_sdk::contract::{SubjectStateStream, SubjectStateUpdate};
+    use std::collections::HashMap;
+
+    #[derive(Default, Clone)]
+    struct StubQuerier {
+        // addressing.value → canonical_id; addressing.scheme
+        // ignored for the test surface.
+        map: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl StubQuerier {
+        fn register(
+            &self,
+            addressing: &ExternalAddressing,
+            canonical_id: &str,
+        ) {
+            self.map
+                .lock()
+                .unwrap()
+                .insert(addressing.value.clone(), canonical_id.to_string());
+        }
+    }
+
+    impl std::fmt::Debug for StubQuerier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StubQuerier").finish_non_exhaustive()
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectQuerier for StubQuerier {
+        fn resolve_addressing<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<String>, ReportError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let map = Arc::clone(&self.map);
+            Box::pin(async move {
+                Ok(map.lock().unwrap().get(&addressing.value).cloned())
+            })
+        }
+
+        fn describe_alias<'a>(
+            &'a self,
+            _id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<evo_plugin_sdk::contract::AliasRecord>,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn describe_subject_with_aliases<'a>(
+            &'a self,
+            _id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            evo_plugin_sdk::SubjectQueryResult,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(
+                async move { Ok(evo_plugin_sdk::SubjectQueryResult::NotFound) },
+            )
+        }
+    }
+
+    /// Stub subject-state subscriber. Holds a
+    /// `tokio::sync::broadcast::Sender` per canonical id;
+    /// `subscribe_subject` returns a fresh receiver wrapped
+    /// in `SubjectStateStream`. `current_state` returns
+    /// whatever was last pushed to that id (None if
+    /// nothing).
+    #[derive(Default, Clone)]
+    struct StubStateSubscriber {
+        inner: Arc<Mutex<StubSubscriberInner>>,
+    }
+
+    #[derive(Default)]
+    struct StubSubscriberInner {
+        senders:
+            HashMap<String, tokio::sync::broadcast::Sender<SubjectStateUpdate>>,
+        latest: HashMap<String, serde_json::Value>,
+    }
+
+    impl StubStateSubscriber {
+        /// Publish a state update for the given canonical id.
+        /// Active receivers see it via their next `recv`;
+        /// future subscribers see it via `current_state`.
+        fn publish(&self, canonical_id: &str, state: serde_json::Value) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.latest.insert(canonical_id.to_string(), state.clone());
+            let sender = inner
+                .senders
+                .entry(canonical_id.to_string())
+                .or_insert_with(|| {
+                    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+                    tx
+                });
+            let _ = sender.send(SubjectStateUpdate {
+                canonical_id: canonical_id.to_string(),
+                subject_type: ENVELOPE_OBSERVED_SUBJECT_TYPE.to_string(),
+                state: Some(state),
+                modified_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+        }
+    }
+
+    impl std::fmt::Debug for StubStateSubscriber {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StubStateSubscriber")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectStateSubscriber for StubStateSubscriber {
+        fn subscribe_subject<'a>(
+            &'a self,
+            canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<SubjectStateStream, ReportError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let mut guard = inner.lock().unwrap();
+                let sender = guard
+                    .senders
+                    .entry(canonical_id.clone())
+                    .or_insert_with(|| {
+                        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+                        tx
+                    });
+                let receiver = sender.subscribe();
+                Ok(SubjectStateStream::new(receiver, canonical_id))
+            })
+        }
+
+        fn current_state<'a>(
+            &'a self,
+            canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<serde_json::Value>, ReportError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                Ok(inner.lock().unwrap().latest.get(&canonical_id).cloned())
+            })
+        }
+    }
+
     // ----- helpers -----
 
     async fn loaded_plugin() -> (PlaybackOptionsPlugin, tempfile::TempDir) {
@@ -1903,6 +2511,7 @@ mod tests {
         let state_path = dir.path().join(STATE_FILENAME);
         let mut p = PlaybackOptionsPlugin::new().with_state_path(state_path);
         p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        p.subject_announcer = Some(Arc::new(CapturingAnnouncer::default()));
         p.loaded = true;
         (p, dir)
     }
@@ -2488,6 +3097,234 @@ mod tests {
 
     // ----- mixer-transition contract tests (T3 / T5 / T6) -----
 
+    // ----- envelope-coordination tests -----
+
+    /// Build a plugin instance wired up for envelope-flow
+    /// tests: capturing announcer + stub querier + stub
+    /// state subscriber, the envelope_observed addressing
+    /// pre-resolved to `OBSERVED_CID`. Tests can use
+    /// `subscriber.publish(OBSERVED_CID, ...)` to simulate
+    /// the warden's ack.
+    async fn envelope_wired_plugin() -> (
+        PlaybackOptionsPlugin,
+        Arc<CapturingAnnouncer>,
+        StubStateSubscriber,
+        StubQuerier,
+        tempfile::TempDir,
+    ) {
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join(STATE_FILENAME);
+        let announcer = Arc::new(CapturingAnnouncer::default());
+        let subscriber = StubStateSubscriber::default();
+        let querier = StubQuerier::default();
+        querier.register(
+            &ExternalAddressing {
+                scheme: ENVELOPE_SCHEME.to_string(),
+                value: ENVELOPE_OBSERVED_VALUE.to_string(),
+            },
+            OBSERVED_CID,
+        );
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(state_path)
+            .with_envelope_ack_timeout_override(Duration::from_millis(200));
+        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        p.subject_announcer =
+            Some(Arc::clone(&announcer) as Arc<dyn SubjectAnnouncer>);
+        p.subject_state_subscriber = Some(
+            Arc::new(subscriber.clone()) as Arc<dyn SubjectStateSubscriber>
+        );
+        p.subject_querier =
+            Some(Arc::new(querier.clone()) as Arc<dyn SubjectQuerier>);
+        p.loaded = true;
+        (p, announcer, subscriber, querier, dir)
+    }
+
+    fn envelope_observed_state(
+        generation: u64,
+        state: EnvelopeState,
+    ) -> serde_json::Value {
+        serde_json::to_value(EnvelopeObserved {
+            v: ENVELOPE_PAYLOAD_VERSION,
+            generation,
+            observed_state: state,
+            observed_at_ms: 0,
+        })
+        .unwrap()
+    }
+
+    fn envelope_requested_publishes(
+        announcer: &CapturingAnnouncer,
+    ) -> Vec<EnvelopeRequested> {
+        announcer
+            .updates()
+            .into_iter()
+            .filter(|u| {
+                u.addressing.scheme == ENVELOPE_SCHEME
+                    && u.addressing.value == ENVELOPE_REQUESTED_VALUE
+            })
+            .filter_map(|u| {
+                serde_json::from_value::<EnvelopeRequested>(u.state).ok()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn env_publishes_muted_then_unmuted_in_order_with_warden_ack() {
+        // Full happy-path E2E: orchestrator publishes
+        // envelope_requested=Muted, warden (stub) acks with
+        // a matching envelope_observed=Muted; orchestrator
+        // advances; persists new mixer_type; publishes
+        // envelope_requested=Unmuted; warden acks; gesture
+        // completes Applied. The captured envelope_requested
+        // stream MUST be [muted, unmuted] in that order with
+        // monotonic generations.
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let (mut p, announcer, subscriber, _querier, _dir) =
+            envelope_wired_plugin().await;
+
+        // Run the gesture; spawn a parallel acker that
+        // observes each muted publish and feeds back the
+        // matching observed.
+        let subscriber_clone = subscriber.clone();
+        let announcer_clone = Arc::clone(&announcer);
+        let ack_task = tokio::spawn(async move {
+            // Poll the announcer for envelope_requested
+            // publishes and feed back acks. Bounded by the
+            // overall timeout via the orchestrator's await.
+            let mut acked_gens = std::collections::HashSet::new();
+            for _ in 0..200 {
+                let requests = envelope_requested_publishes(&announcer_clone);
+                for req in &requests {
+                    if !acked_gens.contains(&req.generation) {
+                        subscriber_clone.publish(
+                            OBSERVED_CID,
+                            envelope_observed_state(
+                                req.generation,
+                                req.requested_state,
+                            ),
+                        );
+                        acked_gens.insert(req.generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let resp = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect("set_mixer_type ok");
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["status"], "ok");
+
+        ack_task.abort();
+
+        let requests = envelope_requested_publishes(&announcer);
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly two envelope_requested publishes per transition: muted + unmuted; got {requests:?}"
+        );
+        assert_eq!(requests[0].requested_state, EnvelopeState::Muted);
+        assert_eq!(requests[1].requested_state, EnvelopeState::Unmuted);
+        assert!(
+            requests[1].generation > requests[0].generation,
+            "generation monotonic across envelope publishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_no_ack_routes_to_rollback() {
+        // I5 (rollback-safe) at the envelope layer: when the
+        // warden never publishes envelope_observed, the
+        // orchestrator's await times out at the configured
+        // timeout (200ms in this test); the orchestrator
+        // emits rolled_back (no failed); the gesture returns
+        // Err(Permanent) naming the at_phase + reason. The
+        // chain is back at the prior valid state.
+        let (mut p, announcer, _subscriber, _querier, _dir) =
+            envelope_wired_plugin().await;
+
+        let err = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect_err("timeout must route to rollback");
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("rolled back"),
+                    "rollback path engaged: {msg}"
+                );
+                assert!(
+                    msg.contains("pre_mute"),
+                    "rollback identifies the failed phase: {msg}"
+                );
+                assert!(
+                    msg.contains("envelope ack timeout"),
+                    "rollback names the timeout cause: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        // Only the muted publish was attempted; no unmute
+        // because the pre-mute step never completed.
+        let requests = envelope_requested_publishes(&announcer);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requested_state, EnvelopeState::Muted);
+    }
+
+    #[tokio::test]
+    async fn env_advisory_mode_when_no_observed_subject_announced() {
+        // When envelope_observed addressing doesn't resolve
+        // (no warden participating), the orchestrator's await
+        // returns Ok immediately + the transition proceeds.
+        // This is NOT silent failure — it's conditional
+        // behavior based on observable subject-registry state
+        // (a debug log surfaces the advisory-mode entry). We
+        // exercise it by using a querier whose envelope_observed
+        // addressing is NOT registered.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join(STATE_FILENAME);
+        let announcer = Arc::new(CapturingAnnouncer::default());
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(state_path)
+            .with_envelope_ack_timeout_override(Duration::from_millis(200));
+        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        p.subject_announcer =
+            Some(Arc::clone(&announcer) as Arc<dyn SubjectAnnouncer>);
+        // Querier that resolves nothing (no envelope_observed
+        // addressing registered → no warden).
+        p.subject_querier =
+            Some(Arc::new(StubQuerier::default()) as Arc<dyn SubjectQuerier>);
+        // Subscriber present but unused — querier returns None
+        // before subscribe is called.
+        p.subject_state_subscriber =
+            Some(Arc::new(StubStateSubscriber::default())
+                as Arc<dyn SubjectStateSubscriber>);
+        p.loaded = true;
+
+        let resp = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect("advisory-mode transition completes");
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["status"], "ok");
+        // Both publishes still happen — the advisory-mode
+        // path skips only the AWAIT side, not the PUBLISH.
+        let requests = envelope_requested_publishes(&announcer);
+        assert_eq!(requests.len(), 2);
+    }
+
     #[tokio::test]
     async fn t3_set_mixer_type_hardware_refuses_when_coordinates_missing() {
         // Contract acceptance criterion
@@ -2598,6 +3435,7 @@ mod tests {
             let mut p = PlaybackOptionsPlugin::new()
                 .with_state_path(state_path.clone());
             p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+            p.subject_announcer = Some(Arc::new(CapturingAnnouncer::default()));
             p.loaded = true;
             // Set the coordinates first (contract:
             // hardware-mode requires them), then switch.
@@ -2666,6 +3504,7 @@ mod tests {
             let mut p = PlaybackOptionsPlugin::new()
                 .with_state_path(state_path.clone());
             p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+            p.subject_announcer = Some(Arc::new(CapturingAnnouncer::default()));
             p.loaded = true;
             p.handle_request(&req(
                 "options.set_mixer_device",

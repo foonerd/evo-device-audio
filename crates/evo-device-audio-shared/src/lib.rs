@@ -17,6 +17,7 @@ use lofty::read_from_path;
 use lofty::tag::Accessor;
 
 pub mod audio_ui_pack;
+pub mod transition_envelope;
 
 /// MPD warden: missing artist in `mpd-album` is encoded as this literal.
 pub const UNKNOWN_ARTIST: &str = "unknown";

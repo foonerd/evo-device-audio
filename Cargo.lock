@@ -1321,6 +1321,8 @@ version = "0.1.0"
 dependencies = [
  "evo-plugin-sdk",
  "lofty",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -3321,6 +3323,7 @@ name = "org-evoframework-playback-options"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "evo-device-audio-shared",
  "evo-plugin-sdk",
  "semver",
  "serde",
