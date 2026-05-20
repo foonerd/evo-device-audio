@@ -530,6 +530,14 @@ impl AlsaDeliveryPlugin {
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
         let task = tokio::spawn(async move {
+            // Track the last observed mixer_type so a transition
+            // between Hardware / Software / None can be detected
+            // and signalled via the audio.mixer.transition_applied
+            // happening. Outer Option = "no observation yet";
+            // inner Option mirrors OptionsSettings.mixer_type
+            // (None means "operator has not chosen").
+            let mut last_mixer_type: Option<Option<options_render::MixerType>> =
+                None;
             loop {
                 tokio::select! {
                     _ = task_shutdown.notified() => {
@@ -661,6 +669,68 @@ impl AlsaDeliveryPlugin {
                                         "emit delivery.options_rendered failed"
                                     );
                                 }
+
+                                // Mixer-transition contract: when
+                                // the new state's mixer_type
+                                // differs from the previously-
+                                // observed value AND the drop-in
+                                // write succeeded (the rendered
+                                // pipeline is now on disk),
+                                // emit a dedicated
+                                // `audio.mixer.transition_applied`
+                                // happening. Downstream consumers
+                                // (the playback warden's mixer-
+                                // bind path, UI affordances)
+                                // serialise their re-bind work
+                                // against this signal so they do
+                                // not race delivery.alsa's
+                                // drop-in write.
+                                let transition_fired =
+                                    matches!(&last_mixer_type, Some(prev) if *prev != settings.mixer_type)
+                                        && write_outcome.is_ok();
+                                if transition_fired {
+                                    let from_label = last_mixer_type
+                                        .as_ref()
+                                        .and_then(|m| m.as_ref())
+                                        .map(mixer_type_wire_label)
+                                        .unwrap_or("unset");
+                                    let to_label = settings
+                                        .mixer_type
+                                        .as_ref()
+                                        .map(mixer_type_wire_label)
+                                        .unwrap_or("unset");
+                                    let transition_payload = serde_json::json!({
+                                        "subject_canonical_id":
+                                            state_update.canonical_id,
+                                        "observed_at_ms": observed_at_ms,
+                                        "drop_in_path":
+                                            drop_in_path.display().to_string(),
+                                        "from": from_label,
+                                        "to": to_label,
+                                    });
+                                    if let Err(e) = happening_emitter
+                                        .emit_plugin_event(
+                                            "audio.mixer.transition_applied"
+                                                .to_string(),
+                                            transition_payload,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            plugin = PLUGIN_NAME,
+                                            error = %e,
+                                            "emit audio.mixer.transition_applied failed"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            plugin = PLUGIN_NAME,
+                                            from = from_label,
+                                            to = to_label,
+                                            "audio mixer-mode transition applied"
+                                        );
+                                    }
+                                }
+                                last_mixer_type = Some(settings.mixer_type);
                             }
                             Err(SubjectStateStreamError::Lagged {
                                 dropped,
@@ -835,6 +905,18 @@ impl AlsaDeliveryPlugin {
             handle.shutdown.notify_one();
             let _ = handle.task.await;
         }
+    }
+}
+
+/// Stable wire label for a [`options_render::MixerType`]. Used in
+/// the `audio.mixer.transition_applied` happening payload's
+/// `from` / `to` fields so consumers can switch on a string
+/// without re-deriving the enum from JSON.
+fn mixer_type_wire_label(mt: &options_render::MixerType) -> &'static str {
+    match mt {
+        options_render::MixerType::Hardware => "hardware",
+        options_render::MixerType::Software => "software",
+        options_render::MixerType::None => "none",
     }
 }
 
@@ -1982,6 +2064,22 @@ pcm.evo {
         assert_eq!(parsed, ActiveDacConfig::default());
         assert!(parsed.overlay.is_empty());
         assert!(parsed.alsacard_hint.is_none());
+    }
+
+    #[test]
+    fn mixer_type_wire_label_round_trip() {
+        assert_eq!(
+            mixer_type_wire_label(&options_render::MixerType::Hardware),
+            "hardware"
+        );
+        assert_eq!(
+            mixer_type_wire_label(&options_render::MixerType::Software),
+            "software"
+        );
+        assert_eq!(
+            mixer_type_wire_label(&options_render::MixerType::None),
+            "none"
+        );
     }
 
     #[test]
