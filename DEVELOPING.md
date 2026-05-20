@@ -704,7 +704,7 @@ Once `evo-plugin-tool validate-shelf-schema` ships in a framework release, the a
 
 ## Cross-compiling for the target hardware
 
-reference target (`aarch64-unknown-linux-gnu`) and other non-host targets cross-compile via the [`cross`](https://github.com/cross-rs/cross) crate, configured by the workspace's `Cross.toml`. During active development the workspace pins `evo-plugin-sdk` via a path dep on the sibling `evo-core-eng` clone; cross-rs auto-mounts each path-dep crate directory but does not mount the path-dep's workspace root, so cargo's `edition.workspace = true` inheritance walk fails. The workaround is the `scripts/cross-build.sh` wrapper, which sets `CROSS_CONTAINER_OPTS` to mount the eng-line workspace root explicitly:
+reference target (`aarch64-unknown-linux-gnu`) and other non-host targets cross-compile via the [`cross`](https://github.com/cross-rs/cross) crate, configured by the workspace's `Cross.toml`. During pre-release development the workspace pins `evo-plugin-sdk` via a path dep on a sibling framework clone; cross-rs auto-mounts each path-dep crate directory but does not mount the path-dep's workspace root, so cargo's `edition.workspace = true` inheritance walk fails. The workaround is the `scripts/cross-build.sh` wrapper, which sets `CROSS_CONTAINER_OPTS` to mount the framework workspace root explicitly:
 
 ```sh
 scripts/cross-build.sh aarch64-unknown-linux-gnu \

@@ -81,10 +81,10 @@ EVO_PLUGIN_SIGNING_KEY="${EVO_PLUGIN_SIGNING_KEY:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Sibling clone of `evo-core-eng` hosts the `evo-plugin-tool`
+# Sibling framework workspace clone hosts the `evo-plugin-tool`
 # crate. The signing step shells into it via `--manifest-path`.
 ENG_ROOT="$(cd "${REPO_ROOT}/../evo-core-eng" 2>/dev/null && pwd)" || {
-    echo "WARN: sibling evo-core-eng clone not found at ${REPO_ROOT}/../evo-core-eng" >&2
+    echo "WARN: sibling framework workspace clone not found at ${REPO_ROOT}/../evo-core-eng" >&2
     ENG_ROOT=""
 }
 
@@ -183,12 +183,12 @@ if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
         exit 1
     fi
     if [[ -z "${ENG_ROOT}" ]]; then
-        echo "FAIL: cannot sign bundles — sibling evo-core-eng clone missing" >&2
+        echo "FAIL: cannot sign bundles — sibling framework workspace clone missing" >&2
         echo "      expected at ${REPO_ROOT}/../evo-core-eng" >&2
         exit 1
     fi
     echo "  ok (signing key: ${EVO_PLUGIN_SIGNING_KEY})"
-    echo "  ok (evo-plugin-tool source: ${ENG_ROOT})"
+    echo "  ok (framework tool source: ${ENG_ROOT})"
 fi
 
 if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" "

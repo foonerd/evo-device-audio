@@ -2,44 +2,36 @@
 # evo-device-audio.
 #
 # This file shapes how `cross build` runs: per-target image
-# overrides and pre-build scripts. The volume mount needed
-# for the v0.1.13 path-dep on evo-core-eng (see explanation
-# below) is supplied via the CROSS_CONTAINER_OPTS environment
-# variable rather than this file's `volumes` field — see
-# scripts/cross-build.sh and DEVELOPING.md for the canonical
+# overrides and pre-build scripts. During pre-release development
+# the workspace's `evo-plugin-sdk` pin resolves through a sibling
+# path-dep on the framework's working tree; the volume mount
+# needed to expose that workspace root inside the container is
+# supplied via the `CROSS_CONTAINER_OPTS` environment variable
+# rather than this file's `volumes` field — see
+# `scripts/cross-build.sh` and `DEVELOPING.md` for the canonical
 # invocation.
 #
-# v0.1.13 development branch state — two reasons we need
-# Cross.toml content beyond a placeholder:
+# Two reasons this config exists beyond a placeholder:
 #
-# 1. evo-plugin-sdk path-dep visibility.
-#    [workspace.dependencies] in this repo's Cargo.toml pins
-#    evo-plugin-sdk via
-#    `path = "../evo-core-eng/crates/evo-plugin-sdk"` against
-#    the sibling local clone of evo-core-eng for the
-#    duration of v0.1.13 development (substrate-current SDK
-#    types — AudioRouting, CompositionCapabilities at
-#    shape 2 — ship only on evo-core-eng's eng-line). cross
-#    auto-discovers path-dep crate directories and mounts
-#    each leaf into the container at the host-canonical path,
-#    but it does NOT mount the path-dep's workspace root.
-#    evo-plugin-sdk uses `edition.workspace = true` so cargo
-#    must walk up from
-#    `<host>/evo-core-eng/crates/evo-plugin-sdk/Cargo.toml`
-#    to `<host>/evo-core-eng/Cargo.toml` to resolve the
-#    inheritance. The CROSS_CONTAINER_OPTS env-var
-#    workaround mounts the workspace root explicitly. At
-#    v0.1.13 release-cut the SDK pin flips back to git+tag
-#    and the volume mount can be removed.
+# 1. Path-dep workspace-root visibility. `cross` auto-discovers
+#    path-dep crate directories and mounts each leaf into the
+#    container at the host-canonical path, but it does NOT mount
+#    the path-dep's workspace root. The SDK pin uses
+#    `edition.workspace = true`, so cargo must walk up from the
+#    SDK crate to its workspace root to resolve the inheritance.
+#    The `CROSS_CONTAINER_OPTS` workaround mounts that workspace
+#    root explicitly. At release cut the SDK pin flips back to a
+#    `git = ..., tag = ...` form against the published framework
+#    release and this workaround is no longer needed.
 #
-# 2. libasound2 cross-target dependency.
-#    The composition.alsa plugin's optional `alsa-substrate`
-#    Cargo feature pulls in the `alsa` crate (libasound
-#    bindings). Cross-builds for aarch64-unknown-linux-gnu
-#    therefore need libasound2-dev for the arm64 architecture
-#    inside the container. The pre-build script installs it
-#    on every fresh container start. Other targets that do
-#    not enable `alsa-substrate` are unaffected.
+# 2. libasound2 cross-target dependency. The composition.alsa
+#    plugin's optional `alsa-substrate` Cargo feature pulls in
+#    the `alsa` crate (libasound bindings). Cross-builds for
+#    aarch64-unknown-linux-gnu therefore need libasound2-dev
+#    for the arm64 architecture inside the container. The
+#    pre-build script installs it on every fresh container
+#    start. Other targets that do not enable `alsa-substrate`
+#    are unaffected.
 
 [build.env]
 volumes = ["EVO_CORE_ENG"]
