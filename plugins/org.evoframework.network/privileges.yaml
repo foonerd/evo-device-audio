@@ -1,22 +1,25 @@
 schema_version: "1.0"
 plugin: org.evoframework.network
 owner: evo-device-audio
-isolation: in_process
+isolation: oop
 
-# In-process plugin loaded into the steward identity per
-# manifest.toml (transport = "in-process"). Privileges declared here
-# union into the steward record at admission. The reference
-# distribution provisions a narrow NOPASSWD sudoers drop-in for
-# `nmcli` so the service identity can issue NetworkManager
-# operations without escalation prompts; the framework's Privilege
-# Preflight Admission Gate (PPAG) probes the drop-in at admission
-# time, stamps the resolution on `LoadContext::capabilities`, and
-# the plugin's dispatcher composite reads that resolution to pick
-# its invocation strategy (direct under root, sudo -n under a
-# non-root service user). The plugin must remain non-panic under
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.network/`. The steward
+# spawns the wire binary as a subprocess and wires the SDK
+# contract over a Unix domain socket. The reference
+# distribution provisions narrow NOPASSWD sudoers drop-ins
+# for `nmcli` (plus `iw` and `rfkill` for radio operations)
+# so the service identity can issue NetworkManager
+# operations without escalation prompts; the framework's
+# Privilege Preflight Admission Gate (PPAG) probes the
+# drop-ins at admission time, stamps the resolution on
+# `LoadContext::capabilities`, and the plugin's dispatcher
+# composite reads that resolution to pick its invocation
+# strategy (direct under root, sudo -n under a non-root
+# service user). The plugin must remain non-panic under
 # hardware/BIOS radio lock, software rfkill, and partial
-# NetworkManager degradation — failures are reported as structured
-# events, never as panics.
+# NetworkManager degradation — failures are reported as
+# structured events, never as panics.
 
 capability_intent:
   - id: nmcli_invocation

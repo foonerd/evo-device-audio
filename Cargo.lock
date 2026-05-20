@@ -1314,7 +1314,6 @@ dependencies = [
  "org-evoframework-delivery-alsa",
  "org-evoframework-metadata-local",
  "org-evoframework-multiroom-evo-native",
- "org-evoframework-network",
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
  "tokio",

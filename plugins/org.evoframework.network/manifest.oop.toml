@@ -49,5 +49,10 @@ request_types = [
     "network.nm.security.harden",
     "network.nm.flight_mode.get",
     "network.nm.flight_mode.set",
+    "network.nm.radio.status",
+    "network.nm.radio.set",
+    "network.nm.supervisor.status",
+    "network.nm.wifi_devices",
+    "network.refresh_connectivity",
 ]
 response_budget_ms = 15000
