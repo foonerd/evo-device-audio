@@ -1,0 +1,72 @@
+# Out-of-process bundle manifest for org.evoframework.metadata.local.
+#
+# This is the production-shaped variant. The publish-plugin-bundles
+# workflow stages a per-target bundle directory containing this file
+# (renamed to `manifest.toml`) plus the cross-compiled
+# `metadata-local-wire` binary as `plugin.bin`, signs with the
+# commons signing key, packs as `.tar.gz`, and pushes to
+# `foonerd/evo-device-audio-artefacts` under
+# `bundles/org.evoframework.metadata.local/<target>/`.
+#
+# The companion in-process variant (`manifest.toml` in this same
+# directory) is what in-process distributions consume. Both
+# manifests describe the same plugin at the same version; only the
+# transport differs. A `describe_matches_oop_manifest` test in
+# `src/lib.rs` guards against drift between this file and the
+# plugin's runtime `describe()` output.
+#
+# See:
+# - evo-core docs/engineering/PLUGIN_PACKAGING.md (bundle layout)
+# - evo-core docs/engineering/RELEASE_PLANE.md  (plugin-bundle kind)
+
+[plugin]
+name = "org.evoframework.metadata.local"
+# Keep in sync with this crate's Cargo.toml [package].version and
+# manifest.toml [plugin].version. All three update together.
+version = "0.1.1"
+contract = 1
+
+[target]
+shelf = "metadata.providers"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+# The OOP path (this manifest variant) needs the SDK's `run_oop`
+# helper, which lands in evo-core 0.1.10. Pinning at the first
+# 0.1.10 release candidate keeps the constraint honest and admits
+# cleanly on any rc.* build from rc.1 onwards as well as the
+# eventual 0.1.10 final and later — semver pre-release ordering
+# treats `0.1.10-rc.1 <= 0.1.10-rc.N <= 0.1.10`.
+evo_min_version = "0.1.10-rc.1"
+os_family = "linux"
+outbound_network = false
+# Optional in org.evoframework.metadata.local.toml: [library] roots
+# (MPD file paths, same as artwork); [metadata] profile =
+# "standard" | "extended" (default standard) — see plugin
+# docs/METADATA_QUERY_V1.md.
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["metadata.query"]
+response_budget_ms = 10000

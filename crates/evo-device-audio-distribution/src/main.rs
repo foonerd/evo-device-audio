@@ -122,7 +122,6 @@ use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 use evo_plugin_sdk::Manifest;
 use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
-use org_evoframework_metadata_local::MetadataLocalPlugin;
 use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 use org_evoframework_playback_options::PlaybackOptionsPlugin;
@@ -413,23 +412,18 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting multiroom.evo-native")?;
 
-            // 7. metadata.local: singleton respondent on the
-            //    audio.metadata.providers shelf. Tag-based
-            //    metadata over local-file libraries; sync I/O
-            //    (lofty + std::fs) runs on the blocking thread
-            //    pool so the steward's shared async runtime is
-            //    not stalled by library-scan latency.
-            let metadata_local_manifest = Manifest::from_toml(
-                org_evoframework_metadata_local::MANIFEST_TOML,
-            )
-            .context("parsing metadata.local manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    MetadataLocalPlugin::new(),
-                    metadata_local_manifest,
-                )
-                .await
-                .context("admitting metadata.local")?;
+            // 7. metadata.local moved to out-of-process shipping
+            //    form. The plugin is no longer admitted via
+            //    Phase 1 compile-link; the
+            //    `dist/scripts/deploy-distribution.sh` flow
+            //    cross-builds its wire binary
+            //    (`metadata-local-wire`), stages + signs a
+            //    bundle from
+            //    `plugins/org.evoframework.metadata.local/manifest.oop.toml`,
+            //    and installs it at
+            //    `/opt/evo/plugins/org.evoframework.metadata.local/`.
+            //    Phase 2 discovery (below) admits it from the
+            //    filesystem search root.
 
             // 8. artwork.local moved to out-of-process shipping
             //    form. The plugin is no longer admitted via

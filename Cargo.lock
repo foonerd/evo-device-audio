@@ -1312,7 +1312,6 @@ dependencies = [
  "evo-primitives",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
- "org-evoframework-metadata-local",
  "org-evoframework-multiroom-evo-native",
  "org-evoframework-playback-mpd",
  "org-evoframework-playback-options",
@@ -3218,6 +3217,7 @@ dependencies = [
 name = "org-evoframework-metadata-local"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "evo-device-audio-shared",
  "evo-plugin-sdk",
  "lofty",
@@ -3229,6 +3229,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
