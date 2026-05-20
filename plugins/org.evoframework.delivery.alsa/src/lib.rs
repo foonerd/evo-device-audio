@@ -92,7 +92,7 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 /// Embedded manifest source.
@@ -186,6 +186,25 @@ pub struct AlsaDeliveryPlugin {
     /// settings changes is the next chunk; this commit lands
     /// the observer wiring per audit Finding F5.
     options_observer: Option<OptionsObserverHandle>,
+    /// Hardware-audio active-config observer task handle. `Some`
+    /// after a successful `Plugin::load` when LoadContext supplied
+    /// the subject_state_subscriber + the
+    /// `evo.hardware.audio:active_config` subject was resolvable;
+    /// `None` otherwise. The task drains state updates from the
+    /// hardware.audio-config plugin and caches the resolved
+    /// active-DAC snapshot in [`active_dac_config`] so the
+    /// `delivery.active_endpoint` verb surfaces a unified
+    /// "what is currently bound" snapshot to the operator UI
+    /// without parsing `aplay -L` output.
+    hardware_audio_observer: Option<HardwareAudioObserverHandle>,
+    /// Cached hardware-audio active configuration snapshot. `None`
+    /// before the first observer update; `Some(...)` once the
+    /// observer has seen at least one state from the
+    /// hardware-audio-config plugin. Read by the
+    /// `delivery.active_endpoint` verb to surface the resolved
+    /// alsacard / mixer hint downstream consumers can bind
+    /// against.
+    active_dac_config: Arc<RwLock<Option<ActiveDacConfig>>>,
 }
 
 /// Handle on the route-change reactor task spawned at load.
@@ -210,6 +229,49 @@ struct OptionsObserverHandle {
     shutdown: Arc<Notify>,
 }
 
+/// Handle on the hardware-audio active-config observer task
+/// spawned at load.
+struct HardwareAudioObserverHandle {
+    task: JoinHandle<()>,
+    shutdown: Arc<Notify>,
+}
+
+/// Cached snapshot of the hardware.audio-config plugin's
+/// `evo.hardware.audio:active_config` subject, populated by the
+/// observer task on every state update. Operator-facing wire-op
+/// `delivery.active_endpoint` returns this verbatim under the
+/// `active_dac_config` field so the UI can render
+/// "currently playing through: <name> via pcm.evo" without
+/// parsing `aplay -L` output.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActiveDacConfig {
+    /// Raw `dtoverlay=` token currently active in the managed
+    /// block (empty when no managed block is present).
+    #[serde(default)]
+    pub overlay: String,
+    /// Catalogue id whose `overlay` field matches the active
+    /// overlay, or None if no catalogue entry matches.
+    #[serde(default)]
+    pub catalogue_id: Option<String>,
+    /// ALSA card short id hint (e.g. `sndrpihifiberry`, `BossDAC`,
+    /// `DAC`). The downstream pcm.evo binding uses this hint to
+    /// resolve the real `hw:` card index without re-running
+    /// `aplay -L`. None means the operator's selected DAC has no
+    /// catalogue mixer hint (no in-DAC mixer; software-volume
+    /// path is the only sensible option).
+    #[serde(default)]
+    pub alsacard_hint: Option<String>,
+    /// In-DAC mixer-control hint (e.g. `Digital`, `Master`). None
+    /// means no in-DAC mixer; the operator's mixer_type setting
+    /// then constrains the chain (`software` or `none`).
+    #[serde(default)]
+    pub mixer_hint: Option<String>,
+    /// Boot-config path the active overlay was read from. Empty
+    /// on board classes without a boot-config path.
+    #[serde(default)]
+    pub boot_config_path: String,
+}
+
 impl AlsaDeliveryPlugin {
     /// Construct a fresh plugin instance.
     pub fn new() -> Self {
@@ -223,6 +285,8 @@ impl AlsaDeliveryPlugin {
             requests_handled: 0,
             reactor: None,
             options_observer: None,
+            hardware_audio_observer: None,
+            active_dac_config: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -633,6 +697,175 @@ impl AlsaDeliveryPlugin {
             let _ = handle.task.await;
         }
     }
+
+    /// Subscribe to the hardware.audio-config plugin's
+    /// `evo.hardware.audio:active_config` subject and cache the
+    /// most-recently-observed snapshot in
+    /// [`active_dac_config`]. Best-effort: if the subscriber /
+    /// querier are unavailable, if the subject has not yet been
+    /// announced, or if subscribe fails, the observer is simply
+    /// not wired this load cycle. The `delivery.active_endpoint`
+    /// verb continues to return its baseline payload without the
+    /// `active_dac_config` field populated.
+    async fn spawn_hardware_audio_observer(&mut self, ctx: &LoadContext) {
+        let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_state_subscriber not populated; skipping \
+                 hardware-audio observer"
+            );
+            return;
+        };
+        let Some(querier) = ctx.subject_querier.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_querier not populated; skipping hardware-audio \
+                 observer"
+            );
+            return;
+        };
+        let cache = Arc::clone(&self.active_dac_config);
+        let addressing = ExternalAddressing {
+            scheme: "evo.hardware.audio".to_string(),
+            value: "active_config".to_string(),
+        };
+        let canonical_id =
+            match querier.resolve_addressing(addressing.clone()).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "hardware-audio active_config subject not yet \
+                         announced; observer not wired this cycle"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "resolve_addressing for hardware-audio active_config \
+                         failed"
+                    );
+                    return;
+                }
+            };
+        let mut stream =
+            match subscriber.subscribe_subject(canonical_id.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "subscribe to hardware-audio active_config subject \
+                         failed"
+                    );
+                    return;
+                }
+            };
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "hardware-audio observer: shutdown received"
+                        );
+                        return;
+                    }
+                    update = stream.recv() => {
+                        match update {
+                            Ok(state_update) => {
+                                let active = extract_active_dac_config(
+                                    state_update.state.as_ref(),
+                                );
+                                {
+                                    let mut guard = cache.write().await;
+                                    *guard = Some(active.clone());
+                                }
+                                tracing::info!(
+                                    plugin = PLUGIN_NAME,
+                                    overlay = %active.overlay,
+                                    catalogue_id = %active
+                                        .catalogue_id
+                                        .as_deref()
+                                        .unwrap_or("<unmatched>"),
+                                    alsacard_hint = %active
+                                        .alsacard_hint
+                                        .as_deref()
+                                        .unwrap_or("<none>"),
+                                    "hardware-audio active_config cached"
+                                );
+                            }
+                            Err(SubjectStateStreamError::Lagged {
+                                dropped,
+                            }) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    dropped = dropped,
+                                    "hardware-audio observer stream lagged"
+                                );
+                            }
+                            Err(SubjectStateStreamError::Closed) => {
+                                tracing::debug!(
+                                    plugin = PLUGIN_NAME,
+                                    "hardware-audio observer stream closed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        self.hardware_audio_observer =
+            Some(HardwareAudioObserverHandle { task, shutdown });
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            canonical_id = %canonical_id,
+            "hardware-audio active_config observer task spawned"
+        );
+    }
+
+    async fn stop_hardware_audio_observer(&mut self) {
+        if let Some(handle) = self.hardware_audio_observer.take() {
+            handle.shutdown.notify_one();
+            let _ = handle.task.await;
+        }
+    }
+}
+
+/// Pull an [`ActiveDacConfig`] out of the published-state JSON the
+/// hardware.audio-config plugin emits. The wire shape carries the
+/// active config nested under `active`:
+///
+/// ```json
+/// {
+///   "v": 1,
+///   "active": {
+///     "overlay": "hifiberry-dacplus",
+///     "catalogue_id": "hifiberry-dacplus",
+///     "alsacard_hint": "sndrpihifiberry",
+///     "mixer_hint": "Digital",
+///     "boot_config_path": "/boot/firmware/config.txt"
+///   }
+/// }
+/// ```
+///
+/// Missing fields default to the empty / None variant via
+/// [`ActiveDacConfig`]'s serde defaults. Returns the default
+/// (`overlay = ""`) when `state` is None / not an object.
+fn extract_active_dac_config(
+    state: Option<&serde_json::Value>,
+) -> ActiveDacConfig {
+    let Some(state) = state else {
+        return ActiveDacConfig::default();
+    };
+    let active = state.get("active").unwrap_or(state);
+    serde_json::from_value(active.clone()).unwrap_or_default()
 }
 
 /// One-shot endpoint fetch over the AudioRouting handle.
@@ -771,10 +1004,24 @@ impl Plugin for AlsaDeliveryPlugin {
             // next chunk; this wiring is the audit-required
             // consumer path for `audio.options.changed`.
             self.spawn_options_observer(ctx).await;
+            // Spawn the hardware.audio-config plugin's
+            // active_config-subject observer. Caches the
+            // resolved active-DAC snapshot (overlay token,
+            // catalogue id, alsacard / mixer hints) so the
+            // delivery.active_endpoint verb surfaces a unified
+            // "what is bound" answer to the operator UI without
+            // re-parsing aplay -L output. Best-effort: if the
+            // hardware.audio-config plugin has not yet admitted /
+            // announced its subject on this load cycle, the
+            // observer is not wired and the cache stays None;
+            // the verb continues to respond with the baseline
+            // payload.
+            self.spawn_hardware_audio_observer(ctx).await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "plugin loaded; modular ALSA delivery surface ready; \
-                 route-change reactor + options-subject observer running"
+                 route-change reactor + options-subject observer + \
+                 hardware-audio active_config observer running"
             );
             Ok(())
         }
@@ -791,6 +1038,7 @@ impl Plugin for AlsaDeliveryPlugin {
             );
             self.stop_reactor().await;
             self.stop_options_observer().await;
+            self.stop_hardware_audio_observer().await;
             self.audio_routing = None;
             self.loaded = false;
             Ok(())
@@ -949,11 +1197,13 @@ impl AlsaDeliveryPlugin {
             },
             None => None,
         };
+        let active_dac_config = self.active_dac_config.read().await.clone();
         let payload = ActiveEndpoint {
             v: PAYLOAD_VERSION,
             asound_conf_path: self.asound_conf_path.display().to_string(),
             pcm_evo_defined,
             framework_endpoint,
+            active_dac_config,
         };
         encode(req, &payload)
     }
@@ -1066,6 +1316,15 @@ struct ActiveEndpoint {
     asound_conf_path: String,
     pcm_evo_defined: bool,
     framework_endpoint: Option<ReadEndpointSummary>,
+    /// Cached snapshot from the hardware.audio-config plugin's
+    /// `evo.hardware.audio:active_config` subject, observed via
+    /// the plugin's subject subscription. `None` when the
+    /// subject has not yet been seen on this load cycle (e.g.
+    /// the hardware.audio-config plugin admitted after
+    /// delivery.alsa and the subject was not yet announced when
+    /// delivery.alsa tried to subscribe). Operator UI surfaces
+    /// the resolved alsacard / mixer hints from this field.
+    active_dac_config: Option<ActiveDacConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1681,6 +1940,113 @@ pcm.evo {
             .unwrap();
         let v: Value = serde_json::from_slice(&resp.payload).unwrap();
         assert_eq!(v["pcm_evo_defined"], true);
+    }
+
+    #[test]
+    fn extract_active_dac_config_reads_nested_active_shape() {
+        let state = serde_json::json!({
+            "v": 1,
+            "active": {
+                "overlay": "hifiberry-dacplus",
+                "catalogue_id": "hifiberry-dacplus",
+                "alsacard_hint": "sndrpihifiberry",
+                "mixer_hint": "Digital",
+                "boot_config_path": "/boot/firmware/config.txt",
+            },
+        });
+        let parsed = extract_active_dac_config(Some(&state));
+        assert_eq!(parsed.overlay, "hifiberry-dacplus");
+        assert_eq!(parsed.catalogue_id.as_deref(), Some("hifiberry-dacplus"));
+        assert_eq!(parsed.alsacard_hint.as_deref(), Some("sndrpihifiberry"));
+        assert_eq!(parsed.mixer_hint.as_deref(), Some("Digital"));
+        assert_eq!(parsed.boot_config_path, "/boot/firmware/config.txt");
+    }
+
+    #[test]
+    fn extract_active_dac_config_accepts_flat_shape_for_resilience() {
+        let state = serde_json::json!({
+            "overlay": "i-sabre-q2m",
+            "alsacard_hint": "DAC",
+            "mixer_hint": "Digital",
+            "boot_config_path": "/boot/config.txt",
+        });
+        let parsed = extract_active_dac_config(Some(&state));
+        assert_eq!(parsed.overlay, "i-sabre-q2m");
+        assert_eq!(parsed.alsacard_hint.as_deref(), Some("DAC"));
+        assert_eq!(parsed.boot_config_path, "/boot/config.txt");
+    }
+
+    #[test]
+    fn extract_active_dac_config_returns_default_on_none() {
+        let parsed = extract_active_dac_config(None);
+        assert_eq!(parsed, ActiveDacConfig::default());
+        assert!(parsed.overlay.is_empty());
+        assert!(parsed.alsacard_hint.is_none());
+    }
+
+    #[test]
+    fn extract_active_dac_config_returns_default_on_unset_active() {
+        let state = serde_json::json!({
+            "v": 1,
+            "active": {
+                "overlay": "",
+                "catalogue_id": null,
+                "alsacard_hint": null,
+                "mixer_hint": null,
+                "boot_config_path": "",
+            },
+        });
+        let parsed = extract_active_dac_config(Some(&state));
+        assert!(parsed.overlay.is_empty());
+        assert!(parsed.catalogue_id.is_none());
+        assert!(parsed.alsacard_hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_endpoint_returns_cached_active_dac_config() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let routing: Arc<dyn AudioRouting> =
+            Arc::new(StubDeliveryAudioRouting::new());
+        p.install_routing(Some(routing)).unwrap();
+        // Seed the cache as if the hardware-audio observer had fired.
+        {
+            let mut guard = p.active_dac_config.write().await;
+            *guard = Some(ActiveDacConfig {
+                overlay: "hifiberry-dacplus".into(),
+                catalogue_id: Some("hifiberry-dacplus".into()),
+                alsacard_hint: Some("sndrpihifiberry".into()),
+                mixer_hint: Some("Digital".into()),
+                boot_config_path: "/boot/firmware/config.txt".into(),
+            });
+        }
+        let resp = p
+            .handle_request(&request(
+                "delivery.active_endpoint",
+                json!({ "v": 1 }),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["active_dac_config"]["overlay"], "hifiberry-dacplus");
+        assert_eq!(v["active_dac_config"]["alsacard_hint"], "sndrpihifiberry");
+        assert_eq!(v["active_dac_config"]["mixer_hint"], "Digital");
+    }
+
+    #[tokio::test]
+    async fn active_endpoint_omits_cached_dac_config_when_unobserved() {
+        let mut p = AlsaDeliveryPlugin::new();
+        let routing: Arc<dyn AudioRouting> =
+            Arc::new(StubDeliveryAudioRouting::new());
+        p.install_routing(Some(routing)).unwrap();
+        let resp = p
+            .handle_request(&request(
+                "delivery.active_endpoint",
+                json!({ "v": 1 }),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert!(v["active_dac_config"].is_null());
     }
 
     #[tokio::test]
