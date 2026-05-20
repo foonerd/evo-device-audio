@@ -313,6 +313,33 @@ mod tests {
         );
     }
 
+    /// OOP manifest must declare an explicit lifecycle mode
+    /// matching its operator-reload intent. `LifecycleMode`
+    /// defaults to `Frozen`; a manifest carrying only the
+    /// legacy `hot_reload = "restart"` field still inherits
+    /// the `Frozen` default and the framework refuses
+    /// operator reload gestures with `PluginIsFrozen`.
+    /// metadata.local's provider chain is operator-tunable
+    /// (provider URLs, cache policy), so the canonical reload
+    /// shape is teardown + re-admit (`reload-cleanable`).
+    #[test]
+    fn oop_manifest_declares_reload_cleanable_mode() {
+        const MANIFEST_OOP_TOML: &str = include_str!("../manifest.oop.toml");
+        let m = Manifest::from_toml(MANIFEST_OOP_TOML)
+            .expect("manifest.oop.toml must parse");
+        let lifecycle = m
+            .lifecycle
+            .as_ref()
+            .expect("manifest.oop.toml must declare [lifecycle]");
+        assert_eq!(
+            lifecycle.mode,
+            evo_plugin_sdk::manifest::LifecycleMode::ReloadCleanable,
+            "manifest.oop.toml [lifecycle].mode must be 'reload-cleanable' \
+             (legacy `hot_reload = \"restart\"` alone parses to the Frozen \
+             default and refuses operator reload gestures)"
+        );
+    }
+
     /// Production-shipping manifest variant
     /// (`manifest.oop.toml`) carries the same capability
     /// declarations as `manifest.toml` except for the transport

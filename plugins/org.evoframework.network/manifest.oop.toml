@@ -29,7 +29,17 @@ max_memory_mb = 64
 max_cpu_percent = 10
 
 [lifecycle]
-hot_reload = "restart"
+# The framework's reload runtime checks `mode` to decide
+# which path to take on operator-gestured reload. `mode`
+# defaults to `Frozen` (refuses reload) when not declared.
+# The supervisor's multi-source ingest + adaptive_tick +
+# probe URL configuration are operator-tunable; reload
+# requires a clean teardown of the rtnetlink / NM / polling
+# sources and re-admit at the new configuration, so we
+# declare `reload-cleanable`. The legacy
+# `hot_reload = "restart"` field previously carried alone
+# is now removed — `mode` is the canonical surface.
+mode = "reload-cleanable"
 autostart = true
 restart_on_crash = true
 restart_budget = 5
