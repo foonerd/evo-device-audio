@@ -34,6 +34,8 @@
 # Toggles:
 #   EVO_INSTALL_MPD_SUDOERS=0          — skip /etc/sudoers.d/evo-mpd-restart
 #   EVO_INSTALL_NETWORK_NM_SUDOERS=0   — skip /etc/sudoers.d/evo-network-nm
+#   EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skip /etc/sudoers.d/evo-hardware-audio
+#   EVO_INSTALL_DACS_CATALOGUE=0       — skip /usr/share/evo-device-audio/dacs.json install
 #   EVO_INSTALL_SYSTEMD_DROP_INS=0     — skip /etc/systemd/system/evo.service.d/
 #   EVO_INSTALL_CLIENT_ACL=0           — skip /etc/evo/client_acl.toml install
 #   EVO_INSTALL_MPD_FRAGMENT=0         — skip /etc/evo/mpd.conf bootstrap (empty file)
@@ -68,6 +70,9 @@ SERVICE_USER=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
+HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
+DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
+DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
 SYSTEMD_DROPIN_DIR="/etc/systemd/system/evo.service.d"
 MPD_FRAGMENT_PATH="/etc/evo/mpd.conf"
@@ -327,6 +332,64 @@ if [[ "${EVO_INSTALL_NETWORK_NM_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $NETWORK_NM_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_NETWORK_NM_SUDOERS=0 — skipping network.nm sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1c: /etc/sudoers.d/evo-hardware-audio (narrow NOPASSWD)
+# ----------------------------------------------------------
+# Path-scoped grant for the hardware.audio-config plugin's
+# boot-config + i2c-dev module-load.d drop-in writes. The plugin
+# never runs as root; the grant is scoped to exactly the two
+# boot-config locations + the i2c-dev drop-in path so the audit
+# log keeps a full record of any command outside this surface.
+if [[ "${EVO_INSTALL_HARDWARE_AUDIO_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-hardware-audio.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$HARDWARE_AUDIO_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $HARDWARE_AUDIO_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skipping hardware-audio sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1d: /usr/share/evo-device-audio/dacs.json
+# ----------------------------------------------------------
+# The hardware.audio-config plugin embeds the catalogue at build
+# time (include_str! against plugins/.../data/dacs.json). The
+# canonical on-disk copy lives at /usr/share/evo-device-audio/
+# so an OOP-shipped variant of the plugin (or other consumers
+# that want the catalogue without linking the lib crate) can
+# read the same source. The plugin reads the embedded copy
+# first; this file is a documented host-side artifact.
+if [[ "${EVO_INSTALL_DACS_CATALOGUE:-1}" != "0" ]]; then
+    DACS_CATALOGUE_SOURCE="$DIST_DIR/../plugins/org.evoframework.hardware.audio-config/data/dacs.json"
+    if [[ -f "$DACS_CATALOGUE_SOURCE" ]]; then
+        install -d -m 0755 -o root -g root "$DACS_CATALOGUE_DIR"
+        install -m 0644 -o root -g root \
+            "$DACS_CATALOGUE_SOURCE" "$DACS_CATALOGUE_PATH"
+        echo "[bootstrap] installed $DACS_CATALOGUE_PATH"
+    else
+        echo "[bootstrap] WARN: dacs.json source not found at $DACS_CATALOGUE_SOURCE; skipping"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_DACS_CATALOGUE=0 — skipping DAC catalogue install"
 fi
 
 # ----------------------------------------------------------
@@ -972,6 +1035,19 @@ if [[ -f "$NETWORK_NM_SUDOERS_FILE" ]]; then
     fi
 else
     echo "  [skip]  network.nm sudoers drop-in not installed"
+fi
+
+# hardware-audio sudoers drop-in present + dacs.json catalogue
+# resolvable at the canonical share path.
+if [[ -f "$HARDWARE_AUDIO_SUDOERS_FILE" ]]; then
+    echo "  [ok]    hardware-audio sudoers drop-in installed at $HARDWARE_AUDIO_SUDOERS_FILE"
+else
+    echo "  [skip]  hardware-audio sudoers drop-in not installed"
+fi
+if [[ -f "$DACS_CATALOGUE_PATH" ]]; then
+    echo "  [ok]    DAC catalogue installed at $DACS_CATALOGUE_PATH"
+else
+    echo "  [skip]  DAC catalogue not installed at $DACS_CATALOGUE_PATH (plugin reads its embedded copy)"
 fi
 
 # Fragment path writable by service user.
