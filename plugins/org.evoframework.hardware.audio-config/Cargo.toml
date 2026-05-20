@@ -1,0 +1,45 @@
+[package]
+name = "org-evoframework-hardware-audio-config"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware audio-config plugin for the evo audio reference device. Owns the device's I2S DAC catalogue + boot-config dtoverlay block + companion module loads. Publishes the operator-visible capability surface (catalogue, active config, reboot-required state) the delivery + options plugins react against."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
+[[bin]]
+name = "hardware-audio-config-wire"
+path = "src/bin/hardware-audio-config-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+regex = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Async filesystem (boot-config read/write, modules-load.d drop-in)
+# + subprocess (sudo -n cat/tee for root-owned narrow paths). The
+# plugin runs as the steward service user, never as root; the
+# narrow sudoers grant in dist/sudoers.d/evo-hardware-audio.in
+# admits exactly the paths declared in privileges.yaml.
+tokio = { workspace = true, features = ["fs", "process"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

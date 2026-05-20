@@ -1,0 +1,49 @@
+schema_version: "1.0"
+plugin: org.evoframework.hardware.audio-config
+owner: evo-device-audio
+isolation: oop
+
+# In-process plugin loaded into the steward identity per
+# manifest.toml (transport = "in-process"). Privileges declared here
+# union into the steward record at admission. Per-distribution
+# host_provisioning lives in evo-device-audio/PRIVILEGES.yaml.
+
+capability_intent:
+  - id: board_profile_probe
+    need: read `/proc/device-tree/model` and `/proc/cpuinfo` to resolve the host board profile (e.g. "Raspberry PI"). The profile keys the DAC catalogue's per-board section; on a board class without a catalogue (NUC, generic x86) the plugin admits and exposes an empty catalogue with a structured diagnostic.
+    access_path: filesystem/system
+    failure_mode: profile resolution falls back to the `EVO_HARDWARE_AUDIO_PROFILE` environment-variable override; if absent, the plugin admits as "Unknown" board and the catalogue list is empty.
+  - id: boot_config_read
+    need: read `/boot/firmware/config.txt` (Bookworm/Pi default) or `/boot/config.txt` (legacy) to surface the currently-active dtoverlay block through the `hardware.audio.current_config` verb. The plugin prefers direct read when the file is world-readable; falls back to `sudo -n cat` against the narrow sudoers grant when permission is denied.
+    access_path: filesystem/system
+    failure_mode: current_config returns Unknown with operator-readable hint naming the failing path; plugin admits and continues. Catalogue listing + dtoverlay writes proceed independently of read availability.
+  - id: boot_config_write
+    need: write the managed dtoverlay block to `/boot/firmware/config.txt` or `/boot/config.txt` on every `hardware.audio.select_dac` or `clear_dac` gesture. The write replaces a banner-fenced block (banner + `dtoverlay=` line) to avoid disturbing operator-or-image-owned content elsewhere in the file. The plugin uses `sudo -n tee` against the narrow sudoers grant; the grant is path-scoped to the two boot-config locations, NOT the whole filesystem.
+    access_path: sudoers/command
+    failure_mode: select_dac / clear_dac respond with a structured error naming the failing path + the sudoers grant required; no boot-config change occurs; the previous configuration remains on disk and the `pending_reboot` subject does NOT flip to true. Operator diagnoses via the verb response + journal warn line.
+  - id: i2c_dev_module_grant
+    need: install `/etc/modules-load.d/evo-i2c-dev.conf` containing the literal `i2c-dev` so the kernel auto-loads the i2c-dev module at boot, exposing `/dev/i2c-*` for the userspace probe path many I2S HATs depend on (ID EEPROM, volume control). This drop-in is Pi-only; on other board profiles the side effect is skipped. The drop-in path is part of the narrow sudoers grant.
+    access_path: sudoers/command
+    failure_mode: i2c-dev drop-in install fails with a structured warn log; the dtoverlay block write still completes (the operator's primary selection succeeds); the i2c-dev side effect is the operator's follow-up. Reboot-required signalling remains accurate (the dtoverlay change still requires a reboot regardless of the module drop-in state).
+
+required_binaries:
+  - name: sudo
+    failure_mode: select_dac / clear_dac respond with a structured error citing the missing sudoers grant; catalogue read + current_config read still respond.
+  - name: tee
+    failure_mode: sudo-piped write to the boot config or modules-load.d drop-in fails; verb returns a structured error.
+  - name: cat
+    failure_mode: sudo-piped read of the boot config falls through to direct-read; if direct-read also fails, current_config returns Unknown.
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -r /proc/cpuinfo"
+    - "test -e /boot/firmware/config.txt -o -e /boot/config.txt"
+  expected:
+    - cpuinfo readable (board-profile probe path)
+    - one of the boot-config locations exists (resolved by the plugin)
+
+host_provisioning: {}

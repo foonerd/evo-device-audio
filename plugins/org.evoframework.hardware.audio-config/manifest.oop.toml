@@ -1,0 +1,56 @@
+[plugin]
+name = "org.evoframework.hardware.audio-config"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "hardware.audio"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 24
+max_cpu_percent = 2
+
+[lifecycle]
+# Reactive-only: the plugin publishes the
+# evo.hardware.audio:capabilities + :active_config + :pending_reboot
+# subjects at admission. Operator gestures (select_dac /
+# clear_dac) flow through the respondent surface, write the boot
+# config's dtoverlay block, then emit the
+# `hardware.audio.reboot_required` happening + refresh the
+# subject state. No teardown + re-admit cycle is needed.
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities]
+announce_subjects = true
+
+[capabilities.respondent]
+request_types = [
+    "hardware.audio.list_dac_catalogue",
+    "hardware.audio.select_dac",
+    "hardware.audio.clear_dac",
+    "hardware.audio.current_config",
+    "hardware.audio.confirm_reboot_required",
+]
+response_budget_ms = 3000
