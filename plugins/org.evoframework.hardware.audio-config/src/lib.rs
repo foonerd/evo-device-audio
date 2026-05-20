@@ -68,6 +68,7 @@ pub mod modder;
 pub mod provider;
 pub mod provider_pi;
 pub mod provider_rockchip;
+pub mod verify;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -158,6 +159,7 @@ const REQUEST_TYPES: &[&str] = &[
     "hardware.audio.clear_dac",
     "hardware.audio.current_config",
     "hardware.audio.confirm_reboot_required",
+    "hardware.audio.verify_install",
     "hardware.audio.dsp.list_controls",
     "hardware.audio.dsp.get_control",
     "hardware.audio.dsp.set_control",
@@ -889,6 +891,9 @@ impl Respondent for HardwareAudioConfigPlugin {
                 "hardware.audio.confirm_reboot_required" => {
                     self.handle_confirm_reboot_required(req).await
                 }
+                "hardware.audio.verify_install" => {
+                    self.handle_verify_install(req).await
+                }
                 "hardware.audio.dsp.list_controls" => {
                     self.handle_dsp_list_controls(req).await
                 }
@@ -1066,6 +1071,31 @@ impl HardwareAudioConfigPlugin {
             &serde_json::json!({
                 "v": PAYLOAD_VERSION,
                 "pending_reboot": state,
+            }),
+        )
+    }
+
+    async fn handle_verify_install(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        let dac_count = self.list_catalogue().len();
+        let probes = vec![
+            crate::verify::probe_board_profile(&self.profile),
+            crate::verify::probe_catalogue(&self.profile, dac_count),
+            crate::verify::probe_sudoers_grant().await,
+            crate::verify::probe_modder_staging_dir(std::path::Path::new(
+                crate::modder::USER_OVERLAY_DIR,
+            ))
+            .await,
+        ];
+        let report = crate::verify::assemble_report(probes);
+        encode(
+            req,
+            &serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "report": report,
             }),
         )
     }
@@ -1954,6 +1984,58 @@ mod tests {
             deadline: None,
             instance_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn verify_install_handler_returns_report_with_four_probes() {
+        // Handler-level test: the wire-op runs the full probe
+        // set including the real `sudo -n -l` probe + the real
+        // staging-directory probe. We don't pin per-probe
+        // verdicts (they depend on the host the test runs on),
+        // only the shape: a `report` field carrying `status` +
+        // `probes[]` of length 4 with the canonical names.
+        let mut p = plugin_with_stubbed_pi_provider().await;
+        let resp = p
+            .handle_request(&dsp_request(
+                "hardware.audio.verify_install",
+                serde_json::json!({"v": 1}),
+            ))
+            .await
+            .expect("verify_install ok");
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["v"], 1);
+        let report = &v["report"];
+        assert!(
+            report["status"].is_string(),
+            "status must be a string verdict, got {:?}",
+            report["status"]
+        );
+        let probes = report["probes"].as_array().unwrap();
+        assert_eq!(probes.len(), 4);
+        let names: Vec<&str> =
+            probes.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "board_profile",
+                "catalogue",
+                "sudoers_grant",
+                "modder_staging_dir"
+            ],
+            "probe order is part of the contract"
+        );
+        // board_profile MUST be ok in this test — the helper
+        // pins profile to "Raspberry PI".
+        let bp = probes
+            .iter()
+            .find(|p| p["name"] == "board_profile")
+            .unwrap();
+        assert_eq!(bp["ok"], true);
+        // catalogue MUST be ok — the embedded catalogue has
+        // entries for Raspberry PI.
+        let cat = probes.iter().find(|p| p["name"] == "catalogue").unwrap();
+        assert_eq!(cat["ok"], true);
     }
 
     #[tokio::test]
