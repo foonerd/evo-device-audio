@@ -11,6 +11,14 @@ description = "ALSA composition stage for the evo audio data plane. Drives the f
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
+[[bin]]
+name = "composition-alsa-wire"
+path = "src/bin/composition-alsa-wire.rs"
+
 # Cargo features.
 #
 # `alsa-substrate` (off by default) pulls in the `alsa` crate
@@ -35,6 +43,7 @@ default = []
 alsa-substrate = ["dep:alsa", "dep:nix"]
 
 [dependencies]
+anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -48,6 +57,7 @@ thiserror = { workspace = true }
 # reactor + byte-flow worker tasks.
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Optional: ALSA PCM substrate. Linked only when the
 # `alsa-substrate` feature is on — see [features] above.
 alsa = { version = "0.10", optional = true }

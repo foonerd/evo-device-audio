@@ -1,0 +1,100 @@
+[plugin]
+name = "org.evoframework.multiroom.evo-native"
+# Keep in sync with this crate's Cargo.toml [package].version
+# (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.multiroom"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+# Reactive-only mode declares this plugin observes its
+# operator-mutable state from framework substrate (group
+# composition, per-device role, per-group leader_ms,
+# peer-endpoint discovery, presence) via subscription rather
+# than re-reading TOML on every config gesture. The framework
+# admits the plugin once at boot; subsequent operator
+# gestures land via wire ops (`admin.group.*`,
+# `admin.multiroom.*`) that mutate the substrate; the plugin
+# observes the mutations on its subscription loop and
+# reconfigures in place — release DAC, open different DAC,
+# drop subscriptions to old group's frames, subscribe to new
+# group's frames — all without lifecycle churn.
+mode = "reactive-only"
+# Per-plugin teardown + admit deadlines (defaults are 5000ms
+# each). The reactive-only mode never tears down post-admit,
+# so `teardown_deadline_ms` applies only to operator-
+# gestured plugin disable; `admit_deadline_ms` bounds the
+# admit-time substrate-read + subscription-registration work.
+teardown_deadline_ms = 5000
+admit_deadline_ms = 5000
+
+# Non-disruptive defaults — the framework substitutes these
+# when both the operator-supplied TOML and the prior-known-
+# good TOML fail to admit. The defaults admit the plugin in
+# `role = auto` mode (no multi-room engagement, DAC stays
+# free for local-only MPD); operator gestures engage
+# multi-room when ready. Field shape is plugin-specific; the
+# framework treats this block opaquely and feeds the fields
+# to the plugin's load() path on the fall-back path.
+[lifecycle.defaults]
+alsa_pcm = "evo"
+# Source role unsupported under defaults — operator-installed
+# loopback PCM is required for capture, and the default has
+# no operator gesture to engage source role.
+source_pcm = ""
+
+# This plugin participates in the multi-room audio-plane: it
+# fans audio frames out to receivers when the local node is
+# elected as a group's source-host AND subscribes to incoming
+# frames from a source-host peer when the local node is a
+# receiver. The framework owns the TCP transport + handshake +
+# heartbeat + NTP-lite sync + source-host election; this
+# plugin contributes the audio-chain bridge.
+#
+# capabilities.audio_plane = true tells the admission engine
+# to populate LoadContext.audio_plane so the plugin can call
+# fan_out_audio_frame + subscribe_audio_frames.
+#
+# capabilities.subscribe_subjects = true tells the admission
+# engine to populate LoadContext.subject_state_subscriber so
+# the plugin can subscribe to source-host election state
+# updates (audio.election.source_host subject the framework
+# already announces per multi-room group).
+[capabilities]
+audio_plane = true
+subscribe_subjects = true
+
+[capabilities.respondent]
+request_types = [
+    "multiroom.get_status",
+    "multiroom.set_leader_ms",
+    "audio.multiroom.frame_trace.snapshot",
+]
+response_budget_ms = 1000

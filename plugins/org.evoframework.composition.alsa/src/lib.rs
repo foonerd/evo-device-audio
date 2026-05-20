@@ -935,6 +935,48 @@ mod tests {
         serde_json::from_slice(bytes).expect("response payload is valid JSON")
     }
 
+    #[tokio::test]
+    async fn describe_matches_embedded_manifest() {
+        let p = AlsaCompositionPlugin::new();
+        let d = p.describe().await;
+        let m = manifest();
+        assert_eq!(d.identity.name, m.plugin.name);
+        assert_eq!(d.identity.version, m.plugin.version);
+        let drift =
+            evo_plugin_sdk::drift::detect_drift(&m, &d.runtime_capabilities);
+        assert!(
+            drift.is_empty(),
+            "in-tree manifest.toml drifted from runtime describe(): {:?}",
+            drift
+        );
+    }
+
+    /// Production-shipping manifest variant
+    /// (`manifest.oop.toml`) carries the same capability
+    /// declarations as `manifest.toml` except for the transport
+    /// block. The framework's admission gate refuses any plugin
+    /// whose manifest declarations drift from the runtime
+    /// `describe()` output; without this test the OOP manifest
+    /// can drift silently and admission fails only at deploy
+    /// time on a real rig.
+    #[tokio::test]
+    async fn describe_matches_oop_manifest() {
+        const MANIFEST_OOP_TOML: &str = include_str!("../manifest.oop.toml");
+        let p = AlsaCompositionPlugin::new();
+        let d = p.describe().await;
+        let m = evo_plugin_sdk::Manifest::from_toml(MANIFEST_OOP_TOML)
+            .expect("manifest.oop.toml must parse");
+        assert_eq!(d.identity.name, m.plugin.name);
+        assert_eq!(d.identity.version, m.plugin.version);
+        let drift =
+            evo_plugin_sdk::drift::detect_drift(&m, &d.runtime_capabilities);
+        assert!(
+            drift.is_empty(),
+            "manifest.oop.toml drifted from runtime describe(): {:?}",
+            drift
+        );
+    }
+
     #[test]
     fn embedded_manifest_parses() {
         let m = manifest();

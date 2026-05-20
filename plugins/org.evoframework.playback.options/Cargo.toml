@@ -11,7 +11,16 @@ description = "Operator-facing audiophile-grade playback settings plugin. Persis
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
+[[bin]]
+name = "playback-options-wire"
+path = "src/bin/playback-options-wire.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -20,6 +29,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 toml = "0.8"
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

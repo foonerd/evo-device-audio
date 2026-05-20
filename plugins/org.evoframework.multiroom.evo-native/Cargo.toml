@@ -11,6 +11,14 @@ description = "evo-native multi-room audio-frame fan-out plugin. Bridges the loc
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
+[[bin]]
+name = "multiroom-evo-native-wire"
+path = "src/bin/multiroom-evo-native-wire.rs"
+
 # `alsa-substrate` (off by default) pulls in the `alsa` crate
 # and turns on the receiver-side ALSA playback path. Without
 # the feature the plugin still admits, equips the audio-plane
@@ -25,6 +33,7 @@ default = []
 alsa-substrate = ["dep:alsa"]
 
 [dependencies]
+anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -33,6 +42,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 toml = "0.8"
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = { workspace = true }
 alsa = { version = "0.10", optional = true }
 
