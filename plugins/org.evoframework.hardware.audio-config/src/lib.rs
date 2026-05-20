@@ -87,10 +87,21 @@ use crate::provider_pi::PiProvider;
 /// Embedded plugin manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
-/// Embedded DAC catalogue (bundled at build time, also installed at
-/// `/usr/share/evo-device-audio/dacs.json` by the bootstrap script
-/// for an OOP-shipped variant of this plugin).
-pub const EMBEDDED_DACS_JSON: &str = include_str!("../data/dacs.json");
+/// Embedded DAC catalogue — frozen provenance snapshot of Volumio's
+/// upstream `dacs.json`. Lives under `data/import/` to signal its
+/// non-load-bearing build-time-only role. ADR-0132 retires runtime
+/// Volumio JSON parsing in a follow-on commit; the current location
+/// already enforces the source-of-truth-is-frozen invariant.
+pub const EMBEDDED_DACS_JSON: &str =
+    include_str!("../data/import/volumio-dacs.json");
+
+/// Embedded Volumio dac_dsp.json — frozen provenance snapshot.
+/// Names-only filter (10 entries, each carrying card name +
+/// `dsp_options[]` ALSA mixer-control-name array). Joined with the
+/// curated DSP control pool + runtime amixer introspection by the
+/// DSP capability resolver landing in the next P0 sub-phase.
+pub const EMBEDDED_VOLUMIO_DAC_DSP_JSON: &str =
+    include_str!("../data/import/volumio-dac-dsp.json");
 
 /// Plugin identity name (must match manifest).
 pub const PLUGIN_NAME: &str = "org.evoframework.hardware.audio-config";

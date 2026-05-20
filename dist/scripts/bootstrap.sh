@@ -372,14 +372,14 @@ fi
 # Step 1d: /usr/share/evo-device-audio/dacs.json
 # ----------------------------------------------------------
 # The hardware.audio-config plugin embeds the catalogue at build
-# time (include_str! against plugins/.../data/dacs.json). The
+# time (include_str! against plugins/.../data/import/volumio-dacs.json). The
 # canonical on-disk copy lives at /usr/share/evo-device-audio/
 # so an OOP-shipped variant of the plugin (or other consumers
 # that want the catalogue without linking the lib crate) can
 # read the same source. The plugin reads the embedded copy
 # first; this file is a documented host-side artifact.
 if [[ "${EVO_INSTALL_DACS_CATALOGUE:-1}" != "0" ]]; then
-    DACS_CATALOGUE_SOURCE="$DIST_DIR/../plugins/org.evoframework.hardware.audio-config/data/dacs.json"
+    DACS_CATALOGUE_SOURCE="$DIST_DIR/../plugins/org.evoframework.hardware.audio-config/data/import/volumio-dacs.json"
     if [[ -f "$DACS_CATALOGUE_SOURCE" ]]; then
         install -d -m 0755 -o root -g root "$DACS_CATALOGUE_DIR"
         install -m 0644 -o root -g root \
