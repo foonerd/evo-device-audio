@@ -73,6 +73,25 @@ impl EvoCatalog {
         let board = self.boards.iter().find(|b| b.name == profile)?;
         board.dacs.iter().find(|d| d.id == dac_id)
     }
+
+    /// Lookup helper — return the provider key declared for the
+    /// given board profile (`"pi"`, `"noop"`, future board-class
+    /// keys). The plugin's runtime dispatch consumes this to pick
+    /// the concrete [`HardwareAudioProvider`] implementation
+    /// without string-matching board names in the plugin body.
+    /// Returns None when the profile does not appear in the
+    /// catalog.
+    ///
+    /// [`HardwareAudioProvider`]: crate::provider::HardwareAudioProvider
+    pub fn provider_key_for_profile<'a>(
+        &'a self,
+        profile: &str,
+    ) -> Option<&'a str> {
+        self.boards
+            .iter()
+            .find(|b| b.name == profile)
+            .map(|b| b.provider.as_str())
+    }
 }
 
 /// One board profile from `boards[]`.
