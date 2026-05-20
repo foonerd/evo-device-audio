@@ -2340,28 +2340,37 @@ fn try_configure_capture_pcm(
 ) -> Result<alsa::PCM, (CaptureConfigureStage, alsa::Error)> {
     let pcm = alsa::PCM::new(source_pcm, alsa::Direction::Capture, true)
         .map_err(|e| (CaptureConfigureStage::PcmOpen, e))?;
-    let hwp = alsa::pcm::HwParams::any(&pcm)
-        .map_err(|e| (CaptureConfigureStage::HwParamsAny, e))?;
-    hwp.set_channels(BASELINE_CHANNELS as u32)
-        .map_err(|e| (CaptureConfigureStage::SetChannels, e))?;
-    hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
-        .map_err(|e| (CaptureConfigureStage::SetRate, e))?;
-    hwp.set_format(alsa::pcm::Format::S16LE)
-        .map_err(|e| (CaptureConfigureStage::SetFormat, e))?;
-    hwp.set_access(alsa::pcm::Access::RWInterleaved)
-        .map_err(|e| (CaptureConfigureStage::SetAccess, e))?;
-    // Explicit period + buffer time on capture. Without
-    // this snd-aloop's defaults yield a ~10-second capture
-    // buffer (524288 frames @ 48 kHz observed empirically)
-    // which makes capture-side audible latency dependent on
-    // a startup-timing race between MPD's first writei and
-    // the capture-thread's first readi.
-    hwp.set_period_time_near(20_000, alsa::ValueOr::Nearest)
-        .map_err(|e| (CaptureConfigureStage::SetPeriodTime, e))?;
-    hwp.set_buffer_time_near(80_000, alsa::ValueOr::Nearest)
-        .map_err(|e| (CaptureConfigureStage::SetBufferTime, e))?;
-    pcm.hw_params(&hwp)
-        .map_err(|e| (CaptureConfigureStage::HwParams, e))?;
+    // `HwParams::any(&pcm)` returns a struct that borrows `pcm`
+    // for the lifetime of the value. NLL releases borrows at
+    // the borrower's drop, not at last-use, so scoping `hwp`
+    // in its own block forces the borrow to end before the
+    // `Ok(pcm)` move. Without this scope the function refuses
+    // to compile under modern rustc (cannot move out of pcm
+    // because it is borrowed by hwp, dropped at end-of-fn).
+    {
+        let hwp = alsa::pcm::HwParams::any(&pcm)
+            .map_err(|e| (CaptureConfigureStage::HwParamsAny, e))?;
+        hwp.set_channels(BASELINE_CHANNELS as u32)
+            .map_err(|e| (CaptureConfigureStage::SetChannels, e))?;
+        hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
+            .map_err(|e| (CaptureConfigureStage::SetRate, e))?;
+        hwp.set_format(alsa::pcm::Format::S16LE)
+            .map_err(|e| (CaptureConfigureStage::SetFormat, e))?;
+        hwp.set_access(alsa::pcm::Access::RWInterleaved)
+            .map_err(|e| (CaptureConfigureStage::SetAccess, e))?;
+        // Explicit period + buffer time on capture. Without
+        // this snd-aloop's defaults yield a ~10-second capture
+        // buffer (524288 frames @ 48 kHz observed empirically)
+        // which makes capture-side audible latency dependent on
+        // a startup-timing race between MPD's first writei and
+        // the capture-thread's first readi.
+        hwp.set_period_time_near(20_000, alsa::ValueOr::Nearest)
+            .map_err(|e| (CaptureConfigureStage::SetPeriodTime, e))?;
+        hwp.set_buffer_time_near(80_000, alsa::ValueOr::Nearest)
+            .map_err(|e| (CaptureConfigureStage::SetBufferTime, e))?;
+        pcm.hw_params(&hwp)
+            .map_err(|e| (CaptureConfigureStage::HwParams, e))?;
+    }
     Ok(pcm)
 }
 
