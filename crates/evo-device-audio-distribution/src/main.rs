@@ -120,10 +120,7 @@ use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 use evo_plugin_sdk::Manifest;
-use org_evoframework_composition_alsa::AlsaCompositionPlugin;
-use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
-use org_evoframework_playback_mpd::MpdPlaybackPlugin;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -283,123 +280,24 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("registering Tier 2 audio widget kinds")?;
 
-            // 1. composition.alsa: singleton respondent on
-            //    audio.composition shape 2. Still admitted via
-            //    Phase 1 compile-link today because the
-            //    plugin's `load()` requires
-            //    `LoadContext::audio_routing`, and the
-            //    framework's OOP admission path does not yet
-            //    wire-proxy that handle to subprocess plugins.
-            //    The wire binary + OOP manifest are scaffolded
-            //    in-tree; this admission moves to Phase 2 once
-            //    the framework extends its OOP path to
-            //    provision audio handles.
-            let composition_manifest = Manifest::from_toml(
-                org_evoframework_composition_alsa::MANIFEST_TOML,
-            )
-            .context("parsing composition.alsa manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    AlsaCompositionPlugin::new(),
-                    composition_manifest,
-                )
-                .await
-                .context("admitting composition.alsa")?;
+            // composition.alsa, delivery.alsa, playback.mpd,
+            // playback.options, artwork.local, network, and
+            // metadata.local have all moved to out-of-process
+            // shipping form. The deploy script
+            // (`dist/scripts/deploy-distribution.sh`)
+            // cross-builds each wire binary, signs the
+            // bundle, and stages it under
+            // `/opt/evo/plugins/<name>/`; Phase 2 discovery
+            // (below) admits them from the filesystem search
+            // root. The framework's audio-routing wire-proxy
+            // (the `WireFrame::AudioRoutingStateChanged`
+            // forwarder installed at admission) carries the
+            // resolved topology across the subprocess
+            // boundary, so audio-capable plugins admit
+            // cleanly through the OOP path without a
+            // compile-link dependency in this binary.
 
-            // 2. playback.options moved to out-of-process
-            //    shipping form. The plugin is no longer
-            //    admitted via Phase 1 compile-link; the
-            //    `dist/scripts/deploy-distribution.sh` flow
-            //    cross-builds its wire binary
-            //    (`playback-options-wire`), stages + signs a
-            //    bundle from
-            //    `plugins/org.evoframework.playback.options/manifest.oop.toml`,
-            //    and installs it at
-            //    `/opt/evo/plugins/org.evoframework.playback.options/`.
-            //    Phase 2 discovery (below) admits it from the
-            //    filesystem search root. The plugin needs no
-            //    audio data-plane handle so it admits cleanly
-            //    across the OOP boundary today.
-
-            // 3. delivery.alsa: singleton respondent on
-            //    audio.delivery shape 2. Still admitted via
-            //    Phase 1 compile-link today — same
-            //    `LoadContext::audio_routing` requirement as
-            //    composition.alsa. Wire binary + OOP manifest
-            //    are scaffolded in-tree; admission moves to
-            //    Phase 2 once the framework's OOP path
-            //    provisions audio handles.
-            let delivery_manifest = Manifest::from_toml(
-                org_evoframework_delivery_alsa::MANIFEST_TOML,
-            )
-            .context("parsing delivery.alsa manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    AlsaDeliveryPlugin::new(),
-                    delivery_manifest,
-                )
-                .await
-                .context("admitting delivery.alsa")?;
-
-            // 4. playback.mpd: warden + respondent on
-            //    audio.playback shape 1. Still admitted via
-            //    Phase 1 compile-link today.
-            //
-            //    The SDK + framework OOP combined-mode
-            //    plumbing exists (the wire binary
-            //    `playback-mpd-wire`, `manifest.oop.toml`,
-            //    `serve_combined` + `run_oop_warden_with_respondent`
-            //    in the SDK, `WireWardenAndRespondent` +
-            //    `admit_out_of_process_warden_with_respondent`
-            //    on the framework side) but mpd's `load()`
-            //    requires `LoadContext::audio_routing` (the
-            //    plugin declares `[capabilities.source]`
-            //    with `output_kind = "audio.pcm"` — the
-            //    framework MUST provision an audio_routing
-            //    handle and refuses load otherwise). The
-            //    framework's OOP admission path does not yet
-            //    wire-proxy audio_routing to subprocess
-            //    plugins; same gate as composition.alsa +
-            //    delivery.alsa + multiroom.evo-native. mpd
-            //    moves to Phase 2 when that gate closes.
-            //
-            //    Admit AFTER playback.options so the
-            //    audio.options.settings subject already
-            //    exists when playback.mpd subscribes.
-            let playback_manifest = Manifest::from_toml(
-                org_evoframework_playback_mpd::MANIFEST_TOML,
-            )
-            .context("parsing playback.mpd manifest")?;
-            engine
-                .admit_singleton_warden_with_respondent(
-                    MpdPlaybackPlugin::new(),
-                    playback_manifest,
-                )
-                .await
-                .context("admitting playback.mpd")?;
-
-            // 5. network: singleton respondent on
-            //    network moved to out-of-process shipping
-            //    form. The plugin is no longer admitted via
-            //    Phase 1 compile-link; the
-            //    `dist/scripts/deploy-distribution.sh` flow
-            //    cross-builds its wire binary
-            //    (`network-wire`), stages + signs a bundle
-            //    from
-            //    `plugins/org.evoframework.network/manifest.oop.toml`,
-            //    and installs it at
-            //    `/opt/evo/plugins/org.evoframework.network/`.
-            //    Phase 2 discovery (below) admits it from
-            //    the filesystem search root, the framework's
-            //    PPAG runner probes the `nmcli` / `iw` /
-            //    `rfkill` NOPASSWD drop-ins (provisioned by
-            //    `bootstrap.sh` Steps 1 + 1b), stamps the
-            //    dispatcher resolution on
-            //    `LoadContext::capabilities`, and the
-            //    plugin's subprocess reads the resolution to
-            //    pick its invocation strategy.
-
-            // 6. multiroom.evo-native: singleton respondent on
+            // multiroom.evo-native: singleton respondent on
             //    audio.multiroom shape 1. Still admitted via
             //    Phase 1 compile-link today because the
             //    plugin's `load()` requires
@@ -423,34 +321,6 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 )
                 .await
                 .context("admitting multiroom.evo-native")?;
-
-            // 7. metadata.local moved to out-of-process shipping
-            //    form. The plugin is no longer admitted via
-            //    Phase 1 compile-link; the
-            //    `dist/scripts/deploy-distribution.sh` flow
-            //    cross-builds its wire binary
-            //    (`metadata-local-wire`), stages + signs a
-            //    bundle from
-            //    `plugins/org.evoframework.metadata.local/manifest.oop.toml`,
-            //    and installs it at
-            //    `/opt/evo/plugins/org.evoframework.metadata.local/`.
-            //    Phase 2 discovery (below) admits it from the
-            //    filesystem search root.
-
-            // 8. artwork.local moved to out-of-process shipping
-            //    form. The plugin is no longer admitted via
-            //    Phase 1 compile-link; the
-            //    `dist/scripts/deploy-distribution.sh` flow
-            //    cross-builds its wire binary
-            //    (`artwork-local-wire`), stages a bundle from
-            //    `plugins/org.evoframework.artwork.local/manifest.oop.toml`,
-            //    and installs it at
-            //    `/opt/evo/plugins/org.evoframework.artwork.local/`.
-            //    Phase 2 discovery (below) admits it from the
-            //    filesystem search root, and the operator's
-            //    install / remove / update / enable / disable
-            //    lifecycle reaches the plugin without a steward
-            //    restart.
 
             // Phase 2 — filesystem discovery for operator-
             // installed out-of-process plugins. Walks

@@ -47,44 +47,35 @@ evo-device-audio-shared = { path = "../evo-device-audio-shared" }
 # property the framework promises; full per-plugin lifecycle
 # requires migrating each plugin to a runtime-loadable artefact
 # (OOP or cdylib). This distribution carries the compile-link
-# shape for the reference plugin set until each plugin moves
-# to a runtime-loadable shipping form.
-# `org-evoframework-playback-options` is no longer a
-# production dep of the distribution binary — it migrated to
-# out-of-process shipping form. Its wire binary is cross-built
-# independently via the deploy script and the plugin admits
-# through framework Phase 2 discovery from
-# `/opt/evo/plugins/org.evoframework.playback.options/`.
-# Workspace membership keeps it cross-buildable from the
-# device repo.
+# shape only for plugins whose framework-side OOP transport is
+# still landing; everything else ships through Phase 2 discovery.
 #
-# `org-evoframework-composition-alsa`,
-# `org-evoframework-delivery-alsa`,
-# `org-evoframework-multiroom-evo-native`, and
-# `org-evoframework-playback-mpd` REMAIN production
-# deps today because their plugins consume framework audio
-# data-plane handles (`audio_routing`, `audio_plane`,
-# `multiroom_substrate`) at `load()` time, and the
-# framework's OOP admission path does not yet wire-proxy
-# those handles to subprocess plugins. The wire binary +
-# manifest.oop.toml for each is scaffolded in-tree (mpd's
-# wire binary uses the SDK's `run_oop_warden_with_respondent`
-# combined entry point landed in evo-core-eng); the
-# migration moves to Phase 2 once the framework's OOP path
-# provisions audio + multi-room handles across the
-# subprocess boundary.
-org-evoframework-composition-alsa = { path = "../../plugins/org.evoframework.composition.alsa" }
-org-evoframework-delivery-alsa = { path = "../../plugins/org.evoframework.delivery.alsa" }
+# Out-of-process today (no longer compile-linked here):
+#   * `org-evoframework-artwork-local`
+#   * `org-evoframework-network`
+#   * `org-evoframework-metadata-local`
+#   * `org-evoframework-playback-options`
+#   * `org-evoframework-composition-alsa`
+#   * `org-evoframework-delivery-alsa`
+#   * `org-evoframework-playback-mpd`
+#
+# Each ships a wire binary + `manifest.oop.toml`; the deploy
+# script (`dist/scripts/deploy-distribution.sh`) cross-builds
+# the wire binary, signs the bundle, and stages it under
+# `/opt/evo/plugins/<name>/`. Workspace membership keeps them
+# cross-buildable from this repo.
+#
+# `org-evoframework-multiroom-evo-native` REMAINS a production
+# dep today because the plugin consumes
+# `LoadContext::audio_plane` (and `multiroom_substrate`) at
+# load() time, and the framework's OOP admission path does
+# not yet wire-proxy those handles to subprocess plugins.
+# `AudioRouting` itself is now wire-proxied — multiroom's
+# remaining gating is the high-frequency audio-frame fan-out
+# surface. The wire binary + OOP manifest are scaffolded
+# in-tree; the migration lands once that handle has a sound
+# cross-process transport.
 org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
-org-evoframework-playback-mpd = { path = "../../plugins/org.evoframework.playback.mpd" }
-# `org-evoframework-artwork-local` is no longer a production
-# dep of the distribution binary — it migrated to
-# out-of-process shipping form. The wire binary is
-# cross-built independently via the deploy script and the
-# plugin admits through framework Phase 2 discovery from
-# `/opt/evo/plugins/org.evoframework.artwork.local/`.
-# Workspace membership keeps it cross-buildable from the
-# device repo.
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.
@@ -103,16 +94,16 @@ toml = { workspace = true }
 default = []
 # Cross-builds for target hardware enable this feature to
 # pull in the libasound-backed AlsaPcm substrate path inside
-# the still-compile-link-admitted composition.alsa and
-# multiroom.evo-native plugins. Once those plugins move to
-# OOP shipping form (gated on the framework's OOP admission
-# path provisioning audio handles across the subprocess
-# boundary), the deploy script will pass `--features
-# alsa-substrate` directly to each plugin's wire-binary
-# cross-build via the `OOP_PLUGINS` features column and this
-# passthrough retires.
+# the still-compile-link-admitted multiroom.evo-native
+# plugin. composition.alsa and delivery.alsa have moved to
+# OOP shipping form; the deploy script passes
+# `--features alsa-substrate` directly to their wire-binary
+# cross-builds via the `OOP_PLUGINS` features column. Once
+# multiroom.evo-native also moves to OOP shipping form
+# (gated on the framework's OOP admission path provisioning
+# audio_plane + multiroom_substrate across the subprocess
+# boundary), this passthrough retires.
 alsa-substrate = [
-    "org-evoframework-composition-alsa/alsa-substrate",
     "org-evoframework-multiroom-evo-native/alsa-substrate",
 ]
 

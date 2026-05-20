@@ -123,36 +123,32 @@ OOP_PLUGINS=(
     "org.evoframework.network:org-evoframework-network:network-wire:"
     "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
     "org.evoframework.playback.options:org-evoframework-playback-options:playback-options-wire:"
+    "org.evoframework.composition.alsa:org-evoframework-composition-alsa:composition-alsa-wire:alsa-substrate"
+    "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:alsa-substrate"
+    "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
 )
 
 # Plugins still on Phase 1 compile-link admission today (with
 # named blockers):
 #
-#   * org.evoframework.composition.alsa  — needs
-#     LoadContext::audio_routing across the OOP boundary;
-#     framework's OOP admission path does not yet provision
-#     that handle (the in-process path does via
-#     AdmissionEngine::with_audio_routing). Manifest declares
-#     `[capabilities.composition]` so the framework's load-time
-#     check refuses admission without the handle.
-#   * org.evoframework.delivery.alsa  — same audio_routing
-#     issue as composition.alsa (manifest declares
-#     `[capabilities.delivery]`).
 #   * org.evoframework.multiroom.evo-native  — needs
 #     LoadContext::audio_plane (+ multiroom_substrate) across
 #     the OOP boundary; framework's OOP admission path does
 #     not yet wire-proxy those handles to the subprocess.
-#   * org.evoframework.playback.mpd  — needs
-#     `run_oop_warden_with_respondent` SDK entry point;
-#     `run_oop` is respondent-only, `run_oop_warden` is
-#     warden-only, and the warden dispatch loop explicitly
-#     rejects respondent verbs. mpd is both.
+#     `AudioRouting` itself is wire-proxied; this plugin
+#     additionally consumes `AudioPlaneHandle::fan_out_audio_frame`
+#     (hot path, every audio frame) and
+#     `subscribe_audio_frames` (streaming subscription).
+#     Migrating these onto a Unix-socket wire would re-introduce
+#     the per-frame copy + IPC cost the audio data plane is
+#     designed to avoid; the next chunk lands a shared-memory
+#     fast path OR keeps multiroom on compile-link as a
+#     vendor-tier exception.
 #
-# All four wire binaries, OOP manifests, and drift tests are
-# scaffolded in-tree (each plugin's `src/bin/*-wire.rs` +
-# `manifest.oop.toml` + Cargo.toml `[[bin]]` entry compile
-# clean today). The migrations land per-plugin as each named
-# framework / SDK gap closes.
+# The wire binary, OOP manifest, and drift test for
+# multiroom.evo-native are scaffolded in-tree; the migration
+# lands once the audio_plane handle has a sound cross-process
+# transport.
 
 echo "=== deploy-distribution.sh ==="
 echo "Target:        ${SSH_TARGET}"
