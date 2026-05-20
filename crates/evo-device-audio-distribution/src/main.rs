@@ -342,13 +342,27 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .context("admitting delivery.alsa")?;
 
             // 4. playback.mpd: warden + respondent on
-            //    audio.playback shape 1. Owns the `mpd-path`
-            //    URI scheme; the framework's source-verb
-            //    dispatcher routes play_now / etc. to its
-            //    respondent surface, while the steward's
-            //    custody-aware dispatcher routes
-            //    course_correct verbs (play / pause / seek /
-            //    set_volume / etc.) to the warden surface.
+            //    audio.playback shape 1. Still admitted via
+            //    Phase 1 compile-link today.
+            //
+            //    The SDK + framework OOP combined-mode
+            //    plumbing exists (the wire binary
+            //    `playback-mpd-wire`, `manifest.oop.toml`,
+            //    `serve_combined` + `run_oop_warden_with_respondent`
+            //    in the SDK, `WireWardenAndRespondent` +
+            //    `admit_out_of_process_warden_with_respondent`
+            //    on the framework side) but mpd's `load()`
+            //    requires `LoadContext::audio_routing` (the
+            //    plugin declares `[capabilities.source]`
+            //    with `output_kind = "audio.pcm"` — the
+            //    framework MUST provision an audio_routing
+            //    handle and refuses load otherwise). The
+            //    framework's OOP admission path does not yet
+            //    wire-proxy audio_routing to subprocess
+            //    plugins; same gate as composition.alsa +
+            //    delivery.alsa + multiroom.evo-native. mpd
+            //    moves to Phase 2 when that gate closes.
+            //
             //    Admit AFTER playback.options so the
             //    audio.options.settings subject already
             //    exists when playback.mpd subscribes.
