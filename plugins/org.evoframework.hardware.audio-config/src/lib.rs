@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+pub mod dsp;
 pub mod dsp_pool;
 pub mod evo_catalog;
 pub mod import;
