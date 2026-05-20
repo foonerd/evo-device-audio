@@ -79,6 +79,10 @@ use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::dsp::{
+    resolve_dsp_capabilities, AmixerReadOutcome, AmixerReader, DspCapabilitySet,
+};
+use crate::dsp_pool::{parse_dsp_control_pool, DspControlPool};
 use crate::evo_catalog::{parse_evo_catalog, DacEntry, EvoCatalog};
 use crate::provider::{
     ActiveConfig, ApplyOutcome, HardwareAudioProvider, NoopProvider,
@@ -95,6 +99,12 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// One canonical parse path is the invariant.
 pub const EMBEDDED_EVO_CATALOG_TOML: &str =
     include_str!("../data/evo-catalog.toml");
+
+/// Embedded curated DSP control pool. Joined with the active DAC's
+/// catalog `dsp_options[]` + live amixer introspection in the
+/// three-layer resolver. Updates ship with plugin releases.
+pub const EMBEDDED_DSP_CONTROL_POOL_TOML: &str =
+    include_str!("../data/dsp-control-pool.toml");
 
 /// Plugin identity name (must match manifest).
 pub const PLUGIN_NAME: &str = "org.evoframework.hardware.audio-config";
@@ -117,12 +127,14 @@ const SUBJECT_SCHEME: &str = "evo.hardware.audio";
 const SUBJECT_VALUE_CAPABILITIES: &str = "capabilities";
 const SUBJECT_VALUE_ACTIVE_CONFIG: &str = "active_config";
 const SUBJECT_VALUE_PENDING_REBOOT: &str = "pending_reboot";
+const SUBJECT_VALUE_DSP_CAPABILITIES: &str = "dsp_capabilities";
 
 /// Subject types the framework records. Underscored form because
 /// the catalogue parser rejects subject-type names containing `.`.
 const SUBJECT_TYPE_CAPABILITIES: &str = "hardware_audio_capabilities";
 const SUBJECT_TYPE_ACTIVE_CONFIG: &str = "hardware_audio_active_config";
 const SUBJECT_TYPE_PENDING_REBOOT: &str = "hardware_audio_pending_reboot";
+const SUBJECT_TYPE_DSP_CAPABILITIES: &str = "hardware_audio_dsp_capabilities";
 
 /// Request types this plugin honours. Lockstep-matched against
 /// `manifest.toml` [capabilities.respondent].request_types by the
@@ -155,6 +167,7 @@ fn plugin_crate_version() -> semver::Version {
 pub struct HardwareAudioConfigPlugin {
     loaded: bool,
     catalogue: Option<EvoCatalog>,
+    dsp_pool: Option<DspControlPool>,
     profile: String,
     profile_pinned: bool,
     provider: Arc<dyn HardwareAudioProvider>,
@@ -190,6 +203,7 @@ impl HardwareAudioConfigPlugin {
         Self {
             loaded: false,
             catalogue: None,
+            dsp_pool: None,
             profile: "Unknown".into(),
             profile_pinned: false,
             provider: Arc::new(NoopProvider::default()),
@@ -294,6 +308,13 @@ impl HardwareAudioConfigPlugin {
         }
     }
 
+    fn dsp_capabilities_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: SUBJECT_SCHEME.to_string(),
+            value: SUBJECT_VALUE_DSP_CAPABILITIES.to_string(),
+        }
+    }
+
     fn capabilities_state(&self) -> serde_json::Value {
         serde_json::json!({
             "v": PAYLOAD_VERSION,
@@ -328,6 +349,11 @@ impl HardwareAudioConfigPlugin {
                 Self::pending_reboot_addressing(),
                 self.pending_reboot_state().await,
             ),
+            (
+                SUBJECT_TYPE_DSP_CAPABILITIES,
+                Self::dsp_capabilities_addressing(),
+                self.resolve_and_pack_dsp_capabilities().await,
+            ),
         ];
         for (subject_type, addressing, state) in announces {
             let announcement = SubjectAnnouncement {
@@ -345,6 +371,69 @@ impl HardwareAudioConfigPlugin {
                     "announce subject failed"
                 );
             }
+        }
+    }
+
+    /// Resolve the DSP capability set for the currently-active DAC
+    /// and pack it as the subject-state JSON payload. Drives both
+    /// the load-time announce and every active_config-change-driven
+    /// republish.
+    async fn resolve_and_pack_dsp_capabilities(&self) -> serde_json::Value {
+        let caps = self.resolve_dsp_capabilities_now().await;
+        serde_json::json!({
+            "v": PAYLOAD_VERSION,
+            "capabilities": caps,
+        })
+    }
+
+    /// Run the three-layer resolver against the plugin's current
+    /// state. Returns an empty capability set with a
+    /// `NoActiveDac`-equivalent diagnostic when the active config
+    /// has no resolved catalog id; the resolver itself owns the
+    /// per-control bound/unbound surface.
+    async fn resolve_dsp_capabilities_now(&self) -> DspCapabilitySet {
+        let (catalog, pool) =
+            match (self.catalogue.as_ref(), self.dsp_pool.as_ref()) {
+                (Some(cat), Some(pool)) => (cat, pool),
+                _ => {
+                    return DspCapabilitySet {
+                        dac_id: None,
+                        alsa_card_hint: None,
+                        advanced_settings_enabled: false,
+                        controls: Vec::new(),
+                        diagnostics: Vec::new(),
+                    };
+                }
+            };
+        let dac_id = match self.provider.current_config().await {
+            Ok(active) => self.enrich_active_config(active).catalogue_id,
+            Err(_) => None,
+        };
+        let amixer = ProviderAsAmixer(self.provider.as_ref());
+        resolve_dsp_capabilities(
+            catalog,
+            &self.profile,
+            dac_id.as_deref(),
+            pool,
+            &amixer,
+        )
+        .await
+    }
+
+    async fn republish_dsp_capabilities(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        let state = self.resolve_and_pack_dsp_capabilities().await;
+        if let Err(e) = announcer
+            .update_state(Self::dsp_capabilities_addressing(), state)
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "update dsp_capabilities subject state failed"
+            );
         }
     }
 
@@ -489,6 +578,15 @@ impl Plugin for HardwareAudioConfigPlugin {
                     )));
                 }
             };
+            self.dsp_pool =
+                match parse_dsp_control_pool(EMBEDDED_DSP_CONTROL_POOL_TOML) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return Err(PluginError::Permanent(format!(
+                            "embedded dsp-control-pool.toml parse error: {e}"
+                        )));
+                    }
+                };
             if !self.profile_pinned {
                 self.profile = provider_pi::resolve_board_profile().await;
             }
@@ -637,6 +735,7 @@ impl HardwareAudioConfigPlugin {
         self.flip_pending_reboot(&cause).await;
         self.republish_active_config().await;
         self.republish_pending_reboot().await;
+        self.republish_dsp_capabilities().await;
         self.emit_happening(
             SELECTED_EVENT,
             serde_json::json!({
@@ -681,6 +780,7 @@ impl HardwareAudioConfigPlugin {
         }
         self.republish_active_config().await;
         self.republish_pending_reboot().await;
+        self.republish_dsp_capabilities().await;
         self.emit_happening(
             CLEARED_EVENT,
             serde_json::json!({
@@ -815,6 +915,29 @@ struct SelectDacPayload {
 impl HasPayloadVersion for SelectDacPayload {
     fn payload_version(&self) -> u32 {
         self.v
+    }
+}
+
+// =============================================================
+// Provider -> AmixerReader bridge
+// =============================================================
+
+/// Thin wrapper letting [`resolve_dsp_capabilities`] consume a
+/// [`HardwareAudioProvider`] reference through its [`AmixerReader`]
+/// supertrait. The bridge exists because trait upcasting from
+/// `&dyn HardwareAudioProvider` to `&dyn AmixerReader` stabilises
+/// after the MSRV pinned for this workspace.
+struct ProviderAsAmixer<'a>(&'a dyn HardwareAudioProvider);
+
+impl<'a> AmixerReader for ProviderAsAmixer<'a> {
+    fn read_control<'b>(
+        &'b self,
+        card_hint: &'b str,
+        control_name: &'b str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = AmixerReadOutcome> + Send + 'b>,
+    > {
+        self.0.read_control(card_hint, control_name)
     }
 }
 
