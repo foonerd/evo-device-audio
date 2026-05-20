@@ -67,6 +67,7 @@ pub mod import;
 pub mod modder;
 pub mod provider;
 pub mod provider_pi;
+pub mod provider_rockchip;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -205,8 +206,11 @@ fn plugin_crate_version() -> semver::Version {
 fn make_provider(provider_key: &str) -> Arc<dyn HardwareAudioProvider> {
     match provider_key {
         "pi" => Arc::new(PiProvider::new()),
-        // "rockchip" / other board-class keys land here as
-        // NoopProvider until their concrete impls are wired in.
+        "rockchip" => {
+            Arc::new(crate::provider_rockchip::RockchipProvider::new())
+        }
+        // Future board-class keys land here as NoopProvider until
+        // their concrete impls are wired in.
         _ => Arc::new(NoopProvider::default()),
     }
 }
@@ -1685,13 +1689,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn make_provider_dispatches_rockchip_key_to_rockchip_provider() {
+        let provider = make_provider("rockchip");
+        assert_eq!(provider.board_profile().await.expect("ok"), "Tinkerboard");
+    }
+
+    #[tokio::test]
     async fn make_provider_unknown_key_falls_back_to_noop() {
         // The dispatch table is the source of truth; unknown keys
         // (a future board class declared in the catalogue before
         // the runtime impl lands) must not panic admission — they
         // resolve to NoopProvider so the operator sees an empty
         // DAC list + NotApplicable writes rather than a refusal.
-        let provider = make_provider("rockchip");
+        let provider = make_provider("future-board-class");
         assert_eq!(provider.board_profile().await.expect("ok"), "Unknown");
     }
 

@@ -96,11 +96,14 @@ pub fn import_volumio_to_evo_catalog(
 }
 
 /// Map a Volumio board-class name to the evo-native provider key.
-/// Pi → `pi` (PiProvider with dtoverlay management); every other
-/// class → `noop` until a concrete provider lands on the rig.
+/// Pi → `pi` (PiProvider with dtoverlay management);
+/// Tinkerboard → `rockchip` (RockchipProvider against
+/// `/boot/hw_intf.conf`); every other class → `noop` until a
+/// concrete provider lands on the rig.
 fn pick_provider(board_name: &str) -> String {
     match board_name {
         "Raspberry PI" => "pi".to_string(),
+        "Tinkerboard" => "rockchip".to_string(),
         _ => "noop".to_string(),
     }
 }
@@ -306,10 +309,16 @@ mod tests {
             .find(|b| b.name == "Raspberry PI")
             .expect("Pi board");
         assert_eq!(pi.provider, "pi");
-        // Other boards (Odroid C1+, Sparky, Tinkerboard) get the
-        // noop provider until concrete providers land on the rig.
+        let tinker = catalog
+            .boards
+            .iter()
+            .find(|b| b.name == "Tinkerboard")
+            .expect("Tinkerboard board");
+        assert_eq!(tinker.provider, "rockchip");
+        // Every other class (Odroid C1+, Sparky) still resolves
+        // to noop until a concrete provider lands on the rig.
         for board in &catalog.boards {
-            if board.name != "Raspberry PI" {
+            if board.name != "Raspberry PI" && board.name != "Tinkerboard" {
                 assert_eq!(
                     board.provider, "noop",
                     "board {} should default to noop provider until concrete impl lands",

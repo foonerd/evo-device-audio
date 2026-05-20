@@ -237,9 +237,12 @@ pub const PI_I2C_DEV_MODULES_FILE: &str =
     "/etc/modules-load.d/evo-i2c-dev.conf";
 
 /// Resolve the host's board profile by reading
-/// `/proc/device-tree/model` (Pi exposes the model string here) and
-/// falling back to `/proc/cpuinfo`'s Model line. Honours the
-/// `EVO_HARDWARE_AUDIO_PROFILE` override.
+/// `/proc/device-tree/model` (most boards expose the model string
+/// here) and falling back to `/proc/cpuinfo`'s Model line. Honours
+/// the `EVO_HARDWARE_AUDIO_PROFILE` override. Returns the
+/// catalogue board-name string (`"Raspberry PI"`, `"Tinkerboard"`)
+/// the plugin uses to look up the right provider; `"Unknown"`
+/// when no marker matches.
 pub async fn resolve_board_profile() -> String {
     if let Ok(override_profile) = std::env::var("EVO_HARDWARE_AUDIO_PROFILE") {
         if !override_profile.is_empty() {
@@ -253,12 +256,21 @@ pub async fn resolve_board_profile() -> String {
         if model_trim.contains("Raspberry Pi") {
             return "Raspberry PI".into();
         }
+        if model_trim.contains("Tinker Board")
+            || model_trim.contains("Tinkerboard")
+        {
+            return "Tinkerboard".into();
+        }
     }
     if let Ok(cpuinfo) = tokio::fs::read_to_string("/proc/cpuinfo").await {
         for line in cpuinfo.lines() {
             if let Some(rest) = line.strip_prefix("Model") {
                 if rest.contains("Raspberry Pi") {
                     return "Raspberry PI".into();
+                }
+                if rest.contains("Tinker Board") || rest.contains("Tinkerboard")
+                {
+                    return "Tinkerboard".into();
                 }
             }
         }
