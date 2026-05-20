@@ -843,6 +843,52 @@ if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
         "$SYSTEMCTL_BIN" restart mpd.service
         echo "[bootstrap] restarted mpd.service to pick up pcm.evo"
     fi
+
+    # Create /etc/asound.d/ owned by the steward service user
+    # so the delivery.alsa plugin can atomic-write the
+    # operator-options drop-in at runtime without sudoers
+    # escalation. The drop-in path is the canonical override
+    # surface for operator-tunable pcm.evo settings
+    # (mixer type, output device, resampling target); the base
+    # /etc/asound.conf above includes it via the
+    # `<configfile>` directive, so ALSA's PCM-open re-read
+    # picks up the operator change on the next play /
+    # pause-resume cycle.
+    #
+    # `mode 0775 root:<service-user>` lets the service user
+    # write files into the directory while still allowing
+    # operator-readable inspection via standard tooling
+    # (`cat /etc/asound.d/evo-options.conf`). The directory
+    # itself is owned root:<service-user> rather than fully
+    # service-owned so an accidental `chown -R` against the
+    # service user's home directory cannot reparent the
+    # directory and break the drop-in path.
+    install -d -m 0775 -o root -g "$SERVICE_USER" /etc/asound.d
+    echo "[bootstrap] ensured /etc/asound.d/ (mode 0775, owner root:$SERVICE_USER)"
+
+    # Seed an empty operator-options drop-in so the base
+    # asound.conf's `<configfile>` include never fails to
+    # parse on a fresh install. The delivery.alsa plugin
+    # atomic-overwrites this file at runtime on every operator
+    # gesture against the playback.options settings surface;
+    # the seed body is a single header comment naming the
+    # canonical writer so an operator who reads the file
+    # pre-first-edit understands it is plugin-managed.
+    EVO_OPTIONS_DROPIN_PATH="/etc/asound.d/evo-options.conf"
+    if [[ ! -f "$EVO_OPTIONS_DROPIN_PATH" ]]; then
+        {
+            echo "# Operator-options ALSA drop-in for evo-device-audio."
+            echo "# Plugin-managed: org.evoframework.delivery.alsa rewrites"
+            echo "# this file atomically on every operator gesture against"
+            echo "# the playback.options settings surface. Empty on a"
+            echo "# fresh install (no operator gestures yet); the"
+            echo "# bootstrap-installed baseline pcm.evo in"
+            echo "# /etc/asound.conf is the active definition until the"
+            echo "# first override is written."
+        } | install -m 0664 -o root -g "$SERVICE_USER" /dev/stdin \
+            "$EVO_OPTIONS_DROPIN_PATH"
+        echo "[bootstrap] seeded empty $EVO_OPTIONS_DROPIN_PATH"
+    fi
 else
     echo "[bootstrap] EVO_INSTALL_ASOUND_CONF=0 — skipping asound.conf"
 fi

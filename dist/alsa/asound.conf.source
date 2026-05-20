@@ -84,3 +84,20 @@ ctl.evo {
     type hw
     card "@EVO_AUDIO_CARD@"
 }
+
+# NOTE: the operator-options drop-in (/etc/asound.d/evo-options.conf)
+# is NOT included on the source-host variant. The source's
+# `pcm.evo` is structurally different from the
+# receiver/standalone baseline (route plugin fanning out to
+# snd-aloop + local DAC simultaneously); blindly overriding
+# `pcm.evo` from the operator-options drop-in would break
+# the multi-room fan-out shape. Source-host operators tune
+# mixer-type and output-device via the playback.options
+# wire-op surface; the subject-substrate update still
+# persists + emits happenings the operator can observe in
+# the journal. The audible reconfiguration on the source-
+# host re-derives from the operator-edited
+# `/etc/asound.conf.source` template on the next
+# bootstrap.sh run. Receiver/standalone installs read the
+# include and pick up the drop-in's `pcm.evo` override
+# immediately on the next PCM open.
