@@ -124,7 +124,7 @@ OOP_PLUGINS=(
     "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
     "org.evoframework.playback.options:org-evoframework-playback-options:playback-options-wire:"
     "org.evoframework.composition.alsa:org-evoframework-composition-alsa:composition-alsa-wire:alsa-substrate"
-    "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:alsa-substrate"
+    "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:"
     "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
     "org.evoframework.multiroom.evo-native:org-evoframework-multiroom-evo-native:multiroom-evo-native-wire:alsa-substrate"
 )
