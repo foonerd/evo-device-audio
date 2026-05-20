@@ -1,0 +1,357 @@
+# Curated DSP control pool — evo-native schema for the ALSA mixer
+# controls the DSP capability resolver may surface.
+#
+# This file is the LOAD-BEARING shipped artefact for the DSP
+# capability resolver's middle layer (catalog dsp_options[] →
+# curated pool → live amixer cget; see ADR-0132 §Decision 2).
+#
+# Each entry binds an ALSA mixer-control name to operator-facing
+# metadata that the runtime cannot recover from amixer
+# introspection alone — human label, recommended default,
+# apply-semantics, description. The runtime composes pool entries
+# with live amixer current-value reads to publish the
+# `evo.hardware.audio:dsp_capabilities` subject; unknown controls
+# (not in the pool) surface with `bound = true` and the raw mixer-
+# control name as the human label, never silently disappearing.
+#
+# Per ADR-0132 §Decision 2: future updates ship with plugin
+# releases. An online reference pool source is a recorded
+# future-architecture extension, not v0.1.13 scope.
+#
+# Curated controls land in this file when:
+#   1. Any DAC in data/evo-catalog.toml `dsp_options[]` references
+#      the name (the entry resolves an existing reference), OR
+#   2. The control has appeared in the audiophile-grade reference
+#      literature (HiFiBerry / Allo / TauDAC / Audiophonics docs)
+#      and is reasonable to surface when present on the bound card.
+#
+# Provenance is recorded per-entry. The pool DOES NOT presume a
+# control exists on any given bound card — that's the third layer
+# (amixer introspection) producing `bound = false` for declared-
+# but-not-exposed controls with an operator-readable diagnostic.
+
+schema_version = 1
+
+# =============================================================
+# DAC-onboard DSP program selectors
+# =============================================================
+
+[[controls]]
+name = "DSP Program"
+human_label = "DSP Program"
+type = "enum"
+known_values = ["None", "DAC", "DAC+Headphone", "Headphone", "Mute"]
+recommended_default = "None"
+apply_semantics = "hot_apply"
+description = "Selects the DSP routing program loaded on the DAC's onboard SHARC / DSP block. 'None' bypasses the DSP entirely (audiophile bit-perfect path); other modes apply card-specific signal routing."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Anti-alias / reconstruction-filter selection (audiophile core)
+# =============================================================
+
+[[controls]]
+name = "FIR Filter Type"
+human_label = "FIR Filter (anti-alias)"
+type = "enum"
+known_values = ["Fast Roll-Off", "Slow Roll-Off", "Apodizing", "Minimum Phase"]
+recommended_default = "Slow Roll-Off"
+apply_semantics = "hot_apply"
+description = "Anti-alias filter shape near the Nyquist frequency. Slow roll-off preserves transient response at the cost of stop-band rejection; minimum-phase preserves time-domain coherence (audiophile preference). Hot-applied on most DACs."
+provenance_seed = "volumio:dac_dsp.json"
+
+[[controls]]
+name = "IIR Filter Select"
+human_label = "IIR Filter (reconstruction)"
+type = "enum"
+known_values = ["Linear Phase", "Minimum Phase"]
+recommended_default = "Linear Phase"
+apply_semantics = "hot_apply"
+description = "Reconstruction-filter family. Linear-phase preserves magnitude response (textbook); minimum-phase eliminates pre-ringing at the cost of slight phase shift. Audiophile preference territory."
+provenance_seed = "volumio:dac_dsp.json"
+
+[[controls]]
+name = "Filter"
+human_label = "Reconstruction Filter"
+type = "enum"
+known_values = ["Linear Phase Fast", "Linear Phase Slow", "Minimum Phase Fast", "Minimum Phase Slow", "Apodizing", "Hybrid", "Brickwall"]
+recommended_default = "Linear Phase Fast"
+apply_semantics = "hot_apply"
+description = "Generic reconstruction-filter selector. The pool's exhaustive value list is the union across known chipsets; runtime amixer introspection narrows to what the bound card actually exposes."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Deemphasis (legacy-format support)
+# =============================================================
+
+[[controls]]
+name = "Deemphasis"
+human_label = "Deemphasis"
+type = "boolean"
+recommended_default = false
+apply_semantics = "hot_apply"
+description = "Applies inverse 50/15 us pre-emphasis curve. Engage ONLY for pre-CD-era recordings (master tapes / early CDs mastered with emphasis); leave off for modern material. Most operators never touch this."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# DSD-over-PCM (DSD transport)
+# =============================================================
+
+[[controls]]
+name = "DoP"
+human_label = "DSD-over-PCM (DoP)"
+type = "boolean"
+recommended_default = false
+apply_semantics = "hot_apply"
+description = "Encodes DSD bitstream inside PCM frames so DAC chips that natively decode DSD receive it through the PCM transport. Engage when the source library carries DSD AND the bound card declares DSD capability."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Sub-channel mixing (Allo Piano 2.1 family)
+# =============================================================
+
+[[controls]]
+name = "Subwoofer mode"
+human_label = "Subwoofer Mode"
+type = "enum"
+known_values = ["Bypass", "Sub", "Stereo"]
+recommended_default = "Bypass"
+apply_semantics = "hot_apply"
+description = "Allo Piano 2.1 family: selects how the DAC's secondary channel pair routes — bypass (stereo passthrough), sub (low-pass to subwoofer), stereo (full-band to a second stereo output)."
+provenance_seed = "volumio:dac_dsp.json"
+
+[[controls]]
+name = "Lowpass"
+human_label = "Subwoofer Lowpass"
+type = "enum"
+known_values = ["60 Hz", "70 Hz", "80 Hz", "90 Hz", "100 Hz", "110 Hz", "120 Hz", "130 Hz", "140 Hz", "150 Hz", "160 Hz", "170 Hz", "180 Hz", "190 Hz", "200 Hz"]
+recommended_default = "80 Hz"
+apply_semantics = "hot_apply"
+description = "Subwoofer-channel low-pass frequency. Allo Piano 2.1 family; coupled with 'Subwoofer mode = Sub'. 80 Hz is the THX-aligned crossover default."
+provenance_seed = "volumio:dac_dsp.json"
+
+[[controls]]
+name = "Dual Mode"
+human_label = "Dual-DAC Mode"
+type = "enum"
+known_values = ["None", "Mono", "Stereo", "Dual-Mono"]
+recommended_default = "None"
+apply_semantics = "hot_apply"
+description = "Allo Piano 2.1 family: dual-DAC chip operating mode. Dual-Mono drives both DAC chips with the same channel for power-sum SNR improvement; Stereo is conventional."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Clock / link health
+# =============================================================
+
+[[controls]]
+name = "Clock Missing Period"
+human_label = "Clock Missing Period (s)"
+type = "integer"
+recommended_default = 0
+apply_semantics = "hot_apply"
+description = "HiFiBerry DAC family: master-clock loss recovery timeout. 0 = use hardware default. Operators rarely change this; surfaced for diagnostic-grade workflows."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Digital output source (Digi-family cards)
+# =============================================================
+
+[[controls]]
+name = "Tx Source"
+human_label = "Digital Output Source"
+type = "enum"
+known_values = ["Player", "I2S In", "External"]
+recommended_default = "Player"
+apply_semantics = "hot_apply"
+description = "JustBoom / HiFiBerry Digi family: selects which stream the S/PDIF transmitter forwards. Player = local playback; I2S In = passthrough from upstream I2S source; External = card-specific external input."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Output protection (TauDAC and similar)
+# =============================================================
+
+[[controls]]
+name = "Anti-Clipping Mode"
+human_label = "Anti-Clipping"
+type = "enum"
+known_values = ["Off", "Light", "Medium", "Aggressive"]
+recommended_default = "Off"
+apply_semantics = "hot_apply"
+description = "TauDAC / similar: digital-domain peak limiter to prevent post-conversion clipping when source material has inter-sample peaks. 'Off' is bit-perfect; engage only when chasing peaks that the source-level limiter missed."
+provenance_seed = "volumio:dac_dsp.json"
+
+[[controls]]
+name = "Dither"
+human_label = "Dither"
+type = "enum"
+known_values = ["None", "TPDF", "Shaped"]
+recommended_default = "None"
+apply_semantics = "hot_apply"
+description = "Dither noise injection during bit-depth reduction. 'None' is bit-perfect; TPDF (triangular-PDF) is the audiophile compromise when bit-depth must reduce; shaped adds psycho-acoustic noise-shaping."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# HDMI audio format
+# =============================================================
+
+[[controls]]
+name = "hdmi audio format Function"
+human_label = "HDMI Audio Format"
+type = "enum"
+known_values = ["LPCM 2ch", "LPCM 5.1", "LPCM 7.1", "Auto"]
+recommended_default = "LPCM 2ch"
+apply_semantics = "hot_apply"
+description = "HDMI passthrough format selector. Most audiophile use cases stay on LPCM 2ch; multi-channel modes are for home-theatre integration."
+provenance_seed = "volumio:dac_dsp.json"
+
+# =============================================================
+# Headphone-amp DSP (audiophile add-on territory)
+# =============================================================
+
+[[controls]]
+name = "Headphone Out"
+human_label = "Headphone Output"
+type = "boolean"
+recommended_default = false
+apply_semantics = "hot_apply"
+description = "Engages the card's dedicated headphone amplifier output (when present). Some HATs (HiFiBerry DAC2 HD, Allo Boss2) ship with this; engaging it usually mutes the line-out."
+provenance_seed = "evo:hat-survey-2026-05"
+
+[[controls]]
+name = "Headphone Gain"
+human_label = "Headphone Gain"
+type = "enum"
+known_values = ["Low", "Medium", "High"]
+recommended_default = "Low"
+apply_semantics = "hot_apply"
+description = "Headphone-amp gain stage. Low for IEMs / sensitive headphones; high for 250+ ohm dynamic headphones. Start low and raise only as needed."
+provenance_seed = "evo:hat-survey-2026-05"
+
+# =============================================================
+# Volume / Master / Digital (the hardware-mixer controls)
+# =============================================================
+# These appear in dacs.json's `mixer` field rather than dsp_options,
+# but the pool carries them so the resolver can present them when
+# operators want to expose the hardware-mixer level through the
+# advanced surface (vs the operator-facing playback.options volume
+# slider that drives the same control transparently).
+
+[[controls]]
+name = "Master"
+human_label = "Master Volume"
+type = "db_scale"
+recommended_default = -10
+apply_semantics = "hot_apply"
+description = "Hardware-mixer master volume (dB scale). Surfaces in the advanced DSP pane for operators who want direct control alongside the playback.options volume slider that drives the same control through the volume-curve mapping."
+provenance_seed = "alsa:hardware-mixer-baseline"
+
+[[controls]]
+name = "Digital"
+human_label = "Digital Volume"
+type = "db_scale"
+recommended_default = -10
+apply_semantics = "hot_apply"
+description = "Hardware-mixer digital-domain volume (dB scale). Bit-perfect only at 0 dB; any attenuation introduces digital truncation. Pair with playback.options.mixer_type = hardware for direct control."
+provenance_seed = "alsa:hardware-mixer-baseline"
+
+[[controls]]
+name = "PCM"
+human_label = "PCM Volume"
+type = "db_scale"
+recommended_default = -10
+apply_semantics = "hot_apply"
+description = "Hardware-mixer PCM-domain volume (dB scale). Equivalent to Digital on most cards; some chipsets name it PCM to match the upstream-channel naming convention."
+provenance_seed = "alsa:hardware-mixer-baseline"
+
+# =============================================================
+# Mute / soft-mute
+# =============================================================
+
+[[controls]]
+name = "Soft Mute"
+human_label = "Soft Mute"
+type = "boolean"
+recommended_default = false
+apply_semantics = "hot_apply"
+description = "DAC's onboard soft-mute (typically a few-ms ramp). Engage to silence the output without disturbing the data stream; clearer mechanism than zeroing the master volume."
+provenance_seed = "evo:hat-survey-2026-05"
+
+[[controls]]
+name = "Auto Mute"
+human_label = "Auto Mute (silence detect)"
+type = "boolean"
+recommended_default = false
+apply_semantics = "hot_apply"
+description = "DAC's silence-detect auto-mute. When source is silent for >N samples, output ramps to mute to suppress hiss; can interfere with fade-in transients on dynamic material."
+provenance_seed = "evo:hat-survey-2026-05"
+
+# =============================================================
+# I2S / format negotiation (advanced operator territory)
+# =============================================================
+
+[[controls]]
+name = "I2S Format"
+human_label = "I2S Format"
+type = "enum"
+known_values = ["Standard", "Left-Justified", "Right-Justified", "DSP A", "DSP B"]
+recommended_default = "Standard"
+apply_semantics = "requires_restart"
+description = "I2S bus framing convention. Mismatches between source and DAC produce garbled or silent output. Almost never touched; surfaced for the diagnostic-grade modder workflow only."
+provenance_seed = "evo:hat-survey-2026-05"
+
+[[controls]]
+name = "Bit Clock Polarity"
+human_label = "Bit-Clock Polarity"
+type = "enum"
+known_values = ["Normal", "Inverted"]
+recommended_default = "Normal"
+apply_semantics = "requires_restart"
+description = "I2S bit-clock edge polarity. As with I2S Format, this is diagnostic-grade — mismatches produce silent or distorted output. Surfaced for the modder workflow only."
+provenance_seed = "evo:hat-survey-2026-05"
+
+# =============================================================
+# DSD-specific transport modes
+# =============================================================
+
+[[controls]]
+name = "DSD Mode"
+human_label = "DSD Transport Mode"
+type = "enum"
+known_values = ["PCM", "DoP", "Native DSD"]
+recommended_default = "PCM"
+apply_semantics = "requires_restart"
+description = "Selects whether the DAC chip receives DSD natively (Native DSD requires a chip+driver pair that supports it), encoded as DoP (DSD-over-PCM), or always demoted to PCM."
+provenance_seed = "evo:hat-survey-2026-05"
+
+[[controls]]
+name = "DSD Filter"
+human_label = "DSD Reconstruction Filter"
+type = "enum"
+known_values = ["50 kHz", "60 kHz", "70 kHz"]
+recommended_default = "50 kHz"
+apply_semantics = "hot_apply"
+description = "DSD reconstruction-filter cutoff. Higher cutoffs leave more out-of-band noise but capture more high-frequency detail; lower cutoffs are the safe audiophile default."
+provenance_seed = "evo:hat-survey-2026-05"
+
+# =============================================================
+# Soft-volume curve hints (some chipsets expose this directly)
+# =============================================================
+
+[[controls]]
+name = "Volume Ramp Time"
+human_label = "Volume Ramp (ms)"
+type = "integer"
+recommended_default = 50
+apply_semantics = "hot_apply"
+description = "DAC's volume-change ramp duration. Longer ramps eliminate audible clicks when changing volume; shorter ramps feel more responsive on UI gestures."
+provenance_seed = "evo:hat-survey-2026-05"
+
+[[controls]]
+name = "Phase Compensation"
+human_label = "Phase Compensation"
+type = "boolean"
+recommended_default = true
+apply_semantics = "hot_apply"
+description = "DSP-stage all-pass network that corrects group-delay variation through the reconstruction filter. On for most material; off for measurement / diagnostic purposes."
+provenance_seed = "evo:hat-survey-2026-05"
