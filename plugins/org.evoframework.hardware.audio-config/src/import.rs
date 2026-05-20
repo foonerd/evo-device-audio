@@ -8,9 +8,9 @@
 //! pins the importer's output byte-equal against the checked-in
 //! golden catalog.
 //!
-//! Per ADR-0132 §Decision 1 + §Invariant: the Volumio shape is not
-//! a runtime contract. This module is the only place evo-device-audio
-//! understands Volumio's `dacs.json` + `dac_dsp.json` shapes.
+//! The Volumio shape is not a runtime contract: this module is
+//! the only place evo-device-audio understands Volumio's
+//! `dacs.json` + `dac_dsp.json` shapes.
 
 use std::collections::HashMap;
 
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn importer_output_matches_checked_in_golden_byte_equal() {
-        // The regression-guard contract from ADR-0132 §References:
-        // re-running the importer against the frozen Volumio sources
+        // The regression-guard contract: re-running the importer
+        // against the frozen Volumio sources
         // produces byte-identical output to the checked-in golden.
         // Any drift in the importer logic OR the source JSONs OR
         // the catalog struct field order surfaces here; the

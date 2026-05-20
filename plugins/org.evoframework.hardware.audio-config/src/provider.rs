@@ -6,12 +6,15 @@
 //! / writing the boot-config dtoverlay block, installing companion
 //! module drop-ins) lives behind the [`HardwareAudioProvider`] trait.
 //!
-//! v0.1.13 ships a single concrete provider (`provider_pi::PiProvider`
-//! against Raspberry Pi config.txt). Other board classes (Rockchip,
-//! generic x86 with PCI HATs, MCU follower devices) admit through a
-//! [`NoopProvider`] that surfaces an empty catalogue + a structured
-//! "no catalogue for this board class" diagnostic; concrete providers
-//! land as the corresponding hardware reaches the reference rig.
+//! The reference distribution ships a single concrete provider
+//! ([`provider_pi::PiProvider`] against Raspberry Pi `config.txt`).
+//! Other board classes (Rockchip, generic x86 with PCI HATs,
+//! MCU-class follower devices) admit through a [`NoopProvider`]
+//! that surfaces an empty catalogue + a structured "no catalogue
+//! for this board class" diagnostic; concrete providers add as
+//! the matching hardware reaches the supported set.
+//!
+//! [`provider_pi::PiProvider`]: crate::provider_pi::PiProvider
 
 use std::future::Future;
 use std::pin::Pin;

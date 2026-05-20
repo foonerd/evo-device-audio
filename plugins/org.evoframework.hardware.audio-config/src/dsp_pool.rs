@@ -1,17 +1,16 @@
 //! Curated DSP control pool — types + loader.
 //!
 //! The pool is the middle layer of the three-layer DSP capability
-//! resolver (ADR-0132 §Decision 2): per-DAC catalog `dsp_options[]`
-//! list → curated pool entry (this module) → live `amixer cget`
-//! introspection. Pool entries carry the operator-facing metadata
-//! the runtime cannot recover from amixer alone — human label,
-//! recommended default, apply-semantics, description.
+//! resolver: per-DAC catalog `dsp_options[]` list → curated pool
+//! entry (this module) → live `amixer cget` introspection. Pool
+//! entries carry the operator-facing metadata the runtime cannot
+//! recover from amixer alone — human label, recommended default,
+//! apply-semantics, description.
 //!
-//! Per ADR-0132 §Invariant: unknown controls (declared in catalog
-//! but not present in this pool) surface in the runtime
-//! `dsp_capabilities` subject with the raw mixer-control name as
-//! the human label and `unbound_pool_entry = true`. They are never
-//! silently dropped.
+//! Unknown controls (declared in catalog but not present in this
+//! pool) surface in the runtime `dsp_capabilities` subject with the
+//! raw mixer-control name as the human label and
+//! `unbound_pool_entry = true`. They are never silently dropped.
 
 use std::collections::HashMap;
 
@@ -20,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Top-level pool shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DspControlPool {
-    /// Pool schema version. Pinned at 1 for v0.1.13.
+    /// Pool schema version. Pinned at 1 for this release line.
     pub schema_version: u32,
     /// Per-control schema entries.
     #[serde(default)]
@@ -157,7 +156,7 @@ mod tests {
         assert_eq!(pool.schema_version, 1);
         assert!(
             pool.controls.len() >= 25,
-            "expected the v0.1.13 pool to ship at least ~25 controls; found {}",
+            "expected the shipped pool to carry at least ~25 controls; found {}",
             pool.controls.len()
         );
     }
@@ -192,10 +191,10 @@ mod tests {
 
     #[test]
     fn every_catalog_dsp_option_resolves_in_pool() {
-        // Per ADR-0132 §Invariant: unknown controls (declared in
-        // catalog but absent from pool) surface as
-        // `unbound_pool_entry` at the resolver layer — they are
-        // not silent failures. This test pins that EVERY DSP option
+        // Unknown controls (declared in catalog but absent from
+        // pool) surface as `unbound_pool_entry` at the resolver
+        // layer — they are not silent failures. This test pins
+        // that EVERY DSP option
         // currently referenced by ANY catalog DAC has a matching
         // pool entry; new catalog entries that introduce a control
         // not in the pool fail this gate and force the pool author
