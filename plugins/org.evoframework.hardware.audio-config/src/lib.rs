@@ -85,6 +85,12 @@ use crate::dsp::{
 };
 use crate::dsp_pool::{parse_dsp_control_pool, DspControlPool};
 use crate::evo_catalog::{parse_evo_catalog, DacEntry, EvoCatalog};
+use crate::modder::{
+    check_hash_against_allowlist, compute_dtbo_hash,
+    merge_user_overlay_into_catalog, validate_confirmation_token,
+    verify_allowlist_signature, ModderError, ModderSurfaceState,
+    SignedAllowlist, UserOverlayRow, UserOverlayState,
+};
 use crate::provider::{
     ActiveConfig, ApplyOutcome, HardwareAudioProvider, NoopProvider,
 };
@@ -129,6 +135,7 @@ const SUBJECT_VALUE_CAPABILITIES: &str = "capabilities";
 const SUBJECT_VALUE_ACTIVE_CONFIG: &str = "active_config";
 const SUBJECT_VALUE_PENDING_REBOOT: &str = "pending_reboot";
 const SUBJECT_VALUE_DSP_CAPABILITIES: &str = "dsp_capabilities";
+const SUBJECT_VALUE_MODDER_OVERLAYS: &str = "modder_overlays";
 
 /// Subject types the framework records. Underscored form because
 /// the catalogue parser rejects subject-type names containing `.`.
@@ -136,6 +143,7 @@ const SUBJECT_TYPE_CAPABILITIES: &str = "hardware_audio_capabilities";
 const SUBJECT_TYPE_ACTIVE_CONFIG: &str = "hardware_audio_active_config";
 const SUBJECT_TYPE_PENDING_REBOOT: &str = "hardware_audio_pending_reboot";
 const SUBJECT_TYPE_DSP_CAPABILITIES: &str = "hardware_audio_dsp_capabilities";
+const SUBJECT_TYPE_MODDER_OVERLAYS: &str = "hardware_audio_modder_overlays";
 
 /// Request types this plugin honours. Lockstep-matched against
 /// `manifest.toml` [capabilities.respondent].request_types by the
@@ -149,12 +157,28 @@ const REQUEST_TYPES: &[&str] = &[
     "hardware.audio.dsp.list_controls",
     "hardware.audio.dsp.get_control",
     "hardware.audio.dsp.set_control",
+    "hardware.audio.modder.list_overlays",
+    "hardware.audio.modder.register_overlay",
+    "hardware.audio.modder.remove_overlay",
 ];
 
 /// Happening event_type emitted on every successful
 /// hardware.audio.dsp.set_control gesture. Downstream consumers
 /// serialise their rebind work against this signal.
 const DSP_CONTROL_CHANGED_EVENT: &str = "hardware.audio.dsp.control_changed";
+
+/// Happening event_type emitted on successful register_overlay.
+const MODDER_OVERLAY_REGISTERED_EVENT: &str =
+    "hardware.audio.modder.overlay_registered";
+
+/// Happening event_type emitted on successful remove_overlay.
+const MODDER_OVERLAY_REMOVED_EVENT: &str =
+    "hardware.audio.modder.overlay_removed";
+
+/// Happening event_type emitted on refused register / remove
+/// gestures (carries the structured variant string).
+const MODDER_OVERLAY_REFUSED_EVENT: &str =
+    "hardware.audio.modder.overlay_refused";
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -185,6 +209,21 @@ pub struct HardwareAudioConfigPlugin {
     happening_emitter: Option<Arc<dyn HappeningEmitter>>,
     subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
     requests_handled: u64,
+    /// Modder surface state — distribution-tier config flag.
+    /// Showcase distributions default to Enabled; vendor
+    /// distributions override to Disabled via the plugin's
+    /// `/etc/evo/plugins.d/<name>.toml` config.
+    modder_state: ModderSurfaceState,
+    /// Operator-signed DTBO allowlist, loaded from disk at
+    /// admission when present. `None` when the allowlist is
+    /// absent or its signature does not verify; every modder
+    /// gesture refuses with the appropriate variant in that
+    /// case.
+    modder_allowlist: Arc<RwLock<Option<SignedAllowlist>>>,
+    /// Registered user-overlay catalog rows (each paired with
+    /// its activation state). Refreshed on every successful
+    /// register_overlay / remove_overlay.
+    modder_overlays: Arc<RwLock<Vec<(UserOverlayRow, UserOverlayState)>>>,
 }
 
 /// `evo.hardware.audio:pending_reboot` subject payload + the in-
@@ -223,6 +262,9 @@ impl HardwareAudioConfigPlugin {
             happening_emitter: None,
             subject_announcer: None,
             requests_handled: 0,
+            modder_state: ModderSurfaceState::default(),
+            modder_allowlist: Arc::new(RwLock::new(None)),
+            modder_overlays: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -324,6 +366,13 @@ impl HardwareAudioConfigPlugin {
         }
     }
 
+    fn modder_overlays_addressing() -> ExternalAddressing {
+        ExternalAddressing {
+            scheme: SUBJECT_SCHEME.to_string(),
+            value: SUBJECT_VALUE_MODDER_OVERLAYS.to_string(),
+        }
+    }
+
     fn capabilities_state(&self) -> serde_json::Value {
         serde_json::json!({
             "v": PAYLOAD_VERSION,
@@ -362,6 +411,11 @@ impl HardwareAudioConfigPlugin {
                 SUBJECT_TYPE_DSP_CAPABILITIES,
                 Self::dsp_capabilities_addressing(),
                 self.resolve_and_pack_dsp_capabilities().await,
+            ),
+            (
+                SUBJECT_TYPE_MODDER_OVERLAYS,
+                Self::modder_overlays_addressing(),
+                self.modder_overlays_state().await,
             ),
         ];
         for (subject_type, addressing, state) in announces {
@@ -442,6 +496,53 @@ impl HardwareAudioConfigPlugin {
                 plugin = PLUGIN_NAME,
                 error = %e,
                 "update dsp_capabilities subject state failed"
+            );
+        }
+    }
+
+    /// Pack the modder-overlays subject payload from the
+    /// plugin's current state. Includes the distribution-tier
+    /// surface flag, the allowlist status (absent / loaded /
+    /// signature-failed), and the per-overlay rows with their
+    /// activation states.
+    async fn modder_overlays_state(&self) -> serde_json::Value {
+        let overlays_guard = self.modder_overlays.read().await;
+        let allowlist_guard = self.modder_allowlist.read().await;
+        let entries: Vec<serde_json::Value> = overlays_guard
+            .iter()
+            .map(|(row, state)| {
+                serde_json::json!({
+                    "row": row,
+                    "state": state,
+                })
+            })
+            .collect();
+        let allowlist_status = if allowlist_guard.is_some() {
+            "loaded"
+        } else {
+            "absent"
+        };
+        serde_json::json!({
+            "v": PAYLOAD_VERSION,
+            "surface_state": self.modder_state,
+            "allowlist_status": allowlist_status,
+            "overlays": entries,
+        })
+    }
+
+    async fn republish_modder_overlays(&self) {
+        let Some(announcer) = self.subject_announcer.as_ref() else {
+            return;
+        };
+        let state = self.modder_overlays_state().await;
+        if let Err(e) = announcer
+            .update_state(Self::modder_overlays_addressing(), state)
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "update modder_overlays subject state failed"
             );
         }
     }
@@ -699,6 +800,15 @@ impl Respondent for HardwareAudioConfigPlugin {
                 }
                 "hardware.audio.dsp.set_control" => {
                     self.handle_dsp_set_control(req).await
+                }
+                "hardware.audio.modder.list_overlays" => {
+                    self.handle_modder_list_overlays(req).await
+                }
+                "hardware.audio.modder.register_overlay" => {
+                    self.handle_modder_register_overlay(req).await
+                }
+                "hardware.audio.modder.remove_overlay" => {
+                    self.handle_modder_remove_overlay(req).await
                 }
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired"
@@ -1009,6 +1119,167 @@ impl HardwareAudioConfigPlugin {
             }),
         )
     }
+
+    // =============================================================
+    // Modder wire-op handlers
+    // =============================================================
+
+    async fn handle_modder_list_overlays(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        let state = self.modder_overlays_state().await;
+        encode(req, &state)
+    }
+
+    async fn handle_modder_register_overlay(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: RegisterOverlayPayload = parse_versioned(req)?;
+        let outcome = self.try_register_overlay(&payload).await;
+        match outcome {
+            Ok(()) => {
+                self.republish_modder_overlays().await;
+                self.emit_happening(
+                    MODDER_OVERLAY_REGISTERED_EVENT,
+                    serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "id": payload.row.id,
+                    }),
+                )
+                .await;
+                encode(
+                    req,
+                    &serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "status": "ok",
+                    }),
+                )
+            }
+            Err(e) => {
+                self.emit_happening(
+                    MODDER_OVERLAY_REFUSED_EVENT,
+                    serde_json::json!({
+                        "v": PAYLOAD_VERSION,
+                        "id": payload.row.id,
+                        "reason": e.to_string(),
+                    }),
+                )
+                .await;
+                Err(PluginError::Permanent(e.to_string()))
+            }
+        }
+    }
+
+    async fn try_register_overlay(
+        &self,
+        payload: &RegisterOverlayPayload,
+    ) -> Result<(), ModderError> {
+        // (1) Distribution-tier surface guard.
+        self.modder_state.guard_or_refuse()?;
+        // (2) Confirmation-token gate (two-step confirm).
+        validate_confirmation_token(
+            &payload.confirmation_token,
+            &payload.row.id,
+        )?;
+        // (3) Compute hash of supplied DTBO blob + verify against
+        // operator-supplied digest.
+        let computed = compute_dtbo_hash(&payload.dtbo_bytes);
+        if computed != payload.dtbo_sha256_hex {
+            return Err(ModderError::DigestMismatch(format!(
+                "computed {computed}; supplied {}",
+                payload.dtbo_sha256_hex
+            )));
+        }
+        if payload.row.dtbo_sha256_hex != computed {
+            return Err(ModderError::DigestMismatch(format!(
+                "row's declared dtbo_sha256_hex {} does not match computed {computed}",
+                payload.row.dtbo_sha256_hex
+            )));
+        }
+        // (4) Allowlist gate.
+        let allowlist_guard = self.modder_allowlist.read().await;
+        let allowlist = allowlist_guard.as_ref().ok_or_else(|| {
+            ModderError::AllowlistEntryMissing(
+                "no allowlist loaded; install /etc/evo/hardware/audio/overlays/allowlist.signed".into(),
+            )
+        })?;
+        verify_allowlist_signature(allowlist)?;
+        check_hash_against_allowlist(allowlist, &computed)?;
+        drop(allowlist_guard);
+        // (5) Merge gate — verify the new row composes with the
+        // base catalog (refuses on collision-without-override or
+        // override-against-locked-base).
+        let base = self.catalogue.as_ref().ok_or_else(|| {
+            ModderError::CollidesWithBaseCatalog(
+                "base catalog not loaded; plugin admission incomplete".into(),
+            )
+        })?;
+        let _merged = merge_user_overlay_into_catalog(base, &payload.row)?;
+        // (6) Record the row in the in-memory overlays list with
+        // Active state. Filesystem persistence + DTBO install land
+        // in the next sub-phase; this commit accepts the
+        // operator's register gesture into memory + emits the
+        // happening + republishes the subject.
+        let mut overlays = self.modder_overlays.write().await;
+        overlays.retain(|(row, _)| row.id != payload.row.id);
+        overlays.push((payload.row.clone(), UserOverlayState::Active));
+        Ok(())
+    }
+
+    async fn handle_modder_remove_overlay(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: RemoveOverlayPayload = parse_versioned(req)?;
+        self.modder_state
+            .guard_or_refuse()
+            .map_err(|e| PluginError::Permanent(e.to_string()))?;
+        // Refuse if the overlay is currently active in the boot-
+        // config managed block (operator must clear_dac or select
+        // a different DAC first).
+        if let Ok(active) = self.provider.current_config().await {
+            let mut overlays = self.modder_overlays.write().await;
+            if let Some((row, _)) =
+                overlays.iter().find(|(r, _)| r.id == payload.id)
+            {
+                if !active.overlay.is_empty() && active.overlay == row.overlay {
+                    return Err(PluginError::Permanent(format!(
+                        "OverlayActive: overlay {:?} is currently bound; \
+                         clear_dac or select a different DAC first",
+                        payload.id
+                    )));
+                }
+            }
+            let before = overlays.len();
+            overlays.retain(|(row, _)| row.id != payload.id);
+            if overlays.len() == before {
+                return Err(PluginError::Permanent(format!(
+                    "AllowlistEntryMissing: no registered overlay with id {:?}",
+                    payload.id
+                )));
+            }
+            drop(overlays);
+        }
+        self.republish_modder_overlays().await;
+        self.emit_happening(
+            MODDER_OVERLAY_REMOVED_EVENT,
+            serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "id": payload.id,
+            }),
+        )
+        .await;
+        encode(
+            req,
+            &serde_json::json!({
+                "v": PAYLOAD_VERSION,
+                "status": "ok",
+            }),
+        )
+    }
 }
 
 /// Decode the operator-supplied JSON payload value into the typed
@@ -1189,6 +1460,46 @@ struct DspSetControlPayload {
 }
 
 impl HasPayloadVersion for DspSetControlPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterOverlayPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// User-overlay catalog row metadata.
+    row: UserOverlayRow,
+    /// SHA-256 digest of the supplied DTBO blob, hex-encoded.
+    /// Plugin recomputes the hash from `dtbo_bytes` and refuses
+    /// on mismatch (DigestMismatch). The row's
+    /// `dtbo_sha256_hex` MUST also match.
+    dtbo_sha256_hex: String,
+    /// Raw DTBO blob bytes. Plugin hashes + verifies + persists
+    /// (in the follow-on filesystem-integration step).
+    #[serde(default)]
+    dtbo_bytes: Vec<u8>,
+    /// Two-step-confirm token. Must equal the literal
+    /// `CONFIRM:<row.id>`.
+    confirmation_token: String,
+}
+
+impl HasPayloadVersion for RegisterOverlayPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveOverlayPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    /// Catalog id of the registered overlay to remove.
+    id: String,
+}
+
+impl HasPayloadVersion for RemoveOverlayPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -1614,6 +1925,210 @@ mod tests {
                 assert!(msg.contains("boolean"));
             }
             other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    // ===== Modder wire ops =====
+
+    #[tokio::test]
+    async fn modder_list_overlays_returns_empty_state_initially() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        let resp = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.list_overlays",
+                serde_json::json!({ "v": 1 }),
+            ))
+            .await
+            .expect("list ok");
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["allowlist_status"], "absent");
+        assert_eq!(v["overlays"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn modder_register_refuses_when_surface_disabled() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        p.modder_state = crate::modder::ModderSurfaceState::Disabled;
+        let err = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.register_overlay",
+                serde_json::json!({
+                    "v": 1,
+                    "row": {
+                        "id": "test",
+                        "display_name": "Test",
+                        "board_profile": "Raspberry PI",
+                        "overlay": "test-overlay",
+                        "dtbo_sha256_hex": "00".repeat(32),
+                    },
+                    "dtbo_sha256_hex": "00".repeat(32),
+                    "dtbo_bytes": [],
+                    "confirmation_token": "CONFIRM:test",
+                }),
+            ))
+            .await
+            .unwrap_err();
+        if let PluginError::Permanent(msg) = err {
+            assert!(
+                msg.contains("AdvancedSettingsDisabled"),
+                "want AdvancedSettingsDisabled, got: {msg}"
+            );
+        } else {
+            panic!("expected Permanent");
+        }
+    }
+
+    #[tokio::test]
+    async fn modder_register_refuses_on_confirmation_token_mismatch() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        let err = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.register_overlay",
+                serde_json::json!({
+                    "v": 1,
+                    "row": {
+                        "id": "test",
+                        "display_name": "Test",
+                        "board_profile": "Raspberry PI",
+                        "overlay": "test-overlay",
+                        "dtbo_sha256_hex": "00".repeat(32),
+                    },
+                    "dtbo_sha256_hex": "00".repeat(32),
+                    "dtbo_bytes": [],
+                    "confirmation_token": "CONFIRM:wrong",
+                }),
+            ))
+            .await
+            .unwrap_err();
+        if let PluginError::Permanent(msg) = err {
+            assert!(msg.contains("ConfirmationTokenMismatch"));
+        } else {
+            panic!("expected Permanent");
+        }
+    }
+
+    #[tokio::test]
+    async fn modder_register_refuses_when_allowlist_missing() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        let blob = b"my dtbo blob bytes";
+        let hash = crate::modder::compute_dtbo_hash(blob);
+        let err = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.register_overlay",
+                serde_json::json!({
+                    "v": 1,
+                    "row": {
+                        "id": "test",
+                        "display_name": "Test",
+                        "board_profile": "Raspberry PI",
+                        "overlay": "test-overlay",
+                        "dtbo_sha256_hex": hash,
+                    },
+                    "dtbo_sha256_hex": hash,
+                    "dtbo_bytes": blob,
+                    "confirmation_token": "CONFIRM:test",
+                }),
+            ))
+            .await
+            .unwrap_err();
+        if let PluginError::Permanent(msg) = err {
+            assert!(
+                msg.contains("AllowlistEntryMissing"),
+                "want AllowlistEntryMissing, got: {msg}"
+            );
+        } else {
+            panic!("expected Permanent");
+        }
+    }
+
+    #[tokio::test]
+    async fn modder_register_refuses_on_digest_mismatch() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        let blob = b"actual blob";
+        let wrong_hash = "00".repeat(32);
+        let err = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.register_overlay",
+                serde_json::json!({
+                    "v": 1,
+                    "row": {
+                        "id": "test",
+                        "display_name": "Test",
+                        "board_profile": "Raspberry PI",
+                        "overlay": "test-overlay",
+                        "dtbo_sha256_hex": wrong_hash,
+                    },
+                    "dtbo_sha256_hex": wrong_hash,
+                    "dtbo_bytes": blob,
+                    "confirmation_token": "CONFIRM:test",
+                }),
+            ))
+            .await
+            .unwrap_err();
+        if let PluginError::Permanent(msg) = err {
+            assert!(msg.contains("DigestMismatch"));
+        } else {
+            panic!("expected Permanent");
+        }
+    }
+
+    #[tokio::test]
+    async fn modder_remove_refuses_unknown_id() {
+        let mut p =
+            HardwareAudioConfigPlugin::new().with_profile("Raspberry PI");
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+        let err = p
+            .handle_request(&dsp_request(
+                "hardware.audio.modder.remove_overlay",
+                serde_json::json!({
+                    "v": 1,
+                    "id": "no-such-overlay",
+                }),
+            ))
+            .await
+            .unwrap_err();
+        if let PluginError::Permanent(msg) = err {
+            assert!(msg.contains("AllowlistEntryMissing"));
+        } else {
+            panic!("expected Permanent");
+        }
+    }
+
+    #[test]
+    fn manifest_modder_request_types_present() {
+        let m = manifest();
+        let resp = m
+            .capabilities
+            .respondent
+            .as_ref()
+            .expect("respondent declared");
+        for verb in [
+            "hardware.audio.modder.list_overlays",
+            "hardware.audio.modder.register_overlay",
+            "hardware.audio.modder.remove_overlay",
+        ] {
+            assert!(
+                resp.request_types.iter().any(|t| t == verb),
+                "manifest missing {verb:?}"
+            );
         }
     }
 }

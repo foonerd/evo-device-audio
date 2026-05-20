@@ -69,5 +69,8 @@ request_types = [
     "hardware.audio.dsp.list_controls",
     "hardware.audio.dsp.get_control",
     "hardware.audio.dsp.set_control",
+    "hardware.audio.modder.list_overlays",
+    "hardware.audio.modder.register_overlay",
+    "hardware.audio.modder.remove_overlay",
 ]
 response_budget_ms = 3000
