@@ -957,6 +957,32 @@ else
 fi
 
 # ----------------------------------------------------------
+# Modder staging directory: /etc/evo/hardware/audio/overlays/
+# ----------------------------------------------------------
+# The hardware.audio-config plugin's modder workflow persists
+# operator-uploaded DTBO overlays + their TOML row metadata to
+# this directory. The plugin runs as the steward service user
+# and writes both files directly (no sudo) — the directory
+# itself is owned root:<service-user> so the plugin can write
+# but a casual chown of the service user's home does not
+# reparent the data store. Operator places the signed allowlist
+# at <dir>/allowlist.signed BEFORE running register_overlay;
+# the plugin refuses every register gesture without it.
+#
+# DTBO blobs install from staging to /boot/firmware/overlays/
+# via the narrow sudoers grant (EVO_HARDWARE_AUDIO_MODDER alias
+# in /etc/sudoers.d/evo-hardware-audio). The plugin never runs
+# as root; the grant is the sole privilege escalation surface
+# for the modder workflow.
+if [[ "${EVO_INSTALL_MODDER_DIR:-1}" != "0" ]]; then
+    install -d -m 0775 -o root -g "$SERVICE_USER" \
+        /etc/evo/hardware/audio/overlays
+    echo "[bootstrap] ensured /etc/evo/hardware/audio/overlays/ (mode 0775, owner root:$SERVICE_USER)"
+else
+    echo "[bootstrap] EVO_INSTALL_MODDER_DIR=0 — skipping modder staging directory"
+fi
+
+# ----------------------------------------------------------
 # Verification: confirm what we just installed.
 # ----------------------------------------------------------
 echo

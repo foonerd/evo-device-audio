@@ -23,6 +23,20 @@
 #    `sudo -n tee` on every operator gesture against the
 #    hardware.audio shelf.
 #
+# 3. `EVO_HARDWARE_AUDIO_MODDER` `Cmnd_Alias` — `tee` + `rm`
+#    against `/boot/firmware/overlays/*`. Used by the DIY
+#    DTBO modder workflow (hardware.audio.modder shelf)
+#    to install operator-uploaded DTBO blobs against the
+#    operator-signed allowlist. The path glob is narrow
+#    (one directory only); only files within
+#    `/boot/firmware/overlays/` are reachable through this
+#    alias. Operator-signed allowlist enforcement happens
+#    inside the plugin BEFORE the sudo invocation — the
+#    grant is the last layer; the per-DAC
+#    `advanced_settings_enabled` flag + the distribution-
+#    tier modder config flag + the SHA-256-against-
+#    signed-allowlist gate all run first.
+#
 # Both aliases are PATH-SCOPED. There is no broad sudo
 # grant: the operator's audit log keeps full records on any
 # command outside these aliases.
@@ -48,5 +62,10 @@ Cmnd_Alias EVO_HARDWARE_AUDIO_WRITE = \
     /usr/bin/tee /boot/config.txt, \
     /usr/bin/tee /etc/modules-load.d/evo-i2c-dev.conf
 
+Cmnd_Alias EVO_HARDWARE_AUDIO_MODDER = \
+    /usr/bin/tee /boot/firmware/overlays/*, \
+    /usr/bin/rm -f /boot/firmware/overlays/*
+
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_READ
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_WRITE
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_MODDER
