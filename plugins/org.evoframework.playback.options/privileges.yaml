@@ -1,7 +1,7 @@
 schema_version: "1.0"
 plugin: org.evoframework.playback.options
 owner: evo-device-audio
-isolation: in_process
+isolation: oop
 
 # In-process plugin loaded into the steward identity per
 # manifest.toml. Privileges declared here union into the steward

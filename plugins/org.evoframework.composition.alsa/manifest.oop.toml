@@ -1,0 +1,71 @@
+# Out-of-process bundle manifest for org.evoframework.composition.alsa.
+#
+# Production-shaped variant. The publish-plugin-bundles workflow
+# stages a per-target bundle directory containing this file
+# (renamed to `manifest.toml`) plus the cross-compiled
+# `composition-alsa-wire` binary as `plugin.bin`, signs with the
+# commons signing key, packs as `.tar.gz`, and pushes to
+# `foonerd/evo-device-audio-artefacts` under
+# `bundles/org.evoframework.composition.alsa/<target>/`.
+#
+# Both manifests describe the same plugin at the same version;
+# only the transport differs. A `describe_matches_oop_manifest`
+# test in `src/lib.rs` guards against drift between this file and
+# the plugin's runtime `describe()` output.
+
+[plugin]
+name = "org.evoframework.composition.alsa"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.composition"
+shape = 2
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["composition.select_mode"]
+response_budget_ms = 1000
+
+# Audio data plane: composition stage. The framework configures
+# CompositionEndpoints (input + output) and a negotiated
+# AudioFormat per topology; this plugin opens the endpoints,
+# drives audio bytes through them, and reacts to topology
+# rewires through a registered RouteChangeCallback. Audio bytes
+# never traverse the wire protocol or any SDK callback — they
+# flow exclusively through the OS-native primitive the
+# framework selected (ALSA loopback for the reference build).
+[capabilities.composition]
+input_kind = "audio.pcm"
+output_kind = "audio.pcm"
+default_mode = "passthrough"
+
+[[capabilities.composition.modes]]
+name = "passthrough"
+preserves_bit_perfect = true

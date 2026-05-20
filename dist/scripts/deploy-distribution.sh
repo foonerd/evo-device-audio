@@ -99,12 +99,14 @@ DIST_BIN="evo-device-audio"
 
 # Out-of-process plugin bundles shipped alongside the steward
 # binary. Each entry binds:
-#   <plugin-name>:<plugin-crate>:<wire-binary>
+#   <plugin-name>:<plugin-crate>:<wire-binary>:<features>
 # where <plugin-name> is the canonical name landing under
 # `/opt/evo/plugins/<plugin-name>/` on the target,
-# <plugin-crate> is the cargo `-p` package id, and
+# <plugin-crate> is the cargo `-p` package id,
 # <wire-binary> is the binary cargo emits under
-# `target/<triple>/release/`.
+# `target/<triple>/release/`, and <features> is the optional
+# `--features` arg the wire-binary cross-build receives
+# (empty when no features apply).
 #
 # Each plugin's `manifest.oop.toml` is renamed to
 # `manifest.toml` and the wire binary is renamed to
@@ -117,10 +119,40 @@ DIST_BIN="evo-device-audio"
 # walks at boot, and the install / remove / update lifecycle
 # reaches per-plugin without touching the steward binary.
 OOP_PLUGINS=(
-    "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire"
-    "org.evoframework.network:org-evoframework-network:network-wire"
-    "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire"
+    "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire:"
+    "org.evoframework.network:org-evoframework-network:network-wire:"
+    "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
+    "org.evoframework.playback.options:org-evoframework-playback-options:playback-options-wire:"
 )
+
+# Plugins still on Phase 1 compile-link admission today (with
+# named blockers):
+#
+#   * org.evoframework.composition.alsa  — needs
+#     LoadContext::audio_routing across the OOP boundary;
+#     framework's OOP admission path does not yet provision
+#     that handle (the in-process path does via
+#     AdmissionEngine::with_audio_routing). Manifest declares
+#     `[capabilities.composition]` so the framework's load-time
+#     check refuses admission without the handle.
+#   * org.evoframework.delivery.alsa  — same audio_routing
+#     issue as composition.alsa (manifest declares
+#     `[capabilities.delivery]`).
+#   * org.evoframework.multiroom.evo-native  — needs
+#     LoadContext::audio_plane (+ multiroom_substrate) across
+#     the OOP boundary; framework's OOP admission path does
+#     not yet wire-proxy those handles to the subprocess.
+#   * org.evoframework.playback.mpd  — needs
+#     `run_oop_warden_with_respondent` SDK entry point;
+#     `run_oop` is respondent-only, `run_oop_warden` is
+#     warden-only, and the warden dispatch loop explicitly
+#     rejects respondent verbs. mpd is both.
+#
+# All four wire binaries, OOP manifests, and drift tests are
+# scaffolded in-tree (each plugin's `src/bin/*-wire.rs` +
+# `manifest.oop.toml` + Cargo.toml `[[bin]]` entry compile
+# clean today). The migrations land per-plugin as each named
+# framework / SDK gap closes.
 
 echo "=== deploy-distribution.sh ==="
 echo "Target:        ${SSH_TARGET}"
@@ -229,10 +261,17 @@ fi
 echo "  ok (steward: ${LOCAL_BIN})"
 
 for entry in "${OOP_PLUGINS[@]}"; do
-    IFS=':' read -r p_name p_crate p_wire <<< "${entry}"
-    if ! run_cross_build -p "${p_crate}" --bin "${p_wire}"; then
-        echo "FAIL: ${p_name} wire-binary cross-build exited non-zero" >&2
-        exit 2
+    IFS=':' read -r p_name p_crate p_wire p_features <<< "${entry}"
+    if [[ -n "${p_features}" ]]; then
+        if ! run_cross_build -p "${p_crate}" --bin "${p_wire}" --features "${p_features}"; then
+            echo "FAIL: ${p_name} wire-binary cross-build exited non-zero" >&2
+            exit 2
+        fi
+    else
+        if ! run_cross_build -p "${p_crate}" --bin "${p_wire}"; then
+            echo "FAIL: ${p_name} wire-binary cross-build exited non-zero" >&2
+            exit 2
+        fi
     fi
     p_local_bin="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${p_wire}"
     if [[ ! -x "${p_local_bin}" ]]; then
@@ -272,6 +311,39 @@ echo
 # bundle.
 # ----------------------------------------------------------
 echo "[3/5] scp + install steward binary + OOP plugin bundles ..."
+
+# Sweep stale OOP bundle dirs on the target. Plugin dirs
+# under `/opt/evo/plugins/` that are NOT in this deploy's
+# `OOP_PLUGINS` array are stale — either from an earlier
+# deploy that has since reverted a plugin to Phase 1
+# compile-link admission, or from a plugin name that's been
+# retired entirely. Leaving them in place causes the
+# framework's Phase 2 discovery to attempt admission, fail
+# (because the matching Phase 1 path admits the same plugin
+# first, or because the bundle no longer matches the live
+# plugin contract), and emit noisy `skipping plugin: admission
+# failed` log lines on every boot.
+EXPECTED_DIRS=""
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name _ _ _ <<< "${entry}"
+    EXPECTED_DIRS="${EXPECTED_DIRS} ${p_name}"
+done
+if ! ssh "${SSH_TARGET}" "
+    set -e
+    if [ -d /opt/evo/plugins ]; then
+        for d in /opt/evo/plugins/*/; do
+            name=\$(basename \"\$d\")
+            case \" ${EXPECTED_DIRS} \" in
+                *\" \$name \"*) ;;
+                *) sudo -n rm -rf \"\$d\" && echo \"  swept stale: \$name\" ;;
+            esac
+        done
+    fi
+"; then
+    echo "FAIL: stale bundle sweep on target failed" >&2
+    exit 3
+fi
+
 TMP_REMOTE="/tmp/evo-device-audio.deploy.$$"
 if ! scp -q "${LOCAL_BIN}" "${SSH_TARGET}:${TMP_REMOTE}"; then
     echo "FAIL: scp steward binary to target failed" >&2
@@ -288,7 +360,7 @@ fi
 echo "  ok (steward installed)"
 
 for entry in "${OOP_PLUGINS[@]}"; do
-    IFS=':' read -r p_name p_crate p_wire <<< "${entry}"
+    IFS=':' read -r p_name p_crate p_wire _ <<< "${entry}"
     p_local_bin="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${p_wire}"
     p_manifest_src="${REPO_ROOT}/plugins/${p_name}/manifest.oop.toml"
     if [[ ! -f "${p_manifest_src}" ]]; then

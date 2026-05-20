@@ -124,7 +124,6 @@ use org_evoframework_composition_alsa::AlsaCompositionPlugin;
 use org_evoframework_delivery_alsa::AlsaDeliveryPlugin;
 use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
 use org_evoframework_playback_mpd::MpdPlaybackPlugin;
-use org_evoframework_playback_options::PlaybackOptionsPlugin;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -285,7 +284,16 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .context("registering Tier 2 audio widget kinds")?;
 
             // 1. composition.alsa: singleton respondent on
-            //    audio.composition shape 2.
+            //    audio.composition shape 2. Still admitted via
+            //    Phase 1 compile-link today because the
+            //    plugin's `load()` requires
+            //    `LoadContext::audio_routing`, and the
+            //    framework's OOP admission path does not yet
+            //    wire-proxy that handle to subprocess plugins.
+            //    The wire binary + OOP manifest are scaffolded
+            //    in-tree; this admission moves to Phase 2 once
+            //    the framework extends its OOP path to
+            //    provision audio handles.
             let composition_manifest = Manifest::from_toml(
                 org_evoframework_composition_alsa::MANIFEST_TOML,
             )
@@ -298,44 +306,29 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("admitting composition.alsa")?;
 
-            // 2. playback.options: singleton respondent on
-            //    audio.options shape 1. Operator-facing
-            //    audiophile-grade settings (resampling /
-            //    mixer_type / DOP / output_device /
-            //    volume_normalization). Persists state
-            //    across restarts; emits
-            //    Happening::PluginEvent on every change AND
-            //    publishes the settings as a subject so
-            //    downstream consumers can subscribe via the
-            //    framework's SubjectStateSubscriber. Admit
-            //    BEFORE delivery.alsa + playback.mpd so the
-            //    settings subject already exists when those
-            //    plugins' load-time resolve runs (delivery
-            //    observes the subject per audit Finding F5;
-            //    playback.mpd consumes mixer_type from it).
-            let options_manifest = Manifest::from_toml(
-                org_evoframework_playback_options::MANIFEST_TOML,
-            )
-            .context("parsing playback.options manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    PlaybackOptionsPlugin::new(),
-                    options_manifest,
-                )
-                .await
-                .context("admitting playback.options")?;
+            // 2. playback.options moved to out-of-process
+            //    shipping form. The plugin is no longer
+            //    admitted via Phase 1 compile-link; the
+            //    `dist/scripts/deploy-distribution.sh` flow
+            //    cross-builds its wire binary
+            //    (`playback-options-wire`), stages + signs a
+            //    bundle from
+            //    `plugins/org.evoframework.playback.options/manifest.oop.toml`,
+            //    and installs it at
+            //    `/opt/evo/plugins/org.evoframework.playback.options/`.
+            //    Phase 2 discovery (below) admits it from the
+            //    filesystem search root. The plugin needs no
+            //    audio data-plane handle so it admits cleanly
+            //    across the OOP boundary today.
 
             // 3. delivery.alsa: singleton respondent on
-            //    audio.delivery shape 2. Owns the modular ALSA
-            //    pipeline (pcm.evo definition in
-            //    /etc/asound.conf); declares the WriteEndpoint
-            //    upstream plugins write into; exposes
-            //    operator-facing hardware probing verbs
-            //    consumed by the playback.options plugin. At
-            //    load time, subscribes to the options subject
-            //    (now announced by step 2 above) and emits
-            //    `delivery.options_observed` happenings on
-            //    every settings change.
+            //    audio.delivery shape 2. Still admitted via
+            //    Phase 1 compile-link today — same
+            //    `LoadContext::audio_routing` requirement as
+            //    composition.alsa. Wire binary + OOP manifest
+            //    are scaffolded in-tree; admission moves to
+            //    Phase 2 once the framework's OOP path
+            //    provisions audio handles.
             let delivery_manifest = Manifest::from_toml(
                 org_evoframework_delivery_alsa::MANIFEST_TOML,
             )
@@ -393,13 +386,18 @@ fn audio_distribution_admission() -> AdmissionSetup {
             //    pick its invocation strategy.
 
             // 6. multiroom.evo-native: singleton respondent on
-            //    audio.multiroom shape 1. Bridges the local
-            //    audio chain to the framework's audio-plane
-            //    TCP transport. Role flips dynamically per
-            //    source-host election: source-host nodes
-            //    capture from the local audio chain + fan
-            //    frames out; receivers subscribe to incoming
-            //    frames + render to local ALSA.
+            //    audio.multiroom shape 1. Still admitted via
+            //    Phase 1 compile-link today because the
+            //    plugin's `load()` requires
+            //    `LoadContext::audio_plane` (and consumes the
+            //    multi-room substrate via
+            //    `multiroom_substrate`); the framework's OOP
+            //    admission path does not yet wire-proxy those
+            //    handles to subprocess plugins. Wire binary +
+            //    OOP manifest are scaffolded in-tree;
+            //    admission moves to Phase 2 once the framework
+            //    extends its OOP path to provision audio +
+            //    multi-room handles.
             let multiroom_manifest = Manifest::from_toml(
                 org_evoframework_multiroom_evo_native::MANIFEST_TOML,
             )

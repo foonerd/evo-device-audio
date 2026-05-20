@@ -1314,7 +1314,6 @@ dependencies = [
  "org-evoframework-delivery-alsa",
  "org-evoframework-multiroom-evo-native",
  "org-evoframework-playback-mpd",
- "org-evoframework-playback-options",
  "tokio",
  "toml",
  "tracing",
@@ -3188,6 +3187,7 @@ name = "org-evoframework-composition-alsa"
 version = "0.1.0"
 dependencies = [
  "alsa",
+ "anyhow",
  "evo-plugin-sdk",
  "nix 0.30.1",
  "semver",
@@ -3197,12 +3197,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "org-evoframework-delivery-alsa"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "evo-plugin-sdk",
  "semver",
  "serde",
@@ -3211,6 +3213,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3237,6 +3240,7 @@ name = "org-evoframework-multiroom-evo-native"
 version = "0.1.0"
 dependencies = [
  "alsa",
+ "anyhow",
  "base64",
  "evo-plugin-sdk",
  "semver",
@@ -3246,6 +3250,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3297,6 +3302,7 @@ dependencies = [
 name = "org-evoframework-playback-options"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "evo-plugin-sdk",
  "semver",
  "serde",
@@ -3306,6 +3312,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

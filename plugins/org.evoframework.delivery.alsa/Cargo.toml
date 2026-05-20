@@ -11,7 +11,16 @@ description = "ALSA delivery plugin for the evo audio data plane. Owns the modul
 [lib]
 path = "src/lib.rs"
 
+# Out-of-process wire binary — the production-shaped OOP entrypoint
+# the framework's release plane cross-builds, signs, packs, and
+# publishes as a plugin bundle. The companion in-process
+# admission path uses the lib crate directly.
+[[bin]]
+name = "delivery-alsa-wire"
+path = "src/bin/delivery-alsa-wire.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +30,7 @@ thiserror = { workspace = true }
 # subprocess (`aplay -L`, `amixer -c` hardware probing).
 tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
