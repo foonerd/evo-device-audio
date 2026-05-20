@@ -1310,7 +1310,6 @@ dependencies = [
  "evo-multiroom",
  "evo-plugin-sdk",
  "evo-primitives",
- "org-evoframework-multiroom-evo-native",
  "tokio",
  "toml",
  "tracing",

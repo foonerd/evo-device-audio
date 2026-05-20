@@ -126,29 +126,17 @@ OOP_PLUGINS=(
     "org.evoframework.composition.alsa:org-evoframework-composition-alsa:composition-alsa-wire:alsa-substrate"
     "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:alsa-substrate"
     "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
+    "org.evoframework.multiroom.evo-native:org-evoframework-multiroom-evo-native:multiroom-evo-native-wire:alsa-substrate"
 )
 
-# Plugins still on Phase 1 compile-link admission today (with
-# named blockers):
-#
-#   * org.evoframework.multiroom.evo-native  — needs
-#     LoadContext::audio_plane (+ multiroom_substrate) across
-#     the OOP boundary; framework's OOP admission path does
-#     not yet wire-proxy those handles to the subprocess.
-#     `AudioRouting` itself is wire-proxied; this plugin
-#     additionally consumes `AudioPlaneHandle::fan_out_audio_frame`
-#     (hot path, every audio frame) and
-#     `subscribe_audio_frames` (streaming subscription).
-#     Migrating these onto a Unix-socket wire would re-introduce
-#     the per-frame copy + IPC cost the audio data plane is
-#     designed to avoid; the next chunk lands a shared-memory
-#     fast path OR keeps multiroom on compile-link as a
-#     vendor-tier exception.
-#
-# The wire binary, OOP manifest, and drift test for
-# multiroom.evo-native are scaffolded in-tree; the migration
-# lands once the audio_plane handle has a sound cross-process
-# transport.
+# Every reference-distribution plugin now ships out-of-process.
+# The framework's audio-routing, multi-room substrate, and
+# audio-plane wire-proxies carry every per-plugin handle the
+# plugin's `load()` requires across the subprocess boundary.
+# Phase 1 compile-link admission is retired for the reference
+# plugin set; vendor distributions retain the option of
+# compile-link admission for plugins that benefit from in-
+# process latency (none of the reference plugins do today).
 
 echo "=== deploy-distribution.sh ==="
 echo "Target:        ${SSH_TARGET}"

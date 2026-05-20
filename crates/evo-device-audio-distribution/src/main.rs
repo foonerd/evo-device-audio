@@ -119,8 +119,6 @@ use anyhow::Context;
 use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
-use evo_plugin_sdk::Manifest;
-use org_evoframework_multiroom_evo_native::MultiroomEvoNativePlugin;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -280,47 +278,21 @@ fn audio_distribution_admission() -> AdmissionSetup {
                 .await
                 .context("registering Tier 2 audio widget kinds")?;
 
-            // composition.alsa, delivery.alsa, playback.mpd,
-            // playback.options, artwork.local, network, and
-            // metadata.local have all moved to out-of-process
-            // shipping form. The deploy script
+            // Every reference-distribution plugin
+            // (artwork.local, network, metadata.local,
+            // playback.options, composition.alsa,
+            // delivery.alsa, playback.mpd, multiroom.evo-native)
+            // ships out-of-process. The deploy script
             // (`dist/scripts/deploy-distribution.sh`)
-            // cross-builds each wire binary, signs the
-            // bundle, and stages it under
-            // `/opt/evo/plugins/<name>/`; Phase 2 discovery
-            // (below) admits them from the filesystem search
-            // root. The framework's audio-routing wire-proxy
-            // (the `WireFrame::AudioRoutingStateChanged`
-            // forwarder installed at admission) carries the
-            // resolved topology across the subprocess
-            // boundary, so audio-capable plugins admit
-            // cleanly through the OOP path without a
-            // compile-link dependency in this binary.
-
-            // multiroom.evo-native: singleton respondent on
-            //    audio.multiroom shape 1. Still admitted via
-            //    Phase 1 compile-link today because the
-            //    plugin's `load()` requires
-            //    `LoadContext::audio_plane` (and consumes the
-            //    multi-room substrate via
-            //    `multiroom_substrate`); the framework's OOP
-            //    admission path does not yet wire-proxy those
-            //    handles to subprocess plugins. Wire binary +
-            //    OOP manifest are scaffolded in-tree;
-            //    admission moves to Phase 2 once the framework
-            //    extends its OOP path to provision audio +
-            //    multi-room handles.
-            let multiroom_manifest = Manifest::from_toml(
-                org_evoframework_multiroom_evo_native::MANIFEST_TOML,
-            )
-            .context("parsing multiroom.evo-native manifest")?;
-            engine
-                .admit_singleton_respondent(
-                    MultiroomEvoNativePlugin::new(),
-                    multiroom_manifest,
-                )
-                .await
-                .context("admitting multiroom.evo-native")?;
+            // cross-builds each wire binary, signs the bundle,
+            // and stages it under `/opt/evo/plugins/<name>/`;
+            // Phase 2 discovery (below) admits them from the
+            // filesystem search root. The framework's three
+            // wire-proxies (audio-routing, multi-room substrate,
+            // audio-plane) carry every per-plugin handle the
+            // plugin's `load()` requires across the subprocess
+            // boundary, so no compile-link admission is needed
+            // in this binary for the reference plugin set.
 
             // Phase 2 — filesystem discovery for operator-
             // installed out-of-process plugins. Walks
