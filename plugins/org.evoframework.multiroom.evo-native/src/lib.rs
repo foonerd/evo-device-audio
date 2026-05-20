@@ -2282,6 +2282,136 @@ async fn try_complete_record(
     recipient_pending.remove(key);
 }
 
+/// Capture-open + hwparams-configure outcome. Captures the
+/// stage at which configuration failed so the retry loop can
+/// log a precise final-state diagnostic, and so test callers
+/// asserting against this helper can distinguish recoverable
+/// stages from hard ones.
+///
+/// Marked `#[cfg(feature = "alsa-substrate")]` because the
+/// type's `Ok` arm carries an `alsa::PCM`; without the feature
+/// the crate is not linked. The retry helper that consumes
+/// this type lives outside the cfg gate so its retry-policy
+/// logic is testable without alsa-substrate present.
+#[cfg(feature = "alsa-substrate")]
+#[derive(Debug)]
+enum CaptureConfigureStage {
+    PcmOpen,
+    HwParamsAny,
+    SetChannels,
+    SetRate,
+    SetFormat,
+    SetAccess,
+    SetPeriodTime,
+    SetBufferTime,
+    HwParams,
+}
+
+#[cfg(feature = "alsa-substrate")]
+impl CaptureConfigureStage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PcmOpen => "alsa::PCM::new",
+            Self::HwParamsAny => "alsa::pcm::HwParams::any",
+            Self::SetChannels => "set_channels",
+            Self::SetRate => "set_rate",
+            Self::SetFormat => "set_format",
+            Self::SetAccess => "set_access",
+            Self::SetPeriodTime => "set_period_time_near",
+            Self::SetBufferTime => "set_buffer_time_near",
+            Self::HwParams => "pcm.hw_params",
+        }
+    }
+}
+
+/// One attempt at opening + configuring the capture PCM. On
+/// success returns a fully-configured PCM ready for
+/// `prepare() + start()`; on failure returns the stage name
+/// and the underlying alsa::Error so the retry loop can
+/// log + decide whether to retry.
+///
+/// Re-opens the PCM each call: the snd-aloop race that
+/// motivates the retry loop only resolves when the kernel
+/// sees a fresh handle, so dropping the PCM between attempts
+/// is load-bearing.
+#[cfg(feature = "alsa-substrate")]
+fn try_configure_capture_pcm(
+    source_pcm: &str,
+) -> Result<alsa::PCM, (CaptureConfigureStage, alsa::Error)> {
+    let pcm = alsa::PCM::new(source_pcm, alsa::Direction::Capture, true)
+        .map_err(|e| (CaptureConfigureStage::PcmOpen, e))?;
+    let hwp = alsa::pcm::HwParams::any(&pcm)
+        .map_err(|e| (CaptureConfigureStage::HwParamsAny, e))?;
+    hwp.set_channels(BASELINE_CHANNELS as u32)
+        .map_err(|e| (CaptureConfigureStage::SetChannels, e))?;
+    hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
+        .map_err(|e| (CaptureConfigureStage::SetRate, e))?;
+    hwp.set_format(alsa::pcm::Format::S16LE)
+        .map_err(|e| (CaptureConfigureStage::SetFormat, e))?;
+    hwp.set_access(alsa::pcm::Access::RWInterleaved)
+        .map_err(|e| (CaptureConfigureStage::SetAccess, e))?;
+    // Explicit period + buffer time on capture. Without
+    // this snd-aloop's defaults yield a ~10-second capture
+    // buffer (524288 frames @ 48 kHz observed empirically)
+    // which makes capture-side audible latency dependent on
+    // a startup-timing race between MPD's first writei and
+    // the capture-thread's first readi.
+    hwp.set_period_time_near(20_000, alsa::ValueOr::Nearest)
+        .map_err(|e| (CaptureConfigureStage::SetPeriodTime, e))?;
+    hwp.set_buffer_time_near(80_000, alsa::ValueOr::Nearest)
+        .map_err(|e| (CaptureConfigureStage::SetBufferTime, e))?;
+    pcm.hw_params(&hwp)
+        .map_err(|e| (CaptureConfigureStage::HwParams, e))?;
+    Ok(pcm)
+}
+
+/// Retry a fallible operation with bounded exponential
+/// backoff. Returns the first `Ok` or the LAST `Err` after the
+/// attempt budget is exhausted.
+///
+/// `initial_delay` doubles on each failed attempt; the closure
+/// is invoked up to `max_attempts` times. `on_attempt` fires
+/// before each attempt (1-indexed) so callers can log the
+/// attempt counter without polluting the retry-result shape.
+///
+/// Sync-thread oriented: uses `std::thread::sleep` between
+/// attempts because the multi-room capture thread is an OS
+/// thread, not a tokio task. Reuse for async callers would
+/// require a parallel async variant.
+///
+/// The production caller (`run_capture_thread`) is feature-
+/// gated on `alsa-substrate`; this helper compiles on that
+/// feature OR in `test` builds so the retry-policy contract is
+/// verifiable without alsa-substrate present.
+#[cfg(any(feature = "alsa-substrate", test))]
+fn retry_with_backoff<T, E, F, A>(
+    max_attempts: u32,
+    initial_delay: std::time::Duration,
+    mut op: F,
+    mut on_attempt: A,
+) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    A: FnMut(u32),
+{
+    let mut delay = initial_delay;
+    let mut last_err: Option<E> = None;
+    for attempt in 1..=max_attempts {
+        on_attempt(attempt);
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+    }
+    Err(last_err.expect("retry loop ran at least once"))
+}
+
 /// OS-thread body that owns the ALSA capture handle. Loops
 /// reading `FRAMES_PER_CHUNK` frames at a time, pushing each
 /// chunk onto the async-side channel. Drops the oldest chunk
@@ -2295,113 +2425,70 @@ fn run_capture_thread(
     audio_plane: Arc<dyn AudioPlaneHandle>,
     should_exit: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Open the capture PCM NON-BLOCKING. In blocking mode
-    // `io.readi()` parks indefinitely waiting for samples
-    // (e.g. when MPD stops feeding the loopback playback
-    // half); the thread can never reach the `tx.is_closed()`
-    // poll between iterations and the async unload path
-    // hangs until the framework's 10 s plugin-shutdown
-    // deadline fires SIGKILL, then systemd's 90 s
-    // TimeoutStopSec runs out. Combined with `pcm.wait`
-    // below, this thread polls cooperatively every 100 ms.
-    let pcm = match alsa::PCM::new(&source_pcm, alsa::Direction::Capture, true)
-    {
+    // Open + configure the capture PCM NON-BLOCKING. In
+    // blocking mode `io.readi()` parks indefinitely waiting
+    // for samples (e.g. when MPD stops feeding the loopback
+    // playback half); the thread can never reach the
+    // `tx.is_closed()` poll between iterations and the
+    // async unload path hangs until the framework's 10 s
+    // plugin-shutdown deadline fires SIGKILL, then systemd's
+    // 90 s TimeoutStopSec runs out. Combined with
+    // `pcm.wait` below, this thread polls cooperatively
+    // every 100 ms.
+    //
+    // The open + hwparams chain is wrapped in
+    // `retry_with_backoff` to cover the snd-aloop
+    // start-of-day race: on a fresh source-role first
+    // start, the loopback's capture half can fail
+    // `set_rate` (or any other hwparams call) with EBUSY
+    // because the playback half (typically MPD's
+    // audio_output) has not committed kernel state yet.
+    // The previous shape exited the thread on the first
+    // failure; operator-visible behaviour was
+    // "everything else looks fine, audio just isn't
+    // flowing" with a single warn line. Four attempts at
+    // 100 / 200 / 400 / 800 ms backoff give ~1.5 s for the
+    // kernel-state race to settle before giving up; the
+    // PCM is dropped between attempts so each retry sees
+    // a fresh open. Subsequent rotations across the BASE
+    // tag's three-target rig never reproduced the failure;
+    // the retry budget is bounded so a hard fault still
+    // surfaces promptly.
+    let pcm = match retry_with_backoff(
+        4,
+        std::time::Duration::from_millis(100),
+        || try_configure_capture_pcm(&source_pcm),
+        |attempt| {
+            if attempt > 1 {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    attempt,
+                    source_pcm = %source_pcm,
+                    "ALSA capture configure: retrying after \
+                     prior-attempt failure"
+                );
+            }
+        },
+    ) {
         Ok(p) => p,
-        Err(e) => {
+        Err((stage, e)) => {
+            // LOGGING.md §2: warn (recoverable at the
+            // process level — operator restart heals — but
+            // operator-visible at the journal since the
+            // source plugin's audio chain will not start
+            // until the kernel race resolves).
             tracing::warn!(
                 plugin = PLUGIN_NAME,
+                stage = stage.as_str(),
                 error = %e,
                 source_pcm = %source_pcm,
-                "ALSA capture open failed; source task will starve"
+                "ALSA capture configure failed after retries; \
+                 source task will starve until next plugin reload"
             );
             return;
         }
     };
     {
-        let hwp = match alsa::pcm::HwParams::any(&pcm) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %e,
-                    "alsa::pcm::HwParams::any (capture) failed"
-                );
-                return;
-            }
-        };
-        if let Err(e) = hwp.set_channels(BASELINE_CHANNELS as u32) {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_channels (capture) failed"
-            );
-            return;
-        }
-        if let Err(e) =
-            hwp.set_rate(BASELINE_SAMPLE_RATE_HZ, alsa::ValueOr::Nearest)
-        {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_rate (capture) failed"
-            );
-            return;
-        }
-        if let Err(e) = hwp.set_format(alsa::pcm::Format::S16LE) {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_format (capture) failed"
-            );
-            return;
-        }
-        if let Err(e) = hwp.set_access(alsa::pcm::Access::RWInterleaved) {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_access (capture) failed"
-            );
-            return;
-        }
-        // Explicit period + buffer time on capture. Without
-        // this snd-aloop's defaults yield a ~10-second
-        // capture buffer (524288 frames @ 48 kHz observed
-        // empirically) which makes capture-side audible
-        // latency dependent on a startup-timing race between
-        // MPD's first writei and the capture-thread's first
-        // readi — sometimes ~10 ms (Perfect), sometimes
-        // ~1 second (way behind), nothing deterministic in
-        // between. Target ALSA period+buffer in TIME (us)
-        // so each device tier picks its tightest natively-
-        // supported size; snd-aloop honours 20 ms / 80 ms
-        // cleanly. The audible-latency budget is now
-        // structural, not random.
-        if let Err(e) = hwp.set_period_time_near(20_000, alsa::ValueOr::Nearest)
-        {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_period_time_near (capture) failed"
-            );
-            return;
-        }
-        if let Err(e) = hwp.set_buffer_time_near(80_000, alsa::ValueOr::Nearest)
-        {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "set_buffer_time_near (capture) failed"
-            );
-            return;
-        }
-        if let Err(e) = pcm.hw_params(&hwp) {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "pcm.hw_params (capture) failed"
-            );
-            return;
-        }
         // Read back the actually-negotiated values + log.
         // Operators see capture-side audible latency =
         // buffer_ms here. Combined with leader_ms (200 ms)
@@ -3186,5 +3273,90 @@ alsa_pcm = "evo"
         p.apply_config(&table).unwrap();
         assert_eq!(p.config.role, Role::Receiver);
         assert_eq!(p.config.alsa_pcm, "evo");
+    }
+
+    // ---- retry_with_backoff coverage ----
+    //
+    // The retry helper closes the snd-aloop start-of-day race
+    // identified in the risk register: source-role first start
+    // can fail `hwparams.set_rate` with EBUSY because the
+    // loopback's playback half has not committed kernel state
+    // yet. The helper is generic + sync-thread oriented; these
+    // tests pin the four behaviours that matter at the retry-
+    // policy layer (success on first try, recover-then-succeed,
+    // exhaust-and-fail, on_attempt cadence).
+
+    #[test]
+    fn retry_returns_ok_on_first_attempt_without_sleeping() {
+        let mut attempts = 0u32;
+        let started = std::time::Instant::now();
+        let result: Result<u32, ()> = super::retry_with_backoff(
+            5,
+            std::time::Duration::from_millis(50),
+            || {
+                attempts += 1;
+                Ok(attempts)
+            },
+            |_| {},
+        );
+        assert_eq!(result, Ok(1));
+        assert_eq!(attempts, 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(40),
+            "first-attempt success must not sleep"
+        );
+    }
+
+    #[test]
+    fn retry_returns_ok_after_recovery() {
+        let mut attempts = 0u32;
+        let result: Result<u32, &'static str> = super::retry_with_backoff(
+            5,
+            std::time::Duration::from_millis(10),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err("not yet")
+                } else {
+                    Ok(attempts)
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(result, Ok(3));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_returns_last_err_after_exhaustion() {
+        let mut attempts = 0u32;
+        let result: Result<u32, String> = super::retry_with_backoff(
+            3,
+            std::time::Duration::from_millis(5),
+            || {
+                attempts += 1;
+                Err(format!("attempt {attempts}"))
+            },
+            |_| {},
+        );
+        assert_eq!(result, Err("attempt 3".to_string()));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_fires_on_attempt_callback_for_every_attempt() {
+        let mut on_attempt_calls = Vec::new();
+        let mut op_calls = 0u32;
+        let _result: Result<(), ()> = super::retry_with_backoff(
+            4,
+            std::time::Duration::from_millis(1),
+            || {
+                op_calls += 1;
+                Err(())
+            },
+            |attempt| on_attempt_calls.push(attempt),
+        );
+        assert_eq!(on_attempt_calls, vec![1, 2, 3, 4]);
+        assert_eq!(op_calls, 4);
     }
 }
