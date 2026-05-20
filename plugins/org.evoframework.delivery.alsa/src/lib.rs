@@ -74,6 +74,8 @@
 // keep it allowed crate-wide.
 #![allow(clippy::manual_async_fn)]
 
+mod options_render;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -105,6 +107,15 @@ pub const PLUGIN_NAME: &str = "org.evoframework.delivery.alsa";
 /// pointing at an alternative path will override this in a
 /// future config-driven enhancement.
 const ASOUND_CONF_PATH: &str = "/etc/asound.conf";
+
+/// Canonical filesystem path of the operator-options drop-in.
+/// The reference distribution's bootstrap script installs the
+/// directory (`/etc/asound.d/`) owned by the steward service
+/// user so the delivery plugin can atomic-write this file
+/// without sudoers escalation. The base `/etc/asound.conf`
+/// includes this file (ALSA's `<configfile>` directive) so any
+/// `pcm.evo` definition here overrides the bootstrap baseline.
+const ASOUND_OPTIONS_DROP_IN_PATH: &str = "/etc/asound.d/evo-options.conf";
 
 /// Wire-protocol payload version every respondent payload and
 /// response carries. Independent of plugin SemVer; bumped on
@@ -147,6 +158,11 @@ pub struct AlsaDeliveryPlugin {
     /// Path to the asound.conf the active pcm.evo definition
     /// lives at. Defaults to [`ASOUND_CONF_PATH`].
     asound_conf_path: PathBuf,
+    /// Path the plugin writes the operator-options drop-in to
+    /// on each `audio.options.settings` subject update.
+    /// Defaults to [`ASOUND_OPTIONS_DROP_IN_PATH`]; tests
+    /// override via `with_asound_options_drop_in_path`.
+    asound_options_drop_in_path: PathBuf,
     /// Cumulative respondent requests handled since
     /// construction. Surfaced for diagnostics; not part of the
     /// wire contract.
@@ -201,6 +217,9 @@ impl AlsaDeliveryPlugin {
             loaded: false,
             audio_routing: None,
             asound_conf_path: PathBuf::from(ASOUND_CONF_PATH),
+            asound_options_drop_in_path: PathBuf::from(
+                ASOUND_OPTIONS_DROP_IN_PATH,
+            ),
             requests_handled: 0,
             reactor: None,
             options_observer: None,
@@ -212,6 +231,18 @@ impl AlsaDeliveryPlugin {
     #[cfg(test)]
     pub(crate) fn with_asound_conf_path(mut self, path: PathBuf) -> Self {
         self.asound_conf_path = path;
+        self
+    }
+
+    /// Replace the asound-options drop-in path. Used by tests to
+    /// point at a tempdir-backed file rather than
+    /// `/etc/asound.d/evo-options.conf`.
+    #[cfg(test)]
+    pub(crate) fn with_asound_options_drop_in_path(
+        mut self,
+        path: PathBuf,
+    ) -> Self {
+        self.asound_options_drop_in_path = path;
         self
     }
 
@@ -363,12 +394,19 @@ impl AlsaDeliveryPlugin {
     /// wired this cycle and the operator surface continues to
     /// work without it. A subsequent steward restart re-attempts.
     ///
-    /// Per audit Finding F5: this method is the consumer path
-    /// for the `audio.options.changed` reactivity contract. The
-    /// full pcm.evo re-render in response to options changes
-    /// is the next chunk; this lands the observable consumer
-    /// wiring so the cross-plugin reactivity is operator-
-    /// verifiable rather than emit-into-the-void.
+    /// On every received subject-state update the observer
+    /// runs a four-stage pipeline: extract an
+    /// [`OptionsSettings`] from the payload; render the
+    /// asound.conf drop-in body; atomic-write the drop-in at
+    /// [`AlsaDeliveryPlugin::asound_options_drop_in_path`];
+    /// emit a `delivery.options_rendered` happening carrying
+    /// the rendered byte length so subscribers can observe the
+    /// reactive path firing.
+    ///
+    /// ALSA re-reads `/etc/asound.conf` (and its included drop-
+    /// ins) on each PCM open, so the running playback chain
+    /// picks up the new pipeline on the next play / pause-
+    /// resume cycle.
     async fn spawn_options_observer(&mut self, ctx: &LoadContext) {
         let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
             tracing::debug!(
@@ -387,6 +425,7 @@ impl AlsaDeliveryPlugin {
             return;
         };
         let happening_emitter = Arc::clone(&ctx.happening_emitter);
+        let drop_in_path = self.asound_options_drop_in_path.clone();
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
@@ -439,31 +478,123 @@ impl AlsaDeliveryPlugin {
                     update = stream.recv() => {
                         match update {
                             Ok(state_update) => {
-                                let payload = serde_json::json!({
+                                let observed_at_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+
+                                // Extract → render → write. The
+                                // observer-observed happening
+                                // (kept for diagnostic-replay
+                                // consumers) fires alongside the
+                                // newer options_rendered happening
+                                // (which signals subscribers that
+                                // the on-disk pipeline definition
+                                // has changed). Both happenings
+                                // carry the canonical subject id
+                                // so a single subscriber can
+                                // correlate observer activity
+                                // against pipeline rewrites.
+                                let settings_state =
+                                    state_update.state.unwrap_or(
+                                        serde_json::Value::Null,
+                                    );
+                                let settings =
+                                    options_render::extract_options_settings_from_state(
+                                        &settings_state,
+                                    );
+                                let body = options_render::render_drop_in(
+                                    &settings,
+                                );
+                                let render_bytes = body.len();
+                                let write_outcome = options_render::atomic_write_drop_in(
+                                    &drop_in_path,
+                                    &body,
+                                )
+                                .await;
+                                match &write_outcome {
+                                    Ok(()) => {
+                                        // LOGGING.md §2: info
+                                        // (operator-visible
+                                        // lifecycle narrative —
+                                        // the pcm.evo pipeline
+                                        // definition changed on
+                                        // disk).
+                                        tracing::info!(
+                                            plugin = PLUGIN_NAME,
+                                            drop_in_path = %drop_in_path.display(),
+                                            render_bytes,
+                                            "audio-options drop-in rewritten"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // LOGGING.md §2: warn
+                                        // (recoverable; the
+                                        // previous drop-in
+                                        // remains on disk, the
+                                        // operator's prior
+                                        // pipeline keeps audio
+                                        // flowing).
+                                        tracing::warn!(
+                                            plugin = PLUGIN_NAME,
+                                            drop_in_path = %drop_in_path.display(),
+                                            error = %e,
+                                            "audio-options drop-in write failed; \
+                                             prior pipeline retained"
+                                        );
+                                    }
+                                }
+
+                                let observed_payload = serde_json::json!({
                                     "subject_canonical_id":
                                         state_update.canonical_id,
-                                    "observed_at_ms":
-                                        std::time::SystemTime::now()
-                                            .duration_since(
-                                                std::time::UNIX_EPOCH,
-                                            )
-                                            .map(|d| d.as_millis() as u64)
-                                            .unwrap_or(0),
-                                    "settings_state":
-                                        state_update.state,
+                                    "observed_at_ms": observed_at_ms,
+                                    "settings_state": settings_state,
                                 });
                                 if let Err(e) = happening_emitter
                                     .emit_plugin_event(
                                         "delivery.options_observed"
                                             .to_string(),
-                                        payload,
+                                        observed_payload,
                                     )
                                     .await
                                 {
+                                    // LOGGING.md §2: warn
+                                    // (recoverable; the disk
+                                    // write was the load-bearing
+                                    // side effect; this happening
+                                    // is the diagnostic surface).
                                     tracing::warn!(
                                         plugin = PLUGIN_NAME,
                                         error = %e,
                                         "emit delivery.options_observed failed"
+                                    );
+                                }
+
+                                let rendered_payload = serde_json::json!({
+                                    "subject_canonical_id":
+                                        state_update.canonical_id,
+                                    "observed_at_ms": observed_at_ms,
+                                    "drop_in_path":
+                                        drop_in_path.display().to_string(),
+                                    "render_bytes": render_bytes,
+                                    "write_ok": write_outcome.is_ok(),
+                                });
+                                if let Err(e) = happening_emitter
+                                    .emit_plugin_event(
+                                        "delivery.options_rendered"
+                                            .to_string(),
+                                        rendered_payload,
+                                    )
+                                    .await
+                                {
+                                    // LOGGING.md §2: warn
+                                    // (recoverable; diagnostic
+                                    // surface).
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %e,
+                                        "emit delivery.options_rendered failed"
                                     );
                                 }
                             }
@@ -1742,5 +1873,151 @@ pcm.evo {
         );
         assert!(p.reactor.is_none());
         assert!(!stub.has_route_change_callback());
+    }
+
+    // ----- Options→delivery re-render integration -----
+    //
+    // The observer body's per-update path is `extract →
+    // render → atomic_write`. The renderer and the
+    // atomic-write helper have their own unit tests in
+    // `options_render::tests`; this integration test
+    // exercises the three-stage composition end-to-end and
+    // asserts the on-disk drop-in matches the renderer's
+    // output for the given subject-state payload. The
+    // observer task itself is not driven (that would require
+    // a full LoadContext + SubjectStateSubscriber stub
+    // surface); the composition under test is the same code
+    // path the observer body invokes.
+
+    #[test]
+    fn with_asound_options_drop_in_path_overrides_default() {
+        let p = AlsaDeliveryPlugin::new()
+            .with_asound_options_drop_in_path(PathBuf::from("/tmp/test.conf"));
+        assert_eq!(
+            p.asound_options_drop_in_path,
+            PathBuf::from("/tmp/test.conf"),
+            "test override must replace the canonical drop-in path"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_pipeline_extracts_renders_and_atomic_writes_drop_in() {
+        let dir = tempdir().expect("tempdir");
+        let drop_in_path = dir.path().join("evo-options.conf");
+
+        // Simulate the subject-state payload the
+        // playback.options publisher emits for a hardware-
+        // mixer choice with a named control.
+        let state = json!({
+            "mixer_type": "hardware",
+            "mixer_control": "Digital",
+            "output_device": "hw:CARD=DAC,DEV=0",
+        });
+
+        let settings =
+            options_render::extract_options_settings_from_state(&state);
+        let body = options_render::render_drop_in(&settings);
+        options_render::atomic_write_drop_in(&drop_in_path, &body)
+            .await
+            .expect("atomic_write_drop_in");
+
+        let read_back = tokio::fs::read_to_string(&drop_in_path)
+            .await
+            .expect("read drop-in back");
+        assert_eq!(read_back, body, "on-disk drop-in matches renderer output");
+        assert!(read_back.contains("card \"DAC\""));
+        assert!(
+            read_back.contains("# hardware-mixer control: \"Digital\""),
+            "hardware mixer control surfaces as ctl.evo comment hint"
+        );
+        // Hardware mode without softvol — bit-perfect path.
+        assert!(!read_back.contains("type softvol"));
+    }
+
+    #[tokio::test]
+    async fn observer_pipeline_rewrites_drop_in_on_subsequent_updates() {
+        let dir = tempdir().expect("tempdir");
+        let drop_in_path = dir.path().join("evo-options.conf");
+
+        // First update: software mixer.
+        let first_state = json!({
+            "mixer_type": "software",
+            "output_device": "hw:CARD=DAC,DEV=0",
+        });
+        let first_settings =
+            options_render::extract_options_settings_from_state(&first_state);
+        options_render::atomic_write_drop_in(
+            &drop_in_path,
+            &options_render::render_drop_in(&first_settings),
+        )
+        .await
+        .expect("first atomic_write");
+
+        let first_contents = tokio::fs::read_to_string(&drop_in_path)
+            .await
+            .expect("read first");
+        assert!(first_contents.contains("type softvol"));
+
+        // Second update: hardware mixer with control. The
+        // drop-in must rewrite end-to-end; no residual softvol
+        // node from the first render may survive.
+        let second_state = json!({
+            "mixer_type": "hardware",
+            "mixer_control": "Master",
+            "output_device": "hw:CARD=DAC,DEV=0",
+        });
+        let second_settings =
+            options_render::extract_options_settings_from_state(&second_state);
+        options_render::atomic_write_drop_in(
+            &drop_in_path,
+            &options_render::render_drop_in(&second_settings),
+        )
+        .await
+        .expect("second atomic_write");
+
+        let second_contents = tokio::fs::read_to_string(&drop_in_path)
+            .await
+            .expect("read second");
+        assert!(!second_contents.contains("type softvol"));
+        assert!(
+            second_contents.contains("# hardware-mixer control: \"Master\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_pipeline_handles_resampling_node_change() {
+        let dir = tempdir().expect("tempdir");
+        let drop_in_path = dir.path().join("evo-options.conf");
+
+        // First: 96 kHz target.
+        let state_96k = json!({
+            "resampling": { "enabled": true, "target_rate_hz": 96000 }
+        });
+        let settings_96k =
+            options_render::extract_options_settings_from_state(&state_96k);
+        options_render::atomic_write_drop_in(
+            &drop_in_path,
+            &options_render::render_drop_in(&settings_96k),
+        )
+        .await
+        .expect("96k write");
+        let body_96k = tokio::fs::read_to_string(&drop_in_path).await.unwrap();
+        assert!(body_96k.contains("rate 96000"));
+
+        // Second: operator disables resampling.
+        let state_off = json!({
+            "resampling": { "enabled": false, "target_rate_hz": 96000 }
+        });
+        let settings_off =
+            options_render::extract_options_settings_from_state(&state_off);
+        options_render::atomic_write_drop_in(
+            &drop_in_path,
+            &options_render::render_drop_in(&settings_off),
+        )
+        .await
+        .expect("off write");
+        let body_off = tokio::fs::read_to_string(&drop_in_path).await.unwrap();
+        assert!(!body_off.contains("rate 96000"));
+        assert!(!body_off.contains("pcm.evo_rate"));
     }
 }

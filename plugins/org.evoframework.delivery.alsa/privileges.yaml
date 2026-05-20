@@ -17,6 +17,10 @@ capability_intent:
     need: read `/etc/asound.conf` to surface the active pcm.evo definition through the `delivery.active_endpoint` verb so operators / settings UI can confirm what the framework's reconciliation engine is binding playback against.
     access_path: filesystem/system
     failure_mode: active_endpoint verb returns Unknown with operator-readable hint; plugin admits and continues.
+  - id: alsa_options_drop_in_write
+    need: write `/etc/asound.d/evo-options.conf` (atomic rename from the same directory) on every operator gesture against the `playback.options` settings surface. The drop-in defines the operator-selected pcm.evo pipeline shape (mixer type, output device, optional resampling node); the base `/etc/asound.conf` `<configfile>`-includes the drop-in so a write here changes the on-disk pipeline definition without rewriting the bootstrap-owned base file. ALSA re-reads the inclusion graph on every PCM open, so running playback picks up the new shape on the next play / pause-resume cycle without a daemon-level recycle.
+    access_path: filesystem/service-owned
+    failure_mode: settings-state update is observed (the `delivery.options_observed` happening still fires) but the drop-in write fails with a structured warn log; the previous drop-in remains on disk and the operator's prior pipeline keeps audio flowing. Operator diagnoses via `delivery.options_rendered` happening's `write_ok = false` field + the journal warn line naming the failed path. The grant is filesystem ownership of the `/etc/asound.d/` directory (created by `bootstrap.sh` as `mode 0775 owner <service-user>`), NOT sudoers — there is no command escalation needed; the plugin writes to its own directory.
 
 required_binaries:
   - name: aplay
