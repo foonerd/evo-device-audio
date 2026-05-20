@@ -56,7 +56,14 @@ org-evoframework-playback-options = { path = "../../plugins/org.evoframework.pla
 org-evoframework-network = { path = "../../plugins/org.evoframework.network" }
 org-evoframework-multiroom-evo-native = { path = "../../plugins/org.evoframework.multiroom.evo-native" }
 org-evoframework-metadata-local = { path = "../../plugins/org.evoframework.metadata.local" }
-org-evoframework-artwork-local = { path = "../../plugins/org.evoframework.artwork.local" }
+# `org-evoframework-artwork-local` is no longer a production
+# dep of the distribution binary — it migrated to
+# out-of-process shipping form. The wire binary is
+# cross-built independently via the deploy script and the
+# plugin admits through framework Phase 2 discovery from
+# `/opt/evo/plugins/org.evoframework.artwork.local/`.
+# Workspace membership keeps it cross-buildable from the
+# device repo.
 
 # Async runtime and CLI parser surfaces shared with the
 # steward.

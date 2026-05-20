@@ -1310,7 +1310,6 @@ dependencies = [
  "evo-multiroom",
  "evo-plugin-sdk",
  "evo-primitives",
- "org-evoframework-artwork-local",
  "org-evoframework-composition-alsa",
  "org-evoframework-delivery-alsa",
  "org-evoframework-metadata-local",

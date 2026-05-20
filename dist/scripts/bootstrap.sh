@@ -558,6 +558,49 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 2.8: /etc/evo/trust.d/ — distribution-tier plugin trust
+# ----------------------------------------------------------
+# Out-of-process plugins are admitted from
+# `/opt/evo/plugins/<name>/` only after their bundle signature
+# verifies against a public key the steward has loaded from
+# `/etc/evo/trust.d/`. The framework's prototype-install.sh
+# seeds framework-tier roots (e.g. release-signing); the
+# distribution layers its own plugin trust on top.
+#
+# The audio reference distribution publishes its plugins under
+# the `org.evoframework.*` namespace; the commons-plugin
+# signing key authorises that namespace at trust class
+# `platform`. The matching public key + sidecar ship in
+# `dist/keys/` and install here so a fresh-OS install lands at
+# the working trust posture without operator key juggling.
+COMMONS_TRUST_PEM="$DIST_DIR/keys/commons-plugin-signing-public.pem"
+COMMONS_TRUST_META="$DIST_DIR/keys/commons-plugin-signing-public.meta.toml"
+TRUST_D_DIR="/etc/evo/trust.d"
+if [[ -f "$COMMONS_TRUST_PEM" && -f "$COMMONS_TRUST_META" ]]; then
+    install -d -m 0755 -o root -g root "$TRUST_D_DIR"
+    install -m 0644 -o root -g root \
+        "$COMMONS_TRUST_PEM" "$TRUST_D_DIR/commons-plugin-signing-public.pem"
+    install -m 0644 -o root -g root \
+        "$COMMONS_TRUST_META" "$TRUST_D_DIR/commons-plugin-signing-public.meta.toml"
+    echo "[bootstrap] installed $TRUST_D_DIR/commons-plugin-signing-public.{pem,meta.toml}"
+else
+    echo "[bootstrap] WARN: commons-plugin trust files missing from $DIST_DIR/keys/ — out-of-process plugin admission will fail until installed" >&2
+fi
+
+# ----------------------------------------------------------
+# Step 2.9: /opt/evo/plugins/ — search root for OOP plugin bundles
+# ----------------------------------------------------------
+# The framework's Phase 2 plugin discovery walks
+# `plugins.search_roots` (default `/opt/evo/plugins` then
+# `/var/lib/evo/plugins`). Ensure the canonical first root
+# exists; bundle install (via `deploy-distribution.sh` or
+# operator-driven `evo-plugin-tool plugin install`) lands
+# `<plugin-name>/manifest.toml` + `plugin.bin` + `manifest.sig`
+# under this root.
+install -d -m 0755 -o root -g root /opt/evo/plugins
+echo "[bootstrap] /opt/evo/plugins/ created (mode 0755, plugin bundle search root)"
+
+# ----------------------------------------------------------
 # Step 2.5: /etc/evo/client_acl.toml — operator capability ACL
 # ----------------------------------------------------------
 # The framework's wire-surface ACL gates plans_admin /
