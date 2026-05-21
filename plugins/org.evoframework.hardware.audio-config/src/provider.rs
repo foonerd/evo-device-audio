@@ -233,6 +233,40 @@ pub trait HardwareAudioProvider:
         >,
     >;
 
+    /// Failsafe discovery: when [`Self::current_config`] returns an
+    /// empty overlay (no managed block on disk), scan the boot
+    /// config for bare `dtoverlay=<token>` lines OUTSIDE the
+    /// plugin's managed banner block and return the first token
+    /// whose value is in `known_overlays`. Returns `Ok(None)` when
+    /// no bare DAC overlay is present.
+    ///
+    /// This honours operators who configure a DAC by editing the
+    /// boot config directly (or by using a non-evo tool) without
+    /// gestures through the plugin. The plugin then surfaces the
+    /// detected overlay on the published `active_config` subject
+    /// so downstream consumers (delivery.alsa's outputs
+    /// enrichment, UI surfaces) can still resolve operator-
+    /// friendly labels and mixer hints. The managed-vs-discovered
+    /// distinction does not affect the published shape; gestures
+    /// that write (apply / clear) continue to operate only on the
+    /// managed block.
+    ///
+    /// Default implementation returns `Ok(None)` — provider
+    /// implementations without boot-config introspection (e.g.
+    /// `NoopProvider`) need no further work.
+    fn discover_bare_overlay<'a>(
+        &'a self,
+        _known_overlays: Vec<String>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, ProviderError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+
     /// Apply a catalogue entry: validate the overlay, write the
     /// managed block to the boot config, optionally install the
     /// i2c-dev module drop-in (Pi-only). Returns the

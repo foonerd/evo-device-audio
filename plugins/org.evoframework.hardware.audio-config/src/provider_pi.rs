@@ -215,6 +215,48 @@ pub fn extract_active_overlay(text: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Failsafe discovery: scan a boot-config text for bare
+/// `dtoverlay=<token>` lines OUTSIDE the plugin's managed banner
+/// block and return the first token whose value (or whose base
+/// segment before the first comma) is in `known_overlays`.
+///
+/// Honours operators who configure a DAC by editing the boot
+/// config directly. Returns `None` when no recognisable bare DAC
+/// overlay is present; matching against `known_overlays` (drawn
+/// from the plugin's DAC catalogue at call time) keeps non-DAC
+/// overlays (`vc4-kms-v3d`, `dwc2`, etc.) out of the result.
+pub fn discover_bare_overlay(
+    text: &str,
+    known_overlays: &[String],
+) -> Option<String> {
+    let stripped = strip_managed_block(text);
+    let line_re = match Regex::new(r"(?m)^\s*dtoverlay=(?P<token>[^\r\n]+)") {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for caps in line_re.captures_iter(&stripped) {
+        let Some(token_match) = caps.name("token") else {
+            continue;
+        };
+        let token = token_match.as_str().trim();
+        if token.is_empty() {
+            continue;
+        }
+        let base = token.split(',').next().unwrap_or(token).trim();
+        for candidate in known_overlays {
+            if candidate.is_empty() {
+                continue;
+            }
+            let candidate_base =
+                candidate.split(',').next().unwrap_or(candidate.as_str());
+            if candidate == token || candidate_base == base {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the boot-config path the provider should target. Prefers
 /// `/boot/firmware/config.txt` (Bookworm/Trixie default on Pi), falls
 /// back to `/boot/config.txt`. Honours the `EVO_BOOT_CONFIG_PATH`
@@ -585,6 +627,31 @@ impl HardwareAudioProvider for PiProvider {
                 mixer_hint: None,
                 boot_config_path: self.boot_config_path.clone(),
             })
+        })
+    }
+
+    fn discover_bare_overlay<'a>(
+        &'a self,
+        known_overlays: Vec<String>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, ProviderError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            #[cfg(test)]
+            {
+                if let Some(text) = self.current_text().await {
+                    return Ok(self::discover_bare_overlay(
+                        &text,
+                        &known_overlays,
+                    ));
+                }
+            }
+            let text = read_boot_config(&self.boot_config_path).await?;
+            Ok(self::discover_bare_overlay(&text, &known_overlays))
         })
     }
 
@@ -1016,5 +1083,66 @@ mod tests {
             )
             .await;
         assert!(matches!(outcome, AmixerWriteOutcome::CardUnknown { .. }));
+    }
+
+    // ----- discover_bare_overlay failsafe tests -----
+
+    #[test]
+    fn discover_bare_overlay_finds_dac_outside_managed_block() {
+        let sample = "[all]\ndtoverlay=vc4-kms-v3d\ndtoverlay=dwc2,dr_mode=host\ndtoverlay=i-sabre-q2m\n";
+        let known = vec![
+            "hifiberry-dac".to_string(),
+            "i-sabre-q2m".to_string(),
+            "allo-boss-dac-pcm512x-audio".to_string(),
+        ];
+        let found = discover_bare_overlay(sample, &known);
+        assert_eq!(found.as_deref(), Some("i-sabre-q2m"));
+    }
+
+    #[test]
+    fn discover_bare_overlay_skips_non_dac_overlays() {
+        let sample =
+            "[all]\ndtoverlay=vc4-kms-v3d\ndtoverlay=dwc2,dr_mode=host\n";
+        let known = vec!["hifiberry-dac".to_string(), "BossDAC".to_string()];
+        let found = discover_bare_overlay(sample, &known);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn discover_bare_overlay_ignores_managed_block_overlay() {
+        // The managed-block overlay is not surfaced by the
+        // discovery path — current_config handles that case.
+        let sample = "[all]\n#### evo i2s setting below: do not alter ####\ndtoverlay=hifiberry-dac\n";
+        let known = vec!["hifiberry-dac".to_string()];
+        let found = discover_bare_overlay(sample, &known);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn discover_bare_overlay_matches_base_when_params_differ() {
+        // Operator wrote `dtoverlay=allo-boss-dac-pcm512x-audio,foo=bar`
+        // bare; catalogue records `allo-boss-dac-pcm512x-audio` (no
+        // params). The base-segment match returns the full operator-
+        // written form so consumers see the actual configuration.
+        let sample = "[all]\ndtoverlay=allo-boss-dac-pcm512x-audio,foo=bar\n";
+        let known = vec!["allo-boss-dac-pcm512x-audio".to_string()];
+        let found = discover_bare_overlay(sample, &known);
+        assert_eq!(
+            found.as_deref(),
+            Some("allo-boss-dac-pcm512x-audio,foo=bar")
+        );
+    }
+
+    #[test]
+    fn discover_bare_overlay_empty_text_returns_none() {
+        let found = discover_bare_overlay("", &["hifiberry-dac".to_string()]);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn discover_bare_overlay_empty_known_list_returns_none() {
+        let sample = "[all]\ndtoverlay=hifiberry-dac\n";
+        let found = discover_bare_overlay(sample, &[]);
+        assert!(found.is_none());
     }
 }
