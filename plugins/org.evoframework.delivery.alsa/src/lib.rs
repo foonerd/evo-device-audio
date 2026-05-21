@@ -80,6 +80,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use evo_plugin_sdk::contract::audio_routing::{
     AudioRouting, AudioRoutingError, ReadEndpoint, RouteChange,
@@ -768,12 +769,13 @@ impl AlsaDeliveryPlugin {
     /// Subscribe to the hardware.audio-config plugin's
     /// `evo.hardware.audio:active_config` subject and cache the
     /// most-recently-observed snapshot in
-    /// [`active_dac_config`]. Best-effort: if the subscriber /
-    /// querier are unavailable, if the subject has not yet been
-    /// announced, or if subscribe fails, the observer is simply
-    /// not wired this load cycle. The `delivery.active_endpoint`
-    /// verb continues to return its baseline payload without the
-    /// `active_dac_config` field populated.
+    /// [`active_dac_config`]. The observer task tolerates the
+    /// load-order race between delivery.alsa and
+    /// hardware.audio-config: when the upstream subject has not
+    /// yet been announced at admission, the task backs off and
+    /// retries `resolve_addressing` until it succeeds (or
+    /// shutdown). This keeps the active-DAC enrichment path
+    /// live regardless of which plugin admits first.
     async fn spawn_hardware_audio_observer(&mut self, ctx: &LoadContext) {
         let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
             tracing::debug!(
@@ -807,29 +809,63 @@ impl AlsaDeliveryPlugin {
             scheme: "evo.hardware.audio".to_string(),
             value: "active_config".to_string(),
         };
-        let canonical_id =
-            match querier.resolve_addressing(addressing.clone()).await {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        "hardware-audio active_config subject not yet \
-                         announced; observer not wired this cycle"
-                    );
-                    return;
+        let querier_for_task = Arc::clone(querier);
+        let subscriber_for_task = Arc::clone(subscriber);
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            // Stage 1: keep trying to resolve the active_config
+            // addressing until the upstream subject is announced.
+            // Backoff caps at 5 s so the loop adapts to delays
+            // without flooding the querier; an immediate
+            // shutdown short-circuits the wait.
+            let mut backoff = Duration::from_millis(250);
+            const BACKOFF_CAP: Duration = Duration::from_secs(5);
+            let canonical_id = loop {
+                match querier_for_task
+                    .resolve_addressing(addressing.clone())
+                    .await
+                {
+                    Ok(Some(id)) => break id,
+                    Ok(None) => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "hardware-audio active_config subject not yet \
+                             announced; backing off and retrying"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "resolve_addressing for hardware-audio \
+                             active_config errored; backing off and retrying"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        "resolve_addressing for hardware-audio active_config \
-                         failed"
-                    );
-                    return;
+                tokio::select! {
+                    _ = task_shutdown.notified() => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "hardware-audio observer: shutdown received \
+                             during resolve-addressing wait"
+                        );
+                        return;
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
                 }
+                backoff = std::cmp::min(backoff * 2, BACKOFF_CAP);
             };
-        let mut stream =
-            match subscriber.subscribe_subject(canonical_id.clone()).await {
+            // Stage 2: subscribe. A failure here means the
+            // substrate refused the canonical id we just
+            // resolved (very unusual); log and exit. A
+            // re-spawn on next plugin load picks it back up.
+            let mut stream = match subscriber_for_task
+                .subscribe_subject(canonical_id.clone())
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -837,14 +873,18 @@ impl AlsaDeliveryPlugin {
                         error = %e,
                         canonical_id = %canonical_id,
                         "subscribe to hardware-audio active_config subject \
-                         failed"
+                         failed; observer not wired this load cycle"
                     );
                     return;
                 }
             };
-        let shutdown = Arc::new(Notify::new());
-        let task_shutdown = Arc::clone(&shutdown);
-        let task = tokio::spawn(async move {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                canonical_id = %canonical_id,
+                "hardware-audio active_config observer task connected"
+            );
+            // Stage 3: receive updates + republish enriched
+            // outputs on every state push.
             loop {
                 tokio::select! {
                     _ = task_shutdown.notified() => {
@@ -919,8 +959,8 @@ impl AlsaDeliveryPlugin {
             Some(HardwareAudioObserverHandle { task, shutdown });
         tracing::info!(
             plugin = PLUGIN_NAME,
-            canonical_id = %canonical_id,
-            "hardware-audio active_config observer task spawned"
+            "hardware-audio active_config observer task spawned; \
+             resolve-addressing retry loop running in-task"
         );
     }
 
