@@ -190,6 +190,23 @@ echo "[2/3] stop steward + wipe ..."
 WIPE_SCRIPT_HEAD="
 set -e
 sudo -n systemctl stop evo 2>/dev/null || true
+# Kill any evo-device-audio process not under systemd's
+# control (e.g. a manual \`sudo /opt/evo/bin/evo-device-audio\`
+# launched from an ssh session). systemctl stop leaves those
+# alone; they go on holding ports (notably 7331 audio-plane)
+# and block the next install's bind.
+sudo -n pkill -KILL -f '/opt/evo/bin/evo-device-audio' 2>/dev/null || true
+sudo -n pkill -KILL -f '/opt/evo/plugins/.*/plugin\\.bin' 2>/dev/null || true
+"
+
+WIPE_MPD_INCLUDES="
+if [ -f /etc/mpd.conf ]; then
+    sudo -n sed -i.pre-evo-purge \\
+        -e '/^[[:space:]]*include[[:space:]]\\+\"\\/etc\\/evo\\/mpd\\.conf\"[[:space:]]*\$/d' \\
+        -e '/^[[:space:]]*include_optional[[:space:]]\\+\"\\/etc\\/evo\\/mpd\\.conf\"[[:space:]]*\$/d' \\
+        -e '/^[[:space:]]*#[[:space:]]*>>>[[:space:]]*evo-device-audio.*>>>[[:space:]]*\$/,/^[[:space:]]*#[[:space:]]*<<<[[:space:]]*evo-device-audio.*<<<[[:space:]]*\$/d' \\
+        /etc/mpd.conf
+fi
 "
 
 WIPE_BUNDLES="
@@ -230,10 +247,11 @@ sudo -n systemctl daemon-reload
 case "${MODE}" in
     --bundles) WIPE_BODY="${WIPE_BUNDLES}" ;;
     --soft)    WIPE_BODY="${WIPE_BUNDLES}${WIPE_STATE}" ;;
-    --full)    WIPE_BODY="${WIPE_BUNDLES}${WIPE_STATE}${WIPE_BINARY}${WIPE_CONFIG}" ;;
+    --full)    WIPE_BODY="${WIPE_BUNDLES}${WIPE_STATE}${WIPE_BINARY}${WIPE_CONFIG}${WIPE_MPD_INCLUDES}" ;;
 esac
 
-if ! ssh "${SSH_TARGET}" "${WIPE_SCRIPT_HEAD}${WIPE_BODY}"; then
+if ! printf '%s\n%s\n' "${WIPE_SCRIPT_HEAD}" "${WIPE_BODY}" \
+        | ssh "${SSH_TARGET}" 'bash -s' ; then
     echo "FAIL: wipe step returned non-zero on target" >&2
     exit 2
 fi
