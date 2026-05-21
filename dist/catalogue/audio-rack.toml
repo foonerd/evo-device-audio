@@ -305,6 +305,23 @@ name = "audio_multiroom_frame_trace"
 [[subjects]]
 name = "audio_multiroom_device_card"
 
+# Subject type the delivery.alsa plugin announces at load
+# carrying the resolved-outputs list (one entry per ALSA
+# card / subdevice the host kernel exposes). The plugin
+# joins each `aplay -l` row against its shipped card-name
+# catalog and the hardware.audio-config plugin's active
+# DAC, attaching an operator-friendly label, an output
+# class hint, and the default mixer control. Operator UI
+# resolves the canonical id by querying the subject
+# querier with addressing `evo.audio.delivery:outputs` and
+# subscribes to state changes via the framework's
+# SubjectStateSubscriber to react when the host's audio
+# topology changes. The field set mirrors the schema
+# declaration in the catalogue-schemas repo under
+# `schemas/org.evoframework/audio/delivery.v2.toml`.
+[[subjects]]
+name = "audio_delivery_outputs"
+
 # Subject types the hardware.audio-config plugin announces
 # at admission. capabilities carries the resolved DAC class
 # list + per-class instances + per-instance mixer-type
