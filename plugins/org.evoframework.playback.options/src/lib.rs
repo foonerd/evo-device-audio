@@ -113,6 +113,34 @@ pub mod transition;
 /// `rolled_back` outcome the operator sees.
 const ENVELOPE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Timeout the orchestrator applies to each subject-state
+/// wire publish call (envelope_requested at steps 2 + 7 and
+/// settings at step 3). Bounds an unreachable substrate or a
+/// blocked observer fan-out from stalling the transition past
+/// its declared SLA. Matches `ENVELOPE_ACK_TIMEOUT` so each
+/// publish + ack pair has a uniform bound.
+const SUBJECT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Overall budget for a single set_mixer_type gesture. Wraps
+/// the eight-step orchestrator so a stuck inner step cannot
+/// hold the plugin's `&mut self` past this budget. Sized as
+/// the sum of internal step budgets (publish + ack at pre-mute
+/// and at unmute, plus publish at set-authority) with slack
+/// for disk I/O and observer fan-out reaction. On expiry the
+/// orchestrator emits a `failed` lifecycle happening with the
+/// `overall_budget` phase tag and returns `Permanent`; the
+/// transition lock and the plugin's `&mut self` release as
+/// soon as the timeout future resolves, so subsequent requests
+/// stop queueing behind the stuck gesture.
+const TRANSITION_OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound applied to the post-timeout `failed` lifecycle emit.
+/// The happenings bus is a different substrate to the subject
+/// announcer (the likely wedge source) so this is defence in
+/// depth; on expiry the emit is dropped and the gesture's
+/// permanent error still returns to the caller.
+const POST_TIMEOUT_LIFECYCLE_BUDGET: Duration = Duration::from_secs(2);
+
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
@@ -470,6 +498,21 @@ pub struct PlaybackOptionsPlugin {
     /// override with shorter durations so the timeout-
     /// routes-to-rollback test runs in milliseconds.
     envelope_ack_timeout_override: Option<Duration>,
+    /// Per-instance override for the wire-publish timeout
+    /// applied at steps 2, 3, and 7 of the mixer-transition
+    /// orchestrator. Production paths leave this `None` and
+    /// the [`SUBJECT_PUBLISH_TIMEOUT`] default applies. The
+    /// regression test that simulates a wedged subject
+    /// announcer overrides with a sub-second duration so the
+    /// test runs in tens of milliseconds.
+    subject_publish_timeout_override: Option<Duration>,
+    /// Per-instance override for the overall transition
+    /// budget on `set_mixer_type`. Production paths leave
+    /// this `None` and the [`TRANSITION_OVERALL_TIMEOUT`]
+    /// default applies. The regression test that exercises
+    /// the outer-budget recovery path overrides with a sub-
+    /// second duration.
+    transition_overall_timeout_override: Option<Duration>,
     requests_handled: u64,
 }
 
@@ -487,6 +530,8 @@ impl PlaybackOptionsPlugin {
             subject_querier: None,
             envelope_generation: Arc::new(AtomicU64::new(0)),
             envelope_ack_timeout_override: None,
+            subject_publish_timeout_override: None,
+            transition_overall_timeout_override: None,
             requests_handled: 0,
         }
     }
@@ -501,6 +546,33 @@ impl PlaybackOptionsPlugin {
         timeout: Duration,
     ) -> Self {
         self.envelope_ack_timeout_override = Some(timeout);
+        self
+    }
+
+    /// Test-only override for the wire-publish timeout used by
+    /// `publish_envelope_requested` and `publish_settings_state`.
+    /// The slow-announcer regression test sets a sub-second
+    /// duration so the test runs without waiting the production
+    /// default of five seconds.
+    #[cfg(test)]
+    pub(crate) fn with_subject_publish_timeout_override(
+        mut self,
+        timeout: Duration,
+    ) -> Self {
+        self.subject_publish_timeout_override = Some(timeout);
+        self
+    }
+
+    /// Test-only override for the overall transition budget.
+    /// The outer-budget regression test sets a sub-second
+    /// duration so the test runs without waiting the production
+    /// default of thirty seconds.
+    #[cfg(test)]
+    pub(crate) fn with_transition_overall_timeout_override(
+        mut self,
+        timeout: Duration,
+    ) -> Self {
+        self.transition_overall_timeout_override = Some(timeout);
         self
     }
 
@@ -843,10 +915,25 @@ impl PlaybackOptionsPlugin {
         };
         let value = serde_json::to_value(&payload)
             .map_err(|e| format!("serialise envelope_requested: {e}"))?;
-        announcer
-            .update_state(Self::envelope_requested_addressing(), value)
-            .await
-            .map_err(|e| format!("update envelope_requested state: {e:?}"))?;
+        let publish_timeout = self
+            .subject_publish_timeout_override
+            .unwrap_or(SUBJECT_PUBLISH_TIMEOUT);
+        let publish_future = announcer
+            .update_state(Self::envelope_requested_addressing(), value);
+        match tokio::time::timeout(publish_timeout, publish_future).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(format!("update envelope_requested state: {e:?}"));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "envelope publish timeout after {}ms (substrate \
+                     update_state did not return; downstream observer is \
+                     wedged)",
+                    publish_timeout.as_millis()
+                ));
+            }
+        }
         Ok(generation)
     }
 
@@ -989,15 +1076,28 @@ impl PlaybackOptionsPlugin {
                 return;
             }
         };
-        if let Err(e) = announcer
-            .update_state(Self::settings_addressing(), state)
-            .await
-        {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "update settings subject state failed"
-            );
+        let publish_timeout = self
+            .subject_publish_timeout_override
+            .unwrap_or(SUBJECT_PUBLISH_TIMEOUT);
+        let publish_future =
+            announcer.update_state(Self::settings_addressing(), state);
+        match tokio::time::timeout(publish_timeout, publish_future).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = ?e,
+                    "update settings subject state failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    timeout_ms = publish_timeout.as_millis() as u64,
+                    "settings subject state publish timed out; subscribers \
+                     may miss this update"
+                );
+            }
         }
     }
 
@@ -1337,11 +1437,67 @@ impl PlaybackOptionsPlugin {
 
         // Acquire the transition lock for the duration of the
         // state machine. Concurrent mixer_type gestures wait
-        // (I3 single authority).
+        // (single-authority invariant).
         let lock_arc = Arc::clone(&self.transition_lock);
         let _lock = lock_arc.lock_owned().await;
 
-        let outcome = self.run_mixer_transition(from, to).await;
+        // Wrap the orchestrator in an overall budget. Each
+        // internal step (envelope publish, ack await, persist,
+        // settings publish, unmute publish, ack await) already
+        // carries its own bound; the outer budget is the safety
+        // net for any pathological compound case, and releases
+        // the plugin's `&mut self` deterministically so
+        // subsequent requests cannot queue behind a stuck
+        // gesture.
+        let overall_timeout = self
+            .transition_overall_timeout_override
+            .unwrap_or(TRANSITION_OVERALL_TIMEOUT);
+        let outcome = match tokio::time::timeout(
+            overall_timeout,
+            self.run_mixer_transition(from, to),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => {
+                let reason = format!(
+                    "transition_timed_out after {}ms (inner orchestration did \
+                     not return within the overall budget)",
+                    overall_timeout.as_millis()
+                );
+                // Cancellation may have left in-memory settings
+                // out of step with the persisted state.toml (the
+                // window is narrow: between the in-memory mutate
+                // at step 3 and the fsync completion). Re-read
+                // disk as the authoritative source so the next
+                // request observes a coherent self.settings.
+                if let Ok(restored) = self.load_settings_from_disk().await {
+                    self.settings = restored;
+                }
+                // Emit the lifecycle.failed happening through a
+                // short budget so the happenings bus cannot also
+                // wedge the recovery path (defence in depth; the
+                // happenings substrate is distinct from the
+                // subject announcer that is the likely wedge
+                // source, but engineering bar forbids any
+                // unbounded await in the recovery path).
+                let _ = tokio::time::timeout(
+                    POST_TIMEOUT_LIFECYCLE_BUDGET,
+                    self.emit_lifecycle_failed(
+                        from,
+                        to,
+                        "overall_budget",
+                        &reason,
+                    ),
+                )
+                .await;
+                return Err(PluginError::Permanent(format!(
+                    "mixer-transition failed at overall_budget (chain in \
+                     unknown post-pre-mute state; operator intervention \
+                     required): {reason}"
+                )));
+            }
+        };
 
         match outcome {
             transition::TransitionOutcome::Applied { .. }
@@ -3546,5 +3702,253 @@ mod tests {
             .with_state_path(dir.path().join("nonexistent.toml"));
         let s = p.load_settings_from_disk().await.unwrap();
         assert_eq!(s, Settings::default());
+    }
+
+    // ----- Outer-budget recovery tests -----
+    //
+    // Regression coverage for the wedge surfaced on a live rig:
+    // a `set_mixer_type` gesture that called into a substrate
+    // whose `update_state` never returned stalled the plugin's
+    // `&mut self` indefinitely, queueing every subsequent
+    // request behind it until the steward was restarted. The
+    // fix adds two bounds:
+    //
+    //   1. Per-call timeout on each `announcer.update_state`
+    //      invocation inside `publish_envelope_requested` and
+    //      `publish_settings_state` (`SUBJECT_PUBLISH_TIMEOUT`).
+    //
+    //   2. An overall budget on `run_mixer_transition` inside
+    //      `handle_set_mixer_type` (`TRANSITION_OVERALL_TIMEOUT`),
+    //      which forces the inner future to drop and releases
+    //      `&mut self` even if the inner orchestration's own
+    //      bounds compose pathologically.
+    //
+    // These tests pin both bounds. The hung-substrate is
+    // simulated by a `BlockingAnnouncer` whose `update_state`
+    // future never resolves; production substrates may surface
+    // the same shape under socket back-pressure, a stalled
+    // observer fan-out, or a dead peer.
+
+    /// Announcer whose `update_state` never returns. Mirrors a
+    /// wedged subject-substrate observer: socket back-pressure,
+    /// a peer that never drains the announcement stream, or a
+    /// deadlocked observer reaction. `announce` and `retract`
+    /// resolve immediately so plugin construction is unaffected.
+    #[derive(Default)]
+    struct BlockingAnnouncer;
+
+    impl std::fmt::Debug for BlockingAnnouncer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BlockingAnnouncer").finish_non_exhaustive()
+        }
+    }
+
+    impl SubjectAnnouncer for BlockingAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            _announcement: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                // Never returns. The test cancels this future by
+                // dropping it (the outer-budget timeout fires in
+                // `handle_set_mixer_type` and the inner future is
+                // dropped, which drops this).
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+    }
+
+    fn blocking_announcer_plugin(
+        publish_timeout: Duration,
+        overall_timeout: Duration,
+    ) -> (PlaybackOptionsPlugin, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join(STATE_FILENAME);
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(state_path)
+            .with_subject_publish_timeout_override(publish_timeout)
+            .with_transition_overall_timeout_override(overall_timeout);
+        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        p.subject_announcer =
+            Some(Arc::new(BlockingAnnouncer) as Arc<dyn SubjectAnnouncer>);
+        p.subject_state_subscriber =
+            Some(Arc::new(StubStateSubscriber::default())
+                as Arc<dyn SubjectStateSubscriber>);
+        p.subject_querier =
+            Some(Arc::new(StubQuerier::default()) as Arc<dyn SubjectQuerier>);
+        p.loaded = true;
+        (p, dir)
+    }
+
+    #[tokio::test]
+    async fn publish_envelope_timeout_routes_to_rollback() {
+        // Per-call publish bound fires first (200ms) before the
+        // overall budget (5s). The orchestrator's pre-mute step
+        // surfaces the publish timeout, routes to rollback, and
+        // returns Permanent naming the publish-timeout cause.
+        let (mut p, _dir) = blocking_announcer_plugin(
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        );
+
+        let started = std::time::Instant::now();
+        let err = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect_err("blocked publish must surface as Permanent");
+        let elapsed = started.elapsed();
+
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("rolled back"),
+                    "rollback path engaged on publish timeout: {msg}"
+                );
+                assert!(
+                    msg.contains("pre_mute"),
+                    "rollback identifies the failed phase: {msg}"
+                );
+                assert!(
+                    msg.contains("publish timeout"),
+                    "error names the publish-timeout cause: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "publish timeout (200ms) must surface well below the overall \
+             budget (5s); elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outer_budget_fires_when_publish_bound_exceeds_overall() {
+        // Overall budget (300ms) fires first because the per-call
+        // publish bound (5s) is longer. The outer timeout cancels
+        // the inner orchestration, emits `failed` with the
+        // `overall_budget` phase tag, and returns Permanent. This
+        // is the safety net that prevents the wedge regardless of
+        // how the inner step composition stalls.
+        let (mut p, _dir) = blocking_announcer_plugin(
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+
+        let started = std::time::Instant::now();
+        let err = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect_err("outer budget must surface as Permanent");
+        let elapsed = started.elapsed();
+
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("overall_budget"),
+                    "error names the outer-budget phase: {msg}"
+                );
+                assert!(
+                    msg.contains("transition_timed_out"),
+                    "error names the timeout reason: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        // Outer budget at 300ms; allow generous slack for the
+        // post-timeout recovery work (disk re-read + lifecycle
+        // emit). The hard assertion is "well below 5s" (the
+        // per-call publish bound, which must NOT have been the
+        // surface that fired).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "outer budget must surface well below per-call publish bound \
+             (5s); elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_unwedged_after_outer_budget_recovery() {
+        // The engineering-bar test: after the outer budget
+        // recovers from a wedged orchestration, a subsequent
+        // request must complete promptly. Before the fix,
+        // `&mut self` was held by the stuck inner future and
+        // every later request queued behind it; the steward had
+        // to be restarted. After the fix, the inner future is
+        // dropped and the next request handles immediately.
+        let (mut p, _dir) = blocking_announcer_plugin(
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+
+        // First request: hits the outer-budget recovery path.
+        let _err = p
+            .handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            ))
+            .await
+            .expect_err("outer budget must surface as Permanent");
+
+        // Second request: must complete promptly. We pick
+        // `options.get_settings` because it touches no wire
+        // surface — purely in-memory snapshot of `self.settings`.
+        // If the plugin is wedged, this hangs forever and the
+        // test framework's per-test timeout would surface it.
+        let started = std::time::Instant::now();
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .expect("get_settings must complete after outer-budget recovery");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "second request must complete promptly (proves plugin unwedged); \
+             elapsed = {elapsed:?}"
+        );
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["v"], 1);
     }
 }
