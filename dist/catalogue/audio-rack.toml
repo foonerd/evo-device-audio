@@ -106,6 +106,39 @@ Role flips dynamically per the framework's source-host election.
 """
 
 [[racks]]
+name = "hardware"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Audio hardware enablement surface: DAC catalogue + DSP \
+capability resolution + boot-config dtoverlay management + \
+DIY DTBO modder workflow. One shelf per hardware domain; \
+the audio shelf covers DAC selection, per-DAC DSP control \
+surface, hardware self-test, and the operator-gestured \
+modder workflow for custom DTBO uploads.
+"""
+
+[[racks.shelves]]
+name = "audio"
+shape = 1
+description = """
+Audio hardware enablement respondent. Owns the DAC catalogue \
+(built-time-imported from the data/import/ provenance \
+sources) + curated DSP control pool + three-layer DSP \
+capability resolver (catalogue dsp_options[] -> control pool \
+-> live amixer cget). Operator gestures: select_dac / \
+clear_dac / list_dacs / verify_install + per-DAC DSP \
+control get|set + modder workflow \
+(list_overlays / register_overlay / remove_overlay) when \
+the per-DAC advanced_settings_enabled flag is on AND the \
+distribution-tier modder gate permits it. Publishes \
+evo.hardware.audio:capabilities, :active_config, \
+:dsp_capabilities, :pending_reboot subjects + emits the \
+hardware.audio.reboot_required + hardware.audio.dsp \
+.control_changed happenings.
+"""
+
+[[racks]]
 name = "networking"
 family = "domain"
 kinds = ["registrar"]
@@ -271,6 +304,34 @@ name = "audio_multiroom_frame_trace"
 # CARD-DESIGN-SOURCE.md`.
 [[subjects]]
 name = "audio_multiroom_device_card"
+
+# Subject types the hardware.audio-config plugin announces
+# at admission. capabilities carries the resolved DAC class
+# list + per-class instances + per-instance mixer-type
+# capability (the destination-picker capability surface).
+# active_config carries the currently-selected DAC + its
+# bound ALSA coordinate. pending_reboot is True when a
+# select_dac / register_overlay / remove_overlay gesture
+# rewrote the boot-config dtoverlay block and a reboot is
+# required for the change to take effect. dsp_capabilities
+# carries the three-layer-resolved DSP control set for the
+# active DAC. modder_overlays carries the registered user
+# overlay set (DTBO blobs registered via the modder
+# workflow).
+[[subjects]]
+name = "hardware_audio_capabilities"
+
+[[subjects]]
+name = "hardware_audio_active_config"
+
+[[subjects]]
+name = "hardware_audio_pending_reboot"
+
+[[subjects]]
+name = "hardware_audio_dsp_capabilities"
+
+[[subjects]]
+name = "hardware_audio_modder_overlays"
 
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from

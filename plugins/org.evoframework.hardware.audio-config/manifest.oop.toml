@@ -52,6 +52,7 @@ request_types = [
     "hardware.audio.clear_dac",
     "hardware.audio.current_config",
     "hardware.audio.confirm_reboot_required",
+    "hardware.audio.verify_install",
     "hardware.audio.dsp.list_controls",
     "hardware.audio.dsp.get_control",
     "hardware.audio.dsp.set_control",
