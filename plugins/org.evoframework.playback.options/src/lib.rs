@@ -915,25 +915,57 @@ impl PlaybackOptionsPlugin {
         };
         let value = serde_json::to_value(&payload)
             .map_err(|e| format!("serialise envelope_requested: {e}"))?;
+        // Background the wire publish. The substrate's in-memory
+        // broadcast (the channel the warden's subject-state stream
+        // consumes) is fed BEFORE the durable + happening emit
+        // chain — so subscribers see the new state immediately
+        // while the wire ack to the publisher waits on the slow
+        // SQLite-serialised emit. Awaiting that ack adds nothing
+        // to functional correctness (the warden has already
+        // received the request); it just stalls the orchestrator.
+        // Background the publish, return the generation
+        // immediately, and let `await_envelope_ack` observe the
+        // warden's response via its own subscription. The
+        // SUBJECT_PUBLISH_TIMEOUT bound stays inside the spawned
+        // task so a permanently-wedged substrate cannot leak a
+        // task that lives forever.
         let publish_timeout = self
             .subject_publish_timeout_override
             .unwrap_or(SUBJECT_PUBLISH_TIMEOUT);
-        let publish_future = announcer
-            .update_state(Self::envelope_requested_addressing(), value);
-        match tokio::time::timeout(publish_timeout, publish_future).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(format!("update envelope_requested state: {e:?}"));
+        let announcer_for_task = Arc::clone(announcer);
+        let addressing_for_task = Self::envelope_requested_addressing();
+        let state_label = match state {
+            EnvelopeState::Muted => "muted",
+            EnvelopeState::Unmuted => "unmuted",
+        };
+        tokio::spawn(async move {
+            let publish_future =
+                announcer_for_task.update_state(addressing_for_task, value);
+            match tokio::time::timeout(publish_timeout, publish_future).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = ?e,
+                        generation = generation,
+                        requested_state = state_label,
+                        "envelope_requested wire publish errored after \
+                         backgrounding"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        generation = generation,
+                        requested_state = state_label,
+                        timeout_ms = publish_timeout.as_millis() as u64,
+                        "envelope_requested wire publish timed out after \
+                         backgrounding; warden may have already seen the \
+                         state via the substrate's in-memory broadcast"
+                    );
+                }
             }
-            Err(_) => {
-                return Err(format!(
-                    "envelope publish timeout after {}ms (substrate \
-                     update_state did not return; downstream observer is \
-                     wedged)",
-                    publish_timeout.as_millis()
-                ));
-            }
-        }
+        });
         Ok(generation)
     }
 
@@ -1076,29 +1108,42 @@ impl PlaybackOptionsPlugin {
                 return;
             }
         };
+        // Background the wire publish. Subscribers (delivery.alsa,
+        // playback.mpd) see the new state via the substrate's
+        // in-memory broadcast immediately; the wire ack to the
+        // publisher waits for the slow durable + happening emit
+        // chain. The orchestrator does not need to wait for that
+        // ack — the settings publish is best-effort (no caller
+        // checks the return value) and the downstream reactors
+        // are already running.
         let publish_timeout = self
             .subject_publish_timeout_override
             .unwrap_or(SUBJECT_PUBLISH_TIMEOUT);
-        let publish_future =
-            announcer.update_state(Self::settings_addressing(), state);
-        match tokio::time::timeout(publish_timeout, publish_future).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    error = ?e,
-                    "update settings subject state failed"
-                );
+        let announcer_for_task = Arc::clone(announcer);
+        let addressing_for_task = Self::settings_addressing();
+        tokio::spawn(async move {
+            let publish_future =
+                announcer_for_task.update_state(addressing_for_task, state);
+            match tokio::time::timeout(publish_timeout, publish_future).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = ?e,
+                        "settings subject state wire publish errored after \
+                         backgrounding"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        timeout_ms = publish_timeout.as_millis() as u64,
+                        "settings subject state wire publish timed out after \
+                         backgrounding"
+                    );
+                }
             }
-            Err(_) => {
-                tracing::warn!(
-                    plugin = PLUGIN_NAME,
-                    timeout_ms = publish_timeout.as_millis() as u64,
-                    "settings subject state publish timed out; subscribers \
-                     may miss this update"
-                );
-            }
-        }
+        });
     }
 
     /// Emit a `Happening::PluginEvent` carrying the operator-
@@ -3477,6 +3522,8 @@ mod tests {
         assert_eq!(v["status"], "ok");
         // Both publishes still happen — the advisory-mode
         // path skips only the AWAIT side, not the PUBLISH.
+        // Drain the backgrounded publish tasks before asserting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let requests = envelope_requested_publishes(&announcer);
         assert_eq!(requests.len(), 2);
     }
@@ -3797,67 +3844,38 @@ mod tests {
         publish_timeout: Duration,
         overall_timeout: Duration,
     ) -> (PlaybackOptionsPlugin, tempfile::TempDir) {
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
         let dir = tempdir().unwrap();
         let state_path = dir.path().join(STATE_FILENAME);
+        // Register envelope_observed so `await_envelope_ack`
+        // enters its subscribe + wait branch (rather than the
+        // advisory-mode short-circuit). The wedge tests rely on
+        // the orchestrator actually waiting somewhere inside
+        // `run_mixer_transition` — with the publish backgrounded,
+        // the wait inside `await_envelope_ack` is what the outer
+        // budget pre-empts.
+        let querier = StubQuerier::default();
+        querier.register(
+            &ExternalAddressing {
+                scheme: ENVELOPE_SCHEME.to_string(),
+                value: ENVELOPE_OBSERVED_VALUE.to_string(),
+            },
+            OBSERVED_CID,
+        );
         let mut p = PlaybackOptionsPlugin::new()
             .with_state_path(state_path)
             .with_subject_publish_timeout_override(publish_timeout)
-            .with_transition_overall_timeout_override(overall_timeout);
+            .with_transition_overall_timeout_override(overall_timeout)
+            .with_envelope_ack_timeout_override(Duration::from_secs(5));
         p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
         p.subject_announcer =
             Some(Arc::new(BlockingAnnouncer) as Arc<dyn SubjectAnnouncer>);
         p.subject_state_subscriber =
             Some(Arc::new(StubStateSubscriber::default())
                 as Arc<dyn SubjectStateSubscriber>);
-        p.subject_querier =
-            Some(Arc::new(StubQuerier::default()) as Arc<dyn SubjectQuerier>);
+        p.subject_querier = Some(Arc::new(querier) as Arc<dyn SubjectQuerier>);
         p.loaded = true;
         (p, dir)
-    }
-
-    #[tokio::test]
-    async fn publish_envelope_timeout_routes_to_rollback() {
-        // Per-call publish bound fires first (200ms) before the
-        // overall budget (5s). The orchestrator's pre-mute step
-        // surfaces the publish timeout, routes to rollback, and
-        // returns Permanent naming the publish-timeout cause.
-        let (mut p, _dir) = blocking_announcer_plugin(
-            Duration::from_millis(200),
-            Duration::from_secs(5),
-        );
-
-        let started = std::time::Instant::now();
-        let err = p
-            .handle_request(&req(
-                "options.set_mixer_type",
-                json!({ "v": 1, "value": "none" }),
-            ))
-            .await
-            .expect_err("blocked publish must surface as Permanent");
-        let elapsed = started.elapsed();
-
-        match err {
-            PluginError::Permanent(msg) => {
-                assert!(
-                    msg.contains("rolled back"),
-                    "rollback path engaged on publish timeout: {msg}"
-                );
-                assert!(
-                    msg.contains("pre_mute"),
-                    "rollback identifies the failed phase: {msg}"
-                );
-                assert!(
-                    msg.contains("publish timeout"),
-                    "error names the publish-timeout cause: {msg}"
-                );
-            }
-            other => panic!("expected Permanent, got {other:?}"),
-        }
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "publish timeout (200ms) must surface well below the overall \
-             budget (5s); elapsed = {elapsed:?}"
-        );
     }
 
     #[tokio::test]
