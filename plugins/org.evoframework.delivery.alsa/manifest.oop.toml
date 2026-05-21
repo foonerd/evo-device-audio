@@ -45,6 +45,11 @@ restart_budget = 5
 # LoadContext.subject_state_subscriber so the plugin can observe
 # operator changes to the playback.options settings subject and
 # emit a `delivery.options_observed` happening on every update.
+# `announce_subjects = true` populates LoadContext.subject_announcer
+# so the plugin can publish `evo.audio.delivery:outputs` at load
+# (the resolved ALSA outputs list — `aplay -l` joined against the
+# embedded card catalog with operator-friendly labels + output
+# class derivation).
 # The full asound.conf re-rendering response to settings changes
 # (pcm.evo rewriting based on mixer_type / output_device / etc.)
 # is the next phase of the delivery-side reactivity work; the
@@ -52,6 +57,7 @@ restart_budget = 5
 # contract is operator-verifiable rather than emit-into-the-void.
 [capabilities]
 subscribe_subjects = true
+announce_subjects = true
 
 # Respondent capabilities. Operator-facing introspection of the
 # modular ALSA pipeline state: which cards / mixers / formats the host
@@ -63,6 +69,7 @@ request_types = [
     "delivery.list_cards",
     "delivery.list_mixers",
     "delivery.active_endpoint",
+    "delivery.list_outputs",
 ]
 response_budget_ms = 5000
 
