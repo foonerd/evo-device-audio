@@ -1,29 +1,35 @@
-//! DSP capability resolver — three-layer merge producing the
-//! operator-facing per-DAC DSP control set.
+//! DSP capability resolver — live-hardware-truth + presentation
+//! enrichment producing the operator-facing per-DAC DSP control
+//! set.
 //!
-//! The resolver joins:
+//! Discovery layers (in order):
 //!
-//! 1. The active DAC's catalog `dsp_options[]` (list of ALSA mixer-
-//!    control names the catalog declares for this hardware).
-//! 2. The curated DSP control pool (operator-facing schema per
-//!    control: type, value-domain, human label, recommended
-//!    default, apply-semantics, description).
-//! 3. Live amixer introspection (current value + runtime-narrowed
-//!    range; abstracted via the [`AmixerReader`] trait so the
-//!    resolver is testable without a real ALSA card).
+//! 1. Live amixer enumeration (`amixer -c <card> controls`) is the
+//!    ground truth: the kernel driver bound by the active overlay
+//!    decides which mixer controls exist. The resolver enumerates
+//!    them via [`AmixerReader::list_controls`]; the catalog's
+//!    `dsp_options[]` is NOT consulted as a gate — operator-visible
+//!    state matches the hardware, never a hand-curated allowlist
+//!    that could drift.
+//! 2. Live amixer cget on each discovered control via
+//!    [`AmixerReader::read_control`] supplies the runtime type +
+//!    current value + range/enum domain.
+//! 3. The curated DSP control pool joins by name for presentation
+//!    enrichment (human label, semantic group, apply semantics,
+//!    description). Controls without a pool entry surface as
+//!    `unbound_pool_entry = true` with the raw ALSA name as the
+//!    label — the operator sees what the hardware exposes; pool
+//!    coverage is presentation polish, not a capability gate.
 //!
-//! Each layer's absence is observable in the published surface; no
-//! layer is silently skipped. Specifically:
+//! Each layer's absence is observable in the published surface;
+//! no layer is silently skipped. Specifically:
 //!
-//! * Control declared in catalog but not in pool → surfaces with
-//!   `unbound_pool_entry = true` and the raw ALSA name as the
-//!   human label.
-//! * Control declared in catalog (and possibly pool) but not
-//!   exposed by amixer on the bound card → surfaces with
-//!   `bound = false` and an operator-readable `unbound_reason`.
+//! * Discovered control not in pool → surfaces with
+//!   `unbound_pool_entry = true` and the raw ALSA name as label.
+//! * No ALSA card matches the catalog's hint → resolver returns
+//!   an empty controls list plus [`ResolverDiagnostic::CardUnknownToAmixer`].
 //! * No active DAC selected → resolver returns an empty
-//!   [`DspCapabilitySet`] plus a top-level diagnostic
-//!   [`ResolverDiagnostic::NoActiveDac`].
+//!   [`DspCapabilitySet`] plus [`ResolverDiagnostic::NoActiveDac`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -34,12 +40,27 @@ use crate::dsp_pool::{ApplySemantics, ControlType, DspControlPool};
 use crate::evo_catalog::EvoCatalog;
 
 /// Live amixer-introspection abstraction. The resolver invokes
-/// [`read_control`] once per control declared in the catalog
-/// `dsp_options[]`; the production implementation shells into
-/// `amixer -c <card> cget name='<control>'` and parses the output.
-/// Tests inject stub implementations to exercise every
-/// resolver branch without depending on an ALSA card.
+/// [`AmixerReader::list_controls`] once per gesture to discover
+/// the bound card's control set (hardware ground truth), then
+/// [`AmixerReader::read_control`] per discovered control to
+/// fetch its live state. Production implementations shell into
+/// `amixer -c <card> controls` and `amixer -c <card> cget
+/// name='<control>'`; tests inject stubs.
 pub trait AmixerReader: Send + Sync {
+    /// Enumerate the ALSA mixer control names the bound card
+    /// currently exposes (`amixer scontrols -c <card>` shape).
+    /// This is the resolver's ground truth: a control exists if
+    /// the kernel driver registered it. Returns
+    /// [`AmixerListOutcome::Found`] with the discovered name
+    /// list, [`AmixerListOutcome::CardUnknown`] when no card
+    /// matches the supplied hint, or
+    /// [`AmixerListOutcome::IntrospectionFailed`] for subprocess
+    /// / parse failures.
+    fn list_controls<'a>(
+        &'a self,
+        card_hint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AmixerListOutcome> + Send + 'a>>;
+
     /// Read the live state of one ALSA mixer control on the given
     /// card. Returns [`AmixerReadOutcome::Found`] when the control
     /// exists on the card, [`AmixerReadOutcome::NotPresent`] when
@@ -55,6 +76,27 @@ pub trait AmixerReader: Send + Sync {
         card_hint: &'a str,
         control_name: &'a str,
     ) -> Pin<Box<dyn Future<Output = AmixerReadOutcome> + Send + 'a>>;
+}
+
+/// Outcome variant returned by [`AmixerReader::list_controls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmixerListOutcome {
+    /// Card enumerated successfully. Carries the list of control
+    /// names the kernel driver registered. May be empty if the
+    /// card exists but has no mixer controls (e.g. some pure
+    /// digital outputs).
+    Found(Vec<String>),
+    /// No ALSA card matches the supplied hint on this host.
+    CardUnknown {
+        /// Operator-readable diagnostic.
+        reason: String,
+    },
+    /// Subprocess failed, parse failed, or some other
+    /// introspection path errored.
+    IntrospectionFailed {
+        /// Underlying error string.
+        reason: String,
+    },
 }
 
 /// Outcome variant returned by [`AmixerReader::read_control`].
@@ -238,18 +280,30 @@ pub enum ResolverDiagnostic {
         dac_id: String,
     },
     /// The active DAC catalog entry has no `alsa_card_hint`.
-    /// Resolver cannot invoke amixer; every control surfaces
-    /// with `bound = false` + a hint-missing `unbound_reason`.
+    /// Resolver cannot invoke amixer; the discovered controls
+    /// list is empty.
     NoAlsaCardHint {
         /// The DAC id with no card hint.
         dac_id: String,
     },
-    /// The active DAC catalog entry has no `dsp_options[]`.
-    /// Resolver returns an empty controls list — operator-
-    /// expected state for most DACs without onboard DSP chips.
-    NoDspOptionsDeclared {
-        /// The DAC id with no DSP options.
-        dac_id: String,
+    /// Amixer reports the bound card does not exist on this
+    /// host — the kernel did not register the overlay, or the
+    /// catalog's `alsa_card_hint` is stale. Surfaces the
+    /// underlying amixer diagnostic so the operator can act.
+    CardUnknownToAmixer {
+        /// The card hint the resolver tried to enumerate.
+        card_hint: String,
+        /// Operator-readable amixer diagnostic.
+        reason: String,
+    },
+    /// Amixer introspection errored for some other reason
+    /// (subprocess failure, parse failure). Surfaces the
+    /// underlying diagnostic.
+    AmixerIntrospectionFailed {
+        /// The card hint the resolver tried to enumerate.
+        card_hint: String,
+        /// Operator-readable amixer diagnostic.
+        reason: String,
     },
 }
 
@@ -295,13 +349,13 @@ pub async fn resolve_dsp_capabilities(
     };
 
     let mut diagnostics: Vec<ResolverDiagnostic> = Vec::new();
-    if alsa_card_hint.is_none() {
+
+    // Without a card hint, amixer cannot enumerate; surface
+    // the diagnostic with an empty controls list. The operator-
+    // facing affordance ("no DSP controls available for this
+    // DAC") matches reality — the catalog row is incomplete.
+    let Some(card) = alsa_card_hint.clone() else {
         diagnostics.push(ResolverDiagnostic::NoAlsaCardHint {
-            dac_id: dac_id.to_string(),
-        });
-    }
-    if dac.dsp_options.is_empty() {
-        diagnostics.push(ResolverDiagnostic::NoDspOptionsDeclared {
             dac_id: dac_id.to_string(),
         });
         return DspCapabilitySet {
@@ -311,22 +365,57 @@ pub async fn resolve_dsp_capabilities(
             controls: Vec::new(),
             diagnostics,
         };
-    }
+    };
 
+    // Layer 1 — live discovery. The bound card's kernel driver
+    // decides which controls exist; the resolver mirrors that
+    // truth. A catalog hint that points at a card the kernel
+    // does not expose surfaces a CardUnknownToAmixer diagnostic
+    // (NOT a silent empty result). Any other introspection
+    // error surfaces AmixerIntrospectionFailed.
+    let discovered: Vec<String> = match amixer.list_controls(&card).await {
+        AmixerListOutcome::Found(names) => names,
+        AmixerListOutcome::CardUnknown { reason } => {
+            diagnostics.push(ResolverDiagnostic::CardUnknownToAmixer {
+                card_hint: card.clone(),
+                reason,
+            });
+            return DspCapabilitySet {
+                dac_id: Some(dac.id.clone()),
+                alsa_card_hint,
+                advanced_settings_enabled: dac.advanced_settings_enabled,
+                controls: Vec::new(),
+                diagnostics,
+            };
+        }
+        AmixerListOutcome::IntrospectionFailed { reason } => {
+            diagnostics.push(ResolverDiagnostic::AmixerIntrospectionFailed {
+                card_hint: card.clone(),
+                reason,
+            });
+            return DspCapabilitySet {
+                dac_id: Some(dac.id.clone()),
+                alsa_card_hint,
+                advanced_settings_enabled: dac.advanced_settings_enabled,
+                controls: Vec::new(),
+                diagnostics,
+            };
+        }
+    };
+
+    // Layer 2 + 3 — per-control merge: cget for runtime state,
+    // pool lookup for presentation enrichment. Discovered
+    // controls without a pool entry surface raw-named with
+    // unbound_pool_entry = true so the operator sees what the
+    // hardware exposes; pool coverage gaps are visible in the
+    // shipped surface and an actionable signal for pool-author
+    // follow-up.
     let pool_lookup = pool.build_lookup();
     let mut controls: Vec<DspControlState> =
-        Vec::with_capacity(dac.dsp_options.len());
-    for control_name in &dac.dsp_options {
+        Vec::with_capacity(discovered.len());
+    for control_name in &discovered {
         let pool_entry = pool_lookup.get(control_name.as_str());
-        let amixer_outcome = match alsa_card_hint.as_ref() {
-            Some(card) => amixer.read_control(card, control_name).await,
-            None => AmixerReadOutcome::CardUnknown {
-                reason: format!(
-                    "catalog entry '{}' has no alsa_card_hint; cannot probe amixer",
-                    dac.id
-                ),
-            },
-        };
+        let amixer_outcome = amixer.read_control(&card, control_name).await;
         controls.push(merge_layers(
             control_name,
             pool_entry.copied(),
@@ -448,6 +537,48 @@ fn merge_layers(
 
 #[cfg(test)]
 mod tests {
+    // ----- resolver-gate invariant -----
+    //
+    // The resolver's source of truth for "which controls
+    // exist?" is live amixer enumeration. The catalog's
+    // `dsp_options[]` is retired as a gate; the resolver code
+    // path MUST NOT consult `dac.dsp_options` (any consultation
+    // would re-introduce the data-incomplete-catalogue defect
+    // that left 100/101 shipped catalogue rows with empty
+    // `dsp_options[]` returning empty control surfaces).
+    //
+    // The structural test below greps the resolver function's
+    // body for any `dac.dsp_options` reference and fails if
+    // any appears. Tests, doc comments, and catalog-data
+    // literals are excluded by scoping the search to the
+    // function's source range.
+
+    #[test]
+    fn resolver_no_longer_consults_catalog_dsp_options_gate() {
+        // Scope the grep to PRODUCTION source only — split the
+        // file at `#[cfg(test)]` so the test module's own
+        // diagnostic literals (which legitimately spell the
+        // retired field name in comments and the pattern
+        // string) don't count as bypass sites. The production
+        // half of the file MUST contain zero `dac.dsp_options`
+        // dereferences; the resolver gate is hardware truth,
+        // not catalog declaration.
+        const SOURCE: &str = include_str!("dsp.rs");
+        let production = SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("file has at least one segment");
+        let pattern = concat!("dac.", "dsp_options");
+        let count = production.matches(pattern).count();
+        assert_eq!(
+            count, 0,
+            "resolver code must not consult `dac.dsp_options` — \
+             live amixer enumeration is the gate; found {count} \
+             occurrence(s) of the dereference pattern in the \
+             production half of the file."
+        );
+    }
+
     use super::*;
     use crate::dsp_pool::parse_dsp_control_pool;
     use crate::evo_catalog::parse_evo_catalog;
@@ -480,6 +611,26 @@ mod tests {
     }
 
     impl AmixerReader for StubAmixer {
+        fn list_controls<'a>(
+            &'a self,
+            card_hint: &'a str,
+        ) -> Pin<Box<dyn Future<Output = AmixerListOutcome> + Send + 'a>>
+        {
+            // Discovered control set = the names that have stubbed
+            // read responses for this card. Tests set per-control
+            // outcomes via `set()`; discovery surfaces those names
+            // without requiring a parallel list-stub call.
+            let names: Vec<String> = self
+                .responses
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(card, _)| card == card_hint)
+                .map(|(_, control)| control.clone())
+                .collect();
+            Box::pin(async move { AmixerListOutcome::Found(names) })
+        }
+
         fn read_control<'a>(
             &'a self,
             card_hint: &'a str,
@@ -541,13 +692,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dac_with_no_dsp_options_returns_empty_controls() {
-        // adafruit-max98357 has no DSP options in the catalog
-        // (just a basic DAC with no onboard DSP). Should return
-        // empty controls + the NoDspOptionsDeclared diagnostic.
+    async fn dac_whose_card_exposes_no_controls_returns_empty_list() {
+        // Live amixer enumeration returns an empty list when the
+        // bound card has no mixer controls (some pure-digital
+        // outputs, or a kernel driver that registered the card
+        // without exposing any cset names). The resolver mirrors
+        // that truth: empty controls, NO diagnostic — the
+        // operator-facing affordance is correct ("this DAC has
+        // no operator-tunable controls") and the catalog gate
+        // is not consulted.
         let catalog = parse_evo_catalog(EMBEDDED_CATALOG).expect("catalog");
         let pool = parse_dsp_control_pool(EMBEDDED_POOL).expect("pool");
-        let amixer = StubAmixer::new();
+        let amixer = StubAmixer::new(); // no controls stubbed
         let caps = resolve_dsp_capabilities(
             &catalog,
             "Raspberry PI",
@@ -557,10 +713,13 @@ mod tests {
         )
         .await;
         assert!(caps.controls.is_empty());
-        assert!(matches!(
-            caps.diagnostics.first(),
-            Some(ResolverDiagnostic::NoDspOptionsDeclared { .. })
-        ));
+        // No diagnostic — empty controls reflects hardware
+        // truth (amixer Found([])), not a catalog-side gate.
+        assert!(
+            caps.diagnostics.is_empty(),
+            "no diagnostic when amixer reports zero controls: {:?}",
+            caps.diagnostics
+        );
         assert!(caps.advanced_settings_enabled);
     }
 
@@ -610,8 +769,14 @@ mod tests {
         assert_eq!(caps.dac_id.as_deref(), Some("hifiberry-dacplus"));
         assert_eq!(caps.alsa_card_hint.as_deref(), Some("sndrpihifiberry"));
 
-        let dsp_program = &caps.controls[0];
-        assert_eq!(dsp_program.name, "DSP Program");
+        // Tests are order-tolerant: real amixer returns names in
+        // kernel-driver order, which is deterministic per host but
+        // not test-stub-stable. Locate by name.
+        let dsp_program = caps
+            .controls
+            .iter()
+            .find(|c| c.name == "DSP Program")
+            .expect("DSP Program control surfaces");
         assert_eq!(dsp_program.human_label, "DSP Program");
         assert!(dsp_program.bound);
         assert!(!dsp_program.unbound_pool_entry);
@@ -634,8 +799,11 @@ mod tests {
         );
         assert!(dsp_program.recommended_default.is_some());
 
-        let clock = &caps.controls[1];
-        assert_eq!(clock.name, "Clock Missing Period");
+        let clock = caps
+            .controls
+            .iter()
+            .find(|c| c.name == "Clock Missing Period")
+            .expect("Clock Missing Period control surfaces");
         assert!(clock.bound);
         assert!(matches!(clock.control_type, ControlType::Integer));
         match &clock.value_domain {
@@ -648,25 +816,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_control_surfaces_with_reason_not_silent_disappearance() {
-        // Pin the ADR-required invariant: a control declared in
-        // catalog dsp_options[] but not exposed by amixer surfaces
-        // with bound = false + operator-readable unbound_reason.
-        // The control does NOT silently disappear from the list.
+    async fn discovered_set_is_amixer_truth_not_catalog_declaration() {
+        // Discovery is hardware-driven: the resolver enumerates
+        // whatever the kernel driver exposes via amixer, NOT
+        // whatever the catalog's `dsp_options[]` lists. This
+        // test stubs amixer to expose ONE control on the bound
+        // card (a control the catalog does NOT declare in its
+        // dsp_options[] — `Master`) and asserts the resolver
+        // surfaces it. The pre-redesign behavior would have
+        // returned empty controls because the catalog said
+        // dsp_options = ["DSP Program", "Clock Missing Period"]
+        // (and our stub set neither).
         let catalog = parse_evo_catalog(EMBEDDED_CATALOG).expect("catalog");
         let pool = parse_dsp_control_pool(EMBEDDED_POOL).expect("pool");
         let amixer = StubAmixer::new();
-        // Set only ONE of HiFiBerry DAC Plus's two controls;
-        // leave the other unset (StubAmixer returns NotPresent).
         amixer.set(
             "sndrpihifiberry",
-            "DSP Program",
+            "Master",
             AmixerReadOutcome::Found(LiveControlState {
-                control_type: ControlType::Enum,
-                current_value: serde_json::Value::String("None".into()),
-                enum_values: vec!["None".into()],
-                integer_min: None,
-                integer_max: None,
+                control_type: ControlType::Integer,
+                current_value: serde_json::Value::Number(50.into()),
+                enum_values: vec![],
+                integer_min: Some(0),
+                integer_max: Some(100),
             }),
         );
         let caps = resolve_dsp_capabilities(
@@ -677,20 +849,14 @@ mod tests {
             &amixer,
         )
         .await;
-        assert_eq!(caps.controls.len(), 2, "both controls surface");
-        let clock = caps
-            .controls
-            .iter()
-            .find(|c| c.name == "Clock Missing Period")
-            .expect("Clock Missing Period present in list");
-        assert!(!clock.bound);
-        assert!(!clock.unbound_reason.is_empty());
-        assert!(clock.current_value.is_none());
-        // Pool entry still resolved — the human label + recommended
-        // default + apply_semantics come from the pool layer even
-        // when amixer is unbound.
-        assert_eq!(clock.human_label, "Clock Missing Period (s)");
-        assert!(clock.recommended_default.is_some());
+        assert_eq!(
+            caps.controls.len(),
+            1,
+            "hardware-discovered control surfaces regardless of \
+             catalog dsp_options[] contents"
+        );
+        assert_eq!(caps.controls[0].name, "Master");
+        assert!(caps.controls[0].bound);
     }
 
     #[tokio::test]
@@ -750,12 +916,14 @@ provenance = "test"
     }
 
     #[tokio::test]
-    async fn no_alsa_card_hint_surfaces_diagnostic_and_unbinds_every_control() {
-        // Sparky / Tinkerboard DACs in the catalog have no
-        // alsa_card_hint. The resolver cannot probe amixer; every
-        // control surfaces with bound = false + a card-hint-missing
-        // unbound_reason; the top-level diagnostic carries
-        // NoAlsaCardHint.
+    async fn no_alsa_card_hint_surfaces_diagnostic_with_empty_controls() {
+        // Without a card hint the resolver cannot enumerate via
+        // amixer. The result is empty controls + the
+        // NoAlsaCardHint diagnostic — operator-facing
+        // affordance: "this DAC's catalog row is incomplete; we
+        // can't see its controls" rather than a fabricated
+        // unbound list. The catalog dsp_options[] is irrelevant
+        // (the gate is hardware truth, not catalog declaration).
         let catalog_toml = r#"
 schema_version = 1
 [[boards]]
@@ -782,15 +950,15 @@ provenance = "test"
             &amixer,
         )
         .await;
-        assert_eq!(caps.controls.len(), 1);
+        assert!(
+            caps.controls.is_empty(),
+            "no controls when card hint absent"
+        );
         assert!(caps.alsa_card_hint.is_none());
         assert!(caps
             .diagnostics
             .iter()
             .any(|d| matches!(d, ResolverDiagnostic::NoAlsaCardHint { .. })));
-        let ctl = &caps.controls[0];
-        assert!(!ctl.bound);
-        assert!(ctl.unbound_reason.contains("alsa_card_hint"));
     }
 
     #[tokio::test]

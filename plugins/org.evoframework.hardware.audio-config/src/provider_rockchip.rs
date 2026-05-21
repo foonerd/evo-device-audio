@@ -24,10 +24,11 @@ use regex::Regex;
 
 use crate::amixer_subprocess::{
     amixer_cget_via_subprocess, amixer_cset_via_subprocess,
+    amixer_scontrols_via_subprocess,
 };
 #[cfg(test)]
 use crate::dsp::LiveControlState;
-use crate::dsp::{AmixerReadOutcome, AmixerReader};
+use crate::dsp::{AmixerListOutcome, AmixerReadOutcome, AmixerReader};
 #[cfg(test)]
 use crate::dsp_pool::ControlType;
 use crate::evo_catalog::DacEntry;
@@ -448,6 +449,27 @@ impl HardwareAudioProvider for RockchipProvider {
 }
 
 impl AmixerReader for RockchipProvider {
+    fn list_controls<'a>(
+        &'a self,
+        card_hint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AmixerListOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            {
+                let stubs = self.test_amixer_reads.lock().await;
+                let names: Vec<String> = stubs
+                    .keys()
+                    .filter(|(card, _)| card == card_hint)
+                    .map(|(_, control)| control.clone())
+                    .collect();
+                if !names.is_empty() {
+                    return AmixerListOutcome::Found(names);
+                }
+            }
+            amixer_scontrols_via_subprocess(card_hint).await
+        })
+    }
+
     fn read_control<'a>(
         &'a self,
         card_hint: &'a str,

@@ -1755,6 +1755,19 @@ impl HasPayloadVersion for RemoveOverlayPayload {
 struct ProviderAsAmixer<'a>(&'a dyn HardwareAudioProvider);
 
 impl<'a> AmixerReader for ProviderAsAmixer<'a> {
+    fn list_controls<'b>(
+        &'b self,
+        card_hint: &'b str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::dsp::AmixerListOutcome>
+                + Send
+                + 'b,
+        >,
+    > {
+        self.0.list_controls(card_hint)
+    }
+
     fn read_control<'b>(
         &'b self,
         card_hint: &'b str,

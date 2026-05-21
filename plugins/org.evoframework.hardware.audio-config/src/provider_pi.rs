@@ -30,10 +30,11 @@ use tokio::process::Command;
 
 use crate::amixer_subprocess::{
     amixer_cget_via_subprocess, amixer_cset_via_subprocess,
+    amixer_scontrols_via_subprocess,
 };
 #[cfg(test)]
 use crate::dsp::LiveControlState;
-use crate::dsp::{AmixerReadOutcome, AmixerReader};
+use crate::dsp::{AmixerListOutcome, AmixerReadOutcome, AmixerReader};
 #[cfg(test)]
 use crate::dsp_pool::ControlType;
 use crate::evo_catalog::DacEntry;
@@ -764,6 +765,33 @@ impl HardwareAudioProvider for PiProvider {
 // test-state stubbing layer on top of that path.
 
 impl AmixerReader for PiProvider {
+    fn list_controls<'a>(
+        &'a self,
+        card_hint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AmixerListOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            {
+                // Test override: derive the discovered list from
+                // the stubbed `read_control` map (every (card,
+                // control) the test stubbed is a discovered
+                // control). Tests stay consistent with one call
+                // to `stub_amixer_read`; no parallel `list`
+                // stub required.
+                let stubs = self.test_amixer_reads.lock().await;
+                let names: Vec<String> = stubs
+                    .keys()
+                    .filter(|(card, _)| card == card_hint)
+                    .map(|(_, control)| control.clone())
+                    .collect();
+                if !names.is_empty() {
+                    return AmixerListOutcome::Found(names);
+                }
+            }
+            amixer_scontrols_via_subprocess(card_hint).await
+        })
+    }
+
     fn read_control<'a>(
         &'a self,
         card_hint: &'a str,
