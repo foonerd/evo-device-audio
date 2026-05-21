@@ -498,10 +498,14 @@ impl HardwareAudioConfigPlugin {
                     };
                 }
             };
-        let dac_id = match self.provider.current_config().await {
-            Ok(active) => self.enrich_active_config(active).catalogue_id,
-            Err(_) => None,
-        };
+        // Use the same failsafe path the published active_config
+        // subject uses, so the DSP resolver sees the catalogue_id
+        // of a DAC selected via a bare dtoverlay just as it would
+        // for a DAC selected via the managed block. Without this,
+        // a Pi where the operator wrote `dtoverlay=i-sabre-q2m`
+        // by hand outside the managed block resolves dac_id =
+        // None and surfaces zero DSP controls.
+        let dac_id = self.read_active_config_with_failsafe().await.catalogue_id;
         let amixer = ProviderAsAmixer(self.provider.as_ref());
         resolve_dsp_capabilities(
             catalog,
@@ -632,67 +636,79 @@ impl HardwareAudioConfigPlugin {
         }
     }
 
-    async fn read_and_enrich_active_config_value(&self) -> serde_json::Value {
+    /// Read the active configuration with the bare-overlay
+    /// failsafe applied. Two call sites consume this:
+    /// `read_and_enrich_active_config_value` (the published
+    /// active_config subject), and `resolve_dsp_capabilities_now`
+    /// (the DSP capability resolver that needs the resolved
+    /// catalogue_id to know which DAC's control set to surface).
+    /// Both surfaces must honour boot-config-edited overlays
+    /// outside the managed block; centralising the lookup keeps
+    /// them in lockstep.
+    async fn read_active_config_with_failsafe(&self) -> ActiveConfig {
         let base = match self.provider.current_config().await {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "provider current_config read failed; announcing unset"
+                    "provider current_config read failed; returning unset"
                 );
                 ActiveConfig::unset(String::new())
             }
         };
+        if !base.overlay.is_empty() {
+            return self.enrich_active_config(base);
+        }
         // Failsafe discovery: when the managed block is absent
-        // (overlay empty) but the operator wrote a recognised DAC
-        // overlay bare in the boot config (or some other tool put
-        // it there), ask the provider to scan for bare dtoverlay
-        // lines that match a catalogue DAC. If found, populate
-        // `overlay` so the catalogue enrichment downstream gives
-        // the consumer the operator-friendly label and mixer
-        // hints. The plugin's write path (apply / clear) is
-        // unchanged — it continues to operate only on the
-        // managed block.
-        let active = if base.overlay.is_empty() {
-            let known_overlays = self
-                .catalogue
-                .as_ref()
-                .map(|catalogue| {
-                    catalogue
-                        .dac_list_for_profile(&self.profile)
-                        .into_iter()
-                        .map(|entry| entry.overlay)
-                        .filter(|o| !o.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            match self.provider.discover_bare_overlay(known_overlays).await {
-                Ok(Some(discovered)) => {
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        discovered_overlay = %discovered,
-                        "discovered bare DAC overlay outside managed block; \
-                         enriching active_config as read-only failsafe"
-                    );
-                    let mut promoted = base;
-                    promoted.overlay = discovered;
-                    self.enrich_active_config(promoted)
-                }
-                Ok(None) => base,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        "provider discover_bare_overlay errored; \
-                         falling back to unset"
-                    );
-                    base
-                }
+        // but the operator wrote a recognised DAC overlay bare in
+        // the boot config, ask the provider to scan for bare
+        // dtoverlay lines that match a catalogue DAC. If found,
+        // populate `overlay` so the catalogue enrichment
+        // downstream gives the consumer the operator-friendly
+        // label, alsacard / mixer hints, and catalogue_id (the
+        // latter is what the DSP resolver keys off). The plugin's
+        // write path (apply / clear) is unchanged — it continues
+        // to operate only on the managed block.
+        let known_overlays = self
+            .catalogue
+            .as_ref()
+            .map(|catalogue| {
+                catalogue
+                    .dac_list_for_profile(&self.profile)
+                    .into_iter()
+                    .map(|entry| entry.overlay)
+                    .filter(|o| !o.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match self.provider.discover_bare_overlay(known_overlays).await {
+            Ok(Some(discovered)) => {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    discovered_overlay = %discovered,
+                    "discovered bare DAC overlay outside managed block; \
+                     enriching active_config as read-only failsafe"
+                );
+                let mut promoted = base;
+                promoted.overlay = discovered;
+                self.enrich_active_config(promoted)
             }
-        } else {
-            self.enrich_active_config(base)
-        };
+            Ok(None) => base,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "provider discover_bare_overlay errored; \
+                     falling back to unset"
+                );
+                base
+            }
+        }
+    }
+
+    async fn read_and_enrich_active_config_value(&self) -> serde_json::Value {
+        let active = self.read_active_config_with_failsafe().await;
         serde_json::json!({
             "v": PAYLOAD_VERSION,
             "active": active,
