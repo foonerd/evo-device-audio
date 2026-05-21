@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::alsa_cards::{AlsaCardCatalog, CardEntry, TypeHint};
+use crate::ActiveDacConfig;
 
 #[derive(Debug, Error)]
 pub enum OutputEnumerationError {
@@ -115,17 +116,38 @@ pub enum CatalogProvenance {
 struct AplayCardDevice {
     card_idx: u32,
     device_idx: u32,
+    /// The short identifier — the token between `card N:` and the
+    /// opening `[` on the aplay -l line. Matches what the
+    /// hardware.audio-config plugin's DAC catalogue records as
+    /// `alsa_card_hint`. Used for active-DAC enrichment matching.
+    /// Empty when the line lacks a short id (defensive fallback).
+    short_id: String,
+    /// The long form — the bracketed token immediately following
+    /// the short id. Matches what the `alsa-cards.toml` catalogue
+    /// records under `name`. Used for catalog-row lookup and as
+    /// the operator-facing fallback label when no catalog row
+    /// matches.
     card_name: String,
 }
 
 /// Enumerate outputs visible to the host kernel + resolve
 /// against the catalog. The catalog is provided by the caller
-/// so tests can inject a synthetic catalog.
+/// so tests can inject a synthetic catalog. The optional active
+/// DAC config (sourced from the cached
+/// `evo.hardware.audio:active_config` subject) enriches rows
+/// whose kernel card name matches the active DAC's
+/// `alsacard_hint` AND whose catalog row lacks a label or a
+/// default mixer control — closing the gap for DAC HATs whose
+/// kernel card name is generic (e.g. `DAC` shared by several
+/// distinct DACs) and whose curated metadata lives in the
+/// hardware.audio-config plugin's DAC catalogue rather than
+/// this plugin's `alsa-cards.toml`.
 pub async fn enumerate_outputs(
     catalog: &AlsaCardCatalog,
+    active_dac_config: Option<&ActiveDacConfig>,
 ) -> Result<Vec<ResolvedAlsaOutput>, OutputEnumerationError> {
     let stdout = run_aplay_l_lowercase().await?;
-    Ok(resolve(&stdout, catalog))
+    Ok(resolve(&stdout, catalog, active_dac_config))
 }
 
 /// Pure resolution function — splits `aplay -l` output into
@@ -135,11 +157,77 @@ pub async fn enumerate_outputs(
 pub fn resolve(
     stdout: &str,
     catalog: &AlsaCardCatalog,
+    active_dac_config: Option<&ActiveDacConfig>,
 ) -> Vec<ResolvedAlsaOutput> {
     let rows = parse_aplay_l_lowercase(stdout);
     rows.into_iter()
-        .map(|row| resolve_row(row, catalog))
+        .map(|row| {
+            let short_id = row.short_id.clone();
+            let mut resolved = resolve_row(row, catalog);
+            enrich_from_active_dac_config(
+                &mut resolved,
+                &short_id,
+                active_dac_config,
+            );
+            resolved
+        })
         .collect()
+}
+
+/// Best-effort enrichment from the cached active DAC config.
+/// Operates on a row whose catalog resolution may have left
+/// the label as the raw card name (Unmapped) or the default
+/// mixer control empty (catalog row without `default_mixer`).
+/// Single-owner discipline: this function never overrides a
+/// label or mixer the alsa-cards catalog supplied — the catalog
+/// is the shipped-reference source for generic cards; the
+/// active DAC config is the operator-selected DAC's metadata
+/// owned by the hardware.audio-config plugin and is the
+/// authoritative source ONLY when the kernel-exposed card
+/// name matches the active DAC's hint.
+fn enrich_from_active_dac_config(
+    resolved: &mut ResolvedAlsaOutput,
+    short_id: &str,
+    active: Option<&ActiveDacConfig>,
+) {
+    let Some(active) = active else {
+        return;
+    };
+    let Some(active_hint) = active.alsacard_hint.as_deref() else {
+        return;
+    };
+    // The hardware.audio-config DAC catalogue records the short
+    // identifier as `alsa_card_hint`; the alsa-cards.toml records
+    // either short_id or the bracketed long form depending on
+    // historical inheritance from the upstream cards.json. Match
+    // against both to remain resilient to the convention drift.
+    if active_hint != short_id && active_hint != resolved.card_name {
+        return;
+    }
+    // Default mixer control: only fill when the catalog left
+    // it empty. The catalog's per-card value (when present)
+    // remains authoritative — different subdevices of the same
+    // card may carry different mixer hints the catalog
+    // distinguishes.
+    if resolved.default_mixer_control.is_none() {
+        if let Some(mixer) = active.mixer_hint.as_ref() {
+            if !mixer.is_empty() {
+                resolved.default_mixer_control = Some(mixer.clone());
+            }
+        }
+    }
+    // Label: only fill when the catalog left the row Unmapped.
+    // A Curated row carries the catalog's label which the
+    // operator-facing UI relies on for stable nomenclature
+    // (the active DAC's display name may differ from the
+    // catalog's preferred form).
+    if resolved.catalog_provenance == CatalogProvenance::Unmapped {
+        if let Some(display) = active.display_name.as_ref() {
+            if !display.is_empty() {
+                resolved.label = display.clone();
+            }
+        }
+    }
 }
 
 async fn run_aplay_l_lowercase() -> Result<String, OutputEnumerationError> {
@@ -190,10 +278,11 @@ fn parse_card_line(line: &str) -> Option<AplayCardDevice> {
     let rest = line.strip_prefix("card ")?;
     let (idx_str, after_idx) = rest.split_once(':')?;
     let card_idx: u32 = idx_str.trim().parse().ok()?;
-    // Card name is the bracketed token immediately following
-    // the short id.
+    // Short id is the token between the colon and the opening
+    // bracket. Card name (long form) is the bracketed token.
     let after_idx = after_idx.trim_start();
     let bracket_start = after_idx.find('[')?;
+    let short_id = after_idx[..bracket_start].trim().to_string();
     let after_bracket = &after_idx[bracket_start + 1..];
     let bracket_end = after_bracket.find(']')?;
     let card_name = after_bracket[..bracket_end].to_string();
@@ -207,6 +296,7 @@ fn parse_card_line(line: &str) -> Option<AplayCardDevice> {
     Some(AplayCardDevice {
         card_idx,
         device_idx,
+        short_id,
         card_name,
     })
 }
@@ -404,7 +494,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     fn resolve_single_device_curated_row() {
         let cat = fixture_catalog();
         let raw = "card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]\n";
-        let outputs = resolve(raw, &cat);
+        let outputs = resolve(raw, &cat, None);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         assert_eq!(out.card_idx, 0);
@@ -422,7 +512,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     fn resolve_i2s_dac_row_marked_i2s_via_type_hint() {
         let cat = fixture_catalog();
         let raw = "card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ HiFi pcm5122-hifi-0 [HiFiBerry DAC+ HiFi pcm5122-hifi-0]\n";
-        let outputs = resolve(raw, &cat);
+        let outputs = resolve(raw, &cat, None);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].label, "HiFiBerry DAC Plus");
         assert_eq!(outputs[0].output_class, OutputClass::I2s);
@@ -433,7 +523,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     fn resolve_multi_device_card_per_subdevice_label() {
         let cat = fixture_catalog();
         let raw = "card 0: link [atm7059_link], device 0: jack [jack]\ncard 0: link [atm7059_link], device 1: hdmi [hdmi]\ncard 0: link [atm7059_link], device 2: spdif [spdif]\n";
-        let outputs = resolve(raw, &cat);
+        let outputs = resolve(raw, &cat, None);
         assert_eq!(outputs.len(), 3);
         assert_eq!(outputs[0].label, "Cheapo Audio Jack");
         assert_eq!(outputs[0].output_class, OutputClass::Analog);
@@ -448,7 +538,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     fn resolve_unmapped_card_falls_back_to_raw_name() {
         let cat = fixture_catalog();
         let raw = "card 7: WeirdHat [SomeUnknownDac], device 0: foo [bar]\n";
-        let outputs = resolve(raw, &cat);
+        let outputs = resolve(raw, &cat, None);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].label, "SomeUnknownDac");
         assert_eq!(outputs[0].catalog_provenance, CatalogProvenance::Unmapped);
@@ -506,5 +596,120 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
 ";
         let rows = parse_aplay_l_lowercase(raw);
         assert_eq!(rows.len(), 1);
+    }
+
+    // ----- active-DAC enrichment tests -----
+    //
+    // Regression coverage for the architectural fix: DAC HATs
+    // whose kernel-reported card name is generic (e.g. `DAC`
+    // shared by Audiophonics I-Sabre, ALLO Mini Boss, and other
+    // boards) carry their operator-facing label + mixer-control
+    // on the hardware.audio-config plugin's DAC catalogue, not
+    // on this plugin's `alsa-cards.toml`. The enumerator
+    // consults the cached active-DAC subject and enriches rows
+    // whose kernel card name matches the active DAC's
+    // `alsacard_hint` AND whose catalog-resolved row lacks a
+    // label or mixer.
+
+    fn active_dac_for(
+        alsacard_hint: &str,
+        display_name: &str,
+        mixer_hint: &str,
+    ) -> ActiveDacConfig {
+        ActiveDacConfig {
+            overlay: "irrelevant".into(),
+            catalogue_id: None,
+            display_name: Some(display_name.into()),
+            alsacard_hint: Some(alsacard_hint.into()),
+            mixer_hint: Some(mixer_hint.into()),
+            boot_config_path: "/boot/config.txt".into(),
+        }
+    }
+
+    #[test]
+    fn active_dac_enriches_unmapped_row_with_label_and_mixer() {
+        // I-Sabre Q2M scenario: card_name = "DAC", catalog has
+        // no row, active DAC config carries the friendly label
+        // and the Digital mixer. After enrichment the row has
+        // label = "I-Sabre Q2M" and default_mixer_control =
+        // Some("Digital") — the UI's Hardware mixer affordance
+        // becomes reachable.
+        let cat = fixture_catalog();
+        let raw = "card 3: DAC [I-Sabre Q2M DAC], device 0: I-Sabre [foo]\n";
+        let active =
+            active_dac_for("DAC", "Audiophonics I-Sabre Q2M", "Digital");
+        let outputs = resolve(raw, &cat, Some(&active));
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        // card_name is the bracketed long form (matches the catalog
+        // key); the active-DAC enrichment matches on the short id
+        // "DAC".
+        assert_eq!(out.card_name, "I-Sabre Q2M DAC");
+        assert_eq!(out.label, "Audiophonics I-Sabre Q2M");
+        assert_eq!(out.default_mixer_control.as_deref(), Some("Digital"));
+    }
+
+    #[test]
+    fn active_dac_does_not_match_when_alsacard_hint_differs() {
+        // Row card_name = "DAC", active DAC hint = "BossDAC".
+        // No match → row stays Unmapped / unenriched.
+        let cat = fixture_catalog();
+        let raw = "card 3: DAC [Foo], device 0: Foo [bar]\n";
+        let active = active_dac_for("BossDAC", "Allo BOSS", "Digital");
+        let outputs = resolve(raw, &cat, Some(&active));
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(out.label, "Foo");
+        assert!(out.default_mixer_control.is_none());
+        assert_eq!(out.catalog_provenance, CatalogProvenance::Unmapped);
+    }
+
+    #[test]
+    fn active_dac_does_not_override_catalog_label_or_mixer() {
+        // Catalog has snd_rpi_hifiberry_dacplus with no
+        // default_mixer (i2s type hint). Active DAC config
+        // also points at hint = "snd_rpi_hifiberry_dacplus"
+        // with display_name = "Should Not Override" and a
+        // mixer hint of "Digital". The catalog's label takes
+        // precedence (Curated provenance is not overridden);
+        // the absent default_mixer_control gets filled from
+        // the active DAC's mixer_hint.
+        let cat = fixture_catalog();
+        let raw = "card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ HiFi pcm5122-hifi-0 [HiFiBerry DAC+ HiFi pcm5122-hifi-0]\n";
+        let active = active_dac_for(
+            "snd_rpi_hifiberry_dacplus",
+            "Should Not Override",
+            "Digital",
+        );
+        let outputs = resolve(raw, &cat, Some(&active));
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        // Catalog label held (Curated provenance untouched).
+        assert_eq!(out.label, "HiFiBerry DAC Plus");
+        assert_eq!(out.catalog_provenance, CatalogProvenance::Curated);
+        // Missing mixer filled from active DAC's hint.
+        assert_eq!(out.default_mixer_control.as_deref(), Some("Digital"));
+    }
+
+    #[test]
+    fn active_dac_with_empty_strings_does_not_enrich() {
+        // ActiveConfig::unset (operator cleared the DAC, or
+        // the catalogue lookup failed): display_name/mixer_hint
+        // are None or empty. Enrichment must not write empty
+        // values over the catalog fallback.
+        let cat = fixture_catalog();
+        let raw = "card 3: DAC [Foo], device 0: Foo [bar]\n";
+        let active = ActiveDacConfig {
+            overlay: String::new(),
+            catalogue_id: None,
+            display_name: None,
+            alsacard_hint: Some("DAC".into()),
+            mixer_hint: None,
+            boot_config_path: String::new(),
+        };
+        let outputs = resolve(raw, &cat, Some(&active));
+        let out = &outputs[0];
+        assert_eq!(out.label, "Foo");
+        assert!(out.default_mixer_control.is_none());
     }
 }

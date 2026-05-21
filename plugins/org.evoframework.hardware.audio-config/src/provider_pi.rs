@@ -568,6 +568,7 @@ impl HardwareAudioProvider for PiProvider {
                     return Ok(ActiveConfig {
                         overlay,
                         catalogue_id: None,
+                        display_name: None,
                         alsacard_hint: None,
                         mixer_hint: None,
                         boot_config_path: self.boot_config_path.clone(),
@@ -579,6 +580,7 @@ impl HardwareAudioProvider for PiProvider {
             Ok(ActiveConfig {
                 overlay,
                 catalogue_id: None,
+                display_name: None,
                 alsacard_hint: None,
                 mixer_hint: None,
                 boot_config_path: self.boot_config_path.clone(),

@@ -285,6 +285,15 @@ pub struct ActiveDacConfig {
     /// overlay, or None if no catalogue entry matches.
     #[serde(default)]
     pub catalogue_id: Option<String>,
+    /// Operator-friendly display name from the resolved catalogue
+    /// entry, or None when no entry matches. Populated by
+    /// hardware.audio-config when it enriches the active config
+    /// against its DAC catalogue. Consumed by the outputs
+    /// enumeration to render the friendly label on rows whose
+    /// kernel card name otherwise resolves to a generic /
+    /// unmapped token (e.g. `DAC` for any of several DAC HATs).
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// ALSA card short id hint (e.g. `sndrpihifiberry`, `BossDAC`,
     /// `DAC`). The downstream pcm.evo binding uses this hint to
     /// resolve the real `hw:` card index without re-running
@@ -783,6 +792,17 @@ impl AlsaDeliveryPlugin {
             return;
         };
         let cache = Arc::clone(&self.active_dac_config);
+        // Capture handles the task closure uses to re-enumerate
+        // + republish on every active_config update. The catalog
+        // and announcer are populated by
+        // install_card_catalog_and_publish_outputs which runs
+        // immediately before this; an Option<None> for either
+        // means that step failed (catalog parse error or
+        // subject_announcer not on the LoadContext) and the
+        // republish path simply no-ops.
+        let catalog_for_task = self.card_catalog.clone();
+        let announcer_for_task = self.subject_announcer.clone();
+        let cached_outputs_for_task = Arc::clone(&self.cached_outputs);
         let addressing = ExternalAddressing {
             scheme: "evo.hardware.audio".to_string(),
             value: "active_config".to_string(),
@@ -857,6 +877,22 @@ impl AlsaDeliveryPlugin {
                                         .unwrap_or("<none>"),
                                     "hardware-audio active_config cached"
                                 );
+                                // Re-enumerate + republish outputs
+                                // with the freshly-cached active
+                                // DAC config so DAC HATs whose
+                                // kernel card name is generic
+                                // (e.g. "DAC" shared across
+                                // several DACs) carry the
+                                // operator-friendly label and
+                                // mixer control on the outputs
+                                // subject.
+                                republish_outputs_enriched(
+                                    catalog_for_task.as_ref(),
+                                    announcer_for_task.as_ref(),
+                                    &cached_outputs_for_task,
+                                    Some(&active),
+                                )
+                                .await;
                             }
                             Err(SubjectStateStreamError::Lagged {
                                 dropped,
@@ -924,6 +960,69 @@ fn extract_active_dac_config(
     };
     let active = state.get("active").unwrap_or(state);
     serde_json::from_value(active.clone()).unwrap_or_default()
+}
+
+/// Re-enumerate `aplay -l`, enrich rows against the supplied
+/// active DAC config, update the cached-outputs snapshot, and
+/// publish a fresh `evo.audio.delivery:outputs` state. Called
+/// by the hardware-audio observer task on every active_config
+/// update so DAC HATs whose kernel card name is generic carry
+/// the operator-friendly label and mixer control once the
+/// hardware.audio-config plugin has resolved its active DAC.
+///
+/// Best-effort: when catalog or announcer is None
+/// (install_card_catalog_and_publish_outputs failed earlier in
+/// load) the call is a no-op. When enumeration fails (aplay -l
+/// missing / non-zero exit) the cached outputs are left
+/// unchanged and the update is skipped — a stale-but-valid
+/// snapshot survives a transient enumeration failure.
+async fn republish_outputs_enriched(
+    catalog: Option<&Arc<AlsaCardCatalog>>,
+    announcer: Option<&Arc<dyn SubjectAnnouncer>>,
+    cached_outputs: &Arc<RwLock<Vec<ResolvedAlsaOutput>>>,
+    active_dac_config: Option<&ActiveDacConfig>,
+) {
+    let Some(catalog) = catalog else {
+        return;
+    };
+    let Some(announcer) = announcer else {
+        return;
+    };
+    let outputs =
+        match output_enumeration::enumerate_outputs(catalog, active_dac_config)
+            .await
+        {
+            Ok(outs) => outs,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "outputs re-enumeration on active_config update failed; \
+                     leaving cached snapshot in place"
+                );
+                return;
+            }
+        };
+    *cached_outputs.write().await = outputs.clone();
+    let addressing = ExternalAddressing {
+        scheme: SUBJECT_SCHEME_DELIVERY.to_string(),
+        value: SUBJECT_VALUE_OUTPUTS.to_string(),
+    };
+    let state =
+        serde_json::to_value(&outputs).unwrap_or(serde_json::Value::Null);
+    if let Err(e) = announcer.update_state(addressing, state).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "evo.audio.delivery:outputs update_state failed"
+        );
+    } else {
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            output_count = outputs.len(),
+            "evo.audio.delivery:outputs republished with enriched active DAC"
+        );
+    }
 }
 
 /// One-shot endpoint fetch over the AudioRouting handle.
@@ -1074,7 +1173,6 @@ impl Plugin for AlsaDeliveryPlugin {
             // observer is not wired and the cache stays None;
             // the verb continues to respond with the baseline
             // payload.
-            self.spawn_hardware_audio_observer(ctx).await;
             // Load the embedded ALSA card catalog + enumerate
             // outputs at admission. The publish is best-effort:
             // a catalog parse error (shipping defect) or an
@@ -1082,7 +1180,14 @@ impl Plugin for AlsaDeliveryPlugin {
             // the plugin's load, because the rest of the
             // delivery surface (pcm.evo, options observer, etc.)
             // is independent of the outputs surface.
+            //
+            // Runs BEFORE the hardware-audio observer spawns so
+            // the observer's task closure can capture the
+            // installed card_catalog + subject_announcer +
+            // cached_outputs handles and trigger an enriched
+            // republish on every active_config update.
             self.install_card_catalog_and_publish_outputs(ctx).await;
+            self.spawn_hardware_audio_observer(ctx).await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "plugin loaded; modular ALSA delivery surface ready; \
@@ -1323,19 +1428,31 @@ impl AlsaDeliveryPlugin {
         self.card_catalog = Some(Arc::clone(&catalog));
         self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
 
-        let outputs =
-            match output_enumeration::enumerate_outputs(&catalog).await {
-                Ok(outs) => outs,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %e,
-                        "alsa output enumeration failed; outputs subject \
-                         will publish an empty list this boot"
-                    );
-                    Vec::new()
-                }
-            };
+        // Read the cached active DAC config (populated by the
+        // hardware-audio observer task on every active_config
+        // subject update). At initial load the cache may still
+        // be None if the observer has not received its first
+        // state push yet; in that case the initial publish ships
+        // unenriched rows, and the observer's first update will
+        // trigger a re-enumerate + update_state republish below.
+        let active_dac = self.active_dac_config.read().await.clone();
+        let outputs = match output_enumeration::enumerate_outputs(
+            &catalog,
+            active_dac.as_ref(),
+        )
+        .await
+        {
+            Ok(outs) => outs,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "alsa output enumeration failed; outputs subject \
+                     will publish an empty list this boot"
+                );
+                Vec::new()
+            }
+        };
         *self.cached_outputs.write().await = outputs.clone();
 
         let announcement = SubjectAnnouncement {
@@ -2182,6 +2299,7 @@ pcm.evo {
             *guard = Some(ActiveDacConfig {
                 overlay: "hifiberry-dacplus".into(),
                 catalogue_id: Some("hifiberry-dacplus".into()),
+                display_name: Some("HiFiBerry DAC+".into()),
                 alsacard_hint: Some("sndrpihifiberry".into()),
                 mixer_hint: Some("Digital".into()),
                 boot_config_path: "/boot/firmware/config.txt".into(),

@@ -346,6 +346,11 @@ impl HardwareAudioConfigPlugin {
             for entry in catalogue.dac_list_for_profile(&self.profile) {
                 if entry.overlay == cfg.overlay {
                     cfg.catalogue_id = Some(entry.id);
+                    cfg.display_name = if entry.display_name.is_empty() {
+                        None
+                    } else {
+                        Some(entry.display_name)
+                    };
                     cfg.alsacard_hint = if entry.alsa_card_hint.is_empty() {
                         None
                     } else {
@@ -1808,12 +1813,18 @@ mod tests {
         let cfg = ActiveConfig {
             overlay: "allo-katana-dac-audio".into(),
             catalogue_id: None,
+            display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
         let enriched = p.enrich_active_config(cfg);
         assert_eq!(enriched.catalogue_id.as_deref(), Some("allo-katana-dac"));
+        assert!(
+            enriched.display_name.is_some(),
+            "enriched display_name populated from catalogue: {:?}",
+            enriched.display_name,
+        );
         assert_eq!(enriched.alsacard_hint.as_deref(), Some("Katana"));
         assert_eq!(enriched.mixer_hint.as_deref(), Some("Master"));
     }
@@ -1826,12 +1837,14 @@ mod tests {
         let cfg = ActiveConfig {
             overlay: "not-in-catalogue".into(),
             catalogue_id: None,
+            display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
         let enriched = p.enrich_active_config(cfg.clone());
         assert!(enriched.catalogue_id.is_none());
+        assert!(enriched.display_name.is_none());
         assert!(enriched.alsacard_hint.is_none());
         assert!(enriched.mixer_hint.is_none());
         assert_eq!(enriched.overlay, cfg.overlay);

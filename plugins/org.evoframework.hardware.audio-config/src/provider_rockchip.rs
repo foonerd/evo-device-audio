@@ -343,6 +343,7 @@ impl HardwareAudioProvider for RockchipProvider {
                     return Ok(ActiveConfig {
                         overlay,
                         catalogue_id: None,
+                        display_name: None,
                         alsacard_hint: None,
                         mixer_hint: None,
                         boot_config_path: self.hw_intf_path.clone(),
@@ -354,6 +355,7 @@ impl HardwareAudioProvider for RockchipProvider {
             Ok(ActiveConfig {
                 overlay,
                 catalogue_id: None,
+                display_name: None,
                 alsacard_hint: None,
                 mixer_hint: None,
                 boot_config_path: self.hw_intf_path.clone(),

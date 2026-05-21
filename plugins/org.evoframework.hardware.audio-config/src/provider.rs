@@ -81,6 +81,13 @@ pub struct ActiveConfig {
     /// overlay, or None if no catalogue entry matches (the operator
     /// wrote a custom overlay, or the catalogue has changed).
     pub catalogue_id: Option<String>,
+    /// The operator-friendly display name from the resolved
+    /// catalogue entry, or None when no entry matches. Carried on
+    /// the published `evo.hardware.audio:active_config` subject so
+    /// downstream consumers (delivery.alsa's outputs enumeration,
+    /// UI surfaces) render the operator-facing label without
+    /// re-loading the DAC catalogue themselves.
+    pub display_name: Option<String>,
     /// The catalogue `alsacard` hint for the resolved entry, or
     /// None if no match. Downstream plugins (delivery.alsa) use this
     /// to resolve the real card index without re-running `aplay -L`.
@@ -103,6 +110,7 @@ impl ActiveConfig {
         Self {
             overlay: String::new(),
             catalogue_id: None,
+            display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
             boot_config_path: boot_config_path.into(),
