@@ -1115,17 +1115,12 @@ impl HardwareAudioConfigPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
-        let active = self.provider.current_config().await.map_err(|e| {
-            PluginError::Permanent(format!(
-                "provider current_config failed: {e}"
-            ))
-        })?;
-        let enriched = self.enrich_active_config(active);
+        let active = self.read_active_config_with_failsafe().await;
         encode(
             req,
             &serde_json::json!({
                 "v": PAYLOAD_VERSION,
-                "active": enriched,
+                "active": active,
             }),
         )
     }
@@ -1452,10 +1447,13 @@ impl HardwareAudioConfigPlugin {
         self.modder_state
             .guard_or_refuse()
             .map_err(|e| PluginError::Permanent(e.to_string()))?;
-        // Refuse if the overlay is currently active in the boot-
-        // config managed block (operator must clear_dac or select
-        // a different DAC first).
-        if let Ok(active) = self.provider.current_config().await {
+        // Refuse if the overlay is currently active (managed
+        // block OR the failsafe-discovered bare overlay outside
+        // the managed block). Routes through the single
+        // canonical reader so the modder workflow honours the
+        // same active-DAC view operator UI sees.
+        let active = self.read_active_config_with_failsafe().await;
+        {
             let mut overlays = self.modder_overlays.write().await;
             if let Some((row, _)) =
                 overlays.iter().find(|(r, _)| r.id == payload.id)
@@ -2459,5 +2457,112 @@ mod tests {
                 "manifest missing {verb:?}"
             );
         }
+    }
+
+    // ----- canonical-reader invariant -----
+    //
+    // Every consumer of "what is the active DAC?" — request-verb
+    // handlers, the published `active_config` subject, the DSP
+    // capability resolver, the modder workflow's overlay-in-use
+    // check — routes through
+    // `read_active_config_with_failsafe`. The provider trait's
+    // raw `current_config()` is called from exactly ONE site
+    // inside the plugin: that helper. Two structural guarantees
+    // pin the invariant:
+    //
+    //   1. `provider.current_config()` appears exactly once in
+    //      this file's source — the helper's first line. Any
+    //      additional call site is a bypass that re-introduces
+    //      the parallel-truth defect.
+    //
+    //   2. `handle_current_config` returns the same shape the
+    //      published subject carries: the failsafe-discovered
+    //      bare-overlay path's catalogue_id / display_name /
+    //      alsacard_hint / mixer_hint appear on the verb's
+    //      response, not just on the subject.
+    //
+    // Together they retire the previous parallel-truth shape
+    // (verb bypassed the failsafe; subject did not). New
+    // consumers MUST go through the helper.
+
+    #[test]
+    fn canonical_active_config_reader_has_single_provider_call_site() {
+        // Lockdown: the raw `provider.current_config()` call lives
+        // inside `read_active_config_with_failsafe` and only
+        // there. Any additional appearance is a regression —
+        // either a handler bypassed the helper (parallel truth)
+        // or a refactor accidentally duplicated the surface.
+        //
+        // The match string carries the `.await` suffix so this
+        // test's own diagnostic literals (which spell the call
+        // without `.await`) are not counted as real call sites.
+        const SOURCE: &str = include_str!("lib.rs");
+        let pattern = concat!("self.provider.", "current_config().", "await");
+        let count = SOURCE.matches(pattern).count();
+        assert_eq!(
+            count, 1,
+            "exactly one canonical raw-current-config await site \
+             permitted (inside `read_active_config_with_failsafe`); \
+             found {count}. Route any new consumer through the \
+             canonical reader helper, not the provider trait method."
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_current_config_returns_failsafe_discovered_dac() {
+        // Failing-case-passes evidence for the canonical-reader
+        // invariant: on a host whose boot config carries a bare
+        // `dtoverlay=<dac>` line outside the plugin's managed
+        // block, the request verb returns the failsafe-enriched
+        // payload (catalogue_id, display_name, alsacard_hint,
+        // mixer_hint resolved against the catalogue) — same
+        // shape the published subject carries. Before the fix,
+        // the verb called `provider.current_config()` directly
+        // and returned an empty payload.
+        let boot_text = "[all]\ndtoverlay=vc4-kms-v3d\ndtoverlay=i-sabre-q2m\n";
+        let pi = std::sync::Arc::new(
+            crate::provider_pi::PiProvider::for_tests(boot_text),
+        );
+        let mut p = HardwareAudioConfigPlugin::new()
+            .with_profile("Raspberry PI")
+            .with_provider(pi);
+        p.catalogue = parse_evo_catalog(EMBEDDED_EVO_CATALOG_TOML).ok();
+        p.loaded = true;
+
+        let resp = p
+            .handle_request(&dsp_request(
+                "hardware.audio.current_config",
+                serde_json::json!({ "v": 1 }),
+            ))
+            .await
+            .expect("handle_current_config returns ok");
+        let value: serde_json::Value =
+            serde_json::from_slice(&resp.payload).unwrap();
+        let active = value.get("active").expect("active block present");
+        assert_eq!(
+            active.get("overlay").and_then(|v| v.as_str()),
+            Some("i-sabre-q2m"),
+            "overlay populated from bare-overlay failsafe discovery: {active}"
+        );
+        assert_eq!(
+            active.get("catalogue_id").and_then(|v| v.as_str()),
+            Some("audiophonics-es9028q2m-dac"),
+            "catalogue_id resolved by enrich_active_config: {active}"
+        );
+        let display_name = active.get("display_name").and_then(|v| v.as_str());
+        assert!(
+            display_name.is_some() && !display_name.unwrap().is_empty(),
+            "display_name populated: {active}"
+        );
+        assert_eq!(
+            active.get("alsacard_hint").and_then(|v| v.as_str()),
+            Some("DAC"),
+            "alsacard_hint resolved: {active}"
+        );
+        assert_eq!(
+            active.get("mixer_hint").and_then(|v| v.as_str()),
+            Some("Digital"),
+            "mixer_hint resolved: {active}"
+        );
     }
 }
