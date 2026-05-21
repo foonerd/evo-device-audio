@@ -29,6 +29,8 @@ thiserror = { workspace = true }
 # Async filesystem (asound.conf rendering / atomic writes) +
 # subprocess (`aplay -L`, `amixer -c` hardware probing).
 tokio = { workspace = true, features = ["fs", "process"] }
+# Embedded alsa-cards.toml catalog parsing.
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

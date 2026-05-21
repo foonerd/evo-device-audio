@@ -88,9 +88,16 @@ use evo_plugin_sdk::contract::audio_routing::{
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
     PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, SubjectStateStreamError,
+    Response, RuntimeCapabilities, SubjectAnnouncement, SubjectAnnouncer,
+    SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
+
+pub mod alsa_cards;
+pub mod output_enumeration;
+
+use alsa_cards::AlsaCardCatalog;
+use output_enumeration::ResolvedAlsaOutput;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -133,7 +140,18 @@ const REQUEST_TYPES: &[&str] = &[
     "delivery.list_cards",
     "delivery.list_mixers",
     "delivery.active_endpoint",
+    "delivery.list_outputs",
 ];
+
+/// Subject scheme + value for the resolved-outputs surface.
+/// Published once at load and read back by the
+/// `delivery.list_outputs` respondent verb. Hot-plug re-publish
+/// and reactive subscription on hardware change land in a
+/// follow-on chunk; the load-time publish is the canonical
+/// boot-state surface UI consumes today.
+const SUBJECT_SCHEME_DELIVERY: &str = "evo.audio.delivery";
+const SUBJECT_VALUE_OUTPUTS: &str = "outputs";
+const SUBJECT_TYPE_OUTPUTS: &str = "audio_delivery_outputs";
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -206,6 +224,19 @@ pub struct AlsaDeliveryPlugin {
     /// alsacard / mixer hint downstream consumers can bind
     /// against.
     active_dac_config: Arc<RwLock<Option<ActiveDacConfig>>>,
+    /// Embedded static ALSA card catalog. Loaded at admission
+    /// from the baked-in `data/alsa-cards.toml`; provides the
+    /// raw-card-name → operator-friendly-label resolution that
+    /// `delivery.list_outputs` joins `aplay -l` rows against.
+    card_catalog: Option<Arc<AlsaCardCatalog>>,
+    /// Subject announcer pulled from
+    /// [`LoadContext::subject_announcer`] at load. Used to
+    /// publish the resolved-outputs subject once at load.
+    subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
+    /// Cached snapshot of the resolved ALSA outputs published at
+    /// load time. `delivery.list_outputs` returns this verbatim;
+    /// hot-plug re-enumeration lands in a follow-on chunk.
+    cached_outputs: Arc<RwLock<Vec<ResolvedAlsaOutput>>>,
 }
 
 /// Handle on the route-change reactor task spawned at load.
@@ -288,6 +319,9 @@ impl AlsaDeliveryPlugin {
             options_observer: None,
             hardware_audio_observer: None,
             active_dac_config: Arc::new(RwLock::new(None)),
+            card_catalog: None,
+            subject_announcer: None,
+            cached_outputs: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -1041,11 +1075,20 @@ impl Plugin for AlsaDeliveryPlugin {
             // the verb continues to respond with the baseline
             // payload.
             self.spawn_hardware_audio_observer(ctx).await;
+            // Load the embedded ALSA card catalog + enumerate
+            // outputs at admission. The publish is best-effort:
+            // a catalog parse error (shipping defect) or an
+            // `aplay -l` failure is logged but does not refuse
+            // the plugin's load, because the rest of the
+            // delivery surface (pcm.evo, options observer, etc.)
+            // is independent of the outputs surface.
+            self.install_card_catalog_and_publish_outputs(ctx).await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 "plugin loaded; modular ALSA delivery surface ready; \
                  route-change reactor + options-subject observer + \
-                 hardware-audio active_config observer running"
+                 hardware-audio active_config observer running; \
+                 outputs subject published"
             );
             Ok(())
         }
@@ -1113,6 +1156,7 @@ impl Respondent for AlsaDeliveryPlugin {
                 "delivery.active_endpoint" => {
                     self.handle_active_endpoint(req).await
                 }
+                "delivery.list_outputs" => self.handle_list_outputs(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      manifest/runtime drift bug"
@@ -1231,6 +1275,106 @@ impl AlsaDeliveryPlugin {
         };
         encode(req, &payload)
     }
+
+    /// `delivery.list_outputs` — return the cached resolved-
+    /// outputs list captured at load. Hot-plug re-enumeration
+    /// lands in a follow-on chunk; today's surface is the
+    /// boot-state snapshot.
+    async fn handle_list_outputs(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned_payload::<EmptyPayload>(req)?;
+        let outputs = self.cached_outputs.read().await.clone();
+        let payload = ListOutputsResponse {
+            v: PAYLOAD_VERSION,
+            outputs,
+        };
+        encode(req, &payload)
+    }
+
+    /// Load the embedded ALSA card catalog, enumerate the host's
+    /// ALSA outputs via `aplay -l`, cache the resolved list, and
+    /// publish the snapshot on `evo.audio.delivery:outputs`. The
+    /// subject_announcer is captured from `ctx` so subsequent
+    /// re-publish paths (hot-plug, operator-triggered refresh)
+    /// can reuse it once those chunks land.
+    async fn install_card_catalog_and_publish_outputs(
+        &mut self,
+        ctx: &LoadContext,
+    ) {
+        let catalog = match AlsaCardCatalog::load_embedded() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "alsa-cards catalog: parse failed; outputs surface \
+                     unavailable on this boot"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            card_catalog_rows = catalog.len(),
+            "alsa-cards catalog loaded"
+        );
+        self.card_catalog = Some(Arc::clone(&catalog));
+        self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
+
+        let outputs =
+            match output_enumeration::enumerate_outputs(&catalog).await {
+                Ok(outs) => outs,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "alsa output enumeration failed; outputs subject \
+                         will publish an empty list this boot"
+                    );
+                    Vec::new()
+                }
+            };
+        *self.cached_outputs.write().await = outputs.clone();
+
+        let announcement = SubjectAnnouncement {
+            subject_type: SUBJECT_TYPE_OUTPUTS.to_string(),
+            addressings: vec![ExternalAddressing {
+                scheme: SUBJECT_SCHEME_DELIVERY.to_string(),
+                value: SUBJECT_VALUE_OUTPUTS.to_string(),
+            }],
+            claims: Vec::new(),
+            state: serde_json::to_value(&outputs)
+                .unwrap_or(serde_json::Value::Null),
+            announced_at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = self
+            .subject_announcer
+            .as_ref()
+            .unwrap()
+            .announce(announcement)
+            .await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "evo.audio.delivery:outputs announce failed"
+            );
+        } else {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                output_count = outputs.len(),
+                "evo.audio.delivery:outputs announced"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ListOutputsResponse {
+    v: u32,
+    outputs: Vec<ResolvedAlsaOutput>,
 }
 
 // ===== wire payload types =====

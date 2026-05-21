@@ -1,0 +1,490 @@
+# ALSA card-name → operator-friendly label catalog.
+#
+# Static reference data. Maps the raw `aplay -l` card name to a
+# human-readable label, the type hint (i2s vs integrated; richer
+# classes — HDMI / Analog / SPDIF / USB / Bluetooth — are derived
+# at runtime from the label + name keywords), and the per-card
+# default ALSA mixer control. Multi-device cards (one card with
+# multiple subdevices, e.g. HDMI with multiple outputs) carry a
+# `devices` array with per-subdevice labels.
+#
+# The data here is a verbatim port of the predecessor JSON-shape
+# catalog the audio platform shipped, normalised to TOML and to
+# snake_case field names. Adding rows for new ALSA card names is
+# a framework-release change; this file is shipped-only (no
+# operator-supplied rows; custom hardware integration goes
+# through the hardware.audio-config modder workflow, separate
+# concern).
+#
+# Schema version: 1.
+
+schema_version = 1
+
+[[cards]]
+name = "bcm2835 ALSA"
+pretty_name = "HDMI Out"
+default_mixer = "PCM"
+type_hint = "integrated"
+
+[[cards]]
+name = "bcm2835 HDMI 1"
+pretty_name = "HDMI Out"
+default_mixer = "HDMI"
+type_hint = "integrated"
+
+[[cards]]
+name = "vc4-hdmi-0"
+pretty_name = "HDMI 0 Out"
+type_hint = "integrated"
+
+[[cards]]
+name = "vc4-hdmi-1"
+pretty_name = "HDMI 1 Out"
+type_hint = "integrated"
+
+[[cards]]
+name = "bcm2835 Headphones"
+pretty_name = "Headphones"
+default_mixer = "PCM"
+type_hint = "integrated"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dac"
+pretty_name = "Hifiberry DAC"
+type_hint = "i2s"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dacplus"
+pretty_name = "HiFiBerry DAC Plus"
+type_hint = "i2s"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dacplusadc"
+pretty_name = "HiFiBerry DAC Plus ADC"
+type_hint = "i2s"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dacplusadcpro"
+pretty_name = "HiFiBerry DAC Plus ADC PRO"
+type_hint = "i2s"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dacplusdsp"
+pretty_name = "HiFiBerry DAC Plus DSP"
+type_hint = "i2s"
+
+[[cards]]
+name = "snd_rpi_hifiberry_dacplushd"
+pretty_name = "HiFiBerry DAC+ HD"
+type_hint = "i2s"
+
+[[cards]]
+name = "HiFiBerry Digi+ Pro HiFi wm8804-spdif-0"
+pretty_name = "HiFiBerry Digi+ Pro"
+type_hint = "i2s"
+
+[[cards]]
+name = "IQaudIODAC"
+pretty_name = "IQaudIO DAC"
+type_hint = "i2s"
+
+[[cards]]
+name = "sndrpijustboomd"
+pretty_name = "JustBoom DAC Boards"
+type_hint = "i2s"
+
+[[cards]]
+name = "atm7059_link"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "Cheapo Audio Jack"
+default_mixer = "DAC PA"
+[[cards.devices]]
+index = 1
+pretty_name = "HDMI Audio Out"
+[[cards.devices]]
+index = 2
+pretty_name = "Cheapo S/PDIF"
+
+[[cards]]
+name = "PianoDACPlus"
+pretty_name = "Allo Piano 2.1"
+default_mixer = "Digital"
+type_hint = "i2s"
+
+[[cards]]
+name = "BossDAC"
+pretty_name = "Allo BOSS"
+default_mixer = "Digital"
+type_hint = "i2s"
+
+[[cards]]
+name = "sndhdmi"
+pretty_name = "HDMI Out"
+type_hint = "integrated"
+
+[[cards]]
+name = "audiocodec"
+pretty_name = "Analog Audio Out"
+default_mixer = "headphone volume"
+type_hint = "integrated"
+
+[[cards]]
+name = "imxvt1613audio"
+pretty_name = "Analog Audio Out"
+default_mixer = "Speaker"
+type_hint = "integrated"
+
+[[cards]]
+name = "imxhdmisoc"
+pretty_name = "HDMI Audio Out"
+default_mixer = "Speaker"
+type_hint = "integrated"
+
+[[cards]]
+name = "imxaudiotda1998"
+pretty_name = "HDMI Audio Out"
+default_mixer = "Speaker"
+type_hint = "integrated"
+
+[[cards]]
+name = "ODROID-DAC2"
+pretty_name = "HiFi Shield 2"
+default_mixer = "Digital"
+type_hint = "i2s"
+
+[[cards]]
+name = "ODROID-DAC"
+pretty_name = "HiFi Shield/Shield+"
+type_hint = "integrated"
+
+[[cards]]
+name = "ODROID-HDMI"
+pretty_name = "HDMI/ TOSLINK (S/PDIF)"
+type_hint = "integrated"
+
+[[cards]]
+name = "sndspdif"
+pretty_name = "TOSLINK (S/PDIF)"
+type_hint = "integrated"
+
+[[cards]]
+name = "snddaudio0"
+pretty_name = "ANALOG (DAC)"
+type_hint = "integrated"
+
+[[cards]]
+name = "rockchipminiarm"
+pretty_name = "HDMI Audio Out"
+type_hint = "integrated"
+
+[[cards]]
+name = "S/PDIF PCM snd-soc-dummy-dai-0"
+pretty_name = "TOSLINK (S/PDIF)"
+type_hint = "integrated"
+
+[[cards]]
+name = "HiFi-ASRC-FE (*)"
+pretty_name = "ANALOG (DAC)"
+default_mixer = "Digital"
+type_hint = "integrated"
+
+[[cards]]
+name = "TinkerAudio OnBoard"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "HDMI"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 2
+pretty_name = "Audio Jack Out"
+default_mixer = "Headphone,1"
+
+[[cards]]
+name = "USB Audio OnBoard"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "HDMI"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 2
+pretty_name = "Audio Jack Out"
+default_mixer = "Headphone,1"
+
+[[cards]]
+name = "rockchip"
+pretty_name = "HDMI"
+type_hint = "integrated"
+
+[[cards]]
+name = "sun4i-codec"
+pretty_name = "Onboard Analog"
+default_mixer = "Power Amplifier"
+type_hint = "integrated"
+
+[[cards]]
+name = "snd-sun8i-i2s-dac"
+pretty_name = "I2S"
+type_hint = "integrated"
+
+[[cards]]
+name = "H3 Audio Codec"
+pretty_name = "Onboard Audio"
+default_mixer = "DAC"
+type_hint = "integrated"
+
+[[cards]]
+name = "HDA Intel HDMI"
+type_hint = "integrated"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI 0"
+[[cards.devices]]
+index = 7
+pretty_name = "HDMI 1"
+[[cards.devices]]
+index = 8
+pretty_name = "HDMI 2"
+[[cards.devices]]
+index = 9
+pretty_name = "HDMI 3"
+[[cards.devices]]
+index = 10
+pretty_name = "HDMI 4"
+
+[[cards]]
+name = "HDA Intel PCH"
+[[cards.devices]]
+index = 0
+pretty_name = "Analog Out"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI"
+
+[[cards]]
+name = "HDA Intel"
+[[cards.devices]]
+index = 0
+pretty_name = "Analog Out"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI"
+
+[[cards]]
+name = "HDA C-Media"
+[[cards.devices]]
+index = 0
+pretty_name = "C-Media Analog Out"
+[[cards.devices]]
+index = 1
+pretty_name = "C-Media SPDIF/Toslink"
+
+[[cards]]
+name = "HDA Creative"
+[[cards.devices]]
+index = 0
+pretty_name = "CA0132 Analog"
+[[cards.devices]]
+index = 1
+pretty_name = "CA0132 SPDIF/Toslink"
+
+[[cards]]
+name = "HD-Audio Generic"
+[[cards.devices]]
+index = 0
+pretty_name = "Analog Out"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI"
+
+[[cards]]
+name = "HDA ATI SB"
+[[cards.devices]]
+index = 0
+pretty_name = "Analog Out"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+
+[[cards]]
+name = "HDA ATI HDMI"
+type_hint = "integrated"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI 0"
+[[cards.devices]]
+index = 7
+pretty_name = "HDMI 1"
+
+[[cards]]
+name = "HDA NVidia"
+type_hint = "integrated"
+[[cards.devices]]
+index = 3
+pretty_name = "HDMI 0"
+[[cards.devices]]
+index = 7
+pretty_name = "HDMI 1"
+
+[[cards]]
+name = "Intel ICH6"
+[[cards.devices]]
+index = 0
+pretty_name = "HDMI"
+[[cards.devices]]
+index = 4
+pretty_name = "SPDIF"
+
+[[cards]]
+name = "bytcr-rt5640"
+pretty_name = "Headphone Jack/ Speaker"
+default_mixer = "DAC1"
+type_hint = "integrated"
+
+[[cards]]
+name = "bytcr-rt5651"
+pretty_name = "Headphone Jack"
+default_mixer = "HP"
+type_hint = "integrated"
+
+[[cards]]
+name = "cht-bsw-rt5672"
+pretty_name = "Headphone Jack/ Speaker"
+default_mixer = "DAC1"
+type_hint = "integrated"
+
+[[cards]]
+name = "bytcht-es8316"
+pretty_name = "Headphone Jack"
+default_mixer = "HP"
+type_hint = "integrated"
+
+[[cards]]
+name = "Intel HDMI/DP LPE Audio"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "HDMI 0"
+[[cards.devices]]
+index = 1
+pretty_name = "HDMI 1"
+[[cards.devices]]
+index = 2
+pretty_name = "HDMI 2"
+
+[[cards]]
+name = "Analog-ES8316"
+pretty_name = "Analog Onboard ES8316"
+default_mixer = "DAC"
+type_hint = "integrated"
+
+[[cards]]
+name = "AML-AUGESOUND"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "HDMI Audio"
+default_mixer = "DAC Digital"
+[[cards.devices]]
+index = 1
+pretty_name = "Line Out/ Headphones"
+default_mixer = "DAC Digital"
+[[cards.devices]]
+index = 2
+pretty_name = "SPDIF (config)"
+default_mixer = "None"
+
+[[cards]]
+name = "AML-AUGESOUND-MP1"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "I2S"
+[[cards.devices]]
+index = 2
+pretty_name = "S/PDIF"
+ignore_generic_mixer = true
+
+[[cards]]
+name = "AML-AUGESOUND-V1S"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "I2S"
+[[cards.devices]]
+index = 2
+pretty_name = "S/PDIF"
+ignore_generic_mixer = true
+[[cards.devices]]
+index = 2
+pretty_name = "HDMI"
+default_mixer = "DAC Digital"
+
+[[cards]]
+name = "AML-AUGESOUND-V"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "I2S + SPDIF + HDMI"
+default_mixer = "DAC Digital"
+[[cards.devices]]
+index = 1
+pretty_name = "HDMI only"
+default_mixer = "DAC Digital"
+[[cards.devices]]
+index = 2
+pretty_name = "SPDIF + HDMI"
+default_mixer = "DAC Digital"
+
+[[cards]]
+name = "AML-MESONAUDIO"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "I2S+SPDIF+HDMI"
+default_mixer = "DAC Digital"
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF+HDMI"
+default_mixer = "DAC Digital"
+
+[[cards]]
+name = "AML-M8AUDIO"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "I2S"
+hidden = true
+[[cards.devices]]
+index = 1
+pretty_name = "SPDIF"
+[[cards.devices]]
+index = 2
+pretty_name = "PCM"
+hidden = true
+
+[[cards]]
+name = "Xonar SoundCard"
+type_hint = "integrated"
+[[cards.devices]]
+index = 0
+pretty_name = "Xonar Headphone/ Analog out"
+[[cards.devices]]
+index = 2
+pretty_name = "Xonar S/DIF (optical) out"
