@@ -883,6 +883,63 @@ impl AlsaDeliveryPlugin {
                 canonical_id = %canonical_id,
                 "hardware-audio active_config observer task connected"
             );
+            // Seed the cache with the current state. The
+            // subscribe path only delivers updates AFTER
+            // subscription; if the upstream plugin announced its
+            // initial active_config before we connected, the
+            // stream has no historical replay and we would never
+            // see the current value until the operator gestures
+            // a `select_dac`. Pulling current_state once at
+            // subscribe time closes that gap so the active-DAC
+            // enrichment of the outputs subject fires
+            // immediately.
+            match subscriber_for_task
+                .current_state(canonical_id.clone())
+                .await
+            {
+                Ok(Some(state)) => {
+                    let active = extract_active_dac_config(Some(&state));
+                    {
+                        let mut guard = cache.write().await;
+                        *guard = Some(active.clone());
+                    }
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        overlay = %active.overlay,
+                        catalogue_id = %active
+                            .catalogue_id
+                            .as_deref()
+                            .unwrap_or("<unmatched>"),
+                        alsacard_hint = %active
+                            .alsacard_hint
+                            .as_deref()
+                            .unwrap_or("<none>"),
+                        "hardware-audio active_config seeded from current_state"
+                    );
+                    republish_outputs_enriched(
+                        catalog_for_task.as_ref(),
+                        announcer_for_task.as_ref(),
+                        &cached_outputs_for_task,
+                        Some(&active),
+                    )
+                    .await;
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        "hardware-audio active_config current_state empty; \
+                         awaiting first update"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "hardware-audio active_config current_state read \
+                         errored; awaiting first update"
+                    );
+                }
+            }
             // Stage 3: receive updates + republish enriched
             // outputs on every state push.
             loop {
