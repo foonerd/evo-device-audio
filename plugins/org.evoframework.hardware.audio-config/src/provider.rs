@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::dsp::{AmixerReadOutcome, AmixerReader};
+use crate::dsp::{AmixerListOutcome, AmixerReadOutcome, AmixerReader};
 use crate::evo_catalog::DacEntry;
 
 /// Errors a provider may return. Variants are explicit so callers
@@ -325,6 +325,20 @@ impl Default for NoopProvider {
 }
 
 impl AmixerReader for NoopProvider {
+    fn list_controls<'a>(
+        &'a self,
+        _card_hint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AmixerListOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            AmixerListOutcome::CardUnknown {
+                reason:
+                    "noop provider has no bound ALSA card; cannot enumerate \
+                     mixer controls"
+                        .to_string(),
+            }
+        })
+    }
+
     fn read_control<'a>(
         &'a self,
         _card_hint: &'a str,

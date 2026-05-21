@@ -8,7 +8,7 @@
 
 use tokio::process::Command;
 
-use crate::dsp::{AmixerReadOutcome, LiveControlState};
+use crate::dsp::{AmixerListOutcome, AmixerReadOutcome, LiveControlState};
 use crate::dsp_pool::ControlType;
 use crate::provider::{AmixerWriteOutcome, AmixerWriteValue};
 
@@ -166,6 +166,86 @@ pub fn encode_amixer_write_value(value: &AmixerWriteValue) -> String {
         AmixerWriteValue::Boolean(true) => "on".to_string(),
         AmixerWriteValue::Boolean(false) => "off".to_string(),
     }
+}
+
+/// Invoke `amixer -c <card> controls` and parse the resulting
+/// control-name list. Returns:
+///
+/// * [`AmixerListOutcome::Found`] with the discovered control
+///   names on success (may be an empty vec for cards without
+///   mixer controls).
+/// * [`AmixerListOutcome::CardUnknown`] when amixer reports the
+///   card hint cannot be matched.
+/// * [`AmixerListOutcome::IntrospectionFailed`] for spawn /
+///   parse / unrecognised-exit errors.
+pub async fn amixer_scontrols_via_subprocess(
+    card_hint: &str,
+) -> AmixerListOutcome {
+    let output = match Command::new("amixer")
+        .args(["-c", card_hint, "controls"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return AmixerListOutcome::IntrospectionFailed {
+                reason: format!("spawn amixer controls: {e}"),
+            };
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr_lc = stderr.to_ascii_lowercase();
+        if stderr_lc.contains("no such file") || stderr_lc.contains("card") {
+            return AmixerListOutcome::CardUnknown {
+                reason: format!("amixer controls refused: {stderr}"),
+            };
+        }
+        return AmixerListOutcome::IntrospectionFailed {
+            reason: format!(
+                "amixer controls exit {}: {stderr}",
+                output.status.code().unwrap_or(-1)
+            ),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let names = parse_amixer_controls(&stdout);
+    AmixerListOutcome::Found(names)
+}
+
+/// Parse `amixer controls` output into a deduplicated list of
+/// `name='<token>'` values, preserving discovery order. Each
+/// line is shaped:
+///
+/// ```text
+/// numid=N,iface=MIXER,name='<token>',index=K
+/// ```
+///
+/// Lines that don't carry a `name='...'` field are skipped.
+/// Duplicates are dropped (some cards expose the same control
+/// twice with different `index=` values; the operator-facing
+/// surface treats them as one).
+pub fn parse_amixer_controls(output: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let Some(start) = line.find("name='") else {
+            continue;
+        };
+        let after = &line[start + "name='".len()..];
+        let Some(end) = after.find('\'') else {
+            continue;
+        };
+        let name = after[..end].to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Invoke `amixer -c <card> cget name='<control>'` and classify
