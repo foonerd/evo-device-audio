@@ -1,0 +1,58 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.power
+owner: evo-device-audio
+isolation: oop
+
+# Framework-reserved power management plugin. Stocks the
+# `system.power` shelf with two operator-gestured verbs
+# (reboot_device + power_off_device) both gated by the framework
+# dispatcher's per-verb capability gate (step_up:system_admin).
+# The runtime invokes `systemctl reboot` / `systemctl poweroff`
+# via a narrow NOPASSWD sudoers drop-in
+# (`dist/sudoers.d/evo-system-power`). systemctl is a client that
+# talks to PID 1 over the system D-Bus; the call itself does not
+# write through the filesystem, so the steward's
+# `ProtectSystem=strict` mount-namespace policy does not interfere
+# (no systemd drop-in is needed). The plugin returns immediately
+# after issuing the systemctl call; PID 1 performs the actual
+# shutdown asynchronously.
+#
+# Vendor distributions that need different shutdown semantics
+# (hardware watchdog, alternate init system, locked-down host)
+# ship their own replacement plugin under their vendor namespace.
+# The verb names (`reboot_device`, `power_off_device`) and the
+# capability scope (`system_admin`) are stable across vendor
+# replacements; the implementation underneath is not.
+
+capability_intent:
+  - id: systemctl_reboot_invocation
+    need: invoke `sudo /usr/bin/systemctl reboot` to request an orderly host reboot from systemd PID 1. The verb is operator-gestured; the framework dispatcher's per-verb capability gate verifies the principal holds step_up:system_admin before the request reaches the plugin. The plugin's invocation is structurally narrow — exactly the one binary, exactly that one argument — surfaced as the `EVO_SYSTEM_POWER_REBOOT` sudoers Cmnd_Alias in `dist/sudoers.d/evo-system-power`.
+    access_path: sudoers/command
+    failure_mode: every reboot_device call responds with PluginError::Transient carrying the underlying sudo / systemctl stderr; the steward keeps running; the operator sees the structured error.
+  - id: systemctl_poweroff_invocation
+    need: invoke `sudo /usr/bin/systemctl poweroff` to request an orderly host power-off from systemd PID 1. Same gate + sudoers Cmnd_Alias shape as the reboot variant; surfaced as `EVO_SYSTEM_POWER_POWEROFF`.
+    access_path: sudoers/command
+    failure_mode: every power_off_device call responds with PluginError::Transient carrying the underlying sudo / systemctl stderr; the steward keeps running.
+
+required_binaries:
+  - name: systemctl
+    min_version: "240"
+    failure_mode: refuse to admit; structured admission error names the missing binary. systemctl below 240 is rare on shipping Linux distributions and pre-dates the D-Bus PolicyKit interface this plugin relies on for unprivileged-fallback behaviour.
+  - name: sudo
+    min_version: "1.9"
+    failure_mode: refuse to admit; the narrow NOPASSWD grant relies on sudoers parsing introduced in 1.9.
+
+required_kernel_modules: []
+
+required_system_services:
+  - systemd-journald.service
+
+verification:
+  commands:
+    - "test -x /usr/bin/systemctl"
+    - "test -f /etc/sudoers.d/evo-system-power"
+  expected:
+    - systemctl binary present at the canonical path
+    - operator-installed narrow sudoers grant present
+
+host_provisioning: {}

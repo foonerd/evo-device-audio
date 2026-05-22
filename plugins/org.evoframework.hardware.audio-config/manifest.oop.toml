@@ -61,3 +61,13 @@ request_types = [
     "hardware.audio.modder.remove_overlay",
 ]
 response_budget_ms = 3000
+
+# Per-verb capability gate declarations. Framework
+# dispatcher enforces step_up:audio_admin on every mutating verb;
+# read-only verbs default to anonymous-OK.
+[capabilities.respondent.verb_capabilities]
+"hardware.audio.select_dac" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.clear_dac" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.dsp.set_control" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.modder.register_overlay" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.modder.remove_overlay" = { kind = "step_up", scope = "audio_admin" }

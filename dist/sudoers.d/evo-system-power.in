@@ -1,0 +1,56 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-system-power with mode 0440,
+# owned root:root.
+#
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to exactly two commands the
+# `org.evoframework.system.power` plugin invokes:
+#
+# 1. `EVO_SYSTEM_POWER_REBOOT` — `/usr/bin/systemctl reboot`.
+#    The `reboot_device` operator-gestured verb invokes this
+#    when the framework's per-verb capability gate has verified
+#    the principal holds step_up:system_admin. The verb shape
+#    is exact-match (one argument: `reboot`); no wildcards, no
+#    additional argv elements.
+#
+# 2. `EVO_SYSTEM_POWER_POWEROFF` — `/usr/bin/systemctl poweroff`.
+#    Same gate, same invocation shape for the `power_off_device`
+#    operator-gestured verb.
+#
+# Both aliases are EXACT-MATCH. There is no broad sudo grant:
+# the operator's audit log keeps full records on any command
+# outside these two aliases. The framework dispatcher's per-verb
+# capability gate (declared in the plugin's manifest at
+# `[capabilities.respondent.verb_capabilities]`) is the FIRST
+# layer of defence; sudoers is the LAST. A principal without
+# step_up:system_admin never reaches this sudo invocation.
+#
+# Defaults!EVO_SYSTEM_POWER !pam_session, !syslog quiets the
+# per-invocation PAM session lines + syslog records the journal
+# already captures via the parent steward's structured log. The
+# audit-record-of-record for system.power invocations is the
+# steward's `Witness` chain (capability dispatch audit), NOT
+# the sudo log; the sudo Defaults reduce journal noise without
+# losing audit fidelity.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-system-power.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-system-power
+#
+# `visudo -c -f /etc/sudoers.d/evo-system-power` verifies
+# syntactically valid sudoers.
+
+Cmnd_Alias EVO_SYSTEM_POWER_REBOOT = /usr/bin/systemctl reboot
+Cmnd_Alias EVO_SYSTEM_POWER_POWEROFF = /usr/bin/systemctl poweroff
+
+Defaults!EVO_SYSTEM_POWER_REBOOT !pam_session, !syslog
+Defaults!EVO_SYSTEM_POWER_POWEROFF !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_POWER_REBOOT
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_POWER_POWEROFF

@@ -384,6 +384,8 @@ mod tests {
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let e = p.handle_request(&r).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -400,6 +402,8 @@ mod tests {
             correlation_id: 2,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();
@@ -416,6 +420,8 @@ mod tests {
             correlation_id: 3,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let out = p.handle_request(&r).await.unwrap();
         let v: Value = serde_json::from_slice(&out.payload).unwrap();

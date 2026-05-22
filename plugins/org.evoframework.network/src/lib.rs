@@ -6344,6 +6344,8 @@ version = 1
             correlation_id,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         }
     }
 
