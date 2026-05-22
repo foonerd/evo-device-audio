@@ -263,6 +263,15 @@ install -d -m 0755 "${STAGE_DIR}/dist/alsa"
 cp -a "${REPO_ROOT}/dist/alsa/." "${STAGE_DIR}/dist/alsa/"
 install -d -m 0755 "${STAGE_DIR}/dist/mpd"
 cp -a "${REPO_ROOT}/dist/mpd/." "${STAGE_DIR}/dist/mpd/"
+# Distribution-tier plugin defaults. bootstrap.sh reads from
+# `${DIST_DIR}/plugins.d/` to install the network plugin's
+# `probe_kind = off` default and to render the multiroom
+# template against the operator's --multiroom-* flags. Without
+# this in the bundle, both files silently skip — the network
+# plugin admits with its code defaults and the multiroom plugin
+# does not get configured at install time.
+install -d -m 0755 "${STAGE_DIR}/dist/plugins.d"
+cp -a "${REPO_ROOT}/dist/plugins.d/." "${STAGE_DIR}/dist/plugins.d/"
 # etc-evo seeds (client_acl.toml, etc.).
 if [[ -d "${REPO_ROOT}/dist/etc-evo" ]]; then
     install -d -m 0755 "${STAGE_DIR}/dist/etc-evo"

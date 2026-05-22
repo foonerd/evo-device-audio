@@ -454,8 +454,8 @@ wipe_user_data() {
     rm -rf /var/lib/evo/plugins
     rm -rf /var/lib/evo/https/credentials
     rm -rf /var/lib/evo/plans
-    # The /etc/evo baseline re-application happens in
-    # place_etc_evo() after the bundle is extracted.
+    # The /etc/evo baseline re-application happens via
+    # invoke_bootstrap_placement after the bundle is extracted.
     rm -rf /etc/evo
 }
 
@@ -563,24 +563,6 @@ invoke_bootstrap_placement() {
     EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}"
 }
 
-place_music_library() {
-    if [[ "${EVO_INSTALL_MUSIC_LIBRARY}" == "0" ]]; then
-        return 0
-    fi
-    install -d -m 0755 -o root -g root /var/lib/evo
-    if ! install -d -m 0755 -o "${SERVICE_USER}" -g audio \
-            /var/lib/evo/music \
-            /var/lib/evo/music/INTERNAL \
-            /var/lib/evo/music/USB \
-            /var/lib/evo/music/NAS 2>/dev/null; then
-        install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
-            /var/lib/evo/music \
-            /var/lib/evo/music/INTERNAL \
-            /var/lib/evo/music/USB \
-            /var/lib/evo/music/NAS
-    fi
-}
-
 purge_evo_mpd_includes() {
     # Strip ALL evo-related markers from /etc/mpd.conf so the
     # next inject lands on a clean baseline. Idempotent.
@@ -605,21 +587,6 @@ purge_evo_mpd_includes() {
         /etc/mpd.conf
     # Drop trailing blank lines left behind by the deletes.
     sed -i -e ':a' -e '/^$/{$d;N;ba' -e '}' /etc/mpd.conf
-}
-
-# Music-directory pin in /etc/mpd.conf — the only mpd.conf
-# rewrite owned by evo-install.sh (because it depends on
-# EVO_INSTALL_MUSIC_LIBRARY, which is an installer-tier
-# decision, not a placement-tier one). bootstrap.sh owns the
-# include directive itself.
-pin_mpd_music_directory() {
-    if [[ ! -f /etc/mpd.conf ]]; then
-        return 0
-    fi
-    if [[ "${EVO_INSTALL_MUSIC_LIBRARY}" != "0" ]] && \
-       ! grep -qE '^\s*music_directory\s+"/var/lib/evo/music"' /etc/mpd.conf; then
-        sed -i.pre-evo-music -E 's|^\s*music_directory\s+".*"|music_directory "/var/lib/evo/music"|' /etc/mpd.conf || true
-    fi
 }
 
 start_steward() {
@@ -851,52 +818,45 @@ init_work_dir
 
 case "${MODE}" in
     install)
-        echo "[1/9] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[2/9] fetch bundle ..."     ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[3/9] extract bundle ..."   ; extract_bundle          ; echo "  ok"
-        echo "[4/9] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
-        echo "[5/9] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
-        echo "[6/9] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/9] music library ..."    ; place_music_library     ; echo "  ok"
-        echo "[8/9] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
-        echo "[9/9] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[1/7] system packages ..." ; ensure_system_packages ; echo "  ok"
+        echo "[2/7] fetch bundle ..."     ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[3/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
+        echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
+        echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[7/7] start + verify ..."   ; start_steward ; verify_post_condition
         ;;
     reinstall)
-        echo "[1/10] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[2/10] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[3/10] extract bundle ..."  ; extract_bundle          ; echo "  ok"
-        echo "[4/10] FULL WIPE (binaries + config + state + music) ..."
+        echo "[1/8] system packages ..." ; ensure_system_packages ; echo "  ok"
+        echo "[2/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[3/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[4/8] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
-        echo "[5/10] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[6/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/10] music library skeleton ..." ; place_music_library ; echo "  ok"
-        echo "[8/10] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
-        echo "[9/10] start + verify ..."  ; start_steward ; verify_post_condition
+        echo "[5/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
+        echo "[6/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[7/8] start + verify ..."  ; start_steward ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
     wipe-config)
-        echo "[1/10] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
-        echo "[2/10] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[3/10] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[4/10] extract bundle ..."  ; extract_bundle          ; echo "  ok"
-        echo "[5/10] CONFIG WIPE (binaries + config + state, music preserved) ..."
+        echo "[1/8] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[2/8] system packages ..." ; ensure_system_packages ; echo "  ok"
+        echo "[3/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[4/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[5/8] CONFIG WIPE (binaries + config + state, music preserved) ..."
         wipe_config ; echo "  ok"
-        echo "[6/10] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[7/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[8/10] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
-        echo "[9/10] start + verify ..."  ; start_steward ; verify_post_condition
-        echo "[10/10] verify music library byte-equal ..." ; verify_music_hashes_preserved
+        echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
+        echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[8/8] start + verify + music library byte-equal ..."  ; start_steward ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)
-        echo "[1/8] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
-        echo "[2/8] fetch bundle (for /etc/evo baseline) ..." ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[3/8] extract bundle ..."   ; extract_bundle          ; echo "  ok"
-        echo "[4/8] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
+        echo "[1/7] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[2/7] fetch bundle (for /etc/evo baseline) ..." ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[3/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
+        echo "[4/7] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
         wipe_user_data ; echo "  ok"
-        echo "[5/8] /etc/evo baseline (re-apply) + drop-ins + sudoers ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[6/8] mpd music directory pin (idempotent) ..." ; pin_mpd_music_directory ; echo "  ok"
-        echo "[7/8] start + verify ..."   ; start_steward ; verify_post_condition
-        echo "[8/8] verify music library byte-equal ..." ; verify_music_hashes_preserved
+        echo "[5/7] /etc/evo baseline (re-apply) + drop-ins + sudoers + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/7] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[7/7] verify music library byte-equal ..." ; verify_music_hashes_preserved
         ;;
 esac
 

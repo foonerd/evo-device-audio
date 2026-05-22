@@ -764,6 +764,53 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 3.6: /var/lib/evo/music/{INTERNAL,USB,NAS} +
+# /etc/mpd.conf music_directory pin
+# ----------------------------------------------------------
+# The audio distribution's prescribed music library layout
+# (documented in dist/README.md; gated as a release-cut
+# acceptance criterion). The directories must exist BEFORE
+# the mpd restart in the asound step so mpd's startup
+# music_directory open succeeds — otherwise mpd logs an
+# exception and the post-install gate's zero-fail invariant
+# fails. Boilerplate per the distribution: same on every
+# target, every install.
+#
+# Ownership: owner SERVICE_USER, group `audio` when present
+# (Debian convention for music-library access), with a
+# SERVICE_USER:SERVICE_USER fallback for hosts where the
+# `audio` group does not exist.
+if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
+    install -d -m 0755 -o root -g root /var/lib/evo
+    if ! install -d -m 0755 -o "$SERVICE_USER" -g audio \
+            /var/lib/evo/music \
+            /var/lib/evo/music/INTERNAL \
+            /var/lib/evo/music/USB \
+            /var/lib/evo/music/NAS 2>/dev/null; then
+        install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            /var/lib/evo/music \
+            /var/lib/evo/music/INTERNAL \
+            /var/lib/evo/music/USB \
+            /var/lib/evo/music/NAS
+    fi
+    echo "[bootstrap] /var/lib/evo/music/{INTERNAL,USB,NAS} ensured (owner $SERVICE_USER, mode 0755)"
+    # mpd's music_directory must point at /var/lib/evo/music
+    # before the restart later in this script. The line is
+    # in /etc/mpd.conf (Debian shape: top-level
+    # `music_directory "..."`). idempotent: rewrite only when
+    # the current value differs.
+    if [[ -f /etc/mpd.conf ]] \
+        && ! grep -qE '^\s*music_directory\s+"/var/lib/evo/music"' /etc/mpd.conf; then
+        sed -i.pre-evo-music -E \
+            's|^\s*music_directory\s+".*"|music_directory "/var/lib/evo/music"|' \
+            /etc/mpd.conf
+        echo "[bootstrap] pinned music_directory in /etc/mpd.conf to /var/lib/evo/music"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_MUSIC_LIBRARY=0 — skipping music library skeleton + music_directory pin"
+fi
+
+# ----------------------------------------------------------
 # Step 3.5: /opt/evo/catalogue/default.toml — distribution
 # catalogue including this audio-rack fragment. The catalogue
 # composer is intentionally minimal in this build: it
