@@ -74,6 +74,10 @@ request_types = [
     "options.set_gapless",
     "options.set_eq_engaged",
     "options.set_eq_band",
+    "options.list_eq_presets",
+    "options.save_eq_preset",
+    "options.recall_eq_preset",
+    "options.delete_eq_preset",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ]

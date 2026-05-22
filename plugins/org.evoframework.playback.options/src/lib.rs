@@ -206,6 +206,10 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_gapless",
     "options.set_eq_engaged",
     "options.set_eq_band",
+    "options.list_eq_presets",
+    "options.save_eq_preset",
+    "options.recall_eq_preset",
+    "options.delete_eq_preset",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ];
@@ -234,6 +238,19 @@ const EQ_BAND_GAIN_MAX_DB: f32 = 15.0;
 const EQ_BAND_Q_MIN: f32 = 0.1;
 /// EQ band Q upper bound (narrow / sharp).
 const EQ_BAND_Q_MAX: f32 = 30.0;
+
+/// Maximum number of named EQ presets the library holds.
+/// Operator save gestures past this count refuse with a
+/// structured Permanent error naming the cap. 32 covers the
+/// operator-curated set without unbounded growth from a UI
+/// bug; the import path is gated by the same cap.
+pub const EQ_PRESET_LIBRARY_MAX_COUNT: usize = 32;
+/// Maximum length of a preset name in bytes. Operator save
+/// gestures with a longer name refuse with a structured
+/// Permanent error naming the cap. 64 bytes covers any
+/// operator-meaningful name without permitting a UI bug to
+/// stash arbitrary blobs in the preset key.
+pub const EQ_PRESET_NAME_MAX_LEN: usize = 64;
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -440,6 +457,32 @@ pub struct Settings {
     /// bands hears no change.
     #[serde(default = "default_eq_bands")]
     pub eq_bands: Vec<EqBand>,
+    /// Named EQ preset library. Each entry carries a unique
+    /// name + the same 10-band shape as `eq_bands`. Operator
+    /// gestures save / recall / delete named presets;
+    /// `recall` atomically replaces `eq_bands` with the named
+    /// preset's bands and emits a single
+    /// `audio.options.changed` happening (not 10). The
+    /// `eq_engaged` flag is intentionally NOT part of a
+    /// preset — engagement is session state, not part of a
+    /// saved curve. Bounded by [`EQ_PRESET_LIBRARY_MAX_COUNT`]
+    /// and per-entry name length by
+    /// [`EQ_PRESET_NAME_MAX_LEN`].
+    #[serde(default)]
+    pub eq_presets: Vec<NamedEqPreset>,
+}
+
+/// One named EQ preset. Round-trips through the settings file
+/// alongside `eq_bands` so the preset library survives plugin
+/// restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedEqPreset {
+    /// Operator-meaningful name (UTF-8, 1..=64 bytes; the
+    /// setter refuses empty or over-long names). Names are
+    /// case-sensitive and unique within the library.
+    pub name: String,
+    /// 10 band parameters matching the schema-pinned shape.
+    pub bands: Vec<EqBand>,
 }
 
 /// One band of the parametric EQ. Mirrors the schema's
@@ -499,6 +542,7 @@ impl Default for Settings {
             gapless: default_gapless(),
             eq_engaged: false,
             eq_bands: default_eq_bands(),
+            eq_presets: Vec::new(),
         }
     }
 }
@@ -1556,6 +1600,18 @@ impl Respondent for PlaybackOptionsPlugin {
                     self.handle_set_eq_engaged(req).await
                 }
                 "options.set_eq_band" => self.handle_set_eq_band(req).await,
+                "options.list_eq_presets" => {
+                    self.handle_list_eq_presets(req).await
+                }
+                "options.save_eq_preset" => {
+                    self.handle_save_eq_preset(req).await
+                }
+                "options.recall_eq_preset" => {
+                    self.handle_recall_eq_preset(req).await
+                }
+                "options.delete_eq_preset" => {
+                    self.handle_delete_eq_preset(req).await
+                }
                 "options.restore_last_known_good" => {
                     self.handle_restore_last_known_good(req).await
                 }
@@ -2280,6 +2336,169 @@ impl PlaybackOptionsPlugin {
         )
     }
 
+    /// Return the named EQ preset library to the operator.
+    /// Empty array on a fresh device; library order is
+    /// insertion order (save appends; recall does not
+    /// rearrange).
+    async fn handle_list_eq_presets(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        parse_versioned::<EmptyPayload>(req)?;
+        let body = ListEqPresetsResponse {
+            v: PAYLOAD_VERSION,
+            presets: self.settings.eq_presets.clone(),
+        };
+        encode(req, &body)
+    }
+
+    /// Save a named EQ preset. Creates a new entry, or
+    /// overwrites by name. Validates the name + every band
+    /// against the schema-pinned domains; refusal carries a
+    /// structured Permanent error naming the offending field +
+    /// accepted range.
+    async fn handle_save_eq_preset(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SaveEqPresetPayload = parse_versioned(req)?;
+        validate_preset_name(&payload.name)?;
+        if payload.bands.len() != EQ_BAND_COUNT {
+            return Err(PluginError::Permanent(format!(
+                "eq_preset.bands must contain exactly {} entries; got {}",
+                EQ_BAND_COUNT,
+                payload.bands.len()
+            )));
+        }
+        for (i, band) in payload.bands.iter().enumerate() {
+            validate_eq_band(i, band)?;
+        }
+
+        // Overwrite-by-name semantics: scan for existing
+        // entry; if absent, enforce library cap before push.
+        if let Some(slot) = self
+            .settings
+            .eq_presets
+            .iter_mut()
+            .find(|p| p.name == payload.name)
+        {
+            slot.bands = payload.bands.clone();
+        } else {
+            if self.settings.eq_presets.len() >= EQ_PRESET_LIBRARY_MAX_COUNT {
+                return Err(PluginError::Permanent(format!(
+                    "eq_preset library cap reached ({} entries); delete \
+                     a preset before saving another",
+                    EQ_PRESET_LIBRARY_MAX_COUNT
+                )));
+            }
+            self.settings.eq_presets.push(NamedEqPreset {
+                name: payload.name.clone(),
+                bands: payload.bands.clone(),
+            });
+        }
+        self.persist_settings().await?;
+        self.emit_changed(
+            "eq_presets",
+            serde_json::to_value(&self.settings.eq_presets)
+                .map_err(map_json_err)?,
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Apply a named preset's bands to the active eq_bands
+    /// atomically. The 10-band replace + single
+    /// `audio.options.changed` emission is the verb's
+    /// raison d'être — a recall via the per-band setter would
+    /// fire 10 subject updates; this verb fires one.
+    async fn handle_recall_eq_preset(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
+        validate_preset_name(&payload.name)?;
+        let bands = match self
+            .settings
+            .eq_presets
+            .iter()
+            .find(|p| p.name == payload.name)
+        {
+            Some(p) => p.bands.clone(),
+            None => {
+                return Err(PluginError::Permanent(format!(
+                    "eq_preset {:?} not found in the library; \
+                     call list_eq_presets to enumerate",
+                    payload.name
+                )));
+            }
+        };
+        if bands.len() != EQ_BAND_COUNT {
+            return Err(PluginError::Permanent(format!(
+                "eq_preset {:?} carries {} bands; expected {} \
+                 (persisted-state shape drift)",
+                payload.name,
+                bands.len(),
+                EQ_BAND_COUNT
+            )));
+        }
+        self.settings.eq_bands = bands;
+        self.persist_settings().await?;
+        // Single subject update for the full band-set replace —
+        // operators see one happening, not ten.
+        self.emit_changed(
+            "eq_bands",
+            serde_json::to_value(&self.settings.eq_bands)
+                .map_err(map_json_err)?,
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Remove a named preset from the library. Refuses on an
+    /// unknown name with a structured Permanent error.
+    async fn handle_delete_eq_preset(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
+        validate_preset_name(&payload.name)?;
+        let before = self.settings.eq_presets.len();
+        self.settings.eq_presets.retain(|p| p.name != payload.name);
+        if self.settings.eq_presets.len() == before {
+            return Err(PluginError::Permanent(format!(
+                "eq_preset {:?} not found in the library; \
+                 call list_eq_presets to enumerate",
+                payload.name
+            )));
+        }
+        self.persist_settings().await?;
+        self.emit_changed(
+            "eq_presets",
+            serde_json::to_value(&self.settings.eq_presets)
+                .map_err(map_json_err)?,
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
     async fn handle_set_mixer_device(
         &mut self,
         req: &Request,
@@ -2828,10 +3047,92 @@ impl HasPayloadVersion for SetEqBandPayload {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SaveEqPresetPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    name: String,
+    bands: Vec<EqBand>,
+}
+
+impl HasPayloadVersion for SaveEqPresetPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Common payload shape for `options.recall_eq_preset` +
+/// `options.delete_eq_preset` — both take just the preset
+/// name on top of the version envelope.
+#[derive(Debug, Deserialize)]
+struct NameOnlyEqPresetPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    name: String,
+}
+
+impl HasPayloadVersion for NameOnlyEqPresetPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ListEqPresetsResponse {
+    v: u32,
+    presets: Vec<NamedEqPreset>,
+}
+
 #[derive(Debug, Serialize)]
 struct SimpleOk {
     v: u32,
     status: &'static str,
+}
+
+/// Refuse empty + over-long preset names with structured
+/// errors. UTF-8 byte length is the cap; tracked separately
+/// from `char` count so multi-byte chars don't escape the
+/// bound by virtue of a permissive grapheme count.
+fn validate_preset_name(name: &str) -> Result<(), PluginError> {
+    if name.is_empty() {
+        return Err(PluginError::Permanent(
+            "eq_preset.name must not be empty".to_string(),
+        ));
+    }
+    if name.len() > EQ_PRESET_NAME_MAX_LEN {
+        return Err(PluginError::Permanent(format!(
+            "eq_preset.name must be at most {} bytes; got {}",
+            EQ_PRESET_NAME_MAX_LEN,
+            name.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate one band against the schema-pinned domain. Used
+/// by both the single-band setter and the preset-save bulk
+/// path; one canonical validation surface so the two entry
+/// points stay in lockstep.
+fn validate_eq_band(index: usize, band: &EqBand) -> Result<(), PluginError> {
+    if !(EQ_BAND_FREQ_MIN..=EQ_BAND_FREQ_MAX).contains(&band.freq_hz) {
+        return Err(PluginError::Permanent(format!(
+            "eq_preset.bands[{}].freq_hz must lie in {}..={}; got {}",
+            index, EQ_BAND_FREQ_MIN, EQ_BAND_FREQ_MAX, band.freq_hz
+        )));
+    }
+    if !(EQ_BAND_GAIN_MIN_DB..=EQ_BAND_GAIN_MAX_DB).contains(&band.gain_db) {
+        return Err(PluginError::Permanent(format!(
+            "eq_preset.bands[{}].gain_db must lie in {}..={} dB; got {}",
+            index, EQ_BAND_GAIN_MIN_DB, EQ_BAND_GAIN_MAX_DB, band.gain_db
+        )));
+    }
+    if !(EQ_BAND_Q_MIN..=EQ_BAND_Q_MAX).contains(&band.q) {
+        return Err(PluginError::Permanent(format!(
+            "eq_preset.bands[{}].q must lie in {}..={}; got {}",
+            index, EQ_BAND_Q_MIN, EQ_BAND_Q_MAX, band.q
+        )));
+    }
+    Ok(())
 }
 
 /// Local helper — serde_json error -> PluginError. Used in
@@ -3869,6 +4170,306 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    // ---- EQ preset library coverage ----
+
+    fn flat_bands_json() -> serde_json::Value {
+        let arr: Vec<_> = (0..EQ_BAND_COUNT)
+            .map(|_| json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
+            .collect();
+        serde_json::Value::Array(arr)
+    }
+
+    #[tokio::test]
+    async fn list_eq_presets_empty_on_fresh_plugin() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let resp = p
+            .handle_request(&req("options.list_eq_presets", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["presets"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_persists_and_lists() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "vocal-boost", "bands": flat_bands_json() }),
+        ))
+        .await
+        .unwrap();
+        let resp = p
+            .handle_request(&req("options.list_eq_presets", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["presets"].as_array().unwrap().len(), 1);
+        assert_eq!(v["presets"][0]["name"], "vocal-boost");
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_overwrites_by_name() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // First save with flat bands.
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "test", "bands": flat_bands_json() }),
+        ))
+        .await
+        .unwrap();
+        // Overwrite with a band-0 freq of 200.
+        let mut modified = flat_bands_json();
+        modified[0]["freq_hz"] = json!(200);
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "test", "bands": modified }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().eq_presets.len(), 1, "overwrite, not append");
+        assert_eq!(p.settings().eq_presets[0].bands[0].freq_hz, 200);
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_refuses_empty_name() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.save_eq_preset",
+                json!({ "v": 1, "name": "", "bands": flat_bands_json() }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("name") && msg.contains("empty"),
+                    "refusal must name the field; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_refuses_overlong_name() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let long = "x".repeat(EQ_PRESET_NAME_MAX_LEN + 1);
+        let err = p
+            .handle_request(&req(
+                "options.save_eq_preset",
+                json!({ "v": 1, "name": long, "bands": flat_bands_json() }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("64"),
+                    "refusal must name the cap; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_refuses_wrong_band_count() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Only 5 bands — schema requires 10.
+        let short_bands: Vec<_> = (0..5)
+            .map(|_| json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
+            .collect();
+        let err = p
+            .handle_request(&req(
+                "options.save_eq_preset",
+                json!({ "v": 1, "name": "short", "bands": short_bands }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_refuses_out_of_range_field() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let mut bands = flat_bands_json();
+        bands[3]["gain_db"] = json!(100.0); // outside -15..=15
+        let err = p
+            .handle_request(&req(
+                "options.save_eq_preset",
+                json!({ "v": 1, "name": "bad", "bands": bands }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("bands[3].gain_db"),
+                    "refusal must name the offending band field; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_eq_preset_refuses_library_cap_overflow() {
+        let (mut p, _dir) = loaded_plugin().await;
+        for i in 0..EQ_PRESET_LIBRARY_MAX_COUNT {
+            p.handle_request(&req(
+                "options.save_eq_preset",
+                json!({
+                    "v": 1,
+                    "name": format!("preset-{}", i),
+                    "bands": flat_bands_json(),
+                }),
+            ))
+            .await
+            .unwrap();
+        }
+        // The (max + 1)-th create overflows.
+        let err = p
+            .handle_request(&req(
+                "options.save_eq_preset",
+                json!({
+                    "v": 1,
+                    "name": "one-too-many",
+                    "bands": flat_bands_json(),
+                }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("library cap")
+                        && msg
+                            .contains(&EQ_PRESET_LIBRARY_MAX_COUNT.to_string()),
+                    "refusal must name the cap; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_eq_preset_replaces_active_bands_atomically() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Save a preset with all bands at 4 kHz / +3 dB.
+        let preset_bands: Vec<_> = (0..EQ_BAND_COUNT)
+            .map(|_| json!({ "freq_hz": 4000, "gain_db": 3.0, "q": 1.5 }))
+            .collect();
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "boost-4k", "bands": preset_bands }),
+        ))
+        .await
+        .unwrap();
+        // Active bands are still flat (the save did not touch them).
+        assert_eq!(p.settings().eq_bands[0].freq_hz, 1000);
+
+        // Recall replaces all 10 bands.
+        p.handle_request(&req(
+            "options.recall_eq_preset",
+            json!({ "v": 1, "name": "boost-4k" }),
+        ))
+        .await
+        .unwrap();
+        for i in 0..EQ_BAND_COUNT {
+            assert_eq!(p.settings().eq_bands[i].freq_hz, 4000);
+            assert!((p.settings().eq_bands[i].gain_db - 3.0).abs() < 1e-6);
+            assert!((p.settings().eq_bands[i].q - 1.5).abs() < 1e-6);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_eq_preset_refuses_unknown_name() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.recall_eq_preset",
+                json!({ "v": 1, "name": "not-there" }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("not-there")
+                        && msg.contains("list_eq_presets"),
+                    "refusal must name the offending preset + point at \
+                     the enumeration verb; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_eq_preset_removes_and_lists_drop() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "tmp", "bands": flat_bands_json() }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().eq_presets.len(), 1);
+        p.handle_request(&req(
+            "options.delete_eq_preset",
+            json!({ "v": 1, "name": "tmp" }),
+        ))
+        .await
+        .unwrap();
+        assert!(p.settings().eq_presets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_eq_preset_refuses_unknown_name() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.delete_eq_preset",
+                json!({ "v": 1, "name": "ghost" }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn recall_eq_preset_does_not_touch_eq_engaged() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Engage EQ.
+        p.handle_request(&req(
+            "options.set_eq_engaged",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        // Save + recall a preset.
+        p.handle_request(&req(
+            "options.save_eq_preset",
+            json!({ "v": 1, "name": "x", "bands": flat_bands_json() }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.recall_eq_preset",
+            json!({ "v": 1, "name": "x" }),
+        ))
+        .await
+        .unwrap();
+        // Engagement flag is unchanged — the preset doesn't
+        // carry it.
+        assert!(
+            p.settings().eq_engaged,
+            "recall must not flip eq_engaged; session state stays"
+        );
     }
 
     #[tokio::test]
