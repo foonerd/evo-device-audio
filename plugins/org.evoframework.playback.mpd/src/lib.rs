@@ -247,6 +247,23 @@ const TEST_TONE_DEFAULT_CHANNEL: &str = "both";
 /// surface rather than failing opaquely against MPD's ack.
 const TEST_TONE_MPD_UNIX_SOCKET: &str = "/run/mpd/socket";
 
+/// Spool directory the warden writes synthesised test-tone
+/// WAVs to. Lives under the steward's `RuntimeDirectory=evo`
+/// (`/run/evo/`) so the path is shared across every local
+/// service — `/tmp` is NOT a safe choice because
+/// `evo.service` runs with `PrivateTmp=yes` (the steward sees
+/// its own private /tmp namespace while MPD sees the host's,
+/// so a file the warden writes to /tmp is invisible to the
+/// MPD daemon). `/run/evo/` is the steward's runtime
+/// directory under systemd's `RuntimeDirectory` mechanism;
+/// it's mode 0755 root:root and accessible to every other
+/// local service. The warden mkdirs `test-tones/` under it on
+/// first write (idempotent) and chmods each WAV to 0644 so
+/// the mpd user (different from the steward user) can read
+/// the file. systemd cleans `/run/evo/` on service stop, so
+/// no separate cleanup primitive is required.
+const TEST_TONE_SPOOL_DIR: &str = "/run/evo/test-tones";
+
 /// Parse the embedded manifest into a [`Manifest`] struct.
 ///
 /// Panics if the embedded manifest fails to parse. Such a failure
@@ -2449,17 +2466,36 @@ impl MpdPlaybackPlugin {
                 ))
             })?;
         let wav = synthesise_test_tone_wav(freq_hz, duration_ms, channel);
-        let path =
-            format!("/tmp/evo-test-tone-{}.wav", correction.correlation_id);
+        // The spool directory lives under the steward's
+        // RuntimeDirectory (/run/evo/) so the path is shared
+        // across services. /tmp is unusable here:
+        // evo.service runs with `PrivateTmp=yes`, isolating
+        // its /tmp from MPD's view — a file the warden writes
+        // to /tmp is invisible to the MPD daemon. mkdir_all is
+        // idempotent + safe across concurrent invocations.
+        tokio::fs::create_dir_all(TEST_TONE_SPOOL_DIR)
+            .await
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "emit_test_tone create_dir_all {} failed: {}",
+                    TEST_TONE_SPOOL_DIR, e
+                ))
+            })?;
+        let path = format!(
+            "{}/evo-test-tone-{}.wav",
+            TEST_TONE_SPOOL_DIR, correction.correlation_id
+        );
         tokio::fs::write(&path, &wav).await.map_err(|e| {
             PluginError::Permanent(format!(
                 "emit_test_tone write to {} failed: {}",
                 path, e
             ))
         })?;
-        // Make the temp file world-readable so the MPD daemon
-        // (running as the `mpd` user) can read it. The /tmp
-        // directory is sticky; only the owner can unlink.
+        // Make the WAV world-readable so the MPD daemon
+        // (running as the `mpd` user, distinct from the
+        // steward user) can read it. The spool directory is
+        // mode 0755 root:root from systemd's RuntimeDirectory
+        // primitive; per-file 0644 closes the read path.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4343,6 +4379,31 @@ mod tests {
     // ---- audio-protocol-settings parser coverage ----
 
     // ---- emit_test_tone payload-validation coverage ----
+
+    #[test]
+    fn test_tone_spool_dir_lives_under_runtime_directory() {
+        // The spool path MUST sit under /run/evo/ so it
+        // survives systemd PrivateTmp sandboxing on the
+        // steward (which makes /tmp invisible to MPD). The
+        // distribution's RuntimeDirectory=evo systemd
+        // directive creates /run/evo/ root:root 0755 on every
+        // service start; the warden's mkdir_all of
+        // TEST_TONE_SPOOL_DIR composes inside it.
+        assert!(
+            TEST_TONE_SPOOL_DIR.starts_with("/run/evo/"),
+            "spool dir must live under /run/evo/ so MPD can \
+             read files the steward writes; got: {}",
+            TEST_TONE_SPOOL_DIR
+        );
+        // Defensive: /tmp must not creep back in as a path
+        // prefix — the prior implementation wrote there and
+        // hit the PrivateTmp namespace mismatch.
+        assert!(
+            !TEST_TONE_SPOOL_DIR.starts_with("/tmp"),
+            "/tmp is PrivateTmp-sandboxed; MPD cannot read \
+             files the steward writes there"
+        );
+    }
 
     #[tokio::test]
     async fn course_correct_emit_test_tone_rejects_freq_below_audible_band() {
