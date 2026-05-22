@@ -27,6 +27,8 @@ pub enum CatalogError {
     Parse(#[from] toml::de::Error),
     #[error("alsa-cards.toml schema_version {found} unsupported (expected 1)")]
     SchemaVersion { found: u32 },
+    #[error("alsa-cards.toml: hda_codecs.codec_id {raw} is not a valid 32-bit hex string")]
+    InvalidCodecId { raw: String },
 }
 
 /// Top-level catalog payload as it appears on disk.
@@ -34,6 +36,31 @@ pub enum CatalogError {
 struct CatalogFile {
     schema_version: u32,
     cards: Vec<RawCardRow>,
+    /// HDA codec identification overlay. Each entry maps a 32-bit
+    /// HDA `vendor_id` (formatted as 8-char hex) to an operator-
+    /// friendly chip family label. The kernel reports the codec's
+    /// chip name via `/proc/asound/cardN/codec#N` (`Codec:` line);
+    /// the overlay table re-brands it where the catalog carries a
+    /// preferred form (e.g. kernel says `Realtek ALC233`, the
+    /// catalog might present it as `Realtek ALC233 (high-quality
+    /// analog out)`). Optional — when absent or no entry matches,
+    /// the kernel-supplied chip name is the label.
+    #[serde(default)]
+    hda_codecs: Vec<RawHdaCodecRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawHdaCodecRow {
+    /// 32-bit HDA codec vendor id as 8-char hex string (no `0x`
+    /// prefix, lowercase). Matches the `Vendor Id:` field in
+    /// `/proc/asound/cardN/codec#N`.
+    codec_id: String,
+    /// Operator-friendly label for this codec chip family
+    /// (e.g. `Realtek ALC233`, `Conexant CX20756`).
+    pretty_name: String,
+    /// Free-text description for the operator UI. Optional.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,10 +162,21 @@ impl TypeHint {
     }
 }
 
-/// Loaded catalog indexed by raw ALSA card name.
+/// HDA codec overlay entry — operator-friendly label + optional
+/// description keyed by 32-bit `vendor_id`. Populated from the
+/// `[[hda_codecs]]` rows in `alsa-cards.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdaCodecEntry {
+    pub pretty_name: String,
+    pub description: Option<String>,
+}
+
+/// Loaded catalog indexed by raw ALSA card name + 32-bit HDA
+/// codec vendor id.
 #[derive(Debug, Clone)]
 pub struct AlsaCardCatalog {
     by_name: HashMap<String, CardEntry>,
+    by_codec_id: HashMap<u32, HdaCodecEntry>,
 }
 
 impl AlsaCardCatalog {
@@ -192,7 +230,36 @@ impl AlsaCardCatalog {
             };
             by_name.insert(row.name, entry);
         }
-        Ok(Self { by_name })
+        let mut by_codec_id: HashMap<u32, HdaCodecEntry> = HashMap::new();
+        for codec in parsed.hda_codecs {
+            let cleaned = codec.codec_id.trim().trim_start_matches("0x");
+            let id = u32::from_str_radix(cleaned, 16).map_err(|_| {
+                CatalogError::InvalidCodecId {
+                    raw: codec.codec_id.clone(),
+                }
+            })?;
+            by_codec_id.insert(
+                id,
+                HdaCodecEntry {
+                    pretty_name: codec.pretty_name,
+                    description: codec.description.filter(|s| !s.is_empty()),
+                },
+            );
+        }
+        Ok(Self {
+            by_name,
+            by_codec_id,
+        })
+    }
+
+    /// Look up an HDA codec by its 32-bit `vendor_id` (as read
+    /// from `/proc/asound/cardN/codec#N`). Returns the operator-
+    /// friendly chip family label + optional description when the
+    /// catalog carries an overlay row for this codec; None when
+    /// the codec is uncatalogued and the caller should fall back
+    /// to the kernel-supplied chip name as the label.
+    pub fn lookup_codec(&self, codec_id: u32) -> Option<&HdaCodecEntry> {
+        self.by_codec_id.get(&codec_id)
     }
 
     /// Look up by raw ALSA card name.

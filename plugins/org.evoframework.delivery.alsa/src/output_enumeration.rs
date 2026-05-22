@@ -414,16 +414,22 @@ fn resolve_row(
                 }
             } else {
                 // Card matched but subdevice index isn't in the
-                // catalog. Partial-match: kernel classification
-                // still applies (card-level); label falls back to
-                // the raw name (no subdevice-specific label
-                // available).
+                // catalog's per-subdevice map. Partial-match:
+                // kernel classification still applies (card-level);
+                // label applies the same precedence the fully-
+                // unmapped branch uses — codec overlay → kernel
+                // chip name → kernel long_name → card_name. This
+                // keeps catalogue widening (codec overlay rows
+                // added under `[[hda_codecs]]`) effective for
+                // subdevices whose per-subdevice label isn't in
+                // the per-card-name multi-device table.
+                let label = resolve_unmapped_label(identity, &row, catalog);
                 ResolvedAlsaOutput {
                     card_idx: row.card_idx,
                     device_idx: row.device_idx,
                     card_name: row.card_name.clone(),
                     alsa_id,
-                    label: row.card_name,
+                    label,
                     output_class: kernel_output_class,
                     default_mixer_control: None,
                     catalog_provenance: CatalogProvenance::Unmapped,
@@ -433,16 +439,24 @@ fn resolve_row(
             }
         }
         None => {
-            // Unmapped against alsa-cards.toml. Prefer the
-            // kernel-supplied long_name as the fallback label —
-            // operator sees "HDA Intel PCH at 0x..." rather than
-            // the bare short_id, which is more meaningful for
-            // diagnostic. Falls back to the aplay-parsed card_name
-            // when kernel introspection didn't produce an identity.
-            let label = identity
-                .map(|i| i.long_name.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| row.card_name.clone());
+            // Unmapped against alsa-cards.toml's per-card-name
+            // table. Label precedence for HDA cards (the common
+            // x86 / amd64 case):
+            //   1. Catalogue codec overlay (`[[hda_codecs]]`) hit
+            //      via the kernel-supplied codec vendor_id — the
+            //      operator-friendly chip family brand label.
+            //   2. Kernel-supplied codec chip name (e.g.
+            //      `Realtek ALC233`) — already operator-readable,
+            //      just not curated.
+            //   3. Kernel-supplied card long_name (e.g.
+            //      `HDA Intel PCH at 0x98b20000 irq 149`) — the
+            //      controller identity; meaningful but verbose.
+            //   4. aplay-parsed card_name — last resort.
+            //
+            // For non-HDA unmapped cards, the codec-overlay layer
+            // is skipped (no codecs); the precedence collapses to
+            // 3 → 4 (kernel long_name → aplay card_name).
+            let label = resolve_unmapped_label(identity, &row, catalog);
             ResolvedAlsaOutput {
                 card_idx: row.card_idx,
                 device_idx: row.device_idx,
@@ -457,6 +471,44 @@ fn resolve_row(
             }
         }
     }
+}
+
+/// Resolve the operator-facing label for an unmapped card,
+/// applying the precedence documented above the call site:
+/// codec overlay → kernel chip name → kernel long_name → aplay
+/// card_name. Catalogue codec lookup is only consulted when the
+/// kernel supplied a codec for this card (HDA-class identity).
+fn resolve_unmapped_label(
+    identity: Option<&crate::kernel_introspection::CardIdentity>,
+    row: &AplayCardDevice,
+    catalog: &AlsaCardCatalog,
+) -> String {
+    if let Some(id) = identity {
+        // Codec overlay path: walk the codec list and return the
+        // first catalogue brand match. Prefer the analog codec
+        // (typically address 0) — it's the operator-meaningful
+        // chip on a card; HDMI codec sibling labels are less
+        // useful for primary-output identification.
+        for codec in &id.codecs {
+            if let Some(entry) = catalog.lookup_codec(codec.vendor_id) {
+                return entry.pretty_name.clone();
+            }
+        }
+        // No codec catalogue hit. Use the first codec's
+        // kernel-supplied chip name if any — already
+        // operator-readable.
+        if let Some(first_codec) = id.codecs.first() {
+            if !first_codec.chip_name.is_empty() {
+                return first_codec.chip_name.clone();
+            }
+        }
+        // No codec at all (I²S DAC, Loopback, vc4-hdmi).
+        // Kernel long_name carries the controller identity.
+        if !id.long_name.is_empty() {
+            return id.long_name.clone();
+        }
+    }
+    row.card_name.clone()
 }
 
 // NOTE: `derive_output_class` retired with the kernel-introspection-
@@ -887,15 +939,16 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
     fn x86_class_hda_card_uncatalogued_classifies_as_analog_not_unknown() {
         // FAILING-CASE REPRODUCTION pin for the kernel-introspection
         // discipline. Before the kernel-introspection layer landed,
-        // an HDA card unknown to alsa-cards.toml fell through to
-        // OutputClass::Unknown — the UI rendered "Other" for a
-        // perfectly usable card.
+        // an HDA card unknown to alsa-cards.toml's per-card-name
+        // table fell through to OutputClass::Unknown — the UI
+        // rendered "Other" for a perfectly usable card.
         //
-        // After: kernel reports CardKind::Hda for the card;
-        // classify_from_kernel maps that to OutputClass::Analog;
-        // the operator UI renders the "Analog" Destination chip
-        // with the kernel-supplied long_name as the label (until
-        // catalogue-overlay branding lands).
+        // After: kernel reports CardKind::Hda; classifier returns
+        // OutputClass::Analog. This test uses fixture_catalog
+        // (synthetic, no codec overlay) so the label precedence
+        // collapses to the kernel-supplied long_name — the next
+        // test exercises the codec-overlay branch against the
+        // shipped catalogue.
         let cat = fixture_catalog();
         let raw = "card 1: PCH [HDA Intel PCH], device 0: ALC233 Analog [ALC233 Analog]\n";
         let identities = vec![crate::kernel_introspection::CardIdentity {
@@ -923,9 +976,113 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
              the prior keyword-scan path returned Unknown and the \
              UI rendered 'Other' for this card",
         );
-        // Label falls back to the kernel-supplied long_name when
-        // the alsa-cards catalogue carries no row for this card.
-        assert_eq!(out.label, "HDA Intel PCH at 0x98b20000 irq 149");
+        // Label falls back to the kernel-supplied chip name (this
+        // catalogue has no codec overlay for 0x10ec0235; the
+        // fixture's per-card-name table doesn't carry PCH either).
+        // Precedence: codec overlay (miss) → kernel chip_name (hit).
+        // Synthetic fixture has no codec overlay for 0x10ec0235;
+        // precedence resolves to the kernel-supplied chip name.
+        assert_eq!(out.label, "Realtek ALC233");
         assert_eq!(out.catalog_provenance, CatalogProvenance::Unmapped);
+    }
+
+    #[test]
+    fn shipped_catalog_codec_overlay_relabels_hda_card_with_brand_name() {
+        // STAGE 2 REGRESSION PIN: against the SHIPPED catalogue
+        // (not the synthetic fixture), an HDA card whose kernel
+        // card_name is NOT in the per-card-name table AND whose
+        // codec vendor_id IS in the `[[hda_codecs]]` overlay
+        // surfaces with the catalogue's brand-name label. This is
+        // the operator-facing value the codec-overlay widening
+        // delivers for hosts the per-card-name catalogue does not
+        // cover.
+        //
+        // Note: when both tables match (per-card-name AND codec
+        // overlay), per-card-name wins — the existing subdevice
+        // pretty_names ("Analog Out", "HDMI") carry operator-
+        // meaningful subdevice-level information that codec-id-
+        // keyed branding cannot. The two layers are complementary.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 1: FutureAudio [FutureAudio Custom Mainboard], device 0: ALC233 Analog [ALC233 Analog]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 1,
+            short_id: "FutureAudio".into(),
+            long_name: "FutureAudio Custom Mainboard at 0xabcdef".into(),
+            driver: "HDA-Intel".into(),
+            kind: crate::kernel_introspection::CardKind::Hda,
+            codecs: vec![crate::kernel_introspection::CodecIdentity {
+                address: 0,
+                chip_name: "Realtek ALC233".into(),
+                vendor_id: 0x10ec0235,
+                subsystem_id: 0x12345678,
+                is_hdmi: false,
+            }],
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        // OutputClass remains Analog (Stage 1 invariant unchanged).
+        assert_eq!(out.output_class, OutputClass::Analog);
+        // Stage 2 win: label = catalogue overlay brand name from
+        // the [[hda_codecs]] table — precedence applies because
+        // the per-card-name table does NOT carry "FutureAudio
+        // Custom Mainboard".
+        assert_eq!(out.label, "Realtek ALC233");
+    }
+
+    #[test]
+    fn shipped_catalog_codec_overlay_miss_falls_back_to_kernel_chip_name() {
+        // Precedence pin: when the codec's vendor_id is NOT in the
+        // overlay (Stage 2's initial dataset is intentionally
+        // bounded — operator may encounter codecs not yet
+        // catalogued), the label falls back to the kernel-supplied
+        // chip_name. The kernel name is already operator-readable;
+        // catalogue widening grows label quality without breaking
+        // anything.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 5: Future [Mystery Audio], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 5,
+            short_id: "Future".into(),
+            long_name: "Mystery Audio at 0xdeadbeef".into(),
+            driver: "HDA-Intel".into(),
+            kind: crate::kernel_introspection::CardKind::Hda,
+            codecs: vec![crate::kernel_introspection::CodecIdentity {
+                address: 0,
+                chip_name: "FutureCorp FC9999".into(),
+                vendor_id: 0xdeadbeef, // not in any catalogue overlay
+                subsystem_id: 0x00000000,
+                is_hdmi: false,
+            }],
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        // Precedence: codec overlay (miss) → kernel chip_name (hit).
+        assert_eq!(out.label, "FutureCorp FC9999");
+        // Classification unchanged — Stage 1 path intact.
+        assert_eq!(out.output_class, OutputClass::Analog);
+    }
+
+    #[test]
+    fn shipped_catalog_codec_overlay_skipped_when_no_codecs() {
+        // I²S DAC: kernel introspection produces a CardIdentity
+        // with empty codec list. Codec overlay path is skipped;
+        // precedence collapses to kernel long_name → aplay
+        // card_name. Catalogue widening does NOT regress the I²S
+        // path.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 3: SynthDAC [Synth I2S DAC], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 3,
+            short_id: "SynthDAC".into(),
+            long_name: "Synth I2S DAC".into(),
+            driver: "synth_i2s_dac".into(),
+            kind: crate::kernel_introspection::CardKind::I2s,
+            codecs: Vec::new(), // No codec — I²S DAC
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        assert_eq!(out.label, "Synth I2S DAC");
+        assert_eq!(out.output_class, OutputClass::I2s);
     }
 }

@@ -488,3 +488,173 @@ pretty_name = "Xonar Headphone/ Analog out"
 [[cards.devices]]
 index = 2
 pretty_name = "Xonar S/DIF (optical) out"
+
+# ============================================================
+# HDA codec overlay — operator-friendly chip family labels for
+# Intel HD-Audio codecs encountered on x86_64 / amd64 hosts.
+#
+# Keyed by 32-bit `vendor_id` (as read from
+# /proc/asound/cardN/codec#N's `Vendor Id:` field). The kernel
+# reports a chip family string on the `Codec:` line for every
+# entry below; the catalog rebrands or augments where a more
+# operator-meaningful label exists. Catalog miss → kernel chip
+# name surfaces as the fallback label (no silent loss).
+#
+# Initial dataset focuses on codec variants common on recent
+# x86 / amd64 mainboards (mainstream + workstation vintage).
+# Coverage widens by extending this section — the lookup
+# infrastructure is fixed; only the data table grows.
+
+# --- Realtek ALC family (most prevalent on consumer x86) ---
+
+[[hda_codecs]]
+codec_id = "10ec0221"
+pretty_name = "Realtek ALC221"
+
+[[hda_codecs]]
+codec_id = "10ec0233"
+pretty_name = "Realtek ALC233"
+
+[[hda_codecs]]
+codec_id = "10ec0235"
+pretty_name = "Realtek ALC233"
+
+[[hda_codecs]]
+codec_id = "10ec0236"
+pretty_name = "Realtek ALC236"
+
+[[hda_codecs]]
+codec_id = "10ec0255"
+pretty_name = "Realtek ALC255"
+
+[[hda_codecs]]
+codec_id = "10ec0256"
+pretty_name = "Realtek ALC256"
+
+[[hda_codecs]]
+codec_id = "10ec0257"
+pretty_name = "Realtek ALC257"
+
+[[hda_codecs]]
+codec_id = "10ec0269"
+pretty_name = "Realtek ALC269"
+
+[[hda_codecs]]
+codec_id = "10ec0282"
+pretty_name = "Realtek ALC282"
+
+[[hda_codecs]]
+codec_id = "10ec0285"
+pretty_name = "Realtek ALC285"
+
+[[hda_codecs]]
+codec_id = "10ec0287"
+pretty_name = "Realtek ALC287"
+
+[[hda_codecs]]
+codec_id = "10ec0289"
+pretty_name = "Realtek ALC289"
+
+[[hda_codecs]]
+codec_id = "10ec0295"
+pretty_name = "Realtek ALC295"
+
+[[hda_codecs]]
+codec_id = "10ec0298"
+pretty_name = "Realtek ALC298"
+
+[[hda_codecs]]
+codec_id = "10ec0662"
+pretty_name = "Realtek ALC662"
+
+[[hda_codecs]]
+codec_id = "10ec0668"
+pretty_name = "Realtek ALC668"
+
+[[hda_codecs]]
+codec_id = "10ec0892"
+pretty_name = "Realtek ALC892"
+
+[[hda_codecs]]
+codec_id = "10ec0897"
+pretty_name = "Realtek ALC897"
+
+[[hda_codecs]]
+codec_id = "10ec0899"
+pretty_name = "Realtek ALC899"
+
+[[hda_codecs]]
+codec_id = "10ec1220"
+pretty_name = "Realtek ALC1220"
+
+[[hda_codecs]]
+codec_id = "10ec1304"
+pretty_name = "Realtek ALC1304"
+
+[[hda_codecs]]
+codec_id = "10ec4080"
+pretty_name = "Realtek ALC4080"
+
+# --- Conexant / Cirrus / IDT (workstation + business laptops) ---
+
+[[hda_codecs]]
+codec_id = "14f12008"
+pretty_name = "Conexant CX20751"
+
+[[hda_codecs]]
+codec_id = "14f1506e"
+pretty_name = "Conexant CX8200"
+
+[[hda_codecs]]
+codec_id = "10134208"
+pretty_name = "Cirrus CS4208"
+
+[[hda_codecs]]
+codec_id = "1013420b"
+pretty_name = "Cirrus CS4210"
+
+[[hda_codecs]]
+codec_id = "111d76d1"
+pretty_name = "IDT 92HD90BXX"
+
+[[hda_codecs]]
+codec_id = "111d76e0"
+pretty_name = "IDT 92HD91BXX"
+
+# --- Intel / NVIDIA / AMD HDMI codecs (display-side audio) ---
+# These accompany the analog codec on the same HDA controller.
+# Operator UI typically routes around them; the brand label
+# helps diagnostic output even when the chip is not directly
+# selectable.
+
+[[hda_codecs]]
+codec_id = "8086280b"
+pretty_name = "Intel Kabylake HDMI"
+
+[[hda_codecs]]
+codec_id = "8086280c"
+pretty_name = "Intel Cannonlake HDMI"
+
+[[hda_codecs]]
+codec_id = "8086280d"
+pretty_name = "Intel Geminilake HDMI"
+
+[[hda_codecs]]
+codec_id = "8086280f"
+pretty_name = "Intel Icelake HDMI"
+
+[[hda_codecs]]
+codec_id = "80862812"
+pretty_name = "Intel Tigerlake HDMI"
+
+[[hda_codecs]]
+codec_id = "80862814"
+pretty_name = "Intel Alderlake HDMI"
+
+[[hda_codecs]]
+codec_id = "10de0094"
+pretty_name = "NVIDIA HDMI Audio"
+
+[[hda_codecs]]
+codec_id = "1002aa01"
+pretty_name = "AMD/ATI HDMI Audio"
