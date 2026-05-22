@@ -16,7 +16,37 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer};
 
-use crate::evo_catalog::{BoardProfile, DacEntry, EvoCatalog};
+use crate::evo_catalog::{BoardProfile, DacEntry, EvoCatalog, Interface};
+
+/// Build-time mapping from Volumio DAC ids to their declared
+/// `interface` value. Every catalogue row MUST declare an
+/// interface; Volumio's source carries no equivalent field, so the
+/// importer assigns one per id. Default for any id not listed
+/// below is `Interface::I2s` — the overwhelming majority of
+/// HAT DACs reach the SoC over the I2S bus. The exceptions
+/// listed below are SPDIF transmitters (no DAC; the HAT emits
+/// the bitstream to an external receiver) and analog-only HATs
+/// (codecs / amplifiers that do not present an I2S DAC).
+/// Update this table when adding a Volumio row that is not
+/// I2S; the regression-guard test forces an importer-output
+/// rebuild on every change so any drift surfaces immediately.
+const NON_I2S_VOLUMIO_IDS: &[(&str, Interface)] = &[
+    ("allo-digione", Interface::Spdif),
+    ("hifiberry-digi", Interface::Spdif),
+    ("hifiberry-digi-pro", Interface::Spdif),
+    ("interludeaudio-digital", Interface::Spdif),
+    ("interludeaudio-analog", Interface::Analog),
+    ("iqaudio-digiplus", Interface::Spdif),
+    ("justboom-digi", Interface::Spdif),
+];
+
+fn interface_for_volumio_id(id: &str) -> Interface {
+    NON_I2S_VOLUMIO_IDS
+        .iter()
+        .find(|(known_id, _)| *known_id == id)
+        .map(|(_, iface)| *iface)
+        .unwrap_or(Interface::I2s)
+}
 
 /// Generator timestamp used for every importer run. Constant so the
 /// importer's output is byte-equal-deterministic — the checked-in
@@ -131,7 +161,9 @@ fn convert_row(
             .collect()
     };
     let provenance = format!("volumio:dacs.json#{}", row.id);
+    let interface = interface_for_volumio_id(&row.id);
     DacEntry {
+        interface,
         id: row.id,
         display_name: row.name,
         overlay: row.overlay,

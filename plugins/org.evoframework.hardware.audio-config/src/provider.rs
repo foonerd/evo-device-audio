@@ -95,6 +95,15 @@ pub struct ActiveConfig {
     /// The catalogue `mixer` hint for the resolved entry, or None.
     /// playback.mpd uses this to bind the in-DAC mixer control.
     pub mixer_hint: Option<String>,
+    /// The catalogue's declared `interface` for the resolved entry,
+    /// or None when no catalogue entry matches. Carried on the
+    /// published `evo.hardware.audio:active_config` subject so
+    /// delivery.alsa's output-class derivation reads the
+    /// authoritative classification declared by the catalogue
+    /// directly — never re-inferred from card-name string
+    /// heuristics at the join site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<crate::evo_catalog::Interface>,
     /// The boot-config path the active overlay was read from
     /// (`/boot/firmware/config.txt` or `/boot/config.txt`). Empty
     /// on board classes without a boot-config path.
@@ -113,6 +122,7 @@ impl ActiveConfig {
             display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
+            interface: None,
             boot_config_path: boot_config_path.into(),
         }
     }
@@ -434,6 +444,7 @@ mod tests {
     async fn noop_provider_apply_returns_not_applicable() {
         let p = NoopProvider::default();
         let entry = DacEntry {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "x".into(),
             display_name: "Y".into(),
             overlay: "hifiberry-dac".into(),

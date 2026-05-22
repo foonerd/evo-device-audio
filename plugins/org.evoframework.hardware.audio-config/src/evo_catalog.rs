@@ -113,11 +113,47 @@ pub struct BoardProfile {
     pub dacs: Vec<DacEntry>,
 }
 
+/// Bus topology by which the DAC is reached. Declared per-row in
+/// the catalogue; downstream consumers (audio.delivery output-class
+/// derivation, UI Destination chips) classify directly from this
+/// value. No default — every row MUST declare; the loader rejects
+/// rows omitting it. Silent inference at downstream join sites is
+/// forbidden.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Interface {
+    /// I2S bus — HAT DACs on Raspberry Pi-class boards reach the SoC
+    /// over the I2S pins. The majority of the catalogue.
+    I2s,
+    /// USB audio interface — DACs reached over a USB Audio Class
+    /// endpoint. Catalogued for completeness; the reference Pi
+    /// catalogue currently lists none.
+    Usb,
+    /// S/PDIF transmitter — optical or coaxial digital output. The
+    /// HAT itself contains no DAC; it transmits the bitstream to an
+    /// external receiver.
+    Spdif,
+    /// HDMI audio output — multichannel digital audio over HDMI.
+    Hdmi,
+    /// Analog line / amplifier output. Catalogued for HATs whose
+    /// purpose is analog conditioning (codecs, ADC+DAC combinations,
+    /// integrated amplifiers) rather than I2S DAC duties.
+    Analog,
+    /// Bluetooth A2DP / equivalent wireless link.
+    Bluetooth,
+}
+
 /// One DAC entry. Evo-native shape — field names translated from
 /// the Volumio source at import time so the runtime surface speaks
 /// the framework's vocabulary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DacEntry {
+    /// Bus topology by which this DAC is reached. The authoritative
+    /// downstream classification — delivery.alsa's output-class
+    /// derivation reads this directly; UI Destination chips render
+    /// off the declared value. Required: no default, no inference.
+    /// The loader rejects rows that omit `interface`.
+    pub interface: Interface,
     /// Catalog id (e.g. `hifiberry-dacplus`). Operator gestures
     /// reference entries by this id.
     pub id: String,
@@ -305,5 +341,76 @@ mod tests {
             .find_dac("Raspberry PI", "hifiberry-dacplus")
             .expect("entry");
         assert_eq!(entry.provenance, "volumio:dacs.json#hifiberry-dacplus");
+    }
+
+    #[test]
+    fn loader_refuses_row_omitting_interface() {
+        // Contract pin: every catalogue DAC row MUST declare an
+        // `interface` value (schema `interface-declared-per-dac`).
+        // A row that omits the field MUST fail to parse — no
+        // default, no silent inference. This is the structural
+        // safeguard against the regression in which delivery.alsa's
+        // output-class derivation fell back to card-name string
+        // heuristics and classified the operator's selected DAC as
+        // "Other" because no path carried the bus topology.
+        let raw = r#"
+schema_version = 1
+[[boards]]
+name = "Raspberry PI"
+provider = "pi"
+[[boards.dacs]]
+id = "missing-interface"
+display_name = "No Interface DAC"
+overlay = "x"
+alsa_card_hint = "x"
+needs_reboot_on_apply = false
+advanced_settings_enabled = true
+dsp_options = []
+provenance = "test"
+"#;
+        let err = parse_evo_catalog(raw)
+            .expect_err("loader must refuse a DAC row that omits `interface`");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_ascii_lowercase().contains("interface"),
+            "rejection diagnostic must name the missing field: {msg}",
+        );
+    }
+
+    #[test]
+    fn every_shipped_dac_row_declares_an_interface() {
+        // Contract pin: the embedded catalogue carries an
+        // `interface` value for every row. This test reads the
+        // catalogue as parsed (interface is a required field on
+        // the DacEntry struct, so its presence here is implied
+        // by successful parsing) and reasserts the value-domain
+        // discipline.
+        let cat = parse_evo_catalog(EMBEDDED_CATALOG).expect("parse");
+        for board in &cat.boards {
+            for dac in &board.dacs {
+                // The interface field is an enum, so any value is
+                // already constrained at parse time. This loop
+                // exists to surface a future drift in shape: if
+                // someone widens the catalogue with a row missing
+                // `interface`, parse_evo_catalog fails before this
+                // loop runs (covered by the previous test).
+                let _ = dac.interface;
+            }
+        }
+        // Sanity: a representative i2s row declares i2s.
+        let i2s_row = cat
+            .find_dac("Raspberry PI", "audiophonics-es9028q2m-dac")
+            .expect("representative i2s row present in catalogue");
+        assert_eq!(i2s_row.interface, Interface::I2s);
+        // Sanity: a representative spdif row declares spdif.
+        let spdif_row = cat
+            .find_dac("Raspberry PI", "hifiberry-digi")
+            .expect("representative spdif row present in catalogue");
+        assert_eq!(spdif_row.interface, Interface::Spdif);
+        // Sanity: a representative analog row declares analog.
+        let analog_row = cat
+            .find_dac("Raspberry PI", "interludeaudio-analog")
+            .expect("representative analog row present in catalogue");
+        assert_eq!(analog_row.interface, Interface::Analog);
     }
 }

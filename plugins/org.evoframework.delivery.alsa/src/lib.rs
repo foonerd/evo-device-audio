@@ -308,6 +308,16 @@ pub struct ActiveDacConfig {
     /// then constrains the chain (`software` or `none`).
     #[serde(default)]
     pub mixer_hint: Option<String>,
+    /// Bus topology declared by the hardware.audio-config catalogue
+    /// row for the active DAC. None when no catalogue entry matched
+    /// the on-disk overlay (the operator wrote a custom overlay, or
+    /// the catalogue has changed). Consumed by output-class
+    /// derivation as the authoritative classification — when
+    /// present, the row's `output_class` is set directly from
+    /// this declared value with no fallback to card-name string
+    /// heuristics.
+    #[serde(default)]
+    pub interface: Option<String>,
     /// Boot-config path the active overlay was read from. Empty
     /// on board classes without a boot-config path.
     #[serde(default)]
@@ -2401,6 +2411,7 @@ pcm.evo {
                 display_name: Some("HiFiBerry DAC+".into()),
                 alsacard_hint: Some("sndrpihifiberry".into()),
                 mixer_hint: Some("Digital".into()),
+                interface: Some("i2s".into()),
                 boot_config_path: "/boot/firmware/config.txt".into(),
             });
         }

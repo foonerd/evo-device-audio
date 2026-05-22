@@ -228,6 +228,41 @@ fn enrich_from_active_dac_config(
             }
         }
     }
+    // Output class: set from the hardware.audio-config catalogue's
+    // declared `interface` value when the active-DAC join
+    // identifies this row. The catalogue is the authoritative
+    // source — every DAC row declares its bus topology per the
+    // schema's `interface-declared-per-dac` acceptance contract,
+    // and the loader rejects rows omitting it. The declared value
+    // overrides any prior derivation: a card whose kernel name
+    // contains no class-marker keyword cannot be classified by
+    // string heuristics, yet the active-DAC join carries the
+    // catalogue's exact answer. When the active-DAC join does not
+    // match this row (different card), the prior derivation stands
+    // and the keyword path remains authoritative for outputs the
+    // catalogue does not know about (HDMI, USB, integrated codecs).
+    if let Some(iface) = active.interface.as_deref() {
+        if let Some(declared) = parse_output_class(iface) {
+            resolved.output_class = declared;
+        }
+    }
+}
+
+/// Parse the catalogue's declared `interface` string into the
+/// finer-grained [`OutputClass`]. Returns `None` when the string
+/// is not a recognised variant — caller leaves the resolved
+/// row's existing `output_class` untouched in that case (logged
+/// upstream by the subject deserialiser when it surfaces).
+fn parse_output_class(raw: &str) -> Option<OutputClass> {
+    match raw {
+        "i2s" => Some(OutputClass::I2s),
+        "usb" => Some(OutputClass::Usb),
+        "spdif" => Some(OutputClass::Spdif),
+        "hdmi" => Some(OutputClass::Hdmi),
+        "analog" => Some(OutputClass::Analog),
+        "bluetooth" => Some(OutputClass::Bluetooth),
+        _ => None,
+    }
 }
 
 async fn run_aplay_l_lowercase() -> Result<String, OutputEnumerationError> {
@@ -622,6 +657,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             display_name: Some(display_name.into()),
             alsacard_hint: Some(alsacard_hint.into()),
             mixer_hint: Some(mixer_hint.into()),
+            interface: Some("i2s".into()),
             boot_config_path: "/boot/config.txt".into(),
         }
     }
@@ -705,11 +741,123 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             display_name: None,
             alsacard_hint: Some("DAC".into()),
             mixer_hint: None,
+            interface: None,
             boot_config_path: String::new(),
         };
         let outputs = resolve(raw, &cat, Some(&active));
         let out = &outputs[0];
         assert_eq!(out.label, "Foo");
         assert!(out.default_mixer_control.is_none());
+    }
+
+    #[test]
+    fn declared_interface_sets_output_class_on_unmapped_row() {
+        // Regression pin. The hardware.audio-config catalogue
+        // declares each DAC row's bus topology via the `interface`
+        // field; downstream the active_config subject carries the
+        // resolved row's declared value to delivery.alsa as
+        // `ActiveDacConfig.interface`. The delivery-side
+        // `enrich_from_active_dac_config` MUST set the resolved
+        // row's output_class from that declared value when the
+        // active-DAC join identifies this row, even when the
+        // alsa-cards catalogue does NOT carry the kernel card
+        // name verbatim. Without this declarative path, unmapped-
+        // card rows fall through `derive_output_class`'s keyword
+        // scan — and a card whose kernel name contains no class-
+        // marker keyword is classified as Unknown and renders as
+        // "Other" in the operator UI even though the framework
+        // knows the precise DAC and its bus topology.
+        let cat = fixture_catalog();
+        // Kernel card name with no class-marker keyword. The
+        // alsa-cards catalogue fixture does not contain this name
+        // (Unmapped). active_dac is provided with
+        // `interface = "i2s"` declared.
+        let raw = "card 3: SynthDAC [SynthDAC], device 0: foo [bar]\n";
+        let active = ActiveDacConfig {
+            overlay: "synth-overlay".into(),
+            catalogue_id: Some("synth-dac".into()),
+            display_name: Some("Synthetic DAC".into()),
+            alsacard_hint: Some("SynthDAC".into()),
+            mixer_hint: Some("Digital".into()),
+            interface: Some("i2s".into()),
+            boot_config_path: "/boot/firmware/config.txt".into(),
+        };
+        let outputs = resolve(raw, &cat, Some(&active));
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(
+            out.output_class,
+            OutputClass::I2s,
+            "declared catalogue interface MUST set output_class \
+             on an unmapped row; the operator UI relies on this \
+             classification to render Destination chips",
+        );
+        // The active-DAC label enrichment still applies — the
+        // declarative interface fix doesn't regress label
+        // promotion.
+        assert_eq!(out.label, "Synthetic DAC");
+        assert_eq!(out.default_mixer_control.as_deref(), Some("Digital"));
+    }
+
+    #[test]
+    fn declared_interface_overrides_keyword_derivation() {
+        // Symmetric pin: even when the catalogue row carries a
+        // type_hint that would otherwise derive a non-I2S class,
+        // an active-DAC declared interface for the SAME card wins.
+        // The catalogue is the authoritative classification source
+        // when present.
+        let cat = fixture_catalog();
+        // Use a card the fixture catalogue maps to I2s via its
+        // type_hint; declare the active DAC as spdif. The result
+        // must be spdif (the declared value), not i2s (the
+        // catalogue type_hint).
+        let raw = "card 0: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: x [y]\n";
+        let active = ActiveDacConfig {
+            overlay: "hifiberry-digi".into(),
+            catalogue_id: Some("hifiberry-digi".into()),
+            display_name: Some("HiFiBerry Digi".into()),
+            alsacard_hint: Some("sndrpihifiberry".into()),
+            mixer_hint: None,
+            interface: Some("spdif".into()),
+            boot_config_path: "/boot/firmware/config.txt".into(),
+        };
+        let outputs = resolve(raw, &cat, Some(&active));
+        let out = &outputs[0];
+        assert_eq!(
+            out.output_class,
+            OutputClass::Spdif,
+            "active-DAC declared interface MUST override the \
+             alsa-cards catalogue's coarser type_hint — the \
+             hardware.audio-config catalogue is the authoritative \
+             source for the active row's classification",
+        );
+    }
+
+    #[test]
+    fn unknown_active_interface_string_leaves_prior_class_intact() {
+        // Hardening pin: when the active-DAC subject carries an
+        // unrecognised interface string (forward-compat with a
+        // newer catalogue declaring a value this build does not
+        // know), the prior derivation stands — the row does NOT
+        // collapse to Unknown. Forward-compat: a vendor adding
+        // `interface = "spdif_optical"` later does not silently
+        // unclassify every existing row's output_class.
+        let cat = fixture_catalog();
+        let raw = "card 0: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: x [y]\n";
+        let active = ActiveDacConfig {
+            overlay: "hifiberry-dacplus".into(),
+            catalogue_id: Some("hifiberry-dacplus".into()),
+            display_name: Some("HiFiBerry DAC+".into()),
+            alsacard_hint: Some("sndrpihifiberry".into()),
+            mixer_hint: Some("Digital".into()),
+            interface: Some("spdif_optical".into()),
+            boot_config_path: "/boot/firmware/config.txt".into(),
+        };
+        let outputs = resolve(raw, &cat, Some(&active));
+        let out = &outputs[0];
+        // The alsa-cards catalogue's type_hint = i2s for this
+        // kernel card name; the unknown interface string leaves
+        // that prior derivation alone.
+        assert_eq!(out.output_class, OutputClass::I2s);
     }
 }

@@ -361,6 +361,7 @@ impl HardwareAudioConfigPlugin {
                     } else {
                         Some(entry.in_card_mixer)
                     };
+                    cfg.interface = Some(entry.interface);
                     break;
                 }
             }
@@ -1892,6 +1893,7 @@ mod tests {
             display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
+            interface: None,
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
         let enriched = p.enrich_active_config(cfg);
@@ -1916,6 +1918,7 @@ mod tests {
             display_name: None,
             alsacard_hint: None,
             mixer_hint: None,
+            interface: None,
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
         let enriched = p.enrich_active_config(cfg.clone());
@@ -2308,6 +2311,7 @@ mod tests {
                         "id": "test",
                         "display_name": "Test",
                         "board_profile": "Raspberry PI",
+                        "interface": "i2s",
                         "overlay": "test-overlay",
                         "dtbo_sha256_hex": "00".repeat(32),
                     },
@@ -2343,6 +2347,7 @@ mod tests {
                         "id": "test",
                         "display_name": "Test",
                         "board_profile": "Raspberry PI",
+                        "interface": "i2s",
                         "overlay": "test-overlay",
                         "dtbo_sha256_hex": "00".repeat(32),
                     },
@@ -2377,6 +2382,7 @@ mod tests {
                         "id": "test",
                         "display_name": "Test",
                         "board_profile": "Raspberry PI",
+                        "interface": "i2s",
                         "overlay": "test-overlay",
                         "dtbo_sha256_hex": hash,
                     },
@@ -2414,6 +2420,7 @@ mod tests {
                         "id": "test",
                         "display_name": "Test",
                         "board_profile": "Raspberry PI",
+                        "interface": "i2s",
                         "overlay": "test-overlay",
                         "dtbo_sha256_hex": wrong_hash,
                     },

@@ -347,6 +347,7 @@ impl HardwareAudioProvider for RockchipProvider {
                         display_name: None,
                         alsacard_hint: None,
                         mixer_hint: None,
+                        interface: None,
                         boot_config_path: self.hw_intf_path.clone(),
                     });
                 }
@@ -359,6 +360,7 @@ impl HardwareAudioProvider for RockchipProvider {
                 display_name: None,
                 alsacard_hint: None,
                 mixer_hint: None,
+                interface: None,
                 boot_config_path: self.hw_intf_path.clone(),
             })
         })
@@ -623,6 +625,7 @@ mod tests {
     async fn rockchip_provider_apply_then_clear_round_trips_in_memory() {
         let provider = RockchipProvider::for_tests("intf:i2c=on\n");
         let entry = DacEntry {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "allo-piano-dac".into(),
             display_name: "Allo Piano DAC".into(),
             overlay: "allo-piano-dac".into(),
@@ -657,6 +660,7 @@ mod tests {
     async fn rockchip_provider_apply_rejects_empty_catalogue_overlay() {
         let provider = RockchipProvider::for_tests("");
         let entry = DacEntry {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "module-only".into(),
             display_name: "Module-only DAC".into(),
             overlay: String::new(),

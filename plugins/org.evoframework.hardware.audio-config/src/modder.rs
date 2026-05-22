@@ -129,6 +129,13 @@ pub struct UserOverlayRow {
     pub display_name: String,
     /// Board profile this row attaches to (e.g. "Raspberry PI").
     pub board_profile: String,
+    /// Bus topology by which this user-overlay DAC is reached.
+    /// Required: the operator declares it when registering the
+    /// overlay. Downstream consumers (delivery.alsa output-class
+    /// derivation, UI Destination chips) classify directly from
+    /// this declared value; the framework never re-infers from
+    /// card-name string heuristics at the join site.
+    pub interface: crate::evo_catalog::Interface,
     /// dtoverlay token written into the managed block on
     /// `select_dac`. Must be non-empty.
     pub overlay: String,
@@ -393,6 +400,7 @@ pub fn merge_user_overlay_into_catalog(
 
 fn user_overlay_to_dac_entry(row: &UserOverlayRow) -> DacEntry {
     DacEntry {
+        interface: row.interface,
         id: row.id.clone(),
         display_name: row.display_name.clone(),
         overlay: row.overlay.clone(),
@@ -812,6 +820,7 @@ mod tests {
     fn merge_appends_new_row_into_existing_profile() {
         let base = parse_evo_catalog(EMBEDDED_CATALOG).expect("parse");
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "my-custom-dac".into(),
             display_name: "My Custom DAC".into(),
             board_profile: "Raspberry PI".into(),
@@ -836,6 +845,7 @@ mod tests {
     fn merge_refuses_collision_without_override() {
         let base = parse_evo_catalog(EMBEDDED_CATALOG).expect("parse");
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "hifiberry-dacplus".into(), // Collides with base
             display_name: "Replacement".into(),
             board_profile: "Raspberry PI".into(),
@@ -856,6 +866,7 @@ mod tests {
         // hifiberry-dacplus has advanced_settings_enabled = true,
         // so override = true succeeds.
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "hifiberry-dacplus".into(),
             display_name: "Custom replacement".into(),
             board_profile: "Raspberry PI".into(),
@@ -884,6 +895,7 @@ schema_version = 1
 name = "Raspberry PI"
 provider = "pi"
 [[boards.dacs]]
+interface = "i2s"
 id = "vendor-locked"
 display_name = "Vendor-locked DAC"
 overlay = "vendor-overlay"
@@ -895,6 +907,7 @@ provenance = "vendor"
 "#;
         let base = parse_evo_catalog(base_toml).expect("parse");
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "vendor-locked".into(),
             display_name: "Trying to override".into(),
             board_profile: "Raspberry PI".into(),
@@ -921,6 +934,7 @@ provenance = "vendor"
     fn merge_refuses_unknown_board_profile() {
         let base = parse_evo_catalog(EMBEDDED_CATALOG).expect("parse");
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "x".into(),
             display_name: "X".into(),
             board_profile: "Unknown SBC".into(),
@@ -1052,6 +1066,7 @@ provenance = "vendor"
         let blob = b"dtbo bytes".to_vec();
         let hash = compute_dtbo_hash(&blob);
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "my-custom".into(),
             display_name: "My Custom".into(),
             board_profile: "Raspberry PI".into(),
@@ -1092,6 +1107,7 @@ provenance = "vendor"
         // actual DTBO contents.
         let blob = b"actual bytes";
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "bad-row".into(),
             display_name: "Bad Row".into(),
             board_profile: "Raspberry PI".into(),
@@ -1124,6 +1140,7 @@ provenance = "vendor"
         let blob = b"some bytes";
         let hash = compute_dtbo_hash(blob);
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "row".into(),
             display_name: "Row".into(),
             board_profile: "Raspberry PI".into(),
@@ -1148,6 +1165,7 @@ provenance = "vendor"
         let blob = b"bytes";
         let hash = compute_dtbo_hash(blob);
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "row".into(),
             display_name: "Row".into(),
             board_profile: "Raspberry PI".into(),
@@ -1179,6 +1197,7 @@ provenance = "vendor"
         // Persist + remove + remove again all succeed.
         let blob = b"bytes";
         let row = UserOverlayRow {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "to-remove".into(),
             display_name: "X".into(),
             board_profile: "Raspberry PI".into(),

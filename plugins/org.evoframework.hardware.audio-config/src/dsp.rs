@@ -881,6 +881,7 @@ schema_version = 1
 name = "Test Board"
 provider = "noop"
 [[boards.dacs]]
+interface = "i2s"
 id = "test-dac"
 display_name = "Test DAC"
 overlay = "test"
@@ -939,6 +940,7 @@ schema_version = 1
 name = "Test Board"
 provider = "noop"
 [[boards.dacs]]
+interface = "i2s"
 id = "test-dac"
 display_name = "Test DAC"
 overlay = ""
@@ -982,6 +984,7 @@ schema_version = 1
 name = "Test Board"
 provider = "noop"
 [[boards.dacs]]
+interface = "i2s"
 id = "locked-dac"
 display_name = "Vendor-Locked DAC"
 overlay = "vendor"
@@ -1013,6 +1016,7 @@ schema_version = 1
 name = "Test Board"
 provider = "noop"
 [[boards.dacs]]
+interface = "i2s"
 id = "test-dac"
 display_name = "Test DAC"
 overlay = "x"
@@ -1078,6 +1082,7 @@ schema_version = 1
 name = "Test Board"
 provider = "noop"
 [[boards.dacs]]
+interface = "i2s"
 id = "test-dac-fir"
 display_name = "Test DAC (FIR)"
 overlay = "x"

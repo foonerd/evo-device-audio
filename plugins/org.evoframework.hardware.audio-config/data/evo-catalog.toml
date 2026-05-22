@@ -10,6 +10,7 @@ name = "Raspberry PI"
 provider = "pi"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "adafruit-max98357"
 display_name = "Adafruit MAX98357"
 overlay = "max98357a"
@@ -26,6 +27,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#adafruit-max98357"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "adafruit-uda1334a"
 display_name = "Adafruit UDA1334A"
 overlay = "hifiberry-dac,i2s-mmap"
@@ -42,6 +44,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#adafruit-uda1334a"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "allo-boss-dac"
 display_name = "Allo BOSS"
 overlay = "allo-boss-dac-pcm512x-audio"
@@ -58,6 +61,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#allo-boss-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "allo-boss-dac-pi5"
 display_name = "Allo BOSS [Pi5]"
 overlay = "allo-boss-dac-pcm512x-audio,slave"
@@ -74,6 +78,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#allo-boss-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "allo-boss2-dac"
 display_name = "Allo BOSS2"
 overlay = "allo-boss2-dac-audio"
@@ -90,6 +95,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#allo-boss2-dac"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "allo-digione"
 display_name = "Allo DigiOne"
 overlay = "allo-digione"
@@ -106,6 +112,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#allo-digione"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "allo-katana-dac"
 display_name = "Allo Katana"
 overlay = "allo-katana-dac-audio"
@@ -126,6 +133,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#allo-katana-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audio-injector-stereo"
 display_name = "AudioInjector Stereo"
 overlay = "audioinjector-wm8731-audio"
@@ -142,6 +150,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audio-injector-stereo"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audio-injector-bare"
 display_name = "AudioInjector bare I2S"
 overlay = "audioinjector-bare-i2s"
@@ -158,6 +167,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audio-injector-bare"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audio-injector-isolated"
 display_name = "AudioInjector Isolated"
 overlay = "audioinjector-isolated-soundcard"
@@ -174,6 +184,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audio-injector-isolated"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audio-injector-pro"
 display_name = "AudioInjector Pro"
 overlay = "audioinjector-isolated-soundcard"
@@ -190,6 +201,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audio-injector-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audio-injector-ultra"
 display_name = "AudioInjector Ultra 2"
 overlay = "audioinjector-ultra"
@@ -206,6 +218,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audio-injector-ultra"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "piano-dac"
 display_name = "Allo Piano"
 overlay = "allo-piano-dac-pcm512x-audio"
@@ -222,6 +235,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#piano-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "piano-dac-plus"
 display_name = "Allo Piano 2.1"
 overlay = "allo-piano-dac-plus-pcm512x-audio"
@@ -243,6 +257,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#piano-dac-plus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "applepi-dac"
 display_name = "ApplePi DAC"
 overlay = "applepi-dac"
@@ -259,6 +274,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#applepi-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "audiophonics-es9028q2m-dac"
 display_name = "Audiophonics I-Sabre ES9028Q2M"
 overlay = "i-sabre-q2m"
@@ -275,6 +291,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#audiophonics-es9028q2m-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "bassfly"
 display_name = "BassFly-uHAT"
 overlay = "i2s-dac"
@@ -291,6 +308,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#bassfly"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "bassfly-mic"
 display_name = "BassFly-uHAT with I2S Mic"
 overlay = "googlevoicehat-soundcard"
@@ -307,6 +325,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#bassfly-mic"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "bassmantis"
 display_name = "BassMantis-uHAT"
 overlay = "i2s-dac"
@@ -323,6 +342,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#bassmantis"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "bassmantis-mic"
 display_name = "BassMantis-uHAT with I2S Mic"
 overlay = "googlevoicehat-soundcard"
@@ -339,6 +359,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#bassmantis-mic"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "bassowl"
 display_name = "BassOwl-HAT"
 overlay = "i2s-dac"
@@ -355,6 +376,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#bassowl"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "chipdip-master-dac"
 display_name = "ChipDip DAC"
 overlay = "chipdip-dac"
@@ -371,6 +393,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#chipdip-master-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "dionaudio-loco-v2"
 display_name = "Dion Audio Loco V2 DAC-AMP"
 overlay = "dionaudio-loco-v2"
@@ -387,6 +410,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#dionaudio-loco-v2"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "fe-pi-audio"
 display_name = "Fe-Pi Audio"
 overlay = "fe-pi-audio"
@@ -403,6 +427,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#fe-pi-audio"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "generic-dac"
 display_name = "Generic I2S DAC"
 overlay = "hifiberry-dac"
@@ -419,6 +444,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#generic-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "googlevoicehat"
 display_name = "Google voiceHAT"
 overlay = "googlevoicehat-soundcard"
@@ -435,6 +461,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#googlevoicehat"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp"
 display_name = "HiFiBerry Amp"
 overlay = "hifiberry-amp"
@@ -451,6 +478,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp100"
 display_name = "HiFiBerry Amp100"
 overlay = "hifiberry-amp100"
@@ -467,6 +495,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp100"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp100-pi5"
 display_name = "HiFiBerry Amp100 [Pi5]"
 overlay = "hifiberry-amp100,slave"
@@ -483,6 +512,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp100-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp2"
 display_name = "HiFiBerry Amp2"
 overlay = "hifiberry-dacplus"
@@ -499,6 +529,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp2"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp2-pi5"
 display_name = "HiFiBerry Amp2 [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -515,6 +546,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp2-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp3"
 display_name = "HiFiBerry Amp3"
 overlay = "hifiberry-amp3"
@@ -531,6 +563,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp3"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp4"
 display_name = "HiFiBerry Amp4"
 overlay = "hifiberry-dacplus"
@@ -547,6 +580,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp4"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp4-pi5"
 display_name = "HiFiBerry Amp4 [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -563,6 +597,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp4-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp4-pro"
 display_name = "HiFiBerry Amp4 Pro"
 overlay = "hifiberry-amp4pro"
@@ -579,6 +614,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp4-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp4-pro-pi5"
 display_name = "HiFiBerry Amp4 Pro [Pi5]"
 overlay = "hifiberry-amp4pro,slave"
@@ -595,6 +631,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp4-pro-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dac"
 display_name = "HiFiBerry DAC"
 overlay = "hifiberry-dac"
@@ -611,6 +648,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplus"
 display_name = "HiFiBerry DAC Plus"
 overlay = "hifiberry-dacplus"
@@ -630,6 +668,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#hifiberry-dacplus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplus-pi5"
 display_name = "HiFiBerry DAC Plus [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -646,6 +685,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacplus-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplusadc"
 display_name = "HiFiBerry DAC Plus ADC"
 overlay = "hifiberry-dacplusadc"
@@ -662,6 +702,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacplusadc"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacpluspro"
 display_name = "HiFiBerry DAC+ Pro"
 overlay = "hifiberry-dacplus"
@@ -678,6 +719,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacpluspro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacpluspro-pi5"
 display_name = "HiFiBerry DAC+ Pro [Pi5]"
 overlay = "hifiberry-dacplus-pro"
@@ -694,6 +736,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacpluspro-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplusadcpro"
 display_name = "HiFiBerry DAC Plus ADC PRO"
 overlay = "hifiberry-dacplusadcpro"
@@ -710,6 +753,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacplusadcpro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplusadcpro-pi5"
 display_name = "HiFiBerry DAC Plus ADC PRO [Pi5]"
 overlay = "hifiberry-dacplusadcpro,slave"
@@ -726,6 +770,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacplusadcpro-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplusdsp"
 display_name = "HiFiBerry DAC Plus DSP"
 overlay = "hifiberry-dacplusdsp"
@@ -742,6 +787,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dacplusdsp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dac2hd"
 display_name = "HiFiBerry DAC2 HD"
 overlay = "hifiberry-dacplushd"
@@ -758,6 +804,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dac2hd"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dac2pro"
 display_name = "HiFiBerry DAC2 Pro"
 overlay = "hifiberry-dacplus"
@@ -774,6 +821,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dac2pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dac2pro-pi5"
 display_name = "HiFiBerry DAC2 Pro [Pi5]"
 overlay = "hifiberry-dacplus-pro"
@@ -790,6 +838,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dac2pro-pi5"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "hifiberry-digi"
 display_name = "HiFiBerry Digi"
 overlay = "hifiberry-digi"
@@ -806,6 +855,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-digi"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "hifiberry-digi-pro"
 display_name = "HiFiBerry Digi+ Pro"
 overlay = "hifiberry-digi-pro"
@@ -822,6 +872,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-digi-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifibox-dac"
 display_name = "HiFiBox DAC"
 overlay = "hifiberry-dacplus"
@@ -842,6 +893,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifibox-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifibox-dac-pi5"
 display_name = "HiFiBox DAC [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -862,6 +914,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifibox-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "innomaker-dac"
 display_name = "Innomaker Dac"
 overlay = "allo-boss-dac-pcm512x-audio"
@@ -878,6 +931,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#innomaker-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "innomaker-dac-pi5"
 display_name = "Innomaker Dac [Pi5]"
 overlay = "allo-boss-dac-pcm512x-audio,slave"
@@ -894,6 +948,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#innomaker-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "innomaker-dac-pro"
 display_name = "Innomaker Dac Pro"
 overlay = "allo-katana-dac-audio"
@@ -910,6 +965,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#innomaker-dac-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "innomaker-amp"
 display_name = "Innomaker Amp"
 overlay = "hifiberry-amp"
@@ -926,6 +982,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#innomaker-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "innomaker-amp-pro"
 display_name = "Innomaker Amp Pro"
 overlay = "merus-amp"
@@ -942,6 +999,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#innomaker-amp-pro"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "interludeaudio-digital"
 display_name = "Interlude Audio Digital Hat"
 overlay = "interludeaudio-digital"
@@ -958,6 +1016,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#interludeaudio-digital"
 
 [[boards.dacs]]
+interface = "analog"
 id = "interludeaudio-analog"
 display_name = "Interlude Audio Analog Hat"
 overlay = "interludeaudio-analog"
@@ -974,6 +1033,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#interludeaudio-analog"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "iqaudio-dacplus"
 display_name = "IQaudIO DAC Plus"
 overlay = "iqaudio-dacplus,unmute_amp "
@@ -990,6 +1050,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#iqaudio-dacplus"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "iqaudio-digiplus"
 display_name = "IQaudIO Pi-Digi+"
 overlay = "iqaudio-digi-wm8804-audio"
@@ -1006,6 +1067,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#iqaudio-digiplus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "iqaudio-amp"
 display_name = "IQaudIO Pi-DigiAMP+"
 overlay = "iqaudio-dacplus,unmute_amp "
@@ -1022,6 +1084,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#iqaudio-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "justboom-amp"
 display_name = "JustBoom Amp Boards"
 overlay = "justboom-dac"
@@ -1041,6 +1104,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#justboom-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "justboom-dac"
 display_name = "JustBoom DAC Boards"
 overlay = "justboom-dac"
@@ -1063,6 +1127,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#justboom-dac"
 
 [[boards.dacs]]
+interface = "spdif"
 id = "justboom-digi"
 display_name = "JustBoom Digi Boards"
 overlay = "justboom-digi"
@@ -1082,6 +1147,7 @@ dsp_options = ["Tx Source"]
 provenance = "volumio:dacs.json#justboom-digi"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "mamboberry-dac"
 display_name = "Mamboberry LS DAC+"
 overlay = "hifiberry-dac"
@@ -1098,6 +1164,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#mamboberry-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "melopero-daczero"
 display_name = "Melopero DAC ZERO"
 overlay = "hifiberry-dacplus"
@@ -1114,6 +1181,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#melopero-daczero"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "melopero-daczero-pi5"
 display_name = "Melopero DAC ZERO [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1130,6 +1198,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#melopero-daczero-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "merus-amp"
 display_name = "MERUS™ Amp piHAT ZW"
 overlay = "merus-amp"
@@ -1146,6 +1215,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#merus-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "nanosound-dac"
 display_name = "NanoSound DAC"
 overlay = "hifiberry-dacplus"
@@ -1162,6 +1232,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#nanosound-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "nanosound-dac-pi5"
 display_name = "NanoSound DAC [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1178,6 +1249,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#nanosound-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "pecan-dac"
 display_name = "Orchard Audio PecanPi DAC"
 overlay = "i2s-dac"
@@ -1194,6 +1266,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#pecan-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "pecan-plus-dac"
 display_name = "Orchard Audio PecanPi+ DAC"
 overlay = "hifiberry-dacplusdsp"
@@ -1210,6 +1283,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#pecan-plus-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "osa-dacberry-one-plus"
 display_name = "OSA DACBerry ONE+"
 overlay = "hifiberry-dacplus"
@@ -1226,6 +1300,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#osa-dacberry-one-plus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "osa-dacberry-one-plus-pi5"
 display_name = "OSA DACBerry ONE+ [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1242,6 +1317,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#osa-dacberry-one-plus-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "osa-dacberry-pro"
 display_name = "OSA DACBerry PRO"
 overlay = "iqaudio-dacplus"
@@ -1258,6 +1334,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#osa-dacberry-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "phat-beat"
 display_name = "pHAT BEAT"
 overlay = "hifiberry-dac"
@@ -1274,6 +1351,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#phat-beat"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "phat-dac"
 display_name = "pHAT DAC"
 overlay = "hifiberry-dac"
@@ -1290,6 +1368,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#phat-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "502-dac"
 display_name = "PI 2 Design 502DAC"
 overlay = "hifiberry-dacplus"
@@ -1306,6 +1385,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#502-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "502-dac-pi5"
 display_name = "PI 2 Design 502DAC [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1322,6 +1402,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#502-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "502-dac-pro"
 display_name = "PI 2 Design 502DAC Pro"
 overlay = "hifiberry-dacplus"
@@ -1338,6 +1419,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#502-dac-pro"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "502-dac-pro-pi5"
 display_name = "PI 2 Design 502DAC Pro [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1354,6 +1436,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#502-dac-pro-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "503hta-hybrid"
 display_name = "PI 2 Design 503HTA Hybrid Tube Amp"
 overlay = "hifiberry-dac"
@@ -1370,6 +1453,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#503hta-hybrid"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "picade-hat"
 display_name = "Picade HAT"
 overlay = "hifiberry-dac"
@@ -1386,6 +1470,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#picade-hat"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "pisound"
 display_name = "Pisound"
 overlay = "pisound"
@@ -1402,6 +1487,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#pisound"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "i2s-dac"
 display_name = "R-PI DAC"
 overlay = "i2s-dac"
@@ -1418,6 +1504,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#i2s-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "rpi-dacplus"
 display_name = "Raspberry Pi DAC+"
 overlay = "rpi-dacplus"
@@ -1434,6 +1521,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#rpi-dacplus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "soekris-dac"
 display_name = "Soekris dam 1021"
 overlay = "hifiberry-dac"
@@ -1450,6 +1538,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#soekris-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "speaker-phat"
 display_name = "Speaker pHAT"
 overlay = "hifiberry-dac"
@@ -1466,6 +1555,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#speaker-phat"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "st400-dac-amp"
 display_name = "ST400 Dac (PCM5122) - Amp"
 overlay = "iqaudio-dacplus"
@@ -1482,6 +1572,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#st400-dac-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "taudac"
 display_name = "TauDAC - DM101"
 overlay = "taudac"
@@ -1502,6 +1593,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#taudac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "terraberry-dac2"
 display_name = "Terra-Berry DAC 2/3"
 overlay = "i-sabre-q2m"
@@ -1518,6 +1610,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#terraberry-dac2"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "waveshare-wm8960"
 display_name = "Waveshare WM8960 Audio HAT"
 overlay = "wm8960-soundcard"
@@ -1534,6 +1627,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#waveshare-wm8960"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "wisdpi-hifi-dac"
 display_name = "wisdPi Hifi DAC"
 overlay = "hifiberry-dacplus"
@@ -1550,6 +1644,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#wisdpi-hifi-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "wisdpi-hifi-dac-pi5"
 display_name = "wisdPi Hifi DAC [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1566,6 +1661,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#wisdpi-hifi-dac-pi5"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "volumio-zero"
 display_name = "Volumio Zero ES9039 DAC"
 overlay = "es9039q2m-i2s"
@@ -1582,6 +1678,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#volumio-zero"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "52pi-nvdac"
 display_name = "52Pi NVDAC"
 overlay = "hifiberry-dacplus"
@@ -1598,6 +1695,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#52pi-nvdac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "52pi-nvdac-pi5"
 display_name = "52Pi NVDAC [Pi5]"
 overlay = "hifiberry-dacplus-std"
@@ -1618,6 +1716,7 @@ name = "Odroid C1+"
 provider = "noop"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "odroid-hifi-shield"
 display_name = "HiFi Shield"
 overlay = ""
@@ -1638,6 +1737,7 @@ name = "Sparky"
 provider = "noop"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "piano-dac"
 display_name = "Allo Piano"
 overlay = ""
@@ -1654,6 +1754,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#piano-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "piano-dac-plus"
 display_name = "Allo Piano 2.1"
 overlay = ""
@@ -1679,6 +1780,7 @@ name = "Tinkerboard"
 provider = "rockchip"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-amp"
 display_name = "HiFiBerry Amp"
 overlay = "hifiberry-amp"
@@ -1695,6 +1797,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-amp"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dac"
 display_name = "HiFiBerry DAC"
 overlay = "hifiberry-dac"
@@ -1711,6 +1814,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#hifiberry-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "hifiberry-dacplus"
 display_name = "HiFiBerry DAC Plus"
 overlay = "hifiberry-dacplus"
@@ -1730,6 +1834,7 @@ dsp_options = [
 provenance = "volumio:dacs.json#hifiberry-dacplus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "iqaudio-dacplus"
 display_name = "IQaudIO DAC Plus"
 overlay = "iqaudio-dacplus"
@@ -1746,6 +1851,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#iqaudio-dacplus"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "rpi-dac"
 display_name = "R-PI DAC"
 overlay = "rpi-dac"
@@ -1762,6 +1868,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#rpi-dac"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "wisdPi Hifi DAC"
 display_name = "wisdPi Hifi DAC"
 overlay = "hifiberry-dacplus"
@@ -1778,6 +1885,7 @@ dsp_options = []
 provenance = "volumio:dacs.json#wisdPi Hifi DAC"
 
 [[boards.dacs]]
+interface = "i2s"
 id = "52Pi NVDAC"
 display_name = "52Pi NVDAC"
 overlay = "hifiberry-dacplus"

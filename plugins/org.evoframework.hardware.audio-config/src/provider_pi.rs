@@ -614,6 +614,7 @@ impl HardwareAudioProvider for PiProvider {
                         display_name: None,
                         alsacard_hint: None,
                         mixer_hint: None,
+                        interface: None,
                         boot_config_path: self.boot_config_path.clone(),
                     });
                 }
@@ -626,6 +627,7 @@ impl HardwareAudioProvider for PiProvider {
                 display_name: None,
                 alsacard_hint: None,
                 mixer_hint: None,
+                interface: None,
                 boot_config_path: self.boot_config_path.clone(),
             })
         })
@@ -973,6 +975,7 @@ mod tests {
     async fn pi_provider_apply_then_clear_round_trips_in_memory() {
         let provider = PiProvider::for_tests("[all]\nenable_uart=1\n");
         let entry = DacEntry {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "hifiberry-dacplus".into(),
             display_name: "HiFiBerry DAC Plus".into(),
             overlay: "hifiberry-dacplus".into(),
@@ -1010,6 +1013,7 @@ mod tests {
     async fn pi_provider_apply_rejects_empty_catalogue_overlay() {
         let provider = PiProvider::for_tests("[all]\n");
         let entry = DacEntry {
+            interface: crate::evo_catalog::Interface::I2s,
             id: "module-only".into(),
             display_name: "Module-only DAC".into(),
             overlay: String::new(),
