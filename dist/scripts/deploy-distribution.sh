@@ -205,6 +205,9 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" "
     test -f /etc/systemd/system/evo.service.d/exec-start.conf || {
         echo 'WARN: exec-start.conf drop-in missing; systemd may launch the framework default binary on next restart (run bootstrap.sh)' >&2
     }
+    test -f /etc/systemd/system/evo.service.d/hardware-audio-privileges.conf || {
+        echo 'WARN: hardware-audio-privileges.conf drop-in missing; hardware.audio select_dac / clear_dac / modder writes will fail with Read-only file system inside the service namespace (run bootstrap.sh)' >&2
+    }
 " >/dev/null 2>&1; then
     echo "FAIL: target pre-flight failed; cannot continue" >&2
     exit 1
