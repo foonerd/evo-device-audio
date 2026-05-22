@@ -1107,6 +1107,8 @@ mod tests {
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&resp.payload);
@@ -1128,6 +1130,8 @@ mod tests {
             correlation_id: 2,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&resp.payload);
@@ -1149,6 +1153,8 @@ mod tests {
             correlation_id: 3,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&resp.payload);
@@ -1169,6 +1175,8 @@ mod tests {
             correlation_id: 4,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&resp.payload);
@@ -1190,6 +1198,8 @@ mod tests {
             correlation_id: 5,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         let v = decode_payload(&resp.payload);
@@ -1211,6 +1221,8 @@ mod tests {
             correlation_id: 6,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let err = p.handle_request(&req).await.unwrap_err();
         match err {
@@ -1232,6 +1244,8 @@ mod tests {
             correlation_id: 7,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let err = p.handle_request(&req).await.unwrap_err();
         match err {

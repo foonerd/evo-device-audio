@@ -35,6 +35,7 @@
 #   EVO_INSTALL_MPD_SUDOERS=0          — skip /etc/sudoers.d/evo-mpd-restart
 #   EVO_INSTALL_NETWORK_NM_SUDOERS=0   — skip /etc/sudoers.d/evo-network-nm
 #   EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skip /etc/sudoers.d/evo-hardware-audio
+#   EVO_INSTALL_SYSTEM_POWER_SUDOERS=0  — skip /etc/sudoers.d/evo-system-power
 #   EVO_INSTALL_DACS_CATALOGUE=0       — skip /usr/share/evo-device-audio/dacs.json install
 #   EVO_INSTALL_SYSTEMD_DROP_INS=0     — skip /etc/systemd/system/evo.service.d/
 #   EVO_INSTALL_CLIENT_ACL=0           — skip /etc/evo/client_acl.toml install
@@ -71,6 +72,7 @@ SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
+SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
@@ -366,6 +368,41 @@ if [[ "${EVO_INSTALL_HARDWARE_AUDIO_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $HARDWARE_AUDIO_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skipping hardware-audio sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1d: /etc/sudoers.d/evo-system-power (narrow NOPASSWD)
+# ----------------------------------------------------------
+# Path-scoped grant for the org.evoframework.system.power plugin's
+# `reboot_device` + `power_off_device` verbs. The framework
+# dispatcher's per-verb capability gate (step_up:system_admin)
+# is the FIRST line of defence — the sudoers grant is the LAST.
+# Both Cmnd_Aliases are exact-match (one binary, one argv element
+# each); there is no broad sudo grant on this surface.
+if [[ "${EVO_INSTALL_SYSTEM_POWER_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-system-power.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$SYSTEM_POWER_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $SYSTEM_POWER_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_SYSTEM_POWER_SUDOERS=0 — skipping system-power sudoers drop-in"
 fi
 
 # ----------------------------------------------------------

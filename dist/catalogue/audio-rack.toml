@@ -215,6 +215,34 @@ library. Consumer-facing schema lives in evo-catalogue-schemas \
 (artwork resolve v1).
 """
 
+[[racks]]
+name = "system"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Host-level system management surface. One shelf per \
+system concern; the power shelf carries operator-gestured \
+reboot / power-off verbs gated by the framework's per-verb \
+capability gate at step_up:system_admin. Additional shelves \
+(time, storage, updates) attach as their plugins land.
+"""
+
+[[racks.shelves]]
+name = "power"
+shape = 1
+description = """
+Host power-management respondent: answers `reboot_device` and \
+`power_off_device` for the operator's gestured shutdown \
+requests. Both verbs are step_up gated at the framework \
+dispatcher (scope `system_admin`); the principal must hold the \
+write scope AND an active step-up auth session before the verb \
+reaches the plugin. Reference implementation invokes \
+`systemctl reboot|poweroff` through a narrow EVO_SYSTEM_POWER \
+sudoers grant; vendor distributions that need different \
+shutdown semantics (hardware watchdog, alternate init system) \
+ship a vendor-namespace replacement under the same verb shape.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by

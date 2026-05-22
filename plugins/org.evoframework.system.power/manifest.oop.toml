@@ -1,0 +1,44 @@
+[plugin]
+name = "org.evoframework.system.power"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "system.power"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["reboot_device", "power_off_device"]
+response_budget_ms = 5000
+
+[capabilities.respondent.verb_capabilities]
+reboot_device = { kind = "step_up", scope = "system_admin" }
+power_off_device = { kind = "step_up", scope = "system_admin" }

@@ -75,3 +75,26 @@ request_types = [
     "hardware.audio.modder.remove_overlay",
 ]
 response_budget_ms = 3000
+
+# Per-verb capability gate declarations. The framework
+# dispatcher consults this map BEFORE forwarding the request to
+# the plugin's handle_request; a principal that does not satisfy
+# the declared scope refuses with `permission_denied` at the
+# dispatch boundary. Read-only verbs (`list_dac_catalogue`,
+# `current_config`, `confirm_reboot_required`, `verify_install`,
+# `dsp.list_controls`, `dsp.get_control`, `modder.list_overlays`)
+# remain unmapped and default to anonymous-OK per the framework's
+# backwards-compatible default. The mutating verbs all gate on
+# `step_up:audio_admin` — the operator must hold an active step-up
+# auth session on the audio_admin scope before any DAC selection,
+# overlay register, or DSP mutation reaches the plugin. The OS-
+# layer enforcement (the sudoers Cmnd_Aliases `EVO_HARDWARE_AUDIO_*`
+# + the `hardware-audio-privileges.conf` systemd drop-in widening
+# `ReadWritePaths`) continues to be the LAST line of defence; the
+# framework's per-verb capability gate is the FIRST.
+[capabilities.respondent.verb_capabilities]
+"hardware.audio.select_dac" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.clear_dac" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.dsp.set_control" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.modder.register_overlay" = { kind = "step_up", scope = "audio_admin" }
+"hardware.audio.modder.remove_overlay" = { kind = "step_up", scope = "audio_admin" }

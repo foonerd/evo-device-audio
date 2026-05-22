@@ -2072,6 +2072,8 @@ mod tests {
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         }
     }
 
