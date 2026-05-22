@@ -23,7 +23,7 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::alsa_cards::{AlsaCardCatalog, CardEntry, TypeHint};
+use crate::alsa_cards::{AlsaCardCatalog, CardEntry};
 use crate::ActiveDacConfig;
 
 #[derive(Debug, Error)]
@@ -147,23 +147,51 @@ pub async fn enumerate_outputs(
     active_dac_config: Option<&ActiveDacConfig>,
 ) -> Result<Vec<ResolvedAlsaOutput>, OutputEnumerationError> {
     let stdout = run_aplay_l_lowercase().await?;
-    Ok(resolve(&stdout, catalog, active_dac_config))
+    // Layer 1: read kernel-supplied card identities. The kernel is
+    // the authoritative source for card identification.
+    // If the read fails (no /proc/asound, permission denied), we
+    // still proceed with an empty identity set — Layer 2 falls
+    // back to OutputClass::Unknown for every row, which is the
+    // explicit failure semantics. The introspection error is
+    // logged but not propagated as a hard error: enumeration
+    // still produces hw:N,M rows operators can route audio to,
+    // just without rich classification.
+    let identities =
+        match crate::kernel_introspection::introspect_all_cards().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "kernel introspection failed; output_class \
+                     classification falls back to Unknown for every \
+                     row this enumeration pass — operator UI may show \
+                     'Other' for cards the kernel knows but we could \
+                     not parse"
+                );
+                Vec::new()
+            }
+        };
+    Ok(resolve(&stdout, catalog, active_dac_config, &identities))
 }
 
 /// Pure resolution function — splits `aplay -l` output into
 /// `(card_idx, device_idx, card_name)` rows and joins each
 /// against the catalog. Pulled out of `enumerate_outputs` so
-/// tests can pass synthetic stdout without spawning processes.
+/// tests can pass synthetic stdout + identity fixtures without
+/// spawning processes or accessing `/proc/asound`.
 pub fn resolve(
     stdout: &str,
     catalog: &AlsaCardCatalog,
     active_dac_config: Option<&ActiveDacConfig>,
+    identities: &[crate::kernel_introspection::CardIdentity],
 ) -> Vec<ResolvedAlsaOutput> {
     let rows = parse_aplay_l_lowercase(stdout);
     rows.into_iter()
         .map(|row| {
             let short_id = row.short_id.clone();
-            let mut resolved = resolve_row(row, catalog);
+            let identity =
+                identities.iter().find(|i| i.card_idx == row.card_idx);
+            let mut resolved = resolve_row(row, identity, catalog);
             enrich_from_active_dac_config(
                 &mut resolved,
                 &short_id,
@@ -338,24 +366,31 @@ fn parse_card_line(line: &str) -> Option<AplayCardDevice> {
 
 fn resolve_row(
     row: AplayCardDevice,
+    identity: Option<&crate::kernel_introspection::CardIdentity>,
     catalog: &AlsaCardCatalog,
 ) -> ResolvedAlsaOutput {
     let alsa_id = format!("hw:{},{}", row.card_idx, row.device_idx);
+    // Layer 2: kernel-supplied classification is authoritative per
+    // the kernel-introspection-authoritative discipline. When kernel
+    // introspection produced an identity for
+    // this card index, derive output_class from it. When it didn't
+    // (read failed, card_idx mismatch, hardware unplugged between
+    // enumeration passes), output_class is Unknown — the explicit
+    // failure semantic that surfaces the gap rather than silently
+    // inferring from card-name string heuristics.
+    let kernel_output_class = identity
+        .map(crate::kernel_introspection::classify_from_kernel)
+        .unwrap_or(OutputClass::Unknown);
     match catalog.lookup(&row.card_name) {
         Some(CardEntry::Single(single)) => {
             let label = single.pretty_name.clone();
-            let output_class = derive_output_class(
-                &row.card_name,
-                &label,
-                Some(single.type_hint),
-            );
             ResolvedAlsaOutput {
                 card_idx: row.card_idx,
                 device_idx: row.device_idx,
                 card_name: row.card_name,
                 alsa_id,
                 label,
-                output_class,
+                output_class: kernel_output_class,
                 default_mixer_control: single.default_mixer.clone(),
                 catalog_provenance: CatalogProvenance::Curated,
                 hidden: false,
@@ -365,18 +400,13 @@ fn resolve_row(
         Some(CardEntry::MultiDevice(multi)) => {
             if let Some(dev) = multi.devices.get(&row.device_idx) {
                 let label = dev.pretty_name.clone();
-                let output_class = derive_output_class(
-                    &row.card_name,
-                    &label,
-                    Some(multi.type_hint),
-                );
                 ResolvedAlsaOutput {
                     card_idx: row.card_idx,
                     device_idx: row.device_idx,
                     card_name: row.card_name,
                     alsa_id,
                     label,
-                    output_class,
+                    output_class: kernel_output_class,
                     default_mixer_control: dev.default_mixer.clone(),
                     catalog_provenance: CatalogProvenance::Curated,
                     hidden: dev.hidden,
@@ -384,20 +414,17 @@ fn resolve_row(
                 }
             } else {
                 // Card matched but subdevice index isn't in the
-                // catalog. Treat as partial-match: keep the type
-                // hint, fall back the label to the raw name.
-                let output_class = derive_output_class(
-                    &row.card_name,
-                    &row.card_name,
-                    Some(multi.type_hint),
-                );
+                // catalog. Partial-match: kernel classification
+                // still applies (card-level); label falls back to
+                // the raw name (no subdevice-specific label
+                // available).
                 ResolvedAlsaOutput {
                     card_idx: row.card_idx,
                     device_idx: row.device_idx,
                     card_name: row.card_name.clone(),
                     alsa_id,
                     label: row.card_name,
-                    output_class,
+                    output_class: kernel_output_class,
                     default_mixer_control: None,
                     catalog_provenance: CatalogProvenance::Unmapped,
                     hidden: false,
@@ -406,15 +433,23 @@ fn resolve_row(
             }
         }
         None => {
-            let output_class =
-                derive_output_class(&row.card_name, &row.card_name, None);
+            // Unmapped against alsa-cards.toml. Prefer the
+            // kernel-supplied long_name as the fallback label —
+            // operator sees "HDA Intel PCH at 0x..." rather than
+            // the bare short_id, which is more meaningful for
+            // diagnostic. Falls back to the aplay-parsed card_name
+            // when kernel introspection didn't produce an identity.
+            let label = identity
+                .map(|i| i.long_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| row.card_name.clone());
             ResolvedAlsaOutput {
                 card_idx: row.card_idx,
                 device_idx: row.device_idx,
                 card_name: row.card_name.clone(),
                 alsa_id,
-                label: row.card_name,
-                output_class,
+                label,
+                output_class: kernel_output_class,
                 default_mixer_control: None,
                 catalog_provenance: CatalogProvenance::Unmapped,
                 hidden: false,
@@ -424,52 +459,14 @@ fn resolve_row(
     }
 }
 
-/// Derive the finer-grained `OutputClass` from the type hint
-/// the catalog ships plus keyword matches against the card name
-/// and label. The order matters — Bluetooth and USB checks come
-/// first so a card name containing "USB" doesn't fall into the
-/// HDMI bucket via the label.
-fn derive_output_class(
-    card_name: &str,
-    label: &str,
-    hint: Option<TypeHint>,
-) -> OutputClass {
-    let card_lc = card_name.to_ascii_lowercase();
-    let label_lc = label.to_ascii_lowercase();
-    let either =
-        |needle: &str| card_lc.contains(needle) || label_lc.contains(needle);
-
-    if either("bluez") || either("bluetooth") {
-        return OutputClass::Bluetooth;
-    }
-    if either("usb") {
-        return OutputClass::Usb;
-    }
-    if either("hdmi") {
-        return OutputClass::Hdmi;
-    }
-    if either("spdif") || either("s/pdif") || either("toslink") {
-        return OutputClass::Spdif;
-    }
-    // The catalog type hint runs before generic Analog inference
-    // because the volumio cards.json marks I2S DAC HATs with
-    // `type = "i2S"` and they should be reported as I2S even
-    // when the label happens to contain a generic word.
-    if let Some(TypeHint::I2s) = hint {
-        return OutputClass::I2s;
-    }
-    if either("analog")
-        || either("headphone")
-        || either("line out")
-        || either("audiocodec")
-        || either("onboard audio")
-        || either("audio jack")
-        || either("speaker")
-    {
-        return OutputClass::Analog;
-    }
-    OutputClass::Unknown
-}
+// NOTE: `derive_output_class` retired with the kernel-introspection-
+// authoritative discipline. The old path string-matched keywords
+// against kernel-reported card names ("usb", "hdmi", "spdif",
+// "analog", "headphone", ...) to classify the row's OutputClass.
+// Kernel runtime introspection (`kernel_introspection::classify_from_kernel`)
+// is the single canonical classification path now; the catalog
+// supplies presentation only. Reintroducing keyword classification
+// at the join site violates the discipline's invariant.
 
 #[cfg(test)]
 mod tests {
@@ -525,11 +522,34 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
         assert_eq!(rows[1].card_name, "snd_rpi_hifiberry_dacplus");
     }
 
+    fn synthetic_identity(
+        card_idx: u32,
+        kind: crate::kernel_introspection::CardKind,
+    ) -> crate::kernel_introspection::CardIdentity {
+        crate::kernel_introspection::CardIdentity {
+            card_idx,
+            short_id: "X".into(),
+            long_name: "X".into(),
+            driver: "X".into(),
+            kind,
+            codecs: Vec::new(),
+        }
+    }
+
     #[test]
     fn resolve_single_device_curated_row() {
         let cat = fixture_catalog();
         let raw = "card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]\n";
-        let outputs = resolve(raw, &cat, None);
+        // Kernel introspection identifies card 0 as HDMI (this
+        // fixture's bcm2835 ALSA row is HDMI-class). Under
+        // the kernel-introspection-authoritative discipline the
+        // OutputClass derives from this CardIdentity,
+        // not from keyword inference over the card-name string.
+        let identities = vec![synthetic_identity(
+            0,
+            crate::kernel_introspection::CardKind::Hdmi,
+        )];
+        let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         assert_eq!(out.card_idx, 0);
@@ -544,10 +564,19 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     }
 
     #[test]
-    fn resolve_i2s_dac_row_marked_i2s_via_type_hint() {
+    fn resolve_i2s_dac_row_marked_i2s_via_kernel_identity() {
         let cat = fixture_catalog();
         let raw = "card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ HiFi pcm5122-hifi-0 [HiFiBerry DAC+ HiFi pcm5122-hifi-0]\n";
-        let outputs = resolve(raw, &cat, None);
+        // Kernel introspection identifies card 1 as I²S DAC
+        // (driver name matches the I²S heuristic + no codec file
+        // — the path Layer 1 classifies as I²S). The previous
+        // path relied on the alsa-cards.toml row's TypeHint::I2s;
+        // that's now ignored in favour of kernel-derived identity.
+        let identities = vec![synthetic_identity(
+            1,
+            crate::kernel_introspection::CardKind::I2s,
+        )];
+        let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].label, "HiFiBerry DAC Plus");
         assert_eq!(outputs[0].output_class, OutputClass::I2s);
@@ -555,25 +584,44 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
     }
 
     #[test]
-    fn resolve_multi_device_card_per_subdevice_label() {
+    fn resolve_multi_device_card_all_subdevices_share_kernel_classification() {
+        // Structural pin: a single kernel card has
+        // ONE classification. Subdevice labels can differ per
+        // device (operator-facing nomenclature), but the
+        // OutputClass is a property of the card, derived from
+        // its kernel-supplied identity. The previous keyword-scan
+        // path classified each subdevice independently by label
+        // keyword (a label containing "hdmi" classified as Hdmi,
+        // "spdif" as Spdif, etc.) — that was a parallel truth
+        // path the kernel was already authoritative on.
         let cat = fixture_catalog();
         let raw = "card 0: link [atm7059_link], device 0: jack [jack]\ncard 0: link [atm7059_link], device 1: hdmi [hdmi]\ncard 0: link [atm7059_link], device 2: spdif [spdif]\n";
-        let outputs = resolve(raw, &cat, None);
+        // Kernel classifies card 0 as Hda (analog primary,
+        // representative SoC integrated audio).
+        let identities = vec![synthetic_identity(
+            0,
+            crate::kernel_introspection::CardKind::Hda,
+        )];
+        let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 3);
+        // Labels still differ per subdevice (catalogue
+        // multi-device map supplies them).
         assert_eq!(outputs[0].label, "Cheapo Audio Jack");
-        assert_eq!(outputs[0].output_class, OutputClass::Analog);
         assert_eq!(outputs[0].default_mixer_control.as_deref(), Some("DAC PA"));
         assert_eq!(outputs[1].label, "HDMI Audio Out");
-        assert_eq!(outputs[1].output_class, OutputClass::Hdmi);
         assert_eq!(outputs[2].label, "Cheapo S/PDIF");
-        assert_eq!(outputs[2].output_class, OutputClass::Spdif);
+        // OutputClass is uniform across the card's subdevices,
+        // derived from the kernel CardIdentity.
+        for out in &outputs {
+            assert_eq!(out.output_class, OutputClass::Analog);
+        }
     }
 
     #[test]
     fn resolve_unmapped_card_falls_back_to_raw_name() {
         let cat = fixture_catalog();
         let raw = "card 7: WeirdHat [SomeUnknownDac], device 0: foo [bar]\n";
-        let outputs = resolve(raw, &cat, None);
+        let outputs = resolve(raw, &cat, None, &[]);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].label, "SomeUnknownDac");
         assert_eq!(outputs[0].catalog_provenance, CatalogProvenance::Unmapped);
@@ -581,45 +629,14 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
         assert_eq!(outputs[0].output_class, OutputClass::Unknown);
     }
 
-    #[test]
-    fn derive_output_class_keyword_inference_covers_each_class() {
-        assert_eq!(
-            derive_output_class("bcm2835 HDMI 1", "HDMI Out", None),
-            OutputClass::Hdmi
-        );
-        assert_eq!(
-            derive_output_class("USB Audio", "USB DAC", None),
-            OutputClass::Usb
-        );
-        assert_eq!(
-            derive_output_class("sndspdif", "TOSLINK (S/PDIF)", None),
-            OutputClass::Spdif
-        );
-        assert_eq!(
-            derive_output_class("bluez_card.AA:BB:CC", "Bluetooth Sink", None),
-            OutputClass::Bluetooth
-        );
-        assert_eq!(
-            derive_output_class("audiocodec", "Analog Audio Out", None),
-            OutputClass::Analog
-        );
-        assert_eq!(
-            derive_output_class(
-                "HiFiBerry DAC",
-                "HiFiBerry DAC",
-                Some(TypeHint::I2s)
-            ),
-            OutputClass::I2s
-        );
-        assert_eq!(
-            derive_output_class(
-                "weird-card-no-keyword",
-                "label-no-keyword",
-                None
-            ),
-            OutputClass::Unknown
-        );
-    }
+    // NOTE: the `derive_output_class_keyword_inference_covers_each_class`
+    // test retired with the `derive_output_class` function it
+    // covered. The classification surface moved to
+    // `kernel_introspection::classify_from_kernel`, which is
+    // exercised by `kernel_introspection::tests::classify_*` —
+    // each test pins one CardKind → OutputClass arm explicitly.
+    // Reintroducing keyword-derivation tests at this layer
+    // re-introduces the retired path.
 
     #[test]
     fn parse_skips_continuation_lines() {
@@ -674,7 +691,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
         let raw = "card 3: DAC [I-Sabre Q2M DAC], device 0: I-Sabre [foo]\n";
         let active =
             active_dac_for("DAC", "Audiophonics I-Sabre Q2M", "Digital");
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         // card_name is the bracketed long form (matches the catalog
@@ -692,7 +709,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
         let cat = fixture_catalog();
         let raw = "card 3: DAC [Foo], device 0: Foo [bar]\n";
         let active = active_dac_for("BossDAC", "Allo BOSS", "Digital");
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         assert_eq!(out.label, "Foo");
@@ -717,7 +734,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             "Should Not Override",
             "Digital",
         );
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         // Catalog label held (Curated provenance untouched).
@@ -744,7 +761,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             interface: None,
             boot_config_path: String::new(),
         };
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         let out = &outputs[0];
         assert_eq!(out.label, "Foo");
         assert!(out.default_mixer_control.is_none());
@@ -782,7 +799,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             interface: Some("i2s".into()),
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         assert_eq!(
@@ -821,7 +838,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             interface: Some("spdif".into()),
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &[]);
         let out = &outputs[0];
         assert_eq!(
             out.output_class,
@@ -834,16 +851,22 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
     }
 
     #[test]
-    fn unknown_active_interface_string_leaves_prior_class_intact() {
+    fn unknown_active_interface_string_leaves_kernel_class_intact() {
         // Hardening pin: when the active-DAC subject carries an
         // unrecognised interface string (forward-compat with a
         // newer catalogue declaring a value this build does not
-        // know), the prior derivation stands — the row does NOT
-        // collapse to Unknown. Forward-compat: a vendor adding
-        // `interface = "spdif_optical"` later does not silently
-        // unclassify every existing row's output_class.
+        // know), the kernel-derived OutputClass stands — the row
+        // does NOT collapse to Unknown. Forward-compat: a vendor
+        // adding `interface = "spdif_optical"` later does not
+        // silently unclassify every existing row's output_class.
         let cat = fixture_catalog();
         let raw = "card 0: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: x [y]\n";
+        // Kernel introspection identifies card 0 as I²S (Layer 1+2
+        // classification baseline).
+        let identities = vec![synthetic_identity(
+            0,
+            crate::kernel_introspection::CardKind::I2s,
+        )];
         let active = ActiveDacConfig {
             overlay: "hifiberry-dacplus".into(),
             catalogue_id: Some("hifiberry-dacplus".into()),
@@ -853,11 +876,56 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             interface: Some("spdif_optical".into()),
             boot_config_path: "/boot/firmware/config.txt".into(),
         };
-        let outputs = resolve(raw, &cat, Some(&active));
+        let outputs = resolve(raw, &cat, Some(&active), &identities);
         let out = &outputs[0];
-        // The alsa-cards catalogue's type_hint = i2s for this
-        // kernel card name; the unknown interface string leaves
-        // that prior derivation alone.
+        // Kernel-derived OutputClass = I2s; the unrecognised
+        // active_dac.interface leaves it alone.
         assert_eq!(out.output_class, OutputClass::I2s);
+    }
+
+    #[test]
+    fn x86_class_hda_card_uncatalogued_classifies_as_analog_not_unknown() {
+        // FAILING-CASE REPRODUCTION pin for the kernel-introspection
+        // discipline. Before the kernel-introspection layer landed,
+        // an HDA card unknown to alsa-cards.toml fell through to
+        // OutputClass::Unknown — the UI rendered "Other" for a
+        // perfectly usable card.
+        //
+        // After: kernel reports CardKind::Hda for the card;
+        // classify_from_kernel maps that to OutputClass::Analog;
+        // the operator UI renders the "Analog" Destination chip
+        // with the kernel-supplied long_name as the label (until
+        // catalogue-overlay branding lands).
+        let cat = fixture_catalog();
+        let raw = "card 1: PCH [HDA Intel PCH], device 0: ALC233 Analog [ALC233 Analog]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 1,
+            short_id: "PCH".into(),
+            long_name: "HDA Intel PCH at 0x98b20000 irq 149".into(),
+            driver: "HDA-Intel".into(),
+            kind: crate::kernel_introspection::CardKind::Hda,
+            codecs: vec![crate::kernel_introspection::CodecIdentity {
+                address: 0,
+                chip_name: "Realtek ALC233".into(),
+                vendor_id: 0x10ec0235,
+                subsystem_id: 0x80862074,
+                is_hdmi: false,
+            }],
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(
+            out.output_class,
+            OutputClass::Analog,
+            "kernel CardKind::Hda MUST classify as Analog under \
+             the kernel-introspection-authoritative discipline — \
+             the prior keyword-scan path returned Unknown and the \
+             UI rendered 'Other' for this card",
+        );
+        // Label falls back to the kernel-supplied long_name when
+        // the alsa-cards catalogue carries no row for this card.
+        assert_eq!(out.label, "HDA Intel PCH at 0x98b20000 irq 149");
+        assert_eq!(out.catalog_provenance, CatalogProvenance::Unmapped);
     }
 }
