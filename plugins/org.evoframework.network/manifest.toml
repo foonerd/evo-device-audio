@@ -62,3 +62,31 @@ request_types = [
     "network.refresh_connectivity",
 ]
 response_budget_ms = 15000
+
+# Per-verb capability gate declarations. The framework dispatcher
+# consults this map BEFORE forwarding the request to the plugin's
+# handle_request; a principal that does not satisfy the declared
+# scope refuses at the dispatch boundary with `permission_denied`
+# and the plugin never sees the call. Read-only verbs (status /
+# get / list-devices / supervisor.status / refresh_connectivity)
+# remain unmapped and default to anonymous-OK per the framework's
+# backwards-compatible default. Write-class verbs (intent.set /
+# captive.*) record operator intent or submit credentials; they
+# gate at write:network_admin. Apply-class verbs (intent.apply /
+# security.harden / flight_mode.set / radio.set / scan) reconfigure
+# the host's network state, change radio posture, or initiate
+# active probes; they gate at step_up:network_admin so the operator
+# must hold an active step-up auth session for the change to
+# proceed. The narrow nmcli + iw + rfkill sudoers grants remain in
+# place as the OS-layer enforcement; the framework gate is the
+# first line of defence, the sudoers grant is the last.
+[capabilities.respondent.verb_capabilities]
+"network.nm.intent.set" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.start" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
+"network.nm.intent.apply" = { kind = "step_up", scope = "network_admin" }
+"network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
+"network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.scan" = { kind = "step_up", scope = "network_admin" }
