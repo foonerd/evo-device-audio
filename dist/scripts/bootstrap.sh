@@ -413,6 +413,11 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/mpd-restart-privileges.conf"
 
     install -m 0644 -o root -g root \
+        "$DIST_DIR/systemd/evo.service.d/hardware-audio-privileges.conf" \
+        "$SYSTEMD_DROPIN_DIR/hardware-audio-privileges.conf"
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/hardware-audio-privileges.conf"
+
+    install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/https.conf" \
         "$SYSTEMD_DROPIN_DIR/https.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/https.conf"
