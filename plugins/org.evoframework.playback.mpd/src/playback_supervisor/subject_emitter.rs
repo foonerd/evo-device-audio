@@ -66,10 +66,12 @@
 
 use std::sync::Arc;
 
+use evo_plugin_sdk::audio::AudioFormat;
 use evo_plugin_sdk::contract::{
     ExternalAddressing, RelationAnnouncer, RelationAssertion,
     SubjectAnnouncement, SubjectAnnouncer,
 };
+use serde_json::json;
 
 use crate::mpd::MpdSong;
 use crate::PLUGIN_NAME;
@@ -80,6 +82,9 @@ use crate::PLUGIN_NAME;
 const SUBJECT_TYPE_TRACK: &str = "track";
 /// Subject type for albums. Must match the catalogue.
 const SUBJECT_TYPE_ALBUM: &str = "album";
+/// Subject type for the live stream format. Must match the
+/// catalogue + the audio.playback.v1 schema declaration.
+const SUBJECT_TYPE_STREAM_FORMAT: &str = "audio_playback_stream_format";
 /// Relation predicate for track -> album. Must match the catalogue.
 const PREDICATE_ALBUM_OF: &str = "album_of";
 
@@ -87,6 +92,17 @@ const PREDICATE_ALBUM_OF: &str = "album_of";
 const SCHEME_MPD_PATH: &str = "mpd-path";
 /// Addressing scheme this plugin owns for MPD album identities.
 const SCHEME_MPD_ALBUM: &str = "mpd-album";
+/// Addressing scheme for the playback warden's live stream
+/// format subject. Matches the audio.playback.v1 schema's
+/// `[[subjects]]` declaration verbatim.
+const SCHEME_STREAM_FORMAT: &str = "evo.audio.playback";
+/// Addressing value for the stream_format subject — singleton
+/// per warden (one playback custody → one stream format).
+const VALUE_STREAM_FORMAT: &str = "stream_format";
+/// Payload version for the stream_format subject's state shape.
+/// Bumped on any non-additive payload-shape change; additive
+/// (new optional fields) rides at v1.
+const STREAM_FORMAT_PAYLOAD_VERSION: u32 = 1;
 
 /// Fallback artist value when the MPD `Artist` tag is missing or
 /// empty. Using a concrete sentinel (rather than, say, skipping
@@ -208,6 +224,68 @@ impl SubjectEmitter {
                 error = %e,
                 file = %song.file_path,
                 "album_of relation assertion failed; subjects remain"
+            );
+        }
+    }
+
+    /// Announce the singleton `stream_format` subject. Called
+    /// once at load alongside the warden's other one-time
+    /// announcements. The subject's state is initialised empty;
+    /// the first call to [`SubjectEmitter::update_stream_format`]
+    /// publishes the warden's actual format.
+    ///
+    /// Best-effort: errors from the announcer are logged but
+    /// not propagated. Playback is never disrupted by an
+    /// announcer failure here — subscribers without the subject
+    /// fall back to "format unknown" rather than crashing.
+    pub(crate) async fn announce_stream_format(&self) {
+        let addressing =
+            ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_STREAM_FORMAT);
+        let announcement = SubjectAnnouncement::new(
+            SUBJECT_TYPE_STREAM_FORMAT,
+            vec![addressing],
+        );
+        if let Err(e) = self.subjects.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "stream_format subject announcement failed; \
+                 operator UI live-format display will be \
+                 unavailable until a future re-announce attempt"
+            );
+        }
+    }
+
+    /// Publish the current stream format on the `stream_format`
+    /// subject's state. Called from the route-change reactor on
+    /// every endpoint refresh — the `effective` AudioFormat is
+    /// what reaches the DAC (after resampling + DoP wrapping);
+    /// the `source` AudioFormat is what MPD decoded from the
+    /// file (None when the source isn't separately knowable,
+    /// e.g. on a pure-effective route-change re-publish).
+    ///
+    /// Best-effort: errors from the announcer are logged but
+    /// not propagated. Playback is never disrupted by an
+    /// announcer failure here.
+    pub(crate) async fn update_stream_format(
+        &self,
+        effective: &AudioFormat,
+        source: Option<&AudioFormat>,
+    ) {
+        let addressing =
+            ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_STREAM_FORMAT);
+        let state = json!({
+            "v": STREAM_FORMAT_PAYLOAD_VERSION,
+            "effective": effective,
+            "source": source,
+        });
+        if let Err(e) = self.subjects.update_state(addressing, state).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "stream_format subject update_state failed; \
+                 operator UI may show a stale format until the \
+                 next successful publish"
             );
         }
     }
@@ -600,6 +678,110 @@ mod tests {
         assert_eq!(subjects.count(), 2);
         // The relation was attempted even though it failed.
         assert_eq!(failing_relations.count(), 1);
+    }
+
+    // ===== stream_format subject =====
+
+    #[tokio::test]
+    async fn announce_stream_format_emits_one_announcement_with_canonical_addressing(
+    ) {
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.announce_stream_format().await;
+        assert_eq!(subjects.count(), 1);
+        let ann = subjects.at(0).unwrap();
+        assert_eq!(ann.subject_type, "audio_playback_stream_format");
+        assert_eq!(ann.addressings.len(), 1);
+        assert_eq!(ann.addressings[0].scheme, "evo.audio.playback");
+        assert_eq!(ann.addressings[0].value, "stream_format");
+    }
+
+    #[tokio::test]
+    async fn update_stream_format_pcm_publishes_typed_payload() {
+        // PCM happy path: effective + source both populated.
+        // The wire payload carries the AudioFormat serde shape
+        // (`{ kind, codec, rate_hz, channels }`) for each.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 192_000,
+            channels: 2,
+        };
+        let source = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+            rate_hz: 44_100,
+            channels: 2,
+        };
+        emitter
+            .update_stream_format(&effective, Some(&source))
+            .await;
+        assert_eq!(subjects.state_update_count(), 1);
+        let (addressing, state) = subjects.state_update_at(0).unwrap();
+        assert_eq!(addressing.scheme, "evo.audio.playback");
+        assert_eq!(addressing.value, "stream_format");
+        assert_eq!(state["v"], 1);
+        assert_eq!(state["effective"]["kind"], "pcm");
+        assert_eq!(state["effective"]["rate_hz"], 192_000);
+        assert_eq!(state["effective"]["channels"], 2);
+        assert_eq!(state["source"]["kind"], "pcm");
+        assert_eq!(state["source"]["rate_hz"], 44_100);
+    }
+
+    #[tokio::test]
+    async fn update_stream_format_dsd_surfaces_transport_discriminant() {
+        // DSD path: the transport field (DoP vs NativeUsb) is
+        // the operator-meaningful piece the UI brief named.
+        // The payload carries it verbatim from the AudioFormat
+        // serde representation.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Dsd {
+            rate: evo_plugin_sdk::audio::DsdRate::Dsd64,
+            transport: evo_plugin_sdk::audio::DsdTransport::Dop,
+            channels: 2,
+        };
+        emitter.update_stream_format(&effective, None).await;
+        assert_eq!(subjects.state_update_count(), 1);
+        let (_addressing, state) = subjects.state_update_at(0).unwrap();
+        assert_eq!(state["effective"]["kind"], "dsd");
+        assert_eq!(state["effective"]["transport"], "dop");
+        assert_eq!(state["effective"]["channels"], 2);
+        // Source is None → JSON null. Subscribers treat this as
+        // "source = effective" per the schema contract.
+        assert!(state["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn update_stream_format_with_source_none_emits_null() {
+        // The reactor's per-route-change path passes source=None
+        // (it sees only the effective post-resampling endpoint).
+        // The payload's `source` field must be JSON null — not
+        // omitted, so subscribers can rely on the field's
+        // presence in the schema.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS32Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter.update_stream_format(&effective, None).await;
+        let (_addressing, state) = subjects.state_update_at(0).unwrap();
+        assert!(state.as_object().unwrap().contains_key("source"));
+        assert!(state["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn announce_stream_format_swallows_announcer_failure() {
+        // Robustness pin: an announcer that fails on announce
+        // does NOT panic / propagate — playback never disrupted
+        // by an emitter failure. Matches the existing track /
+        // album emit-song contract.
+        let subjects =
+            Arc::new(CapturingSubjectAnnouncer::failing_with_invalid());
+        let relations = Arc::new(CapturingRelationAnnouncer::default());
+        let emitter = SubjectEmitter::new(subjects.clone(), relations.clone());
+        // Should not panic.
+        emitter.announce_stream_format().await;
+        // The announcer still RECORDS the attempted announce.
+        assert_eq!(subjects.count(), 1);
     }
 
     // ===== null emitter is a true no-op =====

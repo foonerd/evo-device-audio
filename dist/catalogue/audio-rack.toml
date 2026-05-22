@@ -253,6 +253,23 @@ name = "track"
 [[subjects]]
 name = "album"
 
+# Subject type the playback warden announces at load and
+# updates on every audio-format change (track transition
+# with different rate, gapless transition into a different-
+# rate track, MPD reopen at a different format). Carries
+# the AudioFormat reaching the DAC (after resampling +
+# DoP wrapping) and, when separately knowable, the source
+# AudioFormat MPD decoded from the file. Operator UI
+# subscribes to this subject to render the live format
+# display (sample rate, bit depth, channel count, DSD +
+# DoP transport flag). Canonical addressing:
+# `evo.audio.playback:stream_format`. Schema reference:
+# `schemas/org.evoframework/audio/playback.v1.toml`
+# acceptance criterion
+# `stream-format-published-on-load-and-every-format-change`.
+[[subjects]]
+name = "audio_playback_stream_format"
+
 # Subject type the playback.options plugin announces as a
 # durable projection of the operator's audiophile-grade
 # settings (resampling / mixer_type / dop / output_device /

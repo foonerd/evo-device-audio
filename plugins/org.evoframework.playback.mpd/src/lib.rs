@@ -619,6 +619,13 @@ impl MpdPlaybackPlugin {
         let task_wake = Arc::clone(&wake);
         let task_shutdown = Arc::clone(&shutdown);
         let task_count = Arc::clone(&refresh_count);
+        // Clone the subject emitter so the reactor can publish
+        // `stream_format` updates on every endpoint refresh.
+        // The emitter is cheap to clone (Arc bump on each
+        // announcer field); the clone outlives the reactor
+        // task. None when subject_emitter is absent (test paths
+        // that explicitly bypass it).
+        let task_emitter = self.subject_emitter.clone();
         let task = tokio::spawn(async move {
             run_reactor(
                 task_routing,
@@ -626,6 +633,7 @@ impl MpdPlaybackPlugin {
                 task_shutdown,
                 endpoints_tx,
                 task_count,
+                task_emitter,
             )
             .await;
         });
@@ -1199,11 +1207,41 @@ async fn run_reactor(
     shutdown: Arc<Notify>,
     endpoints_tx: watch::Sender<Option<WriteEndpoint>>,
     refresh_count: Arc<std::sync::atomic::AtomicU64>,
+    emitter: Option<SubjectEmitter>,
 ) {
+    // Initial publish: the reactor's wake loop only publishes
+    // on subsequent route changes, so without an initial pass
+    // the stream_format subject's state stays empty until the
+    // first format change. Capture the current endpoint from
+    // the watch channel's initial value (cloned out so the
+    // borrow guard is dropped before the await) and publish
+    // it so subscribers entering mid-stream have a live state
+    // at hand.
+    if let Some(em) = emitter.as_ref() {
+        let initial_snapshot = endpoints_tx.borrow().clone();
+        if let Some(ep) = initial_snapshot.as_ref() {
+            em.update_stream_format(&ep.format, None).await;
+        }
+    }
     loop {
         tokio::select! {
             _ = wake.notified() => {
                 let snapshot = fetch_write_endpoint(routing.as_ref());
+                // Publish the stream_format subject's state on
+                // every endpoint refresh. The reactor is the
+                // single place format changes flow through, so
+                // this is the only sanctioned publish surface
+                // per the audio.playback.v1 acceptance contract.
+                // Source format is None here — the reactor sees
+                // only the framework's post-resampling effective
+                // endpoint; the source-format probe lives on the
+                // MPD-status path (a future extension when the
+                // status reader gains an audio-format field).
+                if let (Some(em), Some(ep)) =
+                    (emitter.as_ref(), snapshot.as_ref())
+                {
+                    em.update_stream_format(&ep.format, None).await;
+                }
                 if endpoints_tx.send(snapshot).is_err() {
                     // Receiver side dropped — nobody reads
                     // these snapshots anymore. The plugin
@@ -1594,17 +1632,27 @@ impl Plugin for MpdPlaybackPlugin {
             // handles the steward supplied. The Arcs are cloned
             // cheaply; the emitter clones them again per custody
             // (one clone per spawn() call).
-            self.subject_emitter = Some(SubjectEmitter::new(
+            let emitter = SubjectEmitter::new(
                 Arc::clone(&ctx.subject_announcer) as Arc<dyn SubjectAnnouncer>,
                 Arc::clone(&ctx.relation_announcer)
                     as Arc<dyn RelationAnnouncer>,
-            ));
+            );
+
+            // Announce the live stream_format subject once at
+            // load. The reactor's per-route-change update calls
+            // (set up via `spawn_reactor` below) drive the
+            // subject's state thereafter.
+            emitter.announce_stream_format().await;
+
+            self.subject_emitter = Some(emitter);
 
             // Spawn the route-change reactor and the
             // fragment-writer worker. The reactor watches
             // the framework's topology rewires; the worker
             // renders MPD's audio_output block and recycles
-            // MPD on every snapshot.
+            // MPD on every snapshot. The reactor also fans
+            // the format part of each endpoint snapshot into
+            // the `stream_format` subject's state.
             self.spawn_reactor().await?;
             self.spawn_fragment_worker().await?;
 

@@ -142,6 +142,7 @@ impl ReturnError {
 pub(crate) struct CapturingSubjectAnnouncer {
     announced: Mutex<Vec<SubjectAnnouncement>>,
     retracted: Mutex<Vec<(ExternalAddressing, Option<String>)>>,
+    state_updates: Mutex<Vec<(ExternalAddressing, serde_json::Value)>>,
     count: AtomicUsize,
     announce_return: Mutex<CaptureReturn>,
 }
@@ -151,6 +152,7 @@ impl Default for CapturingSubjectAnnouncer {
         Self {
             announced: Mutex::new(Vec::new()),
             retracted: Mutex::new(Vec::new()),
+            state_updates: Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
             announce_return: Mutex::new(CaptureReturn::Ok),
         }
@@ -177,6 +179,19 @@ impl CapturingSubjectAnnouncer {
     /// The Nth recorded announcement (zero-indexed), if any.
     pub(crate) fn at(&self, idx: usize) -> Option<SubjectAnnouncement> {
         self.announced.lock().unwrap().get(idx).cloned()
+    }
+
+    /// Total recorded `update_state` invocations.
+    pub(crate) fn state_update_count(&self) -> usize {
+        self.state_updates.lock().unwrap().len()
+    }
+
+    /// The Nth recorded `update_state` invocation (zero-indexed).
+    pub(crate) fn state_update_at(
+        &self,
+        idx: usize,
+    ) -> Option<(ExternalAddressing, serde_json::Value)> {
+        self.state_updates.lock().unwrap().get(idx).cloned()
     }
 }
 
@@ -211,11 +226,14 @@ impl SubjectAnnouncer for CapturingSubjectAnnouncer {
 
     fn update_state<'a>(
         &'a self,
-        _addressing: ExternalAddressing,
-        _state: serde_json::Value,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.state_updates.lock().unwrap().push((addressing, state));
+            Ok(())
+        })
     }
 }
 
