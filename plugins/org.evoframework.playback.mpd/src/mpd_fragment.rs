@@ -141,8 +141,19 @@ pub fn render_audio_output_fragment(
     let format_str = render_format_string(&ep.format)?;
     let device = ep.path.to_string_lossy();
     let mixer_block = render_mixer_block(mixer);
+    // Local Unix-domain control socket. The
+    // `emit_test_tone` course-correct verb opens a dedicated
+    // MPD connection here to dispatch `add file://...` +
+    // `play` — MPD's security model refuses local-file loads
+    // over TCP but allows them on the Unix socket. The
+    // supervisor's main connection stays on its configured
+    // endpoint; this socket carries the test-tone path only.
+    // MPD treats `bind_to_address` directives additively, so
+    // this layers the Unix socket alongside the main
+    // /etc/mpd.conf's TCP / localhost binds.
     Ok(format!(
-        "audio_output {{\n    \
+        "bind_to_address \"/run/mpd/socket\"\n\n\
+         audio_output {{\n    \
          type            \"alsa\"\n    \
          name            \"evo-device-audio\"\n    \
          device          \"{device}\"\n    \
@@ -287,6 +298,25 @@ mod tests {
         // brace so concatenation with neighbouring fragments
         // is well-formed.
         assert!(out.ends_with("}\n"));
+    }
+
+    /// The fragment emits a `bind_to_address` directive for the
+    /// local Unix-domain socket so the `emit_test_tone` verb
+    /// can dispatch `add file://...` + `play` against a
+    /// connection MPD trusts for local-file loads. Every
+    /// admitted topology lands this binding (it lives in the
+    /// per-topology fragment the warden writes).
+    #[test]
+    fn render_includes_unix_socket_bind_to_address() {
+        let ep = pcm_endpoint("hw:0,0", PcmCodec::PcmS16Le, 44_100, 2);
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
+        assert!(
+            out.contains("bind_to_address \"/run/mpd/socket\""),
+            "fragment must declare the Unix-socket bind so the \
+             test-tone verb has a local connection to dispatch \
+             file:// loads on; got:\n{out}"
+        );
     }
 
     #[test]
