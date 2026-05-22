@@ -135,7 +135,7 @@ use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
 use crate::config::PluginConfig;
-use crate::mpd::{ConnectTimeouts, MpdEndpoint};
+use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
 use crate::mpd_fragment::{
     atomic_write_fragment, render_audio_output_fragment, MixerConfig,
 };
@@ -235,6 +235,17 @@ const TEST_TONE_DURATION_MAX_MS: u32 = 10_000;
 /// one. Both-channels matches the most common operator intent
 /// ("verify the chain end-to-end").
 const TEST_TONE_DEFAULT_CHANNEL: &str = "both";
+
+/// Canonical Unix-domain-socket path the test-tone verb opens
+/// a dedicated MPD connection on. MPD's security model refuses
+/// `file://...` URI loads over TCP (the `Access to local files
+/// via TCP is not allowed` error class); the same loads are
+/// permitted on the local Unix socket. The distribution's
+/// bootstrap configures MPD to bind this path; if the operator
+/// runs a TCP-only MPD (no Unix socket configured), the verb
+/// refuses with a structured Permanent error naming the missing
+/// surface rather than failing opaquely against MPD's ack.
+const TEST_TONE_MPD_UNIX_SOCKET: &str = "/run/mpd/socket";
 
 /// Parse the embedded manifest into a [`Manifest`] struct.
 ///
@@ -1631,11 +1642,12 @@ fn parse_correction(
             Ok(PlaybackCommand::SetVolume(v))
         }
         "emit_test_tone" => {
-            // Parsed separately by the course_correct dispatch
-            // path so the synthesis + temp-file write happens
-            // before the supervisor command is built. Reaching
-            // this branch indicates a bug in the dispatcher; the
-            // verb is not a generic command-to-MPD mapping.
+            // course_correct routes this verb to the warden's
+            // dedicated `emit_test_tone` method BEFORE calling
+            // parse_correction. Reaching this branch indicates
+            // a dispatcher bug, not an operator-payload
+            // problem; surface the structured invariant
+            // refusal.
             Err(PluginError::Permanent(
                 "emit_test_tone parsed via dedicated dispatch \
                  path; parse_correction should not see it"
@@ -2107,22 +2119,39 @@ impl Warden for MpdPlaybackPlugin {
                 ));
             }
 
-            // emit_test_tone takes a dedicated dispatch path: the
-            // verb synthesises PCM bytes inside the warden,
-            // writes them to a temp WAV, and dispatches an
-            // internal LoadAndPlay to the supervisor. The
-            // synthesis is inline (single canonical runtime
-            // path); the supervisor's LoadAndPlay command
-            // remains unchanged.
-            let cmd = if correction.correction_type == "emit_test_tone" {
-                let path = self.prepare_test_tone(&correction).await?;
-                PlaybackCommand::LoadAndPlay(path)
-            } else {
-                // Parse first: a malformed correction fails with a
-                // clear "request was bad" signal before we ever
-                // touch the custody map or the supervisor.
-                parse_correction(&correction)?
-            };
+            // emit_test_tone takes a dedicated dispatch path:
+            // the verb synthesises the WAV inline + drives the
+            // MPD load+play sequence on a dedicated Unix-socket
+            // connection (MPD's security model refuses file://
+            // loads over TCP). The supervisor's main connection
+            // is untouched; MPD's idle subprotocol surfaces the
+            // new playing item to the supervisor as a normal
+            // state change.
+            if correction.correction_type == "emit_test_tone" {
+                // Confirm custody is held before dispatching —
+                // otherwise the operator would trigger MPD
+                // playback against a warden the framework hasn't
+                // routed.
+                let _ = self.custodies.get(&handle.id).ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "unknown custody handle: {}",
+                        handle.id
+                    ))
+                })?;
+                self.corrections_dispatched += 1;
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    handle = %handle.id,
+                    cid = correction.correlation_id,
+                    "emit_test_tone dispatching via Unix-socket side connection"
+                );
+                return self.emit_test_tone(&correction).await;
+            }
+
+            // Parse first: a malformed correction fails with a
+            // clear "request was bad" signal before we ever
+            // touch the custody map or the supervisor.
+            let cmd = parse_correction(&correction)?;
 
             let tracked = self.custodies.get(&handle.id).ok_or_else(|| {
                 PluginError::Permanent(format!(
@@ -2334,23 +2363,45 @@ impl MpdPlaybackPlugin {
         encode_simple_ok(req)
     }
 
-    /// Synthesise a sine-wave PCM WAV file for the requested
-    /// test tone and write it to a temp path the local MPD
-    /// daemon can play back. Returns the `file://` URI MPD's
-    /// `add` command accepts.
+    /// Synthesise the requested sine-wave PCM WAV, write it to
+    /// a temp file MPD can read, and dispatch the
+    /// `clear` + `add file://...` + `play` sequence over a
+    /// dedicated Unix-socket connection to MPD.
+    ///
+    /// The Unix-socket detour is required: MPD's security model
+    /// refuses `file://...` URI loads over TCP (`Access to local
+    /// files via TCP is not allowed`), the supervisor's main
+    /// connection is typically TCP, and the operator-facing
+    /// wiring-diagnostic contract pins this verb to "routes
+    /// through the SAME composition + delivery + DAC chain as
+    /// real playback". Opening a side Unix-socket connection
+    /// satisfies all three: the file load succeeds because MPD
+    /// treats local-socket access as trusted; the supervisor's
+    /// TCP queue ops stay on the TCP connection (no
+    /// connection-class change); the rendered audio still
+    /// traverses MPD's audio_output (the pcm.evo chain), which
+    /// is the same path real queue playback uses.
+    ///
+    /// Refusal contract: when `/run/mpd/socket` does not exist
+    /// or refuses connect, the verb returns a structured
+    /// Permanent error naming the missing Unix-socket surface
+    /// and pointing the operator at the distribution's
+    /// `bootstrap.sh` MPD-socket configuration — no silent
+    /// fallback, no opaque MPD-ack passthrough.
     ///
     /// The synthesis runs inline (in-process, no subprocess) so
     /// the operator-gesture latency is bounded by serialisation
-    /// plus `tokio::fs::write`. The WAV header carries a stable
-    /// 44100 Hz / 16-bit / stereo format (universal DAC support
-    /// without bit-perfect risk; if the operator's chain is
-    /// configured for bit-perfect with a non-44100 source, the
-    /// test tone deliberately exercises the format-conversion
-    /// path — the wiring-diagnostic intent stays intact).
-    async fn prepare_test_tone(
+    /// plus `tokio::fs::write` plus the Unix-socket handshake.
+    /// The WAV header carries a stable 44100 Hz / 16-bit /
+    /// stereo format (universal DAC support; if the operator's
+    /// chain is configured for bit-perfect with a non-44100
+    /// source, the test tone deliberately exercises the
+    /// format-conversion path — the wiring-diagnostic intent
+    /// stays intact).
+    async fn emit_test_tone(
         &self,
         correction: &CourseCorrection,
-    ) -> Result<String, PluginError> {
+    ) -> Result<(), PluginError> {
         let payload: TestTonePayload =
             serde_json::from_slice(&correction.payload).map_err(|e| {
                 PluginError::Permanent(format!(
@@ -2406,14 +2457,77 @@ impl MpdPlaybackPlugin {
                 path, e
             ))
         })?;
-        // MPD's `add` accepts the file:// URI scheme when MPD's
-        // `file` input plugin is enabled (default on stock MPD
-        // builds, including the reference distribution's). If
-        // the operator's MPD configuration omits the input
-        // plugin, the supervisor's LoadAndPlay surfaces an Ack
-        // error with MPD's verbatim refusal — explicit failure
-        // semantics at the wiring-diagnostic surface.
-        Ok(format!("file://{}", path))
+        // Make the temp file world-readable so the MPD daemon
+        // (running as the `mpd` user) can read it. The /tmp
+        // directory is sticky; only the owner can unlink.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o644);
+            tokio::fs::set_permissions(&path, perms)
+                .await
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "emit_test_tone chmod 0644 on {} failed: {}",
+                        path, e
+                    ))
+                })?;
+        }
+
+        // Dedicated Unix-socket connection. The supervisor's main
+        // connection is untouched (it stays on its configured
+        // TCP / Unix endpoint and continues serving queue ops);
+        // this side connection exists only for the duration of
+        // the test-tone dispatch.
+        if !std::path::Path::new(TEST_TONE_MPD_UNIX_SOCKET).exists() {
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone refused: MPD Unix socket {} does \
+                 not exist on this host. MPD's security model \
+                 refuses file:// loads over TCP, so the test \
+                 tone requires the local Unix socket. The \
+                 distribution's bootstrap.sh configures this; \
+                 enable it and restart mpd to land the surface.",
+                TEST_TONE_MPD_UNIX_SOCKET
+            )));
+        }
+        let unix_endpoint = MpdEndpoint::unix(TEST_TONE_MPD_UNIX_SOCKET)
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "emit_test_tone Unix-endpoint construction failed \
+                     for {}: {:?}",
+                    TEST_TONE_MPD_UNIX_SOCKET, e
+                ))
+            })?;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(unix_endpoint, self.timeouts)
+                .await
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "emit_test_tone Unix-socket connect failed: {e}"
+                    ))
+                })?;
+        // Three-step sequence — clear so the test tone replaces
+        // any prior queue content, add the file:// URI (allowed
+        // on the Unix socket), play. Any MPD ack surfaces as a
+        // structured Permanent error.
+        conn.clear().await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "emit_test_tone MPD clear failed: {e}"
+            ))
+        })?;
+        let file_uri = format!("file://{}", path);
+        conn.add(&file_uri).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "emit_test_tone MPD add ({}) failed: {e}",
+                file_uri
+            ))
+        })?;
+        conn.play().await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "emit_test_tone MPD play failed: {e}"
+            ))
+        })?;
+        Ok(())
     }
 
     /// Pick the active custody's supervisor.
