@@ -1855,6 +1855,44 @@ impl PlaybackOptionsPlugin {
 
         self.emit_lifecycle_started(from, to).await;
 
+        // Step 1.5 — pre-subscribe to envelope_observed BEFORE
+        // any envelope_requested publish. The substrate
+        // broadcasts state updates synchronously to active
+        // receivers (its in-memory broadcast precedes the
+        // durable + happening emit chain — see
+        // `publish_envelope_requested`'s comment block); a
+        // publish-then-subscribe pattern races the warden's
+        // response broadcast against the orchestrator's
+        // subscribe, and on every first gesture where the
+        // warden's fanout outruns the subscribe the broadcast
+        // is lost to a not-yet-registered receiver. The
+        // orchestrator's `await_envelope_ack` then waits its
+        // full `ENVELOPE_ACK_TIMEOUT` for an ack that already
+        // came and went, then routes to the rollback chain —
+        // the operator sees "Audio mode change reverted" with
+        // an `envelope ack timeout` reason.
+        //
+        // `ensure_envelope_observed_channel` is idempotent:
+        //
+        //   * `Ok(Some(_))` — channel cached for the plugin
+        //     lifetime; subsequent transitions read from the
+        //     same long-lived receiver. The cache is populated
+        //     on first success here and reused at every
+        //     subsequent `await_envelope_ack` invocation.
+        //   * `Ok(None)`  — no warden has announced its
+        //     `envelope_observed` subject; the orchestrator
+        //     runs in advisory-only mode. Does NOT cache, so
+        //     the next gesture re-attempts the resolve once
+        //     the warden lands.
+        //   * `Err(e)`    — substrate failure. The transition
+        //     rolls back at phase `pre_subscribe` — the
+        //     `started` happening is already emitted, so the
+        //     lifecycle invariant (`started` → `rolled_back`
+        //     xor `applied` xor `failed`) is preserved.
+        if let Err(e) = self.ensure_envelope_observed_channel().await {
+            return self.rollback_or_fail(from, to, "pre_subscribe", e).await;
+        }
+
         // Step 1 — read carried level. Baseline: the operator's
         // configured startup-volume floor (deterministic; same
         // across both authorities). Cross-plugin live-volume
@@ -4920,6 +4958,249 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let requests = envelope_requested_publishes(&announcer);
         assert_eq!(requests.len(), 2);
+    }
+
+    // ----- envelope publish-vs-subscribe ordering regression -----
+    //
+    // Wrapper announcer that synchronously publishes
+    // envelope_observed onto the supplied subscriber whenever the
+    // orchestrator publishes envelope_requested. Models a fast
+    // in-substrate warden that responds inside the same
+    // tokio::spawn cycle the orchestrator's publish task runs in.
+    #[derive(Clone)]
+    struct SyncAckAnnouncer {
+        inner: Arc<CapturingAnnouncer>,
+        subscriber: StubStateSubscriber,
+        observed_cid: String,
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAnnouncer for SyncAckAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            announcement: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.inner.announce(announcement)
+        }
+
+        fn retract<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.inner.retract(addressing, reason)
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let inner = Arc::clone(&self.inner);
+            let subscriber = self.subscriber.clone();
+            let observed_cid = self.observed_cid.clone();
+            let addressing_clone = addressing.clone();
+            let state_clone = state.clone();
+            Box::pin(async move {
+                inner.update_state(addressing, state).await?;
+                if addressing_clone.scheme == ENVELOPE_SCHEME
+                    && addressing_clone.value == ENVELOPE_REQUESTED_VALUE
+                {
+                    if let Ok(req) =
+                        serde_json::from_value::<EnvelopeRequested>(state_clone)
+                    {
+                        if req.generation > 0 {
+                            let observed = EnvelopeObserved {
+                                v: ENVELOPE_PAYLOAD_VERSION,
+                                generation: req.generation,
+                                observed_state: req.requested_state,
+                                observed_at_ms: 0,
+                            };
+                            if let Ok(payload) = serde_json::to_value(&observed)
+                            {
+                                subscriber.publish(&observed_cid, payload);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    // Wrapper subscriber that delays subscribe_subject by a
+    // configurable interval before delegating to the inner
+    // stub. Models substrate-roundtrip cost of resolving + wiring
+    // a subscriber against the real subject registry.
+    #[derive(Clone)]
+    struct DelayedSubscribeSubscriber {
+        inner: StubStateSubscriber,
+        subscribe_delay: Duration,
+    }
+
+    impl evo_plugin_sdk::contract::SubjectStateSubscriber
+        for DelayedSubscribeSubscriber
+    {
+        fn subscribe_subject<'a>(
+            &'a self,
+            canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<SubjectStateStream, ReportError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let inner = self.inner.clone();
+            let delay = self.subscribe_delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                inner.subscribe_subject(canonical_id).await
+            })
+        }
+
+        fn current_state<'a>(
+            &'a self,
+            canonical_id: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<serde_json::Value>, ReportError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let inner = self.inner.clone();
+            Box::pin(async move { inner.current_state(canonical_id).await })
+        }
+    }
+
+    #[tokio::test]
+    async fn env_first_gesture_must_not_lose_observed_to_subscribe_race() {
+        // REGRESSION: The orchestrator MUST subscribe to
+        // envelope_observed BEFORE publishing envelope_requested.
+        //
+        // Production substrate broadcasts state updates
+        // synchronously to active subscribers; a tokio
+        // broadcast::Receiver registered AFTER a send() does NOT
+        // see the prior send. If the orchestrator publishes
+        // envelope_requested first and the warden's response
+        // broadcast happens before the orchestrator has
+        // registered a subscriber, the broadcast is lost and the
+        // orchestrator's await times out — producing the
+        // operator-visible "Audio mode change reverted" with
+        // "envelope ack timeout after 5000ms" cited in
+        // [`Self::await_envelope_ack`].
+        //
+        // This test deterministically reproduces the production
+        // timing with no reliance on scheduler luck:
+        //
+        //   1. Slow-subscribe subscriber (200ms delay in
+        //      subscribe_subject) models the substrate-roundtrip
+        //      cost of a real subscribe.
+        //   2. Sync-ack announcer wrapper synchronously publishes
+        //      envelope_observed inside the orchestrator's own
+        //      envelope_requested update_state — models the
+        //      warden's fast in-substrate fanout response.
+        //
+        // With the CURRENT `publish then subscribe` ordering, the
+        // ack broadcast happens BEFORE the orchestrator's subscribe
+        // completes; the broadcast is lost; await_envelope_ack
+        // times out. With the FIXED `subscribe then publish`
+        // ordering, the orchestrator's receiver is registered
+        // before the warden can respond, so the ack arrives on
+        // the active stream and the gesture completes.
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join(STATE_FILENAME);
+
+        let inner_announcer = Arc::new(CapturingAnnouncer::default());
+        let inner_subscriber = StubStateSubscriber::default();
+        let querier = StubQuerier::default();
+        querier.register(
+            &ExternalAddressing {
+                scheme: ENVELOPE_SCHEME.to_string(),
+                value: ENVELOPE_OBSERVED_VALUE.to_string(),
+            },
+            OBSERVED_CID,
+        );
+
+        let sync_ack = SyncAckAnnouncer {
+            inner: Arc::clone(&inner_announcer),
+            subscriber: inner_subscriber.clone(),
+            observed_cid: OBSERVED_CID.to_string(),
+        };
+        let delayed_subscriber = DelayedSubscribeSubscriber {
+            inner: inner_subscriber.clone(),
+            subscribe_delay: Duration::from_millis(200),
+        };
+
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(state_path)
+            .with_envelope_ack_timeout_override(Duration::from_millis(500));
+        p.happening_emitter = Some(Arc::new(CapturingEmitter::default()));
+        p.subject_announcer =
+            Some(Arc::new(sync_ack) as Arc<dyn SubjectAnnouncer>);
+        p.subject_state_subscriber = Some(
+            Arc::new(delayed_subscriber) as Arc<dyn SubjectStateSubscriber>
+        );
+        p.subject_querier = Some(Arc::new(querier) as Arc<dyn SubjectQuerier>);
+        p.loaded = true;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            p.handle_request(&req(
+                "options.set_mixer_type",
+                json!({ "v": 1, "value": "none" }),
+            )),
+        )
+        .await
+        .expect("test framework: gesture must complete within 3s");
+
+        let resp = result.expect(
+            "first mixer-type gesture must NOT race-lose the warden's \
+             envelope_observed ack — orchestrator must subscribe BEFORE \
+             publishing envelope_requested so the warden's response \
+             arrives on an active receiver, not into a closed broadcast",
+        );
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(
+            v["status"], "ok",
+            "first gesture must complete with status=ok despite realistic \
+             publish-vs-subscribe timing"
+        );
+
+        // Both publishes happened (muted then unmuted) — proves
+        // the full state machine ran to completion, not just
+        // step 2. Drain backgrounded publish tasks before the
+        // capture readout.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let requests = envelope_requested_publishes(&inner_announcer);
+        assert_eq!(
+            requests.len(),
+            2,
+            "full state machine must run: muted + unmuted (got: {requests:?})"
+        );
+        assert_eq!(requests[0].requested_state, EnvelopeState::Muted);
+        assert_eq!(requests[1].requested_state, EnvelopeState::Unmuted);
     }
 
     #[tokio::test]
