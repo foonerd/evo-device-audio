@@ -139,6 +139,7 @@ OOP_PLUGINS=(
     "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:"
     "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
     "org.evoframework.multiroom.evo-native:org-evoframework-multiroom-evo-native:multiroom-evo-native-wire:alsa-substrate"
+    "org.evoframework.system.power:org-evoframework-system-power:system-power-wire:"
 )
 
 DIST_BIN="evo-device-audio"
