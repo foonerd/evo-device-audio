@@ -96,8 +96,8 @@ use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HappeningEmitter, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, PluginIdentity, Request,
     Respondent, Response, RuntimeCapabilities, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectQuerier, SubjectStateStreamError,
-    SubjectStateSubscriber,
+    SubjectAnnouncer, SubjectQuerier, SubjectStateStream,
+    SubjectStateStreamError, SubjectStateSubscriber,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -513,7 +513,51 @@ pub struct PlaybackOptionsPlugin {
     /// the outer-budget recovery path overrides with a sub-
     /// second duration.
     transition_overall_timeout_override: Option<Duration>,
+    /// Cached envelope_observed channel — the warden's
+    /// canonical id + the long-lived state-stream the
+    /// orchestrator reads on every transition's mute and
+    /// unmute steps.
+    ///
+    /// **Architectural invariant: resolved + subscribed
+    /// exactly once per plugin lifetime.** Per-transition
+    /// resolve_addressing + subscribe_subject are eliminated
+    /// — those calls pay substrate-roundtrip cost on every
+    /// gesture and are the cascade entry point for
+    /// substrate slowness. The first `set_mixer_type` after
+    /// warden admission resolves + caches; every subsequent
+    /// transition reuses the cached channel and pays only
+    /// the recv-loop cost (one broadcast read + a generation
+    /// filter against the warden's reply).
+    ///
+    /// `Option<Arc<...>>` so the lazy-init path is race-safe
+    /// under the orchestrator's transition lock (the inner
+    /// Mutex wraps the stream for serialised recv access).
+    /// Pre-warden transitions return `Ok(None)` and the
+    /// orchestrator runs in advisory-only mode (legacy
+    /// behavior preserved); init does not cache a `None`
+    /// outcome, so a warden admitting AFTER the first
+    /// transition is picked up by the next transition's
+    /// init attempt.
+    envelope_observed_channel:
+        tokio::sync::Mutex<Option<Arc<EnvelopeObservedChannel>>>,
     requests_handled: u64,
+}
+
+/// Cached envelope_observed channel reused across mixer-
+/// transition gestures. See
+/// [`PlaybackOptionsPlugin::envelope_observed_channel`] for
+/// the architectural invariant.
+struct EnvelopeObservedChannel {
+    /// Warden's canonical subject id for the
+    /// envelope_observed subject. Cached after the one-time
+    /// resolve at first-transition lazy init.
+    canonical_id: String,
+    /// Long-lived state-update stream. Wrapped in a
+    /// `tokio::sync::Mutex` so the orchestrator's transition
+    /// lock (which already serialises transitions) is the
+    /// only contention point; the inner mutex's lock is
+    /// acquired and released per transition.
+    stream: tokio::sync::Mutex<SubjectStateStream>,
 }
 
 impl PlaybackOptionsPlugin {
@@ -532,6 +576,7 @@ impl PlaybackOptionsPlugin {
             envelope_ack_timeout_override: None,
             subject_publish_timeout_override: None,
             transition_overall_timeout_override: None,
+            envelope_observed_channel: tokio::sync::Mutex::new(None),
             requests_handled: 0,
         }
     }
@@ -969,47 +1014,49 @@ impl PlaybackOptionsPlugin {
         Ok(generation)
     }
 
-    /// Await the warden's envelope_observed acknowledgement
-    /// matching `(generation, expected_state)` within
-    /// [`ENVELOPE_ACK_TIMEOUT`]. Subscribes via
-    /// `subject_state_subscriber` + uses `subject_querier`
-    /// to resolve the warden's canonical id.
+    /// Resolve + subscribe the warden's envelope_observed
+    /// channel ONCE, cache it on the plugin, return the cached
+    /// handle on subsequent calls.
     ///
-    /// Three terminal outcomes:
+    /// **Architectural Fix #2 entry point.** Per-transition
+    /// resolve+subscribe is eliminated — those calls pay
+    /// substrate-roundtrip cost on every gesture and are the
+    /// cascade entry point for substrate slowness. The first
+    /// call after warden admission resolves + caches; every
+    /// subsequent call returns the cached handle in O(1).
     ///
-    /// * `Ok(())` — ack received within timeout (envelope
-    ///   honoured by a participating warden).
-    /// * `Ok(())` — addressing resolves to None (no warden
-    ///   participating; advisory mode). Logged at debug.
-    ///   This is NOT silent failure — the absence of a
-    ///   playback warden means no audio chain to protect.
-    ///   When a warden IS admitted the orchestrator
-    ///   gracefully escalates back to the await path.
-    /// * `Err(reason)` — subscribe failed, stream closed,
-    ///   or timeout exceeded. The orchestrator routes this
-    ///   to the rollback chain.
-    async fn await_envelope_ack(
+    /// Return values:
+    ///
+    /// - `Ok(Some(channel))` — channel cached + ready for recv.
+    /// - `Ok(None)` — no warden announced (advisory-only mode);
+    ///   does NOT cache the None, so a warden admitting later
+    ///   is picked up by the next call.
+    /// - `Err(reason)` — substrate error during resolve or
+    ///   subscribe; does NOT cache; next call retries.
+    async fn ensure_envelope_observed_channel(
         &self,
-        generation: u64,
-        expected_state: EnvelopeState,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Arc<EnvelopeObservedChannel>>, String> {
+        {
+            let guard = self.envelope_observed_channel.lock().await;
+            if let Some(channel) = guard.as_ref() {
+                return Ok(Some(Arc::clone(channel)));
+            }
+        }
         let Some(subscriber) = self.subject_state_subscriber.as_ref() else {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 "subject_state_subscriber unpopulated; safety envelope \
-                 advisory-only for this transition"
+                 advisory-only"
             );
-            return Ok(());
+            return Ok(None);
         };
         let Some(querier) = self.subject_querier.as_ref() else {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
-                "subject_querier unpopulated; safety envelope advisory-only \
-                 for this transition"
+                "subject_querier unpopulated; safety envelope advisory-only"
             );
-            return Ok(());
+            return Ok(None);
         };
-
         let canonical_id = match querier
             .resolve_addressing(Self::envelope_observed_addressing())
             .await
@@ -1018,11 +1065,11 @@ impl PlaybackOptionsPlugin {
             Ok(None) => {
                 tracing::debug!(
                     plugin = PLUGIN_NAME,
-                    "envelope_observed subject not yet announced (no \
-                     participating playback warden); safety envelope \
-                     advisory-only for this transition"
+                    "envelope_observed subject not yet announced; safety \
+                     envelope advisory-only for this transition (will retry \
+                     init on next gesture)"
                 );
-                return Ok(());
+                return Ok(None);
             }
             Err(e) => {
                 return Err(format!(
@@ -1030,28 +1077,70 @@ impl PlaybackOptionsPlugin {
                 ));
             }
         };
-
-        let mut stream = subscriber
-            .subscribe_subject(canonical_id.clone())
-            .await
-            .map_err(|e| format!("subscribe envelope_observed: {e:?}"))?;
-
-        // Seed with current_state — the warden may already
-        // have published a matching ack between our publish
-        // call and this subscribe (would be a stale ack from
-        // a previous generation, but check for completeness).
-        if let Ok(Some(state)) = subscriber.current_state(canonical_id).await {
-            if let Some(obs) = parse_envelope_observed(&state) {
-                if observation_matches(&obs, generation, expected_state) {
-                    return Ok(());
-                }
-            }
+        let stream =
+            subscriber
+                .subscribe_subject(canonical_id.clone())
+                .await
+                .map_err(|e| format!("subscribe envelope_observed: {e:?}"))?;
+        let channel = Arc::new(EnvelopeObservedChannel {
+            canonical_id: canonical_id.clone(),
+            stream: tokio::sync::Mutex::new(stream),
+        });
+        let mut guard = self.envelope_observed_channel.lock().await;
+        // Race-safe insert: another caller may have raced past
+        // the initial cache miss and resolved first; if so, use
+        // its channel rather than ours.
+        if guard.is_none() {
+            *guard = Some(Arc::clone(&channel));
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                canonical_id = %canonical_id,
+                "envelope_observed channel resolved + subscribed (cached \
+                 for the plugin's lifetime; subsequent transitions reuse)"
+            );
         }
+        Ok(guard.as_ref().map(Arc::clone))
+    }
 
+    /// Await the warden's envelope_observed acknowledgement
+    /// matching `(generation, expected_state)` within
+    /// [`ENVELOPE_ACK_TIMEOUT`]. Reads from the cached
+    /// long-lived channel established by
+    /// [`Self::ensure_envelope_observed_channel`]; per-
+    /// transition substrate roundtrips are eliminated.
+    ///
+    /// Outcomes:
+    ///
+    /// - `Ok(())` — ack received within budget (warden
+    ///   participating + responded).
+    /// - `Ok(())` — addressing resolves to None (no
+    ///   participating warden; advisory mode). Logged at
+    ///   debug. Absence of a playback warden means no audio
+    ///   chain to protect; when a warden admits later the
+    ///   next transition's lazy init picks it up.
+    /// - `Err(reason)` — stream closed before ack OR the
+    ///   recv-loop timeout fired. The orchestrator routes
+    ///   to the rollback chain.
+    async fn await_envelope_ack(
+        &self,
+        generation: u64,
+        expected_state: EnvelopeState,
+    ) -> Result<(), String> {
+        let Some(channel) = self.ensure_envelope_observed_channel().await?
+        else {
+            // Advisory-only: no warden participating, or the
+            // warden has not yet announced. The orchestrator
+            // proceeds without a confirmed ack; the transition's
+            // safety story is reduced to the operator's own
+            // gesture-level confirmation. Legacy behavior
+            // preserved.
+            return Ok(());
+        };
         let timeout = self
             .envelope_ack_timeout_override
             .unwrap_or(ENVELOPE_ACK_TIMEOUT);
         let result = tokio::time::timeout(timeout, async {
+            let mut stream = channel.stream.lock().await;
             loop {
                 match stream.recv().await {
                     Ok(update) => {
@@ -1069,10 +1158,11 @@ impl PlaybackOptionsPlugin {
                     }
                     Err(SubjectStateStreamError::Lagged { .. }) => continue,
                     Err(SubjectStateStreamError::Closed) => {
-                        return Err(
-                            "envelope_observed stream closed before ack"
-                                .to_string(),
-                        );
+                        return Err(format!(
+                            "envelope_observed stream closed before ack \
+                             (canonical_id={})",
+                            channel.canonical_id
+                        ));
                     }
                 }
             }
@@ -1821,24 +1911,48 @@ impl PlaybackOptionsPlugin {
         .await;
     }
 
+    /// Emit one mixer-transition lifecycle happening.
+    ///
+    /// **Off-critical-path by construction.** Lifecycle records
+    /// are observability output — the operator's success/failure
+    /// outcome is determined by code flow through
+    /// `run_mixer_transition`, not by whether the happenings bus
+    /// accepts a record. Awaiting the bus's emit on the
+    /// orchestrator's critical path makes substrate slowness
+    /// cascade into the transition budget; the orchestrator must
+    /// not hold open `&mut self` waiting for an observability
+    /// write. The implementation spawns the emit as a detached
+    /// task and returns immediately. Errors surface in the
+    /// detached task's tracing output; the orchestrator's
+    /// outcome is unaffected.
+    ///
+    /// The function keeps its `async` signature so call sites
+    /// composing with `.await` need no signature churn, but the
+    /// body performs no awaits before returning — `.await` on
+    /// the returned future resolves on the next poll.
     async fn emit_lifecycle(
         &self,
         event_type: &str,
         payload: serde_json::Value,
     ) {
-        if let Some(emitter) = self.happening_emitter.as_ref() {
-            if let Err(e) = emitter
-                .emit_plugin_event(event_type.to_string(), payload)
-                .await
+        let Some(emitter) = self.happening_emitter.as_ref() else {
+            return;
+        };
+        let emitter = Arc::clone(emitter);
+        let event_type = event_type.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                emitter.emit_plugin_event(event_type.clone(), payload).await
             {
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
-                    event_type = event_type,
+                    event_type = %event_type,
                     error = %e,
-                    "emit mixer-transition lifecycle happening failed"
+                    "emit mixer-transition lifecycle happening failed \
+                     (detached)"
                 );
             }
-        }
+        });
     }
 
     async fn handle_set_dop(
@@ -2533,6 +2647,11 @@ mod tests {
         // addressing.value → canonical_id; addressing.scheme
         // ignored for the test surface.
         map: Arc<Mutex<HashMap<String, String>>>,
+        // Per-call counter so structural tests can assert the
+        // orchestrator's architectural invariant: resolve is
+        // called exactly once per plugin lifetime, not per
+        // transition.
+        resolve_calls: Arc<AtomicU64>,
     }
 
     impl StubQuerier {
@@ -2545,6 +2664,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(addressing.value.clone(), canonical_id.to_string());
+        }
+
+        fn resolve_call_count(&self) -> u64 {
+            self.resolve_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -2567,6 +2690,7 @@ mod tests {
             >,
         > {
             let map = Arc::clone(&self.map);
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 Ok(map.lock().unwrap().get(&addressing.value).cloned())
             })
@@ -2618,6 +2742,17 @@ mod tests {
     #[derive(Default, Clone)]
     struct StubStateSubscriber {
         inner: Arc<Mutex<StubSubscriberInner>>,
+        // Per-call counter so structural tests can assert the
+        // orchestrator's architectural invariant: subscribe is
+        // called exactly once per plugin lifetime, not per
+        // transition.
+        subscribe_calls: Arc<AtomicU64>,
+    }
+
+    impl StubStateSubscriber {
+        fn subscribe_call_count(&self) -> u64 {
+            self.subscribe_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[derive(Default)]
@@ -2672,6 +2807,7 @@ mod tests {
                     + 'a,
             >,
         > {
+            self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
             let inner = Arc::clone(&self.inner);
             Box::pin(async move {
                 let mut guard = inner.lock().unwrap();
@@ -3970,5 +4106,103 @@ mod tests {
         );
         let v: Value = serde_json::from_slice(&resp.payload).unwrap();
         assert_eq!(v["v"], 1);
+    }
+
+    // ---------------------------------------------------------
+    // Architectural invariant: envelope_observed channel
+    // resolved + subscribed EXACTLY ONCE per plugin lifetime,
+    // not per transition.
+    //
+    // Root cause this test pins: prior to the architectural
+    // refactor, every `set_mixer_type` walked
+    // resolve_addressing → subscribe_subject → current_state
+    // from scratch — three substrate round trips per gesture.
+    // When the substrate slowed, each transition stalled
+    // waiting on those calls; the per-call timeouts added
+    // were band-aids that did not address the architectural
+    // defect.
+    //
+    // The fix: resolve + subscribe lazily on first transition,
+    // cache the channel, reuse on every subsequent transition.
+    // Per-transition cost drops to a recv-loop + generation
+    // filter.
+    //
+    // This test drives multiple transitions through one plugin
+    // instance and asserts the stubs observed resolve+subscribe
+    // exactly once.
+    #[tokio::test]
+    async fn envelope_channel_resolved_and_subscribed_exactly_once_across_transitions(
+    ) {
+        const OBSERVED_CID: &str = "stub-envelope-observed-cid";
+        let (mut p, announcer, subscriber, querier, _dir) =
+            envelope_wired_plugin().await;
+
+        // Drive three full transitions. The orchestrator's
+        // mute + unmute steps each consult the envelope_observed
+        // channel, so absent the fix the stubs would observe
+        // 3 × 2 = 6 resolve calls + 6 subscribe calls. With the
+        // architectural fix they MUST observe exactly 1 of each.
+        let subscriber_clone = subscriber.clone();
+        let announcer_clone = Arc::clone(&announcer);
+        let ack_task = tokio::spawn(async move {
+            // Match every envelope_requested with a matching
+            // envelope_observed ack. Loops until every
+            // requested has been acked.
+            let mut acked = 0_usize;
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let pubs = envelope_requested_publishes(&announcer_clone);
+                while acked < pubs.len() {
+                    let req = &pubs[acked];
+                    subscriber_clone.publish(
+                        OBSERVED_CID,
+                        envelope_observed_state(
+                            req.generation,
+                            req.requested_state,
+                        ),
+                    );
+                    acked += 1;
+                }
+                if acked >= 6 {
+                    break;
+                }
+            }
+        });
+
+        // none → software (no-op? depends on default). Let the
+        // helper return the actual starting value; we choose
+        // three target values to force at least two real
+        // transitions whatever the start was.
+        for target in ["software", "none", "software"] {
+            let res = p
+                .handle_request(&req(
+                    "options.set_mixer_type",
+                    json!({ "v": 1, "value": target }),
+                ))
+                .await;
+            assert!(
+                res.is_ok(),
+                "transition to {target} must succeed; got {res:?}"
+            );
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), ack_task).await;
+
+        let resolve_calls = querier.resolve_call_count();
+        let subscribe_calls = subscriber.subscribe_call_count();
+
+        assert_eq!(
+            resolve_calls, 1,
+            "architectural invariant violated: resolve_addressing called \
+             {resolve_calls} times across three transitions; must be \
+             exactly 1 (cached channel re-used across the plugin's \
+             lifetime, not re-resolved per transition)"
+        );
+        assert_eq!(
+            subscribe_calls, 1,
+            "architectural invariant violated: subscribe_subject called \
+             {subscribe_calls} times across three transitions; must be \
+             exactly 1"
+        );
     }
 }
