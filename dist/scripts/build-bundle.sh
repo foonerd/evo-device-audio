@@ -244,6 +244,20 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 fi
+# Placement primitive. evo-install.sh delegates all /etc
+# placement (asound.conf substitution, sudoers, drop-ins,
+# plugins.d defaults, mpd include, trust roots, avahi disable)
+# to bootstrap.sh inside the staged bundle. One canonical
+# placement primitive eliminates the parallel-truth-path
+# regression class. The lib/ directory carries the sourced
+# helper modules bootstrap.sh expects to find (currently
+# detect-audio-card.sh).
+install -d -m 0755 "${STAGE_DIR}/dist/scripts"
+install -m 0755 "${REPO_ROOT}/dist/scripts/bootstrap.sh" \
+    "${STAGE_DIR}/dist/scripts/bootstrap.sh"
+install -d -m 0755 "${STAGE_DIR}/dist/scripts/lib"
+cp -a "${REPO_ROOT}/dist/scripts/lib/." \
+    "${STAGE_DIR}/dist/scripts/lib/"
 # ALSA + MPD reference configs.
 install -d -m 0755 "${STAGE_DIR}/dist/alsa"
 cp -a "${REPO_ROOT}/dist/alsa/." "${STAGE_DIR}/dist/alsa/"

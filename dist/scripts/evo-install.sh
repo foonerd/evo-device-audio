@@ -123,6 +123,19 @@ EVO_ACCEPTANCE_SIGNING_KEY="${EVO_ACCEPTANCE_SIGNING_KEY:-}"
 
 # -------- Argument parsing --------
 MODE="install"
+# Flags relayed to bootstrap.sh's placement primitive. evo-
+# install.sh delegates ALL /etc placement (asound.conf,
+# sudoers, systemd drop-ins, mpd include, plugins.d defaults,
+# trust roots, asound.d, modder dirs) to bootstrap.sh — these
+# variables travel with the call. Empty values are dropped at
+# call time; bootstrap.sh applies its own per-flag defaults.
+EVO_INSTALL_AUDIO_CARD=""
+MULTIROOM_ROLE=""
+MULTIROOM_GROUP_ID=""
+MULTIROOM_SOURCE_PCM=""
+MULTIROOM_ALSA_PCM=""
+MULTIROOM_GROUP_MEMBERS=""
+MULTIROOM_GROUP_MEMBER_ADDRESSES=""
 print_usage() {
     sed -n '2,90p' "$0" >&2
 }
@@ -141,6 +154,34 @@ while [[ $# -gt 0 ]]; do
             MODE="$2"
             shift 2
             ;;
+        --card)
+            EVO_INSTALL_AUDIO_CARD="$2" ; shift 2 ;;
+        --card=*)
+            EVO_INSTALL_AUDIO_CARD="${1#--card=}" ; shift ;;
+        --multiroom-role)
+            MULTIROOM_ROLE="$2" ; shift 2 ;;
+        --multiroom-role=*)
+            MULTIROOM_ROLE="${1#--multiroom-role=}" ; shift ;;
+        --multiroom-group-id)
+            MULTIROOM_GROUP_ID="$2" ; shift 2 ;;
+        --multiroom-group-id=*)
+            MULTIROOM_GROUP_ID="${1#--multiroom-group-id=}" ; shift ;;
+        --multiroom-source-pcm)
+            MULTIROOM_SOURCE_PCM="$2" ; shift 2 ;;
+        --multiroom-source-pcm=*)
+            MULTIROOM_SOURCE_PCM="${1#--multiroom-source-pcm=}" ; shift ;;
+        --multiroom-alsa-pcm)
+            MULTIROOM_ALSA_PCM="$2" ; shift 2 ;;
+        --multiroom-alsa-pcm=*)
+            MULTIROOM_ALSA_PCM="${1#--multiroom-alsa-pcm=}" ; shift ;;
+        --multiroom-group-members)
+            MULTIROOM_GROUP_MEMBERS="$2" ; shift 2 ;;
+        --multiroom-group-members=*)
+            MULTIROOM_GROUP_MEMBERS="${1#--multiroom-group-members=}" ; shift ;;
+        --multiroom-group-member-addresses)
+            MULTIROOM_GROUP_MEMBER_ADDRESSES="$2" ; shift 2 ;;
+        --multiroom-group-member-addresses=*)
+            MULTIROOM_GROUP_MEMBER_ADDRESSES="${1#--multiroom-group-member-addresses=}" ; shift ;;
         -h|--help)
             print_usage
             exit 0
@@ -461,61 +502,65 @@ place_opt_evo() {
     rm -f "${tmp_cat}"
 }
 
-place_etc_evo() {
-    install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" /etc/evo /etc/evo/plugins.d
-    install -d -m 0755 -o root -g root /etc/evo/trust.d
-    local pem
-    for pem in "${STAGE_DIR}/dist/keys/"*.pem "${STAGE_DIR}/dist/keys/"*.meta.toml; do
-        [[ -f "$pem" ]] || continue
-        install -m 0644 -o root -g root "$pem" "/etc/evo/trust.d/$(basename "$pem")"
-    done
-    if [[ ! -f /etc/evo/mpd.conf ]]; then
-        install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
-            /dev/null /etc/evo/mpd.conf
-    fi
-    if [[ -f "${STAGE_DIR}/dist/etc-evo/client_acl.toml" ]]; then
-        install -m 0644 -o root -g root \
-            "${STAGE_DIR}/dist/etc-evo/client_acl.toml" \
-            /etc/evo/client_acl.toml
-    fi
-}
-
-install_systemd() {
+install_main_systemd_unit() {
+    # Main evo.service unit lives at /etc/systemd/system/evo.service.
+    # bootstrap.sh handles only the .d/ drop-ins (exec-start.conf etc.);
+    # the main unit is bundled with the steward and applied here so
+    # bootstrap.sh's daemon-reload finds a complete unit + drop-in
+    # pair. The framework reference unit (evo-core-eng) bakes
+    # ExecStart=/opt/evo/bin/evo; the distribution drop-in
+    # exec-start.conf clears that and substitutes
+    # /opt/evo/bin/evo-device-audio.
     install -m 0644 -o root -g root \
         "${STAGE_DIR}/dist/systemd/evo.service" \
         /etc/systemd/system/evo.service
-    install -d -m 0755 -o root -g root /etc/systemd/system/evo.service.d
-    local conf
-    for conf in "${STAGE_DIR}/dist/systemd/evo.service.d/"*.conf; do
-        [[ -f "$conf" ]] || continue
-        sed -e "s|@EVO_SERVICE_USER@|${SERVICE_USER}|g" "$conf" \
-            > "/etc/systemd/system/evo.service.d/$(basename "$conf")"
-        chmod 0644 "/etc/systemd/system/evo.service.d/$(basename "$conf")"
-    done
 }
 
-install_sudoers() {
-    local src base tmp_sudo systemctl_path nmcli_path curl_path
-    systemctl_path="$(command -v systemctl)"
-    nmcli_path="$(command -v nmcli || echo /usr/bin/nmcli)"
-    curl_path="$(command -v curl || echo /usr/bin/curl)"
-    for src in "${STAGE_DIR}/dist/sudoers.d/"*.in; do
-        [[ -f "$src" ]] || continue
-        base="$(basename "$src" .in)"
-        tmp_sudo="$(mktemp)"
-        sed -e "s|@EVO_SERVICE_USER@|${SERVICE_USER}|g" \
-            -e "s|@SYSTEMCTL@|${systemctl_path}|g" \
-            -e "s|@NMCLI@|${nmcli_path}|g" \
-            -e "s|@CURL@|${curl_path}|g" \
-            "$src" > "${tmp_sudo}"
-        if ! visudo -c -f "${tmp_sudo}" >/dev/null 2>&1; then
-            echo "  WARN: sudoers template ${base} failed visudo -c; skipping"
-            rm -f "${tmp_sudo}"
-            continue
-        fi
-        install -m 0440 -o root -g root "${tmp_sudo}" "/etc/sudoers.d/${base}"
-        rm -f "${tmp_sudo}"
-    done
+invoke_bootstrap_placement() {
+    # Single canonical /etc placement primitive. bootstrap.sh
+    # renders asound.conf with substituted card name, installs
+    # sudoers drop-ins with the resolved service user, lays down
+    # the .d/ drop-ins, plugins.d/ defaults (network probe_kind=off,
+    # multiroom config), trust.d/ public keys, the operator ACL,
+    # the MPD fragment + include injection, the modder directory,
+    # the avahi disable, and runs its own verify section
+    # (placeholder-residue check, amixer probe, aplay --dump-hw-params
+    # probe). evo-install.sh's role is to FETCH + EXTRACT + INVOKE
+    # bootstrap + add bundle-tier evidence on top — not to
+    # reimplement placement in parallel.
+    local bootstrap_path="${STAGE_DIR}/dist/scripts/bootstrap.sh"
+    if [[ ! -f "${bootstrap_path}" ]]; then
+        echo "FAIL: bundle missing dist/scripts/bootstrap.sh at ${bootstrap_path}" >&2
+        exit 4
+    fi
+    local -a args=(--service-user "${SERVICE_USER}")
+    if [[ -n "${EVO_INSTALL_AUDIO_CARD}" ]]; then
+        args+=(--card "${EVO_INSTALL_AUDIO_CARD}")
+    fi
+    if [[ -n "${MULTIROOM_ROLE}" ]]; then
+        args+=(--multiroom-role "${MULTIROOM_ROLE}")
+    fi
+    if [[ -n "${MULTIROOM_GROUP_ID}" ]]; then
+        args+=(--multiroom-group-id "${MULTIROOM_GROUP_ID}")
+    fi
+    if [[ -n "${MULTIROOM_SOURCE_PCM}" ]]; then
+        args+=(--multiroom-source-pcm "${MULTIROOM_SOURCE_PCM}")
+    fi
+    if [[ -n "${MULTIROOM_ALSA_PCM}" ]]; then
+        args+=(--multiroom-alsa-pcm "${MULTIROOM_ALSA_PCM}")
+    fi
+    if [[ -n "${MULTIROOM_GROUP_MEMBERS}" ]]; then
+        args+=(--multiroom-group-members "${MULTIROOM_GROUP_MEMBERS}")
+    fi
+    if [[ -n "${MULTIROOM_GROUP_MEMBER_ADDRESSES}" ]]; then
+        args+=(--multiroom-group-member-addresses "${MULTIROOM_GROUP_MEMBER_ADDRESSES}")
+    fi
+    # EVO_DIST_DIR points bootstrap.sh at the bundle-staged tree
+    # instead of its own script-relative dist/ parent. Subprocess
+    # exit status propagates back via `set -e` — bootstrap.sh
+    # exits 2 on placeholder-residue or visudo failure; the
+    # install primitive surfaces that to the operator.
+    EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}"
 }
 
 place_music_library() {
@@ -562,41 +607,18 @@ purge_evo_mpd_includes() {
     sed -i -e ':a' -e '/^$/{$d;N;ba' -e '}' /etc/mpd.conf
 }
 
-inject_mpd_include() {
+# Music-directory pin in /etc/mpd.conf — the only mpd.conf
+# rewrite owned by evo-install.sh (because it depends on
+# EVO_INSTALL_MUSIC_LIBRARY, which is an installer-tier
+# decision, not a placement-tier one). bootstrap.sh owns the
+# include directive itself.
+pin_mpd_music_directory() {
     if [[ ! -f /etc/mpd.conf ]]; then
         return 0
     fi
-    # Evict every prior evo marker first so the canonical
-    # line lands exactly once, regardless of accumulated
-    # cruft from earlier bootstrap.sh / evo-install.sh runs.
-    purge_evo_mpd_includes
-    # Add the canonical block (delimited so the next purge
-    # finds it deterministically).
-    {
-        printf '\n# >>> evo-device-audio (evo-install.sh) — DO NOT EDIT >>>\n'
-        printf 'include_optional "/etc/evo/mpd.conf"\n'
-        printf '# <<< evo-device-audio (evo-install.sh) — DO NOT EDIT <<<\n'
-    } >> /etc/mpd.conf
     if [[ "${EVO_INSTALL_MUSIC_LIBRARY}" != "0" ]] && \
        ! grep -qE '^\s*music_directory\s+"/var/lib/evo/music"' /etc/mpd.conf; then
         sed -i.pre-evo-music -E 's|^\s*music_directory\s+".*"|music_directory "/var/lib/evo/music"|' /etc/mpd.conf || true
-    fi
-}
-
-install_asound_conf() {
-    if [[ -f "${STAGE_DIR}/dist/alsa/asound.conf" ]]; then
-        if [[ -f /etc/asound.conf ]] && \
-           ! cmp -s "${STAGE_DIR}/dist/alsa/asound.conf" /etc/asound.conf; then
-            cp /etc/asound.conf "/etc/asound.conf.pre-evo.$(date +%Y%m%d%H%M%S)"
-        fi
-        install -m 0644 -o root -g root \
-            "${STAGE_DIR}/dist/alsa/asound.conf" \
-            /etc/asound.conf
-    fi
-    install -d -m 0755 -o root -g root /etc/asound.d
-    if [[ ! -f /etc/asound.d/evo-options.conf ]]; then
-        : > /etc/asound.d/evo-options.conf
-        chmod 0644 /etc/asound.d/evo-options.conf
     fi
 }
 
@@ -615,6 +637,12 @@ CATALOGUE_SOURCE=""
 
 JOURNAL_FAIL_HITS=""
 JOURNAL_FAIL_COUNT=0
+# Active PCM playback probe state. Set by verify_pcm_playback().
+# Values: not_run / ok / busy / fail / skipped_no_aplay /
+# skipped_no_probe_wav. Only `fail` participates in POST_OK
+# gating; `busy` is evidence the chain works (MPD has the
+# device).
+PCM_PLAYBACK_PROBE="not_run"
 
 verify_post_condition() {
     local deadline
@@ -658,6 +686,48 @@ verify_post_condition() {
         JOURNAL_FAIL_COUNT=$(printf '%s\n' "${JOURNAL_FAIL_HITS}" | grep -c . || true)
     else
         JOURNAL_FAIL_COUNT=0
+    fi
+
+    verify_pcm_playback
+}
+
+# Active PCM playback-path probe at post-condition time. The
+# bootstrap-tier probe runs against pcm.evo before the steward
+# starts; this one runs AFTER the steward + plugin admission +
+# delivery.alsa's drop-in rewrite (if any), so it observes the
+# operator-visible final state. EBUSY from MPD holding the PCM
+# is reported as `busy` — that proves the chain opens; only
+# open-failure (`No such device`, `Cannot get card index`, etc.)
+# is the regression class the gate must catch.
+verify_pcm_playback() {
+    local probe_wav=""
+    if [[ -f "${STAGE_DIR}/dist/alsa/silent-probe.wav" ]]; then
+        probe_wav="${STAGE_DIR}/dist/alsa/silent-probe.wav"
+    elif [[ -f /usr/share/sounds/alsa/Front_Center.wav ]]; then
+        probe_wav="/usr/share/sounds/alsa/Front_Center.wav"
+    fi
+    if ! command -v aplay >/dev/null 2>&1; then
+        PCM_PLAYBACK_PROBE="skipped_no_aplay"
+        return 0
+    fi
+    if [[ -z "${probe_wav}" ]]; then
+        PCM_PLAYBACK_PROBE="skipped_no_probe_wav"
+        return 0
+    fi
+    local probe_out probe_exit
+    set +e
+    probe_out="$(aplay -D evo --dump-hw-params "${probe_wav}" 2>&1)"
+    probe_exit=$?
+    set -e
+    if [[ ${probe_exit} -eq 0 ]] \
+        && printf '%s' "${probe_out}" | grep -q '^HW Params of device "evo":'; then
+        PCM_PLAYBACK_PROBE="ok"
+    elif printf '%s' "${probe_out}" | grep -qiE 'device or resource busy|EBUSY'; then
+        PCM_PLAYBACK_PROBE="busy"
+    else
+        PCM_PLAYBACK_PROBE="fail"
+        echo "FAIL: pcm.evo playback probe (aplay --dump-hw-params -D evo) failed:" >&2
+        printf '%s\n' "${probe_out}" | head -5 | sed 's/^/  /' >&2
     fi
 }
 
@@ -733,6 +803,7 @@ music_library_hash_pre = ${music_hash_pre_field}
 music_library_hash_post = ${music_hash_post_field}
 music_library_hash_preserved = ${MUSIC_HASH_PRESERVED}
 music_library_hash_changed = ${MUSIC_HASH_CHANGED}
+pcm_playback_probe = "${PCM_PLAYBACK_PROBE}"
 
 EOF
 
@@ -785,9 +856,9 @@ case "${MODE}" in
         echo "[3/9] extract bundle ..."   ; extract_bundle          ; echo "  ok"
         echo "[4/9] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/9] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
-        echo "[6/9] /etc/evo + sudoers + drop-ins + trust roots ..." ; place_etc_evo ; install_systemd ; install_sudoers ; echo "  ok"
+        echo "[6/9] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
         echo "[7/9] music library ..."    ; place_music_library     ; echo "  ok"
-        echo "[8/9] mpd include + asound.conf ..." ; inject_mpd_include ; install_asound_conf ; echo "  ok"
+        echo "[8/9] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
         echo "[9/9] start + verify ..."   ; start_steward ; verify_post_condition
         ;;
     reinstall)
@@ -797,9 +868,9 @@ case "${MODE}" in
         echo "[4/10] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
         echo "[5/10] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[6/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; place_etc_evo ; install_systemd ; install_sudoers ; echo "  ok"
+        echo "[6/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
         echo "[7/10] music library skeleton ..." ; place_music_library ; echo "  ok"
-        echo "[8/10] mpd include + asound.conf ..." ; inject_mpd_include ; install_asound_conf ; echo "  ok"
+        echo "[8/10] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
         echo "[9/10] start + verify ..."  ; start_steward ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
@@ -811,8 +882,8 @@ case "${MODE}" in
         echo "[5/10] CONFIG WIPE (binaries + config + state, music preserved) ..."
         wipe_config ; echo "  ok"
         echo "[6/10] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[7/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; place_etc_evo ; install_systemd ; install_sudoers ; echo "  ok"
-        echo "[8/10] mpd include + asound.conf ..." ; inject_mpd_include ; install_asound_conf ; echo "  ok"
+        echo "[7/10] /etc/evo + sudoers + drop-ins + trust roots ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[8/10] mpd music directory pin ..." ; pin_mpd_music_directory ; echo "  ok"
         echo "[9/10] start + verify ..."  ; start_steward ; verify_post_condition
         echo "[10/10] verify music library byte-equal ..." ; verify_music_hashes_preserved
         ;;
@@ -822,8 +893,8 @@ case "${MODE}" in
         echo "[3/8] extract bundle ..."   ; extract_bundle          ; echo "  ok"
         echo "[4/8] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
         wipe_user_data ; echo "  ok"
-        echo "[5/8] /etc/evo baseline (re-apply) + drop-ins + sudoers ..." ; place_etc_evo ; install_systemd ; install_sudoers ; echo "  ok"
-        echo "[6/8] mpd include (idempotent) + asound.conf (idempotent) ..." ; inject_mpd_include ; install_asound_conf ; echo "  ok"
+        echo "[5/8] /etc/evo baseline (re-apply) + drop-ins + sudoers ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[6/8] mpd music directory pin (idempotent) ..." ; pin_mpd_music_directory ; echo "  ok"
         echo "[7/8] start + verify ..."   ; start_steward ; verify_post_condition
         echo "[8/8] verify music library byte-equal ..." ; verify_music_hashes_preserved
         ;;
@@ -836,6 +907,7 @@ echo "  admission failures:    ${ADMISSION_FAILURES}"
 echo "  not-declared warnings: ${NOT_DECLARED}"
 echo "  catalogue source:      ${CATALOGUE_SOURCE:-unknown}"
 echo "  journal fail hits:     ${JOURNAL_FAIL_COUNT}"
+echo "  pcm.evo playback:      ${PCM_PLAYBACK_PROBE}"
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     echo "  music library hash:    ${MUSIC_HASH_PRESERVED} (pre=${MUSIC_HASH_PRE} post=${MUSIC_HASH_POST})"
 fi
@@ -852,6 +924,14 @@ if [[ "${PLUGINS_ADMITTED}" -lt 1 ]]; then POST_OK=0; fi
 if [[ "${ADMISSION_FAILURES}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${NOT_DECLARED}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi
+# The PCM playback-path probe is the dedicated catch for the
+# regression class that the old gate missed: a placement that
+# leaves pcm.evo unopenable for playback while the steward +
+# plugin admission look healthy. `fail` is the only state that
+# breaks the gate; `busy` is positive evidence (MPD has the
+# device); the `skipped_*` states are documented gaps the
+# evidence record carries forward.
+if [[ "${PCM_PLAYBACK_PROBE}" == "fail" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi

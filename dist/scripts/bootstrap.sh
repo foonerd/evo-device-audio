@@ -64,7 +64,14 @@ set -euo pipefail
 # Resolve the script's own directory so dist/* paths resolve
 # regardless of the operator's CWD.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# DIST_DIR defaults to the script's parent (canonical layout
+# `dist/scripts/bootstrap.sh` → `dist/`). Operator-facing
+# installers that stage the dist tree elsewhere (e.g.
+# evo-install.sh extracts a signed bundle to a temp directory)
+# override via EVO_DIST_DIR. The override lets a single
+# canonical placement primitive serve both on-target operators
+# and the bundle-driven flow without parallel implementations.
+DIST_DIR="${EVO_DIST_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # Defaults.
 SERVICE_USER=""
@@ -220,44 +227,29 @@ echo "[bootstrap] systemctl binary: $SYSTEMCTL_BIN"
 # Resolve the ALSA card name the modular pipeline targets.
 # Operator override wins (env var EVO_AUDIO_CARD or --card
 # flag); otherwise pick the first playback card reported by
-# `aplay -l`. Refuse the install with an operator-readable
-# error when no playback card is available (e.g. headless
-# container, audio kernel modules absent). Reference
-# distribution uses the I-Sabre Q2M card (name `DAC`); every
-# other deployment substitutes its detected card.
+# `aplay -l` excluding the filter classes documented in
+# detect_audio_card_from_aplay_output. Refuse the install
+# with an operator-readable error when no playback card is
+# available (e.g. headless container, audio kernel modules
+# absent). Reference distribution uses the I-Sabre Q2M card
+# (name `DAC`); every other deployment substitutes its
+# detected card.
 # ----------------------------------------------------------
+
+# detect_audio_card_from_aplay_output: pure parser sourced
+# from lib/detect-audio-card.sh. Kept as a separate file so
+# the regression test suite can drive it with synthetic
+# `aplay -l` fixtures without executing the rest of this
+# script.
+# shellcheck source=lib/detect-audio-card.sh
+. "$SCRIPT_DIR/lib/detect-audio-card.sh"
+
 if [[ -z "$AUDIO_CARD" ]]; then
     if ! command -v aplay >/dev/null 2>&1; then
         echo "aplay not found on PATH; install alsa-utils or pass --card <NAME>" >&2
         exit 1
     fi
-    # `aplay -l` prints lines like:
-    #   card 0: I82801AAICH [Intel 82801AA-ICH], device 0: Intel ICH [Intel 82801AA-ICH]
-    # The card NAME (kernel-stable, hot-plug-stable) sits
-    # between `card N: ` and the next `[`. Prefer non-HDMI
-    # cards (external DAC / USB / on-board analog) over HDMI
-    # outputs — Pi-class boards enumerate HDMI before the
-    # attached DAC, and the operator's intent for a music
-    # appliance is the DAC, not the display's speakers.
-    # Operators with HDMI-as-intended-output (e.g. AVR via
-    # HDMI) override with --card.
-    AUDIO_CARD="$(aplay -l 2>/dev/null | awk -F'[: ]+' '
-        /^card [0-9]+/ {
-            name = $3
-            if (name !~ /^vc4hdmi/ && name !~ /HDMI/i) {
-                print name
-                exit
-            }
-        }
-    ')"
-    # Fall back to the first card when only HDMI cards are
-    # available (HDMI display with speakers is a valid music
-    # appliance target).
-    if [[ -z "$AUDIO_CARD" ]]; then
-        AUDIO_CARD="$(aplay -l 2>/dev/null \
-            | awk -F'[: ]+' '/^card [0-9]+/ { print $3; exit }')"
-    fi
-    if [[ -z "$AUDIO_CARD" ]]; then
+    if ! AUDIO_CARD="$(aplay -l 2>/dev/null | detect_audio_card_from_aplay_output)"; then
         echo "no ALSA playback card detected via aplay -l; pass --card <NAME> to override" >&2
         echo "  (current aplay -l output:)" >&2
         aplay -l 2>&1 | sed 's/^/  /' >&2
@@ -925,6 +917,24 @@ if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
     trap 'rm -f "$ASOUND_RENDERED"' EXIT
     sed -e "s|@EVO_AUDIO_CARD@|$AUDIO_CARD|g" \
         "$ASOUND_TEMPLATE" > "$ASOUND_RENDERED"
+    # Placeholder-residue invariant: if the rendered file still
+    # carries any `@SOMETHING@` token, the substitution chain is
+    # incomplete (either a new placeholder was added to the
+    # template without a matching sed branch, or the template
+    # was modified after this script). A silent install leaves
+    # an unusable file on disk that surfaces only at first audio
+    # play — the failure class that motivated this guard. Refuse
+    # to install; the operator gets a clear pointer at the
+    # specific token left over.
+    if RESIDUE="$(grep -oE '@[A-Z_][A-Z0-9_]*@' "$ASOUND_RENDERED" \
+            | sort -u | head -5)"; [[ -n "$RESIDUE" ]]; then
+        echo "rendered $ASOUND_TEMPLATE still carries unresolved placeholders:" >&2
+        printf '%s\n' "$RESIDUE" | sed 's/^/  /' >&2
+        echo "refusing to install $ASOUND_CONF_PATH (would leave audio unplayable)" >&2
+        echo "  rendered file kept at $ASOUND_RENDERED for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
     # If an existing /etc/asound.conf is present with different
     # contents (compared against the rendered form, not the
     # template), back it up first so the operator never loses
@@ -1175,6 +1185,46 @@ if command -v amixer >/dev/null 2>&1; then
     fi
 else
     echo "  [skip]  amixer not available — ctl.evo probe skipped"
+fi
+
+# Active PCM playback-path probe: confirm `pcm.evo` opens for
+# PLAYBACK against the substituted card. The amixer probe above
+# proves only the control interface resolves; MPD's actual
+# write path is the PCM, and MPD opens the device lazily on
+# first audio_output use — so a misconfigured `pcm.evo` may
+# pass the amixer probe and still surface later as
+# `Failed to open ALSA device "evo": No such device` once the
+# operator hits play. `aplay --dump-hw-params` opens the PCM,
+# negotiates hardware parameters, dumps them, and exits
+# WITHOUT writing audio frames — no audible playback during
+# install. Exit 0 = PCM open + HW param negotiation succeeded.
+# Probe input: prefer the distribution-shipped silent probe
+# WAV (52-byte silent file shipped under dist/alsa/), fall
+# back to the Debian alsa-utils-data Front_Center.wav. On a
+# host with neither, skip with a clear WARN — the probe is the
+# last line of defence against the placeholder-not-substituted
+# class; the placeholder-residue check above is the first.
+PROBE_WAV=""
+if [[ -f "$DIST_DIR/alsa/silent-probe.wav" ]]; then
+    PROBE_WAV="$DIST_DIR/alsa/silent-probe.wav"
+elif [[ -f /usr/share/sounds/alsa/Front_Center.wav ]]; then
+    PROBE_WAV="/usr/share/sounds/alsa/Front_Center.wav"
+fi
+if command -v aplay >/dev/null 2>&1 && [[ -n "$PROBE_WAV" ]]; then
+    PROBE_OUT=""
+    if PROBE_OUT="$(aplay -D evo --dump-hw-params "$PROBE_WAV" 2>&1)" \
+        && printf '%s' "$PROBE_OUT" | grep -q '^HW Params of device "evo":'; then
+        echo "  [ok]    pcm.evo opens for playback against card '$AUDIO_CARD' (aplay --dump-hw-params)"
+    else
+        echo "  [WARN]  pcm.evo failed to open for playback against card '$AUDIO_CARD'"
+        echo "          (audio will fail at first play; review $ASOUND_CONF_PATH)"
+        printf '%s\n' "$PROBE_OUT" | head -5 | sed 's/^/          /'
+    fi
+elif [[ -z "$PROBE_WAV" ]]; then
+    echo "  [skip]  pcm.evo playback probe skipped — no probe WAV found"
+    echo "          (install alsa-utils-data or ship dist/alsa/silent-probe.wav)"
+else
+    echo "  [skip]  pcm.evo playback probe skipped — aplay not available"
 fi
 
 # MPD audio_output probe: after the include + asound.conf are
