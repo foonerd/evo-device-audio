@@ -29,6 +29,8 @@ pub enum CatalogError {
     SchemaVersion { found: u32 },
     #[error("alsa-cards.toml: hda_codecs.codec_id {raw} is not a valid 32-bit hex string")]
     InvalidCodecId { raw: String },
+    #[error("alsa-cards.toml: usb_dacs.usb_id {raw} is not a valid vendor:product hex pair")]
+    InvalidUsbId { raw: String },
 }
 
 /// Top-level catalog payload as it appears on disk.
@@ -57,6 +59,32 @@ struct CatalogFile {
     /// polish path, not a correctness path).
     #[serde(default)]
     ac97_codecs: Vec<RawAc97CodecRow>,
+    /// USB DAC overlay. Each entry keys on a USB vendor:product
+    /// pair (16-bit each) and provides the operator-friendly
+    /// label. The kernel's `/proc/asound/cardN/usbid` carries
+    /// the vendor:product as colon-separated hex (e.g.
+    /// `152a:8762`); the catalogue rebrands this to a
+    /// human-readable model name (e.g. `Topping E50`).
+    /// Optional — when no entry matches, the kernel-supplied
+    /// long_name is the label (the kernel reports the USB
+    /// device's bDescriptor name, often already meaningful).
+    #[serde(default)]
+    usb_dacs: Vec<RawUsbDacRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawUsbDacRow {
+    /// USB vendor:product as colon-separated 16-bit hex strings
+    /// (e.g. `152a:8762`). Verbatim match against
+    /// `/proc/asound/cardN/usbid` after canonicalising to
+    /// lowercase hex.
+    usb_id: String,
+    /// Operator-friendly product label (e.g. `Topping E50`,
+    /// `FiiO K7`).
+    pretty_name: String,
+    /// Free-text description for the operator UI. Optional.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +203,24 @@ pub enum TypeHint {
     Unspecified,
 }
 
+/// Parse a `vendor:product` USB ID literal from the catalogue's
+/// `usb_dacs.usb_id` field. Vendor + product are 16-bit hex; the
+/// separator is a literal `:`. Returns `(vendor, product)` on
+/// success; `Err(InvalidUsbId)` when the literal doesn't match
+/// the expected shape.
+fn parse_usb_id(raw: &str) -> Result<(u16, u16), CatalogError> {
+    let (v, p) = raw
+        .split_once(':')
+        .ok_or_else(|| CatalogError::InvalidUsbId { raw: raw.into() })?;
+    let v_clean = v.trim().trim_start_matches("0x");
+    let p_clean = p.trim().trim_start_matches("0x");
+    let vendor = u16::from_str_radix(v_clean, 16)
+        .map_err(|_| CatalogError::InvalidUsbId { raw: raw.into() })?;
+    let product = u16::from_str_radix(p_clean, 16)
+        .map_err(|_| CatalogError::InvalidUsbId { raw: raw.into() })?;
+    Ok((vendor, product))
+}
+
 impl TypeHint {
     fn from_str(raw: &str) -> Self {
         match raw.to_ascii_lowercase().as_str() {
@@ -203,13 +249,22 @@ pub struct Ac97CodecEntry {
     pub description: Option<String>,
 }
 
+/// USB DAC overlay entry — operator-friendly label keyed by the
+/// USB vendor:product pair. Populated from `[[usb_dacs]]` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbDacEntry {
+    pub pretty_name: String,
+    pub description: Option<String>,
+}
+
 /// Loaded catalog indexed by raw ALSA card name + 32-bit HDA
-/// codec vendor id + AC97 codec chip name.
+/// codec vendor id + AC97 codec chip name + USB vendor:product.
 #[derive(Debug, Clone)]
 pub struct AlsaCardCatalog {
     by_name: HashMap<String, CardEntry>,
     by_codec_id: HashMap<u32, HdaCodecEntry>,
     by_ac97_chip_name: HashMap<String, Ac97CodecEntry>,
+    by_usb_id: HashMap<(u16, u16), UsbDacEntry>,
 }
 
 impl AlsaCardCatalog {
@@ -290,11 +345,35 @@ impl AlsaCardCatalog {
                 },
             );
         }
+        let mut by_usb_id: HashMap<(u16, u16), UsbDacEntry> = HashMap::new();
+        for usb in parsed.usb_dacs {
+            let (v, p) = parse_usb_id(&usb.usb_id)?;
+            by_usb_id.insert(
+                (v, p),
+                UsbDacEntry {
+                    pretty_name: usb.pretty_name,
+                    description: usb.description.filter(|s| !s.is_empty()),
+                },
+            );
+        }
         Ok(Self {
             by_name,
             by_codec_id,
             by_ac97_chip_name,
+            by_usb_id,
         })
+    }
+
+    /// Look up a USB DAC by its (vendor, product) pair.
+    /// Returns the catalogue's preferred label when carried;
+    /// None when the device is uncatalogued and the caller
+    /// should fall back to the kernel-supplied long_name.
+    pub fn lookup_usb_dac(
+        &self,
+        vendor_id: u16,
+        product_id: u16,
+    ) -> Option<&UsbDacEntry> {
+        self.by_usb_id.get(&(vendor_id, product_id))
     }
 
     /// Look up an HDA codec by its 32-bit `vendor_id` (as read

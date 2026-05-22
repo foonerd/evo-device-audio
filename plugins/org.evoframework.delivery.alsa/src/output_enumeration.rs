@@ -515,6 +515,21 @@ fn resolve_unmapped_label(
                 return ac97.chip_name.clone();
             }
         }
+        // USB DAC overlay path: when the kernel registered a USB
+        // audio device (CardKind::Usb), look up its
+        // vendor:product against the catalogue's USB overlay.
+        // The kernel's long_name typically carries the USB
+        // device's bDescriptor name (e.g. `Topping E50 at usb-...`)
+        // which is already meaningful; the overlay rebrands to a
+        // clean operator-facing label (`Topping E50`) without
+        // the bus-attachment suffix.
+        if let Some(usb) = id.usb_dac.as_ref() {
+            if let Some(entry) =
+                catalog.lookup_usb_dac(usb.vendor_id, usb.product_id)
+            {
+                return entry.pretty_name.clone();
+            }
+        }
         // No HDA-codec catalogue hit. Use the first HDA codec's
         // kernel-supplied chip name if any — already
         // operator-readable.
@@ -607,6 +622,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
             kind,
             codecs: Vec::new(),
             ac97_codec: None,
+            usb_dac: None,
         }
     }
 
@@ -987,6 +1003,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 is_hdmi: false,
             }],
             ac97_codec: None,
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
@@ -1041,6 +1058,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 is_hdmi: false,
             }],
             ac97_codec: None,
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
@@ -1079,6 +1097,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 is_hdmi: false,
             }],
             ac97_codec: None,
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];
@@ -1112,13 +1131,17 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             ac97_codec: Some(crate::kernel_introspection::Ac97Codec {
                 chip_name: "Analog Devices AD1980".into(),
             }),
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];
         assert_eq!(out.output_class, OutputClass::Analog);
-        // Catalogue rebrands "Analog Devices AD1980" → catalogue
-        // pretty_name "Analog Devices SoundMAX AD1980".
-        assert_eq!(out.label, "Analog Devices SoundMAX AD1980");
+        // Catalogue keys by kernel chip_name; pretty_name is the
+        // regen-generated vendor-prefixed form ("Analog Devices
+        // AD1980"). The hand-curated "SoundMAX" sub-brand was
+        // retired when the regen example replaced hand-curated
+        // codec rows with kernel-source-derived rows.
+        assert_eq!(out.label, "Analog Devices AD1980");
     }
 
     #[test]
@@ -1140,6 +1163,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             ac97_codec: Some(crate::kernel_introspection::Ac97Codec {
                 chip_name: "FutureCorp FC-AC97".into(), // not catalogued
             }),
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];
@@ -1147,6 +1171,63 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
         // Precedence: catalogue overlay (miss) → kernel chip
         // name (hit).
         assert_eq!(out.label, "FutureCorp FC-AC97");
+    }
+
+    #[test]
+    fn shipped_catalog_usb_dac_overlay_relabels_with_brand_name() {
+        // USB DAC label precedence: when the kernel registered a
+        // USB audio device (CardKind::Usb) and the catalogue's
+        // [[usb_dacs]] table carries a matching vendor:product
+        // entry, the label resolves to the catalogue brand
+        // (e.g. "Topping E50") rather than the kernel-supplied
+        // long_name (which typically includes a bus-attachment
+        // suffix like "Topping E50 at usb-0000:00:14.0-1").
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 2: USBDAC [Topping E50 at usb-0000:00:14.0-1], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 2,
+            short_id: "USBDAC".into(),
+            long_name: "Topping E50 at usb-0000:00:14.0-1, high speed".into(),
+            driver: "USB-Audio".into(),
+            kind: crate::kernel_introspection::CardKind::Usb,
+            codecs: Vec::new(),
+            ac97_codec: None,
+            usb_dac: Some(crate::kernel_introspection::UsbDac {
+                vendor_id: 0x152a,  // Topping
+                product_id: 0x8762, // E50
+            }),
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        assert_eq!(out.output_class, OutputClass::Usb);
+        assert_eq!(out.label, "Topping E50");
+    }
+
+    #[test]
+    fn shipped_catalog_usb_dac_overlay_miss_falls_back_to_kernel_long_name() {
+        // USB DAC precedence pin: catalogue miss → kernel
+        // long_name. Operator still sees a usable label.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 2: USBDAC [Synthetic USB Audio], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 2,
+            short_id: "USBDAC".into(),
+            long_name: "Synthetic USB DAC at usb-bus-1".into(),
+            driver: "USB-Audio".into(),
+            kind: crate::kernel_introspection::CardKind::Usb,
+            codecs: Vec::new(),
+            ac97_codec: None,
+            usb_dac: Some(crate::kernel_introspection::UsbDac {
+                vendor_id: 0xdead,
+                product_id: 0xbeef, // not in any catalogue overlay
+            }),
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        assert_eq!(out.output_class, OutputClass::Usb);
+        // Falls back to kernel long_name (catalogue miss + no
+        // codec chip-name surface for USB).
+        assert_eq!(out.label, "Synthetic USB DAC at usb-bus-1");
     }
 
     #[test]
@@ -1166,6 +1247,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             kind: crate::kernel_introspection::CardKind::I2s,
             codecs: Vec::new(), // No codec — I²S DAC
             ac97_codec: None,
+            usb_dac: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];

@@ -95,6 +95,7 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 
 pub mod alsa_cards;
+pub mod import;
 pub mod kernel_introspection;
 pub mod output_enumeration;
 

@@ -50,6 +50,13 @@ pub struct CardIdentity {
     /// `/proc/asound/cardN/codec97#0/ac97#0-0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ac97_codec: Option<Ac97Codec>,
+    /// USB DAC identity (vendor + product IDs) the kernel
+    /// registered against this card, when applicable. `Some`
+    /// only for [`CardKind::Usb`] cards; the kernel exposes the
+    /// vendor:product pair in `/proc/asound/cardN/usbid`
+    /// (e.g. `152a:8762`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_dac: Option<UsbDac>,
 }
 
 /// Structural classification — the discriminator downstream layers
@@ -97,6 +104,18 @@ pub enum CardKind {
     /// the driver string for diagnostic; downstream layers treat
     /// as [`OutputClass::Unknown`].
     Unknown,
+}
+
+/// One USB DAC identity. USB audio devices expose their vendor +
+/// product IDs through the `/proc/asound/cardN/usbid` file —
+/// e.g. `152a:8762` for a Topping E50. The vendor + product pair
+/// is the catalogue's USB DAC lookup key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDac {
+    /// USB vendor id (16-bit, e.g. `0x152a` for Topping).
+    pub vendor_id: u16,
+    /// USB product id (16-bit, e.g. `0x8762`).
+    pub product_id: u16,
 }
 
 /// One AC97 codec on an AC97-class card. AC97's kernel surface
@@ -237,6 +256,7 @@ pub async fn introspect_from_proc(
             kind,
             codecs: procfs.hda_codecs,
             ac97_codec: procfs.ac97_codec,
+            usb_dac: procfs.usb_dac,
         });
     }
     Ok(identities)
@@ -377,6 +397,7 @@ struct CardCodecProcfs {
     hda_codecs: Vec<CodecIdentity>,
     ac97_codec: Option<Ac97Codec>,
     has_ac97_codec: bool,
+    usb_dac: Option<UsbDac>,
 }
 
 /// Scan `/proc/asound/cardN` for codec surfaces. HDA codecs
@@ -398,6 +419,7 @@ async fn read_codecs_for_card(
             hda_codecs: Vec::new(),
             ac97_codec: None,
             has_ac97_codec: false,
+            usb_dac: None,
         });
     }
     let mut entries = match tokio::fs::read_dir(&card_dir).await {
@@ -413,6 +435,7 @@ async fn read_codecs_for_card(
     };
     let mut hda_codec_files = Vec::new();
     let mut ac97_codec_dirs: Vec<(u8, std::path::PathBuf)> = Vec::new();
+    let mut usbid_path: Option<std::path::PathBuf> = None;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name_str = match name.to_str() {
@@ -435,6 +458,13 @@ async fn read_codecs_for_card(
             if let Ok(addr) = rest.parse::<u8>() {
                 ac97_codec_dirs.push((addr, entry.path()));
             }
+        }
+        // USB DAC: file `usbid` carries `vendor:product` hex
+        // (e.g. `152a:8762` for a Topping E50). Presence
+        // identifies the card as USB-attached; the parsed
+        // vendor + product IDs become the catalogue lookup key.
+        if name_str == "usbid" {
+            usbid_path = Some(entry.path());
         }
     }
     hda_codec_files.sort_by_key(|(addr, _)| *addr);
@@ -501,10 +531,47 @@ async fn read_codecs_for_card(
         None
     };
 
+    // USB DAC identification. `/proc/asound/cardN/usbid`
+    // contains `vendor:product` hex (e.g. `152a:8762`). Read +
+    // parse if present; structural failure (malformed body)
+    // surfaces as None rather than a hard error, so a stray
+    // kernel quirk doesn't fail enumeration of all cards.
+    let usb_dac =
+        if let Some(path) = usbid_path {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(text) => parse_usbid_file(&text),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        return Err(IntrospectionError::PermissionDenied(
+                            format!("cannot read {}: {}", path.display(), e),
+                        ));
+                    }
+                    _ => None,
+                },
+            }
+        } else {
+            None
+        };
+
     Ok(CardCodecProcfs {
         hda_codecs,
         ac97_codec,
         has_ac97_codec,
+        usb_dac,
+    })
+}
+
+/// Parse the `/proc/asound/cardN/usbid` file's `vendor:product`
+/// shape (e.g. `152a:8762\n`). Returns `None` on malformed
+/// input.
+fn parse_usbid_file(text: &str) -> Option<UsbDac> {
+    let trimmed = text.trim();
+    let (vendor_str, product_str) = trimmed.split_once(':')?;
+    let vendor_id = u16::from_str_radix(vendor_str.trim(), 16).ok()?;
+    let product_id = u16::from_str_radix(product_str.trim(), 16).ok()?;
+    Some(UsbDac {
+        vendor_id,
+        product_id,
     })
 }
 
@@ -700,6 +767,7 @@ mod tests {
             kind,
             codecs: Vec::new(),
             ac97_codec: None,
+            usb_dac: None,
         }
     }
 
@@ -1054,6 +1122,7 @@ mod tests {
                 kind: CardKind::Ac97,
                 codecs: Vec::new(),
                 ac97_codec: None,
+                usb_dac: None,
             }),
             crate::output_enumeration::OutputClass::Analog
         );
@@ -1114,6 +1183,48 @@ mod tests {
         let codec = parse_ac97_codec_file(text)
             .expect("first line parses into Ac97Codec");
         assert_eq!(codec.chip_name, "Analog Devices AD1980");
+    }
+
+    #[test]
+    fn parse_usbid_file_extracts_vendor_product() {
+        // The kernel writes `vendor:product` hex with a trailing
+        // newline. Verify the parser handles whitespace.
+        let codec =
+            parse_usbid_file("152a:8762\n").expect("well-formed usbid parses");
+        assert_eq!(codec.vendor_id, 0x152a);
+        assert_eq!(codec.product_id, 0x8762);
+    }
+
+    #[test]
+    fn parse_usbid_file_rejects_malformed_input() {
+        assert!(parse_usbid_file("not a usbid").is_none());
+        assert!(parse_usbid_file("").is_none());
+        assert!(parse_usbid_file("152a").is_none()); // no colon
+        assert!(parse_usbid_file("xx:yy").is_none()); // non-hex
+    }
+
+    #[tokio::test]
+    async fn usb_audio_card_parses_usbid_into_usb_dac_field() {
+        // Failing-case reproduction for USB DACs: the kernel
+        // writes vendor:product to /proc/asound/cardN/usbid. The
+        // introspector must read it + populate CardIdentity.usb_dac
+        // so the catalogue overlay can rebrand the device.
+        let cards = " 2 [USBDAC]: USB-Audio - Synth USB DAC\n";
+        let tmp = TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::write(root.join("cards"), cards).expect("write cards");
+        let card_dir = root.join("card2");
+        std::fs::create_dir_all(&card_dir).expect("mkdir");
+        std::fs::write(card_dir.join("usbid"), "152a:8762\n")
+            .expect("write usbid");
+
+        let identities = introspect_from_proc(root).await.expect("introspect");
+        assert_eq!(identities.len(), 1);
+        let c = &identities[0];
+        assert_eq!(c.kind, CardKind::Usb);
+        let usb = c.usb_dac.as_ref().expect("usb_dac parsed");
+        assert_eq!(usb.vendor_id, 0x152a);
+        assert_eq!(usb.product_id, 0x8762);
     }
 
     #[test]
