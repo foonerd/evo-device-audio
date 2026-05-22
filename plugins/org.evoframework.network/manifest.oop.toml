@@ -66,3 +66,17 @@ request_types = [
     "network.refresh_connectivity",
 ]
 response_budget_ms = 15000
+
+# Per-verb capability gate declarations. Read-only verbs default
+# to anonymous-OK; write-class verbs gate write:network_admin;
+# apply-class verbs gate step_up:network_admin.
+[capabilities.respondent.verb_capabilities]
+"network.nm.intent.set" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.start" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
+"network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
+"network.nm.intent.apply" = { kind = "step_up", scope = "network_admin" }
+"network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
+"network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
+"network.nm.scan" = { kind = "step_up", scope = "network_admin" }
