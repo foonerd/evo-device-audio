@@ -493,19 +493,25 @@ fn merge_layers(
 
     let value_domain = match control_type {
         ControlType::Enum => {
-            let values = if amixer_enum_values.is_empty() {
-                pool_enum_values
-            } else if pool_enum_values.is_empty() {
+            // The kernel + DAC are the source of truth for the
+            // settable item set: amixer enumerates exactly what
+            // the bound control accepts. The curated pool's
+            // `known_values` is a presentation overlay (label
+            // capitalisation, preferred ordering) that CANNOT
+            // narrow the hardware-truth set — intersecting it
+            // against amixer's list silently empties the domain
+            // when pool labels and ALSA item names disagree
+            // (e.g. catalogue says "Slow Roll-Off", driver
+            // reports "slow"), collapsing the operator's
+            // dropdown to zero choices for any control whose
+            // catalogue authors chose human-readable labels.
+            // Use amixer's list whenever the control was read
+            // live; fall back to the pool's list only when the
+            // control is unbound and amixer carries nothing.
+            let values = if !amixer_enum_values.is_empty() {
                 amixer_enum_values
             } else {
-                // Intersection: keep only values present in both
-                // layers (pool's curated set narrowed to what the
-                // bound card actually exposes). Preserves pool's
-                // ordering for UI stability.
                 pool_enum_values
-                    .into_iter()
-                    .filter(|v| amixer_enum_values.iter().any(|a| a == v))
-                    .collect()
             };
             ValueDomain::Enum { values }
         }
@@ -781,9 +787,12 @@ mod tests {
         assert!(dsp_program.bound);
         assert!(!dsp_program.unbound_pool_entry);
         assert!(matches!(dsp_program.control_type, ControlType::Enum));
-        // Intersection of pool's known_values ["None", "DAC",
-        // "DAC+Headphone", "Headphone", "Mute"] with amixer's
-        // ["None", "DAC"] gives ["None", "DAC"] in pool order.
+        // amixer's list is the hardware truth: ["None", "DAC"]
+        // is exactly what the bound control accepts, so it
+        // surfaces verbatim. The pool's wider known_values
+        // (["None", "DAC", "DAC+Headphone", "Headphone",
+        // "Mute"]) is a presentation overlay only — it cannot
+        // expose values the kernel + DAC do not enumerate.
         match &dsp_program.value_domain {
             ValueDomain::Enum { values } => {
                 assert_eq!(
@@ -1036,5 +1045,131 @@ provenance = "test"
         let ctl = &caps.controls[0];
         assert!(!ctl.bound);
         assert!(ctl.unbound_reason.contains("card not found"));
+    }
+
+    #[tokio::test]
+    async fn curated_enum_with_disagreeing_labels_surfaces_amixer_list_not_empty(
+    ) {
+        // Regression pin. A curated pool entry whose
+        // `known_values` carries human-readable labels (e.g.
+        // "Slow Roll-Off", "Brick Wall") joined against an
+        // ALSA driver whose enum items are kernel-side strings
+        // (e.g. "slow", "brick wall") produced an empty
+        // `value_domain.values` under the prior intersection
+        // logic — the two label conventions did not overlap
+        // string-by-string, so the intersection collapsed to
+        // zero entries and the operator-facing dropdown became
+        // unactuatable. Symptoms surface on any DAC whose
+        // driver reports lowercase / underscored item strings
+        // while the curated pool uses Title-Case display
+        // labels.
+        //
+        // This test stubs that exact label-disagreement
+        // scenario (pool's known_values does NOT overlap
+        // amixer's enum_values string-by-string) and asserts
+        // the resolver surfaces amixer's verbatim item list as
+        // the value domain. The kernel + DAC are the
+        // authoritative source for "what values does this
+        // control accept"; the curated pool is a presentation
+        // overlay only.
+        let catalog_toml = r#"
+schema_version = 1
+[[boards]]
+name = "Test Board"
+provider = "noop"
+[[boards.dacs]]
+id = "test-dac-fir"
+display_name = "Test DAC (FIR)"
+overlay = "x"
+alsa_card_hint = "TestCard"
+needs_reboot_on_apply = false
+advanced_settings_enabled = true
+dsp_options = ["FIR Filter Type"]
+provenance = "test"
+"#;
+        let pool_toml = r#"
+schema_version = 1
+[[controls]]
+name = "FIR Filter Type"
+human_label = "FIR Filter (anti-alias)"
+type = "enum"
+known_values = ["Slow Roll-Off", "Fast Roll-Off", "Brick Wall"]
+recommended_default = "Slow Roll-Off"
+apply_semantics = "hot_apply"
+description = "Anti-alias filter shape near Nyquist."
+provenance_seed = "test"
+"#;
+        let catalog = parse_evo_catalog(catalog_toml).expect("catalog");
+        let pool = parse_dsp_control_pool(pool_toml).expect("pool");
+        let amixer = StubAmixer::new();
+        amixer.set(
+            "TestCard",
+            "FIR Filter Type",
+            AmixerReadOutcome::Found(LiveControlState {
+                control_type: ControlType::Enum,
+                current_value: serde_json::Value::String("brick wall".into()),
+                enum_values: vec![
+                    "slow".to_string(),
+                    "fast".to_string(),
+                    "brick wall".to_string(),
+                ],
+                integer_min: None,
+                integer_max: None,
+            }),
+        );
+        let caps = resolve_dsp_capabilities(
+            &catalog,
+            "Test Board",
+            Some("test-dac-fir"),
+            &pool,
+            &amixer,
+        )
+        .await;
+        assert_eq!(caps.controls.len(), 1);
+        let ctl = &caps.controls[0];
+        assert_eq!(ctl.name, "FIR Filter Type");
+        assert!(ctl.bound);
+        assert!(!ctl.unbound_pool_entry);
+        assert!(matches!(ctl.control_type, ControlType::Enum));
+        match &ctl.value_domain {
+            ValueDomain::Enum { values } => {
+                assert_eq!(
+                    values,
+                    &vec![
+                        "slow".to_string(),
+                        "fast".to_string(),
+                        "brick wall".to_string(),
+                    ],
+                    "value_domain.values must surface amixer's verbatim \
+                     item list when pool labels disagree with ALSA names; \
+                     under the prior intersection logic this returned []",
+                );
+            }
+            other => panic!("expected Enum value domain, got {other:?}"),
+        }
+        // The current_value is amixer's exact string and MUST
+        // appear in value_domain.values — otherwise the UI
+        // cannot render the current selection.
+        let current = ctl
+            .current_value
+            .as_ref()
+            .expect("bound control reports current_value");
+        if let ValueDomain::Enum { values } = &ctl.value_domain {
+            assert!(
+                values
+                    .iter()
+                    .any(|v| serde_json::Value::String(v.clone()) == *current),
+                "current_value {current} must appear in value_domain.values",
+            );
+        }
+        // Presentation overlay still arrives from the pool:
+        // human_label, description, recommended_default survive
+        // even though the enum values come from amixer.
+        assert_eq!(ctl.human_label, "FIR Filter (anti-alias)");
+        assert!(ctl.description.contains("Anti-alias"));
+        assert_eq!(
+            ctl.recommended_default,
+            Some(serde_json::Value::String("Slow Roll-Off".into()))
+        );
     }
 }
