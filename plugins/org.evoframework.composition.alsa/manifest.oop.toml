@@ -69,3 +69,14 @@ default_mode = "passthrough"
 [[capabilities.composition.modes]]
 name = "passthrough"
 preserves_bit_perfect = true
+
+# EQ-only mode: 10-band parametric EQ. Applies the configured
+# biquad-cascade per channel to s16le / f32le PCM streams. The
+# operator's per-band parameters (freq_hz, gain_db, Q) live in
+# the `audio.options.settings` subject; the plugin subscribes
+# and recomputes biquad coefficients on every change. Does NOT
+# preserve bit-perfect — the byte stream changes whenever
+# `eq_engaged = true` AND any band has non-zero gain.
+[[capabilities.composition.modes]]
+name = "eq_only"
+preserves_bit_perfect = false

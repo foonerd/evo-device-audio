@@ -111,9 +111,9 @@ use evo_plugin_sdk::contract::audio_routing::{
     RouteChange, RouteChangeCallback,
 };
 use evo_plugin_sdk::contract::{
-    BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
+    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities, SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -495,6 +495,122 @@ impl AlsaCompositionPlugin {
         }
     }
 
+    /// Subscribe to the `audio.options.settings` subject the
+    /// `playback.options` plugin announces; extract operator EQ
+    /// state (`eq_engaged` + `eq_bands`) on every change and
+    /// push to `eq_state_tx`. The byte-flow worker observes the
+    /// channel inline and recomputes biquad coefficients without
+    /// restarting the substrate.
+    ///
+    /// Best-effort: silently skips when `subject_state_subscriber`
+    /// / `subject_querier` are not populated (OOP pre-wire-surface
+    /// or test fixtures); the composition stage continues to
+    /// serve the passthrough mode and the eq_only mode reads the
+    /// default EQ state (engaged = false, bands = flat). When the
+    /// substrate is wired but the `audio.options` subject has
+    /// not yet announced, retries with bounded exponential
+    /// backoff — typical resolve succeeds on attempt 2 or 3.
+    async fn spawn_options_settings_subscriber(&self, ctx: &LoadContext) {
+        let Some(subscriber) = ctx.subject_state_subscriber.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_state_subscriber not populated; skipping \
+                 audio-options subscription"
+            );
+            return;
+        };
+        let Some(querier) = ctx.subject_querier.as_ref() else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "subject_querier not populated; skipping audio-options \
+                 subscription"
+            );
+            return;
+        };
+
+        let subscriber = Arc::clone(subscriber);
+        let querier = Arc::clone(querier);
+        let eq_tx = self.eq_state_tx.clone();
+        let addressing = ExternalAddressing {
+            scheme: "evo.audio.options".to_string(),
+            value: "settings".to_string(),
+        };
+
+        tokio::spawn(async move {
+            let canonical_id = match resolve_options_addressing_with_backoff(
+                querier.as_ref(),
+                &addressing,
+            )
+            .await
+            {
+                Some(id) => id,
+                None => return,
+            };
+
+            // Subscribe FIRST so we cannot miss a state change
+            // that lands between current_state and subscribe.
+            let mut stream = match subscriber
+                .subscribe_subject(canonical_id.clone())
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        canonical_id = %canonical_id,
+                        "subscribe to audio-options settings subject failed"
+                    );
+                    return;
+                }
+            };
+            let initial_state =
+                match subscriber.current_state(canonical_id.clone()).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            canonical_id = %canonical_id,
+                            "read audio-options settings current_state failed; \
+                             subscription continues without initial seed"
+                        );
+                        None
+                    }
+                };
+            if let Some(state) = initial_state {
+                let new_state = parse_eq_runtime_state_from_state(&state);
+                let _ = eq_tx.send_replace(new_state);
+            }
+            loop {
+                match stream.recv().await {
+                    Ok(update) => {
+                        if let Some(state) = update.state.as_ref() {
+                            let new_state =
+                                parse_eq_runtime_state_from_state(state);
+                            let _ = eq_tx.send_replace(new_state);
+                        }
+                    }
+                    Err(SubjectStateStreamError::Lagged { dropped }) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            dropped = dropped,
+                            "audio-options subject stream lagged; continuing"
+                        );
+                    }
+                    Err(SubjectStateStreamError::Closed) => {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            "audio-options subject stream closed; \
+                             subscriber task exiting"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     /// Wind down the reactor task and clear the
     /// route-change callback. Idempotent — calling on a
     /// plugin without an active reactor is a no-op.
@@ -542,6 +658,155 @@ impl AlsaCompositionPlugin {
 /// preempt an in-flight pump cleanly: the worker fires
 /// cancel and awaits the run task before opening the next
 /// substrate, avoiding double-open of the same path.
+/// Inspect a composition-endpoint pair against the EQ DSP's
+/// supported sample-format coverage. Returns `Some(reason)`
+/// when the negotiated format would refuse engagement (any
+/// PcmCodec outside `S16Le` / `F32` or channel count outside
+/// 1..=2). Returns `None` for supported formats. The reason
+/// string is operator-readable and names the offending field.
+fn check_eq_only_format_support(
+    endpoints: &CompositionEndpoints,
+) -> Option<String> {
+    use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
+    match &endpoints.input.format {
+        AudioFormat::Pcm {
+            codec, channels, ..
+        } => {
+            let codec_supported =
+                matches!(codec, PcmCodec::PcmS16Le | PcmCodec::PcmF32);
+            if !codec_supported {
+                return Some(format!(
+                    "eq_only refused: PCM codec {:?} not supported by the \
+                     EQ DSP (supported: PcmS16Le, PcmF32); operator must \
+                     choose a different composition mode",
+                    codec
+                ));
+            }
+            if !(1..=2).contains(channels) {
+                return Some(format!(
+                    "eq_only refused: channel count {} not supported by the \
+                     EQ DSP (supported: 1..=2); operator must choose a \
+                     different composition mode",
+                    channels
+                ));
+            }
+            None
+        }
+        other => Some(format!(
+            "eq_only refused: stream format {:?} not supported by the EQ \
+             DSP (supported: PCM s16le / f32le, mono / stereo)",
+            other
+        )),
+    }
+}
+
+/// Extract the operator's EQ runtime state from an
+/// `audio.options.settings` subject-state payload. Missing
+/// fields fall through to audiophile-grade defaults (engaged
+/// false, 10 flat bands at 1 kHz / 0 dB / Q=1.0).
+fn parse_eq_runtime_state_from_state(
+    state: &serde_json::Value,
+) -> EqRuntimeState {
+    let engaged = state
+        .get("eq_engaged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut bands =
+        [crate::eq_dsp::EqBandParams::default(); crate::eq_dsp::EQ_BAND_COUNT];
+    if let Some(arr) = state.get("eq_bands").and_then(|v| v.as_array()) {
+        for (i, entry) in
+            arr.iter().take(crate::eq_dsp::EQ_BAND_COUNT).enumerate()
+        {
+            let freq_hz = entry
+                .get("freq_hz")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(bands[i].freq_hz);
+            let gain_db = entry
+                .get("gain_db")
+                .and_then(|v| v.as_f64())
+                .map(|n| n as f32)
+                .unwrap_or(bands[i].gain_db);
+            let q = entry
+                .get("q")
+                .and_then(|v| v.as_f64())
+                .map(|n| n as f32)
+                .unwrap_or(bands[i].q);
+            bands[i] = crate::eq_dsp::EqBandParams {
+                freq_hz,
+                gain_db,
+                q,
+            };
+        }
+    }
+    EqRuntimeState { engaged, bands }
+}
+
+/// Resolve the `audio.options.settings` addressing with
+/// bounded exponential backoff. Mirrors the playback.mpd
+/// pattern: the canonical Phase 2 discovery order admits
+/// composition.alsa before playback.options on the reference
+/// distribution, so the first resolve attempt typically
+/// returns `Ok(None)` and the retry succeeds on attempt 2 or
+/// 3.
+async fn resolve_options_addressing_with_backoff(
+    querier: &dyn evo_plugin_sdk::contract::SubjectQuerier,
+    addressing: &ExternalAddressing,
+) -> Option<String> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 6_400;
+    let mut delay_ms = INITIAL_DELAY_MS;
+    for attempt in 0..MAX_ATTEMPTS {
+        match querier.resolve_addressing(addressing.clone()).await {
+            Ok(Some(id)) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        attempt = attempt + 1,
+                        canonical_id = %id,
+                        "audio-options settings subject resolved after \
+                         admission-order retry"
+                    );
+                }
+                return Some(id);
+            }
+            Ok(None) => {
+                if attempt == 0 {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        delay_ms,
+                        "audio-options settings subject not yet announced; \
+                         retrying with exponential backoff"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    attempt = attempt + 1,
+                    "resolve_addressing for audio-options settings failed; \
+                     retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+        }
+    }
+    tracing::warn!(
+        plugin = PLUGIN_NAME,
+        "audio-options settings subject did not resolve within retry budget; \
+         eq state subscriber not wired (eq_only mode reads defaults until \
+         operator settings land)"
+    );
+    None
+}
+
 async fn run_worker(
     mut endpoints_rx: watch::Receiver<Option<CompositionEndpoints>>,
     mode_rx: watch::Receiver<String>,
@@ -810,7 +1075,16 @@ impl Plugin for AlsaCompositionPlugin {
         async move {
             self.install_routing(ctx.audio_routing.clone())?;
             self.spawn_reactor().await?;
-            self.spawn_worker().await
+            self.spawn_worker().await?;
+            // Subscribe to `audio.options.settings` so operator
+            // EQ gestures (set_eq_engaged + set_eq_band) reach
+            // the byte-flow worker. Best-effort; the subscriber
+            // logs + exits silently when the substrate is not
+            // wired (e.g. OOP transport pre-wire-surface) so the
+            // composition stage stays available for the
+            // passthrough mode without the operator surface.
+            self.spawn_options_settings_subscriber(ctx).await;
+            Ok(())
         }
     }
 
@@ -926,6 +1200,33 @@ impl Respondent for AlsaCompositionPlugin {
                         mode, DECLARED_MODES
                     )),
                 );
+            }
+
+            // eq_only refuses at the mode-select gesture when the
+            // current topology's negotiated format is known and
+            // unsupported by the EQ DSP (anything other than
+            // s16le or f32le PCM, mono / stereo). When the
+            // topology has not yet been published
+            // (EndpointNotConfigured), accept the mode — the
+            // worker's pump loop emits a structured Failed
+            // status when a non-supported topology lands later,
+            // so the failure surfaces observably either way.
+            // Schema acceptance row
+            // `eq-only-sample-format-coverage` pins this
+            // contract.
+            if mode == MODE_EQ_ONLY {
+                if let Some(routing) = self.audio_routing.as_ref() {
+                    if let Ok(endpoints) = routing.composition_endpoints() {
+                        if let Some(reason) =
+                            check_eq_only_format_support(&endpoints)
+                        {
+                            return encode_response(
+                                req,
+                                SelectModeResponse::bad_request(reason),
+                            );
+                        }
+                    }
+                }
             }
 
             self.current_mode = mode.to_string();
@@ -1414,6 +1715,170 @@ mod tests {
         );
 
         p.unload().await.unwrap();
+    }
+
+    // ---- eq_only format-refusal coverage ----
+
+    #[tokio::test]
+    async fn select_mode_eq_only_refuses_on_unsupported_pcm_codec() {
+        // Reuse the default ALSA endpoints from test_support but
+        // swap the codec to s24le which the EQ DSP does not
+        // support.
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let mut endpoints = crate::test_support::default_alsa_endpoints();
+        if let AudioFormat::Pcm { codec, .. } = &mut endpoints.input.format {
+            *codec = PcmCodec::PcmS24Le;
+        }
+        if let AudioFormat::Pcm { codec, .. } = &mut endpoints.output.format {
+            *codec = PcmCodec::PcmS24Le;
+        }
+        stub.set_endpoints(endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        let v = decode_payload(&resp.payload);
+        assert_eq!(v["status"], "bad_request");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.contains("eq_only refused") && err.contains("PcmS24Le"),
+            "refusal must name eq_only + the unsupported codec; got: {err}"
+        );
+        // Current mode unchanged.
+        assert_eq!(p.current_mode(), MODE_PASSTHROUGH);
+    }
+
+    #[tokio::test]
+    async fn select_mode_eq_only_accepts_supported_pcm_codec() {
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let mut endpoints = crate::test_support::default_alsa_endpoints();
+        if let AudioFormat::Pcm { codec, .. } = &mut endpoints.input.format {
+            *codec = PcmCodec::PcmF32;
+        }
+        if let AudioFormat::Pcm { codec, .. } = &mut endpoints.output.format {
+            *codec = PcmCodec::PcmF32;
+        }
+        stub.set_endpoints(endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        let v = decode_payload(&resp.payload);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(p.current_mode(), MODE_EQ_ONLY);
+    }
+
+    #[tokio::test]
+    async fn select_mode_eq_only_accepts_when_topology_not_yet_configured() {
+        // No topology published — the helper returns None
+        // (EndpointNotConfigured), the setter accepts the mode.
+        // The worker emits Failed when an unsupported topology
+        // lands later, so the failure remains observable.
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        // No set_endpoints — composition_endpoints returns
+        // EndpointNotConfigured.
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        let v = decode_payload(&resp.payload);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(p.current_mode(), MODE_EQ_ONLY);
+    }
+
+    // ---- audio.options.settings parser coverage ----
+
+    #[test]
+    fn parse_eq_runtime_state_default_when_empty() {
+        let s = parse_eq_runtime_state_from_state(&json!({}));
+        assert!(!s.engaged);
+        assert_eq!(s.bands.len(), crate::eq_dsp::EQ_BAND_COUNT);
+        for b in s.bands.iter() {
+            assert_eq!(b.freq_hz, 1000);
+            assert_eq!(b.gain_db, 0.0);
+            assert_eq!(b.q, 1.0);
+        }
+    }
+
+    #[test]
+    fn parse_eq_runtime_state_extracts_engaged_flag() {
+        let s = parse_eq_runtime_state_from_state(&json!({"eq_engaged": true}));
+        assert!(s.engaged);
+    }
+
+    #[test]
+    fn parse_eq_runtime_state_extracts_band_array() {
+        // Two bands configured; the rest default to flat.
+        let s = parse_eq_runtime_state_from_state(&json!({
+            "eq_engaged": true,
+            "eq_bands": [
+                { "freq_hz": 100, "gain_db": 3.0, "q": 0.7 },
+                { "freq_hz": 1000, "gain_db": -3.0, "q": 1.41 }
+            ]
+        }));
+        assert!(s.engaged);
+        assert_eq!(s.bands[0].freq_hz, 100);
+        assert!((s.bands[0].gain_db - 3.0).abs() < 1e-6);
+        assert!((s.bands[0].q - 0.7).abs() < 1e-6);
+        assert_eq!(s.bands[1].freq_hz, 1000);
+        assert!((s.bands[1].gain_db - -3.0).abs() < 1e-6);
+        assert!((s.bands[1].q - 1.41).abs() < 1e-6);
+        // Remaining bands fall through to defaults.
+        for i in 2..crate::eq_dsp::EQ_BAND_COUNT {
+            assert_eq!(s.bands[i], crate::eq_dsp::EqBandParams::default());
+        }
+    }
+
+    #[test]
+    fn parse_eq_runtime_state_caps_at_band_count() {
+        // 15 bands sent; parser caps at EQ_BAND_COUNT (10).
+        let extra = (0..15)
+            .map(|i| {
+                json!({
+                    "freq_hz": 100 + i * 100,
+                    "gain_db": 0.0,
+                    "q": 1.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let s = parse_eq_runtime_state_from_state(&json!({
+            "eq_engaged": false,
+            "eq_bands": extra,
+        }));
+        assert_eq!(s.bands.len(), crate::eq_dsp::EQ_BAND_COUNT);
+        // Band 9 (last accepted) carries the corresponding
+        // payload row.
+        assert_eq!(s.bands[9].freq_hz, 100 + 9 * 100);
     }
 
     #[tokio::test]
