@@ -55,9 +55,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::AudioProtocolSettings;
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus,
 };
@@ -236,6 +237,7 @@ pub(crate) async fn spawn(
     custody_handle: CustodyHandle,
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
+    audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
         plugin = PLUGIN_NAME,
@@ -252,6 +254,19 @@ pub(crate) async fn spawn(
         MpdConnection::connect_with_timeouts(endpoint.clone(), timeouts)
             .await
             .map_err(classify_connect_error)?;
+
+    // Apply the operator's MPD-protocol settings to the freshly
+    // opened command connection before the initial report. The
+    // settings are persisted across MPD restarts within a single
+    // server session but reset to defaults when MPD itself
+    // restarts; applying on every supervisor spawn restores them
+    // deterministically. Best-effort: if MPD refuses the verb
+    // (e.g. older server without `crossfade` support — unlikely
+    // on a modern build), the apply is logged and skipped, the
+    // session still proceeds.
+    let initial_protocol_settings = *audio_protocol_settings_rx.borrow();
+    apply_audio_protocol_settings(&mut cmd_conn, initial_protocol_settings)
+        .await;
 
     // Initial report: failure here means MPD is unusable, so bail
     // before spawning anything. The same query populates
@@ -293,14 +308,52 @@ pub(crate) async fn spawn(
         subject_emitter,
         last_emitted_file,
     };
-    let task_handle =
-        tokio::spawn(task_state.run(command_rx, shutdown_rx, idle_rx));
+    let task_handle = tokio::spawn(task_state.run(
+        command_rx,
+        shutdown_rx,
+        idle_rx,
+        audio_protocol_settings_rx,
+    ));
 
     Ok(SupervisorHandle {
         command_tx,
         shutdown_tx: Some(shutdown_tx),
         task_handle: Some(task_handle),
     })
+}
+
+/// Apply the operator's MPD-protocol settings to a live command
+/// connection. Both verbs are best-effort — an ACK from MPD is
+/// surfaced as a warning and the session continues; this matches
+/// the engineering bar's "no silent failure" rule (the warning
+/// is observable) without making MPD-version-skew a session-
+/// abort condition.
+async fn apply_audio_protocol_settings(
+    cmd_conn: &mut MpdConnection,
+    settings: AudioProtocolSettings,
+) {
+    if let Err(e) = cmd_conn.set_crossfade(settings.crossfade_seconds).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            crossfade_seconds = settings.crossfade_seconds,
+            error = %e,
+            "set_crossfade rejected; mpd's protocol-layer crossfade \
+             not applied for this session"
+        );
+    }
+    // `gapless = true` engages MPD `single 0` (continue through
+    // the queue); `gapless = false` engages `single 1` (stop
+    // after each track).
+    let single = !settings.gapless;
+    if let Err(e) = cmd_conn.set_single(single).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            single,
+            error = %e,
+            "set_single rejected; mpd's single-mode not applied \
+             for this session"
+        );
+    }
 }
 
 // ----- internal types -----
@@ -392,13 +445,19 @@ struct SupervisorTask {
 
 impl SupervisorTask {
     /// The supervisor task body. Consumes `self` (the run is the
-    /// whole life of the task) and the three channel receivers,
+    /// whole life of the task) and the four channel receivers,
     /// and loops until shutdown or one of the channels closes.
+    /// The watch receiver carries operator-toggled MPD-protocol
+    /// settings (crossfade + single mode); on change, the task
+    /// applies them to the command connection through the same
+    /// canonical dispatch path that handles steward-issued
+    /// commands.
     async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<SupervisorMessage>,
         mut shutdown_rx: oneshot::Receiver<()>,
         mut idle_rx: mpsc::Receiver<IdleEvent>,
+        mut audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
     ) {
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -471,6 +530,39 @@ impl SupervisorTask {
                                 &self.subject_emitter,
                                 &mut self.last_emitted_file,
                             ).await;
+                        }
+                    }
+                }
+                changed = audio_protocol_settings_rx.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            let settings = *audio_protocol_settings_rx.borrow();
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                handle = %self.custody_handle.id,
+                                crossfade_seconds = settings.crossfade_seconds,
+                                gapless = settings.gapless,
+                                "operator changed mpd-protocol settings; \
+                                 applying to live session"
+                            );
+                            apply_audio_protocol_settings(
+                                &mut self.cmd_conn,
+                                settings,
+                            ).await;
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                handle = %self.custody_handle.id,
+                                "audio_protocol_settings watch sender dropped; \
+                                 stopping settings-following arm"
+                            );
+                            // The watch sender on the plugin side has
+                            // dropped, which only happens when the
+                            // plugin itself is being torn down. The
+                            // supervisor will receive shutdown via the
+                            // dedicated channel shortly; stay in the
+                            // select loop on the other arms.
                         }
                     }
                 }
@@ -874,6 +966,20 @@ mod tests {
 
     // ----- integration tests -----
 
+    /// Test helper: default-valued audio_protocol_settings_rx for
+    /// spawn sites that don't exercise the operator-toggle path.
+    /// Returns a receiver bound to a sender that lives in a leaked
+    /// channel — fine for tests, the sender ownership doesn't
+    /// matter because the receiver only reads the default value.
+    fn null_protocol_settings_rx() -> watch::Receiver<AudioProtocolSettings> {
+        let (tx, rx) =
+            watch::channel(AudioProtocolSettings::audiophile_default());
+        // Leak the sender so the receiver stays usable. Tests
+        // don't poll for sender-drop here.
+        Box::leak(Box::new(tx));
+        rx
+    }
+
     #[tokio::test]
     async fn spawn_succeeds_and_emits_initial_report() {
         let (endpoint, _mock) = spawn_mock_mpd(vec![
@@ -891,6 +997,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -923,6 +1030,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -947,12 +1055,14 @@ mod tests {
 
     #[tokio::test]
     async fn command_ack_returns_playback_error_ack() {
-        // Command-conn: 1 = status (initial report),
-        //               2 = currentsong (initial report),
-        //               3 = play -> ACK.
+        // Command-conn: 1 = crossfade (apply_audio_protocol_settings),
+        //               2 = single    (apply_audio_protocol_settings),
+        //               3 = status    (initial report),
+        //               4 = currentsong (initial report),
+        //               5 = play -> ACK.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::AckOnNth {
-                nth: 3,
+                nth: 5,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -969,6 +1079,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -988,13 +1099,15 @@ mod tests {
 
     #[tokio::test]
     async fn command_reconnects_after_transient_drop() {
-        // First command-conn: initial status (seq 1),
-        //                     initial currentsong (seq 2),
-        //                     play (seq 3) -> close connection.
+        // First command-conn:  1 = crossfade (apply_audio_protocol_settings),
+        //                      2 = single    (apply_audio_protocol_settings),
+        //                      3 = status    (initial report),
+        //                      4 = currentsong (initial report),
+        //                      5 = play -> close connection.
         // Second command-conn (reconnect): Standard -> OK on play.
         // Idle conn: hold.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
-            ConnBehaviour::CloseOnNth { nth: 3 },
+            ConnBehaviour::CloseOnNth { nth: 5 },
             ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
         ])
@@ -1009,6 +1122,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1037,6 +1151,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1067,6 +1182,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             SubjectEmitter::null(),
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1110,6 +1226,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             emitter,
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1159,6 +1276,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             emitter,
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1199,6 +1317,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             emitter,
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();
@@ -1257,6 +1376,7 @@ mod tests {
             test_custody_handle(),
             reporter_dyn,
             emitter,
+            null_protocol_settings_rx(),
         )
         .await
         .unwrap();

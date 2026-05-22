@@ -39,12 +39,16 @@
 
 use std::sync::Arc;
 
+use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
 use evo_plugin_sdk::contract::audio_routing::{
     CompositionEndpoints, EndpointKind,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
+
+use crate::eq_dsp::{EqProcessor, EqSampleFormat};
+use crate::{EqRuntimeState, MODE_EQ_ONLY};
 
 /// Errors raised by the byte-flow substrate. Surfaced via
 /// the worker status channel so observability surfaces
@@ -115,6 +119,8 @@ const PUMP_BUFFER_BYTES: usize = 4096;
 /// for the next snapshot or shutdown.
 pub async fn run_substrate(
     endpoints: &CompositionEndpoints,
+    mode_rx: watch::Receiver<String>,
+    eq_state_rx: watch::Receiver<EqRuntimeState>,
     cancel: Arc<Notify>,
 ) -> Result<(), ByteFlowError> {
     if endpoints.input.kind != endpoints.output.kind {
@@ -125,27 +131,83 @@ pub async fn run_substrate(
     }
     match endpoints.input.kind {
         EndpointKind::NamedPipe => {
-            run_named_pipe(endpoints.clone(), cancel).await
+            run_named_pipe(endpoints.clone(), mode_rx, eq_state_rx, cancel)
+                .await
         }
         #[cfg(feature = "alsa-substrate")]
         EndpointKind::AlsaPcm => {
+            // The ALSA substrate path is opaque to the mode +
+            // eq-state channels in this build — the existing
+            // alsa-substrate worker pumps frames through
+            // libasound without an in-loop transform hook. Once
+            // the alsa-substrate worker grows the same
+            // mode-aware pump shape as the named-pipe path,
+            // these channels thread through identically.
+            let _ = mode_rx;
+            let _ = eq_state_rx;
             crate::byte_flow_alsa::run_alsa_pcm(endpoints.clone(), cancel).await
         }
         #[cfg(not(feature = "alsa-substrate"))]
         EndpointKind::AlsaPcm => {
+            let _ = mode_rx;
+            let _ = eq_state_rx;
             Err(ByteFlowError::UnsupportedKind(EndpointKind::AlsaPcm))
         }
         kind @ (EndpointKind::SharedMemory | EndpointKind::JackPort) => {
+            let _ = mode_rx;
+            let _ = eq_state_rx;
             Err(ByteFlowError::UnsupportedKind(kind))
         }
+    }
+}
+
+/// Map an SDK [`AudioFormat`] onto an [`EqSampleFormat`] +
+/// (channels, rate_hz) triple. PCM streams in s16le and f32le
+/// are supported; other PCM codecs and DSD streams surface
+/// the format string verbatim so the eq_only branch can refuse
+/// the mode if engaged (or pass through unchanged if not).
+fn eq_format_from_audio_format(
+    fmt: &AudioFormat,
+) -> (EqSampleFormat, usize, u32) {
+    match fmt {
+        AudioFormat::Pcm {
+            codec,
+            rate_hz,
+            channels,
+            ..
+        } => {
+            let sample_fmt = match codec {
+                PcmCodec::PcmS16Le => EqSampleFormat::S16Le,
+                PcmCodec::PcmF32 => EqSampleFormat::F32Le,
+                PcmCodec::PcmS24Le => {
+                    EqSampleFormat::Other("pcm_s24le".to_string())
+                }
+                PcmCodec::PcmS32Le => {
+                    EqSampleFormat::Other("pcm_s32le".to_string())
+                }
+            };
+            (sample_fmt, *channels as usize, *rate_hz)
+        }
+        other => (EqSampleFormat::Other(format!("{other:?}")), 2, 44100),
     }
 }
 
 /// Named-pipe substrate: open both endpoints as FIFOs at
 /// their configured paths and pump bytes from input to
 /// output until cancel fires or input reaches EOF.
+///
+/// The pump loop observes mode + EQ-state watch channels on
+/// every iteration; when mode == `eq_only` AND
+/// `eq_state.engaged = true` AND the negotiated format is one
+/// the EQ DSP supports (s16le / f32le), the read buffer flows
+/// through an [`EqProcessor`] before write. Other mode +
+/// engagement + format combinations pass through unchanged
+/// (the byte-identical passthrough path). One canonical pump
+/// loop; mode selects the per-iteration branch.
 async fn run_named_pipe(
     endpoints: CompositionEndpoints,
+    mut mode_rx: watch::Receiver<String>,
+    mut eq_state_rx: watch::Receiver<EqRuntimeState>,
     cancel: Arc<Notify>,
 ) -> Result<(), ByteFlowError> {
     let mut input = tokio::fs::OpenOptions::new()
@@ -169,15 +231,80 @@ async fn run_named_pipe(
             ))
         })?;
 
+    // Build the EQ processor from the negotiated input
+    // format. Sample format outside the DSP's coverage
+    // collapses the EQ path to passthrough so the substrate
+    // pumps cleanly even when the operator selected eq_only
+    // on a stream the DSP does not handle — the schema's
+    // `eq-only-sample-format-coverage` acceptance row pins
+    // refusal at the mode-select gesture, not at byte time;
+    // here we honour the safer fallthrough.
+    let (sample_fmt, channels, rate_hz) =
+        eq_format_from_audio_format(&endpoints.input.format);
+    let eq_supported = !matches!(sample_fmt, EqSampleFormat::Other(_))
+        && (1..=2).contains(&channels);
+    let mut processor = if eq_supported {
+        let mut p = EqProcessor::new(channels, sample_fmt, rate_hz);
+        let initial = eq_state_rx.borrow_and_update().clone();
+        p.configure_bands(&initial.bands);
+        Some(p)
+    } else {
+        None
+    };
+
+    // Read the initial mode + engaged state into local
+    // values; the select arms refresh these inline.
+    let mut current_mode = mode_rx.borrow_and_update().clone();
+    let mut eq_engaged = eq_state_rx.borrow().engaged;
+
     let mut buf = vec![0u8; PUMP_BUFFER_BYTES];
     loop {
         tokio::select! {
             biased;
             _ = cancel.notified() => return Ok(()),
+            // Operator changed composition mode mid-stream.
+            // Drop into the new branch on the next read.
+            changed = mode_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                current_mode = mode_rx.borrow().clone();
+            }
+            // Operator changed an EQ band parameter or
+            // engagement flag. Reconfigure the processor in
+            // place; delay state is preserved so no pop.
+            changed = eq_state_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let new_state = eq_state_rx.borrow().clone();
+                eq_engaged = new_state.engaged;
+                if let Some(p) = processor.as_mut() {
+                    p.configure_bands(&new_state.bands);
+                }
+            }
             result = input.read(&mut buf) => {
                 match result {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
+                        let apply_eq = current_mode == MODE_EQ_ONLY
+                            && eq_engaged
+                            && processor.is_some();
+                        if apply_eq {
+                            // process_bytes errors only on
+                            // misalignment / unsupported
+                            // format. Misalignment is a
+                            // substrate-boundary bug; surface
+                            // as ReadFailed so the worker
+                            // exits the substrate and waits
+                            // for the next route change.
+                            let p = processor.as_mut().unwrap();
+                            if let Err(e) = p.process_bytes(&mut buf[..n]) {
+                                return Err(ByteFlowError::ReadFailed(
+                                    format!("eq dsp: {e}"),
+                                ));
+                            }
+                        }
                         output
                             .write_all(&buf[..n])
                             .await

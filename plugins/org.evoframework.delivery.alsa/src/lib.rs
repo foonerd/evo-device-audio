@@ -1997,6 +1997,12 @@ mod tests {
             .expect("manifest declares [capabilities.delivery]");
         assert_eq!(delivery.input_kind, "audio.pcm");
         assert_eq!(delivery.device, "alsa:evo");
+        // Manifest declares the DEFAULT runtime posture — the
+        // plugin's chain ships with a `plug` front-end, so neither
+        // exclusive nor bit-perfect by static guarantee. The
+        // bit-perfect render path is an operator-toggleable branch
+        // in `options_render::render_drop_in`, not a static
+        // manifest invariant.
         assert!(!delivery.bit_perfect_capable);
         assert!(!delivery.exclusive_mode);
     }

@@ -62,9 +62,20 @@ default_mode = "passthrough"
 
 # Passthrough mode: byte-identical copy from input endpoint to
 # output endpoint, no transformation. Preserves bit-perfect by
-# definition. Subsequent commits layer further modes (eq_only,
-# resampler, dsd_to_pcm) onto this same plugin without
-# requiring a shape bump.
+# definition. Subsequent commits layer further modes (resampler,
+# dsd_to_pcm) onto this same plugin without requiring a shape
+# bump.
 [[capabilities.composition.modes]]
 name = "passthrough"
 preserves_bit_perfect = true
+
+# EQ-only mode: 10-band parametric EQ. Applies the configured
+# biquad-cascade per channel to s16le / f32le PCM streams. The
+# operator's per-band parameters (freq_hz, gain_db, Q) live in
+# the `audio.options.settings` subject; the plugin subscribes
+# and recomputes biquad coefficients on every change. Does NOT
+# preserve bit-perfect — the byte stream changes whenever
+# `eq_engaged = true` AND any band has non-zero gain.
+[[capabilities.composition.modes]]
+name = "eq_only"
+preserves_bit_perfect = false

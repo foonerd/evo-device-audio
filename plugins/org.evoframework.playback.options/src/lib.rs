@@ -201,9 +201,39 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_startup_volume",
     "options.set_max_volume",
     "options.set_volume_curve",
+    "options.set_exclusive_mode",
+    "options.set_crossfade_seconds",
+    "options.set_gapless",
+    "options.set_eq_engaged",
+    "options.set_eq_band",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ];
+
+/// Upper bound for the crossfade-seconds operator setting.
+/// Above this the setter refuses with a structured Permanent
+/// error. Catches slider-typo + UI-bug excursions before they
+/// reach MPD.
+const CROSSFADE_SECONDS_MAX: u32 = 30;
+
+/// Number of parametric EQ bands the operator surface
+/// exposes. Pinned to the schema's `eq-band-count-and-domain`
+/// acceptance row; consumer plugins (composition.alsa) honour
+/// exactly this count.
+pub const EQ_BAND_COUNT: usize = 10;
+
+/// EQ band frequency lower bound (audible band).
+const EQ_BAND_FREQ_MIN: u32 = 20;
+/// EQ band frequency upper bound (audible band).
+const EQ_BAND_FREQ_MAX: u32 = 20_000;
+/// EQ band gain lower bound in dB.
+const EQ_BAND_GAIN_MIN_DB: f32 = -15.0;
+/// EQ band gain upper bound in dB.
+const EQ_BAND_GAIN_MAX_DB: f32 = 15.0;
+/// EQ band Q lower bound (broad / flat).
+const EQ_BAND_Q_MIN: f32 = 0.1;
+/// EQ band Q upper bound (narrow / sharp).
+const EQ_BAND_Q_MAX: f32 = 30.0;
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -298,7 +328,11 @@ pub struct ResamplingPolicy {
 /// `state.toml` via serde. Field order is documented +
 /// stable; new fields land as additive options with sensible
 /// defaults (no schema-bump unless a domain narrows).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally omitted because the `eq_bands` field
+// carries f32 values (RBJ-EQ-cookbook gain + Q) which do not
+// implement `Eq` (NaN). `PartialEq` is sufficient for
+// settings-round-trip tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Wire-protocol envelope version. Future incompatible
     /// changes bump this; the plugin parses both shapes during
@@ -365,6 +399,73 @@ pub struct Settings {
     /// existing-deployment compatibility.
     #[serde(default)]
     pub volume_curve: VolumeCurve,
+    /// Bit-perfect (hog) device mode. When `true`, the delivery
+    /// plugin renders the `pcm.evo` chain with NO front-end
+    /// `plug` node and pins directly to the card terminus, so
+    /// source bytes reach the DAC byte-identical. Default
+    /// `false`: the chain uses `plug` (automatic format
+    /// conversion) so any source format opens cleanly — the
+    /// operator-friendly default. Toggling this on requires the
+    /// active delivery plugin to declare
+    /// `bit_perfect_capable = true`; the setter refuses
+    /// otherwise.
+    #[serde(default)]
+    pub exclusive_mode: bool,
+    /// Between-track crossfade duration in seconds. Domain
+    /// 0..=30 (enforced at the setter). `0` disables crossfade
+    /// — the audiophile default, no in-chain fade between
+    /// tracks. Non-zero values request MPD's protocol-level
+    /// crossfade for the named seconds count.
+    #[serde(default)]
+    pub crossfade_seconds: u32,
+    /// Gapless playback flag. Default `true`: the audiophile-
+    /// grade reference treats gap-free traversal of the queue
+    /// as the canonical behaviour. Setting `false` falls
+    /// through to MPD's default single-track behaviour (a
+    /// brief gap between adjacent tracks).
+    #[serde(default = "default_gapless")]
+    pub gapless: bool,
+    /// Parametric-EQ engagement flag. When `true`, the
+    /// composition plugin's eq_only mode applies the
+    /// configured bands to the PCM byte stream. When `false`,
+    /// the stream pumps through unchanged even when the
+    /// composition mode is eq_only (operator A/B switch
+    /// without leaving the EQ mode). Default `false`: the
+    /// operator opts in.
+    #[serde(default)]
+    pub eq_engaged: bool,
+    /// Parametric-EQ band configuration. Exactly 10 bands;
+    /// schema-pinned. Defaults are flat (all bands at 1 kHz,
+    /// 0 dB gain, Q=1.0) — engaging EQ without configuring
+    /// bands hears no change.
+    #[serde(default = "default_eq_bands")]
+    pub eq_bands: Vec<EqBand>,
+}
+
+/// One band of the parametric EQ. Mirrors the schema's
+/// per-band control surface 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqBand {
+    /// Centre frequency in Hz (20..=20000).
+    pub freq_hz: u32,
+    /// Gain in dB (-15.0..=15.0). 0 disables the band.
+    pub gain_db: f32,
+    /// Quality factor (0.1..=30.0). Higher = narrower band.
+    pub q: f32,
+}
+
+impl Default for EqBand {
+    fn default() -> Self {
+        Self {
+            freq_hz: 1000,
+            gain_db: 0.0,
+            q: 1.0,
+        }
+    }
+}
+
+fn default_eq_bands() -> Vec<EqBand> {
+    vec![EqBand::default(); EQ_BAND_COUNT]
 }
 
 fn default_startup_volume_percent() -> u8 {
@@ -373,6 +474,10 @@ fn default_startup_volume_percent() -> u8 {
 
 fn default_max_volume_percent() -> u8 {
     100
+}
+
+fn default_gapless() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -389,6 +494,11 @@ impl Default for Settings {
             startup_volume_percent: default_startup_volume_percent(),
             max_volume_percent: default_max_volume_percent(),
             volume_curve: VolumeCurve::default(),
+            exclusive_mode: false,
+            crossfade_seconds: 0,
+            gapless: default_gapless(),
+            eq_engaged: false,
+            eq_bands: default_eq_bands(),
         }
     }
 }
@@ -1435,6 +1545,17 @@ impl Respondent for PlaybackOptionsPlugin {
                 "options.set_volume_curve" => {
                     self.handle_set_volume_curve(req).await
                 }
+                "options.set_exclusive_mode" => {
+                    self.handle_set_exclusive_mode(req).await
+                }
+                "options.set_crossfade_seconds" => {
+                    self.handle_set_crossfade_seconds(req).await
+                }
+                "options.set_gapless" => self.handle_set_gapless(req).await,
+                "options.set_eq_engaged" => {
+                    self.handle_set_eq_engaged(req).await
+                }
+                "options.set_eq_band" => self.handle_set_eq_band(req).await,
                 "options.restore_last_known_good" => {
                     self.handle_restore_last_known_good(req).await
                 }
@@ -1973,6 +2094,192 @@ impl PlaybackOptionsPlugin {
         )
     }
 
+    /// Toggle bit-perfect (hog) device mode. The persisted flag
+    /// flows through the `audio.options.settings` subject to
+    /// the delivery plugin, which re-renders the `pcm.evo`
+    /// chain. When `exclusive_mode = true` the rendered chain
+    /// pins directly to the card's `hw:` terminus with no
+    /// front-end `plug` node — source bytes reach the DAC
+    /// byte-identical.
+    ///
+    /// No static-capability gate at the setter. The static
+    /// manifest field `capabilities.delivery.bit_perfect_capable`
+    /// is reserved by the SDK for plugins whose chain is ALWAYS
+    /// bit-perfect (the SDK enforces `bit_perfect_capable =>
+    /// exclusive_mode` at manifest parse); a runtime-toggleable
+    /// plugin keeps both false in its manifest and honours the
+    /// operator setting through the renderer branch. The
+    /// delivery-shelf contract `exclusive-mode-delivery-shelf-
+    /// contract` (in options.v2.toml acceptance) pins the
+    /// plugin's obligation to honour the operator's choice or
+    /// emit an operator-readable WARN happening on subject
+    /// update if the plugin cannot render the bit-perfect
+    /// path.
+    async fn handle_set_exclusive_mode(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetExclusiveModePayload = parse_versioned(req)?;
+        self.settings.exclusive_mode = payload.value;
+        self.persist_settings().await?;
+        self.emit_changed(
+            "exclusive_mode",
+            serde_json::Value::Bool(payload.value),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Set the between-track crossfade duration. The value
+    /// must lie in 0..=30 (the upper bound catches slider-typo
+    /// plus UI-bug excursions before they reach MPD). Zero
+    /// disables crossfade entirely. The playback warden
+    /// translates the persisted seconds count into MPD's
+    /// `crossfade <n>` protocol verb on the next subject-update
+    /// window.
+    async fn handle_set_crossfade_seconds(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetCrossfadeSecondsPayload = parse_versioned(req)?;
+        if payload.value > CROSSFADE_SECONDS_MAX {
+            return Err(PluginError::Permanent(format!(
+                "crossfade_seconds must lie in 0..={}; got {}",
+                CROSSFADE_SECONDS_MAX, payload.value
+            )));
+        }
+        self.settings.crossfade_seconds = payload.value;
+        self.persist_settings().await?;
+        self.emit_changed(
+            "crossfade_seconds",
+            serde_json::Value::Number(payload.value.into()),
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Enable / disable gapless playback. When `true`, the
+    /// playback warden engages MPD's single-mode-off + zero-
+    /// pause queue traversal. When `false`, the warden falls
+    /// through to MPD's default single-track behaviour.
+    async fn handle_set_gapless(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetGaplessPayload = parse_versioned(req)?;
+        self.settings.gapless = payload.value;
+        self.persist_settings().await?;
+        self.emit_changed("gapless", serde_json::Value::Bool(payload.value))
+            .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Toggle the parametric-EQ engagement flag. The composition
+    /// plugin's eq_only mode honours this flag: `true` applies
+    /// the configured bands; `false` pumps bytes through
+    /// unchanged. Operator A/B switch without leaving the EQ
+    /// composition mode.
+    async fn handle_set_eq_engaged(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetEqEngagedPayload = parse_versioned(req)?;
+        self.settings.eq_engaged = payload.value;
+        self.persist_settings().await?;
+        self.emit_changed("eq_engaged", serde_json::Value::Bool(payload.value))
+            .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Configure one of the 10 parametric-EQ bands. Validates
+    /// every field against the schema-pinned ranges with
+    /// structured Permanent refusal naming the offending field
+    /// plus the accepted range. Persists; updates the subject;
+    /// the composition plugin recomputes the biquad coefficients
+    /// on the next subject-update window.
+    async fn handle_set_eq_band(
+        &mut self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetEqBandPayload = parse_versioned(req)?;
+        if payload.index as usize >= EQ_BAND_COUNT {
+            return Err(PluginError::Permanent(format!(
+                "eq_band index must lie in 0..{}; got {}",
+                EQ_BAND_COUNT, payload.index
+            )));
+        }
+        if !(EQ_BAND_FREQ_MIN..=EQ_BAND_FREQ_MAX).contains(&payload.freq_hz) {
+            return Err(PluginError::Permanent(format!(
+                "eq_band.freq_hz must lie in {}..={}; got {}",
+                EQ_BAND_FREQ_MIN, EQ_BAND_FREQ_MAX, payload.freq_hz
+            )));
+        }
+        if !(EQ_BAND_GAIN_MIN_DB..=EQ_BAND_GAIN_MAX_DB)
+            .contains(&payload.gain_db)
+        {
+            return Err(PluginError::Permanent(format!(
+                "eq_band.gain_db must lie in {}..={} dB; got {}",
+                EQ_BAND_GAIN_MIN_DB, EQ_BAND_GAIN_MAX_DB, payload.gain_db
+            )));
+        }
+        if !(EQ_BAND_Q_MIN..=EQ_BAND_Q_MAX).contains(&payload.q) {
+            return Err(PluginError::Permanent(format!(
+                "eq_band.q must lie in {}..={}; got {}",
+                EQ_BAND_Q_MIN, EQ_BAND_Q_MAX, payload.q
+            )));
+        }
+        let band = EqBand {
+            freq_hz: payload.freq_hz,
+            gain_db: payload.gain_db,
+            q: payload.q,
+        };
+        // Defensive resize: the persisted state file might be
+        // older than the current EQ_BAND_COUNT shape. Pad with
+        // defaults to the canonical length before writing.
+        while self.settings.eq_bands.len() < EQ_BAND_COUNT {
+            self.settings.eq_bands.push(EqBand::default());
+        }
+        self.settings.eq_bands[payload.index as usize] = band;
+        self.persist_settings().await?;
+        self.emit_changed(
+            "eq_bands",
+            serde_json::to_value(&self.settings.eq_bands)
+                .map_err(map_json_err)?,
+        )
+        .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
     async fn handle_set_mixer_device(
         &mut self,
         req: &Request,
@@ -2448,6 +2755,74 @@ struct SetVolumeCurvePayload {
 }
 
 impl HasPayloadVersion for SetVolumeCurvePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetExclusiveModePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: bool,
+}
+
+impl HasPayloadVersion for SetExclusiveModePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCrossfadeSecondsPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: u32,
+}
+
+impl HasPayloadVersion for SetCrossfadeSecondsPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetGaplessPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: bool,
+}
+
+impl HasPayloadVersion for SetGaplessPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetEqEngagedPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    value: bool,
+}
+
+impl HasPayloadVersion for SetEqEngagedPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetEqBandPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    index: u32,
+    freq_hz: u32,
+    gain_db: f32,
+    q: f32,
+}
+
+impl HasPayloadVersion for SetEqBandPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -3244,6 +3619,286 @@ mod tests {
         .await
         .unwrap();
         assert!(p.settings().volume_normalization);
+    }
+
+    #[tokio::test]
+    async fn default_settings_carry_audiophile_grade_defaults() {
+        let s = Settings::default();
+        assert!(!s.exclusive_mode, "default bit-perfect must be off");
+        assert_eq!(
+            s.crossfade_seconds, 0,
+            "audiophile default — no in-chain fade"
+        );
+        assert!(s.gapless, "audiophile default — gapless on");
+    }
+
+    #[tokio::test]
+    async fn set_exclusive_mode_round_trips() {
+        let (mut p, _dir) = loaded_plugin().await;
+        assert!(!p.settings().exclusive_mode);
+        p.handle_request(&req(
+            "options.set_exclusive_mode",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        assert!(p.settings().exclusive_mode);
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(v["exclusive_mode"], true);
+    }
+
+    #[tokio::test]
+    async fn set_exclusive_mode_clears_back_to_false() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_exclusive_mode",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_exclusive_mode",
+            json!({ "v": 1, "value": false }),
+        ))
+        .await
+        .unwrap();
+        assert!(!p.settings().exclusive_mode);
+    }
+
+    #[tokio::test]
+    async fn set_crossfade_seconds_persists_within_range() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": 5 }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().crossfade_seconds, 5);
+        // Zero is a valid value and disables crossfade.
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": 0 }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().crossfade_seconds, 0);
+        // Upper bound (CROSSFADE_SECONDS_MAX) is accepted.
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": CROSSFADE_SECONDS_MAX }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().crossfade_seconds, CROSSFADE_SECONDS_MAX);
+    }
+
+    #[tokio::test]
+    async fn set_crossfade_seconds_refuses_above_ceiling() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_crossfade_seconds",
+                json!({ "v": 1, "value": CROSSFADE_SECONDS_MAX + 1 }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("0..=30"),
+                    "refusal must name the accepted range; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_gapless_round_trips_and_persists() {
+        let (mut p, _dir) = loaded_plugin().await;
+        // Defaults to true; flip to false then back.
+        assert!(p.settings().gapless);
+        p.handle_request(&req(
+            "options.set_gapless",
+            json!({ "v": 1, "value": false }),
+        ))
+        .await
+        .unwrap();
+        assert!(!p.settings().gapless);
+        p.handle_request(&req(
+            "options.set_gapless",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        assert!(p.settings().gapless);
+    }
+
+    #[tokio::test]
+    async fn default_settings_carry_ten_flat_eq_bands() {
+        let s = Settings::default();
+        assert!(!s.eq_engaged, "EQ off by default");
+        assert_eq!(s.eq_bands.len(), EQ_BAND_COUNT);
+        for (i, b) in s.eq_bands.iter().enumerate() {
+            assert_eq!(b.freq_hz, 1000, "band {} freq_hz default", i);
+            assert_eq!(b.gain_db, 0.0, "band {} gain_db default (flat)", i);
+            assert_eq!(b.q, 1.0, "band {} q default", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_eq_engaged_round_trips() {
+        let (mut p, _dir) = loaded_plugin().await;
+        assert!(!p.settings().eq_engaged);
+        p.handle_request(&req(
+            "options.set_eq_engaged",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        assert!(p.settings().eq_engaged);
+    }
+
+    #[tokio::test]
+    async fn set_eq_band_persists_valid_values() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_eq_band",
+            json!({
+                "v": 1,
+                "index": 3,
+                "freq_hz": 4000,
+                "gain_db": -3.5,
+                "q": 1.41,
+            }),
+        ))
+        .await
+        .unwrap();
+        let band = p.settings().eq_bands[3];
+        assert_eq!(band.freq_hz, 4000);
+        assert!((band.gain_db - -3.5).abs() < 1e-6);
+        assert!((band.q - 1.41).abs() < 1e-6);
+        // Other bands unchanged.
+        assert_eq!(p.settings().eq_bands[0], EqBand::default());
+    }
+
+    #[tokio::test]
+    async fn set_eq_band_refuses_index_above_count() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_eq_band",
+                json!({
+                    "v": 1,
+                    "index": 99,
+                    "freq_hz": 1000,
+                    "gain_db": 0.0,
+                    "q": 1.0,
+                }),
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("index") && msg.contains("0..10"),
+                    "refusal must name index + range; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_eq_band_refuses_freq_below_audible_band() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_eq_band",
+                json!({
+                    "v": 1,
+                    "index": 0,
+                    "freq_hz": 5,
+                    "gain_db": 0.0,
+                    "q": 1.0,
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn set_eq_band_refuses_gain_above_max() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_eq_band",
+                json!({
+                    "v": 1,
+                    "index": 0,
+                    "freq_hz": 1000,
+                    "gain_db": 100.0,
+                    "q": 1.0,
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn set_eq_band_refuses_q_outside_range() {
+        let (mut p, _dir) = loaded_plugin().await;
+        let err = p
+            .handle_request(&req(
+                "options.set_eq_band",
+                json!({
+                    "v": 1,
+                    "index": 0,
+                    "freq_hz": 1000,
+                    "gain_db": 0.0,
+                    "q": 100.0,
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn reset_to_defaults_restores_new_fields() {
+        let (mut p, _dir) = loaded_plugin().await;
+        p.handle_request(&req(
+            "options.set_exclusive_mode",
+            json!({ "v": 1, "value": true }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_crossfade_seconds",
+            json!({ "v": 1, "value": 7 }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req(
+            "options.set_gapless",
+            json!({ "v": 1, "value": false }),
+        ))
+        .await
+        .unwrap();
+        p.handle_request(&req("options.reset_to_defaults", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let s = p.settings();
+        assert!(!s.exclusive_mode);
+        assert_eq!(s.crossfade_seconds, 0);
+        assert!(s.gapless);
     }
 
     #[tokio::test]

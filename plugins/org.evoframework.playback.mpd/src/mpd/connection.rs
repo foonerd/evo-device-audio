@@ -261,6 +261,44 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Set between-track crossfade duration in seconds.
+    ///
+    /// Wire form: `crossfade "<seconds>"\n`. `0` disables
+    /// crossfade entirely. The operator-facing setter
+    /// (`options.set_crossfade_seconds`) caps the value at 30 so
+    /// the wire arg never exceeds MPD's accepted range; values
+    /// MPD rejects surface as [`MpdError::Ack`] (no silent
+    /// clamping).
+    pub(crate) async fn set_crossfade(
+        &mut self,
+        seconds: u32,
+    ) -> Result<(), MpdError> {
+        let arg = seconds.to_string();
+        self.dispatch("crossfade", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
+    /// Set MPD's `single` mode.
+    ///
+    /// Wire form: `single "<0|1>"\n`. Controls whether MPD stops
+    /// at the end of each track (`single 1` — operator's
+    /// "let-me-think-about-it" mode) or continues through the
+    /// queue (`single 0` — the canonical "play through the
+    /// album" mode). The operator-facing `gapless` setting maps
+    /// to this verb: `gapless = true` → `single 0`, `gapless =
+    /// false` → `single 1`. Note that MPD's byte-level gapless
+    /// playback between same-format tracks is decided at the
+    /// audio-output layer, not by this command; this verb is the
+    /// queue-traversal lever the operator actually cares about.
+    pub(crate) async fn set_single(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), MpdError> {
+        let arg = if enabled { "1" } else { "0" };
+        self.dispatch("single", &[arg]).await?;
+        Ok(())
+    }
+
     // ----- idle subprotocol -----
 
     /// Subscribe to subsystem change events.
@@ -1135,6 +1173,46 @@ mod tests {
         conn.ping().await.unwrap();
         let captured = rx.await.unwrap();
         assert_eq!(captured, b"ping\n");
+    }
+
+    #[tokio::test]
+    async fn set_crossfade_sends_crossfade_with_quoted_seconds() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_crossfade(5).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"crossfade \"5\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_crossfade_zero_disables() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_crossfade(0).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"crossfade \"0\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_single_true_engages_one() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_single(true).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"single \"1\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_single_false_engages_zero() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_single(false).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"single \"0\"\n");
     }
 
     // ----- transport: ACK handling -----

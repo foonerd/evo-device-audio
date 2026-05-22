@@ -122,7 +122,9 @@ use tokio::task::JoinHandle;
 
 use crate::byte_flow::{run_substrate, ByteFlowError};
 
+mod biquad;
 mod byte_flow;
+mod eq_dsp;
 
 #[cfg(feature = "alsa-substrate")]
 mod byte_flow_alsa;
@@ -144,7 +146,8 @@ const PAYLOAD_VERSION: u32 = 1;
 /// entries; admission would refuse a mismatch between the
 /// runtime's declared list and the manifest's.
 const MODE_PASSTHROUGH: &str = "passthrough";
-const DECLARED_MODES: &[&str] = &[MODE_PASSTHROUGH];
+const MODE_EQ_ONLY: &str = "eq_only";
+const DECLARED_MODES: &[&str] = &[MODE_PASSTHROUGH, MODE_EQ_ONLY];
 
 /// Parse the embedded plugin manifest.
 pub fn manifest() -> Manifest {
@@ -158,12 +161,49 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
+/// Operator-controlled EQ runtime state derived from the
+/// `audio.options.settings` subject. The subject subscriber
+/// pushes a fresh snapshot to `eq_state_tx`; the byte-flow
+/// substrate observes it through `eq_state_rx` and
+/// reconfigures the [`EqProcessor`] on every change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EqRuntimeState {
+    /// `true` engages the EQ processing path; `false` pumps
+    /// bytes through unchanged even when the active mode is
+    /// `eq_only`. Operator A/B switch within the EQ mode.
+    pub engaged: bool,
+    /// 10 parametric band parameters. Schema-pinned count;
+    /// consumer DSP cascades 10 biquads per channel.
+    pub bands: [crate::eq_dsp::EqBandParams; crate::eq_dsp::EQ_BAND_COUNT],
+}
+
+impl Default for EqRuntimeState {
+    fn default() -> Self {
+        Self {
+            engaged: false,
+            bands: [crate::eq_dsp::EqBandParams::default();
+                crate::eq_dsp::EQ_BAND_COUNT],
+        }
+    }
+}
+
 /// ALSA composition plugin.
 pub struct AlsaCompositionPlugin {
     loaded: bool,
     /// Active composition mode token. Reset to
     /// [`MODE_PASSTHROUGH`] at every successful load.
     current_mode: String,
+    /// Watch channel publishing the active mode token to the
+    /// byte-flow substrate. The substrate's pump loop
+    /// observes mode changes inline and branches between
+    /// passthrough and eq_only processing without restarting
+    /// the substrate lifecycle.
+    mode_tx: watch::Sender<String>,
+    /// Watch channel publishing the operator's EQ runtime
+    /// state (engaged flag + 10 band parameters). Seeded with
+    /// the audiophile-grade flat defaults at construction;
+    /// updated by the `audio.options.settings` subscriber.
+    eq_state_tx: watch::Sender<EqRuntimeState>,
     /// Audio routing handle pulled from
     /// [`LoadContext::audio_routing`] at load time. `None`
     /// before the first successful load and after every
@@ -246,9 +286,13 @@ struct ReactorHandle {
 impl AlsaCompositionPlugin {
     /// Construct a fresh plugin instance.
     pub fn new() -> Self {
+        let (mode_tx, _) = watch::channel(MODE_PASSTHROUGH.to_string());
+        let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
             loaded: false,
             current_mode: MODE_PASSTHROUGH.to_string(),
+            mode_tx,
+            eq_state_tx,
             audio_routing: None,
             requests_handled: 0,
             reactor: None,
@@ -419,11 +463,20 @@ impl AlsaCompositionPlugin {
             .expect("reactor populated")
             .endpoints_rx
             .clone();
+        let mode_rx = self.mode_tx.subscribe();
+        let eq_state_rx = self.eq_state_tx.subscribe();
         let (status_tx, status_rx) = watch::channel(WorkerStatus::Idle);
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
         let task = tokio::spawn(async move {
-            run_worker(endpoints_rx, task_shutdown, status_tx).await;
+            run_worker(
+                endpoints_rx,
+                mode_rx,
+                eq_state_rx,
+                task_shutdown,
+                status_tx,
+            )
+            .await;
         });
 
         self.worker = Some(WorkerHandle {
@@ -491,6 +544,8 @@ impl AlsaCompositionPlugin {
 /// substrate, avoiding double-open of the same path.
 async fn run_worker(
     mut endpoints_rx: watch::Receiver<Option<CompositionEndpoints>>,
+    mode_rx: watch::Receiver<String>,
+    eq_state_rx: watch::Receiver<EqRuntimeState>,
     shutdown: Arc<Notify>,
     status_tx: watch::Sender<WorkerStatus>,
 ) {
@@ -509,6 +564,8 @@ async fn run_worker(
                 run_substrate_lifecycle(
                     endpoints,
                     &mut endpoints_rx,
+                    mode_rx.clone(),
+                    eq_state_rx.clone(),
                     Arc::clone(&shutdown),
                     &status_tx,
                 )
@@ -555,6 +612,8 @@ async fn wait_for_next_event(
 async fn run_substrate_lifecycle(
     endpoints: CompositionEndpoints,
     endpoints_rx: &mut watch::Receiver<Option<CompositionEndpoints>>,
+    mode_rx: watch::Receiver<String>,
+    eq_state_rx: watch::Receiver<EqRuntimeState>,
     shutdown: Arc<Notify>,
     status_tx: &watch::Sender<WorkerStatus>,
 ) -> EventOutcome {
@@ -585,8 +644,16 @@ async fn run_substrate_lifecycle(
     let cancel = Arc::new(Notify::new());
     let cancel_for_run = Arc::clone(&cancel);
     let endpoints_for_run = endpoints.clone();
+    let mode_rx_for_run = mode_rx.clone();
+    let eq_state_rx_for_run = eq_state_rx.clone();
     let mut run_handle = tokio::spawn(async move {
-        run_substrate(&endpoints_for_run, cancel_for_run).await
+        run_substrate(
+            &endpoints_for_run,
+            mode_rx_for_run,
+            eq_state_rx_for_run,
+            cancel_for_run,
+        )
+        .await
     });
 
     tokio::select! {
@@ -862,6 +929,15 @@ impl Respondent for AlsaCompositionPlugin {
             }
 
             self.current_mode = mode.to_string();
+            // Publish the new mode to the byte-flow substrate.
+            // The substrate's pump loop observes mode changes
+            // inline and branches between passthrough and
+            // eq_only processing without restarting the
+            // substrate lifecycle. send_replace ignores the
+            // empty-receiver case (no worker yet) — the next
+            // worker spawn reads the current value on
+            // subscribe.
+            self.mode_tx.send_replace(self.current_mode.clone());
             encode_response(
                 req,
                 SelectModeResponse::ok(self.current_mode.clone()),
@@ -1122,9 +1198,14 @@ mod tests {
         let mut p = AlsaCompositionPlugin::new();
         p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
             .unwrap();
+        // `resampler` is a future mode token reserved in the
+        // schema but not implemented in this build; the runtime
+        // mode list (`DECLARED_MODES`) carries `passthrough` +
+        // `eq_only` and the refusal must name the unknown token
+        // explicitly.
         let req = Request {
             request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
-            payload: json!({ "v": 1, "mode": "eq_only" })
+            payload: json!({ "v": 1, "mode": "resampler" })
                 .to_string()
                 .into_bytes(),
             correlation_id: 2,
@@ -1138,7 +1219,7 @@ mod tests {
         assert_eq!(v["status"], "bad_request");
         let err = v["error"].as_str().unwrap();
         assert!(err.contains("unknown mode"), "got: {err}");
-        assert!(err.contains("eq_only"), "got: {err}");
+        assert!(err.contains("resampler"), "got: {err}");
         assert_eq!(p.current_mode(), MODE_PASSTHROUGH);
     }
 
@@ -1420,6 +1501,9 @@ mod tests {
     // -- Chunk D: byte-flow worker -------------------------------------
 
     use super::test_support::{make_fifo_pair, named_pipe_endpoints};
+    use evo_plugin_sdk::contract::audio_routing::{
+        ReadEndpoint, WriteEndpoint,
+    };
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1573,6 +1657,201 @@ mod tests {
             .await
             .expect("read echoed payload");
         assert_eq!(payload, received);
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_eq_only_engaged_amplifies_centre_band() {
+        // End-to-end EQ integration: mode = eq_only, engaged
+        // = true, band 0 = peaking @ 1 kHz + 12 dB / Q=1.0.
+        // Pump a 1 kHz sine through f32le stereo named-pipe.
+        // The output amplitude must be substantially boosted
+        // relative to the input — proving the worker has
+        // actually routed the bytes through the EqProcessor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_path, output_path) =
+            crate::test_support::make_fifo_pair(dir.path());
+
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let f32_endpoints = CompositionEndpoints {
+            input: ReadEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: input_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+            output: WriteEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: output_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+        };
+        stub.set_endpoints(f32_endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+
+        // Pre-publish the operator settings BEFORE spawning
+        // the worker so the substrate reads the engaged +
+        // boosted state at substrate-open time.
+        p.mode_tx.send_replace(MODE_EQ_ONLY.to_string());
+        let mut bands = [crate::eq_dsp::EqBandParams::default();
+            crate::eq_dsp::EQ_BAND_COUNT];
+        bands[0] = crate::eq_dsp::EqBandParams {
+            freq_hz: 1000,
+            gain_db: 12.0,
+            q: 1.0,
+        };
+        p.eq_state_tx.send_replace(EqRuntimeState {
+            engaged: true,
+            bands,
+        });
+
+        p.spawn_worker().await.unwrap();
+        let (mut writer, mut reader) =
+            open_test_fifo_sides(input_path, output_path).await;
+
+        let mut status_rx =
+            p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut status_rx, 500, |s| {
+            matches!(
+                s,
+                WorkerStatus::Running {
+                    kind: EndpointKind::NamedPipe
+                }
+            )
+        })
+        .await;
+
+        // Build a 1 kHz sine + write to the input pipe.
+        // 4410 frames = 100 ms at 44.1 kHz.
+        let two_pi_f = 2.0 * std::f64::consts::PI * 1000.0;
+        let mut input_bytes = Vec::with_capacity(4410 * 2 * 4);
+        for i in 0..4410 {
+            let t = i as f64 / 44_100.0;
+            let s = (two_pi_f * t).sin() as f32 * 0.3; // -10 dB headroom
+            for _ in 0..2 {
+                input_bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        writer.write_all(&input_bytes).await.expect("write");
+        writer.flush().await.expect("flush");
+
+        let mut output_bytes = vec![0u8; input_bytes.len()];
+        reader.read_exact(&mut output_bytes).await.expect("read");
+
+        // Measure peak amplitude on the second half (filter
+        // has settled). Boost should be ≥ 1.5x relative to
+        // the input peak.
+        let mut peak_in: f32 = 0.0;
+        let mut peak_out: f32 = 0.0;
+        for f in 2205..4410 {
+            let off = f * 2 * 4;
+            let s_in = f32::from_le_bytes([
+                input_bytes[off],
+                input_bytes[off + 1],
+                input_bytes[off + 2],
+                input_bytes[off + 3],
+            ]);
+            let s_out = f32::from_le_bytes([
+                output_bytes[off],
+                output_bytes[off + 1],
+                output_bytes[off + 2],
+                output_bytes[off + 3],
+            ]);
+            peak_in = peak_in.max(s_in.abs());
+            peak_out = peak_out.max(s_out.abs());
+        }
+        assert!(
+            peak_out > peak_in * 1.5,
+            "engaged EQ must boost the centre-frequency sine \
+             end-to-end through the worker; \
+             peak_in={peak_in} peak_out={peak_out}"
+        );
+
+        p.unload().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_eq_only_disengaged_passes_bytes_unchanged() {
+        // Mirror of the previous test but with engaged =
+        // false. The worker still runs eq_only mode but the
+        // pump loop branches to passthrough; bytes must
+        // arrive byte-identical on the output.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_path, output_path) =
+            crate::test_support::make_fifo_pair(dir.path());
+
+        let mut p = AlsaCompositionPlugin::new();
+        let stub = Arc::new(StubAudioRouting::new());
+        let f32_endpoints = CompositionEndpoints {
+            input: ReadEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: input_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+            output: WriteEndpoint {
+                kind: EndpointKind::NamedPipe,
+                path: output_path.clone(),
+                format: AudioFormat::Pcm {
+                    codec: PcmCodec::PcmF32,
+                    rate_hz: 44_100,
+                    channels: 2,
+                },
+                buffer_frames: 1024,
+            },
+        };
+        stub.set_endpoints(f32_endpoints);
+        p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
+        p.spawn_reactor().await.unwrap();
+        // Mode is eq_only but engaged is false.
+        p.mode_tx.send_replace(MODE_EQ_ONLY.to_string());
+        // EqRuntimeState::default has engaged = false.
+
+        p.spawn_worker().await.unwrap();
+        let (mut writer, mut reader) =
+            open_test_fifo_sides(input_path, output_path).await;
+        let mut status_rx =
+            p.subscribe_worker_status().expect("worker running");
+        wait_for_worker_status(&mut status_rx, 500, |s| {
+            matches!(
+                s,
+                WorkerStatus::Running {
+                    kind: EndpointKind::NamedPipe
+                }
+            )
+        })
+        .await;
+
+        let payload: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xAA, 0xBB, 0xCC,
+            0xDD, 0xEE, 0xFF, 0x11, 0x22,
+        ];
+        writer.write_all(&payload).await.expect("write");
+        writer.flush().await.expect("flush");
+
+        let mut received = [0u8; 16];
+        reader.read_exact(&mut received).await.expect("read");
+        assert_eq!(
+            payload, received,
+            "eq_only mode with engaged=false must pass bytes \
+             through unchanged"
+        );
 
         p.unload().await.unwrap();
     }

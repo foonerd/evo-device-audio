@@ -179,6 +179,7 @@ const COURSE_CORRECT_VERBS: &[&str] = &[
     "previous",
     "seek",
     "set_volume",
+    "emit_test_tone",
 ];
 
 /// Source verbs the plugin handles via the respondent
@@ -212,6 +213,28 @@ const PAYLOAD_VERSION: u32 = 1;
 /// daemon's library and played; items in other schemes
 /// dispatch elsewhere by the framework's URI-routing rules.
 const URI_SCHEME_MPD_PATH: &str = "mpd-path";
+
+/// Audible-band lower bound for the `emit_test_tone` verb.
+/// Below this frequency the tone is inaudible and a
+/// well-meaning operator slider sweep can silently land on a
+/// non-perceptible value.
+const TEST_TONE_FREQ_MIN: u32 = 20;
+/// Audible-band upper bound for the `emit_test_tone` verb.
+/// Above this frequency the tone is inaudible and a
+/// slider-typo / UI-bug excursion (100000) would silently land
+/// on a non-perceptible value.
+const TEST_TONE_FREQ_MAX: u32 = 20_000;
+/// Lower bound for the test-tone duration. Below 100 ms the
+/// tone is too short to be operator-perceptible.
+const TEST_TONE_DURATION_MIN_MS: u32 = 100;
+/// Upper bound for the test-tone duration. Above 10 s the
+/// gesture stops being a "brief diagnostic" and becomes an
+/// audio nuisance.
+const TEST_TONE_DURATION_MAX_MS: u32 = 10_000;
+/// Default channel routing when the operator does not specify
+/// one. Both-channels matches the most common operator intent
+/// ("verify the chain end-to-end").
+const TEST_TONE_DEFAULT_CHANNEL: &str = "both";
 
 /// Parse the embedded manifest into a [`Manifest`] struct.
 ///
@@ -343,6 +366,22 @@ pub struct MpdPlaybackPlugin {
     /// channel AND the endpoint reactor's snapshot channel,
     /// re-rendering the mpd_fragment on either change.
     mixer_config_tx: watch::Sender<MixerConfig>,
+    /// Watch channel carrying the operator's currently-selected
+    /// MPD-protocol settings (`crossfade_seconds` + `gapless`).
+    /// Seeded with the audiophile-grade defaults at construction
+    /// (no crossfade, gapless on); updated by the
+    /// `playback.options` settings subscriber on every relevant
+    /// subject change. Each spawned supervisor subscribes via
+    /// [`watch::Sender::subscribe`] and the task body's
+    /// `tokio::select!` arm dispatches `SetCrossfade` +
+    /// `SetSingle` whenever the value changes, so MPD's
+    /// protocol-level crossfade + single-mode follow the
+    /// operator's settings without a separate apply gesture.
+    /// Each new supervisor session also reads the channel's
+    /// current value on connect to apply the operator's choice
+    /// from the start (single canonical apply path, no
+    /// session-init / settings-update fork).
+    audio_protocol_settings_tx: watch::Sender<AudioProtocolSettings>,
     /// Concrete handle on the auto-restarter composite so a
     /// future capabilities-watch reactor can call `re_resolve`
     /// on it without going through the `Arc<dyn MpdRestarter>`
@@ -357,6 +396,37 @@ pub struct MpdPlaybackPlugin {
     /// fixtures, OOP transports). Held here so
     /// `Plugin::unload` can stop it cleanly.
     capabilities_watcher: Option<CapabilitiesWatcherHandle>,
+}
+
+/// Operator-selected MPD-protocol settings carried on the
+/// plugin's `audio_protocol_settings_tx` watch channel. The
+/// subject subscriber extracts these from the
+/// `audio.options.settings` subject; each spawned supervisor
+/// subscribes to the channel and applies the values via MPD's
+/// protocol-layer verbs (`crossfade <n>` + `single <0|1>`) on
+/// session-init and on every change while a session is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioProtocolSettings {
+    /// Between-track crossfade duration in seconds (0..=30,
+    /// upper bound enforced at the options-plugin setter). `0`
+    /// disables crossfade entirely.
+    pub(crate) crossfade_seconds: u32,
+    /// Gapless playback flag. `true` (audiophile default)
+    /// engages MPD `single 0` — continue through the queue;
+    /// `false` engages MPD `single 1` — stop after each track.
+    pub(crate) gapless: bool,
+}
+
+impl AudioProtocolSettings {
+    /// Audiophile-grade defaults: no crossfade, gapless on.
+    /// Matches the `playback.options` plugin's `Settings`
+    /// default for these fields.
+    pub(crate) const fn audiophile_default() -> Self {
+        Self {
+            crossfade_seconds: 0,
+            gapless: true,
+        }
+    }
 }
 
 /// Handle on the PPAG capabilities-watch reactor task. Spawned
@@ -436,6 +506,8 @@ impl MpdPlaybackPlugin {
         timeouts: ConnectTimeouts,
     ) -> Self {
         let (mixer_config_tx, _) = watch::channel(MixerConfig::Software);
+        let (audio_protocol_settings_tx, _) =
+            watch::channel(AudioProtocolSettings::audiophile_default());
         Self {
             loaded: false,
             endpoint,
@@ -453,6 +525,7 @@ impl MpdPlaybackPlugin {
             reactor: None,
             fragment_worker: None,
             mixer_config_tx,
+            audio_protocol_settings_tx,
             auto_restarter: None,
             capabilities_watcher: None,
         }
@@ -752,6 +825,7 @@ impl MpdPlaybackPlugin {
         let subscriber = Arc::clone(subscriber);
         let querier = Arc::clone(querier);
         let mixer_tx = self.mixer_config_tx.clone();
+        let protocol_tx = self.audio_protocol_settings_tx.clone();
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
@@ -820,6 +894,8 @@ impl MpdPlaybackPlugin {
                 {
                     let _ = mixer_tx.send(cfg);
                 }
+                let protocol = parse_audio_protocol_settings_from_state(&state);
+                let _ = protocol_tx.send(protocol);
             }
 
             loop {
@@ -831,6 +907,15 @@ impl MpdPlaybackPlugin {
                             {
                                 let _ = mixer_tx.send(cfg);
                             }
+                            let protocol =
+                                parse_audio_protocol_settings_from_state(state);
+                            // send() returns Err only when every
+                            // subscriber has dropped — no live
+                            // supervisor yet. Updating the channel
+                            // value is fine; the next supervisor
+                            // session reads the latest value on
+                            // subscribe.
+                            let _ = protocol_tx.send_replace(protocol);
                         }
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
@@ -1045,6 +1130,29 @@ async fn resolve_options_addressing_with_backoff(
          remains the operator surface)"
     );
     None
+}
+
+/// Extract the operator's MPD-protocol settings (crossfade +
+/// gapless) from an `audio.options.settings` subject-state
+/// payload. Missing fields fall through to the audiophile-grade
+/// default (no crossfade, gapless on) — the same posture the
+/// options plugin's `Settings::default` carries.
+fn parse_audio_protocol_settings_from_state(
+    state: &serde_json::Value,
+) -> AudioProtocolSettings {
+    let crossfade_seconds = state
+        .get("crossfade_seconds")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let gapless = state
+        .get("gapless")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    AudioProtocolSettings {
+        crossfade_seconds,
+        gapless,
+    }
 }
 
 /// Hardware-mode degrade: if `mixer_type = "Hardware"` but the
@@ -1372,6 +1480,102 @@ async fn apply_fragment_cycle(
 /// this function maps to [`PluginError::Permanent`] because the
 /// correction is malformed and the same bytes will fail the same
 /// way on retry.
+/// Wire-payload shape for the `emit_test_tone` course-correct
+/// verb. All fields beyond `v` are optional; defaults match the
+/// schema (1000 Hz, 1500 ms, both channels).
+#[derive(Debug, serde::Deserialize)]
+struct TestTonePayload {
+    #[serde(default = "default_test_tone_payload_version")]
+    v: u32,
+    #[serde(default)]
+    freq_hz: Option<u32>,
+    #[serde(default)]
+    duration_ms: Option<u32>,
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+fn default_test_tone_payload_version() -> u32 {
+    PAYLOAD_VERSION
+}
+
+/// Channel-routing options for the `emit_test_tone` verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestToneChannel {
+    Left,
+    Right,
+    Both,
+}
+
+impl TestToneChannel {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+/// Synthesise a 44100 Hz / 16-bit / stereo PCM WAV file
+/// carrying the requested sine wave. Returns the complete WAV
+/// byte stream (44-byte header + interleaved samples). Pure
+/// function, deterministic for identical inputs.
+///
+/// Amplitude is fixed at half-scale (`i16::MAX / 2`) so the
+/// tone is clearly audible without being painful — the
+/// wiring-diagnostic intent does not require full-scale
+/// excursion.
+fn synthesise_test_tone_wav(
+    freq_hz: u32,
+    duration_ms: u32,
+    channel: TestToneChannel,
+) -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 44100;
+    const BIT_DEPTH: u16 = 16;
+    const CHANNELS: u16 = 2;
+    let num_samples = (SAMPLE_RATE as u64 * duration_ms as u64 / 1000) as u32;
+    let bytes_per_sample = (BIT_DEPTH / 8) as u32;
+    let block_align = CHANNELS as u32 * bytes_per_sample;
+    let data_size = num_samples * block_align;
+    let byte_rate = SAMPLE_RATE * block_align;
+
+    let mut out = Vec::with_capacity(44 + data_size as usize);
+    // RIFF header.
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_size).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    // fmt chunk.
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&CHANNELS.to_le_bytes());
+    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&(block_align as u16).to_le_bytes());
+    out.extend_from_slice(&BIT_DEPTH.to_le_bytes());
+    // data chunk.
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_size.to_le_bytes());
+
+    let amplitude = (i16::MAX / 2) as f64;
+    let two_pi_f = 2.0 * std::f64::consts::PI * freq_hz as f64;
+    let sample_rate_f = SAMPLE_RATE as f64;
+    for i in 0..num_samples {
+        let t = i as f64 / sample_rate_f;
+        let sample = (amplitude * (two_pi_f * t).sin()) as i16;
+        let (l, r) = match channel {
+            TestToneChannel::Left => (sample, 0i16),
+            TestToneChannel::Right => (0i16, sample),
+            TestToneChannel::Both => (sample, sample),
+        };
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    out
+}
+
 fn parse_correction(
     correction: &CourseCorrection,
 ) -> Result<PlaybackCommand, PluginError> {
@@ -1425,6 +1629,18 @@ fn parse_correction(
                 ))
             })?;
             Ok(PlaybackCommand::SetVolume(v))
+        }
+        "emit_test_tone" => {
+            // Parsed separately by the course_correct dispatch
+            // path so the synthesis + temp-file write happens
+            // before the supervisor command is built. Reaching
+            // this branch indicates a bug in the dispatcher; the
+            // verb is not a generic command-to-MPD mapping.
+            Err(PluginError::Permanent(
+                "emit_test_tone parsed via dedicated dispatch \
+                 path; parse_correction should not see it"
+                    .to_string(),
+            ))
         }
         other => Err(PluginError::Permanent(format!(
             "unknown course correction type: {:?}",
@@ -1822,6 +2038,7 @@ impl Warden for MpdPlaybackPlugin {
             ));
 
             // Spawn the supervisor. Opens two MPD connections,
+            // applies the operator's MPD-protocol settings,
             // emits the initial state report, returns a handle for
             // command dispatch and shutdown. Failure maps to the
             // steward-visible PluginError variant.
@@ -1831,6 +2048,7 @@ impl Warden for MpdPlaybackPlugin {
                 handle.clone(),
                 assignment.custody_state_reporter,
                 emitter,
+                self.audio_protocol_settings_tx.subscribe(),
             )
             .await
             {
@@ -1889,10 +2107,22 @@ impl Warden for MpdPlaybackPlugin {
                 ));
             }
 
-            // Parse first: a malformed correction fails with a
-            // clear "request was bad" signal before we ever touch
-            // the custody map or the supervisor.
-            let cmd = parse_correction(&correction)?;
+            // emit_test_tone takes a dedicated dispatch path: the
+            // verb synthesises PCM bytes inside the warden,
+            // writes them to a temp WAV, and dispatches an
+            // internal LoadAndPlay to the supervisor. The
+            // synthesis is inline (single canonical runtime
+            // path); the supervisor's LoadAndPlay command
+            // remains unchanged.
+            let cmd = if correction.correction_type == "emit_test_tone" {
+                let path = self.prepare_test_tone(&correction).await?;
+                PlaybackCommand::LoadAndPlay(path)
+            } else {
+                // Parse first: a malformed correction fails with a
+                // clear "request was bad" signal before we ever
+                // touch the custody map or the supervisor.
+                parse_correction(&correction)?
+            };
 
             let tracked = self.custodies.get(&handle.id).ok_or_else(|| {
                 PluginError::Permanent(format!(
@@ -2102,6 +2332,88 @@ impl MpdPlaybackPlugin {
             .await
             .map_err(playback_error_to_plugin_error)?;
         encode_simple_ok(req)
+    }
+
+    /// Synthesise a sine-wave PCM WAV file for the requested
+    /// test tone and write it to a temp path the local MPD
+    /// daemon can play back. Returns the `file://` URI MPD's
+    /// `add` command accepts.
+    ///
+    /// The synthesis runs inline (in-process, no subprocess) so
+    /// the operator-gesture latency is bounded by serialisation
+    /// plus `tokio::fs::write`. The WAV header carries a stable
+    /// 44100 Hz / 16-bit / stereo format (universal DAC support
+    /// without bit-perfect risk; if the operator's chain is
+    /// configured for bit-perfect with a non-44100 source, the
+    /// test tone deliberately exercises the format-conversion
+    /// path — the wiring-diagnostic intent stays intact).
+    async fn prepare_test_tone(
+        &self,
+        correction: &CourseCorrection,
+    ) -> Result<String, PluginError> {
+        let payload: TestTonePayload =
+            serde_json::from_slice(&correction.payload).map_err(|e| {
+                PluginError::Permanent(format!(
+                    "emit_test_tone payload is not valid JSON for \
+                 the expected shape: {e}"
+                ))
+            })?;
+        if payload.v != PAYLOAD_VERSION {
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone payload version {} unsupported; \
+                 expected {}",
+                payload.v, PAYLOAD_VERSION
+            )));
+        }
+        let freq_hz = payload.freq_hz.unwrap_or(1000);
+        if !(TEST_TONE_FREQ_MIN..=TEST_TONE_FREQ_MAX).contains(&freq_hz) {
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone freq_hz must lie in {}..={}; \
+                 got {}",
+                TEST_TONE_FREQ_MIN, TEST_TONE_FREQ_MAX, freq_hz
+            )));
+        }
+        let duration_ms = payload.duration_ms.unwrap_or(1500);
+        if !(TEST_TONE_DURATION_MIN_MS..=TEST_TONE_DURATION_MAX_MS)
+            .contains(&duration_ms)
+        {
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone duration_ms must lie in {}..={}; \
+                 got {}",
+                TEST_TONE_DURATION_MIN_MS,
+                TEST_TONE_DURATION_MAX_MS,
+                duration_ms
+            )));
+        }
+        let channel_str = payload
+            .channel
+            .as_deref()
+            .unwrap_or(TEST_TONE_DEFAULT_CHANNEL);
+        let channel =
+            TestToneChannel::from_str(channel_str).ok_or_else(|| {
+                PluginError::Permanent(format!(
+                    "emit_test_tone channel must be one of \
+                     {{left, right, both}}; got {:?}",
+                    channel_str
+                ))
+            })?;
+        let wav = synthesise_test_tone_wav(freq_hz, duration_ms, channel);
+        let path =
+            format!("/tmp/evo-test-tone-{}.wav", correction.correlation_id);
+        tokio::fs::write(&path, &wav).await.map_err(|e| {
+            PluginError::Permanent(format!(
+                "emit_test_tone write to {} failed: {}",
+                path, e
+            ))
+        })?;
+        // MPD's `add` accepts the file:// URI scheme when MPD's
+        // `file` input plugin is enabled (default on stock MPD
+        // builds, including the reference distribution's). If
+        // the operator's MPD configuration omits the input
+        // plugin, the supervisor's LoadAndPlay surfaces an Ack
+        // error with MPD's verbatim refusal — explicit failure
+        // semantics at the wiring-diagnostic surface.
+        Ok(format!("file://{}", path))
     }
 
     /// Pick the active custody's supervisor.
@@ -2334,9 +2646,11 @@ mod tests {
 
     use crate::playback_supervisor::test_mock::{
         capturing_emitter, short_timeouts, spawn_mock_mpd,
-        spawn_unresponsive_mock, CapturingReporter, ConnBehaviour,
+        spawn_unresponsive_mock, test_custody_handle, CapturingReporter,
+        ConnBehaviour,
     };
     use crate::playback_supervisor::SubjectEmitter;
+    use tokio::sync::watch;
 
     // ----- helpers -----
 
@@ -3041,9 +3355,12 @@ mod tests {
 
     #[tokio::test]
     async fn course_correct_maps_ack_to_permanent() {
+        // Command-conn sequence (with audio-protocol-settings apply
+        // at session-init): 1 = crossfade, 2 = single, 3 = status,
+        // 4 = currentsong, 5 = play -> ACK.
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::AckOnNth {
-                nth: 3,
+                nth: 5,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -3907,5 +4224,305 @@ mod tests {
         p.handle_request(&req).await.unwrap();
         assert_eq!(p.requests_handled(), 2);
         p.release_custody(handle).await.unwrap();
+    }
+
+    // ---- audio-protocol-settings parser coverage ----
+
+    // ---- emit_test_tone payload-validation coverage ----
+
+    #[tokio::test]
+    async fn course_correct_emit_test_tone_rejects_freq_below_audible_band() {
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            ConnBehaviour::Standard,
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 1)).await.unwrap();
+        let payload = serde_json::to_vec(
+            &json!({ "v": 1, "freq_hz": 10, "duration_ms": 200 }),
+        )
+        .unwrap();
+        let err = p
+            .course_correct(&handle, correction("emit_test_tone", &payload, 1))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("freq_hz") && msg.contains("20..=20000"),
+                    "refusal must name the field + accepted band; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn course_correct_emit_test_tone_rejects_duration_above_ceiling() {
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            ConnBehaviour::Standard,
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 1)).await.unwrap();
+        let payload =
+            serde_json::to_vec(&json!({ "v": 1, "duration_ms": 99999 }))
+                .unwrap();
+        let err = p
+            .course_correct(&handle, correction("emit_test_tone", &payload, 1))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("duration_ms") && msg.contains("100..=10000"),
+                    "refusal must name the field + range; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn course_correct_emit_test_tone_rejects_unknown_channel() {
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            ConnBehaviour::Standard,
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(CapturingReporter::default());
+        let handle = p.take_custody(assignment(reporter, 1)).await.unwrap();
+        let payload =
+            serde_json::to_vec(&json!({ "v": 1, "channel": "center" }))
+                .unwrap();
+        let err = p
+            .course_correct(&handle, correction("emit_test_tone", &payload, 1))
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(
+                    msg.contains("channel")
+                        && msg.contains("left, right, both"),
+                    "refusal must name the field + accepted domain; got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    // ---- emit_test_tone synthesizer coverage ----
+
+    #[test]
+    fn test_tone_wav_carries_riff_wave_header() {
+        let wav = synthesise_test_tone_wav(1000, 200, TestToneChannel::Both);
+        assert_eq!(&wav[0..4], b"RIFF", "WAV must start with the RIFF magic");
+        assert_eq!(
+            &wav[8..12],
+            b"WAVE",
+            "WAV magic immediately after the RIFF size must be `WAVE`"
+        );
+        assert_eq!(&wav[12..16], b"fmt ", "expected fmt chunk header");
+        assert_eq!(&wav[36..40], b"data", "expected data chunk header");
+    }
+
+    #[test]
+    fn test_tone_wav_carries_44100hz_stereo_16bit_format() {
+        let wav = synthesise_test_tone_wav(1000, 200, TestToneChannel::Both);
+        // fmt chunk: bytes 20..22 = audio_format (PCM = 1)
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        // 22..24 = channels (2 = stereo)
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
+        // 24..28 = sample_rate (44100)
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            44100
+        );
+        // 34..36 = bits per sample (16)
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    }
+
+    #[test]
+    fn test_tone_wav_left_channel_carries_zero_in_right() {
+        let wav = synthesise_test_tone_wav(1000, 100, TestToneChannel::Left);
+        // First sample lives at byte 44 (after header). Each
+        // sample frame is 4 bytes: i16 L + i16 R. Sample 100
+        // (well into the file) — R must be zero for the
+        // left-only channel.
+        let frame_idx = 100usize;
+        let offset = 44 + frame_idx * 4;
+        let right = i16::from_le_bytes([wav[offset + 2], wav[offset + 3]]);
+        assert_eq!(
+            right, 0,
+            "left-only routing must leave the right channel silent"
+        );
+    }
+
+    #[test]
+    fn test_tone_wav_right_channel_carries_zero_in_left() {
+        let wav = synthesise_test_tone_wav(1000, 100, TestToneChannel::Right);
+        let frame_idx = 100usize;
+        let offset = 44 + frame_idx * 4;
+        let left = i16::from_le_bytes([wav[offset], wav[offset + 1]]);
+        assert_eq!(
+            left, 0,
+            "right-only routing must leave the left channel silent"
+        );
+    }
+
+    #[test]
+    fn test_tone_wav_both_channels_carry_same_sample() {
+        let wav = synthesise_test_tone_wav(1000, 100, TestToneChannel::Both);
+        let frame_idx = 100usize;
+        let offset = 44 + frame_idx * 4;
+        let left = i16::from_le_bytes([wav[offset], wav[offset + 1]]);
+        let right = i16::from_le_bytes([wav[offset + 2], wav[offset + 3]]);
+        assert_eq!(
+            left, right,
+            "both-channels routing must carry identical L + R"
+        );
+    }
+
+    #[test]
+    fn test_tone_wav_duration_in_samples_matches_request() {
+        // 500 ms at 44100 Hz = 22050 samples per channel.
+        let wav = synthesise_test_tone_wav(1000, 500, TestToneChannel::Both);
+        // data_size is at bytes 40..44 of the WAV.
+        let data_size =
+            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
+        let expected = 22_050 * 2 /*ch*/ * 2 /*B/sample*/;
+        assert_eq!(data_size, expected);
+    }
+
+    #[test]
+    fn test_tone_wav_synthesis_is_deterministic() {
+        let a = synthesise_test_tone_wav(440, 250, TestToneChannel::Both);
+        let b = synthesise_test_tone_wav(440, 250, TestToneChannel::Both);
+        assert_eq!(
+            a, b,
+            "synthesis must be byte-identical for identical inputs"
+        );
+    }
+
+    #[test]
+    fn test_tone_channel_from_str_round_trips_domain() {
+        assert_eq!(
+            TestToneChannel::from_str("left"),
+            Some(TestToneChannel::Left)
+        );
+        assert_eq!(
+            TestToneChannel::from_str("right"),
+            Some(TestToneChannel::Right)
+        );
+        assert_eq!(
+            TestToneChannel::from_str("both"),
+            Some(TestToneChannel::Both)
+        );
+        assert_eq!(TestToneChannel::from_str("center"), None);
+        assert_eq!(TestToneChannel::from_str(""), None);
+    }
+
+    #[test]
+    fn protocol_settings_default_when_state_empty() {
+        let s = parse_audio_protocol_settings_from_state(&json!({}));
+        assert_eq!(s, AudioProtocolSettings::audiophile_default());
+        assert_eq!(s.crossfade_seconds, 0);
+        assert!(s.gapless);
+    }
+
+    #[test]
+    fn protocol_settings_parses_crossfade_seconds() {
+        let s = parse_audio_protocol_settings_from_state(
+            &json!({ "crossfade_seconds": 7 }),
+        );
+        assert_eq!(s.crossfade_seconds, 7);
+        // Missing `gapless` keeps audiophile default.
+        assert!(s.gapless);
+    }
+
+    #[test]
+    fn protocol_settings_parses_gapless_false() {
+        let s = parse_audio_protocol_settings_from_state(
+            &json!({ "gapless": false }),
+        );
+        assert!(!s.gapless);
+        assert_eq!(s.crossfade_seconds, 0);
+    }
+
+    #[test]
+    fn protocol_settings_parses_both_fields_together() {
+        let s = parse_audio_protocol_settings_from_state(
+            &json!({ "crossfade_seconds": 3, "gapless": false }),
+        );
+        assert_eq!(s.crossfade_seconds, 3);
+        assert!(!s.gapless);
+    }
+
+    #[test]
+    fn protocol_settings_ignores_unrelated_fields() {
+        let s = parse_audio_protocol_settings_from_state(&json!({
+            "mixer_type": "hardware",
+            "output_device": "hw:CARD=DAC,DEV=0",
+            "exclusive_mode": true,
+            "crossfade_seconds": 12,
+            "gapless": true
+        }));
+        assert_eq!(s.crossfade_seconds, 12);
+        assert!(s.gapless);
+    }
+
+    // ---- supervisor session-init apply path ----
+
+    #[tokio::test]
+    async fn supervisor_applies_protocol_settings_at_session_init() {
+        // Command-conn sequence on session-init:
+        //   1 = crossfade "<seconds>"
+        //   2 = single "<0|1>"
+        //   3 = status (initial report)
+        //   4 = currentsong (initial report)
+        // The CapturingMockMpd in this test asserts the FIRST
+        // command on the connection is `crossfade` with the
+        // operator-selected value — proving the apply runs
+        // BEFORE the initial state report.
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![F4Conn::Standard, F4Conn::HoldAfterWelcome])
+                .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        // Seed the watch channel with non-default values BEFORE
+        // spawning the supervisor; this is the operator's
+        // persisted state at the moment a new custody starts.
+        let (tx, rx) = watch::channel(AudioProtocolSettings {
+            crossfade_seconds: 7,
+            gapless: false,
+        });
+
+        let handle = playback_supervisor::spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            rx,
+        )
+        .await
+        .expect("spawn should succeed against a Standard mock");
+
+        // Initial report landed → both apply commands AND status
+        // + currentsong dispatched cleanly.
+        assert_eq!(reporter.count(), 1);
+
+        drop(tx);
+        handle.shutdown().await;
     }
 }

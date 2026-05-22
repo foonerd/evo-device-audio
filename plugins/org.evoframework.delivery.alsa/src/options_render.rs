@@ -81,7 +81,7 @@ use std::path::Path;
 /// `audio.options.settings` subject. The shape mirrors the
 /// `org.evoframework.playback.options` plugin's persisted
 /// Settings struct on the wire (per the subject schema declared
-/// in `evo-catalogue-schemas/org.evoframework/audio/options.v1.toml`).
+/// in `evo-catalogue-schemas/org.evoframework/audio/options.v2.toml`).
 ///
 /// All fields are `Option`-typed so an incomplete subject state
 /// (operator has only set some fields) renders the partial
@@ -107,6 +107,14 @@ pub struct OptionsSettings {
     /// node inserted"; `Some` inserts a `plug` rate-conversion
     /// step at the supplied target rate when `enabled = true`.
     pub resampling: Option<Resampling>,
+    /// Bit-perfect (hog) device mode. `Some(true)` switches the
+    /// chain to a direct `hw:` front-end with NO `plug` node
+    /// (source bytes reach the DAC byte-identical; the open
+    /// will fail if the source format does not match the
+    /// terminus). `Some(false)` / `None` falls through to the
+    /// `plug`-fronted path (operator-friendly default with
+    /// automatic format conversion).
+    pub exclusive_mode: Option<bool>,
 }
 
 /// Mixer-type discriminator. Mirrors the
@@ -175,12 +183,30 @@ pub fn render_drop_in(settings: &OptionsSettings) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_OUTPUT_DEVICE);
 
-    // Resampling node (if requested): `plug` with the operator-
-    // selected target rate. The node is named `pcm.evo_rate` and
-    // chains into the mixer / hardware terminus.
-    let resampling_node = match &settings.resampling {
-        Some(r) if r.enabled => Some(r.target_rate_hz),
-        _ => None,
+    // Bit-perfect (exclusive / hog) mode short-circuits the
+    // conversion-bearing chain: no `plug` front-end, no
+    // resampling node, no `softvol` insertion — source bytes
+    // reach the DAC byte-identical. Hardware-mixer mode remains
+    // valid in bit-perfect (hardware mixers are analog or
+    // transparent); software-mixer / resampling requests are
+    // honoured by their absence from the rendered chain (the
+    // operator visibly opted into bit-perfect, which is
+    // architecturally exclusive of in-chain digital scaling
+    // and rate conversion). Determinism is preserved: identical
+    // inputs render byte-identical output.
+    let exclusive_mode = settings.exclusive_mode.unwrap_or(false);
+
+    // Resampling node (if requested AND not suppressed by
+    // exclusive_mode): `plug` with the operator-selected target
+    // rate. The node is named `pcm.evo_rate` and chains into the
+    // mixer / hardware terminus.
+    let resampling_node = if exclusive_mode {
+        None
+    } else {
+        match &settings.resampling {
+            Some(r) if r.enabled => Some(r.target_rate_hz),
+            _ => None,
+        }
     };
 
     // Mixer node naming + insertion. The renderer emits one of
@@ -193,7 +219,23 @@ pub fn render_drop_in(settings: &OptionsSettings) -> String {
     //               the card's hardware mixer via the
     //               `ctl.evo` chain (already defined in the
     //               baseline asound.conf).
-    let mixer_kind =
+    //
+    // In bit-perfect mode the Software branch collapses to None
+    // (software gain is not bit-perfect); Hardware survives.
+    let mixer_kind = if exclusive_mode {
+        match (settings.mixer_type, settings.mixer_control.as_ref()) {
+            (Some(MixerType::Hardware), Some(ctrl)) if !ctrl.is_empty() => {
+                EffectiveMixer::Hardware(ctrl.as_str())
+            }
+            // Hardware requested but no control supplied — degrade
+            // to None in bit-perfect (operator wanted hardware,
+            // got no control; software-fallback is digital scaling
+            // which violates bit-perfect, so the right thing in
+            // bit-perfect is no mixer rather than silent
+            // promotion to softvol).
+            _ => EffectiveMixer::None,
+        }
+    } else {
         match (settings.mixer_type, settings.mixer_control.as_ref()) {
             (Some(MixerType::Hardware), Some(ctrl)) if !ctrl.is_empty() => {
                 EffectiveMixer::Hardware(ctrl.as_str())
@@ -209,7 +251,8 @@ pub fn render_drop_in(settings: &OptionsSettings) -> String {
             }
             (Some(MixerType::Software), _) => EffectiveMixer::Software,
             (Some(MixerType::None) | None, _) => EffectiveMixer::None,
-        };
+        }
+    };
 
     // Hardware terminus — the named card the chain delivers to.
     writeln!(out, "pcm.evo_terminus {{").unwrap();
@@ -232,7 +275,9 @@ pub fn render_drop_in(settings: &OptionsSettings) -> String {
         out.push('\n');
     }
 
-    // Mixer node when software-mixing.
+    // Mixer node when software-mixing. Suppressed in bit-perfect
+    // mode by the mixer_kind branch above (it cannot be
+    // `Software` when `exclusive_mode = true`).
     if matches!(mixer_kind, EffectiveMixer::Software) {
         writeln!(out, "pcm.evo_mixer {{").unwrap();
         writeln!(out, "    type softvol").unwrap();
@@ -258,25 +303,54 @@ pub fn render_drop_in(settings: &OptionsSettings) -> String {
     }
 
     // Front-end `pcm.evo` chain — what MPD / source plugins
-    // write into. `plug` for automatic format conversion.
-    let slave_name = match (mixer_kind, resampling_node.is_some()) {
-        (EffectiveMixer::Software, _) => "evo_mixer",
-        (_, true) => "evo_rate",
-        _ => "evo_terminus",
-    };
-    writeln!(out, "pcm.evo {{").unwrap();
-    writeln!(out, "    type plug").unwrap();
-    writeln!(out, "    slave.pcm \"{slave_name}\"").unwrap();
-    writeln!(out, "    hint {{").unwrap();
-    writeln!(out, "        show on").unwrap();
-    writeln!(
-        out,
-        "        description \"evo modular pipeline (options-rendered)\""
-    )
-    .unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}").unwrap();
-    out.push('\n');
+    // write into. Two shapes:
+    //
+    //   - Default (operator-friendly): `type plug` for
+    //     automatic format conversion; slave is the resolved
+    //     downstream node (mixer / rate / terminus).
+    //   - Bit-perfect (`exclusive_mode = true`): `type hw`
+    //     directly, byte-identical path. No `plug` node, no
+    //     in-chain format conversion. The DAC's open will fail
+    //     if the source format does not match; that is the
+    //     correct bit-perfect failure mode (operator-visible
+    //     EBUSY / ENOTSUP), not silent format mangling.
+    if exclusive_mode {
+        writeln!(out, "pcm.evo {{").unwrap();
+        writeln!(out, "    type hw").unwrap();
+        writeln!(out, "    card \"{}\"", parse_card_name(output_device))
+            .unwrap();
+        writeln!(out, "    device {}", parse_card_device(output_device))
+            .unwrap();
+        writeln!(out, "    hint {{").unwrap();
+        writeln!(out, "        show on").unwrap();
+        writeln!(
+            out,
+            "        description \"evo modular pipeline (bit-perfect)\""
+        )
+        .unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}").unwrap();
+        out.push('\n');
+    } else {
+        let slave_name = match (mixer_kind, resampling_node.is_some()) {
+            (EffectiveMixer::Software, _) => "evo_mixer",
+            (_, true) => "evo_rate",
+            _ => "evo_terminus",
+        };
+        writeln!(out, "pcm.evo {{").unwrap();
+        writeln!(out, "    type plug").unwrap();
+        writeln!(out, "    slave.pcm \"{slave_name}\"").unwrap();
+        writeln!(out, "    hint {{").unwrap();
+        writeln!(out, "        show on").unwrap();
+        writeln!(
+            out,
+            "        description \"evo modular pipeline (options-rendered)\""
+        )
+        .unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}").unwrap();
+        out.push('\n');
+    }
 
     // `ctl.evo` — operator-visible control surface. For hardware
     // mixers, binds to the named control on the card; for
@@ -361,11 +435,14 @@ pub fn extract_options_settings_from_state(
         })
     });
 
+    let exclusive_mode = state.get("exclusive_mode").and_then(|v| v.as_bool());
+
     OptionsSettings {
         mixer_type,
         mixer_control,
         output_device,
         resampling,
+        exclusive_mode,
     }
 }
 
@@ -720,6 +797,168 @@ mod tests {
         assert!(out.contains("type softvol"));
         assert!(out.contains("rate 192000"));
         assert!(out.contains("card \"DAC\""));
+    }
+
+    // ---- bit-perfect (exclusive_mode) coverage ----
+
+    #[test]
+    fn extractor_parses_exclusive_mode_true() {
+        let s = extract_options_settings_from_state(
+            &serde_json::json!({"exclusive_mode": true}),
+        );
+        assert_eq!(s.exclusive_mode, Some(true));
+    }
+
+    #[test]
+    fn extractor_parses_exclusive_mode_false() {
+        let s = extract_options_settings_from_state(
+            &serde_json::json!({"exclusive_mode": false}),
+        );
+        assert_eq!(s.exclusive_mode, Some(false));
+    }
+
+    #[test]
+    fn extractor_treats_missing_exclusive_mode_as_unset() {
+        let s = extract_options_settings_from_state(&serde_json::json!({}));
+        assert_eq!(s.exclusive_mode, None);
+    }
+
+    #[test]
+    fn bit_perfect_renders_pcm_evo_as_direct_hw_no_plug_front_end() {
+        let s = OptionsSettings {
+            exclusive_mode: Some(true),
+            ..Default::default()
+        };
+        let out = render_drop_in(&s);
+        // The front-end pcm.evo block must be `type hw` directly.
+        let evo_block = out
+            .split("pcm.evo {")
+            .nth(1)
+            .expect("pcm.evo block present");
+        let block_end = evo_block.find('}').expect("pcm.evo block terminator");
+        let pcm_evo_body = &evo_block[..block_end];
+        assert!(
+            pcm_evo_body.contains("type hw"),
+            "bit-perfect front-end must be `type hw` (no plug); \
+             pcm.evo block was: {pcm_evo_body}"
+        );
+        assert!(
+            !pcm_evo_body.contains("type plug"),
+            "bit-perfect front-end must NOT contain `type plug` \
+             (that's the conversion path); pcm.evo block was: \
+             {pcm_evo_body}"
+        );
+        // Hint description must reflect the bit-perfect branch.
+        assert!(
+            pcm_evo_body.contains("bit-perfect"),
+            "bit-perfect hint description missing"
+        );
+    }
+
+    #[test]
+    fn bit_perfect_suppresses_resampling_node_even_when_requested() {
+        let s = OptionsSettings {
+            exclusive_mode: Some(true),
+            resampling: Some(Resampling {
+                enabled: true,
+                target_rate_hz: 192000,
+            }),
+            ..Default::default()
+        };
+        let out = render_drop_in(&s);
+        assert!(
+            !out.contains("evo_rate"),
+            "bit-perfect must suppress the resampling node — \
+             rate conversion is a `plug` operation that violates \
+             bit-perfect; render: {out}"
+        );
+        assert!(
+            !out.contains("rate 192000"),
+            "bit-perfect must not carry the requested rate as a \
+             conversion target; render: {out}"
+        );
+    }
+
+    #[test]
+    fn bit_perfect_suppresses_software_mixer_node_even_when_requested() {
+        let s = OptionsSettings {
+            exclusive_mode: Some(true),
+            mixer_type: Some(MixerType::Software),
+            ..Default::default()
+        };
+        let out = render_drop_in(&s);
+        assert!(
+            !out.contains("type softvol"),
+            "bit-perfect must suppress softvol — digital scaling \
+             is not bit-perfect; render: {out}"
+        );
+        assert!(
+            !out.contains("evo_mixer"),
+            "bit-perfect must suppress the evo_mixer node — \
+             softvol is the only thing it carries; render: {out}"
+        );
+    }
+
+    #[test]
+    fn bit_perfect_keeps_hardware_mixer_for_ctl_evo_binding() {
+        // Hardware mixer attaches at ctl.evo (analog / transparent
+        // path); bit-perfect tolerates it.
+        let s = OptionsSettings {
+            exclusive_mode: Some(true),
+            mixer_type: Some(MixerType::Hardware),
+            mixer_control: Some("Digital".to_string()),
+            ..Default::default()
+        };
+        let out = render_drop_in(&s);
+        // pcm.evo is still direct hw (no plug); ctl.evo still
+        // binds the hardware control.
+        let evo_block = out
+            .split("pcm.evo {")
+            .nth(1)
+            .expect("pcm.evo block present");
+        let block_end = evo_block.find('}').expect("pcm.evo block terminator");
+        let pcm_evo_body = &evo_block[..block_end];
+        assert!(pcm_evo_body.contains("type hw"));
+        assert!(!pcm_evo_body.contains("type plug"));
+        assert!(
+            out.contains("ctl.evo"),
+            "ctl.evo binding stays for hardware-mixer control"
+        );
+    }
+
+    #[test]
+    fn default_path_still_renders_with_plug_when_exclusive_off() {
+        let s = OptionsSettings {
+            exclusive_mode: Some(false),
+            ..Default::default()
+        };
+        let out = render_drop_in(&s);
+        let evo_block = out
+            .split("pcm.evo {")
+            .nth(1)
+            .expect("pcm.evo block present");
+        let block_end = evo_block.find('}').expect("pcm.evo block terminator");
+        let pcm_evo_body = &evo_block[..block_end];
+        assert!(
+            pcm_evo_body.contains("type plug"),
+            "non-bit-perfect default must keep the `plug` \
+             front-end so any source format opens cleanly"
+        );
+    }
+
+    #[test]
+    fn bit_perfect_render_is_deterministic() {
+        let s = OptionsSettings {
+            exclusive_mode: Some(true),
+            output_device: Some("hw:CARD=USBDAC,DEV=0".to_string()),
+            ..Default::default()
+        };
+        let first = render_drop_in(&s);
+        let second = render_drop_in(&s);
+        assert_eq!(
+            first, second,
+            "bit-perfect render must be byte-identical for identical inputs"
+        );
     }
 
     // ---- atomic-write coverage ----

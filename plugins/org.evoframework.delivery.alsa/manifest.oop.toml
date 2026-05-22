@@ -88,15 +88,12 @@ response_budget_ms = 5000
 # probing (alsa_hw_params via libasound) lands as an enhancement
 # once the production substrate stabilises.
 #
-# `exclusive_mode = false` and `bit_perfect_capable = false` keep
-# the reference posture conservative: the pcm.evo chain
-# uses ALSA's `plug` plugin (automatic format conversion), so the
-# delivery stage is NOT bit-perfect on its own — the source must
-# produce a format the chain's terminus accepts, with `plug`
-# bridging any mismatch. Bit-perfect topologies require pinning
-# pcm.evo to a direct `hw:` slave and matching format exactly;
-# that posture is a later improvement for the playback.options-driven
-# config arc.
+# `exclusive_mode = false` + `bit_perfect_capable = false`
+# capture the DEFAULT runtime posture (the chain ships with a
+# `plug` front-end). The plugin's renderer CAN emit a bit-
+# perfect chain when the `audio.options.settings` subject
+# carries `exclusive_mode = true`; the static manifest captures
+# the default, not the operator-toggled runtime branch.
 [capabilities.delivery]
 input_kind = "audio.pcm"
 device = "alsa:evo"

@@ -60,6 +60,7 @@ course_correct_verbs = [
     "previous",
     "seek",
     "set_volume",
+    "emit_test_tone",
 ]
 
 # Source-plugin declaration. The plugin owns the `mpd-path`

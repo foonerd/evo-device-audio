@@ -69,6 +69,11 @@ request_types = [
     "options.set_startup_volume",
     "options.set_max_volume",
     "options.set_volume_curve",
+    "options.set_exclusive_mode",
+    "options.set_crossfade_seconds",
+    "options.set_gapless",
+    "options.set_eq_engaged",
+    "options.set_eq_band",
     "options.restore_last_known_good",
     "options.reset_to_defaults",
 ]
