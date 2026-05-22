@@ -44,6 +44,12 @@ pub struct CardIdentity {
     /// non-HDA cards (I²S DACs, Loopback, etc.). Multiple entries
     /// for HDA cards with separate analog + HDMI codecs.
     pub codecs: Vec<CodecIdentity>,
+    /// AC97 codec the kernel registered against this card, when
+    /// applicable. `Some` only for [`CardKind::Ac97`] cards; the
+    /// kernel exposes the codec chip name on the first line of
+    /// `/proc/asound/cardN/codec97#0/ac97#0-0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ac97_codec: Option<Ac97Codec>,
 }
 
 /// Structural classification — the discriminator downstream layers
@@ -71,6 +77,19 @@ pub enum CardKind {
     Usb,
     /// Bluetooth A2DP / SCO sink — driver string `bluez`-derived.
     Bluetooth,
+    /// AC97 audio family — Intel ICH (snd_intel8x0), VIA 82xx
+    /// (snd_via82xx), ALi 5451 (snd_ali5451), ATI IXP
+    /// (snd_atiixp), Cirrus AC97, and other pre-HDA PCI audio
+    /// chipsets. The codec (e.g. `Analog Devices AD1980`,
+    /// `Realtek ALC650`, `Sigmatel STAC9750`) is exposed under
+    /// `/proc/asound/cardN/codec97#N/ac97#0-0` — distinct from
+    /// HDA's `codec#N` files in path + format. Operator-facing
+    /// classification is [`OutputClass::Analog`] (AC97 is an
+    /// analog-output bus by design). Detection is presence-
+    /// driven: any card with a `codec97#N` directory in its
+    /// procfs node classifies AC97 regardless of the driver
+    /// string variant.
+    Ac97,
     /// ALSA Loopback — framework-internal pipeline card; never an
     /// operator-facing output.
     Loopback,
@@ -78,6 +97,23 @@ pub enum CardKind {
     /// the driver string for diagnostic; downstream layers treat
     /// as [`OutputClass::Unknown`].
     Unknown,
+}
+
+/// One AC97 codec on an AC97-class card. AC97's kernel surface
+/// (`/proc/asound/cardN/codec97#N/ac97#0-0`) uses a structurally
+/// distinct shape from HDA's `codec#N` files — different path,
+/// different content format. The first line of the AC97 codec
+/// file carries the chip name as the kernel resolves it from the
+/// AC97 vendor/device-id registers (e.g. `Analog Devices AD1980`,
+/// `Realtek ALC650`, `Sigmatel STAC9750`); that name is the
+/// authoritative identification field for AC97 chips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ac97Codec {
+    /// Chip name as the kernel reports it on the first line of
+    /// `/proc/asound/cardN/codec97#N/ac97#0-0` (after the
+    /// `B-A/N:` bus/address/codec-number prefix). The most
+    /// operator-meaningful identity field for AC97 cards.
+    pub chip_name: String,
 }
 
 /// One codec on an HDA card. Multiple per card (analog + HDMI codec
@@ -187,15 +223,20 @@ pub async fn introspect_from_proc(
     let rows = parse_cards_file(&cards_text)?;
     let mut identities = Vec::with_capacity(rows.len());
     for row in rows {
-        let codecs = read_codecs_for_card(proc_asound, row.card_idx).await?;
-        let kind = classify_kind(&row.driver, &codecs);
+        let procfs = read_codecs_for_card(proc_asound, row.card_idx).await?;
+        let kind = classify_kind(
+            &row.driver,
+            &procfs.hda_codecs,
+            procfs.has_ac97_codec,
+        );
         identities.push(CardIdentity {
             card_idx: row.card_idx,
             short_id: row.short_id,
             long_name: row.long_name,
             driver: row.driver,
             kind,
-            codecs,
+            codecs: procfs.hda_codecs,
+            ac97_codec: procfs.ac97_codec,
         });
     }
     Ok(identities)
@@ -325,16 +366,39 @@ fn parse_cards_file(
     Ok(rows)
 }
 
-/// Read every `codec#N` file under `/proc/asound/cardM` and parse
-/// it. Returns an empty vec for cards with no codec files
-/// (I²S DACs, Loopback, vc4-hdmi).
+/// Combined readout of `/proc/asound/cardN`'s codec surfaces:
+/// HDA codecs (`codec#N` files), AC97 codec (parsed from
+/// `codec97#0/ac97#0-0` when present), and the AC97-presence
+/// flag (any `codec97#N` directory under the card). The two
+/// kernel surfaces are structurally distinct (different naming,
+/// different content format) but enumerated in the same
+/// directory scan pass — one read trip per card.
+struct CardCodecProcfs {
+    hda_codecs: Vec<CodecIdentity>,
+    ac97_codec: Option<Ac97Codec>,
+    has_ac97_codec: bool,
+}
+
+/// Scan `/proc/asound/cardN` for codec surfaces. HDA codecs
+/// (`codec#N` files) parse into [`CodecIdentity`]; AC97 codecs
+/// (`codec97#N` directories) surface BOTH as a presence flag —
+/// for [`CardKind::Ac97`] classification — AND as a parsed
+/// [`Ac97Codec`] carrying the chip name from
+/// `codec97#0/ac97#0-0`.
+///
+/// Returns empty HDA codec list + `has_ac97_codec=false` for
+/// cards with no codec surfaces (I²S DACs, Loopback, vc4-hdmi).
 async fn read_codecs_for_card(
     proc_asound: &Path,
     card_idx: u32,
-) -> Result<Vec<CodecIdentity>, IntrospectionError> {
+) -> Result<CardCodecProcfs, IntrospectionError> {
     let card_dir = proc_asound.join(format!("card{card_idx}"));
     if !card_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(CardCodecProcfs {
+            hda_codecs: Vec::new(),
+            ac97_codec: None,
+            has_ac97_codec: false,
+        });
     }
     let mut entries = match tokio::fs::read_dir(&card_dir).await {
         Ok(e) => e,
@@ -347,23 +411,37 @@ async fn read_codecs_for_card(
             )));
         }
     };
-    let mut codec_files = Vec::new();
+    let mut hda_codec_files = Vec::new();
+    let mut ac97_codec_dirs: Vec<(u8, std::path::PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name_str = match name.to_str() {
             Some(s) => s,
             None => continue,
         };
+        // HDA codec: file named `codec#0`, `codec#2`, etc.
         if let Some(rest) = name_str.strip_prefix("codec#") {
             if let Ok(addr) = rest.parse::<u8>() {
-                codec_files.push((addr, entry.path()));
+                hda_codec_files.push((addr, entry.path()));
+                continue;
+            }
+        }
+        // AC97 codec: directory named `codec97#0`, etc. The
+        // chipset-driver string variants (ICH / VIA82xx / ALi /
+        // ATIIXP / Cirrus / ...) all expose this same dir
+        // shape — presence-detection is robust across the entire
+        // AC97 driver family without enumerating chipset names.
+        if let Some(rest) = name_str.strip_prefix("codec97#") {
+            if let Ok(addr) = rest.parse::<u8>() {
+                ac97_codec_dirs.push((addr, entry.path()));
             }
         }
     }
-    codec_files.sort_by_key(|(addr, _)| *addr);
+    hda_codec_files.sort_by_key(|(addr, _)| *addr);
+    ac97_codec_dirs.sort_by_key(|(addr, _)| *addr);
 
-    let mut codecs = Vec::with_capacity(codec_files.len());
-    for (address, path) in codec_files {
+    let mut hda_codecs = Vec::with_capacity(hda_codec_files.len());
+    for (address, path) in hda_codec_files {
         let text =
             match tokio::fs::read_to_string(&path).await {
                 Ok(t) => t,
@@ -380,9 +458,73 @@ async fn read_codecs_for_card(
                     }
                 },
             };
-        codecs.push(parse_codec_file(address, &text)?);
+        hda_codecs.push(parse_codec_file(address, &text)?);
     }
-    Ok(codecs)
+
+    // Parse the first AC97 codec's identity. AC97 cards typically
+    // expose a single codec; multiple codecs are theoretically
+    // possible but unusual on consumer hardware. This scan reads
+    // the primary AC97 codec at codec97#0 — the codec on
+    // address 0 of the AC-link bus, which is the analog-output
+    // codec on every AC97 card the framework targets.
+    let has_ac97_codec = !ac97_codec_dirs.is_empty();
+    let ac97_codec = if let Some((_, codec_dir)) = ac97_codec_dirs.first() {
+        // The chip-name file inside the codec97#N directory
+        // follows the `ac97#<bus>-<addr>` convention. Most cards
+        // expose `ac97#0-0` for the primary codec. Read it.
+        let inner = codec_dir.join("ac97#0-0");
+        if inner.exists() {
+            match tokio::fs::read_to_string(&inner).await {
+                Ok(text) => parse_ac97_codec_file(&text),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        return Err(IntrospectionError::PermissionDenied(
+                            format!("cannot read {}: {}", inner.display(), e),
+                        ));
+                    }
+                    _ => {
+                        return Err(IntrospectionError::FilesystemRead(
+                            format!("reading {}: {}", inner.display(), e),
+                        ));
+                    }
+                },
+            }
+        } else {
+            // Codec97 directory present but the conventional
+            // ac97#0-0 file is absent. Card is structurally AC97
+            // (presence flag stays true so classification still
+            // works) but identity isn't parseable from this
+            // surface — caller falls back to long_name.
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(CardCodecProcfs {
+        hda_codecs,
+        ac97_codec,
+        has_ac97_codec,
+    })
+}
+
+/// Parse the kernel's AC97 codec identity from a
+/// `/proc/asound/cardN/codec97#N/ac97#0-0` file. The kernel emits
+/// the chip name on the first line as `B-A/N: <chip_name>` where
+/// `B-A/N` is the bus / address / codec-number prefix (e.g.
+/// `0-0/0: Analog Devices AD1980`). Returns `None` on a
+/// malformed first line; the caller surfaces the gap via the
+/// label-fallback chain rather than failing the introspection.
+fn parse_ac97_codec_file(text: &str) -> Option<Ac97Codec> {
+    let first = text.lines().next()?;
+    // Split on the first colon — anything before is the prefix,
+    // anything after is the chip name.
+    let (_prefix, chip_part) = first.split_once(':')?;
+    let chip_name = chip_part.trim().to_string();
+    if chip_name.is_empty() {
+        return None;
+    }
+    Some(Ac97Codec { chip_name })
 }
 
 /// Parse one `/proc/asound/cardN/codec#N` file. The format is
@@ -447,13 +589,28 @@ fn parse_hex_field(raw: &str) -> Option<u32> {
 }
 
 /// Classify a card's structural [`CardKind`] from its kernel
-/// driver string and codec set. The mapping is the ONLY place
-/// the framework interprets kernel-side driver naming; downstream
-/// layers branch on [`CardKind`], not the driver string.
-fn classify_kind(driver: &str, codecs: &[CodecIdentity]) -> CardKind {
+/// driver string, codec set, and AC97 presence flag. The mapping
+/// is the ONLY place the framework interprets kernel-side driver
+/// naming; downstream layers branch on [`CardKind`], not the
+/// driver string.
+fn classify_kind(
+    driver: &str,
+    codecs: &[CodecIdentity],
+    has_ac97_codec: bool,
+) -> CardKind {
     let d = driver.to_ascii_lowercase();
     if d == "loopback" {
         return CardKind::Loopback;
+    }
+    // AC97 presence is detected via the `codec97#N` directory
+    // in the card's procfs node — a kernel-surface fact common
+    // to every AC97 driver variant (snd_intel8x0 / snd_via82xx /
+    // snd_ali5451 / snd_atiixp / etc.). Presence-driven
+    // detection is robust across chipset names + kernel-driver-
+    // string variants without enumerating every driver tag the
+    // AC97 family has shipped over the years.
+    if has_ac97_codec {
+        return CardKind::Ac97;
     }
     if d.starts_with("hda-") {
         // HDA controller. If EVERY codec on it is HDMI (e.g.
@@ -522,6 +679,7 @@ pub fn classify_from_kernel(
         CardKind::I2s => OutputClass::I2s,
         CardKind::Usb => OutputClass::Usb,
         CardKind::Bluetooth => OutputClass::Bluetooth,
+        CardKind::Ac97 => OutputClass::Analog,
         CardKind::Loopback => OutputClass::Unknown,
         CardKind::Unknown => OutputClass::Unknown,
     }
@@ -541,6 +699,7 @@ mod tests {
             driver: "X".into(),
             kind,
             codecs: Vec::new(),
+            ac97_codec: None,
         }
     }
 
@@ -622,6 +781,54 @@ mod tests {
             std::fs::create_dir_all(&card_dir).expect("mkdir card");
             std::fs::write(card_dir.join("codec#0"), codec_text)
                 .expect("write codec");
+        }
+        tmp
+    }
+
+    /// Synthetic fixture writer for AC97 cards — defaults to a
+    /// stub `ac97#0-0` body that does NOT carry a parseable chip
+    /// name (mirrors the codec97-dir-present-but-identity-file-
+    /// missing case the introspector handles defensively).
+    /// Tests needing a real chip name use
+    /// [`write_synthetic_ac97_proc_asound_named`].
+    fn write_synthetic_ac97_proc_asound(
+        cards_text: &str,
+        per_card_has_ac97: &[u32],
+    ) -> TempDir {
+        let tmp = TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::write(root.join("cards"), cards_text).expect("write cards");
+        for card_idx in per_card_has_ac97 {
+            let codec_dir =
+                root.join(format!("card{card_idx}")).join("codec97#0");
+            std::fs::create_dir_all(&codec_dir).expect("mkdir codec97");
+            // Stub body — parser rejects (no colon on first line)
+            // → ac97_codec field stays None. Card still
+            // classifies as Ac97 via directory presence.
+            std::fs::write(codec_dir.join("ac97#0-0"), "stub ac97 codec")
+                .expect("write ac97 stub");
+        }
+        tmp
+    }
+
+    /// Synthetic fixture writer for AC97 cards with a parseable
+    /// chip-name file. The `ac97#0-0` body follows the kernel
+    /// shape (`B-A/N: <chip_name>` on first line).
+    fn write_synthetic_ac97_proc_asound_named(
+        cards_text: &str,
+        per_card_chip_name: &[(u32, &str)],
+    ) -> TempDir {
+        let tmp = TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::write(root.join("cards"), cards_text).expect("write cards");
+        for (card_idx, chip_name) in per_card_chip_name {
+            let codec_dir =
+                root.join(format!("card{card_idx}")).join("codec97#0");
+            std::fs::create_dir_all(&codec_dir).expect("mkdir codec97");
+            let body =
+                format!("0-0/0: {chip_name}\n\nPCI Subsys Vendor: 0x0000\n");
+            std::fs::write(codec_dir.join("ac97#0-0"), body)
+                .expect("write ac97 codec");
         }
         tmp
     }
@@ -776,5 +983,145 @@ mod tests {
         let identities =
             introspect_from_proc(tmp.path()).await.expect("introspect");
         assert!(identities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ac97_card_with_codec97_dir_classifies_as_ac97() {
+        // FAILING-CASE REPRODUCTION pin: the Intel 82801AA-ICH +
+        // Analog Devices AD1980 AC97 codec scenario. Kernel driver
+        // string is `ICH`, codec file path is
+        // `codec97#0/ac97#0-0` (directory shape, not HDA's
+        // `codec#N` file shape). Before AC97 detection landed,
+        // this card fell through classify_kind to CardKind::
+        // Unknown → OutputClass::Unknown → UI "Other".
+        //
+        // After: the codec97#N directory presence triggers
+        // CardKind::Ac97 classification regardless of the driver
+        // string (kernel-surface-driven detection, robust across
+        // chipset variants).
+        let cards = " 1 [I82801AAICH    ]: ICH - Intel 82801AA-ICH\n                      Intel 82801AA-ICH with AD1980 at irq 21\n";
+        let tmp = write_synthetic_ac97_proc_asound(cards, &[1]);
+        let identities =
+            introspect_from_proc(tmp.path()).await.expect("introspect");
+        assert_eq!(identities.len(), 1);
+        let c = &identities[0];
+        assert_eq!(c.card_idx, 1);
+        assert_eq!(c.driver, "ICH");
+        assert_eq!(c.kind, CardKind::Ac97);
+        // HDA codec list is empty — AC97 codecs use a distinct
+        // procfs surface; populating CodecIdentity from
+        // codec97#N/ac97#0-0 is a future extension.
+        assert!(c.codecs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ac97_detection_robust_across_driver_string_variants() {
+        // Kernel-surface-driven detection: the codec97#N directory
+        // presence triggers Ac97 classification regardless of
+        // what the driver string says. Test fixtures cover three
+        // common AC97 chipset families with different driver
+        // strings — all classify as Ac97 because each has a
+        // codec97#0 directory.
+        let cards = " 0 [VIA8233]: VIA8233 - VIA 8233 Audio\n 1 [ALI5451]: ALI5451 - ALi M5451 PCI\n 2 [ATIIXP]: ATIIXP - ATI IXP\n";
+        let tmp = write_synthetic_ac97_proc_asound(cards, &[0, 1, 2]);
+        let identities =
+            introspect_from_proc(tmp.path()).await.expect("introspect");
+        assert_eq!(identities.len(), 3);
+        for c in &identities {
+            assert_eq!(
+                c.kind,
+                CardKind::Ac97,
+                "AC97 detection MUST be driver-string-agnostic; \
+                 driver={} should still classify as Ac97 via \
+                 codec97 directory presence",
+                c.driver
+            );
+        }
+    }
+
+    #[test]
+    fn classify_ac97_returns_analog() {
+        // Layer 2 arm: CardKind::Ac97 → OutputClass::Analog. AC97
+        // is an analog-output bus by design; the codec feeds the
+        // line/headphone jack. Operator-facing class is the same
+        // as HDA analog.
+        assert_eq!(
+            classify_from_kernel(&CardIdentity {
+                card_idx: 1,
+                short_id: "synthcard".into(),
+                long_name: "Synthetic AC97 audio controller".into(),
+                driver: "synth-ac97".into(),
+                kind: CardKind::Ac97,
+                codecs: Vec::new(),
+                ac97_codec: None,
+            }),
+            crate::output_enumeration::OutputClass::Analog
+        );
+    }
+
+    #[tokio::test]
+    async fn ac97_codec_file_parsed_into_chip_name() {
+        // Failing-case extension: codec97 dir presence triggers
+        // Ac97 classification (already covered), AND the
+        // ac97#0-0 file's first line parses into the ac97_codec
+        // field carrying the chip name. The kernel surfaces the
+        // chip name authoritatively; the parser extracts it from
+        // the `B-A/N: <chip_name>` format.
+        let cards = " 1 [synthcard]: synth-ac97 - Synthetic Audio Controller\n";
+        let tmp = write_synthetic_ac97_proc_asound_named(
+            cards,
+            &[(1, "Analog Devices AD1980")],
+        );
+        let identities =
+            introspect_from_proc(tmp.path()).await.expect("introspect");
+        assert_eq!(identities.len(), 1);
+        let c = &identities[0];
+        assert_eq!(c.kind, CardKind::Ac97);
+        let codec = c
+            .ac97_codec
+            .as_ref()
+            .expect("ac97_codec parsed from ac97#0-0");
+        assert_eq!(codec.chip_name, "Analog Devices AD1980");
+    }
+
+    #[tokio::test]
+    async fn ac97_codec_file_missing_leaves_codec_none_but_classification_intact(
+    ) {
+        // Defensive: codec97 directory present but the ac97#0-0
+        // file is absent (or the body has no parseable first
+        // line). Classification still works via dir-presence;
+        // ac97_codec stays None and the caller falls back to
+        // long_name in the label-precedence chain.
+        let cards = " 1 [synthcard]: synth-ac97 - Synthetic Audio Controller\n";
+        let tmp = write_synthetic_ac97_proc_asound(cards, &[1]);
+        let identities =
+            introspect_from_proc(tmp.path()).await.expect("introspect");
+        let c = &identities[0];
+        assert_eq!(c.kind, CardKind::Ac97);
+        // Stub body has no colon on first line → parser rejects
+        // → ac97_codec stays None.
+        assert!(c.ac97_codec.is_none());
+    }
+
+    #[test]
+    fn parse_ac97_codec_file_extracts_chip_name() {
+        // Direct parser test for the AC97 codec file format. The
+        // kernel emits `B-A/N: <chip_name>` on the first line —
+        // any of the kernel's known prefix shapes (`0-0/0:`,
+        // `0-1/1:`, etc.) parses to the same shape.
+        let text =
+            "0-0/0: Analog Devices AD1980\n\nPCI Subsys Vendor: 0x1028\n";
+        let codec = parse_ac97_codec_file(text)
+            .expect("first line parses into Ac97Codec");
+        assert_eq!(codec.chip_name, "Analog Devices AD1980");
+    }
+
+    #[test]
+    fn parse_ac97_codec_file_rejects_malformed_first_line() {
+        // First line without a colon — defensive rejection.
+        assert!(parse_ac97_codec_file("not a codec header\n").is_none());
+        assert!(parse_ac97_codec_file("").is_none());
+        // Colon present but empty chip name — rejected.
+        assert!(parse_ac97_codec_file("0-0/0:    \n").is_none());
     }
 }

@@ -476,25 +476,46 @@ fn resolve_row(
 /// Resolve the operator-facing label for an unmapped card,
 /// applying the precedence documented above the call site:
 /// codec overlay → kernel chip name → kernel long_name → aplay
-/// card_name. Catalogue codec lookup is only consulted when the
-/// kernel supplied a codec for this card (HDA-class identity).
+/// card_name. Catalogue codec lookup is consulted for HDA and
+/// AC97 codecs alike — the kernel surfaces the codec identity
+/// differently (HDA: `codec#N` with `Vendor Id:` u32; AC97:
+/// `codec97#N/ac97#0-0` with chip-name string), so the
+/// catalogue carries two parallel overlay sections
+/// (`[[hda_codecs]]` keyed by vendor_id, `[[ac97_codecs]]`
+/// keyed by chip_name). Both are consulted; whichever the
+/// kernel-reported card identity carries is the active path.
 fn resolve_unmapped_label(
     identity: Option<&crate::kernel_introspection::CardIdentity>,
     row: &AplayCardDevice,
     catalog: &AlsaCardCatalog,
 ) -> String {
     if let Some(id) = identity {
-        // Codec overlay path: walk the codec list and return the
-        // first catalogue brand match. Prefer the analog codec
-        // (typically address 0) — it's the operator-meaningful
-        // chip on a card; HDMI codec sibling labels are less
-        // useful for primary-output identification.
+        // HDA codec overlay path: walk the codec list and return
+        // the first catalogue brand match. Prefer the analog
+        // codec (typically address 0) — it's the operator-
+        // meaningful chip on a card; HDMI codec sibling labels
+        // are less useful for primary-output identification.
         for codec in &id.codecs {
             if let Some(entry) = catalog.lookup_codec(codec.vendor_id) {
                 return entry.pretty_name.clone();
             }
         }
-        // No codec catalogue hit. Use the first codec's
+        // AC97 codec overlay path: when the kernel registered an
+        // AC97 codec (CardKind::Ac97), look up its chip name
+        // against the catalogue's AC97 overlay. The kernel name
+        // is already operator-readable; the overlay rebrands
+        // where the catalogue carries a preferred form.
+        if let Some(ac97) = id.ac97_codec.as_ref() {
+            if let Some(entry) = catalog.lookup_ac97_codec(&ac97.chip_name) {
+                return entry.pretty_name.clone();
+            }
+            // Catalogue miss: fall back to the kernel chip name
+            // before reaching for long_name.
+            if !ac97.chip_name.is_empty() {
+                return ac97.chip_name.clone();
+            }
+        }
+        // No HDA-codec catalogue hit. Use the first HDA codec's
         // kernel-supplied chip name if any — already
         // operator-readable.
         if let Some(first_codec) = id.codecs.first() {
@@ -585,6 +606,7 @@ card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Hi
             driver: "X".into(),
             kind,
             codecs: Vec::new(),
+            ac97_codec: None,
         }
     }
 
@@ -964,6 +986,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 subsystem_id: 0x80862074,
                 is_hdmi: false,
             }],
+            ac97_codec: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
@@ -1017,6 +1040,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 subsystem_id: 0x12345678,
                 is_hdmi: false,
             }],
+            ac97_codec: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         assert_eq!(outputs.len(), 1);
@@ -1054,6 +1078,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
                 subsystem_id: 0x00000000,
                 is_hdmi: false,
             }],
+            ac97_codec: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];
@@ -1061,6 +1086,67 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
         assert_eq!(out.label, "FutureCorp FC9999");
         // Classification unchanged — Stage 1 path intact.
         assert_eq!(out.output_class, OutputClass::Analog);
+    }
+
+    #[test]
+    fn shipped_catalog_ac97_codec_overlay_relabels_with_brand_name() {
+        // Failing-case reproduction for the AC97 family. An
+        // uncatalogued AC97 controller (kernel card_name not in
+        // the per-card-name table) whose codec chip_name IS in
+        // the [[ac97_codecs]] overlay surfaces with the
+        // catalogue's brand label — the operator-facing value
+        // the AC97 overlay delivers. Before the AC97 codec parse
+        // + overlay path landed, the label was the kernel
+        // long_name (the controller identity) — useful but
+        // verbose; the catalogue-rebranded chip name is the
+        // operator-meaningful identity.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 1: SynthCard [Synth AC97 Audio], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 1,
+            short_id: "SynthCard".into(),
+            long_name: "Synth AC97 Audio Controller".into(),
+            driver: "synth-ac97".into(),
+            kind: crate::kernel_introspection::CardKind::Ac97,
+            codecs: Vec::new(),
+            ac97_codec: Some(crate::kernel_introspection::Ac97Codec {
+                chip_name: "Analog Devices AD1980".into(),
+            }),
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        assert_eq!(out.output_class, OutputClass::Analog);
+        // Catalogue rebrands "Analog Devices AD1980" → catalogue
+        // pretty_name "Analog Devices SoundMAX AD1980".
+        assert_eq!(out.label, "Analog Devices SoundMAX AD1980");
+    }
+
+    #[test]
+    fn shipped_catalog_ac97_codec_overlay_miss_falls_back_to_kernel_chip_name()
+    {
+        // Precedence pin: catalogue miss on AC97 codec → label
+        // falls back to the kernel-supplied chip name (already
+        // operator-readable). Catalogue widening adds rebrand
+        // polish without breaking anything.
+        let cat = AlsaCardCatalog::load_embedded().expect("shipped catalogue");
+        let raw = "card 1: SynthCard [Synth AC97 Audio], device 0: foo [bar]\n";
+        let identities = vec![crate::kernel_introspection::CardIdentity {
+            card_idx: 1,
+            short_id: "SynthCard".into(),
+            long_name: "Synth AC97 Audio Controller".into(),
+            driver: "synth-ac97".into(),
+            kind: crate::kernel_introspection::CardKind::Ac97,
+            codecs: Vec::new(),
+            ac97_codec: Some(crate::kernel_introspection::Ac97Codec {
+                chip_name: "FutureCorp FC-AC97".into(), // not catalogued
+            }),
+        }];
+        let outputs = resolve(raw, &cat, None, &identities);
+        let out = &outputs[0];
+        assert_eq!(out.output_class, OutputClass::Analog);
+        // Precedence: catalogue overlay (miss) → kernel chip
+        // name (hit).
+        assert_eq!(out.label, "FutureCorp FC-AC97");
     }
 
     #[test]
@@ -1079,6 +1165,7 @@ card 0: ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
             driver: "synth_i2s_dac".into(),
             kind: crate::kernel_introspection::CardKind::I2s,
             codecs: Vec::new(), // No codec — I²S DAC
+            ac97_codec: None,
         }];
         let outputs = resolve(raw, &cat, None, &identities);
         let out = &outputs[0];

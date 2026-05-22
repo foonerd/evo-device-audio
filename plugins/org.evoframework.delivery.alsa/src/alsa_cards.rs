@@ -47,6 +47,29 @@ struct CatalogFile {
     /// the kernel-supplied chip name is the label.
     #[serde(default)]
     hda_codecs: Vec<RawHdaCodecRow>,
+    /// AC97 codec identification overlay. Each entry keys on the
+    /// kernel-reported chip name as it appears on the first line
+    /// of `/proc/asound/cardN/codec97#N/ac97#0-0` (e.g.
+    /// `Analog Devices AD1980`). The catalog rebrands the chip
+    /// name where a preferred form exists. Optional — when no
+    /// entry matches, the kernel-supplied chip name is the label
+    /// (already operator-readable; the catalogue overlay is a
+    /// polish path, not a correctness path).
+    #[serde(default)]
+    ac97_codecs: Vec<RawAc97CodecRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawAc97CodecRow {
+    /// Chip name as the kernel surfaces it on the AC97 codec's
+    /// first line (case-sensitive verbatim match).
+    chip_name: String,
+    /// Operator-friendly label that overrides the kernel chip
+    /// name when the catalog carries a preferred form.
+    pretty_name: String,
+    /// Free-text description for the operator UI. Optional.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,12 +194,22 @@ pub struct HdaCodecEntry {
     pub description: Option<String>,
 }
 
+/// AC97 codec overlay entry — operator-friendly label keyed by
+/// the kernel-reported AC97 codec chip name. Populated from the
+/// `[[ac97_codecs]]` rows in `alsa-cards.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ac97CodecEntry {
+    pub pretty_name: String,
+    pub description: Option<String>,
+}
+
 /// Loaded catalog indexed by raw ALSA card name + 32-bit HDA
-/// codec vendor id.
+/// codec vendor id + AC97 codec chip name.
 #[derive(Debug, Clone)]
 pub struct AlsaCardCatalog {
     by_name: HashMap<String, CardEntry>,
     by_codec_id: HashMap<u32, HdaCodecEntry>,
+    by_ac97_chip_name: HashMap<String, Ac97CodecEntry>,
 }
 
 impl AlsaCardCatalog {
@@ -246,9 +279,21 @@ impl AlsaCardCatalog {
                 },
             );
         }
+        let mut by_ac97_chip_name: HashMap<String, Ac97CodecEntry> =
+            HashMap::new();
+        for codec in parsed.ac97_codecs {
+            by_ac97_chip_name.insert(
+                codec.chip_name,
+                Ac97CodecEntry {
+                    pretty_name: codec.pretty_name,
+                    description: codec.description.filter(|s| !s.is_empty()),
+                },
+            );
+        }
         Ok(Self {
             by_name,
             by_codec_id,
+            by_ac97_chip_name,
         })
     }
 
@@ -260,6 +305,21 @@ impl AlsaCardCatalog {
     /// to the kernel-supplied chip name as the label.
     pub fn lookup_codec(&self, codec_id: u32) -> Option<&HdaCodecEntry> {
         self.by_codec_id.get(&codec_id)
+    }
+
+    /// Look up an AC97 codec by its kernel-reported chip name
+    /// (verbatim, case-sensitive — the AC97 codec file's first
+    /// line). Returns the catalogue's preferred form when one is
+    /// declared; None when the codec is uncatalogued and the
+    /// caller should fall back to the kernel-supplied chip name
+    /// (already operator-readable). The catalogue overlay for
+    /// AC97 is a polish path — the kernel chip name is the
+    /// correctness path.
+    pub fn lookup_ac97_codec(
+        &self,
+        chip_name: &str,
+    ) -> Option<&Ac97CodecEntry> {
+        self.by_ac97_chip_name.get(chip_name)
     }
 
     /// Look up by raw ALSA card name.

@@ -658,3 +658,118 @@ pretty_name = "NVIDIA HDMI Audio"
 [[hda_codecs]]
 codec_id = "1002aa01"
 pretty_name = "AMD/ATI HDMI Audio"
+
+# ============================================================
+# AC97 codec overlay — operator-friendly chip labels for AC97
+# codecs encountered on amd64 / x86 hosts with pre-HDA audio
+# (Intel ICH, VIA 82xx, ALi 5451, ATI IXP, Cirrus, etc.).
+#
+# Keyed by the chip name as the kernel surfaces it on the first
+# line of /proc/asound/cardN/codec97#N/ac97#0-0 (verbatim,
+# case-sensitive). The kernel name is already operator-readable
+# (it resolves the AC97 vendor/device-id registers internally);
+# the catalogue overlay rebrands only where a preferred form
+# exists. Catalogue miss → kernel chip name surfaces as the
+# fallback label (no silent loss).
+#
+# Coverage focuses on the most prevalent AC97 codec families on
+# consumer + workstation x86 hardware shipped 1999-2010 vintage.
+# AC97 was superseded by HDA on Intel platforms with the
+# ICH7/ICH8/ICH9 transition, so this catalogue extends mainly
+# for boards still serviced from that era or virtualised /
+# emulated AC97 cards (qemu's `intel-hda-modular,model=duplex`
+# defaults to AC97-compatible).
+
+# --- Analog Devices SoundMAX family ---
+
+[[ac97_codecs]]
+chip_name = "Analog Devices AD1980"
+pretty_name = "Analog Devices SoundMAX AD1980"
+
+[[ac97_codecs]]
+chip_name = "Analog Devices AD1981"
+pretty_name = "Analog Devices SoundMAX AD1981"
+
+[[ac97_codecs]]
+chip_name = "Analog Devices AD1985"
+pretty_name = "Analog Devices SoundMAX AD1985"
+
+[[ac97_codecs]]
+chip_name = "Analog Devices AD1986"
+pretty_name = "Analog Devices SoundMAX AD1986"
+
+# --- Realtek AC97 family ---
+
+[[ac97_codecs]]
+chip_name = "Realtek ALC650"
+pretty_name = "Realtek ALC650"
+
+[[ac97_codecs]]
+chip_name = "Realtek ALC655"
+pretty_name = "Realtek ALC655"
+
+[[ac97_codecs]]
+chip_name = "Realtek ALC658"
+pretty_name = "Realtek ALC658"
+
+[[ac97_codecs]]
+chip_name = "Realtek ALC850"
+pretty_name = "Realtek ALC850"
+
+[[ac97_codecs]]
+chip_name = "Realtek ALC861"
+pretty_name = "Realtek ALC861"
+
+# --- SigmaTel STAC family ---
+
+[[ac97_codecs]]
+chip_name = "SigmaTel STAC9700"
+pretty_name = "SigmaTel STAC9700"
+
+[[ac97_codecs]]
+chip_name = "SigmaTel STAC9750"
+pretty_name = "SigmaTel STAC9750"
+
+[[ac97_codecs]]
+chip_name = "SigmaTel STAC9756"
+pretty_name = "SigmaTel STAC9756"
+
+# --- Conexant + Cirrus AC97 ---
+
+[[ac97_codecs]]
+chip_name = "Conexant CX20468"
+pretty_name = "Conexant CX20468"
+
+[[ac97_codecs]]
+chip_name = "Cirrus Logic CS4202"
+pretty_name = "Cirrus Logic CS4202"
+
+[[ac97_codecs]]
+chip_name = "Cirrus Logic CS4205"
+pretty_name = "Cirrus Logic CS4205"
+
+# --- VIA + Yamaha AC97 ---
+
+[[ac97_codecs]]
+chip_name = "VIA VT1612A"
+pretty_name = "VIA VT1612A"
+
+[[ac97_codecs]]
+chip_name = "VIA VT1616"
+pretty_name = "VIA VT1616"
+
+[[ac97_codecs]]
+chip_name = "VIA VT1617A"
+pretty_name = "VIA VT1617A"
+
+[[ac97_codecs]]
+chip_name = "VIA VT1618"
+pretty_name = "VIA VT1618"
+
+[[ac97_codecs]]
+chip_name = "Yamaha YMF743"
+pretty_name = "Yamaha YMF743"
+
+[[ac97_codecs]]
+chip_name = "Yamaha YMF752"
+pretty_name = "Yamaha YMF752"
