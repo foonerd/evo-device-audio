@@ -58,9 +58,9 @@ impl std::fmt::Display for MpdVersion {
 /// Narrow view of MPD's `status` response.
 ///
 /// Only the fields the playback warden needs today. Additional fields
-/// MPD reports (xfade, mixrampdb, audio, etc.) are intentionally
-/// dropped rather than surfaced: the connection layer's surface grows
-/// by explicit opt-in, not by accumulating every tag MPD emits.
+/// MPD reports (mixrampdb, audio, etc.) are intentionally dropped
+/// rather than surfaced: the connection layer's surface grows by
+/// explicit opt-in, not by accumulating every tag MPD emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MpdStatus {
     /// Playback state (always present in MPD responses).
@@ -79,6 +79,32 @@ pub(crate) struct MpdStatus {
     /// Volume level, 0-100. `None` when MPD reports -1 (no mixer
     /// configured) or when the field is absent.
     pub(crate) volume: Option<u8>,
+    /// `repeat` mode: when set, MPD restarts the queue from
+    /// position 0 after the last song ends. `false` when MPD
+    /// omits the field. Captured by the `emit_test_tone`
+    /// diagnostic so the operator's prior value is restored
+    /// after the tone completes.
+    pub(crate) repeat: bool,
+    /// `random` mode: when set, MPD plays queue entries in
+    /// random order. `false` when MPD omits the field.
+    /// Captured then restored by `emit_test_tone` for the
+    /// same reason as [`Self::repeat`].
+    pub(crate) random: bool,
+    /// `single` mode: when set, MPD stops after the current
+    /// song instead of advancing. `false` when MPD omits the
+    /// field. Captured then restored by `emit_test_tone` for
+    /// the same reason as [`Self::repeat`].
+    pub(crate) single: bool,
+    /// `consume` mode: when set, MPD removes each song from
+    /// the queue after it plays. `false` when MPD omits the
+    /// field. Captured then restored by `emit_test_tone` for
+    /// the same reason as [`Self::repeat`].
+    pub(crate) consume: bool,
+    /// Inter-song crossfade in seconds; `0` disables. `0`
+    /// when MPD omits the field. Captured then restored by
+    /// `emit_test_tone` for the same reason as
+    /// [`Self::repeat`].
+    pub(crate) crossfade_seconds: u32,
 }
 
 /// Narrow view of MPD's `currentsong` response.

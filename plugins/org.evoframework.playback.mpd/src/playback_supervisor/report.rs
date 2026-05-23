@@ -227,6 +227,11 @@ mod tests {
             elapsed: None,
             duration: None,
             volume: None,
+            repeat: false,
+            random: false,
+            single: false,
+            consume: false,
+            crossfade_seconds: 0,
         }
     }
 
@@ -247,6 +252,11 @@ mod tests {
             elapsed: Some(Duration::from_millis(12_345)),
             duration: Some(Duration::from_millis(180_000)),
             volume: Some(50),
+            repeat: false,
+            random: false,
+            single: false,
+            consume: false,
+            crossfade_seconds: 0,
         };
         let song = MpdSong {
             file_path: "INTERNAL/Artist/Album/track.flac".to_string(),
@@ -282,6 +292,11 @@ mod tests {
             elapsed: None,
             duration: None,
             volume: None,
+            repeat: false,
+            random: false,
+            single: false,
+            consume: false,
+            crossfade_seconds: 0,
         };
         let r = PlaybackStateReport::from_mpd(status, None);
         let out = r.serialise();
@@ -298,6 +313,11 @@ mod tests {
             elapsed: None,
             duration: None,
             volume: None,
+            repeat: false,
+            random: false,
+            single: false,
+            consume: false,
+            crossfade_seconds: 0,
         };
         let song = MpdSong {
             file_path: "some/file.flac".to_string(),
@@ -406,6 +426,11 @@ mod tests {
             elapsed: Some(Duration::from_millis(100)),
             duration: Some(Duration::from_millis(200)),
             volume: Some(42),
+            repeat: false,
+            random: false,
+            single: false,
+            consume: false,
+            crossfade_seconds: 0,
         };
         let song = MpdSong {
             file_path: "a/b.flac".to_string(),

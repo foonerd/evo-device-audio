@@ -299,6 +299,56 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Set MPD's `repeat` mode.
+    ///
+    /// Wire form: `repeat "<0|1>"\n`. When set, MPD restarts the
+    /// queue from position 0 after the last song ends — turning
+    /// a one-song queue into an infinite loop, which is the
+    /// behaviour the `emit_test_tone` diagnostic must neutralise
+    /// before play and restore on completion so the operator's
+    /// normal music-listening state survives the diagnostic.
+    pub(crate) async fn set_repeat(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), MpdError> {
+        let arg = if enabled { "1" } else { "0" };
+        self.dispatch("repeat", &[arg]).await?;
+        Ok(())
+    }
+
+    /// Set MPD's `random` mode.
+    ///
+    /// Wire form: `random "<0|1>"\n`. When set, MPD plays queue
+    /// entries in random order. The `emit_test_tone` diagnostic
+    /// neutralises this before play so the queue's lone test
+    /// WAV is the song MPD plays, then restores the operator's
+    /// prior value.
+    pub(crate) async fn set_random(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), MpdError> {
+        let arg = if enabled { "1" } else { "0" };
+        self.dispatch("random", &[arg]).await?;
+        Ok(())
+    }
+
+    /// Set MPD's `consume` mode.
+    ///
+    /// Wire form: `consume "<0|1>"\n`. When set, MPD removes
+    /// each song from the queue after it plays. The
+    /// `emit_test_tone` diagnostic neutralises this before play
+    /// (the diagnostic owns the queue and clears it cleanly on
+    /// its own terms), then restores the operator's prior
+    /// value.
+    pub(crate) async fn set_consume(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), MpdError> {
+        let arg = if enabled { "1" } else { "0" };
+        self.dispatch("consume", &[arg]).await?;
+        Ok(())
+    }
+
     // ----- idle subprotocol -----
 
     /// Subscribe to subsystem change events.
@@ -564,6 +614,11 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
     let mut elapsed: Option<Duration> = None;
     let mut duration: Option<Duration> = None;
     let mut volume: Option<u8> = None;
+    let mut repeat = false;
+    let mut random = false;
+    let mut single = false;
+    let mut consume = false;
+    let mut crossfade_seconds: u32 = 0;
 
     for f in fields {
         match f.key.as_str() {
@@ -591,6 +646,33 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
             "volume" => {
                 volume = parse_volume_field(&f.value)?;
             }
+            "repeat" => {
+                repeat = f.value.as_str() == "1";
+            }
+            "random" => {
+                random = f.value.as_str() == "1";
+            }
+            "single" => {
+                // MPD 0.21+ extended `single` to a three-state
+                // ("0" / "1" / "oneshot"); the warden's restore
+                // path collapses both non-zero values to `true`
+                // because the diagnostic's intent (`single 0` is
+                // the canonical "play through" mode) is binary.
+                // Restore via `set_single(true)` carries the
+                // operator's prior commitment forward; if they
+                // had `oneshot` engaged, the restore reapplies
+                // `single 1` which is a close-enough subset
+                // (oneshot decays to `single 0` after one track
+                // anyway).
+                single = f.value.as_str() != "0";
+            }
+            "consume" => {
+                consume = f.value.as_str() == "1";
+            }
+            "xfade" => {
+                crossfade_seconds =
+                    parse_u32_field("xfade", &f.value).unwrap_or(0);
+            }
             _ => {}
         }
     }
@@ -606,6 +688,11 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
         elapsed,
         duration,
         volume,
+        repeat,
+        random,
+        single,
+        consume,
+        crossfade_seconds,
     })
 }
 
@@ -1213,6 +1300,109 @@ mod tests {
         conn.set_single(false).await.unwrap();
         let captured = rx.await.unwrap();
         assert_eq!(captured, b"single \"0\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_repeat_true_sends_repeat_one() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_repeat(true).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"repeat \"1\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_repeat_false_sends_repeat_zero() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_repeat(false).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"repeat \"0\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_random_true_sends_random_one() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_random(true).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"random \"1\"\n");
+    }
+
+    #[tokio::test]
+    async fn set_consume_true_sends_consume_one() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.set_consume(true).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"consume \"1\"\n");
+    }
+
+    #[tokio::test]
+    async fn status_parses_transport_modes() {
+        // The emit_test_tone diagnostic captures these fields
+        // before play + restores them after. Drift between
+        // the parser + the wire format MPD emits would silently
+        // leak diagnostic-only modes into the operator's
+        // normal playback. Pin them.
+        let (server, client) = duplex(4096);
+        spawn_scripted_exchange(
+            server,
+            b"OK MPD 0.23.5\n",
+            b"state: stop\nrepeat: 1\nrandom: 1\nsingle: 1\nconsume: 1\nxfade: 7\nOK\n",
+        );
+        let mut conn = handshake_for_exchange(client).await;
+        let s = conn.status().await.unwrap();
+        assert!(s.repeat, "repeat: 1 must parse to true");
+        assert!(s.random, "random: 1 must parse to true");
+        assert!(s.single, "single: 1 must parse to true");
+        assert!(s.consume, "consume: 1 must parse to true");
+        assert_eq!(s.crossfade_seconds, 7);
+    }
+
+    #[tokio::test]
+    async fn status_defaults_transport_modes_to_off_when_absent() {
+        // When MPD omits the fields, the diagnostic must capture
+        // them as `false` / `0` so the restore path doesn't
+        // accidentally engage them.
+        let (server, client) = duplex(4096);
+        spawn_scripted_exchange(
+            server,
+            b"OK MPD 0.23.5\n",
+            b"state: stop\nOK\n",
+        );
+        let mut conn = handshake_for_exchange(client).await;
+        let s = conn.status().await.unwrap();
+        assert!(!s.repeat);
+        assert!(!s.random);
+        assert!(!s.single);
+        assert!(!s.consume);
+        assert_eq!(s.crossfade_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn status_single_oneshot_parses_as_true() {
+        // MPD 0.21+ `single: oneshot` is a binary-collapse case
+        // for the diagnostic's restore path. The parser maps
+        // any non-zero value to `single = true`; the restore
+        // re-engages `single 1` (subset of oneshot semantics).
+        let (server, client) = duplex(4096);
+        spawn_scripted_exchange(
+            server,
+            b"OK MPD 0.23.5\n",
+            b"state: stop\nsingle: oneshot\nOK\n",
+        );
+        let mut conn = handshake_for_exchange(client).await;
+        let s = conn.status().await.unwrap();
+        assert!(
+            s.single,
+            "single: oneshot must collapse to true for the \
+             diagnostic's restore-binary capture"
+        );
     }
 
     // ----- transport: ACK handling -----

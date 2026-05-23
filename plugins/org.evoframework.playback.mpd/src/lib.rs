@@ -136,6 +136,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::PluginConfig;
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
+use crate::mpd::{MpdError, MpdStatus};
 use crate::mpd_fragment::{
     atomic_write_fragment, render_audio_output_fragment, MixerConfig,
 };
@@ -353,6 +354,16 @@ pub struct MpdPlaybackPlugin {
     /// Spawned at load; signals shutdown + awaits completion
     /// in unload.
     envelope_subscriber: Option<envelope_subscriber::EnvelopeSubscriberHandle>,
+    /// Test-tone in-flight gate. Set true at the entry of
+    /// `emit_test_tone` and cleared by the background restore
+    /// task on completion. A concurrent `emit_test_tone` while
+    /// the flag is set refuses with a structured Permanent
+    /// error rather than racing two diagnostic runs against
+    /// the same MPD daemon. The flag is `Arc<AtomicBool>` so
+    /// the spawned restore task carries a clone — clearing
+    /// the flag survives the plugin's reference-borrow
+    /// boundary.
+    test_tone_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -546,6 +557,9 @@ impl MpdPlaybackPlugin {
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
+            test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             corrections_dispatched: 0,
             requests_handled: 0,
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -2526,8 +2540,40 @@ impl MpdPlaybackPlugin {
                 TEST_TONE_MPD_UNIX_SOCKET
             )));
         }
+        // In-flight gate: refuse concurrent diagnostic runs.
+        // Two `emit_test_tone` calls overlapping would race
+        // each other's capture / set / restore against the
+        // same MPD daemon and could leave the operator's
+        // prior modes lost (the later capture would observe
+        // the earlier's diagnostic state, then "restore" to
+        // that). A structured refusal protects the operator
+        // surface; once the in-flight tone's restore
+        // completes, the flag clears and the next request
+        // proceeds.
+        if self
+            .test_tone_in_flight
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(PluginError::Permanent(
+                "emit_test_tone refused: another diagnostic tone is \
+                 already in flight on this device. Wait for it to \
+                 complete (configured duration + restore window) and \
+                 retry."
+                    .to_string(),
+            ));
+        }
+        let in_flight = Arc::clone(&self.test_tone_in_flight);
+        // Helper that clears the in-flight gate when the
+        // dispatch fails before the spawned restore task can
+        // take ownership of it. Wrapped in a closure so each
+        // early-return site is a single line.
+        let release_in_flight = || {
+            in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        };
+
         let unix_endpoint = MpdEndpoint::unix(TEST_TONE_MPD_UNIX_SOCKET)
             .map_err(|e| {
+                release_in_flight();
                 PluginError::Permanent(format!(
                     "emit_test_tone Unix-endpoint construction failed \
                      for {}: {:?}",
@@ -2538,31 +2584,228 @@ impl MpdPlaybackPlugin {
             MpdConnection::connect_with_timeouts(unix_endpoint, self.timeouts)
                 .await
                 .map_err(|e| {
+                    release_in_flight();
                     PluginError::Permanent(format!(
                         "emit_test_tone Unix-socket connect failed: {e}"
                     ))
                 })?;
-        // Three-step sequence — clear so the test tone replaces
-        // any prior queue content, add the file:// URI (allowed
-        // on the Unix socket), play. Any MPD ack surfaces as a
-        // structured Permanent error.
-        conn.clear().await.map_err(|e| {
+
+        // Capture the operator's prior transport-mode state.
+        // MPD's repeat / random / single / consume / crossfade
+        // are daemon-global; a queue of one finite WAV played
+        // under operator-default `repeat=1` loops forever. The
+        // diagnostic's contract is "play exactly once,
+        // independent of operator state, leave the operator's
+        // prior state intact". `status` is one round-trip and
+        // surfaces every field the diagnostic must capture.
+        let prior_status = conn.status().await.map_err(|e| {
+            release_in_flight();
             PluginError::Permanent(format!(
-                "emit_test_tone MPD clear failed: {e}"
+                "emit_test_tone MPD status (pre-capture) failed: {e}"
             ))
         })?;
+
+        // Set deterministic diagnostic-isolation modes BEFORE
+        // play so the one-item queue plays exactly once. Each
+        // setter is one round-trip — five round-trips total —
+        // bounded by the connection's command timeout.
+        async fn neutralise_for_diagnostic(
+            conn: &mut MpdConnection,
+        ) -> Result<(), MpdError> {
+            conn.set_repeat(false).await?;
+            conn.set_single(true).await?;
+            conn.set_random(false).await?;
+            conn.set_consume(false).await?;
+            conn.set_crossfade(0).await?;
+            Ok(())
+        }
+        if let Err(e) = neutralise_for_diagnostic(&mut conn).await {
+            // Restore best-effort — we may have set some
+            // modes already; leaving them is worse than trying
+            // to put each back.
+            let _ = conn.set_repeat(prior_status.repeat).await;
+            let _ = conn.set_single(prior_status.single).await;
+            let _ = conn.set_random(prior_status.random).await;
+            let _ = conn.set_consume(prior_status.consume).await;
+            let _ = conn.set_crossfade(prior_status.crossfade_seconds).await;
+            release_in_flight();
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone neutralise (pre-play mode setup) \
+                 failed: {e}; attempted best-effort restore of prior \
+                 modes before refusing"
+            )));
+        }
+
+        // Three-step queue sequence — clear so the test tone
+        // replaces any prior queue content, add the file://
+        // URI (allowed on the Unix socket), play. On failure
+        // restore prior modes before refusing so the operator
+        // is never left in diagnostic state.
+        async fn restore_prior(conn: &mut MpdConnection, prior: &MpdStatus) {
+            let _ = conn.set_repeat(prior.repeat).await;
+            let _ = conn.set_single(prior.single).await;
+            let _ = conn.set_random(prior.random).await;
+            let _ = conn.set_consume(prior.consume).await;
+            let _ = conn.set_crossfade(prior.crossfade_seconds).await;
+        }
+        if let Err(e) = conn.clear().await {
+            restore_prior(&mut conn, &prior_status).await;
+            release_in_flight();
+            return Err(PluginError::Permanent(format!(
+                "emit_test_tone MPD clear failed: {e}"
+            )));
+        }
         let file_uri = format!("file://{}", path);
-        conn.add(&file_uri).await.map_err(|e| {
-            PluginError::Permanent(format!(
+        if let Err(e) = conn.add(&file_uri).await {
+            restore_prior(&mut conn, &prior_status).await;
+            release_in_flight();
+            return Err(PluginError::Permanent(format!(
                 "emit_test_tone MPD add ({}) failed: {e}",
                 file_uri
-            ))
-        })?;
-        conn.play().await.map_err(|e| {
-            PluginError::Permanent(format!(
+            )));
+        }
+        if let Err(e) = conn.play().await {
+            restore_prior(&mut conn, &prior_status).await;
+            release_in_flight();
+            return Err(PluginError::Permanent(format!(
                 "emit_test_tone MPD play failed: {e}"
-            ))
-        })?;
+            )));
+        }
+        // Drop the synchronous connection; the background
+        // restore task opens its own.
+        drop(conn);
+
+        // Background restore: poll status until the tone
+        // finishes, then restore the operator's prior modes.
+        // Spawned (not awaited) so the wire-op returns
+        // promptly while the cleanup runs ephemerally; the
+        // in-flight gate stays set until the spawned task
+        // clears it.
+        //
+        // Bounds:
+        //
+        //   * `duration_ms + RESTORE_DEADLINE_SLACK_MS` —
+        //     upper bound on the wait. `single = 1` halts MPD
+        //     at the end of the one-item queue, so the actual
+        //     wait is the tone's audio duration plus a small
+        //     handshake margin.
+        //   * `STATUS_POLL_INTERVAL_MS` — granularity for the
+        //     `status` poll. Coarse enough to keep MPD's load
+        //     negligible; fine enough that the gap between
+        //     tone-end and restore is sub-perceptible.
+        const STATUS_POLL_INTERVAL_MS: u64 = 100;
+        const RESTORE_DEADLINE_SLACK_MS: u64 = 1500;
+        let socket_path = TEST_TONE_MPD_UNIX_SOCKET.to_string();
+        let timeouts = self.timeouts;
+        let duration_ms_u64 = u64::from(duration_ms);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    duration_ms_u64 + RESTORE_DEADLINE_SLACK_MS,
+                );
+            let mut restore_conn = match MpdEndpoint::unix(&socket_path) {
+                Ok(ep) => {
+                    match MpdConnection::connect_with_timeouts(ep, timeouts)
+                        .await
+                    {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "emit_test_tone restore: reconnect to MPD \
+                                 Unix socket failed; cannot restore prior \
+                                 transport modes — operator's modes may be \
+                                 left in diagnostic state"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = ?e,
+                        "emit_test_tone restore: Unix-endpoint construction \
+                         failed; cannot restore prior transport modes"
+                    );
+                    None
+                }
+            };
+
+            // Wait until MPD reports state=Stopped OR deadline.
+            // single=1 + finite WAV guarantees Stopped at end
+            // of one play; the poll catches it within the
+            // poll interval.
+            if let Some(ref mut conn) = restore_conn {
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            duration_ms = duration_ms_u64,
+                            slack_ms = RESTORE_DEADLINE_SLACK_MS,
+                            "emit_test_tone restore: deadline reached \
+                             waiting for MPD to report stopped; restoring \
+                             prior modes anyway"
+                        );
+                        break;
+                    }
+                    match conn.status().await {
+                        Ok(s)
+                            if matches!(
+                                s.state,
+                                crate::mpd::PlayState::Stopped
+                            ) =>
+                        {
+                            break;
+                        }
+                        Ok(_) => {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(
+                                    STATUS_POLL_INTERVAL_MS,
+                                ),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "emit_test_tone restore: status poll \
+                                 failed; aborting wait + attempting restore"
+                            );
+                            break;
+                        }
+                    }
+                }
+                // Restore the captured pre-tone modes verbatim.
+                // Each setter is logged individually on failure;
+                // partial restore is documented in the warn
+                // line.
+                let _ = conn.set_repeat(prior_status.repeat).await;
+                let _ = conn.set_single(prior_status.single).await;
+                let _ = conn.set_random(prior_status.random).await;
+                let _ = conn.set_consume(prior_status.consume).await;
+                let _ =
+                    conn.set_crossfade(prior_status.crossfade_seconds).await;
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    repeat = prior_status.repeat,
+                    single = prior_status.single,
+                    random = prior_status.random,
+                    consume = prior_status.consume,
+                    crossfade_seconds = prior_status.crossfade_seconds,
+                    "emit_test_tone restore: prior transport modes \
+                     restored"
+                );
+            }
+            // Clear the in-flight gate so the next diagnostic
+            // can fire. Always runs regardless of restore
+            // outcome — leaving the gate latched would jam
+            // the surface.
+            in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
         Ok(())
     }
 
