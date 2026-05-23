@@ -16,19 +16,15 @@ path = "src/bin/network-wire.rs"
 
 [features]
 # Polling source is always compiled — universal correctness floor.
+# Rtnetlink source lives in the shared `evo-network-state` crate
+# and is enabled via that crate's `source-rtnetlink` feature
+# (default on).
 default = ["source-rtnetlink", "source-nm"]
-# Linux kernel netlink subscriber. Observes layer-2 carrier state
-# and layer-3 address attach / detach via RTMGRP_LINK +
-# RTMGRP_IPV4_IFADDR + RTMGRP_IPV6_IFADDR. Linux-only; cfg-gated
-# at the module level so non-Linux builds of the plugin compile
-# without the dependency.
+# Forwards to `evo-network-state`'s rtnetlink feature so non-Linux
+# builds of the plugin can disable it without dragging the netlink
+# dependency tree.
 source-rtnetlink = [
-    "dep:rtnetlink",
-    "dep:netlink-packet-route",
-    "dep:netlink-packet-core",
-    "dep:netlink-proto",
-    "dep:netlink-sys",
-    "dep:futures",
+    "evo-network-state/source-rtnetlink",
 ]
 # NetworkManager D-Bus subscriber. Observes the NM
 # `Connectivity` property + per-device `StateChanged` signals
@@ -43,6 +39,7 @@ source-nm = [
 [dependencies]
 anyhow = { workspace = true }
 async-trait = "0.1"
+evo-network-state = { path = "../../../evo-core-eng/crates/evo-network-state", default-features = false }
 evo-plugin-sdk = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -57,19 +54,13 @@ chacha20poly1305 = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
 
-# Rtnetlink event source (Linux only, feature-gated).
-rtnetlink = { version = "0.14", optional = true }
-netlink-packet-route = { version = "0.19", optional = true }
-netlink-packet-core = { version = "0.7", optional = true }
-netlink-proto = { version = "0.11", optional = true }
-netlink-sys = { version = "0.8", optional = true }
-futures = { version = "0.3", optional = true }
-
 # NetworkManager D-Bus subscriber. Pure-Rust async D-Bus
 # client; the system-bus connection backs `org.freedesktop
 # .NetworkManager` PropertiesChanged + Device.StateChanged
 # subscriptions.
 zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+# Futures channel + stream traits used by the NM source.
+futures = { version = "0.3", optional = true }
 
 [lints]
 workspace = true
