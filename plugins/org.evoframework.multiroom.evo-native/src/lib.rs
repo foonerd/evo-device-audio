@@ -187,6 +187,12 @@ const DEFAULT_LEADER_MS: u64 = 200;
 #[cfg(feature = "alsa-substrate")]
 const SCHEDULER_TICK_MS: u64 = 5;
 
+/// Hard cap for receiver queued frames awaiting presentation
+/// time. Protects against runaway memory/latency growth under
+/// prolonged scheduler starvation.
+#[cfg(feature = "alsa-substrate")]
+const MAX_RECEIVER_QUEUE_FRAMES: usize = 250;
+
 /// Operator config persisted at
 /// `/etc/evo/plugins.d/multiroom.evo-native.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -390,6 +396,10 @@ struct RoleEngagementContext {
     receiver_underruns: Arc<std::sync::atomic::AtomicU64>,
     #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+    source_capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
+    receiver_frame_drops: Arc<std::sync::atomic::AtomicU64>,
     /// Plugin's trace-state slot. Source-role engagement
     /// fills it on capture-mode startup; receiver / auto
     /// engagement clears it. Mutex'd so the substrate
@@ -541,6 +551,7 @@ async fn engage_role(
                     *ctx.trace_state_slot.lock().await =
                         Some(Arc::clone(&trace_state));
                     let task_trace_state = Some(Arc::clone(&trace_state));
+                    let capture_drops = Arc::clone(&ctx.source_capture_drops);
                     tokio::spawn(async move {
                         run_source_capture_task(
                             handle,
@@ -548,6 +559,7 @@ async fn engage_role(
                             frames_sent,
                             source_shutdown,
                             pcm,
+                            capture_drops,
                             task_trace_state,
                         )
                         .await;
@@ -588,6 +600,7 @@ async fn engage_role(
                 let leader_ms = Arc::clone(&ctx.leader_ms);
                 let underruns = Arc::clone(&ctx.receiver_underruns);
                 let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
+                let frame_drops = Arc::clone(&ctx.receiver_frame_drops);
                 let recv_task = tokio::spawn(async move {
                     run_receiver_task(
                         recv_handle,
@@ -595,9 +608,11 @@ async fn engage_role(
                         recv_shutdown,
                         alsa_pcm,
                         Role::Source,
+                        Some(gid.clone()),
                         leader_ms,
                         underruns,
                         queue_depth,
+                        frame_drops,
                     )
                     .await;
                 });
@@ -626,6 +641,7 @@ async fn engage_role(
                 let leader_ms = Arc::clone(&ctx.leader_ms);
                 let underruns = Arc::clone(&ctx.receiver_underruns);
                 let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
+                let frame_drops = Arc::clone(&ctx.receiver_frame_drops);
                 let recv_task = tokio::spawn(async move {
                     run_receiver_task(
                         recv_handle,
@@ -633,9 +649,11 @@ async fn engage_role(
                         recv_shutdown,
                         alsa_pcm,
                         Role::Receiver,
+                        group_id.clone(),
                         leader_ms,
                         underruns,
                         queue_depth,
+                        frame_drops,
                     )
                     .await;
                 });
@@ -878,8 +896,15 @@ async fn resolve_initial_engagement(
     config: &PluginConfig,
 ) -> (Role, Option<String>, Vec<String>, Vec<String>) {
     if let Some(handle) = handle {
-        // Check substrate first.
-        let substrate_role = handle.get_role(local_device_id).await.ok();
+        // Check substrate first. get_role() returns Auto on
+        // substrate-empty, so use list_explicit_roles() to
+        // distinguish explicit operator gesture from default.
+        let substrate_role = match handle.list_explicit_roles().await {
+            Ok(entries) => entries
+                .into_iter()
+                .find_map(|(id, role)| (id == local_device_id).then_some(role)),
+            Err(_) => None,
+        };
         let (substrate_group_id, substrate_members) =
             match handle.list_groups_for_device(local_device_id).await {
                 Ok(groups) => {
@@ -893,10 +918,7 @@ async fn resolve_initial_engagement(
             };
         // If substrate has an explicit role for this device,
         // use it. Else fall back to TOML role.
-        let role = match substrate_role {
-            Some(r) => role_from_substrate(r),
-            None => config.role,
-        };
+        let role = substrate_role.map(role_from_substrate).unwrap_or(config.role);
         // Group precedence: substrate group wins; fall back to
         // TOML group_id + group_members.
         let (group_id, members, member_addresses) = match substrate_group_id {
@@ -1002,6 +1024,13 @@ pub struct MultiroomEvoNativePlugin {
     /// Snapshot for `multiroom.get_status`; updated by the
     /// receiver scheduler each tick.
     receiver_queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    /// Source-side capture bridge send failures. Non-zero
+    /// means the capture thread could not hand a chunk to the
+    /// async side (typically channel teardown during shutdown).
+    source_capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver-side frame drops (invalid format, unrelated
+    /// group, or stream lag drop reports).
+    receiver_frame_drops: Arc<std::sync::atomic::AtomicU64>,
     /// Source-host audible-time trace aggregator state slot.
     /// Populated when the plugin engages source role with
     /// capture mode; the wire-op
@@ -1046,6 +1075,8 @@ impl MultiroomEvoNativePlugin {
             receiver_queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
+            source_capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            receiver_frame_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "alsa-substrate")]
             trace_state: Arc::new(tokio::sync::Mutex::new(None)),
             subject_announcer: None,
@@ -1076,6 +1107,19 @@ impl MultiroomEvoNativePlugin {
     /// for their presentation_time_ms to arrive).
     pub fn receiver_queue_depth(&self) -> u64 {
         self.receiver_queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Source capture bridge send failures.
+    pub fn source_capture_drops(&self) -> u64 {
+        self.source_capture_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Receiver-side dropped frames (group/format rejects and
+    /// lag-reported drop counts).
+    pub fn receiver_frame_drops(&self) -> u64 {
+        self.receiver_frame_drops
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1270,6 +1314,8 @@ impl Plugin for MultiroomEvoNativePlugin {
                 leader_ms: Arc::clone(&self.leader_ms),
                 receiver_underruns: Arc::clone(&self.receiver_underruns),
                 receiver_queue_depth: Arc::clone(&self.receiver_queue_depth),
+                source_capture_drops: Arc::clone(&self.source_capture_drops),
+                receiver_frame_drops: Arc::clone(&self.receiver_frame_drops),
                 #[cfg(feature = "alsa-substrate")]
                 trace_state_slot,
             });
@@ -1453,6 +1499,8 @@ impl Plugin for MultiroomEvoNativePlugin {
             let underruns = self
                 .receiver_underruns
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let source_capture_drops = self.source_capture_drops();
+            let receiver_frame_drops = self.receiver_frame_drops();
             match self.config.role {
                 Role::Receiver => {
                     let underrun_ratio = if frames_received > 0 {
@@ -1460,7 +1508,12 @@ impl Plugin for MultiroomEvoNativePlugin {
                     } else {
                         0.0
                     };
-                    let degraded = underrun_ratio > 0.10;
+                    let frame_drop_ratio = if frames_received > 0 {
+                        receiver_frame_drops as f64 / frames_received as f64
+                    } else {
+                        0.0
+                    };
+                    let degraded = underrun_ratio > 0.10 || frame_drop_ratio > 0.02;
                     checks.push(HealthCheck {
                         name: "receiver_buffer".to_string(),
                         status: if degraded {
@@ -1470,17 +1523,25 @@ impl Plugin for MultiroomEvoNativePlugin {
                         },
                         message: Some(format!(
                             "frames_received={frames_received} \
-                             underruns={underruns} ratio={underrun_ratio:.3}"
+                             underruns={underruns} underrun_ratio={underrun_ratio:.3} \
+                             frame_drops={receiver_frame_drops} frame_drop_ratio={frame_drop_ratio:.3}"
                         )),
                         last_success: (!degraded).then_some(now),
                     });
                 }
                 Role::Source => {
+                    let degraded = source_capture_drops > 0;
                     checks.push(HealthCheck {
                         name: "source_capture".to_string(),
-                        status: HealthStatus::Healthy,
-                        message: Some(format!("frames_sent={frames_sent}")),
-                        last_success: Some(now),
+                        status: if degraded {
+                            HealthStatus::Degraded
+                        } else {
+                            HealthStatus::Healthy
+                        },
+                        message: Some(format!(
+                            "frames_sent={frames_sent} capture_bridge_failures={source_capture_drops}"
+                        )),
+                        last_success: (!degraded).then_some(now),
                     });
                 }
                 Role::Auto => {
@@ -1494,11 +1555,11 @@ impl Plugin for MultiroomEvoNativePlugin {
                 status,
                 detail: Some(format!(
                     "role={} frames_sent={} frames_received={} \
-                     underruns={}",
+                     underruns={} source_capture_drops={} receiver_frame_drops={}",
                     self.config.role.as_wire_str(),
                     frames_sent,
                     frames_received,
-                    underruns,
+                    underruns, source_capture_drops, receiver_frame_drops,
                 )),
                 checks,
                 reported_at: now,
@@ -1533,6 +1594,8 @@ impl Respondent for MultiroomEvoNativePlugin {
                         "frames_received": self.frames_received(),
                         "receiver_queue_depth": self.receiver_queue_depth(),
                         "receiver_underruns": self.receiver_underruns(),
+                        "source_capture_drops": self.source_capture_drops(),
+                        "receiver_frame_drops": self.receiver_frame_drops(),
                     });
                     let body = serde_json::to_vec(&payload).map_err(|e| {
                         PluginError::Permanent(format!(
@@ -1726,11 +1789,11 @@ async fn run_source_tone_generator(
 /// fans each chunk out as one `AudioFrame`. The blocking ALSA
 /// read runs on a dedicated OS thread to keep the tokio
 /// runtime free; chunks are bridged into the async side via
-/// a bounded mpsc channel (back-pressure: drops the oldest
-/// chunk on overflow rather than blocking the capture thread,
-/// because reading slow from a loopback half causes the
-/// loopback playback half to underrun, which corrupts the
-/// real-time chain).
+/// a bounded mpsc channel with blocking send semantics
+/// (lossless bridge): when the async side lags, the capture
+/// thread applies back-pressure instead of dropping chunks.
+/// This prioritises sample integrity over low-latency
+/// continuity.
 #[cfg(feature = "alsa-substrate")]
 async fn run_source_capture_task(
     audio_plane: Arc<dyn AudioPlaneHandle>,
@@ -1738,14 +1801,15 @@ async fn run_source_capture_task(
     sent: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
     source_pcm: String,
+    capture_drops: Arc<std::sync::atomic::AtomicU64>,
     trace_state: Option<Arc<TraceState>>,
 ) {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
 
-    // Capacity covers ~0.5 s of frames; if we fall further
-    // behind than that the loopback playback half is corrupt
-    // already.
+    // Capacity covers ~5 seconds of 20 ms frames. Large
+    // enough to smooth transient scheduling hiccups while
+    // still bounded for memory safety.
     // Channel item carries the captured chunk + the source-
     // side audible-time-trace stage timestamps the capture
     // thread observed at its own call sites: stage 3a is
@@ -1756,7 +1820,7 @@ async fn run_source_capture_task(
     // capture-thread's timestamps reference the same epoch
     // every other audible-time-trace observation on this
     // node uses (the framework runtime's epoch).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<CaptureChunk>(32);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<CaptureChunk>(256);
 
     // Deterministic-exit signal for the OS-level capture
     // thread. The thread polls this atomic in its tight loop
@@ -1785,6 +1849,7 @@ async fn run_source_capture_task(
                 capture_shutdown,
                 capture_audio_plane,
                 capture_exit_flag,
+                capture_drops,
             );
         });
     let capture_thread = match capture_thread {
@@ -2085,7 +2150,7 @@ struct CaptureChunk {
     /// returned with this chunk's samples. Stage 3a.
     capture_readi_return_ns: u64,
     /// Framework-monotonic ns immediately before
-    /// `tx.try_send(this_chunk)` queued the chunk onto the
+    /// `tx.blocking_send(this_chunk)` queued the chunk onto the
     /// async channel. Stage 3b.
     mpsc_send_ns: u64,
     /// PCM samples (pcm_s16_le, interleaved).
@@ -2433,6 +2498,7 @@ fn run_capture_thread(
     shutdown: Arc<Notify>,
     audio_plane: Arc<dyn AudioPlaneHandle>,
     should_exit: Arc<std::sync::atomic::AtomicBool>,
+    capture_drops: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Open + configure the capture PCM NON-BLOCKING. In
     // blocking mode `io.readi()` parks indefinitely waiting
@@ -2612,15 +2678,24 @@ fn run_capture_thread(
                         // immediately before queueing onto
                         // the async channel.
                         let mpsc_send_ns = audio_plane.monotonic_ns();
-                        // Soft-drop on channel full: we are
-                        // the producer of a real-time stream;
-                        // back-pressuring would corrupt the
-                        // loopback playback half upstream.
-                        let _ = tx.try_send(CaptureChunk {
-                            capture_readi_return_ns,
-                            mpsc_send_ns,
-                            pcm: pcm_bytes,
-                        });
+                        // Lossless bridge: block until the
+                        // async side drains one slot. This
+                        // preserves frame integrity under load
+                        // instead of silently dropping chunks.
+                        if tx
+                            .blocking_send(CaptureChunk {
+                                capture_readi_return_ns,
+                                mpsc_send_ns,
+                                pcm: pcm_bytes,
+                            })
+                            .is_err()
+                        {
+                            capture_drops.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            break;
+                        }
                     }
                     Ok(_) => {
                         // Zero frames — try again on next
@@ -2695,9 +2770,11 @@ async fn run_receiver_task(
     shutdown: Arc<Notify>,
     alsa_pcm: String,
     role: Role,
+    expected_group_id: Option<String>,
     leader_ms: Arc<std::sync::atomic::AtomicU64>,
     underruns: Arc<std::sync::atomic::AtomicU64>,
     queue_depth: Arc<std::sync::atomic::AtomicU64>,
+    frame_drops: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut stream = match audio_plane.subscribe_audio_frames().await {
         Ok(s) => s,
@@ -2769,6 +2846,43 @@ async fn run_receiver_task(
             res = stream.recv() => {
                 match res {
                     Ok(frame) => {
+                        if let Some(expected_group) = expected_group_id.as_deref() {
+                            if frame.group_id != expected_group {
+                                frame_drops.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                tracing::debug!(
+                                    plugin = PLUGIN_NAME,
+                                    expected_group_id = %expected_group,
+                                    got_group_id = %frame.group_id,
+                                    from_device_id = %frame.from_device_id,
+                                    "receiver dropped frame from unrelated group"
+                                );
+                                continue;
+                            }
+                        }
+                        if frame.codec != "pcm_s16_le"
+                            || frame.rate_hz != BASELINE_SAMPLE_RATE_HZ
+                            || frame.channels != BASELINE_CHANNELS
+                            || frame.payload.len() % 4 != 0
+                        {
+                            frame_drops.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                codec = %frame.codec,
+                                rate_hz = frame.rate_hz,
+                                channels = frame.channels,
+                                payload_bytes = frame.payload.len(),
+                                from_device_id = %frame.from_device_id,
+                                group_id = %frame.group_id,
+                                "receiver dropped frame with unsupported format"
+                            );
+                            continue;
+                        }
                         counter.fetch_add(
                             1,
                             std::sync::atomic::Ordering::Relaxed,
@@ -2798,6 +2912,27 @@ async fn run_receiver_task(
                             );
                         }
                         queue.push_back(frame);
+                        queue.make_contiguous().sort_by(|a, b| {
+                            a.presentation_time_ms
+                                .cmp(&b.presentation_time_ms)
+                                .then_with(|| a.sequence.cmp(&b.sequence))
+                        });
+                        if queue.len() > MAX_RECEIVER_QUEUE_FRAMES {
+                            let to_drop = queue.len() - MAX_RECEIVER_QUEUE_FRAMES;
+                            for _ in 0..to_drop {
+                                let _ = queue.pop_front();
+                            }
+                            frame_drops.fetch_add(
+                                to_drop as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                dropped = to_drop,
+                                queue_len = queue.len(),
+                                "receiver queue capped; dropped oldest frames to recover"
+                            );
+                        }
                         queue_depth.store(
                             queue.len() as u64,
                             std::sync::atomic::Ordering::Relaxed,
@@ -2808,11 +2943,19 @@ async fn run_receiver_task(
                             dropped,
                         },
                     ) => {
+                        frame_drops.fetch_add(
+                            dropped as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         tracing::warn!(
                             plugin = PLUGIN_NAME,
                             dropped = dropped,
-                            "audio-frame stream lagged; receiver continues at live frame"
+                            "audio-frame stream lagged; receiver resets scheduler state"
                         );
+                        queue.clear();
+                        queue_depth.store(0, std::sync::atomic::Ordering::Relaxed);
+                        anchor_local = None;
+                        anchor_pts_ms = None;
                     }
                     Err(
                         evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Closed,
