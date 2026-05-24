@@ -493,7 +493,34 @@ else
     echo "[bootstrap] EVO_INSTALL_NETWORK_PLUGIN_CONFIG=0 — skipping network plugin config"
 fi
 
-# 2.6b — multiroom plugin config (rendered from flags)
+# 2.6b — multiroom plugin distribution-tier default
+#
+# Install the unconditional default (role=auto, no group, no
+# PCM beyond the distribution-standard `alsa_pcm = "evo"`)
+# so every freshly-installed device admits the multiroom
+# plugin against an explicit on-disk config file rather than
+# against the plugin's internal Default impl. The
+# operator-gestured `--multiroom-role=...` path below
+# overwrites this default when an explicit role is provided.
+# Operator-visible state must live in files the operator can
+# read and edit; relying on an implicit code-side Default is
+# a configuration smell that leaves the operator guessing
+# what the plugin is doing.
+if [[ "${EVO_INSTALL_MULTIROOM_PLUGIN_CONFIG:-1}" != "0" ]]; then
+    MULTIROOM_DEFAULT_TEMPLATE="$DIST_DIR/plugins.d/org.evoframework.multiroom.evo-native.toml"
+    MULTIROOM_DEFAULT_PATH="$PLUGINS_D_DIR/org.evoframework.multiroom.evo-native.toml"
+    if [[ -f "$MULTIROOM_DEFAULT_TEMPLATE" ]]; then
+        install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            "$MULTIROOM_DEFAULT_TEMPLATE" "$MULTIROOM_DEFAULT_PATH"
+        echo "[bootstrap] installed $MULTIROOM_DEFAULT_PATH (role=auto by default)"
+    else
+        echo "[bootstrap] WARN: multiroom plugin default not found at $MULTIROOM_DEFAULT_TEMPLATE; skipping"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_MULTIROOM_PLUGIN_CONFIG=0 — skipping multiroom plugin default config"
+fi
+
+# 2.6c — multiroom plugin config (rendered from flags)
 #
 # Convert a comma-separated list ("a,b,c") to a TOML array
 # literal (["a", "b", "c"]). Trims whitespace around each
@@ -1101,14 +1128,17 @@ else
     echo "  [WARN]  /etc/evo/plugins.d/org.evoframework.network.toml not installed (plugin uses code defaults)"
 fi
 
-# Multiroom plugin config: presence + role honesty.
+# Multiroom plugin config: presence + role honesty. The
+# distribution-tier default ships unconditionally (role=auto)
+# so the missing-file case below should only fire when the
+# operator explicitly set EVO_INSTALL_MULTIROOM_PLUGIN_CONFIG=0.
 if [[ -f /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml ]]; then
     MR_ROLE="$(grep -E '^role' \
         /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml \
         2>/dev/null | head -1 | sed -E 's/.*=\s*"([^"]+)".*/\1/')"
     echo "  [ok]    multiroom plugin config installed (role=${MR_ROLE:-?})"
 else
-    echo "  [skip]  multiroom plugin config not installed (configure via UI wizard or re-run with --multiroom-role)"
+    echo "  [WARN]  /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml not installed (plugin uses code defaults — set EVO_INSTALL_MULTIROOM_PLUGIN_CONFIG=1 or re-run with --multiroom-role)"
 fi
 
 # avahi-daemon must NOT hold UDP 5353 — evo binds it directly.

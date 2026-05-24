@@ -1,0 +1,41 @@
+# Distribution-tier default config for the multiroom plugin.
+#
+# Shipped unconditionally by the installer so every freshly-
+# installed device admits the multiroom plugin against an
+# explicit on-disk config rather than against the plugin's
+# internal Default impl. Operator-visible state must live in
+# files the operator can read and edit; relying on an
+# implicit code-side Default is a configuration smell that
+# leaves the operator guessing what the plugin is doing.
+#
+# Default role is `auto` — the plugin admits without engaging
+# any role. No PCM is opened, no audio is captured or
+# rendered, no group membership asserted. The plugin sits
+# observe-only until the operator promotes it via the
+# `set_device_role` wire op (which writes through the
+# framework's `RoleStore` substrate — the live role surface,
+# not this TOML) or via `bootstrap.sh --multiroom-role=...`
+# at install time (which substitutes the `.in` template
+# variant of this file and overwrites the defaults below).
+#
+# `alsa_pcm = "evo"` is the distribution-standard PCM alias
+# (see `/etc/asound.conf`) that the plugin opens once the
+# operator engages it as `receiver`. The default is recorded
+# here so the operator sees the expected receiver-side wiring
+# without having to consult the plugin source.
+#
+# `leader_ms = 200` is the BASE per-group latency budget the
+# scheduler uses for receiver-side presentation-time
+# anchoring (per ADR's multi-room baseline). Operator-tunable
+# live via `multiroom.set_leader_ms`. Range [20, 2000].
+#
+# `group_id` is omitted (= None) at the default — a device
+# in `auto` role is not asserting membership in any group.
+# The source-host's `--multiroom-role=source` install path
+# populates `group_id` + `group_members` +
+# `group_member_addresses` via the `.in` template's
+# substitution variant of this file.
+
+role = "auto"
+alsa_pcm = "evo"
+leader_ms = 200
