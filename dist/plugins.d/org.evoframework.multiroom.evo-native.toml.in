@@ -11,6 +11,9 @@
 #             audio plane. Set `--multiroom-source-pcm` to the
 #             ALSA PCM the capture half binds (e.g.
 #             `hw:Loopback,1,0` for a standard snd-aloop wiring).
+#             Set `--multiroom-alsa-pcm` to the source-local DAC
+#             render target the plugin writes (defaults to
+#             `evo_local` when unset).
 #             Source role additionally requires
 #             `--multiroom-group-members` (the receiver device
 #             ids it fans out to) and
@@ -38,5 +41,6 @@ role = "@MULTIROOM_ROLE@"
 group_id = "@MULTIROOM_GROUP_ID@"
 @MULTIROOM_GROUP_MEMBERS_LINE@
 @MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE@
-@MULTIROOM_PCM_LINE@
+@MULTIROOM_ALSA_PCM_LINE@
+@MULTIROOM_SOURCE_PCM_LINE@
 leader_ms = 200

@@ -5,6 +5,11 @@
 //! [`WriteEndpoint`] other audio-producing plugins write into.
 //! Stocks the `audio.delivery` shelf at shape 2.
 //!
+//! Plugin-local modular contract reference:
+//! `plugins/org.evoframework.delivery.alsa/docs/MODULAR_ALSA_PLUGIN_CONTRACT.md`.
+//! Device-tier canonical standard:
+//! `dist/MODULAR_ALSA_PIPELINE_STANDARD.md`.
+//!
 //! ## What this plugin is
 //!
 //! A singleton respondent that occupies the terminal stage of the
@@ -327,6 +332,37 @@ pub struct ActiveDacConfig {
 }
 
 impl AlsaDeliveryPlugin {
+    /// Resolve which options-render target to use for the active
+    /// on-disk ALSA topology.
+    ///
+    /// Source-host templates define `pcm.evo_local`; receiver /
+    /// standalone templates do not. The observer uses this marker
+    /// to decide whether operator options should rewrite the main
+    /// producer PCM (`pcm.evo`) or only the source-local renderer
+    /// PCM (`pcm.evo_local`).
+    fn detect_options_render_target(
+        asound_conf_path: &std::path::Path,
+    ) -> options_render::RenderTarget {
+        match std::fs::read_to_string(asound_conf_path) {
+            Ok(body) => {
+                if body.contains("pcm.evo_local") {
+                    options_render::RenderTarget::SourceLocal
+                } else {
+                    options_render::RenderTarget::Main
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    asound_conf_path = %asound_conf_path.display(),
+                    error = %e,
+                    "could not read asound.conf while selecting options-render target; defaulting to main pipeline"
+                );
+                options_render::RenderTarget::Main
+            }
+        }
+    }
+
     /// Construct a fresh plugin instance.
     pub fn new() -> Self {
         Self {
@@ -547,6 +583,8 @@ impl AlsaDeliveryPlugin {
         };
         let happening_emitter = Arc::clone(&ctx.happening_emitter);
         let drop_in_path = self.asound_options_drop_in_path.clone();
+        let render_target =
+            Self::detect_options_render_target(&self.asound_conf_path);
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
@@ -624,9 +662,17 @@ impl AlsaDeliveryPlugin {
                                     options_render::extract_options_settings_from_state(
                                         &settings_state,
                                     );
-                                let body = options_render::render_drop_in(
-                                    &settings,
-                                );
+                                let body = match render_target {
+                                    options_render::RenderTarget::Main => {
+                                        options_render::render_drop_in(&settings)
+                                    }
+                                    options_render::RenderTarget::SourceLocal => {
+                                        options_render::render_drop_in_for_target(
+                                            &settings,
+                                            render_target,
+                                        )
+                                    }
+                                };
                                 let render_bytes = body.len();
                                 let write_outcome = options_render::atomic_write_drop_in(
                                     &drop_in_path,

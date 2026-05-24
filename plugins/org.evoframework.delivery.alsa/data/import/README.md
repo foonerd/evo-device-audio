@@ -10,6 +10,17 @@ under `src/import.rs` does, and only when explicitly invoked via
 `cargo run --example regen_codec_catalogues`. The runtime reads the
 generated TOML.
 
+## Contract references
+
+This file covers only codec-table import mechanics.
+
+For modular ALSA pipeline contracts, use:
+
+- Plugin-local contract:
+  `plugins/org.evoframework.delivery.alsa/docs/MODULAR_ALSA_PLUGIN_CONTRACT.md`
+- Device-tier canonical standard:
+  `dist/MODULAR_ALSA_PIPELINE_STANDARD.md`
+
 ## Source provenance
 
 All files were fetched verbatim from `git.kernel.org`:

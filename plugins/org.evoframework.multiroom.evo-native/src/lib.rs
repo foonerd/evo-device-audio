@@ -18,11 +18,12 @@
 //!     `pcm_s16_le` / 48000 Hz / stereo in 20 ms chunks,
 //!     emitting each chunk as one `AudioFrame`. Apex showcase
 //!     mode — the operator wires `/etc/asound.conf` so the
-//!     local audio chain (`pcm.evo`) forks through a
-//!     `pcm.tee` plug into the receiver hardware DAC AND a
+//!     local producer chain (`pcm.evo`) writes to a
 //!     `snd-aloop` loopback playback half; the multiroom
-//!     plugin reads the loopback capture half, fanning out
-//!     whatever MPD (or any audio producer) is rendering.
+//!     plugin reads the loopback capture half, fans frames
+//!     out to receivers, and (when `alsa_pcm` is configured)
+//!     renders source-local DAC audio through the same
+//!     scheduler path.
 //!   - Synthetic mode (`source_pcm = ""` or unset, default):
 //!     synthesises a 440 Hz sine-wave test tone at
 //!     `pcm_s16_le` / 48000 Hz / stereo. Diagnostic floor —
@@ -547,6 +548,11 @@ async fn engage_role(
                 #[cfg(feature = "alsa-substrate")]
                 {
                     let pcm = source_pcm.clone();
+                    let local_alsa_pcm = if ctx.alsa_pcm.is_empty() {
+                        None
+                    } else {
+                        Some(ctx.alsa_pcm.clone())
+                    };
                     let trace_state = Arc::new(TraceState::new(100));
                     *ctx.trace_state_slot.lock().await =
                         Some(Arc::clone(&trace_state));
@@ -559,6 +565,7 @@ async fn engage_role(
                             frames_sent,
                             source_shutdown,
                             pcm,
+                            local_alsa_pcm,
                             capture_drops,
                             task_trace_state,
                         )
@@ -585,39 +592,6 @@ async fn engage_role(
                 }
             };
             engaged.source_task = Some(source_task);
-            // One-renderer-pipeline: when source has alsa_pcm
-            // configured, also spawn the receiver task to
-            // render the source-local DAC via self-loopback.
-            // Requires the alsa-substrate feature; without it
-            // there is no rendering path so the receiver task
-            // is not built.
-            #[cfg(feature = "alsa-substrate")]
-            if !ctx.alsa_pcm.is_empty() {
-                let counter = Arc::clone(&ctx.frames_received);
-                let recv_shutdown = Arc::clone(&shutdown);
-                let recv_handle = Arc::clone(&ctx.audio_plane);
-                let alsa_pcm = ctx.alsa_pcm.clone();
-                let leader_ms = Arc::clone(&ctx.leader_ms);
-                let underruns = Arc::clone(&ctx.receiver_underruns);
-                let queue_depth = Arc::clone(&ctx.receiver_queue_depth);
-                let frame_drops = Arc::clone(&ctx.receiver_frame_drops);
-                let recv_task = tokio::spawn(async move {
-                    run_receiver_task(
-                        recv_handle,
-                        counter,
-                        recv_shutdown,
-                        alsa_pcm,
-                        Role::Source,
-                        Some(gid.clone()),
-                        leader_ms,
-                        underruns,
-                        queue_depth,
-                        frame_drops,
-                    )
-                    .await;
-                });
-                engaged.receiver_task = Some(recv_task);
-            }
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 group_id = %gid,
@@ -918,7 +892,9 @@ async fn resolve_initial_engagement(
             };
         // If substrate has an explicit role for this device,
         // use it. Else fall back to TOML role.
-        let role = substrate_role.map(role_from_substrate).unwrap_or(config.role);
+        let role = substrate_role
+            .map(role_from_substrate)
+            .unwrap_or(config.role);
         // Group precedence: substrate group wins; fall back to
         // TOML group_id + group_members.
         let (group_id, members, member_addresses) = match substrate_group_id {
@@ -1075,8 +1051,12 @@ impl MultiroomEvoNativePlugin {
             receiver_queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(
                 0,
             )),
-            source_capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            receiver_frame_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            source_capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
+            receiver_frame_drops: Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
             #[cfg(feature = "alsa-substrate")]
             trace_state: Arc::new(tokio::sync::Mutex::new(None)),
             subject_announcer: None,
@@ -1513,7 +1493,8 @@ impl Plugin for MultiroomEvoNativePlugin {
                     } else {
                         0.0
                     };
-                    let degraded = underrun_ratio > 0.10 || frame_drop_ratio > 0.02;
+                    let degraded =
+                        underrun_ratio > 0.10 || frame_drop_ratio > 0.02;
                     checks.push(HealthCheck {
                         name: "receiver_buffer".to_string(),
                         status: if degraded {
@@ -1783,8 +1764,8 @@ async fn run_source_tone_generator(
 
 /// Source-side ALSA capture task. Opens the operator-supplied
 /// capture PCM (typically `evo_loopback` — the capture half of
-/// a `pcm.tee`-forked chain that mirrors `pcm.evo` into a
-/// `snd-aloop` loopback playback half), reads
+/// a `pcm.evo` producer path that writes to a `snd-aloop`
+/// loopback playback half), reads
 /// `pcm_s16_le` / 48000 Hz / stereo in 20 ms chunks, and
 /// fans each chunk out as one `AudioFrame`. The blocking ALSA
 /// read runs on a dedicated OS thread to keep the tokio
@@ -1801,6 +1782,7 @@ async fn run_source_capture_task(
     sent: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<Notify>,
     source_pcm: String,
+    local_alsa_pcm: Option<String>,
     capture_drops: Arc<std::sync::atomic::AtomicU64>,
     trace_state: Option<Arc<TraceState>>,
 ) {
@@ -1866,6 +1848,21 @@ async fn run_source_capture_task(
 
     let mut sequence: u64 = 0;
     let start_monotonic = std::time::Instant::now();
+    let mut local_render = match local_alsa_pcm {
+        Some(ref pcm) if !pcm.is_empty() => match AlsaRender::open(pcm) {
+            Ok(render) => Some(render),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    alsa_pcm = %pcm,
+                    "source local-render open failed; continuing fan-out without local DAC render"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
 
     // Audible-time trace state. The source task captures
     // stages 3a / 3b (via the CaptureChunk it receives), 4a /
@@ -1980,6 +1977,15 @@ async fn run_source_capture_task(
                     );
                 } else {
                     sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(render) = local_render.as_mut() {
+                    if let Err(e) = render.write(&pcm) {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "source local-render write failed; continuing fan-out"
+                        );
+                    }
                 }
                 // Record the source-side partial. The aggregator
                 // matches FrameSendEvent + FrameTraceReport

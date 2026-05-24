@@ -5,28 +5,26 @@
 # glob needed — this is the canonical place for the system's audio
 # pipeline definition.
 #
-# Source-host distinction: `pcm.evo` fans the same stereo signal
-# to TWO destinations simultaneously so the evo multiroom plugin's
-# source-side capture task can read the live mix and fan it across
-# the multi-room fabric while the local DAC continues to play.
+# Source-host distinction: `pcm.evo` writes ONLY to the
+# snd-aloop playback half. The multiroom plugin captures from the
+# matching loopback capture half and owns all local-DAC writes via
+# `alsa_pcm` (typically `evo_local`) on the same scheduler path
+# that fans out to remote receivers.
 #
 # Pipeline shape:
 #
 #   MPD (or any evo producer)
 #       → pcm.evo
-#           → plug (format / rate / channel normalisation)
-#           → route (stereo duplicated to 4 channels)
-#           → multi
-#               → channels 0,1 → plug → hw:CARD=@EVO_AUDIO_CARD@,DEV=0
-#               → channels 2,3 → plug → hw:CARD=Loopback,DEV=0,SUBDEV=0
-#                                          ↓ (kernel mirror)
-#                                       hw:CARD=Loopback,DEV=1,SUBDEV=0
-#                                          ↓
-#                                  evo multiroom plugin's
-#                                  `source_pcm` capture target
-#                                          ↓
-#                                  fans frames across the
-#                                  multi-room fabric to receivers
+#           → plug
+#           → hw:CARD=Loopback,DEV=0,SUBDEV=0
+#                         ↓ (kernel mirror)
+#                      hw:CARD=Loopback,DEV=1,SUBDEV=0
+#                         ↓
+#                 evo multiroom plugin `source_pcm` capture target
+#                         ↓
+#                 plugin fan-out scheduler writes:
+#                   - remote receivers (audio-plane TCP)
+#                   - local DAC via `alsa_pcm` (typically `evo_local`)
 #
 # `@EVO_AUDIO_CARD@` is substituted at install time by
 # bootstrap.sh from the operator-supplied (or auto-detected) ALSA
@@ -34,49 +32,37 @@
 # the `snd-aloop` module exposes; bootstrap.sh loads the module
 # at install time and persists it via /etc/modules-load.d/.
 #
-# Subdevice convention: this template binds source-host capture
-# to `SUBDEV=0`. snd-aloop exposes 8 subdevices per direction;
-# the playback subdevice N mirrors to the capture subdevice N.
-# Future pipeline stages (per-room volume, EQ, room correction)
-# may use additional subdevices; this template ships with the
-# minimum wiring v0.1 needs.
+# Subdevice convention: this template binds the source-host producer
+# path to `SUBDEV=0`. snd-aloop exposes 8 subdevices per direction;
+# playback subdevice N mirrors to capture subdevice N. The source-role
+# plugin config should set `source_pcm` to the matching capture side.
 
 pcm.evo {
     type plug
-    slave.pcm {
-        type route
-        slave {
-            pcm {
-                type multi
-                slaves.a {
-                    channels 2
-                    pcm {
-                        type plug
-                        slave.pcm "hw:CARD=@EVO_AUDIO_CARD@,DEV=0"
-                    }
-                }
-                slaves.b {
-                    channels 2
-                    pcm {
-                        type plug
-                        slave.pcm "hw:CARD=Loopback,DEV=0,SUBDEV=0"
-                    }
-                }
-                bindings.0 { slave a channel 0 }
-                bindings.1 { slave a channel 1 }
-                bindings.2 { slave b channel 0 }
-                bindings.3 { slave b channel 1 }
-            }
-            channels 4
-        }
-        ttable.0.0 1
-        ttable.1.1 1
-        ttable.0.2 1
-        ttable.1.3 1
-    }
+    slave.pcm "hw:CARD=Loopback,DEV=0,SUBDEV=0"
     hint {
         show on
-        description "evo: source-host fan-out to local DAC + snd-aloop"
+        description "evo: source-host producer to snd-aloop playback"
+    }
+}
+
+pcm.evo_local {
+    type plug
+    slave.pcm "hw:CARD=@EVO_AUDIO_CARD@,DEV=0"
+    hint {
+        show on
+        description "evo: source-host local DAC renderer target"
+    }
+}
+
+pcm.evo_loopback_capture {
+    type hw
+    card "Loopback"
+    device 1
+    subdevice 0
+    hint {
+        show on
+        description "evo: source-host loopback capture target"
     }
 }
 
@@ -85,19 +71,8 @@ ctl.evo {
     card "@EVO_AUDIO_CARD@"
 }
 
-# NOTE: the operator-options drop-in (/etc/asound.d/evo-options.conf)
-# is NOT included on the source-host variant. The source's
-# `pcm.evo` is structurally different from the
-# receiver/standalone baseline (route plugin fanning out to
-# snd-aloop + local DAC simultaneously); blindly overriding
-# `pcm.evo` from the operator-options drop-in would break
-# the multi-room fan-out shape. Source-host operators tune
-# mixer-type and output-device via the playback.options
-# wire-op surface; the subject-substrate update still
-# persists + emits happenings the operator can observe in
-# the journal. The audible reconfiguration on the source-
-# host re-derives from the operator-edited
-# `/etc/asound.conf.source` template on the next
-# bootstrap.sh run. Receiver/standalone installs read the
-# include and pick up the drop-in's `pcm.evo` override
-# immediately on the next PCM open.
+# Operator-options drop-in. Source-hosts include the same drop-in
+# path as receiver/standalone, but delivery.alsa renders the source
+# variant to `pcm.evo_local*` nodes only, leaving producer
+# `pcm.evo` (loopback) untouched.
+</etc/asound.d/evo-options.conf>

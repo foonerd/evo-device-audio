@@ -38,6 +38,11 @@ target host.
   lands. Existing `/etc/asound.conf` content is backed up
   to `/etc/asound.conf.pre-evo.<timestamp>` before
   overwrite; idempotent on re-run.
+- `MODULAR_ALSA_PIPELINE_STANDARD.md` — device-tier
+  reference standard for modular ALSA wiring. Defines the
+  canonical source/receiver topologies, ownership boundaries,
+  render-target rules, failure semantics, and release
+  verification gates.
 - `systemd/evo.service.d/state-dir-mode.conf` — drop-in
   override widening `StateDirectoryMode` to `0755` so MPD
   can traverse `/var/lib/evo/` to reach the music tree.

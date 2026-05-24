@@ -595,7 +595,17 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
                 echo "--multiroom-role source requires --multiroom-source-pcm <alsa-pcm>" >&2
                 exit 1
             fi
-            MULTIROOM_PCM_LINE="source_pcm = \"$MULTIROOM_SOURCE_PCM\""
+            # Source role runs one-renderer semantics: MPD writes
+            # to source_pcm's producer path, while multiroom owns
+            # local DAC writes via alsa_pcm. If the operator does
+            # not supply --multiroom-alsa-pcm, default to the
+            # source template's dedicated local-renderer alias.
+            if [[ -z "$MULTIROOM_ALSA_PCM" ]]; then
+                MULTIROOM_ALSA_PCM="evo_local"
+                echo "[bootstrap] --multiroom-alsa-pcm unset for source role; defaulting to $MULTIROOM_ALSA_PCM"
+            fi
+            MULTIROOM_ALSA_PCM_LINE="alsa_pcm = \"$MULTIROOM_ALSA_PCM\""
+            MULTIROOM_SOURCE_PCM_LINE="source_pcm = \"$MULTIROOM_SOURCE_PCM\""
             MULTIROOM_GROUP_MEMBERS_LINE="group_members = $(csv_to_toml_array "$MULTIROOM_GROUP_MEMBERS")"
             MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="group_member_addresses = $(csv_to_toml_array "$MULTIROOM_GROUP_MEMBER_ADDRESSES")"
             ;;
@@ -604,7 +614,8 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
                 echo "--multiroom-role receiver requires --multiroom-alsa-pcm <alsa-pcm>" >&2
                 exit 1
             fi
-            MULTIROOM_PCM_LINE="alsa_pcm = \"$MULTIROOM_ALSA_PCM\""
+            MULTIROOM_ALSA_PCM_LINE="alsa_pcm = \"$MULTIROOM_ALSA_PCM\""
+            MULTIROOM_SOURCE_PCM_LINE="# source_pcm (source role only)"
             # group_members + group_member_addresses are source-
             # role-only. Receivers render every frame that
             # arrives on the audio plane regardless of group, so
@@ -615,7 +626,8 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
             MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
         auto)
-            MULTIROOM_PCM_LINE="# no PCM (role=auto — plugin defers PCM choice until engaged)"
+            MULTIROOM_ALSA_PCM_LINE="# no alsa_pcm (role=auto — plugin defers PCM choice until engaged)"
+            MULTIROOM_SOURCE_PCM_LINE="# no source_pcm (role=auto — plugin defers PCM choice until engaged)"
             MULTIROOM_GROUP_MEMBERS_LINE="# group_members (source role only)"
             MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE="# group_member_addresses (source role only)"
             ;;
@@ -638,7 +650,8 @@ if [[ -n "$MULTIROOM_ROLE" ]]; then
             -e "s|@MULTIROOM_GROUP_ID@|$MULTIROOM_GROUP_ID|g" \
             -e "s|@MULTIROOM_GROUP_MEMBERS_LINE@|$MULTIROOM_GROUP_MEMBERS_LINE|g" \
             -e "s|@MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE@|$MULTIROOM_GROUP_MEMBER_ADDRESSES_LINE|g" \
-            -e "s|@MULTIROOM_PCM_LINE@|$MULTIROOM_PCM_LINE|g" \
+            -e "s|@MULTIROOM_ALSA_PCM_LINE@|$MULTIROOM_ALSA_PCM_LINE|g" \
+            -e "s|@MULTIROOM_SOURCE_PCM_LINE@|$MULTIROOM_SOURCE_PCM_LINE|g" \
             "$MULTIROOM_TEMPLATE" > "$TMP"
         install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
             "$TMP" "$MULTIROOM_PATH"
@@ -946,16 +959,16 @@ fi
 #
 #   - asound.conf         — receiver / auto default: pcm.evo
 #                           writes straight to the local DAC.
-#   - asound.conf.source  — source-host variant: pcm.evo fans
-#                           the same stereo signal to BOTH the
-#                           local DAC AND a snd-aloop playback
+#   - asound.conf.source  — source-host variant: pcm.evo writes
+#                           ONLY to a snd-aloop playback
 #                           subdevice. The evo multiroom plugin's
-#                           source-side capture task reads from
-#                           the matching loopback capture
-#                           subdevice and fans across the multi-
-#                           room fabric while the local DAC keeps
-#                           playing. Requires the `snd-aloop`
-#                           kernel module loaded (handled below).
+#                           source-side capture task reads the
+#                           matching loopback capture subdevice and
+#                           fans across the multi-room fabric while
+#                           the plugin's source-local receiver task
+#                           renders local DAC audio via alsa_pcm.
+#                           Requires the `snd-aloop` kernel module
+#                           loaded (handled below).
 #
 # Selection: when `--multiroom-role=source` was supplied, use
 # the source-host variant. Otherwise the receiver / auto default.
