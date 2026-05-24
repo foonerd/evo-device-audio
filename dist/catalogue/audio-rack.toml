@@ -270,6 +270,25 @@ name = "album"
 [[subjects]]
 name = "audio_playback_stream_format"
 
+# Subject type the playback warden announces at load and
+# updates on every playback state transition (play, pause,
+# stop, track change, seek, set_volume, set_mute, set_repeat,
+# set_shuffle, set_single, set_consume) plus on every
+# regular status poll so `elapsed_ms` advances live for
+# subscribers. Payload carries transport_state,
+# track (title/artist/album/mpd_path), elapsed_ms,
+# duration_ms, volume, muted, repeat, shuffle, single,
+# consume. Operator UI subscribes to this subject to render
+# the live now-playing centre stage (current track, progress
+# bar, transport state, volume readout) without poll.
+# Canonical addressing: `evo.audio.playback:now_playing`.
+# Schema reference:
+# `schemas/org.evoframework/audio/playback.v1.toml`
+# acceptance criterion
+# `now-playing-published-on-load-and-every-state-transition`.
+[[subjects]]
+name = "audio_playback_now_playing"
+
 # Subject type the playback.options plugin announces as a
 # durable projection of the operator's audiophile-grade
 # settings (resampling / mixer_type / dop / output_device /
