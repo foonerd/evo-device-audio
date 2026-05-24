@@ -59,7 +59,13 @@ course_correct_verbs = [
     "next",
     "previous",
     "seek",
+    "seek_by_delta",
     "set_volume",
+    "set_mute",
+    "set_repeat",
+    "set_shuffle",
+    "set_single",
+    "set_consume",
     "emit_test_tone",
 ]
 
@@ -122,6 +128,12 @@ request_types = [
     "next",
     "previous",
     "seek",
+    "seek_by_delta",
     "set_volume",
+    "set_mute",
+    "set_repeat",
+    "set_shuffle",
+    "set_single",
+    "set_consume",
 ]
 response_budget_ms = 2000

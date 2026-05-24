@@ -247,6 +247,27 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Seek by a signed millisecond delta relative to the current
+    /// playhead position.
+    ///
+    /// Wire form: `seekcur "<+|-><seconds.millis>"\n`. MPD's
+    /// `seekcur` accepts a leading `+` or `-` to interpret the time
+    /// as a delta from the current position; the resulting absolute
+    /// position is clamped by MPD to the track's bounds. A delta of
+    /// 0 ms is a no-op (still issued, MPD ACKs cleanly).
+    pub(crate) async fn seek_relative(
+        &mut self,
+        delta_ms: i64,
+    ) -> Result<(), MpdError> {
+        let abs_ms = delta_ms.unsigned_abs();
+        let secs = abs_ms / 1000;
+        let millis = abs_ms % 1000;
+        let sign = if delta_ms < 0 { "-" } else { "+" };
+        let arg = format!("{sign}{secs}.{millis:03}");
+        self.dispatch("seekcur", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
     /// Set the output volume.
     ///
     /// Wire form: `setvol "<volume>"\n`. MPD accepts 0-100; values
@@ -1240,6 +1261,48 @@ mod tests {
         conn.seek(Duration::from_secs(12)).await.unwrap();
         let captured = rx.await.unwrap();
         assert_eq!(captured, b"seekcur \"12.000\"\n");
+    }
+
+    #[tokio::test]
+    async fn seek_relative_positive_uses_plus_prefix() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.seek_relative(15_000).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"seekcur \"+15.000\"\n");
+    }
+
+    #[tokio::test]
+    async fn seek_relative_negative_uses_minus_prefix() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.seek_relative(-5_000).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"seekcur \"-5.000\"\n");
+    }
+
+    #[tokio::test]
+    async fn seek_relative_sub_second_carries_millis_precision() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.seek_relative(250).await.unwrap();
+        let captured = rx.await.unwrap();
+        assert_eq!(captured, b"seekcur \"+0.250\"\n");
+    }
+
+    #[tokio::test]
+    async fn seek_relative_zero_is_no_op_on_wire() {
+        let (server, client) = duplex(4096);
+        let rx = spawn_capturing_exchange(server, b"OK MPD 0.23.5\n", b"OK\n");
+        let mut conn = handshake_for_exchange(client).await;
+        conn.seek_relative(0).await.unwrap();
+        let captured = rx.await.unwrap();
+        // MPD ACKs +0.000 cleanly; the wrapper still sends it so
+        // the caller's intent is faithfully relayed.
+        assert_eq!(captured, b"seekcur \"+0.000\"\n");
     }
 
     #[tokio::test]

@@ -179,7 +179,13 @@ const COURSE_CORRECT_VERBS: &[&str] = &[
     "next",
     "previous",
     "seek",
+    "seek_by_delta",
     "set_volume",
+    "set_mute",
+    "set_repeat",
+    "set_shuffle",
+    "set_single",
+    "set_consume",
     "emit_test_tone",
 ];
 
@@ -201,7 +207,13 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "next",
     "previous",
     "seek",
+    "seek_by_delta",
     "set_volume",
+    "set_mute",
+    "set_repeat",
+    "set_shuffle",
+    "set_single",
+    "set_consume",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -1663,6 +1675,16 @@ fn parse_correction(
             })?;
             Ok(PlaybackCommand::Seek(Duration::from_millis(ms)))
         }
+        "seek_by_delta" => {
+            let delta_ms = trimmed.parse::<i64>().map_err(|_| {
+                PluginError::Permanent(format!(
+                    "seek_by_delta payload must be a signed i64 of \
+                     milliseconds (optional leading +/-), got {:?}",
+                    trimmed
+                ))
+            })?;
+            Ok(PlaybackCommand::SeekRelative(delta_ms))
+        }
         "set_volume" => {
             let v = trimmed.parse::<u8>().map_err(|_| {
                 PluginError::Permanent(format!(
@@ -1672,6 +1694,46 @@ fn parse_correction(
             })?;
             Ok(PlaybackCommand::SetVolume(v))
         }
+        "set_mute" => match trimmed {
+            "1" | "true" => Ok(PlaybackCommand::SetMute(true)),
+            "0" | "false" => Ok(PlaybackCommand::SetMute(false)),
+            other => Err(PluginError::Permanent(format!(
+                "set_mute payload must be '0'/'1' or 'true'/'false', got {:?}",
+                other
+            ))),
+        },
+        "set_repeat" => match trimmed {
+            "1" | "true" => Ok(PlaybackCommand::SetRepeat(true)),
+            "0" | "false" => Ok(PlaybackCommand::SetRepeat(false)),
+            other => Err(PluginError::Permanent(format!(
+                "set_repeat payload must be '0'/'1' or 'true'/'false', got {:?}",
+                other
+            ))),
+        },
+        "set_shuffle" => match trimmed {
+            "1" | "true" => Ok(PlaybackCommand::SetShuffle(true)),
+            "0" | "false" => Ok(PlaybackCommand::SetShuffle(false)),
+            other => Err(PluginError::Permanent(format!(
+                "set_shuffle payload must be '0'/'1' or 'true'/'false', got {:?}",
+                other
+            ))),
+        },
+        "set_single" => match trimmed {
+            "1" | "true" => Ok(PlaybackCommand::SetSingle(true)),
+            "0" | "false" => Ok(PlaybackCommand::SetSingle(false)),
+            other => Err(PluginError::Permanent(format!(
+                "set_single payload must be '0'/'1' or 'true'/'false', got {:?}",
+                other
+            ))),
+        },
+        "set_consume" => match trimmed {
+            "1" | "true" => Ok(PlaybackCommand::SetConsume(true)),
+            "0" | "false" => Ok(PlaybackCommand::SetConsume(false)),
+            other => Err(PluginError::Permanent(format!(
+                "set_consume payload must be '0'/'1' or 'true'/'false', got {:?}",
+                other
+            ))),
+        },
         "emit_test_tone" => {
             // course_correct routes this verb to the warden's
             // dedicated `emit_test_tone` method BEFORE calling
@@ -1902,6 +1964,14 @@ impl Plugin for MpdPlaybackPlugin {
             // (set up via `spawn_reactor` below) drive the
             // subject's state thereafter.
             emitter.announce_stream_format().await;
+
+            // Announce the live now_playing subject once at load.
+            // The playback supervisor's state-report emitter
+            // (every command, every idle wake, every status poll)
+            // drives the subject's state thereafter so the UI
+            // sees the initial state on first subscribe + live
+            // updates without poll.
+            emitter.announce_now_playing().await;
 
             self.subject_emitter = Some(emitter);
 
@@ -2310,7 +2380,13 @@ impl Respondent for MpdPlaybackPlugin {
                         .await
                 }
                 "seek" => self.handle_seek(req).await,
+                "seek_by_delta" => self.handle_seek_by_delta(req).await,
                 "set_volume" => self.handle_set_volume(req).await,
+                "set_mute" => self.handle_set_bool(req, "set_mute").await,
+                "set_repeat" => self.handle_set_bool(req, "set_repeat").await,
+                "set_shuffle" => self.handle_set_bool(req, "set_shuffle").await,
+                "set_single" => self.handle_set_bool(req, "set_single").await,
+                "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      this is a manifest/runtime drift bug"
@@ -2389,6 +2465,56 @@ impl MpdPlaybackPlugin {
         let supervisor = self.active_supervisor("set_volume")?;
         supervisor
             .command(PlaybackCommand::SetVolume(payload.volume))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
+    /// Handle a `seek_by_delta` source-verb request: extract the
+    /// signed millisecond delta and issue a
+    /// [`PlaybackCommand::SeekRelative`]. The supervisor /
+    /// MPD layer clamps the resulting absolute position.
+    async fn handle_seek_by_delta(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SeekByDeltaPayload =
+            parse_versioned_payload(req, "seek_by_delta")?;
+        let supervisor = self.active_supervisor("seek_by_delta")?;
+        supervisor
+            .command(PlaybackCommand::SeekRelative(payload.delta_ms))
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        encode_simple_ok(req)
+    }
+
+    /// Handle a boolean-toggle source-verb request — `set_mute`,
+    /// `set_repeat`, `set_shuffle`, `set_single`, `set_consume`.
+    /// The payload shape is uniform (`{ "v": 1, "enabled": bool
+    /// }`); the verb name selects which [`PlaybackCommand`]
+    /// variant is dispatched.
+    async fn handle_set_bool(
+        &self,
+        req: &Request,
+        verb_name: &'static str,
+    ) -> Result<Response, PluginError> {
+        let payload: SetBoolPayload = parse_versioned_payload(req, verb_name)?;
+        let cmd = match verb_name {
+            "set_mute" => PlaybackCommand::SetMute(payload.enabled),
+            "set_repeat" => PlaybackCommand::SetRepeat(payload.enabled),
+            "set_shuffle" => PlaybackCommand::SetShuffle(payload.enabled),
+            "set_single" => PlaybackCommand::SetSingle(payload.enabled),
+            "set_consume" => PlaybackCommand::SetConsume(payload.enabled),
+            other => {
+                return Err(PluginError::Permanent(format!(
+                    "handle_set_bool called with unknown verb {other:?}; \
+                     this is a dispatcher/runtime drift bug"
+                )));
+            }
+        };
+        let supervisor = self.active_supervisor(verb_name)?;
+        supervisor
+            .command(cmd)
             .await
             .map_err(playback_error_to_plugin_error)?;
         encode_simple_ok(req)
@@ -2991,6 +3117,40 @@ struct SetVolumePayload {
 }
 
 impl HasPayloadVersion for SetVolumePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Wire shape of a `seek_by_delta` request payload. Signed
+/// millisecond offset applied relative to the current playhead
+/// position. The supervisor / MPD layer clamps the resulting
+/// absolute position; this struct does not enforce bounds.
+#[derive(Debug, serde::Deserialize)]
+struct SeekByDeltaPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    delta_ms: i64,
+}
+
+impl HasPayloadVersion for SeekByDeltaPayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+/// Wire shape of every boolean-toggle request payload —
+/// `set_mute`, `set_repeat`, `set_shuffle`, `set_single`,
+/// `set_consume`. Uniform shape lets one struct + one handler
+/// (`handle_set_bool`) drive every toggle verb.
+#[derive(Debug, serde::Deserialize)]
+struct SetBoolPayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    enabled: bool,
+}
+
+impl HasPayloadVersion for SetBoolPayload {
     fn payload_version(&self) -> u32 {
         self.v
     }
@@ -3681,6 +3841,136 @@ mod tests {
             parse_correction(&c).unwrap(),
             PlaybackCommand::PlayPosition(3)
         );
+    }
+
+    // ===== seek_by_delta =====
+
+    #[test]
+    fn parse_seek_by_delta_positive() {
+        let c = correction("seek_by_delta", b"15000", 1);
+        assert_eq!(
+            parse_correction(&c).unwrap(),
+            PlaybackCommand::SeekRelative(15000)
+        );
+    }
+
+    #[test]
+    fn parse_seek_by_delta_negative_rewinds() {
+        let c = correction("seek_by_delta", b"-5000", 1);
+        assert_eq!(
+            parse_correction(&c).unwrap(),
+            PlaybackCommand::SeekRelative(-5000)
+        );
+    }
+
+    #[test]
+    fn parse_seek_by_delta_accepts_explicit_plus_sign() {
+        let c = correction("seek_by_delta", b"+30000", 1);
+        assert_eq!(
+            parse_correction(&c).unwrap(),
+            PlaybackCommand::SeekRelative(30000)
+        );
+    }
+
+    #[test]
+    fn parse_seek_by_delta_zero_is_valid() {
+        let c = correction("seek_by_delta", b"0", 1);
+        assert_eq!(
+            parse_correction(&c).unwrap(),
+            PlaybackCommand::SeekRelative(0)
+        );
+    }
+
+    #[test]
+    fn parse_seek_by_delta_rejects_malformed() {
+        let e = parse_correction(&correction("seek_by_delta", b"soon", 1))
+            .unwrap_err();
+        assert!(matches!(e, PluginError::Permanent(_)));
+    }
+
+    // ===== boolean toggles (set_mute / set_repeat / set_shuffle /
+    // set_single / set_consume) =====
+
+    #[test]
+    fn parse_set_mute_true_and_false() {
+        assert_eq!(
+            parse_correction(&correction("set_mute", b"1", 1)).unwrap(),
+            PlaybackCommand::SetMute(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_mute", b"true", 1)).unwrap(),
+            PlaybackCommand::SetMute(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_mute", b"0", 1)).unwrap(),
+            PlaybackCommand::SetMute(false)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_mute", b"false", 1)).unwrap(),
+            PlaybackCommand::SetMute(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_repeat_true_and_false() {
+        assert_eq!(
+            parse_correction(&correction("set_repeat", b"1", 1)).unwrap(),
+            PlaybackCommand::SetRepeat(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_repeat", b"0", 1)).unwrap(),
+            PlaybackCommand::SetRepeat(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_shuffle_true_and_false() {
+        assert_eq!(
+            parse_correction(&correction("set_shuffle", b"1", 1)).unwrap(),
+            PlaybackCommand::SetShuffle(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_shuffle", b"0", 1)).unwrap(),
+            PlaybackCommand::SetShuffle(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_single_true_and_false() {
+        assert_eq!(
+            parse_correction(&correction("set_single", b"1", 1)).unwrap(),
+            PlaybackCommand::SetSingle(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_single", b"0", 1)).unwrap(),
+            PlaybackCommand::SetSingle(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_consume_true_and_false() {
+        assert_eq!(
+            parse_correction(&correction("set_consume", b"1", 1)).unwrap(),
+            PlaybackCommand::SetConsume(true)
+        );
+        assert_eq!(
+            parse_correction(&correction("set_consume", b"0", 1)).unwrap(),
+            PlaybackCommand::SetConsume(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_mute_rejects_malformed() {
+        let e =
+            parse_correction(&correction("set_mute", b"maybe", 1)).unwrap_err();
+        assert!(matches!(e, PluginError::Permanent(_)));
+    }
+
+    #[test]
+    fn parse_set_repeat_rejects_empty() {
+        let e =
+            parse_correction(&correction("set_repeat", b"", 1)).unwrap_err();
+        assert!(matches!(e, PluginError::Permanent(_)));
     }
 
     // ===== error mapping tests =====

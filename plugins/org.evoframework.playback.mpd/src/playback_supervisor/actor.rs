@@ -275,12 +275,20 @@ pub(crate) async fn spawn(
     // subsequent idle wake on the same song will not re-announce
     // it.
     let mut last_emitted_file: Option<String> = None;
+    // Sessions start unmuted with a 50% pre-mute fallback. A
+    // first `set_mute(true)` will capture the live MPD volume
+    // before silencing; `set_mute(false)` ahead of any prior
+    // mute restores to this fallback rather than to an
+    // operator-confusing 0.
+    let initial_muted: bool = false;
+    let initial_pre_mute_volume: u8 = 50;
     emit_initial_report(
         &mut cmd_conn,
         &custody_handle,
         reporter.as_ref(),
         &subject_emitter,
         &mut last_emitted_file,
+        initial_muted,
     )
     .await?;
 
@@ -307,6 +315,8 @@ pub(crate) async fn spawn(
         reporter,
         subject_emitter,
         last_emitted_file,
+        muted: initial_muted,
+        pre_mute_volume: initial_pre_mute_volume,
     };
     let task_handle = tokio::spawn(task_state.run(
         command_rx,
@@ -441,6 +451,18 @@ struct SupervisorTask {
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
     last_emitted_file: Option<String>,
+    /// Operator-toggled mute state. MPD has no native mute
+    /// primitive — mute is synthesised as `setvol 0` with the
+    /// pre-mute volume captured for restore on unmute. Defaults to
+    /// false (not muted) on session start.
+    muted: bool,
+    /// Captured volume to restore on `set_mute(false)`. Updated
+    /// every time the warden issues `set_mute(true)`: the actor
+    /// reads MPD's current volume via `status()` before sending
+    /// `setvol 0`. Defaults to 50 (the safe-fallback used when no
+    /// pre-mute value was captured, e.g. unmute called on a
+    /// session that started muted).
+    pre_mute_volume: u8,
 }
 
 impl SupervisorTask {
@@ -492,6 +514,8 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
+                                &mut self.muted,
+                                &mut self.pre_mute_volume,
                             ).await;
                             let ok = result.is_ok();
                             let _ = reply.send(result);
@@ -502,6 +526,7 @@ impl SupervisorTask {
                                     self.reporter.as_ref(),
                                     &self.subject_emitter,
                                     &mut self.last_emitted_file,
+                                    self.muted,
                                 ).await;
                             }
                         }
@@ -529,6 +554,7 @@ impl SupervisorTask {
                                 self.reporter.as_ref(),
                                 &self.subject_emitter,
                                 &mut self.last_emitted_file,
+                                self.muted,
                             ).await;
                         }
                     }
@@ -576,9 +602,12 @@ async fn handle_command(
     cmd_conn: &mut MpdConnection,
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
+    muted: &mut bool,
+    pre_mute_volume: &mut u8,
 ) -> Result<(), PlaybackError> {
     // First attempt on the current connection.
-    match dispatch_command(cmd.clone(), cmd_conn).await {
+    match dispatch_command(cmd.clone(), cmd_conn, muted, pre_mute_volume).await
+    {
         Ok(()) => return Ok(()),
         Err(e) if !error_calls_for_reconnect(&e) => {
             return Err(classify_command_error(e));
@@ -633,7 +662,7 @@ async fn handle_command(
     }
 
     // Retry the command once on the fresh connection.
-    match dispatch_command(cmd, cmd_conn).await {
+    match dispatch_command(cmd, cmd_conn, muted, pre_mute_volume).await {
         Ok(()) => Ok(()),
         Err(e) => Err(classify_command_error(e)),
     }
@@ -642,6 +671,8 @@ async fn handle_command(
 async fn dispatch_command(
     cmd: PlaybackCommand,
     cmd_conn: &mut MpdConnection,
+    muted: &mut bool,
+    pre_mute_volume: &mut u8,
 ) -> Result<(), MpdError> {
     match cmd {
         PlaybackCommand::Play => cmd_conn.play().await,
@@ -651,7 +682,64 @@ async fn dispatch_command(
         PlaybackCommand::Next => cmd_conn.next().await,
         PlaybackCommand::Previous => cmd_conn.previous().await,
         PlaybackCommand::Seek(d) => cmd_conn.seek(d).await,
-        PlaybackCommand::SetVolume(v) => cmd_conn.set_volume(v).await,
+        PlaybackCommand::SeekRelative(delta_ms) => {
+            cmd_conn.seek_relative(delta_ms).await
+        }
+        PlaybackCommand::SetVolume(v) => {
+            // Explicit non-zero volume clears mute (operator
+            // moved the slider; that is an unmute). Volume 0
+            // is treated as "operator chose silence" — distinct
+            // from set_mute(true); leaves mute state untouched
+            // so set_mute(false) still restores the captured
+            // pre-mute volume rather than the zero the operator
+            // just set.
+            if v > 0 {
+                *muted = false;
+            }
+            cmd_conn.set_volume(v).await
+        }
+        PlaybackCommand::SetMute(true) => {
+            // Capture current MPD volume before muting so
+            // set_mute(false) restores. MPD reports volume = -1
+            // (mapped to None) when no mixer is configured; in
+            // that case we keep the existing pre_mute_volume
+            // (defaults to 50) so unmute still produces audible
+            // output. Already-muted is idempotent — re-issuing
+            // set_mute(true) over an already-zero volume keeps
+            // the previously captured pre-mute value.
+            if !*muted {
+                let status = cmd_conn.status().await?;
+                if let Some(current) = status.volume {
+                    if current > 0 {
+                        *pre_mute_volume = current;
+                    }
+                }
+            }
+            *muted = true;
+            cmd_conn.set_volume(0).await
+        }
+        PlaybackCommand::SetMute(false) => {
+            // Restore the captured pre-mute volume. Defaults to
+            // 50 when no value was captured (e.g. unmute from a
+            // session that started muted). Volume clamping is
+            // handled by `MpdConnection::set_volume`.
+            *muted = false;
+            cmd_conn.set_volume(*pre_mute_volume).await
+        }
+        PlaybackCommand::SetRepeat(enabled) => {
+            cmd_conn.set_repeat(enabled).await
+        }
+        PlaybackCommand::SetShuffle(enabled) => {
+            // Operator-facing name `shuffle` maps to MPD's
+            // `random` mode primitive.
+            cmd_conn.set_random(enabled).await
+        }
+        PlaybackCommand::SetSingle(enabled) => {
+            cmd_conn.set_single(enabled).await
+        }
+        PlaybackCommand::SetConsume(enabled) => {
+            cmd_conn.set_consume(enabled).await
+        }
         PlaybackCommand::LoadAndPlay(path) => {
             // Replace queue with the single supplied path
             // and start playback. The three commands run on
@@ -709,6 +797,7 @@ async fn emit_initial_report(
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
     last_emitted_file: &mut Option<String>,
+    muted: bool,
 ) -> Result<(), PlaybackError> {
     let status = cmd_conn.status().await.map_err(classify_command_error)?;
     let song = cmd_conn
@@ -719,7 +808,7 @@ async fn emit_initial_report(
     // emitter can read the same song. MpdSong is cheap to clone
     // (a small fixed set of Option<String> plus a short String).
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song);
+    let report = PlaybackStateReport::from_mpd(status, song, muted);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -734,6 +823,7 @@ async fn emit_initial_report(
     }
     maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
         .await;
+    subject_emitter.update_now_playing(&report).await;
     Ok(())
 }
 
@@ -743,6 +833,7 @@ async fn emit_best_effort_report(
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
     last_emitted_file: &mut Option<String>,
+    muted: bool,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -798,7 +889,7 @@ async fn emit_best_effort_report(
         }
     };
     let song_for_emitter = song.clone();
-    let report = PlaybackStateReport::from_mpd(status, song);
+    let report = PlaybackStateReport::from_mpd(status, song, muted);
     let payload = report.serialise().into_bytes();
     if let Err(e) = reporter
         .report(custody_handle, payload, HealthStatus::Healthy)
@@ -813,6 +904,7 @@ async fn emit_best_effort_report(
     }
     maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
         .await;
+    subject_emitter.update_now_playing(&report).await;
 }
 
 /// Invoke the [`SubjectEmitter`] for a song if (and only if) its

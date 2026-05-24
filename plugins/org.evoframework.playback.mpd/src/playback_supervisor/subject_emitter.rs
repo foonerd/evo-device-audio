@@ -73,7 +73,8 @@ use evo_plugin_sdk::contract::{
 };
 use serde_json::json;
 
-use crate::mpd::MpdSong;
+use crate::mpd::{MpdSong, PlayState};
+use crate::playback_supervisor::report::PlaybackStateReport;
 use crate::PLUGIN_NAME;
 
 // ----- catalogue-aligned constants -----
@@ -85,6 +86,9 @@ const SUBJECT_TYPE_ALBUM: &str = "album";
 /// Subject type for the live stream format. Must match the
 /// catalogue + the audio.playback.v1 schema declaration.
 const SUBJECT_TYPE_STREAM_FORMAT: &str = "audio_playback_stream_format";
+/// Subject type for the live now-playing surface. Must match the
+/// catalogue + the audio.playback.v1 schema declaration.
+const SUBJECT_TYPE_NOW_PLAYING: &str = "audio_playback_now_playing";
 /// Relation predicate for track -> album. Must match the catalogue.
 const PREDICATE_ALBUM_OF: &str = "album_of";
 
@@ -99,10 +103,17 @@ const SCHEME_STREAM_FORMAT: &str = "evo.audio.playback";
 /// Addressing value for the stream_format subject — singleton
 /// per warden (one playback custody → one stream format).
 const VALUE_STREAM_FORMAT: &str = "stream_format";
+/// Addressing value for the now_playing subject — singleton per
+/// warden (one playback custody → one now-playing state).
+const VALUE_NOW_PLAYING: &str = "now_playing";
 /// Payload version for the stream_format subject's state shape.
 /// Bumped on any non-additive payload-shape change; additive
 /// (new optional fields) rides at v1.
 const STREAM_FORMAT_PAYLOAD_VERSION: u32 = 1;
+/// Payload version for the now_playing subject's state shape.
+/// Bumped on any non-additive payload-shape change; additive
+/// (new optional fields) rides at v1.
+const NOW_PLAYING_PAYLOAD_VERSION: u32 = 1;
 
 /// Fallback artist value when the MPD `Artist` tag is missing or
 /// empty. Using a concrete sentinel (rather than, say, skipping
@@ -288,6 +299,122 @@ impl SubjectEmitter {
                  next successful publish"
             );
         }
+    }
+
+    /// Announce the singleton `now_playing` subject. Called once
+    /// at load alongside the warden's other one-time
+    /// announcements. The subject's state is initialised empty;
+    /// the first call to
+    /// [`SubjectEmitter::update_now_playing`] publishes the
+    /// warden's actual now-playing state. Subscribers see the
+    /// initial state on first render and every subsequent state
+    /// transition through the subject_state_changed stream.
+    ///
+    /// Best-effort: errors from the announcer are logged but not
+    /// propagated. Playback is never disrupted by an announcer
+    /// failure — subscribers without the subject fall back to
+    /// "no now-playing state" rather than crashing.
+    pub(crate) async fn announce_now_playing(&self) {
+        let addressing =
+            ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_NOW_PLAYING);
+        let announcement = SubjectAnnouncement::new(
+            SUBJECT_TYPE_NOW_PLAYING,
+            vec![addressing],
+        );
+        if let Err(e) = self.subjects.announce(announcement).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "now_playing subject announcement failed; operator \
+                 UI now-playing display will be unavailable until a \
+                 future re-announce attempt"
+            );
+        }
+    }
+
+    /// Publish the current now-playing state on the `now_playing`
+    /// subject. Called from the playback supervisor's report
+    /// emitter on every state transition (play / pause / stop /
+    /// track change / seek / volume / mute / mode flips) and on
+    /// every regular status poll so `elapsed_ms` advances live for
+    /// subscribers without requiring them to maintain a local
+    /// clock.
+    ///
+    /// Best-effort: errors from the announcer are logged but not
+    /// propagated. Playback is never disrupted by an announcer
+    /// failure.
+    pub(crate) async fn update_now_playing(
+        &self,
+        report: &PlaybackStateReport,
+    ) {
+        let addressing =
+            ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_NOW_PLAYING);
+        let state = render_now_playing_state(report);
+        if let Err(e) = self.subjects.update_state(addressing, state).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "now_playing subject update_state failed; operator \
+                 UI may show stale now-playing state until the next \
+                 successful publish"
+            );
+        }
+    }
+}
+
+/// Build the JSON state payload for the now_playing subject.
+///
+/// Pure projection from the report (no IO, no state). Extracted
+/// from [`SubjectEmitter::update_now_playing`] so the renderer
+/// has a deterministic unit-testable surface.
+fn render_now_playing_state(report: &PlaybackStateReport) -> serde_json::Value {
+    let track = match (report.state, report.current_song.as_ref()) {
+        // Stopped or no current song → track is null.
+        (PlayState::Stopped, _) | (_, None) => serde_json::Value::Null,
+        (_, Some(song)) => json!({
+            "title":    song.title,
+            "artist":   song.artist,
+            "album":    song.album,
+            "mpd_path": song.file_path,
+        }),
+    };
+    let elapsed_ms = match report.state {
+        PlayState::Stopped => None,
+        _ => report.elapsed_ms,
+    };
+    let duration_ms = match report.state {
+        PlayState::Stopped => None,
+        _ => report.duration_ms,
+    };
+    // Operator-facing volume default is 0 when MPD reports no
+    // mixer (volume = -1 on the wire, None in MpdStatus). The
+    // operator sees "muted by way of no-mixer" via the now_playing
+    // surface; the explicit muted flag still reflects the
+    // operator-toggled mute state separately.
+    let volume = report.volume.unwrap_or(0);
+    json!({
+        "v":              NOW_PLAYING_PAYLOAD_VERSION,
+        "transport_state": play_state_wire_name(report.state),
+        "track":           track,
+        "elapsed_ms":      elapsed_ms,
+        "duration_ms":     duration_ms,
+        "volume":          volume,
+        "muted":           report.muted,
+        "repeat":          report.repeat,
+        "shuffle":         report.shuffle,
+        "single":          report.single,
+        "consume":         report.consume,
+    })
+}
+
+/// Wire-canonical name for a [`PlayState`] in the now_playing
+/// payload. Matches the schema's `transport_state` enumeration
+/// verbatim.
+fn play_state_wire_name(state: PlayState) -> &'static str {
+    match state {
+        PlayState::Playing => "playing",
+        PlayState::Paused => "paused",
+        PlayState::Stopped => "stopped",
     }
 }
 
@@ -791,5 +918,189 @@ mod tests {
         let e = SubjectEmitter::null();
         e.emit_song(&song_with("a.flac", Some("T"), Some("A"), Some("B")))
             .await;
+    }
+
+    // ===== render_now_playing_state (pure projection) =====
+
+    use crate::playback_supervisor::report::{
+        CurrentSongReport, PlaybackStateReport,
+    };
+
+    fn now_playing_playing(elapsed_ms: u64) -> PlaybackStateReport {
+        PlaybackStateReport {
+            state: PlayState::Playing,
+            song_position: Some(0),
+            elapsed_ms: Some(elapsed_ms),
+            duration_ms: Some(180_000),
+            volume: Some(50),
+            muted: false,
+            repeat: false,
+            shuffle: false,
+            single: false,
+            consume: false,
+            current_song: Some(CurrentSongReport {
+                file_path: "INTERNAL/Artist/Album/track.flac".to_string(),
+                title: Some("Track One".to_string()),
+                artist: Some("An Artist".to_string()),
+                album: Some("An Album".to_string()),
+                duration_ms: Some(180_000),
+            }),
+        }
+    }
+
+    fn now_playing_stopped() -> PlaybackStateReport {
+        PlaybackStateReport {
+            state: PlayState::Stopped,
+            song_position: None,
+            elapsed_ms: None,
+            duration_ms: None,
+            volume: Some(50),
+            muted: false,
+            repeat: false,
+            shuffle: false,
+            single: false,
+            consume: false,
+            current_song: None,
+        }
+    }
+
+    #[test]
+    fn render_now_playing_emits_payload_version() {
+        let v = render_now_playing_state(&now_playing_playing(12_345));
+        assert_eq!(v["v"], NOW_PLAYING_PAYLOAD_VERSION);
+    }
+
+    #[test]
+    fn render_now_playing_includes_transport_state_string() {
+        let playing = render_now_playing_state(&now_playing_playing(0));
+        assert_eq!(playing["transport_state"], "playing");
+
+        let mut paused = now_playing_playing(1000);
+        paused.state = PlayState::Paused;
+        assert_eq!(
+            render_now_playing_state(&paused)["transport_state"],
+            "paused"
+        );
+
+        let stopped = render_now_playing_state(&now_playing_stopped());
+        assert_eq!(stopped["transport_state"], "stopped");
+    }
+
+    #[test]
+    fn render_now_playing_track_is_full_object_when_playing() {
+        let v = render_now_playing_state(&now_playing_playing(12_345));
+        let track = &v["track"];
+        assert_eq!(track["title"], "Track One");
+        assert_eq!(track["artist"], "An Artist");
+        assert_eq!(track["album"], "An Album");
+        assert_eq!(track["mpd_path"], "INTERNAL/Artist/Album/track.flac");
+    }
+
+    #[test]
+    fn render_now_playing_track_is_null_when_stopped() {
+        let v = render_now_playing_state(&now_playing_stopped());
+        assert!(v["track"].is_null());
+    }
+
+    #[test]
+    fn render_now_playing_track_is_null_when_no_current_song() {
+        let mut r = now_playing_playing(0);
+        r.current_song = None;
+        let v = render_now_playing_state(&r);
+        assert!(v["track"].is_null());
+    }
+
+    #[test]
+    fn render_now_playing_elapsed_and_duration_null_when_stopped() {
+        let v = render_now_playing_state(&now_playing_stopped());
+        assert!(v["elapsed_ms"].is_null());
+        assert!(v["duration_ms"].is_null());
+    }
+
+    #[test]
+    fn render_now_playing_elapsed_advances_per_call() {
+        let early = render_now_playing_state(&now_playing_playing(1_000));
+        let later = render_now_playing_state(&now_playing_playing(5_000));
+        assert_eq!(early["elapsed_ms"], 1_000);
+        assert_eq!(later["elapsed_ms"], 5_000);
+    }
+
+    #[test]
+    fn render_now_playing_volume_falls_through_to_zero_when_no_mixer() {
+        let mut r = now_playing_playing(0);
+        r.volume = None;
+        let v = render_now_playing_state(&r);
+        assert_eq!(v["volume"], 0);
+    }
+
+    #[test]
+    fn render_now_playing_muted_flag_reflects_report_state() {
+        let mut r = now_playing_playing(0);
+        r.muted = true;
+        let v = render_now_playing_state(&r);
+        assert_eq!(v["muted"], true);
+        // Volume need not be 0 for muted to be true (operator may
+        // toggle mute while volume slider remains at its prior
+        // value behind-the-scenes).
+        assert_eq!(v["volume"], 50);
+    }
+
+    #[test]
+    fn render_now_playing_mode_flags_surface_correctly() {
+        let mut r = now_playing_playing(0);
+        r.repeat = true;
+        r.shuffle = true;
+        r.single = false;
+        r.consume = false;
+        let v = render_now_playing_state(&r);
+        assert_eq!(v["repeat"], true);
+        assert_eq!(v["shuffle"], true);
+        assert_eq!(v["single"], false);
+        assert_eq!(v["consume"], false);
+    }
+
+    #[test]
+    fn render_now_playing_is_deterministic_for_identical_input() {
+        let r = now_playing_playing(2_500);
+        let a = render_now_playing_state(&r);
+        let b = render_now_playing_state(&r);
+        assert_eq!(a, b);
+    }
+
+    // ===== update_now_playing emits via SubjectAnnouncer =====
+
+    #[tokio::test]
+    async fn update_now_playing_calls_update_state_with_addressing() {
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter
+            .update_now_playing(&now_playing_playing(2_500))
+            .await;
+        // capturing announcer counts update_state calls; the
+        // payload's transport_state proves we published the
+        // playing-state shape.
+        assert_eq!(subjects.state_update_count(), 1);
+        let (addr, payload) =
+            subjects.state_update_at(0).expect("one update recorded");
+        assert_eq!(addr.scheme, SCHEME_STREAM_FORMAT);
+        assert_eq!(addr.value, VALUE_NOW_PLAYING);
+        assert_eq!(payload["transport_state"], "playing");
+    }
+
+    #[tokio::test]
+    async fn announce_now_playing_announces_subject_type() {
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.announce_now_playing().await;
+        // Walk the recorded announcements; the now_playing
+        // announcement is the one with our subject type.
+        let mut found = false;
+        for i in 0..subjects.count() {
+            let a = subjects.at(i).expect("announcement");
+            if a.subject_type == SUBJECT_TYPE_NOW_PLAYING {
+                assert_eq!(a.addressings[0].scheme, SCHEME_STREAM_FORMAT);
+                assert_eq!(a.addressings[0].value, VALUE_NOW_PLAYING);
+                found = true;
+            }
+        }
+        assert!(found, "now_playing announcement should be recorded");
     }
 }

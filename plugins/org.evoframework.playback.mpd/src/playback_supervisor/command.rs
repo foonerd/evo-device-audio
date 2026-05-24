@@ -31,8 +31,26 @@ pub(crate) enum PlaybackCommand {
     Previous,
     /// Seek within the current song to an absolute position.
     Seek(Duration),
+    /// Seek within the current song by a signed millisecond
+    /// delta relative to the current playhead position. Positive
+    /// fast-forwards; negative rewinds. MPD clamps the resulting
+    /// absolute position to the track's bounds.
+    SeekRelative(i64),
     /// Set output volume (0-100; MPD ACKs values above 100).
     SetVolume(u8),
+    /// Mute (`true`) or unmute (`false`). The plugin captures the
+    /// pre-mute volume on mute and restores it on unmute.
+    SetMute(bool),
+    /// Set MPD `repeat` mode (queue-repeat).
+    SetRepeat(bool),
+    /// Set MPD `random` mode (operator-facing name: shuffle).
+    SetShuffle(bool),
+    /// Set MPD `single` mode (stop after current song; with
+    /// repeat enabled, becomes single-track loop).
+    SetSingle(bool),
+    /// Set MPD `consume` mode (remove each played song from the
+    /// queue).
+    SetConsume(bool),
     /// Replace the queue with a single library path and start
     /// playback. Issued in response to a `play_now` source-verb
     /// dispatch: the supervisor clears the queue, adds the path,

@@ -47,6 +47,22 @@ pub(crate) struct PlaybackStateReport {
     pub(crate) duration_ms: Option<u64>,
     /// Volume level, 0-100.
     pub(crate) volume: Option<u8>,
+    /// Explicit mute state. `true` when the warden's `set_mute`
+    /// toggle is engaged. Distinct from `volume == 0` because the
+    /// operator may legitimately choose 0 as a non-muted setting;
+    /// the now-playing subject's `muted` field surfaces this state
+    /// so UI subscribers do not have to infer mute from volume.
+    pub(crate) muted: bool,
+    /// MPD `repeat` mode (queue-repeat).
+    pub(crate) repeat: bool,
+    /// MPD `random` mode (operator-facing name: shuffle).
+    pub(crate) shuffle: bool,
+    /// MPD `single` mode (stop after current song; combined with
+    /// `repeat`, becomes single-track loop).
+    pub(crate) single: bool,
+    /// MPD `consume` mode (remove each played song from the
+    /// queue).
+    pub(crate) consume: bool,
     /// Narrow view of the current song's tags. Absent when MPD
     /// reports no current song.
     pub(crate) current_song: Option<CurrentSongReport>,
@@ -69,14 +85,25 @@ pub(crate) struct CurrentSongReport {
 
 impl PlaybackStateReport {
     /// Build a report from an MPD status plus an optional current
-    /// song.
-    pub(crate) fn from_mpd(status: MpdStatus, song: Option<MpdSong>) -> Self {
+    /// song. The `muted` flag is plugin-state (not in MPD); the
+    /// caller supplies the explicit mute state from the
+    /// warden's mute-toggle tracking.
+    pub(crate) fn from_mpd(
+        status: MpdStatus,
+        song: Option<MpdSong>,
+        muted: bool,
+    ) -> Self {
         Self {
             state: status.state,
             song_position: status.song_position,
             elapsed_ms: status.elapsed.map(duration_to_millis_u64),
             duration_ms: status.duration.map(duration_to_millis_u64),
             volume: status.volume,
+            muted,
+            repeat: status.repeat,
+            shuffle: status.random,
+            single: status.single,
+            consume: status.consume,
             current_song: song.map(CurrentSongReport::from_mpd_song),
         }
     }
@@ -239,7 +266,7 @@ mod tests {
 
     #[test]
     fn minimal_report_has_only_state() {
-        let r = PlaybackStateReport::from_mpd(stopped_status(), None);
+        let r = PlaybackStateReport::from_mpd(stopped_status(), None, false);
         let out = r.serialise();
         assert_eq!(out, "state = \"stopped\"\n");
     }
@@ -265,7 +292,7 @@ mod tests {
             album: Some("An Album".to_string()),
             duration: Some(Duration::from_millis(180_000)),
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song));
+        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();
 
         // Main table, in declared order.
@@ -298,7 +325,7 @@ mod tests {
             consume: false,
             crossfade_seconds: 0,
         };
-        let r = PlaybackStateReport::from_mpd(status, None);
+        let r = PlaybackStateReport::from_mpd(status, None, false);
         let out = r.serialise();
         assert!(!out.contains("[current_song]"));
         assert!(out.contains("state = \"paused\""));
@@ -326,7 +353,7 @@ mod tests {
             album: None,
             duration: None,
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song));
+        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();
         assert!(out.contains("file_path = \"some/file.flac\""));
         assert!(!out.contains("title ="));
@@ -439,7 +466,7 @@ mod tests {
             album: Some("B".to_string()),
             duration: Some(Duration::from_millis(300)),
         };
-        let r = PlaybackStateReport::from_mpd(status, Some(song));
+        let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();
         // Every byte is valid UTF-8 (String guarantees this);
         // every line ends with '\n'.
