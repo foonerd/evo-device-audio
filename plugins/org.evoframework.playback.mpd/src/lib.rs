@@ -2131,6 +2131,28 @@ impl Warden for MpdPlaybackPlugin {
                 ));
             }
 
+            // Idempotence: when this plugin already holds an
+            // active custody the framework's request-op bootstrap
+            // can fire take_custody again on a subsequent verb
+            // dispatch — the ledger may carry stale records (e.g.
+            // post-restart) and the framework conservatively
+            // requests acquisition. Spawning a fresh supervisor
+            // on every such request would discard the accumulated
+            // supervisor state (captured pre-mute volume, mute
+            // toggle, etc.). Return the existing handle instead;
+            // the framework's ledger entry is upserted on the
+            // returned handle id.
+            if let Some((existing_id, _)) = self.custodies.iter().next() {
+                let handle = CustodyHandle::new(existing_id.clone());
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    handle = %handle.id,
+                    cid = assignment.correlation_id,
+                    "take_custody: returning existing handle (idempotent)"
+                );
+                return Ok(handle);
+            }
+
             // Defense in depth: load() populates the emitter
             // alongside setting `loaded = true`, so the two gates
             // are coupled in practice. An explicit check here
@@ -4125,10 +4147,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_drains_active_custodies() {
+    async fn unload_drains_active_custody() {
+        // Playback warden is single-claimant per the schema's
+        // `warden-single-claimant` acceptance criterion; the
+        // plugin's take_custody is therefore idempotent on
+        // subsequent calls. Two take_custody calls collapse to
+        // one active custody (the second returns the first
+        // handle). The drain still has to clean up that single
+        // custody and the supervisor it owns.
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
-            ConnBehaviour::Standard,
-            ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
             ConnBehaviour::HoldAfterWelcome,
         ])
@@ -4139,9 +4166,11 @@ mod tests {
         let reporter_b: Arc<dyn CustodyStateReporter> =
             Arc::new(CapturingReporter::default());
 
-        let _h1 = p.take_custody(assignment(reporter_a, 100)).await.unwrap();
-        let _h2 = p.take_custody(assignment(reporter_b, 200)).await.unwrap();
-        assert_eq!(p.active_custody_count(), 2);
+        let h1 = p.take_custody(assignment(reporter_a, 100)).await.unwrap();
+        let h2 = p.take_custody(assignment(reporter_b, 200)).await.unwrap();
+        // Idempotent: second call returns the existing handle id.
+        assert_eq!(h1.id, h2.id);
+        assert_eq!(p.active_custody_count(), 1);
 
         p.unload().await.unwrap();
         assert_eq!(p.active_custody_count(), 0);
