@@ -2671,6 +2671,45 @@ impl MpdPlaybackPlugin {
                 "emit_test_tone MPD play failed: {e}"
             )));
         }
+        // Deterministic startup gate: proving `play` ACK alone is
+        // insufficient for setup diagnostics because MPD can accept
+        // the command yet never transition to an active stream.
+        // Wait briefly for `state=Playing`; if that never happens,
+        // restore prior modes and fail loudly so setup surfaces a
+        // concrete fault instead of a silent "no sound".
+        const PLAYING_POLL_INTERVAL_MS: u64 = 100;
+        const PLAYING_DEADLINE_MS: u64 = 1500;
+        let playing_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(PLAYING_DEADLINE_MS);
+        loop {
+            if tokio::time::Instant::now() >= playing_deadline {
+                restore_prior(&mut conn, &prior_status).await;
+                release_in_flight();
+                return Err(PluginError::Permanent(format!(
+                    "emit_test_tone MPD play did not transition to Playing \
+                     within {} ms",
+                    PLAYING_DEADLINE_MS
+                )));
+            }
+            match conn.status().await {
+                Ok(s) if matches!(s.state, crate::mpd::PlayState::Playing) => {
+                    break;
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        PLAYING_POLL_INTERVAL_MS,
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    restore_prior(&mut conn, &prior_status).await;
+                    release_in_flight();
+                    return Err(PluginError::Permanent(format!(
+                        "emit_test_tone MPD status poll failed after play: {e}"
+                    )));
+                }
+            }
+        }
         // Drop the synchronous connection; the background
         // restore task opens its own.
         drop(conn);
