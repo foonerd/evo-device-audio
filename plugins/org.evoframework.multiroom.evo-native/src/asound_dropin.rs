@@ -10,17 +10,18 @@
 //! audibly while fanning out to remote receivers).
 //!
 //! When the plugin disengages source role the drop-in is
-//! removed. ALSA's "last definition wins" rule + the base
-//! `/etc/asound.conf`'s glob include of `/etc/asound.d/*.conf`
-//! mean removing the drop-in restores the base direct-to-DAC
-//! definition of `pcm.evo` on the next PCM open.
+//! truncated to empty rather than removed. The base
+//! `/etc/asound.conf` includes this path explicitly (ALSA's
+//! include syntax does not portably accept glob patterns), so
+//! the file must always exist. ALSA's "last definition wins"
+//! rule means an empty body has no effect on `pcm.evo`; the
+//! base direct-to-DAC definition stays in force.
 //!
-//! The `zz-` prefix sorts the drop-in last among
-//! `/etc/asound.d/*.conf` entries (lexicographic order: digit
-//! prefixes < letter prefixes; `evo-options.conf` has no prefix
-//! and sorts before `zz-`). Operator-options drop-ins compose
-//! upstream of the multi-room override; source-mode wins when
-//! both are present.
+//! Load order within `/etc/asound.conf`'s explicit include
+//! list pins this drop-in after `evo-options.conf`, so
+//! operator-options drop-ins compose upstream of the
+//! multi-room override and source-mode wins when both are
+//! present.
 //!
 //! Atomicity: writes go to a temp file in the same directory,
 //! then `rename` into place. Concurrent readers (the MPD
@@ -50,6 +51,19 @@ pub(crate) const DROP_IN_PATH: &str =
 /// The bootstrap-installed file is the single source of truth.
 const BASE_ASOUND_CONF: &str = "/etc/asound.conf";
 
+/// Inert body written when source role disengages. The base
+/// `/etc/asound.conf` includes this file by exact path; the
+/// placeholder must exist so the include resolves. Empty
+/// content (header comment only) has no effect on `pcm.evo`
+/// per ALSA's last-definition-wins rule.
+const DISENGAGED_PLACEHOLDER: &str =
+    "# Multi-room source-mode ALSA drop-in for evo-device-audio.\n\
+# Plugin-managed: org.evoframework.multiroom.evo-native overwrites\n\
+# this file atomically when source role engages on a live group,\n\
+# and truncates it back to this placeholder when the role\n\
+# transitions out. The placeholder has no effect on pcm.evo; the\n\
+# base direct-to-DAC definition stays in force.\n";
+
 /// Errors produced while writing or removing the drop-in.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DropInError {
@@ -68,12 +82,6 @@ pub(crate) enum DropInError {
     Rename {
         temp: PathBuf,
         final_path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("remove drop-in at {path}: {source}")]
-    Remove {
-        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -97,19 +105,20 @@ pub(crate) fn install_source_drop_in() -> Result<(), DropInError> {
     write_atomic(Path::new(DROP_IN_PATH), &body)
 }
 
-/// Remove the source-mode drop-in. No-op when the file is
-/// absent. Called on every transition out of engaged source so
-/// `pcm.evo` collapses back to the base direct-to-DAC
-/// definition on the next PCM open.
+/// Collapse the source-mode drop-in to its inert form by
+/// truncating the file to empty (or writing a header-only
+/// body when the placeholder is missing). Called on every
+/// transition out of engaged source so `pcm.evo` resolves to
+/// the base direct-to-DAC definition on the next PCM open.
+///
+/// The file is preserved (not removed) because the base
+/// `/etc/asound.conf` includes this exact path; ALSA's
+/// include syntax does not portably tolerate missing files.
+/// The placeholder body is the same one the bootstrap seeds
+/// so an operator reading the file post-disengage sees an
+/// honest "no source mode active" state.
 pub(crate) fn remove_source_drop_in() -> Result<(), DropInError> {
-    match std::fs::remove_file(DROP_IN_PATH) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(DropInError::Remove {
-            path: PathBuf::from(DROP_IN_PATH),
-            source: e,
-        }),
-    }
+    write_atomic(Path::new(DROP_IN_PATH), DISENGAGED_PLACEHOLDER)
 }
 
 /// Render the drop-in body. Public-within-crate for testing.
@@ -272,14 +281,23 @@ mod tests {
     }
 
     #[test]
-    fn write_then_remove_round_trips() {
+    fn write_then_collapse_to_placeholder_keeps_file_present() {
         let dir = tempdir();
         let target = dir.join("zz-evo-multiroom-source.conf");
         let body = render(Some("test-card"));
         write_atomic(&target, &body).unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
-        std::fs::remove_file(&target).unwrap();
-        assert!(!target.exists());
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("Loopback"));
+        // Simulate the disengage path: write the placeholder
+        // body over the engaged content. The file stays
+        // present so /etc/asound.conf's explicit include still
+        // resolves; the body collapses to the inert form.
+        write_atomic(&target, DISENGAGED_PLACEHOLDER).unwrap();
+        let post = std::fs::read_to_string(&target).unwrap();
+        assert!(post.contains("Plugin-managed"));
+        assert!(!post.contains("hw:CARD=Loopback"));
+        assert!(target.exists());
     }
 
     #[test]

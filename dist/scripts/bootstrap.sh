@@ -1107,6 +1107,31 @@ if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
             "$EVO_OPTIONS_DROPIN_PATH"
         echo "[bootstrap] seeded empty $EVO_OPTIONS_DROPIN_PATH"
     fi
+
+    # Seed an empty multi-room source-mode drop-in placeholder
+    # so the base asound.conf's include of this path never
+    # fails to parse, even on devices that never engage source
+    # mode. The org.evoframework.multiroom.evo-native plugin
+    # atomic-overwrites this file when it engages source role
+    # on a live group; truncates it back to empty when the
+    # role transitions out. ALSA's last-definition-wins rule
+    # means an empty body has no effect on pcm.evo; the base
+    # template's direct-to-DAC definition stays in force.
+    EVO_MULTIROOM_DROPIN_PATH="/etc/asound.d/zz-evo-multiroom-source.conf"
+    if [[ ! -f "$EVO_MULTIROOM_DROPIN_PATH" ]]; then
+        {
+            echo "# Multi-room source-mode ALSA drop-in for"
+            echo "# evo-device-audio. Plugin-managed:"
+            echo "# org.evoframework.multiroom.evo-native overwrites"
+            echo "# this file atomically when source role engages on a"
+            echo "# live group, and truncates it back to empty when the"
+            echo "# role transitions out. Empty content has no effect"
+            echo "# on pcm.evo; the base direct-to-DAC definition stays"
+            echo "# in force."
+        } | install -m 0664 -o root -g "$SERVICE_USER" /dev/stdin \
+            "$EVO_MULTIROOM_DROPIN_PATH"
+        echo "[bootstrap] seeded empty $EVO_MULTIROOM_DROPIN_PATH"
+    fi
 else
     echo "[bootstrap] EVO_INSTALL_ASOUND_CONF=0 — skipping asound.conf"
 fi
