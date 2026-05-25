@@ -1419,6 +1419,31 @@ impl Plugin for MultiroomEvoNativePlugin {
                 )
                 .await;
 
+            // Floor-invariant precondition: clear any stale
+            // source-mode drop-in left behind by a prior process
+            // before the first engage decision. A prior process
+            // that crashed mid-engagement or that disengaged
+            // without running teardown (segfault, OOM-killed, etc.)
+            // leaves the active drop-in body on disk; on the next
+            // plugin load engage_role's idempotent-no-op shortcut
+            // (engaged.role == effective_role on default-state
+            // Role::Auto) would skip the teardown and the stale
+            // active body would persist. Forcing a placeholder
+            // write here keeps pcm.evo collapsed to the base
+            // direct-to-DAC definition until an engage_role on a
+            // live group writes the active body again. Failure is
+            // best-effort: a write error is logged but does not
+            // refuse the load (the next engage_role on a live
+            // group rewrites the file anyway).
+            if let Err(e) = asound_dropin::remove_source_drop_in() {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "remove_source_drop_in failed at plugin load; stale \
+                     source-mode body may persist until next engage"
+                );
+            }
+
             // Initial engagement — the engage_role function is
             // the same function the substrate subscriber will
             // call on every operator gesture.
