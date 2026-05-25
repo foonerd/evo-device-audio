@@ -955,42 +955,58 @@ fi
 # ----------------------------------------------------------
 # Step 4: /etc/asound.conf — modular ALSA pipeline (pcm.evo)
 #
-# Two templates ship in dist/alsa/:
+# A single base template ships in dist/alsa/:
 #
-#   - asound.conf         — receiver / auto default: pcm.evo
-#                           writes straight to the local DAC.
-#   - asound.conf.source  — source-host variant: pcm.evo writes
-#                           ONLY to a snd-aloop playback
-#                           subdevice. The evo multiroom plugin's
-#                           source-side capture task reads the
-#                           matching loopback capture subdevice and
-#                           fans across the multi-room fabric while
-#                           the plugin's source-local receiver task
-#                           renders local DAC audio via alsa_pcm.
-#                           Requires the `snd-aloop` kernel module
-#                           loaded (handled below).
+#   - asound.conf — pcm.evo writes straight to the local DAC,
+#                   identical on every device regardless of
+#                   multi-room configuration. This is the
+#                   bit-perfect local-playback floor: the
+#                   behaviour the device exhibits when no
+#                   multi-room layer is engaged, the same on
+#                   solo devices and on devices configured for
+#                   any multi-room role. ALSA's `last definition
+#                   wins` semantics let runtime drop-ins under
+#                   /etc/asound.d/ compose additional pipeline
+#                   stages (resampler, EQ, room correction,
+#                   multi-room loopback) on top, and removing a
+#                   drop-in collapses the chain back to this
+#                   base unchanged.
 #
-# Selection: when `--multiroom-role=source` was supplied, use
-# the source-host variant. Otherwise the receiver / auto default.
+# The multi-room plugin owns its own runtime drop-in at
+# `/etc/asound.d/10-evo-multiroom-source.conf` (written and
+# removed by the plugin's source-mode engagement code, not by
+# bootstrap). The plugin's drop-in redefines pcm.evo to route
+# through snd-aloop only while a live group is engaged; the
+# instant the group goes away the drop-in is removed and pcm.evo
+# resolves to the base direct path on the next PCM open. The
+# playback.mpd plugin's supervisor inotify-watches
+# /etc/asound.d/ and cycles MPD output (disableoutput +
+# enableoutput) on every change so MPD picks up the
+# composition shift without a systemd bounce.
+#
+# `snd-aloop` is loaded and persisted unconditionally here. The
+# kernel module is cheap when idle (a few KB resident, no open
+# substreams until the plugin engages source mode) and being
+# present on demand is what lets the multi-room plugin engage
+# source mode without re-bootstrapping.
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
-    if [[ "${MULTIROOM_ROLE:-}" == "source" ]]; then
-        ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf.source"
-        # Source-host fan-out wiring needs the `snd-aloop`
-        # kernel module. Load it now AND persist via
-        # /etc/modules-load.d/ so the module reloads across
-        # reboots without operator intervention.
-        if ! lsmod | grep -q '^snd_aloop'; then
-            modprobe snd-aloop
-            echo "[bootstrap] loaded snd-aloop kernel module"
-        fi
-        install -d -m 0755 /etc/modules-load.d
-        echo "snd-aloop" > /etc/modules-load.d/evo-snd-aloop.conf
-        chmod 0644 /etc/modules-load.d/evo-snd-aloop.conf
-        echo "[bootstrap] persisted snd-aloop in /etc/modules-load.d/evo-snd-aloop.conf"
-    else
-        ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
+    ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
+    # snd-aloop is required for the multi-room plugin's
+    # source-mode runtime drop-in. Load now AND persist via
+    # /etc/modules-load.d/ so the module reloads across reboots
+    # without operator intervention. Unconditional because the
+    # plugin engages source mode at runtime, not at install
+    # time; the install record cannot predict which devices
+    # will eventually act as a source.
+    if ! lsmod | grep -q '^snd_aloop'; then
+        modprobe snd-aloop
+        echo "[bootstrap] loaded snd-aloop kernel module"
     fi
+    install -d -m 0755 /etc/modules-load.d
+    echo "snd-aloop" > /etc/modules-load.d/evo-snd-aloop.conf
+    chmod 0644 /etc/modules-load.d/evo-snd-aloop.conf
+    echo "[bootstrap] persisted snd-aloop in /etc/modules-load.d/evo-snd-aloop.conf"
     if [[ ! -f "$ASOUND_TEMPLATE" ]]; then
         echo "asound template not found at $ASOUND_TEMPLATE" >&2
         exit 2

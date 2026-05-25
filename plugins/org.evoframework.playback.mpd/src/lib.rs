@@ -104,6 +104,7 @@
 // every `impl Plugin` / `impl Warden` method.
 #![allow(clippy::manual_async_fn)]
 
+mod asound_watcher;
 mod config;
 mod envelope_subscriber;
 mod mpd;
@@ -367,6 +368,13 @@ pub struct MpdPlaybackPlugin {
     /// Spawned at load; signals shutdown + awaits completion
     /// in unload.
     envelope_subscriber: Option<envelope_subscriber::EnvelopeSubscriberHandle>,
+    /// `/etc/asound.d/` composition-change watcher. Spawned at
+    /// plugin load; on every observed change dispatches a
+    /// `CycleOutput` to the currently-active custody's
+    /// supervisor so MPD reopens its ALSA handle against the
+    /// post-change drop-in stack. `None` before first load and
+    /// after `Plugin::unload`.
+    asound_watcher: Option<asound_watcher::AsoundWatcherHandle>,
     /// Test-tone in-flight gate. Set true at the entry of
     /// `emit_test_tone` and cleared by the background restore
     /// task on completion. A concurrent `emit_test_tone` while
@@ -570,6 +578,7 @@ impl MpdPlaybackPlugin {
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
+            asound_watcher: None,
             test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -2041,6 +2050,20 @@ impl Plugin for MpdPlaybackPlugin {
             // plugin's own config table.
             self.spawn_options_settings_subscriber(ctx).await;
 
+            // Spawn the /etc/asound.d/ composition-change
+            // watcher. On every detected change the watcher
+            // dispatches a CycleOutput to the active custody's
+            // supervisor, which sends disableoutput 0 +
+            // enableoutput 0 over the MPD wire protocol so
+            // MPD drops and reopens its snd_pcm_t against the
+            // post-change drop-in stack. This is how the
+            // playback warden adapts to multi-room source-mode
+            // engage / disengage without a systemd bounce or a
+            // fragment rewrite.
+            self.asound_watcher = Some(asound_watcher::spawn(Arc::clone(
+                &self.active_command_sender,
+            )));
+
             self.loaded = true;
 
             tracing::info!(
@@ -2099,6 +2122,15 @@ impl Plugin for MpdPlaybackPlugin {
             // supervisor before unload tears the custody
             // down.
             if let Some(handle) = self.envelope_subscriber.take() {
+                handle.stop().await;
+            }
+            // Stop the asound watcher last. The supervisor's
+            // command sender may still be live for a few more
+            // microseconds at this point; the watcher's
+            // background-task drain races a CycleOutput
+            // dispatch at worst, and a Shutdown reply is the
+            // observed outcome that path is designed for.
+            if let Some(handle) = self.asound_watcher.take() {
                 handle.stop().await;
             }
             self.audio_routing = None;

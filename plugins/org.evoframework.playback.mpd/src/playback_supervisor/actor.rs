@@ -246,6 +246,26 @@ impl SupervisorCommandSender {
             Err(_) => Err(PlaybackError::Shutdown),
         }
     }
+
+    /// Cycle MPD output 0 (disable + enable on the MPD wire
+    /// protocol). The asound-watcher task dispatches this
+    /// whenever `/etc/asound.d/` composition changes so MPD
+    /// drops and reopens its `snd_pcm_t` handle, re-resolving
+    /// `pcm.evo` against the post-change drop-in stack. The
+    /// supervisor's command connection serialises this with
+    /// every other command; ordinary playback verbs queued
+    /// before / after a cycle remain correctly ordered.
+    pub(crate) async fn cycle_output(&self) -> Result<(), PlaybackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorMessage::CycleOutput { reply: reply_tx })
+            .await
+            .map_err(|_| PlaybackError::Shutdown)?;
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(PlaybackError::Shutdown),
+        }
+    }
 }
 
 /// Open both connections, emit the initial state report, spawn
@@ -421,6 +441,17 @@ enum SupervisorMessage {
     QueryState {
         reply: oneshot::Sender<Result<PlaybackStateReport, PlaybackError>>,
     },
+    /// One-shot directive to cycle MPD output 0 (disable +
+    /// enable on the MPD wire protocol) so MPD drops and
+    /// reopens its `snd_pcm_t` handle. Fired by the asound
+    /// watcher when `/etc/asound.d/` composition changes
+    /// (multi-room drop-in install / remove, operator-options
+    /// rewrite). The cycle causes the next `snd_pcm_open` to
+    /// re-resolve `pcm.evo` against the post-change drop-in
+    /// stack without a `systemctl restart mpd`.
+    CycleOutput {
+        reply: oneshot::Sender<Result<(), PlaybackError>>,
+    },
 }
 
 /// Events the idle task sends to the main supervisor.
@@ -573,6 +604,40 @@ impl SupervisorTask {
                                     self.muted,
                                 ).await;
                             }
+                        }
+                        Some(SupervisorMessage::CycleOutput { reply }) => {
+                            // Disable + enable MPD output 0 on
+                            // the command connection. MPD's
+                            // disableoutput drops the underlying
+                            // snd_pcm_t; enableoutput reopens it
+                            // by re-running snd_pcm_open against
+                            // the alias `evo`, which ALSA
+                            // resolves through whatever
+                            // composition currently lives under
+                            // /etc/asound.d/. This is the
+                            // canonical primitive for adapting
+                            // MPD to a runtime asound change
+                            // (multi-room drop-in install /
+                            // remove, operator-options rewrite)
+                            // without a systemd bounce. A
+                            // transient transport error on
+                            // either step maps through
+                            // classify_command_error so the
+                            // caller sees a typed PlaybackError.
+                            let result = match self
+                                .cmd_conn
+                                .disable_output(0)
+                                .await
+                            {
+                                Ok(()) => {
+                                    match self.cmd_conn.enable_output(0).await {
+                                        Ok(()) => Ok(()),
+                                        Err(e) => Err(classify_command_error(e)),
+                                    }
+                                }
+                                Err(e) => Err(classify_command_error(e)),
+                            };
+                            let _ = reply.send(result);
                         }
                         Some(SupervisorMessage::QueryState { reply }) => {
                             // Live MPD status + currentsong round-trip;

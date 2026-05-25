@@ -370,6 +370,40 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Disable an MPD output by index, dropping the underlying
+    /// `snd_pcm_t` handle. The primitive the supervisor uses
+    /// when a downstream ALSA composition change (multi-room
+    /// drop-in install/remove, operator-options rewrite) demands
+    /// MPD reopen its ALSA output without a systemd bounce.
+    ///
+    /// Wire form: `disableoutput "<index>"\n`. Idempotent against
+    /// already-disabled outputs.
+    pub(crate) async fn disable_output(
+        &mut self,
+        index: u32,
+    ) -> Result<(), MpdError> {
+        let arg = index.to_string();
+        self.dispatch("disableoutput", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
+    /// Enable an MPD output by index, opening a fresh
+    /// `snd_pcm_t` handle. Paired with [`disable_output`] to
+    /// cycle MPD's ALSA output so the next PCM open re-resolves
+    /// `pcm.evo` against the current `/etc/asound.d/`
+    /// composition.
+    ///
+    /// Wire form: `enableoutput "<index>"\n`. Idempotent against
+    /// already-enabled outputs.
+    pub(crate) async fn enable_output(
+        &mut self,
+        index: u32,
+    ) -> Result<(), MpdError> {
+        let arg = index.to_string();
+        self.dispatch("enableoutput", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
     // ----- idle subprotocol -----
 
     /// Subscribe to subsystem change events.

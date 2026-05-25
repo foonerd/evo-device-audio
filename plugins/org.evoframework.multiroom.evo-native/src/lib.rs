@@ -111,6 +111,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+mod asound_dropin;
 mod device_card;
 
 /// Embedded manifest source.
@@ -428,18 +429,37 @@ struct RoleEngagementContext {
 async fn engage_role(
     state: &Arc<tokio::sync::Mutex<RoleEngagement>>,
     ctx: &RoleEngagementContext,
+    local_device_id: &str,
     role: Role,
     group_id: Option<String>,
     members: Vec<String>,
     member_addresses: Vec<String>,
 ) {
     let mut engaged = state.lock().await;
+
+    // Live-group gate. The local-playback floor invariant says
+    // configured role alone MUST NOT cause any hardware claim;
+    // a group with no other-than-local members is not "live" in
+    // the operational sense and must NOT engage source / receiver
+    // tasks. The configured role stays in the substrate
+    // unchanged — only this engage-cycle is demoted to Auto so
+    // pcm.evo reaches the DAC directly. A subsequent
+    // GroupChange that adds members re-fires this function with
+    // members populated; the engagement promotes naturally to
+    // the configured role.
+    let group_is_live =
+        group_id.is_some() && members.iter().any(|m| m != local_device_id);
+    let effective_role = match (role, group_is_live) {
+        (Role::Source | Role::Receiver, false) => Role::Auto,
+        _ => role,
+    };
+
     // Idempotent no-op on unchanged engagement. Comparing role
     // + group_id captures the substrate's mutation surface
     // (member churn within the same group is handled by the
     // audio-plane fan-out; per-member redial only happens on
     // group change).
-    if engaged.role == role && engaged.group_id == group_id {
+    if engaged.role == effective_role && engaged.group_id == group_id {
         return;
     }
 
@@ -466,6 +486,23 @@ async fn engage_role(
     if engaged.role == Role::Source {
         ctx.audio_plane.close_outbound_connections().await.ok();
     }
+    // Drop-in lifecycle: remove the source-mode asound drop-in
+    // unconditionally on every teardown. The Source arm below
+    // re-installs a fresh one when (and only when) the new
+    // engagement is Source. Removing a non-existent drop-in is
+    // a no-op so this is safe regardless of prior role. The
+    // playback.mpd plugin's asound-watcher picks up the change
+    // and cycles MPD output so the next PCM-open re-resolves
+    // pcm.evo against the post-removal composition.
+    if let Err(e) = asound_dropin::remove_source_drop_in() {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "remove_source_drop_in failed during engage teardown; \
+             pcm.evo may not collapse back to direct-to-DAC \
+             until the file is removed manually"
+        );
+    }
     // Clear any source-role trace state — the new engagement
     // either replaces it (Source w/ capture) or leaves it
     // cleared (Receiver / Auto).
@@ -476,15 +513,16 @@ async fn engage_role(
     // Fresh shutdown signal for the about-to-be-spawned tasks.
     let shutdown = Arc::new(Notify::new());
     engaged.shutdown = Arc::clone(&shutdown);
-    engaged.role = role;
+    engaged.role = effective_role;
     engaged.group_id = group_id.clone();
 
-    // Spawn the role-appropriate tasks. Logic mirrors what
-    // load() does inline today (Stage 11C.3 extracts the
-    // load() role-branch body into this function so the
-    // substrate-subscriber task can re-run engagement on
-    // operator gestures).
-    match role {
+    // Spawn the role-appropriate tasks. The match key is the
+    // *effective* role — the live-group gate above may have
+    // demoted a configured Source/Receiver to Auto when no
+    // non-local member is in the group. Hardware claims happen
+    // only in the Source and Receiver arms; Auto is the floor
+    // (no DAC open, no loopback, no peer dial).
+    match effective_role {
         Role::Source => {
             let Some(gid) = group_id.clone() else {
                 tracing::warn!(
@@ -494,6 +532,37 @@ async fn engage_role(
                 );
                 return;
             };
+            // Install the source-mode asound drop-in BEFORE
+            // dialing peers or spawning the capture task. The
+            // drop-in redefines pcm.evo to route through
+            // snd-aloop's playback half; the MPD plugin's
+            // asound-watcher will cycle MPD output on the
+            // filesystem change so MPD's writes start flowing
+            // into the loopback by the time the source task is
+            // reading the capture half. A drop-in install
+            // failure (read-only /etc/asound.d, permission
+            // denied, ENOSPC) is logged but does not refuse
+            // engagement: the audio-plane fan-out still works
+            // against the source task's synthetic-tone path
+            // when no PCM is reachable, so the substrate-level
+            // engagement state is honest about being in Source
+            // even when the local hardware wiring failed.
+            if let Err(e) = asound_dropin::install_source_drop_in() {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    group_id = %gid,
+                    error = %e,
+                    "install_source_drop_in failed; source-mode \
+                     loopback bridge unavailable on this device"
+                );
+            } else {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    group_id = %gid,
+                    drop_in = asound_dropin::DROP_IN_PATH,
+                    "installed source-mode asound drop-in"
+                );
+            }
             // Source-host instantiates the group locally,
             // dials each receiver. Idempotent against the
             // framework's group store + audio-plane handle —
@@ -649,11 +718,31 @@ async fn engage_role(
             // No DAC engagement; DAC stays free for local MPD.
             // The plugin admits cleanly with no audio-plane
             // tasks; substrate gestures may later transition
-            // it to Source or Receiver.
-            tracing::info!(
-                plugin = PLUGIN_NAME,
-                "engaged Auto role (no DAC, no audio-plane tasks)"
-            );
+            // it to Source or Receiver. Two paths reach here:
+            // the operator configured Auto explicitly, or the
+            // live-group gate demoted a configured
+            // Source/Receiver because no other-than-local
+            // member is in the group. The latter is the
+            // floor-preserving demotion — log the configured
+            // role so the operator can correlate substrate
+            // role with engagement decision.
+            if role == Role::Auto {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "engaged Auto role (no DAC, no audio-plane tasks)"
+                );
+            } else {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    configured_role = role.as_wire_str(),
+                    group_id = ?group_id,
+                    members = ?members,
+                    "engaged Auto (configured role {} demoted: no live \
+                     group with non-local members; local-playback floor \
+                     preserved)",
+                    role.as_wire_str()
+                );
+            }
         }
     }
 }
@@ -782,8 +871,16 @@ async fn handle_role_event(
     // member metadata.
     let (group_id, members, member_addresses) =
         resolve_local_group_state(handle, local_device_id).await;
-    engage_role(state, ctx, new_role, group_id, members, member_addresses)
-        .await;
+    engage_role(
+        state,
+        ctx,
+        local_device_id,
+        new_role,
+        group_id,
+        members,
+        member_addresses,
+    )
+    .await;
 }
 
 async fn handle_group_event(
@@ -822,6 +919,7 @@ async fn handle_group_event(
     engage_role(
         state,
         ctx,
+        local_device_id,
         current_role,
         group_id,
         members,
@@ -847,7 +945,16 @@ async fn recover_from_substrate(
         .unwrap_or(Role::Auto);
     let (group_id, members, member_addresses) =
         resolve_local_group_state(handle, local_device_id).await;
-    engage_role(state, ctx, role, group_id, members, member_addresses).await;
+    engage_role(
+        state,
+        ctx,
+        local_device_id,
+        role,
+        group_id,
+        members,
+        member_addresses,
+    )
+    .await;
 }
 
 /// Determine the plugin's initial engagement at load() time.
@@ -1318,6 +1425,7 @@ impl Plugin for MultiroomEvoNativePlugin {
             engage_role(
                 &self.role_engagement,
                 &role_ctx,
+                &local_device_id,
                 initial_role,
                 group_id,
                 members,

@@ -36,6 +36,17 @@
 #
 # The `@MULTIROOM_*@` placeholders are substituted at install
 # time by bootstrap.sh from operator-provided flags.
+#
+# IMPORTANT — the `role` field below is a first-boot seed
+# only. The live role surface is the framework's `RoleStore`
+# substrate; bootstrap-time substitution sets the initial
+# value, but every subsequent role transition flows through
+# `set_device_role` and the plugin's substrate subscriber.
+# Hardware claims are gated on a live group with non-local
+# members at engage time — the role value here MUST NOT cause
+# any DAC open, loopback bridge, or audio-plane peer dial
+# absent a live group; the local-playback floor is preserved
+# by construction.
 
 role = "@MULTIROOM_ROLE@"
 group_id = "@MULTIROOM_GROUP_ID@"

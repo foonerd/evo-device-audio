@@ -1,0 +1,310 @@
+//! Runtime ALSA drop-in lifecycle for multi-room source mode.
+//!
+//! When the plugin engages source role on a live group it writes
+//! `/etc/asound.d/zz-evo-multiroom-source.conf`. The drop-in
+//! redefines `pcm.evo` to route through `snd-aloop` (so any
+//! pcm.evo writer's frames land on the loopback playback half
+//! where the plugin's source-side capture task reads them) and
+//! defines `pcm.evo_local` as a direct alias to the local DAC
+//! (so the source-host's local rendering task can still play
+//! audibly while fanning out to remote receivers).
+//!
+//! When the plugin disengages source role the drop-in is
+//! removed. ALSA's "last definition wins" rule + the base
+//! `/etc/asound.conf`'s glob include of `/etc/asound.d/*.conf`
+//! mean removing the drop-in restores the base direct-to-DAC
+//! definition of `pcm.evo` on the next PCM open.
+//!
+//! The `zz-` prefix sorts the drop-in last among
+//! `/etc/asound.d/*.conf` entries (lexicographic order: digit
+//! prefixes < letter prefixes; `evo-options.conf` has no prefix
+//! and sorts before `zz-`). Operator-options drop-ins compose
+//! upstream of the multi-room override; source-mode wins when
+//! both are present.
+//!
+//! Atomicity: writes go to a temp file in the same directory,
+//! then `rename` into place. Concurrent readers (the MPD
+//! plugin's asound-watcher, ALSA's PCM-open path, the operator
+//! `cat`ing the file) see prior contents or next contents,
+//! never a partial file.
+//!
+//! Card-name discovery: parsed once per write from the
+//! bootstrap-installed `/etc/asound.conf`, which carries the
+//! authoritative card name as `card "<NAME>"` inside the base
+//! `pcm.evo` block. If the parse fails the drop-in omits the
+//! `pcm.evo_local` definition; source-host fan-out still works
+//! (the loopback wiring is independent of the local-DAC alias),
+//! but the source-host's own local rendering is silent until
+//! the next engage attempt re-parses successfully.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+/// Drop-in file path the plugin owns. Pinned in
+/// `/etc/asound.d/` ahead of any other naming convention so the
+/// override wins via ALSA's last-definition-wins rule.
+pub(crate) const DROP_IN_PATH: &str =
+    "/etc/asound.d/zz-evo-multiroom-source.conf";
+
+/// Path the plugin reads to discover the local DAC card name.
+/// The bootstrap-installed file is the single source of truth.
+const BASE_ASOUND_CONF: &str = "/etc/asound.conf";
+
+/// Errors produced while writing or removing the drop-in.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DropInError {
+    #[error("create temp file in {dir}: {source}")]
+    CreateTemp {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("write drop-in temp file: {source}")]
+    WriteTemp {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("rename {temp} into {final_path}: {source}")]
+    Rename {
+        temp: PathBuf,
+        final_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remove drop-in at {path}: {source}")]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Atomically install the source-mode drop-in at
+/// [`DROP_IN_PATH`]. Parses the local DAC card name from
+/// `/etc/asound.conf` so the drop-in's `pcm.evo_local` resolves
+/// to the right hardware. If the card name is unavailable the
+/// drop-in still installs (without `pcm.evo_local`) so loopback
+/// fan-out works.
+///
+/// Idempotent against repeated calls with the same card name:
+/// the rendered file content is byte-for-byte stable, so
+/// re-writing produces the same final inode contents. The
+/// rename is atomic so concurrent ALSA opens see one of the
+/// stable byte sequences.
+pub(crate) fn install_source_drop_in() -> Result<(), DropInError> {
+    let card = detect_audio_card();
+    let body = render(card.as_deref());
+    write_atomic(Path::new(DROP_IN_PATH), &body)
+}
+
+/// Remove the source-mode drop-in. No-op when the file is
+/// absent. Called on every transition out of engaged source so
+/// `pcm.evo` collapses back to the base direct-to-DAC
+/// definition on the next PCM open.
+pub(crate) fn remove_source_drop_in() -> Result<(), DropInError> {
+    match std::fs::remove_file(DROP_IN_PATH) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DropInError::Remove {
+            path: PathBuf::from(DROP_IN_PATH),
+            source: e,
+        }),
+    }
+}
+
+/// Render the drop-in body. Public-within-crate for testing.
+pub(crate) fn render(card: Option<&str>) -> String {
+    let mut s = String::with_capacity(1024);
+    s.push_str(HEADER);
+    s.push_str(PCM_EVO_LOOPBACK);
+    if let Some(card) = card {
+        s.push_str(&render_pcm_evo_local(card));
+    } else {
+        s.push_str(PCM_EVO_LOCAL_PLACEHOLDER);
+    }
+    s.push_str(PCM_LOOPBACK_CAPTURE);
+    s
+}
+
+fn render_pcm_evo_local(card: &str) -> String {
+    format!(
+        r#"
+pcm.evo_local {{
+    type plug
+    slave.pcm "hw:CARD={card},DEV=0"
+    hint {{
+        show on
+        description "evo: source-host local DAC renderer target"
+    }}
+}}
+"#
+    )
+}
+
+const HEADER: &str = "# Runtime ALSA drop-in written by \
+org.evoframework.multiroom.evo-native while a live multi-room \
+source-mode group is engaged on this device. Removed \
+automatically when the role transitions out of engaged source. \
+DO NOT EDIT BY HAND --- this file is regenerated on every \
+engage transition.\n\n";
+
+const PCM_EVO_LOOPBACK: &str = r#"pcm.evo {
+    type plug
+    slave.pcm "hw:CARD=Loopback,DEV=0,SUBDEV=0"
+    hint {
+        show on
+        description "evo: multi-room source producer to snd-aloop"
+    }
+}
+"#;
+
+const PCM_EVO_LOCAL_PLACEHOLDER: &str =
+    "\n# pcm.evo_local omitted: local DAC card name could not be parsed \
+from /etc/asound.conf at engage time. Source-host fan-out to \
+remote receivers is unaffected; only the source-host's own \
+local rendering is silent until the next engage attempt.\n";
+
+const PCM_LOOPBACK_CAPTURE: &str = r#"
+pcm.evo_loopback_capture {
+    type hw
+    card "Loopback"
+    device 1
+    subdevice 0
+    hint {
+        show on
+        description "evo: source-host loopback capture target"
+    }
+}
+"#;
+
+/// Atomic write: temp file in the same directory, fsync, rename
+/// over the target. Concurrent readers see prior or next, never
+/// partial.
+fn write_atomic(target: &Path, body: &str) -> Result<(), DropInError> {
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let temp = dir.join(format!(
+        ".{}.tmp.{}",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("evo-multiroom"),
+        std::process::id()
+    ));
+
+    {
+        let mut f = std::fs::File::create(&temp).map_err(|e| {
+            DropInError::CreateTemp {
+                dir: dir.to_path_buf(),
+                source: e,
+            }
+        })?;
+        f.write_all(body.as_bytes())
+            .map_err(|e| DropInError::WriteTemp { source: e })?;
+        f.sync_all()
+            .map_err(|e| DropInError::WriteTemp { source: e })?;
+    }
+
+    std::fs::rename(&temp, target).map_err(|e| {
+        // Best-effort temp cleanup; the persistent residue would
+        // be operator-visible but harmless. Suppress the cleanup
+        // error so the caller sees the underlying rename failure.
+        let _ = std::fs::remove_file(&temp);
+        DropInError::Rename {
+            temp: temp.clone(),
+            final_path: target.to_path_buf(),
+            source: e,
+        }
+    })?;
+    Ok(())
+}
+
+/// Parse the local DAC card name from
+/// `/etc/asound.conf`. Returns the first `card "<NAME>"` value
+/// found; the bootstrap-installed file declares the card name
+/// in both `pcm.evo` and `ctl.evo` blocks, both referencing the
+/// same authoritative name.
+fn detect_audio_card() -> Option<String> {
+    let contents = std::fs::read_to_string(BASE_ASOUND_CONF).ok()?;
+    for line in contents.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("card") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_with_card_includes_evo_local() {
+        let body = render(Some("DAC"));
+        assert!(body.contains("pcm.evo {"));
+        assert!(body.contains("hw:CARD=Loopback"));
+        assert!(body.contains("pcm.evo_local {"));
+        assert!(body.contains("hw:CARD=DAC,DEV=0"));
+        assert!(body.contains("pcm.evo_loopback_capture {"));
+    }
+
+    #[test]
+    fn render_without_card_omits_evo_local_with_explanatory_comment() {
+        let body = render(None);
+        assert!(body.contains("pcm.evo {"));
+        assert!(body.contains("hw:CARD=Loopback"));
+        assert!(!body.contains("pcm.evo_local {"));
+        assert!(body.contains("pcm.evo_local omitted"));
+        assert!(body.contains("pcm.evo_loopback_capture {"));
+    }
+
+    #[test]
+    fn render_is_deterministic_for_identical_input() {
+        let a = render(Some("PCH"));
+        let b = render(Some("PCH"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn write_then_remove_round_trips() {
+        let dir = tempdir();
+        let target = dir.join("zz-evo-multiroom-source.conf");
+        let body = render(Some("test-card"));
+        write_atomic(&target, &body).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
+        std::fs::remove_file(&target).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn write_atomic_overwrites_existing_file() {
+        let dir = tempdir();
+        let target = dir.join("zz-evo-multiroom-source.conf");
+        write_atomic(&target, "first").unwrap();
+        write_atomic(&target, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "evo-multiroom-asound-dropin-test-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn rand_suffix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0)
+    }
+}

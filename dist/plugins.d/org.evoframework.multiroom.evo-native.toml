@@ -18,6 +18,27 @@
 # at install time (which substitutes the `.in` template
 # variant of this file and overwrites the defaults below).
 #
+# IMPORTANT — `role` field is a first-boot seed only.
+# The live role surface is the framework's `RoleStore`
+# substrate. The `role` value below is read on first admit
+# (when `RoleStore` has no entry for this device); from that
+# point onward `RoleStore` is the source of truth and this
+# field has no effect on engagement decisions. Operators
+# changing role at runtime use `set_device_role`; the
+# substrate update propagates via `subscribe_role_changes`
+# and the plugin re-engages automatically.
+#
+# Hardware claims are gated on a live group, never on this
+# field. A device whose substrate-role is `receiver` but
+# whose group has no other members opens NO ALSA PCM and
+# claims NO loopback bridge — the local-playback floor is
+# preserved by construction. The matching acceptance rows
+# on the `audio.multiroom` shelf
+# (`local-playback-floor-invariant`,
+# `hardware-claim-gated-on-live-group`,
+# `role-toml-field-is-first-boot-seed-only`) are the public
+# contract.
+#
 # `alsa_pcm = "evo"` is the distribution-standard PCM alias
 # (see `/etc/asound.conf`) that the plugin opens once the
 # operator engages it as `receiver`. The default is recorded
