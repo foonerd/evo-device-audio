@@ -214,6 +214,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "set_shuffle",
     "set_single",
     "set_consume",
+    "get_now_playing",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -2409,6 +2410,7 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_shuffle" => self.handle_set_bool(req, "set_shuffle").await,
                 "set_single" => self.handle_set_bool(req, "set_single").await,
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
+                "get_now_playing" => self.handle_get_now_playing(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      this is a manifest/runtime drift bug"
@@ -2508,6 +2510,33 @@ impl MpdPlaybackPlugin {
             .await
             .map_err(playback_error_to_plugin_error)?;
         encode_simple_ok(req)
+    }
+
+    /// Handle a `get_now_playing` source-verb request: query
+    /// the supervisor for the current playback state report,
+    /// render it through the same projection the now_playing
+    /// subject uses, and return it as the response payload.
+    /// This is the read-side counterpart to the now_playing
+    /// subject's transition-only update stream — fresh UI
+    /// clients call this on connect to render their initial
+    /// frame, then subscribe to the subject for deltas.
+    async fn handle_get_now_playing(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let _: EmptyPayload = parse_versioned_payload(req, "get_now_playing")?;
+        let supervisor = self.active_supervisor("get_now_playing")?;
+        let report = supervisor
+            .query_state()
+            .await
+            .map_err(playback_error_to_plugin_error)?;
+        let state = playback_supervisor::render_now_playing_state(&report);
+        let body = serde_json::to_vec(&state).map_err(|e| {
+            PluginError::Permanent(format!(
+                "get_now_playing response JSON encode failed: {e}"
+            ))
+        })?;
+        Ok(Response::for_request(req, body))
     }
 
     /// Handle a boolean-toggle source-verb request — `set_mute`,
@@ -4953,6 +4982,95 @@ mod tests {
         match err {
             PluginError::Permanent(msg) => {
                 assert!(msg.contains("unknown request type"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_now_playing_returns_rendered_state_without_prior_verb() {
+        // First-render contract: a fresh consumer can dispatch
+        // get_now_playing as its first interaction (no prior
+        // transport verb) and receive the current playback state
+        // in the same wire shape the now_playing subject carries.
+        // This is the read-side companion to the subject, which
+        // only emits on state transitions and does NOT replay the
+        // current value to new subscribers.
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("get_now_playing", json!({ "v": 1 }));
+        let resp = p.handle_request(&req).await.unwrap();
+        let body: Value = serde_json::from_slice(&resp.payload).unwrap();
+
+        // Payload version matches the now_playing subject's
+        // versioned envelope.
+        assert_eq!(body["v"], 1);
+        // Every field the subject emits is present in the read
+        // response so consumers can render their initial frame
+        // from this payload alone.
+        assert!(body.get("transport_state").is_some());
+        assert!(body.get("track").is_some());
+        assert!(body.get("elapsed_ms").is_some());
+        assert!(body.get("duration_ms").is_some());
+        assert!(body.get("volume").is_some());
+        assert!(body.get("muted").is_some());
+        assert!(body.get("repeat").is_some());
+        assert!(body.get("shuffle").is_some());
+        assert!(body.get("single").is_some());
+        assert!(body.get("consume").is_some());
+        // Mock's Standard handler reports state: stop → projection
+        // collapses track + elapsed + duration to null per the
+        // schema's stopped-state contract.
+        assert_eq!(body["transport_state"], "stopped");
+        assert!(body["track"].is_null());
+        assert!(body["elapsed_ms"].is_null());
+        assert!(body["duration_ms"].is_null());
+
+        p.release_custody(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_now_playing_refuses_when_no_active_custody() {
+        // The read verb is part of the source-respondent surface
+        // and inherits the active-custody requirement that every
+        // other source verb honours. Without an admitted plugin
+        // there is no supervisor to query; the dispatcher must
+        // refuse cleanly rather than panic or return an empty
+        // response.
+        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("get_now_playing", json!({ "v": 1 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("no active custody"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_now_playing_refuses_bad_payload_version() {
+        let (mut p, handle, _mock) = loaded_plugin_with_active_custody(vec![
+            F4Conn::Standard,
+            F4Conn::HoldAfterWelcome,
+        ])
+        .await;
+
+        let req = source_request("get_now_playing", json!({ "v": 99 }));
+        let err = p.handle_request(&req).await.unwrap_err();
+        match err {
+            PluginError::Permanent(msg) => {
+                assert!(msg.contains("payload version 99 unsupported"));
             }
             other => panic!("expected Permanent, got {other:?}"),
         }

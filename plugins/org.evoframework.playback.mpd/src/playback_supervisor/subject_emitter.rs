@@ -336,9 +336,16 @@ impl SubjectEmitter {
     /// subject. Called from the playback supervisor's report
     /// emitter on every state transition (play / pause / stop /
     /// track change / seek / volume / mute / mode flips) and on
-    /// every regular status poll so `elapsed_ms` advances live for
-    /// subscribers without requiring them to maintain a local
-    /// clock.
+    /// every MPD idle wake. Emission is event-driven only —
+    /// there is no free-running status poll, so a steadily
+    /// playing track produces no idle events for the playhead
+    /// advancing between transitions. Consumers needing
+    /// continuously-advancing `elapsed_ms` interpolate locally
+    /// from the last reported value + wall-clock while
+    /// `transport_state == "playing"`. Consumers needing
+    /// first-render state (subject-subscribe does not replay
+    /// the current value to a new subscriber) call the
+    /// warden's `get_now_playing` read verb.
     ///
     /// Best-effort: errors from the announcer are logged but not
     /// propagated. Playback is never disrupted by an announcer
@@ -367,7 +374,9 @@ impl SubjectEmitter {
 /// Pure projection from the report (no IO, no state). Extracted
 /// from [`SubjectEmitter::update_now_playing`] so the renderer
 /// has a deterministic unit-testable surface.
-fn render_now_playing_state(report: &PlaybackStateReport) -> serde_json::Value {
+pub(crate) fn render_now_playing_state(
+    report: &PlaybackStateReport,
+) -> serde_json::Value {
     let track = match (report.state, report.current_song.as_ref()) {
         // Stopped or no current song → track is null.
         (PlayState::Stopped, _) | (_, None) => serde_json::Value::Null,

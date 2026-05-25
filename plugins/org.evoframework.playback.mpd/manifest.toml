@@ -135,5 +135,6 @@ request_types = [
     "set_shuffle",
     "set_single",
     "set_consume",
+    "get_now_playing",
 ]
 response_budget_ms = 2000

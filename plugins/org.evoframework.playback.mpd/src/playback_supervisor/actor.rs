@@ -164,6 +164,18 @@ impl SupervisorHandle {
         }
     }
 
+    /// Read the live playback-state report. See
+    /// [`SupervisorCommandSender::query_state`] for semantics.
+    pub(crate) async fn query_state(
+        &self,
+    ) -> Result<PlaybackStateReport, PlaybackError> {
+        SupervisorCommandSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .query_state()
+        .await
+    }
+
     /// Signal shutdown and wait for the supervisor's task to
     /// finish. Idempotent: calling a second time is a no-op.
     pub(crate) async fn shutdown(mut self) {
@@ -206,6 +218,27 @@ impl SupervisorCommandSender {
                 cmd,
                 reply: reply_tx,
             })
+            .await
+            .map_err(|_| PlaybackError::Shutdown)?;
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(PlaybackError::Shutdown),
+        }
+    }
+
+    /// Read the live playback-state report. Drives a fresh
+    /// MPD `status` + `currentsong` round-trip in the
+    /// supervisor task and returns the resulting
+    /// [`PlaybackStateReport`] including the supervisor's
+    /// task-local `muted` flag. Used by the warden's
+    /// `get_now_playing` read verb to satisfy first-render
+    /// requests from freshly-connected UI clients.
+    pub(crate) async fn query_state(
+        &self,
+    ) -> Result<PlaybackStateReport, PlaybackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorMessage::QueryState { reply: reply_tx })
             .await
             .map_err(|_| PlaybackError::Shutdown)?;
         match reply_rx.await {
@@ -377,6 +410,17 @@ enum SupervisorMessage {
         cmd: PlaybackCommand,
         reply: oneshot::Sender<Result<(), PlaybackError>>,
     },
+    /// One-shot query for the current playback state report.
+    /// Fired by the warden's `get_now_playing` read verb. The
+    /// supervisor builds a fresh `PlaybackStateReport` from a
+    /// live MPD `status` + `currentsong` round-trip (so the
+    /// caller observes the live state, not a cached snapshot)
+    /// and replies through the oneshot. The current `muted`
+    /// state from the supervisor's task-local mute tracking is
+    /// folded in as the report's `muted` field.
+    QueryState {
+        reply: oneshot::Sender<Result<PlaybackStateReport, PlaybackError>>,
+    },
 }
 
 /// Events the idle task sends to the main supervisor.
@@ -529,6 +573,35 @@ impl SupervisorTask {
                                     self.muted,
                                 ).await;
                             }
+                        }
+                        Some(SupervisorMessage::QueryState { reply }) => {
+                            // Live MPD status + currentsong round-trip;
+                            // build a PlaybackStateReport carrying the
+                            // supervisor's task-local mute flag. No
+                            // emit_best_effort_report side-channel here:
+                            // a read MUST NOT publish to the now_playing
+                            // subject (otherwise every read fires a
+                            // delta the consumer already has via the
+                            // read response, doubling traffic without
+                            // adding signal). Transient transport errors
+                            // map through classify_command_error so the
+                            // caller sees a typed PlaybackError.
+                            let result = match self.cmd_conn.status().await {
+                                Ok(status) => match self
+                                    .cmd_conn
+                                    .current_song()
+                                    .await
+                                {
+                                    Ok(song) => Ok(PlaybackStateReport::from_mpd(
+                                        status,
+                                        song,
+                                        self.muted,
+                                    )),
+                                    Err(e) => Err(classify_command_error(e)),
+                                },
+                                Err(e) => Err(classify_command_error(e)),
+                            };
+                            let _ = reply.send(result);
                         }
                     }
                 }

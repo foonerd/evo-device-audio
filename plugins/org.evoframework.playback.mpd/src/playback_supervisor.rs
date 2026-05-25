@@ -44,4 +44,4 @@ pub(crate) mod test_mock;
 // the module graph.
 pub(crate) use actor::{spawn, SupervisorCommandSender, SupervisorHandle};
 pub(crate) use command::{PlaybackCommand, PlaybackError};
-pub(crate) use subject_emitter::SubjectEmitter;
+pub(crate) use subject_emitter::{render_now_playing_state, SubjectEmitter};
