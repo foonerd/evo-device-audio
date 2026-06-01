@@ -619,53 +619,44 @@ impl SupervisorTask {
                             // MPD to a runtime asound change
                             // (multi-room drop-in install /
                             // remove, operator-options rewrite)
-                            // without a systemd bounce. A
-                            // transient transport error on
-                            // either step maps through
-                            // classify_command_error so the
-                            // caller sees a typed PlaybackError.
-                            let result = match self
-                                .cmd_conn
-                                .disable_output(0)
-                                .await
-                            {
-                                Ok(()) => {
-                                    match self.cmd_conn.enable_output(0).await {
-                                        Ok(()) => Ok(()),
-                                        Err(e) => Err(classify_command_error(e)),
-                                    }
-                                }
-                                Err(e) => Err(classify_command_error(e)),
-                            };
+                            // without a systemd bounce.
+                            // handle_cycle_output wraps the
+                            // disable/enable pair in the same
+                            // try-then-reconnect-then-retry
+                            // contract handle_command uses, so a
+                            // wedged cmd_conn at the moment the
+                            // asound watcher fires recovers via
+                            // reconnect rather than synthesising
+                            // an exhaustion error.
+                            let result = handle_cycle_output(
+                                &mut self.cmd_conn,
+                                &self.endpoint,
+                                self.timeouts,
+                            ).await;
                             let _ = reply.send(result);
                         }
                         Some(SupervisorMessage::QueryState { reply }) => {
                             // Live MPD status + currentsong round-trip;
                             // build a PlaybackStateReport carrying the
-                            // supervisor's task-local mute flag. No
-                            // emit_best_effort_report side-channel here:
-                            // a read MUST NOT publish to the now_playing
-                            // subject (otherwise every read fires a
-                            // delta the consumer already has via the
-                            // read response, doubling traffic without
-                            // adding signal). Transient transport errors
-                            // map through classify_command_error so the
-                            // caller sees a typed PlaybackError.
-                            let result = match self.cmd_conn.status().await {
-                                Ok(status) => match self
-                                    .cmd_conn
-                                    .current_song()
-                                    .await
-                                {
-                                    Ok(song) => Ok(PlaybackStateReport::from_mpd(
-                                        status,
-                                        song,
-                                        self.muted,
-                                    )),
-                                    Err(e) => Err(classify_command_error(e)),
-                                },
-                                Err(e) => Err(classify_command_error(e)),
-                            };
+                            // supervisor's task-local mute flag.
+                            // handle_query wraps the round-trip in
+                            // the same try-then-reconnect-then-retry
+                            // contract handle_command uses, so a
+                            // first-call wedged cmd_conn recovers via
+                            // reconnect — the fresh-custody first-render
+                            // contract for get_now_playing depends on
+                            // this. No emit_best_effort_report
+                            // side-channel: a read MUST NOT publish to
+                            // the now_playing subject (otherwise every
+                            // read fires a delta the consumer already
+                            // has via the read response, doubling
+                            // traffic without adding signal).
+                            let result = handle_query(
+                                &mut self.cmd_conn,
+                                &self.endpoint,
+                                self.timeouts,
+                                self.muted,
+                            ).await;
                             let _ = reply.send(result);
                         }
                     }
@@ -759,7 +750,115 @@ async fn handle_command(
         }
     }
 
-    // Reconnect loop with backoff.
+    // Reconnect with backoff; bail with a real attempt count on
+    // exhaustion (NOT the synthetic-10 path classify_command_error
+    // produces on a single transport error).
+    reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
+
+    // Retry the command once on the fresh connection.
+    match dispatch_command(cmd, cmd_conn, muted, pre_mute_volume).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(classify_command_error(e)),
+    }
+}
+
+/// Read live playback state (status + currentsong) with the same
+/// try-then-reconnect-then-retry contract `handle_command` uses
+/// for write verbs. The QueryState message path goes through this
+/// so a wedged `cmd_conn` (fresh-spawn race, prior MPD downtime
+/// that left the connection in transport-error state) recovers
+/// the same way a write verb's first attempt recovers. Without
+/// this wrap, the first transport error short-circuits to
+/// `classify_command_error -> ConnectionExhausted { attempts: 10 }`
+/// — a synthetic exhaustion that never tried the real reconnect
+/// machinery, the symptom the operator-UI first-render-read kept
+/// hitting on fresh custodies.
+async fn handle_query(
+    cmd_conn: &mut MpdConnection,
+    endpoint: &MpdEndpoint,
+    timeouts: ConnectTimeouts,
+    muted: bool,
+) -> Result<PlaybackStateReport, PlaybackError> {
+    // First attempt on the current connection.
+    match do_query(cmd_conn, muted).await {
+        Ok(report) => return Ok(report),
+        Err(e) if !error_calls_for_reconnect(&e) => {
+            return Err(classify_command_error(e));
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "query hit transient error; reconnecting"
+            );
+        }
+    }
+
+    reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
+
+    // Retry the query once on the fresh connection.
+    do_query(cmd_conn, muted)
+        .await
+        .map_err(classify_command_error)
+}
+
+async fn do_query(
+    cmd_conn: &mut MpdConnection,
+    muted: bool,
+) -> Result<PlaybackStateReport, MpdError> {
+    let status = cmd_conn.status().await?;
+    let song = cmd_conn.current_song().await?;
+    Ok(PlaybackStateReport::from_mpd(status, song, muted))
+}
+
+/// Cycle MPD output 0 (`disableoutput` + `enableoutput`) with the
+/// same try-then-reconnect-then-retry contract. The asound
+/// watcher dispatches CycleOutput on every `/etc/asound.d/`
+/// composition change; a wedged `cmd_conn` at that moment must
+/// recover via reconnect rather than synthesise an exhaustion
+/// error and leave MPD on a stale handle.
+async fn handle_cycle_output(
+    cmd_conn: &mut MpdConnection,
+    endpoint: &MpdEndpoint,
+    timeouts: ConnectTimeouts,
+) -> Result<(), PlaybackError> {
+    match do_cycle_output(cmd_conn).await {
+        Ok(()) => return Ok(()),
+        Err(e) if !error_calls_for_reconnect(&e) => {
+            return Err(classify_command_error(e));
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "output-cycle hit transient error; reconnecting"
+            );
+        }
+    }
+
+    reconnect_cmd_conn(cmd_conn, endpoint, timeouts).await?;
+
+    do_cycle_output(cmd_conn)
+        .await
+        .map_err(classify_command_error)
+}
+
+async fn do_cycle_output(cmd_conn: &mut MpdConnection) -> Result<(), MpdError> {
+    cmd_conn.disable_output(0).await?;
+    cmd_conn.enable_output(0).await
+}
+
+/// Reconnect-loop-with-backoff helper. Replaces `*cmd_conn` with
+/// a freshly-opened connection on success; returns
+/// `PlaybackError::ConnectionExhausted` with the REAL attempt
+/// count when backoff exhausts. Shared by every code path that
+/// recovers from a wedged command connection
+/// (`handle_command`, `handle_query`, `handle_cycle_output`).
+async fn reconnect_cmd_conn(
+    cmd_conn: &mut MpdConnection,
+    endpoint: &MpdEndpoint,
+    timeouts: ConnectTimeouts,
+) -> Result<(), PlaybackError> {
     let mut backoff = BackoffState::new();
     loop {
         let delay = match backoff.next_delay() {
@@ -782,7 +881,7 @@ async fn handle_command(
                     attempts = backoff.attempts_used(),
                     "command connection re-established"
                 );
-                break;
+                return Ok(());
             }
             Err(e) if error_calls_for_reconnect(&e) => {
                 tracing::debug!(
@@ -797,12 +896,6 @@ async fn handle_command(
                 return Err(classify_command_error(e));
             }
         }
-    }
-
-    // Retry the command once on the fresh connection.
-    match dispatch_command(cmd, cmd_conn, muted, pre_mute_volume).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(classify_command_error(e)),
     }
 }
 
@@ -1360,6 +1453,63 @@ mod tests {
         // play fails the first time (conn closes), the supervisor
         // reconnects, retries on the new connection, succeeds.
         handle.command(PlaybackCommand::Play).await.unwrap();
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn query_state_reconnects_after_transient_drop() {
+        // Regression: get_now_playing's first-render contract
+        // depends on the QueryState message path recovering from
+        // a wedged cmd_conn via reconnect. Before the
+        // handle_query refactor the QueryState branch called
+        // cmd_conn.status() directly; a single transport error
+        // short-circuited through classify_command_error to
+        // ConnectionExhausted{attempts: RECONNECT_MAX_ATTEMPTS}
+        // synthetically, never trying the reconnect machinery.
+        //
+        // Connection budget mirrors
+        // command_reconnects_after_transient_drop:
+        //   First command-conn:
+        //     1 = crossfade (apply_audio_protocol_settings),
+        //     2 = single    (apply_audio_protocol_settings),
+        //     3 = status    (initial report),
+        //     4 = currentsong (initial report),
+        //     5 = status (query_state first attempt) -> close.
+        //   Second command-conn (reconnect): Standard -> OK on
+        //     status + currentsong retry.
+        //   Idle conn: hold.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::CloseOnNth { nth: 5 },
+            ConnBehaviour::HoldAfterWelcome,
+            ConnBehaviour::Standard,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+        )
+        .await
+        .unwrap();
+
+        // First query_state call hits the close-on-nth, the
+        // supervisor reconnects, retries on the fresh connection,
+        // returns a real PlaybackStateReport — the very first
+        // interaction on a fresh custody succeeds.
+        let report = handle.query_state().await.unwrap();
+        // Standard mock's status returns "state: stop" so the
+        // report's state is Stopped; the test asserts the
+        // round-trip COMPLETED rather than a specific song
+        // (the mock has no current song).
+        assert_eq!(report.state, crate::mpd::PlayState::Stopped);
 
         handle.shutdown().await;
     }
