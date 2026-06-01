@@ -105,6 +105,26 @@ scheduling target the envelope's presentation_time_ms declares. \
 Role flips dynamically per the framework's source-host election.
 """
 
+[[racks.shelves]]
+name = "terminus"
+shape = 1
+description = """
+Audio terminus plugin. Canonical owner of every post-mixer \
+audio-derived signal: parallel-tapped from pcm.evo via \
+snd-aloop, owns the spectrum FFT compute (256-bin mel-scale \
+stereo Float32 at 30 Hz with perceptual signals — peak-hold, \
+per-band onset events, L/R correlation), exposes the \
+audio-plane capture surface for cross-plugin consumers. \
+Source-agnostic: every source plugin (MPD today, AirPlay / \
+Cast / Spotify Connect / streaming-radio in the future) writes \
+to pcm.evo and gets every post-mixer signal for free. The \
+terminus is a parallel slave of the multi-slave tee in \
+/etc/asound.conf — the primary slave is hw:CARD=<dac>, the \
+terminus tap is snd-aloop subdev 7. The local-playback floor \
+invariant is preserved by construction: terminus failure, \
+absence, or crash cannot silence the primary audio path.
+"""
+
 [[racks]]
 name = "hardware"
 family = "domain"

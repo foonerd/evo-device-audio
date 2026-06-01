@@ -1,0 +1,41 @@
+[plugin]
+name = "org.evoframework.audio.terminus"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.terminus"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 24
+max_cpu_percent = 3
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "get_spectrum_frame",
+]
+response_budget_ms = 100

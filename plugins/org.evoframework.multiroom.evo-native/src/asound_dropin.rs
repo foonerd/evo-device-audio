@@ -157,13 +157,60 @@ automatically when the role transitions out of engaged source. \
 DO NOT EDIT BY HAND --- this file is regenerated on every \
 engage transition.\n\n";
 
+// pcm.evo composes a multi-slave tee writing simultaneously to
+// the multi-room loopback (subdev 0, the source-mode capture
+// the multi-room plugin reads + fans out) AND the audio-terminus
+// loopback (subdev 7, the spectrum / post-mixer-signal tap).
+// Both subdevs are independent capture buffers fed by the same
+// pcm.evo write; spectrum stays alive during source-mode
+// engagement. The multi-room source-mode capture continues to
+// read from `pcm.evo_loopback_capture` (subdev 1, capture of
+// subdev 0); the terminus plugin reads from subdev 7's capture
+// half.
 const PCM_EVO_LOOPBACK: &str = r#"pcm.evo {
     type plug
-    slave.pcm "hw:CARD=Loopback,DEV=0,SUBDEV=0"
+    slave.pcm "evo_source_mode_tee"
     hint {
         show on
-        description "evo: multi-room source producer to snd-aloop"
+        description "evo: multi-room source producer + terminus tap"
     }
+}
+
+pcm.evo_source_mode_tee {
+    type multi
+    slaves.multiroom.pcm "evo_source_mode_loopback_playback"
+    slaves.multiroom.channels 2
+    slaves.terminus.pcm "evo_terminus_tap"
+    slaves.terminus.channels 2
+    bindings.0.slave multiroom
+    bindings.0.channel 0
+    bindings.1.slave multiroom
+    bindings.1.channel 1
+    bindings.2.slave terminus
+    bindings.2.channel 0
+    bindings.3.slave terminus
+    bindings.3.channel 1
+}
+
+pcm.evo_source_mode_loopback_playback {
+    type hw
+    card "Loopback"
+    device 0
+    subdevice 0
+}
+
+# pcm.evo_terminus_tap is also defined in /etc/asound.conf for
+# the non-source-mode case (the multi-slave tee there writes to
+# the DAC primary + terminus tap). Redefining the same alias
+# here is a no-op since both definitions target the same subdev;
+# the duplication is explicit so this drop-in stands alone
+# (operators reading just this file see the full source-mode
+# wiring without cross-referencing the base asound.conf).
+pcm.evo_terminus_tap {
+    type hw
+    card "Loopback"
+    device 0
+    subdevice 7
 }
 "#;
 
@@ -257,7 +304,16 @@ mod tests {
     fn render_with_card_includes_evo_local() {
         let body = render(Some("DAC"));
         assert!(body.contains("pcm.evo {"));
-        assert!(body.contains("hw:CARD=Loopback"));
+        // Source-mode redefines pcm.evo as a multi-slave tee
+        // writing to BOTH the multi-room loopback (subdev 0)
+        // AND the audio-terminus tap (subdev 7) — spectrum
+        // stays alive during source-mode engagement.
+        assert!(body.contains("evo_source_mode_tee"));
+        assert!(body.contains("evo_source_mode_loopback_playback"));
+        assert!(body.contains("evo_terminus_tap"));
+        assert!(body.contains("card \"Loopback\""));
+        assert!(body.contains("subdevice 0"));
+        assert!(body.contains("subdevice 7"));
         assert!(body.contains("pcm.evo_local {"));
         assert!(body.contains("hw:CARD=DAC,DEV=0"));
         assert!(body.contains("pcm.evo_loopback_capture {"));
@@ -267,7 +323,8 @@ mod tests {
     fn render_without_card_omits_evo_local_with_explanatory_comment() {
         let body = render(None);
         assert!(body.contains("pcm.evo {"));
-        assert!(body.contains("hw:CARD=Loopback"));
+        assert!(body.contains("evo_source_mode_tee"));
+        assert!(body.contains("evo_terminus_tap"));
         assert!(!body.contains("pcm.evo_local {"));
         assert!(body.contains("pcm.evo_local omitted"));
         assert!(body.contains("pcm.evo_loopback_capture {"));
@@ -296,7 +353,7 @@ mod tests {
         write_atomic(&target, DISENGAGED_PLACEHOLDER).unwrap();
         let post = std::fs::read_to_string(&target).unwrap();
         assert!(post.contains("Plugin-managed"));
-        assert!(!post.contains("hw:CARD=Loopback"));
+        assert!(!post.contains("evo_source_mode_tee"));
         assert!(target.exists());
     }
 

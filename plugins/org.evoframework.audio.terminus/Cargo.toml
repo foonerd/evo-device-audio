@@ -1,0 +1,40 @@
+[package]
+name = "org-evoframework-audio-terminus"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "evo audio terminus plugin. Canonical owner of every post-mixer audio-derived signal: parallel-tapped from pcm.evo via snd-aloop, owns spectrum FFT compute, exposes the audio-plane capture surface for cross-plugin consumers. Source-agnostic. Floor invariant preserved (terminus is a parallel slave of the multi-slave tee; terminus failure cannot silence local DAC). Stocks the audio.terminus shelf at shape 1."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "audio-terminus-wire"
+path = "src/bin/audio-terminus-wire.rs"
+
+[features]
+default = []
+alsa-substrate = ["dep:alsa"]
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+rustfft = "6"
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+toml = "0.8"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = { workspace = true }
+alsa = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

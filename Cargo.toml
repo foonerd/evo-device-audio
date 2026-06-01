@@ -14,6 +14,7 @@ members = [
     "plugins/org.evoframework.multiroom.evo-native",
     "plugins/org.evoframework.hardware.audio-config",
     "plugins/org.evoframework.system.power",
+    "plugins/org.evoframework.audio.terminus",
 ]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching
