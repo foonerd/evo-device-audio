@@ -166,14 +166,25 @@ engage transition.\n\n";
 // engagement. The multi-room source-mode capture continues to
 // read from `pcm.evo_loopback_capture` (subdev 1, capture of
 // subdev 0); the terminus plugin reads from subdev 7's capture
-// half.
+// half. The route plugin duplicates input channels into BOTH
+// destinations (the multi plugin splits, it doesn't copy).
 const PCM_EVO_LOOPBACK: &str = r#"pcm.evo {
     type plug
-    slave.pcm "evo_source_mode_tee"
+    slave.pcm "evo_source_mode_duplicate"
     hint {
         show on
         description "evo: multi-room source producer + terminus tap"
     }
+}
+
+pcm.evo_source_mode_duplicate {
+    type route
+    slave.pcm "evo_source_mode_tee"
+    slave.channels 4
+    ttable.0.0 1.0
+    ttable.1.1 1.0
+    ttable.0.2 1.0
+    ttable.1.3 1.0
 }
 
 pcm.evo_source_mode_tee {
@@ -308,12 +319,14 @@ mod tests {
         // writing to BOTH the multi-room loopback (subdev 0)
         // AND the audio-terminus tap (subdev 7) — spectrum
         // stays alive during source-mode engagement.
+        assert!(body.contains("evo_source_mode_duplicate"));
         assert!(body.contains("evo_source_mode_tee"));
         assert!(body.contains("evo_source_mode_loopback_playback"));
         assert!(body.contains("evo_terminus_tap"));
         assert!(body.contains("card \"Loopback\""));
         assert!(body.contains("subdevice 0"));
         assert!(body.contains("subdevice 7"));
+        assert!(body.contains("ttable.0.2 1.0"));
         assert!(body.contains("pcm.evo_local {"));
         assert!(body.contains("hw:CARD=DAC,DEV=0"));
         assert!(body.contains("pcm.evo_loopback_capture {"));
@@ -323,6 +336,7 @@ mod tests {
     fn render_without_card_omits_evo_local_with_explanatory_comment() {
         let body = render(None);
         assert!(body.contains("pcm.evo {"));
+        assert!(body.contains("evo_source_mode_duplicate"));
         assert!(body.contains("evo_source_mode_tee"));
         assert!(body.contains("evo_terminus_tap"));
         assert!(!body.contains("pcm.evo_local {"));
