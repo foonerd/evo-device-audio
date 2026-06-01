@@ -74,6 +74,17 @@ Cmnd_Alias EVO_HARDWARE_AUDIO_MODDER = \
     /usr/bin/tee /boot/firmware/overlays/*, \
     /usr/bin/rm -f /boot/firmware/overlays/*
 
+# Silence PAM session + syslog entries on every grant. Each
+# PPAG probe at admit + each runtime invocation hits the
+# sudoers boundary; without these directives each call
+# produces 3 journal lines (sudo invocation + pam_session
+# open + pam_session close), which is pure litter for an
+# automated framework grant that's already operator-vetted
+# via the NOPASSWD declaration.
+Defaults!EVO_HARDWARE_AUDIO_READ !pam_session, !syslog
+Defaults!EVO_HARDWARE_AUDIO_WRITE !pam_session, !syslog
+Defaults!EVO_HARDWARE_AUDIO_MODDER !pam_session, !syslog
+
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_READ
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_WRITE
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_HARDWARE_AUDIO_MODDER

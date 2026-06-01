@@ -27,4 +27,19 @@
 # `visudo -c -f /etc/sudoers.d/evo-mpd-restart` verifies
 # syntactically valid sudoers.
 
-@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/bin/systemctl restart mpd
+# Cmnd_Alias wrapping the bare MPD-restart command so the
+# matching `Defaults!EVO_MPD_RESTART !pam_session, !syslog`
+# below applies uniformly to every invocation. PAM session
+# open/close lines + syslog entries from a NOPASSWD grant are
+# pure journal litter for an automated framework grant; they
+# describe "evoproto opened a session to run a command it
+# was already allowed to run". The PPAG (privilege-probe-
+# after-grant) machinery at admission AND every fragment-
+# rewrite invocation hit this; without the directive, each
+# call produces 3 journal lines.
+Cmnd_Alias EVO_MPD_RESTART = \
+    /usr/bin/systemctl restart mpd
+
+Defaults!EVO_MPD_RESTART !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_MPD_RESTART

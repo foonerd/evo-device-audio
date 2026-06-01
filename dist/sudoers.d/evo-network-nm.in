@@ -66,7 +66,20 @@ Cmnd_Alias EVO_NM_POLL = \
     /usr/sbin/iw dev, \
     /usr/sbin/iw dev * link
 
+# Bare nmcli (the broader privilege the network plugin's
+# non-poll surfaces use — connection manipulation verbs, etc.)
+# wrapped in its own Cmnd_Alias so the matching Defaults
+# below silences PAM session + syslog entries. Without
+# !pam_session every PPAG probe at admission + every actual
+# invocation produces 3 journal lines; the lines describe
+# "evoproto opened a session to run a command it was already
+# allowed to run", which is pure litter for an automated
+# framework grant.
+Cmnd_Alias EVO_NM_FULL = \
+    /usr/bin/nmcli
+
 Defaults!EVO_NM_POLL !pam_session, !syslog
+Defaults!EVO_NM_FULL !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NM_POLL
-@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: /usr/bin/nmcli
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NM_FULL
