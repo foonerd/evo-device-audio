@@ -290,6 +290,24 @@ name = "album"
 [[subjects]]
 name = "audio_playback_stream_format"
 
+# Subject type the audio terminus plugin announces at load
+# and updates at 30 Hz (tier-adaptive) while audio flows
+# through the post-mixer tap. Payload carries v1-shape
+# magnitudes (256 mel-scale bins stereo Float32 [0, 1]),
+# peak_hold (perceptually decayed per bin), per-band onset
+# booleans (sub_bass / bass / mid / high), L/R correlation
+# per bin, and at_ms timestamp. Operator UI subscribes via
+# subscribe_happenings filtering for this subject_type to
+# render the live visualiser without polling. The terminus
+# is leader-authoritative for multi-room: only the leader's
+# terminus emits the subject; followers inherit via
+# subscription. Canonical addressing:
+# `evo.audio.playback:spectrum_frame`. Schema reference:
+# `schemas/org.evoframework/audio/playback.v1.toml`
+# acceptance criterion `spectrum-payload-v1-shape`.
+[[subjects]]
+name = "audio_playback_spectrum_frame"
+
 # Subject type the playback warden announces at load and
 # updates on every playback state transition (play, pause,
 # stop, track change, seek, set_volume, set_mute, set_repeat,
