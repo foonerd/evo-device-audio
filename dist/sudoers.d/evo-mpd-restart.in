@@ -32,8 +32,8 @@
 # below applies uniformly to every invocation. PAM session
 # open/close lines + syslog entries from a NOPASSWD grant are
 # pure journal litter for an automated framework grant; they
-# describe "evoproto opened a session to run a command it
-# was already allowed to run". The PPAG (privilege-probe-
+# describe "service user opened a session to run a command
+# it was already allowed to run". The PPAG (privilege-probe-
 # after-grant) machinery at admission AND every fragment-
 # rewrite invocation hit this; without the directive, each
 # call produces 3 journal lines.

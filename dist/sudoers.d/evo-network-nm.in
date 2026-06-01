@@ -72,9 +72,9 @@ Cmnd_Alias EVO_NM_POLL = \
 # below silences PAM session + syslog entries. Without
 # !pam_session every PPAG probe at admission + every actual
 # invocation produces 3 journal lines; the lines describe
-# "evoproto opened a session to run a command it was already
-# allowed to run", which is pure litter for an automated
-# framework grant.
+# "service user opened a session to run a command it was
+# already allowed to run", which is pure litter for an
+# automated framework grant.
 Cmnd_Alias EVO_NM_FULL = \
     /usr/bin/nmcli
 
