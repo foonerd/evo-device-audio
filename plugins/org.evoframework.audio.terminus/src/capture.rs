@@ -24,14 +24,17 @@
 //!   the loop cleanly within one read budget (configured to be
 //!   small — ~33 ms at the 30 Hz target).
 //!
-//! Lifecycle gating (transport_state + leader-authoritative)
-//! is enforced in this module by skipping the subject emit
-//! when the plugin's playing flag is unset OR the local device
-//! is not the leader of any active multi-room group. The flag
-//! is set by the `audio_playback_now_playing` subscriber the
-//! plugin spawns; absent that subscriber being wired, emission
-//! defaults to "always emit while capture loop runs" so a
-//! standalone-device deployment still surfaces spectrum.
+//! Lifecycle gating (transport_state) is enforced in this
+//! module by checking a `watch::Receiver<TransportGate>` before
+//! each emit. The capture loop continues running regardless of
+//! gate state (a resume picks up at the next tick without spawn
+//! latency); only the spectrum-subject emit is skipped when the
+//! gate is `NotPlaying`. The gate is fed by the
+//! `now_playing_subscriber` task the plugin spawns; the watch
+//! channel's initial value is `NotPlaying`, so emission is
+//! silent until the subscriber seeds the gate from the
+//! now-playing subject's current state (or a stream update
+//! delivers `transport_state == "playing"`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,10 +42,11 @@ use std::time::Duration;
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use evo_plugin_sdk::contract::SubjectAnnouncer;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::fft::{PerceptualFrame, SpectrumAnalyser, CHANNEL_COUNT, FFT_SIZE};
 use crate::spectrum_subject;
+use crate::transport_gate::TransportGate;
 use crate::PluginConfig;
 
 const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
@@ -63,9 +67,16 @@ pub fn spawn(
     latest_frame: Arc<Mutex<Option<PerceptualFrame>>>,
     announcer: Arc<dyn SubjectAnnouncer>,
     shutdown: Arc<Notify>,
+    transport_gate: watch::Receiver<TransportGate>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        run_capture_loop(config, latest_frame, announcer, shutdown);
+        run_capture_loop(
+            config,
+            latest_frame,
+            announcer,
+            shutdown,
+            transport_gate,
+        );
     })
 }
 
@@ -74,6 +85,7 @@ fn run_capture_loop(
     latest_frame: Arc<Mutex<Option<PerceptualFrame>>>,
     announcer: Arc<dyn SubjectAnnouncer>,
     shutdown: Arc<Notify>,
+    transport_gate: watch::Receiver<TransportGate>,
 ) {
     let mut analyser = SpectrumAnalyser::new(config.sample_rate_hz);
     // Single source of truth for the wire `rate_hz` field. Derived
@@ -145,6 +157,7 @@ fn run_capture_loop(
             &announcer,
             &shutdown,
             rate_hz,
+            &transport_gate,
         );
         match exit_inner {
             InnerExit::Shutdown => return,
@@ -173,6 +186,7 @@ fn run_fft_loop(
     announcer: &Arc<dyn SubjectAnnouncer>,
     shutdown: &Arc<Notify>,
     rate_hz: u32,
+    transport_gate: &watch::Receiver<TransportGate>,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
     // -> FFT_SIZE * 2 i32s per frame.
@@ -225,6 +239,16 @@ fn run_fft_loop(
                 let frame_clone = clone_frame(&frame);
                 if let Ok(mut guard) = latest_frame.lock() {
                     *guard = Some(frame);
+                }
+                // Transport-state gate. Cheap atomic-shaped read
+                // of the watch receiver; skip the announcer emit
+                // when transport is not playing. The frame is
+                // still computed + cached so a resume picks up at
+                // the next tick without spawn latency (the
+                // `get_spectrum_frame` read verb continues to
+                // surface the latest cached frame).
+                if !transport_gate.borrow().should_emit() {
+                    continue;
                 }
                 let announcer = Arc::clone(announcer);
                 tokio_handle.spawn(async move {

@@ -74,6 +74,7 @@ use serde::Deserialize;
 
 mod fft;
 mod spectrum_subject;
+mod transport_gate;
 
 pub use fft::{PerceptualFrame, SpectrumAnalyser};
 pub use spectrum_subject::{
@@ -81,9 +82,12 @@ pub use spectrum_subject::{
     SPECTRUM_SUBJECT_ADDRESSING_SCHEME, SPECTRUM_SUBJECT_ADDRESSING_VALUE,
     SPECTRUM_SUBJECT_TYPE,
 };
+pub use transport_gate::TransportGate;
 
 #[cfg(feature = "alsa-substrate")]
 mod capture;
+#[cfg(feature = "alsa-substrate")]
+mod now_playing_subscriber;
 
 const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
 
@@ -177,6 +181,14 @@ pub struct AudioTerminusPlugin {
     /// unload.
     #[cfg(feature = "alsa-substrate")]
     capture_task: Option<tokio::task::JoinHandle<()>>,
+    /// Transport-gate subscriber handle. Watches the
+    /// `audio_playback_now_playing` subject's `transport_state`
+    /// field and pushes `TransportGate` updates the capture loop
+    /// reads before each emit. `Some` after a successful load;
+    /// the plugin's `unload` notifies its shutdown + awaits the
+    /// task.
+    #[cfg(feature = "alsa-substrate")]
+    transport_gate_subscriber: Option<now_playing_subscriber::SubscriberHandle>,
 }
 
 impl AudioTerminusPlugin {
@@ -190,6 +202,8 @@ impl AudioTerminusPlugin {
             capture_shutdown: None,
             #[cfg(feature = "alsa-substrate")]
             capture_task: None,
+            #[cfg(feature = "alsa-substrate")]
+            transport_gate_subscriber: None,
         }
     }
 
@@ -292,6 +306,48 @@ impl Plugin for AudioTerminusPlugin {
             // alsa-substrate gating.
             #[cfg(feature = "alsa-substrate")]
             {
+                // Construct the transport-gate channel. Initial
+                // value `NotPlaying`: emission stays silent until
+                // the subscriber seeds the gate from the now-playing
+                // subject's current state OR a stream update
+                // delivers `transport_state == "playing"`. This is
+                // the conservative default that honours the
+                // documented contract ("emission is silent unless
+                // transport_state == playing").
+                let (gate_tx, gate_rx) =
+                    tokio::sync::watch::channel(TransportGate::NotPlaying);
+
+                // Spawn the now-playing subscriber. Owns the
+                // SDK's SubjectStateSubscriber + SubjectQuerier
+                // handles + the watch::Sender; pushes gate
+                // updates the capture loop reads via the cloned
+                // Receiver. Requires
+                // `capabilities.subscribe_subjects = true` in the
+                // manifest; admission populates both handles.
+                let subscriber = Arc::clone(
+                    ctx.subject_state_subscriber.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "LoadContext.subject_state_subscriber is None; \
+                                 manifest must declare \
+                                 capabilities.subscribe_subjects = true"
+                                .to_string(),
+                        )
+                    })?,
+                );
+                let querier = Arc::clone(
+                    ctx.subject_querier.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "LoadContext.subject_querier is None; \
+                             manifest must declare \
+                             capabilities.subscribe_subjects = true"
+                                .to_string(),
+                        )
+                    })?,
+                );
+                let subscriber_handle =
+                    now_playing_subscriber::spawn(subscriber, querier, gate_tx);
+                self.transport_gate_subscriber = Some(subscriber_handle);
+
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let capture_handle = capture::spawn(
                     self.config.clone(),
@@ -302,6 +358,7 @@ impl Plugin for AudioTerminusPlugin {
                             .expect("subject_announcer set above"),
                     ),
                     Arc::clone(&shutdown),
+                    gate_rx,
                 );
                 self.capture_shutdown = Some(shutdown);
                 self.capture_task = Some(capture_handle);
@@ -309,7 +366,7 @@ impl Plugin for AudioTerminusPlugin {
                     plugin = PLUGIN_NAME,
                     input_pcm = %self.config.input_pcm,
                     sample_rate_hz = self.config.sample_rate_hz,
-                    "capture task spawned"
+                    "capture task spawned + transport-gate subscriber spawned"
                 );
             }
             #[cfg(not(feature = "alsa-substrate"))]
@@ -341,6 +398,10 @@ impl Plugin for AudioTerminusPlugin {
                 }
                 if let Some(handle) = self.capture_task.take() {
                     let _ = handle.await;
+                }
+                if let Some(sub) = self.transport_gate_subscriber.take() {
+                    sub.shutdown.notify_waiters();
+                    let _ = sub.task.await;
                 }
             }
 

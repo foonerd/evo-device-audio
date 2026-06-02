@@ -34,6 +34,16 @@ autostart = true
 restart_on_crash = true
 restart_budget = 5
 
+[capabilities]
+# subscribe_subjects = true populates
+# LoadContext.subject_state_subscriber + .subject_querier so the
+# plugin can observe the audio.playback.now_playing subject's
+# transport_state field and gate spectrum emission accordingly
+# (emission is silent unless transport_state == "playing"; the
+# capture loop continues running so a resume picks up at the
+# next tick without spawn latency).
+subscribe_subjects = true
+
 [capabilities.respondent]
 request_types = [
     "get_spectrum_frame",
