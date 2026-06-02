@@ -103,11 +103,10 @@ impl CustodyStateReporter for CapturingReporter {
 ///
 /// Today only `Ok` and `Err(Invalid)` are reachable from tests;
 /// the full [`ReportError`] taxonomy (rate-limited, shutting-down,
-/// deregistered) is not exercised here because no Phase 3.4 test
-/// needs to distinguish those outcomes. A later phase that does
-/// need them can extend `ReturnError` with named variants; the
-/// current shape is the minimum that compiles cleanly without
-/// dead-code warnings.
+/// deregistered) is not exercised here. A consumer that does
+/// need the distinction can extend `ReturnError` with named
+/// variants; the current shape is the minimum that compiles
+/// cleanly without dead-code warnings.
 #[derive(Debug, Clone)]
 enum CaptureReturn {
     Ok,
@@ -344,9 +343,8 @@ pub(crate) enum ConnBehaviour {
     Standard,
     /// Like [`Standard`] but `status` reports a `play` state and
     /// `currentsong` returns a populated response (`file`,
-    /// `Title`, `Artist`, `Album`). Used by Phase 3.4 subject-
-    /// emission tests that need a real song to trigger the
-    /// emitter.
+    /// `Title`, `Artist`, `Album`). Used by subject-emission
+    /// tests that need a real song to trigger the emitter.
     ///
     /// [`Standard`]: Self::Standard
     StandardWithSong {

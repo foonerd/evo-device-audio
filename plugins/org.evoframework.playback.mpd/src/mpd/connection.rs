@@ -2,12 +2,11 @@
 //!
 //! One [`MpdConnection`] wraps one logical connection to an MPD
 //! daemon, held for the duration of a custody (per the plugin's
-//! warden contract). Phase 3.1 delivered connect / status /
-//! currentsong; Phase 3.2a adds transport commands (play, pause,
-//! stop, next, previous, seek, set_volume) and the idle
-//! subprotocol. Phase 3.2b's supervisor orchestrates two
-//! connections over this type (one for commands, one for idle -
-//! MPD blocks the connection during idle).
+//! warden contract). The connection delivers connect, status,
+//! currentsong, the transport commands (play, pause, stop, next,
+//! previous, seek, set_volume), and the idle subprotocol. The
+//! supervisor orchestrates two of these (one for commands, one
+//! for idle — MPD blocks the connection during idle).
 //!
 //! Every operation has an explicit deadline. No unbounded waits.
 //! The connection is failure-honest: classified errors surface the
@@ -30,8 +29,8 @@ use super::types::{IdleSubsystem, MpdSong, MpdStatus, MpdVersion, PlayState};
 ///
 /// Defaults tuned for a healthy local MPD: generous enough to
 /// tolerate a loaded daemon, tight enough that a dead MPD does not
-/// stall the warden. All values overridable when the Phase 3.3
-/// configuration layer lands.
+/// stall the warden. All values overridable via the configuration
+/// layer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConnectTimeouts {
     /// Budget for completing the TCP or Unix connect syscall.
@@ -59,8 +58,8 @@ impl Default for ConnectTimeouts {
 /// Not cloneable, not reusable after failure: once a method returns
 /// an error that indicates the connection is done for (closed,
 /// protocol violation), the caller should drop this connection and
-/// construct a new one. Phase 3.2b will wrap this in a supervisor
-/// that does the reconnection automatically.
+/// construct a new one. The supervisor wraps this connection
+/// type to do the reconnection automatically.
 pub(crate) struct MpdConnection {
     framing: Framing<
         Box<dyn AsyncRead + Send + Unpin>,
@@ -94,8 +93,8 @@ impl MpdConnection {
 
     /// Connect with a caller-specified timeout budget.
     ///
-    /// Used by tests and by the Phase 3.3 configuration layer where
-    /// the operator can override the defaults.
+    /// Used by tests and by the configuration layer where the
+    /// operator can override the defaults.
     pub(crate) async fn connect_with_timeouts(
         endpoint: MpdEndpoint,
         timeouts: ConnectTimeouts,
@@ -140,8 +139,8 @@ impl MpdConnection {
     }
 
     /// Dispatch `ping`. A zero-argument no-op useful for liveness
-    /// probes; the supervisor in Phase 3.2b uses it to verify a
-    /// dormant connection is still alive.
+    /// probes; the supervisor uses it to verify a dormant
+    /// connection is still alive.
     pub(crate) async fn ping(&mut self) -> Result<(), MpdError> {
         self.dispatch("ping", &[]).await?;
         Ok(())
@@ -421,13 +420,13 @@ impl MpdConnection {
     /// [`MpdError::Timeout`] with `operation = "idle"` and `elapsed`
     /// equal to the wall-clock time from entry. The caller should
     /// then consider the connection suspect (drop and reconnect;
-    /// the supervisor in Phase 3.2b does exactly that).
+    /// the supervisor does exactly that).
     ///
     /// The connection may only be used for idle while idle is
     /// in-flight. Calling `play`, `status`, etc. from another task
     /// while idle is pending is not supported; MPD will see the
     /// extra command, treat it as `noidle` intent, and may respond
-    /// in ways this layer does not handle. Phase 3.2b enforces
+    /// in ways this layer does not handle. The supervisor enforces
     /// separation by holding idle on a dedicated connection.
     pub(crate) async fn idle(
         &mut self,

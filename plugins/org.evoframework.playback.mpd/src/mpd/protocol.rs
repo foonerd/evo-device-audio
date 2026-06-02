@@ -18,8 +18,9 @@
 //!   command-level failure.
 //!
 //! Command lists, binary responses, and the idle subprotocol are
-//! future work (Phases 3.2+); this module's surface is intentionally
-//! bounded to what Phase 3.1 requires.
+//! handled by sibling modules; this module's surface is bounded
+//! to the line-oriented request/response framing the connection
+//! layer consumes.
 
 use super::error::ProtocolError;
 use super::types::MpdVersion;

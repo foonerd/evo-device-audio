@@ -28,25 +28,23 @@
 //!   streams all work.
 //! - [`connection`]: ties it together. Opens the transport, reads
 //!   the welcome banner, dispatches commands with timeout budgets,
-//!   projects protocol fields into the narrow domain types. Phase
-//!   3.2a added transport commands (play, pause, stop, next,
-//!   previous, seek, set_volume) and the `idle` subprotocol.
+//!   projects protocol fields into the narrow domain types.
+//!   Transport commands (play, pause, stop, next, previous, seek,
+//!   set_volume) and the `idle` subprotocol are part of the
+//!   surface.
 //!
 //! ## Scope and consumption
 //!
-//! Phase 3.1 delivered the protocol stack and status / currentsong.
-//! Phase 3.2a added transport commands and the idle subprotocol.
-//! Phase 3.2b built the [`crate::playback_supervisor`] that
-//! orchestrates two connections (one for commands, one for idle).
-//! Phase 3.2c wired the supervisor into the warden trait impls in
-//! `crate` root; the `unused_imports` suppression that guarded the
-//! declared-but-unconsumed re-exports during 3.1-3.2b is retired
-//! as part of 3.2c.
+//! The connection module delivers the protocol stack + status /
+//! currentsong + transport + idle. The
+//! [`crate::playback_supervisor`] sibling module orchestrates two
+//! connections (one for commands, one for idle). The supervisor
+//! is wired into the warden trait impls at the crate root.
 //!
-//! Phase 3.3 adds the configuration layer that produces the
-//! [`endpoint::MpdEndpoint`] the connection opens. Phase 3.4 uses
-//! the parsed [`types::MpdSong`] to assert `track` and `album`
-//! subjects for Milestone 4's album-art respondent to walk.
+//! The configuration layer produces the
+//! [`endpoint::MpdEndpoint`] the connection opens. The parsed
+//! [`types::MpdSong`] feeds `track` and `album` subject
+//! assertion for downstream album-art / metadata respondents.
 //!
 //! ## dead_code suppression
 //!

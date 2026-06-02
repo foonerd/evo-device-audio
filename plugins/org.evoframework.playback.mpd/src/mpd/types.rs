@@ -110,8 +110,8 @@ pub(crate) struct MpdStatus {
 /// Narrow view of MPD's `currentsong` response.
 ///
 /// Only the fields the playback warden needs today. A richer shape
-/// (composer, date, track number, disc number, etc.) lives as a
-/// future extension when Phase 3.4's subject assertion demands it.
+/// (composer, date, track number, disc number, etc.) extends this
+/// when the consuming subject assertion demands it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MpdSong {
     /// MPD-relative file path (e.g. `INTERNAL/Artist/Album/track.flac`).
@@ -120,7 +120,7 @@ pub(crate) struct MpdSong {
     /// Track title tag, if present.
     pub(crate) title: Option<String>,
     /// Artist tag, if present (prefers Artist over AlbumArtist; the
-    /// warden's subject-assertion logic in Phase 3.4 may walk both).
+    /// warden's subject-assertion logic may walk both).
     pub(crate) artist: Option<String>,
     /// Album tag, if present.
     pub(crate) album: Option<String>,

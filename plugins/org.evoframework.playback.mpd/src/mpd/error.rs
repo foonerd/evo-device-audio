@@ -1,12 +1,12 @@
 //! MPD connection error hierarchy.
 //!
-//! Classified by cause so the warden in Phase 3.2 can map failures
-//! to `PluginError::{Permanent, Transient, Fatal}` without guessing:
+//! Classified by cause so the warden can map failures to
+//! `PluginError::{Permanent, Transient, Fatal}` without guessing:
 //!
 //! - `Transport(_)` is typically transient (reconnect may succeed).
 //! - `Protocol(_)` is fatal (server is not speaking MPD correctly).
 //! - `Ack { .. }` is command-scoped; depends on the code (2 = not
-//!   list, 3 = password, 50 = no exist, etc. - Phase 3.2 decides).
+//!   list, 3 = password, 50 = no exist, etc.).
 //! - `Timeout { .. }` is transient.
 //! - `Config(_)` is permanent (operator supplied a bad endpoint).
 //!

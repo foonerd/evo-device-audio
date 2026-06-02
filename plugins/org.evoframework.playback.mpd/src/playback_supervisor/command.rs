@@ -1,9 +1,9 @@
 //! Playback commands and their failure classification.
 //!
 //! The warden receives high-level `CourseCorrection` values from
-//! the steward; Phase 3.2c translates those into [`PlaybackCommand`]
-//! values and hands them to the supervisor. The command type sits
-//! in this crate so the translation layer has a single place to
+//! the steward and translates those into [`PlaybackCommand`]
+//! values to hand to the supervisor. The command type sits in
+//! this crate so the translation layer has a single place to
 //! round-trip against.
 
 use std::time::Duration;
@@ -61,21 +61,20 @@ pub(crate) enum PlaybackCommand {
 
 /// Failure modes of playback command execution.
 ///
-/// Classified so the warden in Phase 3.2c can map cleanly onto
+/// Classified so the warden can map cleanly onto
 /// `PluginError::{Permanent, Transient, Fatal}` without guessing:
 ///
 /// - [`PlaybackError::Ack`] is command-level: the connection is
-///   healthy, the command itself was refused. Phase 3.2c maps to
-///   `Permanent` (retrying the same command gets the same ACK).
+///   healthy, the command itself was refused. Maps to `Permanent`
+///   (retrying the same command gets the same ACK).
 /// - [`PlaybackError::ConnectionExhausted`] is transient: MPD was
-///   unreachable across all reconnection attempts. Phase 3.2c maps
-///   to `Transient` so the steward can retry the correction at a
+///   unreachable across all reconnection attempts. Maps to
+///   `Transient` so the steward can retry the correction at a
 ///   higher level.
 /// - [`PlaybackError::Protocol`] is fatal at the connection level:
-///   the server is not speaking MPD correctly. Phase 3.2c maps to
-///   `Fatal`.
+///   the server is not speaking MPD correctly. Maps to `Fatal`.
 /// - [`PlaybackError::Shutdown`] indicates the supervisor is no
-///   longer alive. Phase 3.2c maps to `Permanent`.
+///   longer alive. Maps to `Permanent`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PlaybackError {
     /// MPD rejected the command. Connection remains healthy.

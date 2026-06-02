@@ -2,10 +2,9 @@
 //!
 //! Long-lived orchestrator over two [`crate::mpd::MpdConnection`]
 //! instances: the warden's answer to "what actually happens during
-//! a custody". Phase 3.2c wired this module into the warden trait
-//! impls in `lib.rs`; Phase 3.4 extends it with subject and
-//! relation emission so Milestone 4's album-art respondent can
-//! walk the resulting graph.
+//! a custody". Wired into the warden trait impls in `lib.rs`;
+//! emits the `track` / `album` subjects and `album_of` relation
+//! that the album-art respondent walks.
 //!
 //! ## Layers
 //!

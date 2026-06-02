@@ -4409,7 +4409,7 @@ mod tests {
         ));
     }
 
-    // ===== Phase 3.4: subject emission through the warden =====
+    // ===== subject emission through the warden =====
 
     #[tokio::test]
     async fn take_custody_rejects_when_subject_emitter_not_initialised() {

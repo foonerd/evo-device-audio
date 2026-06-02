@@ -14,9 +14,9 @@
 //! tag.
 //!
 //! The output is valid TOML parseable by any compliant decoder.
-//! Consumers downstream of the reporter (Phase 3.2c's warden,
-//! eventually the steward's subject assertion in Phase 3.4) can
-//! use a standard TOML parser to read these reports.
+//! Consumers downstream of the reporter (the warden, the
+//! steward's subject-assertion path) use a standard TOML parser
+//! to read these reports.
 
 use std::time::Duration;
 

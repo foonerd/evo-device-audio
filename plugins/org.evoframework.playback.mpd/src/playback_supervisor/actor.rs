@@ -1589,7 +1589,7 @@ mod tests {
         handle.shutdown().await;
     }
 
-    // ----- Phase 3.4: subject-emission integration tests -----
+    // ----- subject-emission integration tests -----
 
     #[tokio::test]
     async fn spawn_with_playing_song_emits_track_album_and_relation() {
