@@ -399,6 +399,16 @@ impl SubjectEmitter {
     /// Best-effort: errors from the announcer are logged but
     /// not propagated. Playback is never disrupted by an
     /// announcer failure here.
+    ///
+    /// Test-only: production code calls the three independent
+    /// setters ([`Self::update_effective`],
+    /// [`Self::update_source_format`],
+    /// [`Self::update_source_codec`]) so each input flows from
+    /// its authoritative source without collateral-clearing a
+    /// sibling field. Test code prefers this convenience setter
+    /// for assertions that pin effective + source pairs in one
+    /// call.
+    #[cfg(test)]
     pub(crate) async fn update_stream_format(
         &self,
         effective: &AudioFormat,
@@ -415,6 +425,60 @@ impl SubjectEmitter {
             });
             g.effective = Some(effective.clone());
             g.source_format = source.cloned();
+            g.render()
+        };
+        self.publish_envelope(rendered).await;
+    }
+
+    /// Publish an effective-format update without touching the
+    /// source-side inputs. Called by the route-change reactor on
+    /// every endpoint refresh.
+    ///
+    /// Distinct from [`Self::update_stream_format`]: that setter
+    /// clears `source_format` to match the second argument, which
+    /// is the right shape for "publish a known effective +
+    /// known source" pairs (e.g. tests). The reactor knows only
+    /// effective; calling `update_stream_format(effective, None)`
+    /// from the reactor would COLLATERAL-CLEAR a `source_format`
+    /// the file-side probe has set, defeating the merge model.
+    /// This setter touches only `effective` and republishes the
+    /// merged envelope.
+    pub(crate) async fn update_effective(&self, effective: &AudioFormat) {
+        let rendered = {
+            let mut g = self.envelope_state.lock().unwrap_or_else(|p| {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_state mutex poisoned at update_effective; \
+                     overwriting"
+                );
+                p.into_inner()
+            });
+            g.effective = Some(effective.clone());
+            g.render()
+        };
+        self.publish_envelope(rendered).await;
+    }
+
+    /// Publish a source-format update without touching the
+    /// effective or codec inputs. Called by the ambient observer
+    /// / supervisor on every currentsong change after the
+    /// file-side probe resolves the file's authoritative shape.
+    /// Pass `None` to clear (file unprobeable, no song,
+    /// remote-mounted library inaccessible).
+    pub(crate) async fn update_source_format(
+        &self,
+        source_format: Option<&AudioFormat>,
+    ) {
+        let rendered = {
+            let mut g = self.envelope_state.lock().unwrap_or_else(|p| {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_state mutex poisoned at update_source_format; \
+                     overwriting"
+                );
+                p.into_inner()
+            });
+            g.source_format = source_format.cloned();
             g.render()
         };
         self.publish_envelope(rendered).await;
@@ -1138,6 +1202,94 @@ mod tests {
         assert_eq!(state["source_codec"], "flac");
         assert_eq!(state["effective"]["kind"], "pcm");
         assert_eq!(state["effective"]["rate_hz"], 192_000);
+    }
+
+    #[tokio::test]
+    async fn update_effective_via_dedicated_setter_preserves_every_sibling() {
+        // The production reactor calls `update_effective`, NOT
+        // `update_stream_format`. Confirm it touches ONLY the
+        // effective field — source_format + source_codec set
+        // by independent producers must survive.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.update_source_codec(Some("dsf")).await;
+        let source = AudioFormat::Dsd {
+            rate: evo_plugin_sdk::audio::DsdRate::Dsd64,
+            transport: evo_plugin_sdk::audio::DsdTransport::NativeUsb,
+            channels: 2,
+        };
+        emitter.update_source_format(Some(&source)).await;
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+            rate_hz: 44_100,
+            channels: 2,
+        };
+        emitter.update_effective(&effective).await;
+        assert_eq!(subjects.state_update_count(), 3);
+        let (_, state) = subjects.state_update_at(2).unwrap();
+        // Effective from the latest call.
+        assert_eq!(state["effective"]["kind"], "pcm");
+        assert_eq!(state["effective"]["rate_hz"], 44_100);
+        // Source-format preserved from the prior probe.
+        assert_eq!(state["source"]["kind"], "dsd");
+        assert_eq!(state["source"]["rate"], "DSD64");
+        // Source-codec preserved from the prior observer call.
+        assert_eq!(state["source_codec"], "dsf");
+    }
+
+    #[tokio::test]
+    async fn update_source_format_preserves_every_sibling() {
+        // The ambient observer's file-side probe calls
+        // `update_source_format`. Confirm it touches ONLY
+        // source_format — effective + source_codec survive.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+            rate_hz: 44_100,
+            channels: 2,
+        };
+        emitter.update_effective(&effective).await;
+        emitter.update_source_codec(Some("flac")).await;
+        let source = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter.update_source_format(Some(&source)).await;
+        assert_eq!(subjects.state_update_count(), 3);
+        let (_, state) = subjects.state_update_at(2).unwrap();
+        // Source-format from the latest call.
+        assert_eq!(state["source"]["kind"], "pcm");
+        assert_eq!(state["source"]["rate_hz"], 96_000);
+        // Effective preserved from the reactor.
+        assert_eq!(state["effective"]["rate_hz"], 44_100);
+        // Source-codec preserved from the observer's codec
+        // update.
+        assert_eq!(state["source_codec"], "flac");
+    }
+
+    #[tokio::test]
+    async fn update_source_format_none_clears_only_source_field() {
+        // Probe-cleared (None) source must not collateral-clear
+        // effective or codec.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+            rate_hz: 44_100,
+            channels: 2,
+        };
+        emitter.update_effective(&effective).await;
+        let source = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter.update_source_format(Some(&source)).await;
+        emitter.update_source_codec(Some("flac")).await;
+        emitter.update_source_format(None).await;
+        let (_, state) = subjects.state_update_at(3).unwrap();
+        assert!(state["source"].is_null());
+        assert_eq!(state["effective"]["rate_hz"], 44_100);
+        assert_eq!(state["source_codec"], "flac");
     }
 
     #[tokio::test]

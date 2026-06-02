@@ -103,12 +103,20 @@ pub(crate) fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
+    music_directory: Option<std::path::PathBuf>,
 ) -> AmbientObserverHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
 
     let task = tokio::spawn(async move {
-        run(endpoint, timeouts, subject_emitter, task_shutdown).await;
+        run(
+            endpoint,
+            timeouts,
+            subject_emitter,
+            music_directory,
+            task_shutdown,
+        )
+        .await;
     });
 
     AmbientObserverHandle { task, shutdown }
@@ -118,6 +126,7 @@ async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
+    music_directory: Option<std::path::PathBuf>,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -125,6 +134,11 @@ async fn run(
         endpoint = %endpoint,
         "ambient now-playing observer task started"
     );
+
+    // Source-format probe cache: last MPD file_path we probed.
+    // Survives across reconnects so a reconnect with the same
+    // current song does NOT re-probe. Reset to None on song-gone.
+    let mut last_probed_file: Option<String> = None;
 
     // Outer reconnect loop: connect, run the inner loop until it
     // errors out, sleep + retry.
@@ -153,13 +167,27 @@ async fn run(
         // immediately rather than waiting for the next
         // transition.
         let mut cmd_conn = cmd_conn;
-        emit_now_playing(&mut cmd_conn, &subject_emitter).await;
+        emit_now_playing(
+            &mut cmd_conn,
+            &subject_emitter,
+            music_directory.as_deref(),
+            &mut last_probed_file,
+        )
+        .await;
 
         // Inner loop: each iteration blocks on MPD's IDLE; on
         // wake, re-query status + currentsong and republish.
         // Any transport error returns from the inner loop and
         // the outer loop reconnects.
-        run_inner(idle_conn, &mut cmd_conn, &subject_emitter, &shutdown).await;
+        run_inner(
+            idle_conn,
+            &mut cmd_conn,
+            &subject_emitter,
+            music_directory.as_deref(),
+            &mut last_probed_file,
+            &shutdown,
+        )
+        .await;
     }
 }
 
@@ -202,6 +230,8 @@ async fn run_inner(
     mut idle_conn: MpdConnection,
     cmd_conn: &mut MpdConnection,
     subject_emitter: &SubjectEmitter,
+    music_directory: Option<&std::path::Path>,
+    last_probed_file: &mut Option<String>,
     shutdown: &Arc<Notify>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
@@ -235,7 +265,13 @@ async fn run_inner(
                         continue;
                     }
                     Ok(_changed) => {
-                        emit_now_playing(cmd_conn, subject_emitter).await;
+                        emit_now_playing(
+                            cmd_conn,
+                            subject_emitter,
+                            music_directory,
+                            last_probed_file,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -264,6 +300,8 @@ async fn run_inner(
 async fn emit_now_playing(
     cmd_conn: &mut MpdConnection,
     subject_emitter: &SubjectEmitter,
+    music_directory: Option<&std::path::Path>,
+    last_probed_file: &mut Option<String>,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -297,6 +335,23 @@ async fn emit_now_playing(
     let source_codec = song.as_ref().and_then(|s| s.codec_name.as_deref());
     subject_emitter.update_source_codec(source_codec).await;
 
+    // File-side source-format probe: when the current file
+    // differs from the last one we probed, read its head and
+    // publish the parsed AudioFormat. The probe is bounded
+    // I/O (a few KiB) and cached by file_path, so subsequent
+    // status cycles on the same song are zero-cost. A song
+    // transition that crosses a music_directory boundary, a
+    // remote-mounted library that stalls, or an unknown codec
+    // all surface as `None` — the wire envelope's `source`
+    // field clears honestly rather than carrying stale data.
+    maybe_probe_source_format(
+        song.as_ref(),
+        music_directory,
+        last_probed_file,
+        subject_emitter,
+    )
+    .await;
+
     // The ambient observer cannot know the operator's mute
     // intent (mute state is supervisor-task-local). Report the
     // raw MPD volume; consumers that distinguish muted-vs-zero
@@ -307,6 +362,74 @@ async fn emit_now_playing(
     let report =
         PlaybackStateReport::from_mpd(status, song, muted_unknown_to_observer);
     subject_emitter.update_now_playing(&report).await;
+}
+
+/// Run the file-side source-format probe iff the current song's
+/// file path differs from the last one we probed. Publishes the
+/// parsed AudioFormat (or `None` on probe failure / unknown
+/// codec) through [`SubjectEmitter::update_source_format`].
+///
+/// The probe is cached by file_path: a status cycle on the same
+/// song is zero I/O. The cache is reset to `None` when the song
+/// goes away, so re-entering the same song afterwards re-probes.
+async fn maybe_probe_source_format(
+    song: Option<&MpdSong>,
+    music_directory: Option<&std::path::Path>,
+    last_probed_file: &mut Option<String>,
+    subject_emitter: &SubjectEmitter,
+) {
+    match song {
+        None => {
+            if last_probed_file.is_some() {
+                *last_probed_file = None;
+                subject_emitter.update_source_format(None).await;
+            }
+        }
+        Some(s) => {
+            if last_probed_file.as_deref() == Some(s.file_path.as_str()) {
+                return;
+            }
+            *last_probed_file = Some(s.file_path.clone());
+            let abs_path = match music_directory {
+                Some(base) => base.join(&s.file_path),
+                None => {
+                    // No music_directory resolved at load time;
+                    // publish None so the wire stays coherent.
+                    subject_emitter.update_source_format(None).await;
+                    return;
+                }
+            };
+            let codec_hint = match s.codec_name.as_deref() {
+                Some(c) => c,
+                None => {
+                    subject_emitter.update_source_format(None).await;
+                    return;
+                }
+            };
+            let probed = tokio::task::spawn_blocking({
+                let abs_path = abs_path.clone();
+                let codec_hint = codec_hint.to_string();
+                move || {
+                    crate::source_probe::probe_source_format(
+                        &abs_path,
+                        &codec_hint,
+                    )
+                }
+            })
+            .await
+            .unwrap_or(None);
+            if probed.is_none() {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    file = %s.file_path,
+                    codec = %codec_hint,
+                    "source-format probe returned None \
+                     (file unreadable / unknown shape)"
+                );
+            }
+            subject_emitter.update_source_format(probed.as_ref()).await;
+        }
+    }
 }
 
 async fn shutdown_requested(shutdown: &Arc<Notify>) -> bool {

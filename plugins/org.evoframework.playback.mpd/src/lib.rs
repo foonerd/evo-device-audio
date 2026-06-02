@@ -111,6 +111,7 @@ mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
 mod playback_supervisor;
+mod source_probe;
 
 #[cfg(test)]
 mod test_support_routing;
@@ -1462,7 +1463,7 @@ async fn run_reactor(
     if let Some(em) = emitter.as_ref() {
         let initial_snapshot = endpoints_tx.borrow().clone();
         if let Some(ep) = initial_snapshot.as_ref() {
-            em.update_stream_format(&ep.format, None).await;
+            em.update_effective(&ep.format).await;
         }
     }
     loop {
@@ -1471,18 +1472,14 @@ async fn run_reactor(
                 let snapshot = fetch_write_endpoint(routing.as_ref());
                 // Publish the stream_format subject's state on
                 // every endpoint refresh. The reactor is the
-                // single place format changes flow through, so
-                // this is the only sanctioned publish surface
-                // per the audio.playback.v1 acceptance contract.
-                // Source format is None here — the reactor sees
-                // only the framework's post-resampling effective
-                // endpoint; the source-format probe lives on the
-                // MPD-status path (a future extension when the
-                // status reader gains an audio-format field).
+                // single place EFFECTIVE format changes flow
+                // through; it does not touch source_format or
+                // source_codec (the ambient observer owns those
+                // and they survive an effective-format change).
                 if let (Some(em), Some(ep)) =
                     (emitter.as_ref(), snapshot.as_ref())
                 {
-                    em.update_stream_format(&ep.format, None).await;
+                    em.update_effective(&ep.format).await;
                 }
                 if endpoints_tx.send(snapshot).is_err() {
                     // Receiver side dropped — nobody reads
@@ -2076,11 +2073,37 @@ impl Plugin for MpdPlaybackPlugin {
                 .as_ref()
                 .expect("subject_emitter set above")
                 .clone();
+            // Resolve MPD's `music_directory` once at load time
+            // so the ambient observer can map MPD's relative
+            // file paths to absolute filesystem paths for the
+            // file-side source-format probe. The probe stays
+            // gracefully None when the conf file is missing or
+            // doesn't declare the directive — the wire surfaces
+            // source_codec alone in that case rather than
+            // claiming a source shape we can't verify.
+            let music_directory =
+                source_probe::load_music_directory_from_mpd_conf(
+                    std::path::Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
+                );
+            if let Some(ref dir) = music_directory {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    music_directory = %dir.display(),
+                    "ambient source-format probe armed"
+                );
+            } else {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "music_directory unresolved (mpd.conf absent / no directive); \
+                     source-format probe disarmed — source_codec still surfaces"
+                );
+            }
             self.ambient_observer =
                 Some(playback_supervisor::spawn_ambient_observer(
                     self.endpoint.clone(),
                     self.timeouts,
                     ambient_emitter,
+                    music_directory,
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
