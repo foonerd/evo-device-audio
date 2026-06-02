@@ -122,7 +122,134 @@ pub enum FragmentError {
          in this build"
     )]
     EncodedPassthroughNotSupported,
+    /// A numeric `mixer_device` (`hw:3`) was supplied but the
+    /// referenced card index does not exist in `/proc/asound/cards`.
+    /// Numeric indices are brittle (they reorder across reboots,
+    /// USB-DAC hotplugs, kernel driver-load order); we resolve
+    /// them at fragment-render time to the kernel-stable
+    /// `hw:CARD=<name>` form and surface a clear error when the
+    /// resolution fails rather than silently shipping a
+    /// fragment that targets a different card than the operator
+    /// intended.
+    #[error(
+        "mixer_device '{requested}' references ALSA card index {index} \
+         which is not present in /proc/asound/cards (operator config \
+         must use 'hw:CARD=<name>' for stability — numeric indices \
+         reorder across reboots)"
+    )]
+    MixerDeviceCardIndexNotFound {
+        /// The original mixer_device string the operator supplied.
+        requested: String,
+        /// The numeric card index parsed out of the request.
+        index: u32,
+    },
 }
+
+/// Parse a card NAME (the bracketed kernel-stable identifier)
+/// out of `/proc/asound/cards` for the supplied numeric index.
+/// Pure: no I/O, takes the file contents as input. Returns
+/// `None` when the index is not found.
+///
+/// `/proc/asound/cards` lines look like:
+///
+/// ```text
+///  3 [DAC            ]: I-Sabre_Q2M_DAC - I-Sabre Q2M DAC
+///                       I-Sabre Q2M DAC
+/// ```
+///
+/// We extract `DAC` (trimmed) for index `3`. Continuation
+/// lines (the indented description) are skipped.
+fn parse_card_name_from_proc(cards_text: &str, index: u32) -> Option<String> {
+    for line in cards_text.lines() {
+        let trimmed = line.trim_start();
+        // Index lines start with a digit; continuation lines
+        // start with non-digit (whitespace + description).
+        if !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Split off the leading index.
+        let mut parts = trimmed.splitn(2, |c: char| c.is_whitespace());
+        let idx_str = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("");
+        let parsed_idx: u32 = match idx_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if parsed_idx != index {
+            continue;
+        }
+        // The card name is inside brackets after the index:
+        // `[DAC            ]: ...`.
+        let after_bracket_open = rest.strip_prefix('[')?;
+        let close_idx = after_bracket_open.find(']')?;
+        let name = after_bracket_open[..close_idx].trim();
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// Normalise a `mixer_device` string from the operator-supplied
+/// form (commonly numeric, e.g. `hw:3`) to the kernel-stable
+/// named form (`hw:CARD=DAC`). Pass-through for inputs that
+/// already use the named form or that don't match the
+/// `hw:<digits>` shape (operator's custom values are honoured
+/// verbatim).
+///
+/// `cards_text` is the contents of `/proc/asound/cards`; supply
+/// it explicitly so the function stays pure + trivially
+/// testable. The caller is the one site that performs the I/O
+/// read at fragment-render time.
+///
+/// Numeric `hw:N` is THE landmine: ALSA assigns card indices in
+/// probe order; USB-DAC hotplug, kernel driver-load reorder, or
+/// a kernel update can shift the index without warning. A
+/// fragment that hardcodes `hw:3` ends up binding MPD's mixer
+/// to a different card than the operator intended — silently,
+/// at boot, with no error surfaced. The named form survives
+/// every reorder because the kernel-stable name is the
+/// authoritative identifier.
+pub fn normalize_mixer_device(
+    mixer_device: &str,
+    cards_text: &str,
+) -> Result<String, FragmentError> {
+    // Already-named: `hw:CARD=<name>` — pass through.
+    if mixer_device.starts_with("hw:CARD=") {
+        return Ok(mixer_device.to_string());
+    }
+    // Numeric form: `hw:N` or `hw:N,M` (latter rare for
+    // mixer_device but possible). Match and resolve N.
+    let Some(rest) = mixer_device.strip_prefix("hw:") else {
+        // Not an `hw:` form at all — operator custom value;
+        // pass through.
+        return Ok(mixer_device.to_string());
+    };
+    // Split on `,` to handle the optional device subscript.
+    // Resolve N (the card index portion) and re-attach
+    // anything after the comma.
+    let (idx_str, suffix) = match rest.find(',') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, ""),
+    };
+    let Ok(index) = idx_str.parse::<u32>() else {
+        // Not a numeric index — pass through (e.g. operator
+        // wrote `hw:Loopback` directly).
+        return Ok(mixer_device.to_string());
+    };
+    let name =
+        parse_card_name_from_proc(cards_text, index).ok_or_else(|| {
+            FragmentError::MixerDeviceCardIndexNotFound {
+                requested: mixer_device.to_string(),
+                index,
+            }
+        })?;
+    Ok(format!("hw:CARD={name}{suffix}"))
+}
+
+/// Path the renderer reads to resolve numeric card indices.
+/// Constant so tests can identify it; production callers always
+/// read this exact file. Exposed at module scope rather than
+/// embedded as a literal so the dependency is grep-discoverable.
+pub const PROC_ASOUND_CARDS_PATH: &str = "/proc/asound/cards";
 
 /// Canonical ALSA alias the audio-terminus plugin captures
 /// from. Matches the `pcm.evo_terminus_tap` definition in
@@ -688,5 +815,156 @@ mod tests {
         assert!(out.contains("mixer_type      \"software\""));
         assert!(out.contains("mixer_type      \"none\""));
         assert!(out.contains("device          \"evo_terminus_tap\""));
+    }
+
+    // ------- mixer_device card-index normalisation ------------
+    //
+    // Numeric `hw:N` indices are brittle (USB-DAC hotplug or
+    // kernel driver-load reorder shifts them silently). The
+    // renderer resolves them to the kernel-stable
+    // `hw:CARD=<name>` form via /proc/asound/cards before
+    // shipping to MPD.
+
+    /// Sample /proc/asound/cards content modelled after a
+    /// Raspberry Pi 5 with an I-Sabre Q2M USB DAC plugged in
+    /// (cards 0/1: vc4-hdmi; card 2: snd-aloop; card 3: DAC).
+    const CARDS_PI5_DAC: &str = "\
+ 0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+                      vc4-hdmi-0
+ 1 [vc4hdmi1       ]: vc4-hdmi - vc4-hdmi-1
+                      vc4-hdmi-1
+ 2 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+ 3 [DAC            ]: I-Sabre_Q2M_DAC - I-Sabre Q2M DAC
+                      I-Sabre Q2M DAC
+";
+
+    /// Same hardware after a hypothetical reorder (DAC at index
+    /// 0; vc4hdmi shifted up). The named form survives this;
+    /// the numeric form would now address the wrong card.
+    const CARDS_PI5_DAC_REORDERED: &str = "\
+ 0 [DAC            ]: I-Sabre_Q2M_DAC - I-Sabre Q2M DAC
+                      I-Sabre Q2M DAC
+ 1 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+                      vc4-hdmi-0
+ 2 [vc4hdmi1       ]: vc4-hdmi - vc4-hdmi-1
+                      vc4-hdmi-1
+ 3 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+";
+
+    #[test]
+    fn parse_card_name_extracts_bracketed_name_at_index() {
+        assert_eq!(
+            parse_card_name_from_proc(CARDS_PI5_DAC, 0),
+            Some("vc4hdmi0".to_string())
+        );
+        assert_eq!(
+            parse_card_name_from_proc(CARDS_PI5_DAC, 3),
+            Some("DAC".to_string())
+        );
+        assert_eq!(parse_card_name_from_proc(CARDS_PI5_DAC, 99), None);
+    }
+
+    #[test]
+    fn parse_card_name_skips_continuation_lines() {
+        // Continuation lines start with whitespace + description.
+        // The parser must not mistake them for index lines.
+        // CARDS_PI5_DAC has them; verifying we still hit the
+        // right index.
+        assert_eq!(
+            parse_card_name_from_proc(CARDS_PI5_DAC, 2),
+            Some("Loopback".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_already_named_form() {
+        assert_eq!(
+            normalize_mixer_device("hw:CARD=DAC", CARDS_PI5_DAC).unwrap(),
+            "hw:CARD=DAC"
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_numeric_to_named_form() {
+        // The defect-of-record on the Pi 5 rig: persisted
+        // mixer_device = "hw:3" addresses index 3 today but
+        // would address something else after a card reorder.
+        // The normaliser converts to the stable form.
+        assert_eq!(
+            normalize_mixer_device("hw:3", CARDS_PI5_DAC).unwrap(),
+            "hw:CARD=DAC"
+        );
+    }
+
+    #[test]
+    fn normalize_survives_card_reorder() {
+        // The point of the fix: after a reorder, the same
+        // normaliser call returns the DAC's CARD= form
+        // regardless of what index it ended up at. (In a real
+        // deployment the persisted value would have been
+        // normalised at the last load before the reorder, so
+        // the input to this test mirrors what the operator
+        // would set after first realising the index changed —
+        // hw:0 to address the DAC at its new position.)
+        assert_eq!(
+            normalize_mixer_device("hw:0", CARDS_PI5_DAC_REORDERED).unwrap(),
+            "hw:CARD=DAC"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_device_subscript() {
+        // mixer_device occasionally carries a device subscript
+        // (`hw:3,0`). Normalisation rewrites only the card
+        // portion; the `,0` suffix is preserved verbatim.
+        assert_eq!(
+            normalize_mixer_device("hw:3,0", CARDS_PI5_DAC).unwrap(),
+            "hw:CARD=DAC,0"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_non_hw_forms() {
+        // Operator might have set a custom value like a JACK
+        // port or a software-mixer placeholder. The normaliser
+        // does not interfere.
+        assert_eq!(
+            normalize_mixer_device("default", CARDS_PI5_DAC).unwrap(),
+            "default"
+        );
+        assert_eq!(
+            normalize_mixer_device("plug:dmix", CARDS_PI5_DAC).unwrap(),
+            "plug:dmix"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_hw_with_non_numeric_card() {
+        // `hw:Loopback` is already a card name (not numeric).
+        // The current strip_prefix("hw:") path parses Loopback
+        // as a non-numeric token and passes through.
+        assert_eq!(
+            normalize_mixer_device("hw:Loopback", CARDS_PI5_DAC).unwrap(),
+            "hw:Loopback"
+        );
+    }
+
+    #[test]
+    fn normalize_errors_on_unknown_numeric_index() {
+        let err = normalize_mixer_device("hw:99", CARDS_PI5_DAC).unwrap_err();
+        match err {
+            FragmentError::MixerDeviceCardIndexNotFound {
+                requested,
+                index,
+            } => {
+                assert_eq!(requested, "hw:99");
+                assert_eq!(index, 99);
+            }
+            other => {
+                panic!("expected MixerDeviceCardIndexNotFound, got {other:?}")
+            }
+        }
     }
 }

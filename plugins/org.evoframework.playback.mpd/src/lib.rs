@@ -1266,8 +1266,9 @@ fn parse_mixer_config_from_settings_state(
         "none" => Some(MixerConfig::None),
         "hardware" => match (mixer_device, mixer_control) {
             (Some(dev), Some(ctrl)) if !dev.is_empty() && !ctrl.is_empty() => {
+                let normalised = normalise_mixer_device_or_warn(&dev);
                 Some(MixerConfig::Hardware {
-                    mixer_device: dev,
+                    mixer_device: normalised,
                     mixer_control: ctrl,
                 })
             }
@@ -1345,8 +1346,9 @@ fn mixer_config_from_toml(
                     )
                 })?
                 .to_string();
+            let normalised = normalise_mixer_device_or_warn(&mixer_device);
             Ok(MixerConfig::Hardware {
-                mixer_device,
+                mixer_device: normalised,
                 mixer_control,
             })
         }
@@ -1354,6 +1356,62 @@ fn mixer_config_from_toml(
             "mixer_type must be one of {{hardware, software, none}}; got \
              {other:?}"
         ))),
+    }
+}
+
+/// Resolve a numeric `mixer_device` (`hw:3`) to the
+/// kernel-stable named form (`hw:CARD=DAC`) by reading
+/// `/proc/asound/cards`. Pass-through for already-named forms.
+/// I/O failure (e.g. /proc/asound/cards unreadable) AND
+/// resolution failure (e.g. index 3 doesn't exist) both fall
+/// back to the original value with a WARN log — the worst case
+/// is that MPD opens the operator-supplied raw value and either
+/// works (the index happens to be right) or surfaces an MPD-side
+/// open error in the journal. The warning is the operator
+/// signal that the persisted setting should be reissued with
+/// `hw:CARD=<name>`.
+fn normalise_mixer_device_or_warn(raw: &str) -> String {
+    let cards_text = match std::fs::read_to_string(
+        mpd_fragment::PROC_ASOUND_CARDS_PATH,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                raw,
+                "could not read /proc/asound/cards to normalise mixer_device; \
+                 passing the operator-supplied value through verbatim"
+            );
+            return raw.to_string();
+        }
+    };
+    match mpd_fragment::normalize_mixer_device(raw, &cards_text) {
+        Ok(normalised) => {
+            if normalised != raw {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    raw,
+                    normalised = %normalised,
+                    "normalised numeric mixer_device to kernel-stable form \
+                     (operator-persisted value uses ALSA card index which \
+                     reorders across reboots; the rendered fragment uses \
+                     hw:CARD=<name> for stability)"
+                );
+            }
+            normalised
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                raw,
+                error = %e,
+                "mixer_device normalisation failed; passing operator-supplied \
+                 value through verbatim — MPD will either honour it or surface \
+                 a card-open error in its journal"
+            );
+            raw.to_string()
+        }
     }
 }
 
