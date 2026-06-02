@@ -60,17 +60,35 @@ pub const SPECTRUM_SUBJECT_ADDRESSING_VALUE: &str = "spectrum_frame";
 /// version field.
 pub const SPECTRUM_PAYLOAD_VERSION: u32 = 1;
 
-/// Announce the spectrum subject in its initial empty state.
-/// Called at plugin load before the capture loop starts. Best
-/// effort: announcer failures log a warn and don't refuse the
-/// load (the operator UI degrades to no-spectrum, not crash).
-pub async fn announce_initial_state(announcer: &Arc<dyn SubjectAnnouncer>) {
+/// Announce the spectrum subject and seed its initial state
+/// with the empty-frame envelope. Called at plugin load before
+/// the capture loop starts. Best effort: announcer failures log
+/// a warn and don't refuse the load (the operator UI degrades
+/// to no-spectrum, not crash).
+///
+/// The announcement carries the complete wire-shape envelope
+/// (`v`, `bins`, `channels`, `rate_hz`, zero-valued magnitudes /
+/// peak_hold, all-false onsets, zero correlation, `at_ms: 0`)
+/// via `SubjectAnnouncement::with_state`. The framework stores
+/// non-null announcement state on the subject record (see
+/// `evo::subjects::ingest`), so subscribers connecting after the
+/// announce but before the first FFT compute see the wire shape
+/// immediately — no separate `get_spectrum_frame` round-trip
+/// needed to learn the bin count / channel count / rate.
+///
+/// `rate_hz` is the value the first real frame will also carry
+/// — single source of truth via `fft::frame_rate_hz`.
+pub async fn announce_initial_state(
+    announcer: &Arc<dyn SubjectAnnouncer>,
+    rate_hz: u32,
+) {
     let addressing = ExternalAddressing::new(
         SPECTRUM_SUBJECT_ADDRESSING_SCHEME,
         SPECTRUM_SUBJECT_ADDRESSING_VALUE,
     );
     let announcement =
-        SubjectAnnouncement::new(SPECTRUM_SUBJECT_TYPE, vec![addressing]);
+        SubjectAnnouncement::new(SPECTRUM_SUBJECT_TYPE, vec![addressing])
+            .with_state(render_empty_frame(rate_hz));
     if let Err(e) = announcer.announce(announcement).await {
         tracing::warn!(
             plugin = PLUGIN_NAME,
@@ -204,11 +222,14 @@ impl SpectrumEmitter {
         Self { announcer, rate_hz }
     }
 
-    /// Announce the spectrum subject in its initial empty state.
+    /// Announce the spectrum subject and seed its initial state.
     /// Called once at plugin load; subsequent state changes go
-    /// through `emit`.
+    /// through `emit`. The emitter's cached `rate_hz` threads
+    /// into the initial empty-frame envelope so subscribers
+    /// connecting before the first FFT compute see the wire
+    /// shape immediately.
     pub async fn announce(&self) {
-        announce_initial_state(&self.announcer).await;
+        announce_initial_state(&self.announcer, self.rate_hz).await;
     }
 
     /// Publish a fresh spectrum frame on the subject. Best
@@ -223,6 +244,60 @@ impl SpectrumEmitter {
 mod tests {
     use super::*;
     use crate::fft::{OnsetFrame, BIN_COUNT, CHANNEL_COUNT};
+    use evo_plugin_sdk::contract::ReportError;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// Capturing announcer for testing. Records every `announce`
+    /// + `update_state` call so tests can assert what the
+    /// production code emitted onto the wire.
+    struct CapturingAnnouncer {
+        announced: Mutex<Vec<SubjectAnnouncement>>,
+    }
+
+    impl CapturingAnnouncer {
+        fn new() -> Self {
+            Self {
+                announced: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn announced(&self) -> Vec<SubjectAnnouncement> {
+            self.announced.lock().unwrap().clone()
+        }
+    }
+
+    impl SubjectAnnouncer for CapturingAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            announcement: SubjectAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.announced.lock().unwrap().push(announcement);
+                Ok(())
+            })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _: ExternalAddressing,
+            _: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            _: ExternalAddressing,
+            _: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     fn make_frame(
         magnitude_value: f32,
@@ -359,5 +434,52 @@ mod tests {
         let a = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let b = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn announce_initial_state_seeds_full_envelope_in_announcement() {
+        // Subscribers connecting between plugin load and first
+        // FFT compute must see the full wire shape immediately —
+        // no separate `get_spectrum_frame` round-trip required.
+        // The announcement carries the empty-frame envelope via
+        // SubjectAnnouncement::with_state; the framework stores
+        // non-null announcement state on the subject record.
+        let cap = Arc::new(CapturingAnnouncer::new());
+        let announcer: Arc<dyn SubjectAnnouncer> = cap.clone();
+        announce_initial_state(&announcer, TEST_RATE_HZ).await;
+
+        let announced = cap.announced();
+        assert_eq!(announced.len(), 1, "exactly one announce call");
+        let a = &announced[0];
+        assert_eq!(a.subject_type, SPECTRUM_SUBJECT_TYPE);
+
+        let state = &a.state;
+        assert!(!state.is_null(), "announcement state MUST be non-null");
+        assert_eq!(state["v"], SPECTRUM_PAYLOAD_VERSION);
+        assert_eq!(state["bins"], BIN_COUNT);
+        assert_eq!(state["channels"], CHANNEL_COUNT);
+        assert_eq!(state["rate_hz"], TEST_RATE_HZ);
+        assert_eq!(state["at_ms"], 0);
+
+        let mags = state["magnitudes"].as_array().unwrap();
+        assert_eq!(mags.len(), 2, "stereo magnitudes");
+        let l = mags[0].as_array().unwrap();
+        assert_eq!(l.len(), BIN_COUNT);
+        assert!(l.iter().all(|v| v.as_f64() == Some(0.0)));
+
+        let peak = state["peak_hold"].as_array().unwrap();
+        assert_eq!(peak.len(), 2);
+        let pl = peak[0].as_array().unwrap();
+        assert_eq!(pl.len(), BIN_COUNT);
+        assert!(pl.iter().all(|v| v.as_f64() == Some(0.0)));
+
+        assert_eq!(state["onsets"]["sub_bass"], false);
+        assert_eq!(state["onsets"]["bass"], false);
+        assert_eq!(state["onsets"]["mid"], false);
+        assert_eq!(state["onsets"]["high"], false);
+
+        let corr = state["correlation"].as_array().unwrap();
+        assert_eq!(corr.len(), BIN_COUNT);
+        assert!(corr.iter().all(|v| v.as_f64() == Some(0.0)));
     }
 }

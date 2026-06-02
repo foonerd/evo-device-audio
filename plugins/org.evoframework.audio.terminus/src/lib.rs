@@ -268,18 +268,20 @@ impl Plugin for AudioTerminusPlugin {
 
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
 
-            // Announce the spectrum subject once at load. The
-            // subject's state is null-ish until the first frame
-            // computes; emission of the real shape begins on the
-            // capture loop's first successful FFT. Subscribers
-            // connecting before the first frame receive the
-            // subject's nullable shape (transport_state=stopped
-            // analog: empty magnitudes); after the first frame
-            // they receive real spectra.
+            // Announce the spectrum subject once at load with a
+            // seeded empty-frame envelope. The announcement carries
+            // the full wire shape (bins / channels / rate_hz +
+            // zero-valued magnitudes / peak_hold / onsets /
+            // correlation); the framework stores it on the subject
+            // record so subscribers connecting before the first FFT
+            // compute see the wire shape immediately. After the
+            // capture loop's first frame the empty-frame state is
+            // replaced by real spectra via `emit_frame`.
             spectrum_subject::announce_initial_state(
                 self.subject_announcer
                     .as_ref()
                     .expect("subject_announcer set above"),
+                fft::frame_rate_hz(self.config.sample_rate_hz),
             )
             .await;
 
