@@ -148,10 +148,10 @@ echo "Repo root:     ${REPO_ROOT}"
 echo
 
 # ----------------------------------------------------------
-# [0/6] Pre-flight: target reachable + base install present
+# [0/7] Pre-flight: target reachable + base install present
 # + signing key resolvable when OOP plugins are shipped.
 # ----------------------------------------------------------
-echo "[0/6] pre-flight ..."
+echo "[0/7] pre-flight ..."
 
 if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
     # Verify the commons-plugin trust root is on the target.
@@ -218,12 +218,12 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [1/6] Cross-build the steward binary + every OOP plugin's
+# [1/7] Cross-build the steward binary + every OOP plugin's
 # wire binary listed in OOP_PLUGINS. Each build is invoked
 # independently so a failure in one bundle's wire binary
 # leaves the others' artefacts intact for inspection.
 # ----------------------------------------------------------
-echo "[1/6] cross-build ${DIST_CRATE} + OOP wire binaries for ${TARGET_TRIPLE} ..."
+echo "[1/7] cross-build ${DIST_CRATE} + OOP wire binaries for ${TARGET_TRIPLE} ..."
 cd "${REPO_ROOT}"
 
 CROSS_HELPER="${REPO_ROOT}/scripts/cross-build.sh"
@@ -273,9 +273,9 @@ done
 echo
 
 # ----------------------------------------------------------
-# [2/6] Stop the steward; preserve previous binary.
+# [2/7] Stop the steward; preserve previous binary.
 # ----------------------------------------------------------
-echo "[2/6] stop steward + preserve previous binary as evo-device-audio.prev ..."
+echo "[2/7] stop steward + preserve previous binary as evo-device-audio.prev ..."
 if ! ssh "${SSH_TARGET}" "
     set -e
     sudo -n systemctl stop evo || true
@@ -290,7 +290,7 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [3/6] scp the new steward binary + every OOP plugin bundle
+# [3/7] scp the new steward binary + every OOP plugin bundle
 # + install in place. Each plugin bundle is staged locally as
 # a directory containing `manifest.toml` (renamed from the
 # `manifest.oop.toml` template) and `plugin.bin` (the wire
@@ -300,7 +300,7 @@ echo
 # discovery walks `/opt/evo/plugins/` at boot and admits each
 # bundle.
 # ----------------------------------------------------------
-echo "[3/6] scp + install steward binary + OOP plugin bundles ..."
+echo "[3/7] scp + install steward binary + OOP plugin bundles ..."
 
 # Sweep stale OOP bundle dirs on the target. Plugin dirs
 # under `/opt/evo/plugins/` that are NOT in this deploy's
@@ -416,7 +416,7 @@ done
 echo
 
 # ----------------------------------------------------------
-# [4/6] Install catalogue. Composes the same way bootstrap.sh
+# [4/7] Install catalogue. Composes the same way bootstrap.sh
 # does (prepend `schema_version = 1` to dist/catalogue/
 # audio-rack.toml) and atomically installs at the canonical
 # /opt/evo/catalogue/default.toml path. Catalogue updates MUST
@@ -432,7 +432,7 @@ echo
 # file differs from the prior install, the prior is preserved
 # as default.toml.prev for single-step rollback.
 # ----------------------------------------------------------
-echo "[4/6] install catalogue (composed from dist/catalogue/audio-rack.toml) ..."
+echo "[4/7] install catalogue (composed from dist/catalogue/audio-rack.toml) ..."
 CATALOGUE_LOCAL_FRAGMENT="${REPO_ROOT}/dist/catalogue/audio-rack.toml"
 if [[ ! -f "${CATALOGUE_LOCAL_FRAGMENT}" ]]; then
     echo "FAIL: catalogue fragment missing at ${CATALOGUE_LOCAL_FRAGMENT}" >&2
@@ -474,9 +474,94 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [5/6] Start steward.
+# [5/7] Install asound.conf. Composes the same way bootstrap.sh
+# does (sed-substitute @EVO_AUDIO_CARD@ in dist/alsa/asound.conf)
+# and atomically installs at /etc/asound.conf. The substituted
+# card name is extracted from the target's CURRENT
+# /etc/asound.conf so the operator's first-install card choice
+# is preserved verbatim across redeploys.
+#
+# asound.conf changes MUST travel with binary changes that
+# depend on them — when the playback chain's ALSA composition
+# shape changes (e.g. MPD-level vs ALSA-tee tap split), the
+# steward's plugins probe the new asound at admission. A binary
+# that expects a new pcm definition but reads a stale
+# asound.conf yields a half-state at the audio layer. Running
+# this on every deploy makes the steward + asound.conf coherent
+# by construction; if dist/alsa/asound.conf (composed) hasn't
+# changed the install is a byte-identical no-op.
+#
+# Refuses with a clear error if the target has no
+# /etc/asound.conf to extract the card name from — that
+# indicates bootstrap.sh has not yet run on the target and the
+# operator must run it first (it owns the snd-aloop module
+# load + the systemd drop-ins that deploy alone cannot
+# stand up).
+#
+# Backup posture mirrors the catalogue step: when the new
+# composed file differs from the prior install, the prior is
+# preserved as /etc/asound.conf.prev for single-step rollback.
 # ----------------------------------------------------------
-echo "[5/6] start steward ..."
+echo "[5/7] install asound.conf (composed from dist/alsa/asound.conf) ..."
+ASOUND_LOCAL_TEMPLATE="${REPO_ROOT}/dist/alsa/asound.conf"
+if [[ ! -f "${ASOUND_LOCAL_TEMPLATE}" ]]; then
+    echo "FAIL: asound.conf template missing at ${ASOUND_LOCAL_TEMPLATE}" >&2
+    exit 3
+fi
+# Extract the substituted card name from the target's CURRENT
+# /etc/asound.conf. Both `pcm.evo_dac` and `ctl.evo` use the
+# same card name; either yields the value. awk extracts the
+# ctl.evo block; sed pulls the quoted card name out.
+CARD_NAME="$(ssh "${SSH_TARGET}" '
+    awk "/^ctl\\.evo \\{/,/^\\}/" /etc/asound.conf 2>/dev/null \
+        | sed -n "s/.*card *\"\\([^\"]*\\)\".*/\\1/p" | head -1
+')"
+if [[ -z "${CARD_NAME}" ]]; then
+    echo "FAIL: could not extract @EVO_AUDIO_CARD@ value from target's" >&2
+    echo "      /etc/asound.conf (bootstrap.sh must have run first)" >&2
+    exit 3
+fi
+ASOUND_COMPOSED="$(mktemp)"
+sed -e "s|@EVO_AUDIO_CARD@|${CARD_NAME}|g" \
+    "${ASOUND_LOCAL_TEMPLATE}" > "${ASOUND_COMPOSED}"
+# Placeholder-residue invariant: refuse to install a file that
+# still carries any `@SOMETHING@` token (substitution chain
+# incomplete; a silent install leaves audio unplayable).
+if RESIDUE="$(grep -oE '@[A-Z_][A-Z0-9_]*@' "${ASOUND_COMPOSED}" \
+        | sort -u | head -5)"; [[ -n "${RESIDUE}" ]]; then
+    echo "FAIL: rendered asound.conf still carries unresolved placeholders:" >&2
+    printf '%s\n' "${RESIDUE}" | sed 's/^/  /' >&2
+    rm -f "${ASOUND_COMPOSED}"
+    exit 3
+fi
+ASOUND_REMOTE_TMP="/tmp/evo-asound-$$.conf"
+if ! scp -q "${ASOUND_COMPOSED}" \
+    "${SSH_TARGET}:${ASOUND_REMOTE_TMP}"; then
+    rm -f "${ASOUND_COMPOSED}"
+    echo "FAIL: scp asound.conf to target failed" >&2
+    exit 3
+fi
+rm -f "${ASOUND_COMPOSED}"
+if ! ssh "${SSH_TARGET}" "
+    set -e
+    if [[ -f /etc/asound.conf ]] && \
+       ! cmp -s ${ASOUND_REMOTE_TMP} /etc/asound.conf; then
+        sudo -n cp -a /etc/asound.conf /etc/asound.conf.prev
+    fi
+    sudo -n install -m 0644 -o root -g root \
+        ${ASOUND_REMOTE_TMP} /etc/asound.conf
+    rm -f ${ASOUND_REMOTE_TMP}
+"; then
+    echo "FAIL: install asound.conf on target failed" >&2
+    exit 3
+fi
+echo "  ok (card=${CARD_NAME})"
+echo
+
+# ----------------------------------------------------------
+# [6/7] Start steward.
+# ----------------------------------------------------------
+echo "[6/7] start steward ..."
 if ! ssh "${SSH_TARGET}" 'sudo -n systemctl start evo'; then
     echo "FAIL: systemctl start evo returned non-zero" >&2
     exit 4
@@ -487,9 +572,9 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [6/6] Verify service is active + steward emitted ready.
+# [7/7] Verify service is active + steward emitted ready.
 # ----------------------------------------------------------
-echo "[6/6] verify ..."
+echo "[7/7] verify ..."
 ACTIVE_STATE="$(ssh "${SSH_TARGET}" 'systemctl is-active evo' 2>/dev/null || true)"
 if [[ "${ACTIVE_STATE}" != "active" ]]; then
     echo "FAIL: evo.service is not active (state=${ACTIVE_STATE})" >&2

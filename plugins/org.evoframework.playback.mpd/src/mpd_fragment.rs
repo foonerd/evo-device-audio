@@ -124,13 +124,57 @@ pub enum FragmentError {
     EncodedPassthroughNotSupported,
 }
 
-/// Render an MPD `audio_output` configuration block targeting
-/// the supplied [`WriteEndpoint`] with the supplied
-/// [`MixerConfig`].
+/// Canonical ALSA alias the audio-terminus plugin captures
+/// from. Matches the `pcm.evo_terminus_tap` definition in
+/// `dist/alsa/asound.conf` (snd-aloop subdev 7 playback side).
+/// The terminus plugin opens the paired capture side at
+/// `hw:Loopback,1,7` to read the same frames MPD writes here.
+const TERMINUS_OUTPUT_DEVICE: &str = "evo_terminus_tap";
+
+/// Wire format of the terminus loopback contract. Pinned at
+/// the rate + width + channels the terminus capture loop opens
+/// the loopback's capture half with (see
+/// `audio.terminus/src/capture.rs`'s HwParams setup). MPD's
+/// terminus audio_output writes in this exact format; MPD
+/// resamples / re-quantises the source internally if it
+/// differs from the listening output's format. snd-aloop's
+/// playback + capture halves must agree on the format, so this
+/// constant is the wire-shape contract between the two
+/// plugins.
+const TERMINUS_FORMAT_STR: &str = "48000:32:2";
+
+/// Render the MPD fragment carrying the audio_output blocks
+/// the playback chain needs.
 ///
-/// The output is a complete MPD config fragment terminated by a
-/// trailing newline; concatenation into a larger file is the
-/// caller's concern.
+/// Emits TWO blocks:
+///
+/// 1. **listening output** — targets the supplied
+///    [`WriteEndpoint`] with the supplied [`MixerConfig`]. This
+///    is the operator-audible path; the mixer_type honours
+///    whatever the operator chose (hardware / software / none).
+///
+/// 2. **terminus output** — fixed device
+///    `pcm.evo_terminus_tap`, fixed format
+///    `[TERMINUS_FORMAT_STR]`, mixer_type `none`. The terminus
+///    output is always full-scale source audio — never
+///    attenuated by MPD's mixer — so the audio-terminus
+///    plugin's tap captures pre-fader signal regardless of the
+///    listening output's mixer mode.
+///
+/// Splitting the tap at MPD's output stage (rather than via an
+/// ALSA multi-slave tee downstream of MPD) keeps the tap
+/// pre-fader on every rig class: hardware-mixer DAC,
+/// software-mixer USB DAC, Bluetooth output, multi-room
+/// receiver. The listening output stays operator-configured;
+/// the terminus output is wire-shape-contracted with the
+/// terminus plugin.
+///
+/// Failure semantics: MPD's audio_output blocks are
+/// independent. A terminus-output open failure (snd-aloop
+/// kernel module unavailable, Loopback subdev 7 in use) does
+/// not disrupt the listening output — local audio keeps
+/// reaching the DAC regardless of terminus health (floor
+/// invariant preserved by construction).
 pub fn render_audio_output_fragment(
     ep: &WriteEndpoint,
     mixer: &MixerConfig,
@@ -159,6 +203,14 @@ pub fn render_audio_output_fragment(
          device          \"{device}\"\n    \
          format          \"{format_str}\"\n\
          {mixer_block}\
+         }}\n\
+         \n\
+         audio_output {{\n    \
+         type            \"alsa\"\n    \
+         name            \"evo-audio-terminus-tap\"\n    \
+         device          \"{TERMINUS_OUTPUT_DEVICE}\"\n    \
+         format          \"{TERMINUS_FORMAT_STR}\"\n    \
+         mixer_type      \"none\"\n\
          }}\n"
     ))
 }
@@ -532,5 +584,109 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ------- Audio-terminus tap output ------------------------
+    //
+    // The fragment emits TWO audio_output blocks: a listening
+    // output (operator-configurable mixer) + a terminus output
+    // (mixer_type "none", always full-scale source audio). The
+    // terminus output makes the spectrum tap pre-fader on every
+    // rig class without an ALSA-level workaround.
+
+    fn count_audio_output_blocks(fragment: &str) -> usize {
+        fragment.matches("audio_output {").count()
+    }
+
+    #[test]
+    fn render_emits_two_audio_output_blocks() {
+        let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS16Le, 44_100, 2);
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
+        assert_eq!(
+            count_audio_output_blocks(&out),
+            2,
+            "fragment must emit listening output + terminus output; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn terminus_block_carries_fixed_device_format_and_none_mixer() {
+        let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS24Le, 96_000, 2);
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
+        assert!(
+            out.contains("name            \"evo-audio-terminus-tap\""),
+            "terminus block missing canonical name; got:\n{out}"
+        );
+        assert!(
+            out.contains("device          \"evo_terminus_tap\""),
+            "terminus block missing canonical device; got:\n{out}"
+        );
+        assert!(
+            out.contains("format          \"48000:32:2\""),
+            "terminus block must carry the wire-shape contract \
+             format (48000:32:2); got:\n{out}"
+        );
+        assert!(
+            out.contains("mixer_type      \"none\""),
+            "terminus block must use mixer_type \"none\" so the \
+             tap is pre-fader regardless of operator volume; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn terminus_block_present_under_hardware_mixer() {
+        // Listening output uses Hardware mixer (DAC drives gain
+        // downstream); terminus output MUST still be present
+        // with mixer_type "none" so the wire contract is
+        // independent of the listening mixer mode.
+        let ep = pcm_endpoint("hw:0,0", PcmCodec::PcmS16Le, 44_100, 2);
+        let mixer = MixerConfig::Hardware {
+            mixer_device: "hw:0".to_string(),
+            mixer_control: "Digital".to_string(),
+        };
+        let out = render_audio_output_fragment(&ep, &mixer).unwrap();
+        assert_eq!(count_audio_output_blocks(&out), 2);
+        assert!(out.contains("mixer_type      \"hardware\""));
+        assert!(out.contains("mixer_type      \"none\""));
+        assert!(out.contains("device          \"evo_terminus_tap\""));
+    }
+
+    #[test]
+    fn terminus_block_present_under_none_mixer() {
+        // Listening output uses None mixer (downstream preamp /
+        // AVR owns gain); terminus output MUST still be present
+        // with mixer_type "none" — the terminus's "none" is
+        // mechanically identical but the contract is
+        // independent of what the listening output declared.
+        let ep = pcm_endpoint("hw:0,0", PcmCodec::PcmS16Le, 44_100, 2);
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::None).unwrap();
+        assert_eq!(count_audio_output_blocks(&out), 2);
+        // Both blocks carry mixer_type "none"; the count must
+        // be 2 (one per block).
+        assert_eq!(
+            out.matches("mixer_type      \"none\"").count(),
+            2,
+            "both listening + terminus carry mixer_type none; got:\n{out}"
+        );
+        assert!(out.contains("device          \"evo_terminus_tap\""));
+    }
+
+    #[test]
+    fn terminus_block_present_under_software_mixer() {
+        // The defect-of-record: SW-mixer rigs attenuate samples
+        // before writing to ALSA. The terminus block with
+        // mixer_type "none" is the fix — MPD writes full-scale
+        // source to the terminus output regardless of the
+        // listening output's software gain.
+        let ep = pcm_endpoint("hw:0,0", PcmCodec::PcmS16Le, 44_100, 2);
+        let out =
+            render_audio_output_fragment(&ep, &MixerConfig::Software).unwrap();
+        assert_eq!(count_audio_output_blocks(&out), 2);
+        assert!(out.contains("mixer_type      \"software\""));
+        assert!(out.contains("mixer_type      \"none\""));
+        assert!(out.contains("device          \"evo_terminus_tap\""));
     }
 }
