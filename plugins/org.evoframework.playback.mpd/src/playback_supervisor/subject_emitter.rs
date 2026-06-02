@@ -241,9 +241,15 @@ impl SubjectEmitter {
 
     /// Announce the singleton `stream_format` subject. Called
     /// once at load alongside the warden's other one-time
-    /// announcements. The subject's state is initialised empty;
-    /// the first call to [`SubjectEmitter::update_stream_format`]
-    /// publishes the warden's actual format.
+    /// announcements. The subject's state is seeded with an
+    /// empty-envelope payload via `SubjectAnnouncement::with_state`
+    /// so subscribers connecting between announce and the first
+    /// `update_stream_format` see the wire shape immediately —
+    /// no separate read round-trip needed to learn the payload
+    /// version + field set. The framework stores non-null
+    /// announcement state on the subject record, so the seeded
+    /// envelope persists until the reactor's first publish
+    /// overwrites it with the live format.
     ///
     /// Best-effort: errors from the announcer are logged but
     /// not propagated. Playback is never disrupted by an
@@ -255,7 +261,8 @@ impl SubjectEmitter {
         let announcement = SubjectAnnouncement::new(
             SUBJECT_TYPE_STREAM_FORMAT,
             vec![addressing],
-        );
+        )
+        .with_state(render_empty_stream_format());
         if let Err(e) = self.subjects.announce(announcement).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -367,6 +374,25 @@ impl SubjectEmitter {
             );
         }
     }
+}
+
+/// Build the empty-envelope payload for the stream_format
+/// subject's initial announcement state. Carries the wire-shape
+/// constants (`v`, `effective: null`, `source: null`) so a
+/// subscriber connecting before the reactor's first publish
+/// sees the full payload shape (just with no live values
+/// populated yet). The first `update_stream_format` call from
+/// the reactor overwrites this with the live envelope.
+///
+/// Pure projection — no I/O, no state. Extracted out of the
+/// SubjectEmitter so the renderer is unit-testable against
+/// the wire contract.
+pub(crate) fn render_empty_stream_format() -> serde_json::Value {
+    json!({
+        "v": STREAM_FORMAT_PAYLOAD_VERSION,
+        "effective": serde_json::Value::Null,
+        "source": serde_json::Value::Null,
+    })
 }
 
 /// Build the JSON state payload for the now_playing subject.
@@ -829,6 +855,38 @@ mod tests {
         assert_eq!(ann.addressings.len(), 1);
         assert_eq!(ann.addressings[0].scheme, "evo.audio.playback");
         assert_eq!(ann.addressings[0].value, "stream_format");
+    }
+
+    #[tokio::test]
+    async fn announce_stream_format_seeds_empty_envelope_in_announcement_state()
+    {
+        // Subscribers connecting between plugin load and the
+        // reactor's first publish must see the full wire shape
+        // immediately — no separate get_stream_format
+        // round-trip required to learn payload version + field
+        // set. The announcement carries the empty envelope via
+        // SubjectAnnouncement::with_state; the framework stores
+        // non-null announcement state on the subject record.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.announce_stream_format().await;
+        assert_eq!(subjects.count(), 1);
+        let ann = subjects.at(0).unwrap();
+        let state = &ann.state;
+        assert!(
+            !state.is_null(),
+            "announcement state MUST be non-null; got {state}"
+        );
+        assert_eq!(state["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert!(state["effective"].is_null());
+        assert!(state["source"].is_null());
+    }
+
+    #[test]
+    fn render_empty_stream_format_carries_wire_contract() {
+        let state = render_empty_stream_format();
+        assert_eq!(state["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert!(state["effective"].is_null());
+        assert!(state["source"].is_null());
     }
 
     #[tokio::test]
