@@ -14,7 +14,8 @@
 //! { v: 1,
 //!   bins: 256,
 //!   channels: 2,
-//!   rate_hz: 30,
+//!   rate_hz: <actual capture-loop cadence, computed from
+//!            sample_rate_hz / FFT_SIZE via fft::frame_rate_hz>,
 //!   magnitudes: [[256 f32 L], [256 f32 R]],
 //!   peak_hold:  [[256 f32 L], [256 f32 R]],
 //!   onsets:     { sub_bass, bass, mid, high },
@@ -84,15 +85,21 @@ pub async fn announce_initial_state(announcer: &Arc<dyn SubjectAnnouncer>) {
 /// calls this on every successful FFT compute. Best effort: an
 /// announcer error logs at debug (every-frame errors at warn
 /// would flood) and is otherwise silent; the next frame retries.
+///
+/// `rate_hz` is the capture loop's actual cadence (derived once
+/// at loop construction via `fft::frame_rate_hz`); it threads
+/// through to the wire `rate_hz` field so subscribers see the
+/// cadence they actually receive frames at.
 pub async fn emit_frame(
     announcer: &Arc<dyn SubjectAnnouncer>,
     frame: &PerceptualFrame,
+    rate_hz: u32,
 ) {
     let addressing = ExternalAddressing::new(
         SPECTRUM_SUBJECT_ADDRESSING_SCHEME,
         SPECTRUM_SUBJECT_ADDRESSING_VALUE,
     );
-    let state = render_spectrum_frame(frame);
+    let state = render_spectrum_frame(frame, rate_hz);
     if let Err(e) = announcer.update_state(addressing, state).await {
         tracing::debug!(
             plugin = PLUGIN_NAME,
@@ -106,7 +113,14 @@ pub async fn emit_frame(
 /// payload. Public-within-crate for testing + reuse by the
 /// `get_spectrum_frame` read handler (which projects the same
 /// way against the latest cached frame).
-pub fn render_spectrum_frame(frame: &PerceptualFrame) -> serde_json::Value {
+///
+/// `rate_hz` is the cadence value the caller derives via
+/// `fft::frame_rate_hz(sample_rate_hz)` — single source of truth
+/// for the wire field. No default; callers supply.
+pub fn render_spectrum_frame(
+    frame: &PerceptualFrame,
+    rate_hz: u32,
+) -> serde_json::Value {
     // Split the channel-interleaved magnitudes / peak_hold back
     // into the two-arrays-of-256 wire shape the renderer expects.
     let mut mags_l = Vec::with_capacity(BIN_COUNT);
@@ -125,7 +139,7 @@ pub fn render_spectrum_frame(frame: &PerceptualFrame) -> serde_json::Value {
         "v": SPECTRUM_PAYLOAD_VERSION,
         "bins": BIN_COUNT,
         "channels": CHANNEL_COUNT,
-        "rate_hz": 30,
+        "rate_hz": rate_hz,
         "magnitudes": [mags_l, mags_r],
         "peak_hold": [peak_l, peak_r],
         "onsets": {
@@ -144,14 +158,18 @@ pub fn render_spectrum_frame(frame: &PerceptualFrame) -> serde_json::Value {
 /// wire shape, all-zero magnitudes + peak_hold, all-false
 /// onsets, zero correlation, `at_ms: 0`. Renderers handle this
 /// as "silent" — the visual renders idle.
-pub fn render_empty_frame() -> serde_json::Value {
+///
+/// `rate_hz` matches the value `render_spectrum_frame` would
+/// emit once the capture loop computes its first frame — single
+/// source of truth via `fft::frame_rate_hz`.
+pub fn render_empty_frame(rate_hz: u32) -> serde_json::Value {
     let zero_bins: Vec<f32> = vec![0.0; BIN_COUNT];
     let zero_corr: Vec<f32> = vec![0.0; BIN_COUNT];
     json!({
         "v": SPECTRUM_PAYLOAD_VERSION,
         "bins": BIN_COUNT,
         "channels": CHANNEL_COUNT,
-        "rate_hz": 30,
+        "rate_hz": rate_hz,
         "magnitudes": [zero_bins.clone(), zero_bins.clone()],
         "peak_hold": [zero_bins.clone(), zero_bins],
         "onsets": {
@@ -165,20 +183,25 @@ pub fn render_empty_frame() -> serde_json::Value {
     })
 }
 
-/// Thin wrapper bundling the announcer + a stable addressing
-/// so callers don't re-construct the addressing on every emit.
-/// Mirrors the playback.mpd `SubjectEmitter` shape.
+/// Thin wrapper bundling the announcer, a stable addressing,
+/// and the wire `rate_hz` so callers don't re-construct any of
+/// them on every emit. Mirrors the playback.mpd `SubjectEmitter`
+/// shape.
 #[allow(dead_code)]
 pub struct SpectrumEmitter {
     announcer: Arc<dyn SubjectAnnouncer>,
+    rate_hz: u32,
 }
 
 impl SpectrumEmitter {
     /// Construct an emitter bound to the supplied announcer.
     /// The announcer is the plugin's `LoadContext.subject_announcer`
     /// clone; cheap to wrap since SpectrumEmitter holds an Arc.
-    pub fn new(announcer: Arc<dyn SubjectAnnouncer>) -> Self {
-        Self { announcer }
+    /// `rate_hz` is the value the wire field carries on every emit
+    /// — derived once via `fft::frame_rate_hz(sample_rate_hz)` at
+    /// emitter construction.
+    pub fn new(announcer: Arc<dyn SubjectAnnouncer>, rate_hz: u32) -> Self {
+        Self { announcer, rate_hz }
     }
 
     /// Announce the spectrum subject in its initial empty state.
@@ -192,7 +215,7 @@ impl SpectrumEmitter {
     /// effort: announcer errors log at debug and do not fail
     /// the capture loop.
     pub async fn emit(&self, frame: &PerceptualFrame) {
-        emit_frame(&self.announcer, frame).await;
+        emit_frame(&self.announcer, frame, self.rate_hz).await;
     }
 }
 
@@ -226,21 +249,46 @@ mod tests {
         }
     }
 
+    /// Canonical reference rate used across these tests. Matches
+    /// `fft::frame_rate_hz(48_000)` (48 kHz / 1024-point FFT
+    /// rounds to 47) which is what every reference rig emits on
+    /// the wire today.
+    const TEST_RATE_HZ: u32 = 47;
+
     #[test]
     fn render_spectrum_frame_emits_v1_envelope() {
         let frame = make_frame(0.5, 0.7, OnsetFrame::default(), 1_000);
-        let v = render_spectrum_frame(&frame);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(v["v"], SPECTRUM_PAYLOAD_VERSION);
         assert_eq!(v["bins"], BIN_COUNT);
         assert_eq!(v["channels"], CHANNEL_COUNT);
-        assert_eq!(v["rate_hz"], 30);
+        assert_eq!(v["rate_hz"], TEST_RATE_HZ);
         assert_eq!(v["at_ms"], 1_000);
+    }
+
+    #[test]
+    fn render_spectrum_frame_rate_hz_reflects_parameter() {
+        // The wire `rate_hz` field MUST be parameter-driven — not
+        // a hardcoded literal. Three distinct rates, three
+        // distinct wire values; would have failed under the
+        // hardcoded-30 form regardless of input.
+        let frame = make_frame(0.0, 0.0, OnsetFrame::default(), 0);
+        assert_eq!(render_spectrum_frame(&frame, 30)["rate_hz"], 30);
+        assert_eq!(render_spectrum_frame(&frame, 47)["rate_hz"], 47);
+        assert_eq!(render_spectrum_frame(&frame, 94)["rate_hz"], 94);
+    }
+
+    #[test]
+    fn render_empty_frame_rate_hz_reflects_parameter() {
+        assert_eq!(render_empty_frame(30)["rate_hz"], 30);
+        assert_eq!(render_empty_frame(47)["rate_hz"], 47);
+        assert_eq!(render_empty_frame(94)["rate_hz"], 94);
     }
 
     #[test]
     fn render_spectrum_frame_splits_channels_into_two_arrays() {
         let frame = make_frame(0.5, 0.7, OnsetFrame::default(), 2_000);
-        let v = render_spectrum_frame(&frame);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let mags = v["magnitudes"].as_array().expect("magnitudes is array");
         assert_eq!(mags.len(), 2, "two channels");
         let l = mags[0].as_array().expect("L is array");
@@ -256,7 +304,7 @@ mod tests {
     #[test]
     fn render_spectrum_frame_carries_peak_hold() {
         let frame = make_frame(0.0, 0.9, OnsetFrame::default(), 0);
-        let v = render_spectrum_frame(&frame);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let peak = v["peak_hold"].as_array().expect("peak_hold is array");
         assert_eq!(peak.len(), 2);
         let l = peak[0].as_array().unwrap();
@@ -273,7 +321,7 @@ mod tests {
             high: false,
         };
         let frame = make_frame(0.0, 0.0, onsets, 0);
-        let v = render_spectrum_frame(&frame);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(v["onsets"]["sub_bass"], true);
         assert_eq!(v["onsets"]["bass"], false);
         assert_eq!(v["onsets"]["mid"], true);
@@ -283,7 +331,7 @@ mod tests {
     #[test]
     fn render_spectrum_frame_carries_correlation() {
         let frame = make_frame(0.0, 0.0, OnsetFrame::default(), 0);
-        let v = render_spectrum_frame(&frame);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let corr = v["correlation"].as_array().expect("correlation is array");
         assert_eq!(corr.len(), BIN_COUNT);
         for i in 0..BIN_COUNT {
@@ -293,10 +341,11 @@ mod tests {
 
     #[test]
     fn render_empty_frame_matches_v1_shape() {
-        let v = render_empty_frame();
+        let v = render_empty_frame(TEST_RATE_HZ);
         assert_eq!(v["v"], SPECTRUM_PAYLOAD_VERSION);
         assert_eq!(v["bins"], BIN_COUNT);
         assert_eq!(v["channels"], CHANNEL_COUNT);
+        assert_eq!(v["rate_hz"], TEST_RATE_HZ);
         assert_eq!(v["at_ms"], 0);
         let mags = v["magnitudes"].as_array().unwrap();
         assert_eq!(mags.len(), 2);
@@ -307,8 +356,8 @@ mod tests {
     #[test]
     fn render_is_deterministic_for_identical_input() {
         let frame = make_frame(0.3, 0.4, OnsetFrame::default(), 12345);
-        let a = render_spectrum_frame(&frame);
-        let b = render_spectrum_frame(&frame);
+        let a = render_spectrum_frame(&frame, TEST_RATE_HZ);
+        let b = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(a, b);
     }
 }

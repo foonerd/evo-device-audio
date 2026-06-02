@@ -76,6 +76,10 @@ fn run_capture_loop(
     shutdown: Arc<Notify>,
 ) {
     let mut analyser = SpectrumAnalyser::new(config.sample_rate_hz);
+    // Single source of truth for the wire `rate_hz` field. Derived
+    // once at loop construction since neither sample_rate_hz nor
+    // FFT_SIZE change within a capture lifetime.
+    let rate_hz = crate::fft::frame_rate_hz(config.sample_rate_hz);
     let mut consecutive_failures: u32 = 0;
     let mut backoff = RECONNECT_INITIAL;
 
@@ -140,6 +144,7 @@ fn run_capture_loop(
             &latest_frame,
             &announcer,
             &shutdown,
+            rate_hz,
         );
         match exit_inner {
             InnerExit::Shutdown => return,
@@ -167,6 +172,7 @@ fn run_fft_loop(
     latest_frame: &Arc<Mutex<Option<PerceptualFrame>>>,
     announcer: &Arc<dyn SubjectAnnouncer>,
     shutdown: &Arc<Notify>,
+    rate_hz: u32,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
     // -> FFT_SIZE * 2 i32s per frame.
@@ -222,8 +228,12 @@ fn run_fft_loop(
                 }
                 let announcer = Arc::clone(announcer);
                 tokio_handle.spawn(async move {
-                    spectrum_subject::emit_frame(&announcer, &frame_clone)
-                        .await;
+                    spectrum_subject::emit_frame(
+                        &announcer,
+                        &frame_clone,
+                        rate_hz,
+                    )
+                    .await;
                 });
             }
             Err(e) => {

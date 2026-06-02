@@ -54,6 +54,23 @@ pub const CHANNEL_COUNT: usize = 2;
 /// the mel projection collapses anyway.
 pub const FFT_SIZE: usize = 1024;
 
+/// Derive the frame cadence the capture loop runs at, given the
+/// configured sample rate. The capture loop is ALSA-paced: every
+/// `FFT_SIZE` samples drawn at `sample_rate_hz` yields one frame.
+/// Cadence in Hz = `sample_rate_hz / FFT_SIZE` (real value); we
+/// round to the nearest integer for the wire field since
+/// `audio_playback_spectrum_frame.rate_hz` is a `u32`. At 48 kHz
+/// the canonical reference rig sees `48000 / 1024 = 46.875` → 47.
+///
+/// This is the single source of truth for the wire `rate_hz`
+/// field; both the capture loop's emit path and the
+/// `get_spectrum_frame` read handler call this so the value the
+/// renderer reads always matches the cadence it actually receives
+/// frames at.
+pub fn frame_rate_hz(sample_rate_hz: u32) -> u32 {
+    (sample_rate_hz as f64 / FFT_SIZE as f64).round() as u32
+}
+
 /// Mel-scale low-frequency cutoff. 20 Hz is the conventional
 /// audible-band lower bound.
 pub const MEL_LOW_HZ: f32 = 20.0;
@@ -443,6 +460,22 @@ fn compute_band_magnitudes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_hz_rounds_canonical_rates_to_nearest_integer() {
+        // 48 kHz @ 1024-point FFT = 46.875 → 47.
+        assert_eq!(frame_rate_hz(48_000), 47);
+        // 44.1 kHz @ 1024-point FFT = 43.066 → 43.
+        assert_eq!(frame_rate_hz(44_100), 43);
+        // 96 kHz @ 1024-point FFT = 93.75 → 94.
+        assert_eq!(frame_rate_hz(96_000), 94);
+        // 192 kHz @ 1024-point FFT = 187.5 → 188 (banker's-style
+        // round-half-up).
+        assert_eq!(frame_rate_hz(192_000), 188);
+        // Edge: sub-FFT-window sample rate (degenerate, never hit
+        // in practice but mathematically defined) rounds to 0.
+        assert_eq!(frame_rate_hz(500), 0);
+    }
 
     fn make_sine(freq_hz: f32, sample_rate_hz: u32, len: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(len);

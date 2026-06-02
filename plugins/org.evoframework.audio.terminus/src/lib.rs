@@ -405,9 +405,13 @@ impl AudioTerminusPlugin {
         let frame_guard = self.latest_frame.lock().map_err(|_| {
             PluginError::Permanent("latest_frame mutex poisoned".to_string())
         })?;
+        // Same cadence the capture loop emits with. Single source
+        // of truth via `fft::frame_rate_hz` so the read-verb path
+        // and the subject-emit path never disagree on the wire.
+        let rate_hz = fft::frame_rate_hz(self.config.sample_rate_hz);
         let payload = match frame_guard.as_ref() {
-            Some(frame) => render_spectrum_frame(frame),
-            None => spectrum_subject::render_empty_frame(),
+            Some(frame) => render_spectrum_frame(frame, rate_hz),
+            None => spectrum_subject::render_empty_frame(rate_hz),
         };
         let body = serde_json::to_vec(&payload).map_err(|e| {
             PluginError::Permanent(format!(
