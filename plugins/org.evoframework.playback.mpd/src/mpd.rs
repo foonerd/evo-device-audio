@@ -87,4 +87,6 @@ mod types;
 pub(crate) use connection::{ConnectTimeouts, MpdConnection};
 pub(crate) use endpoint::MpdEndpoint;
 pub(crate) use error::MpdError;
-pub(crate) use types::{IdleSubsystem, MpdSong, MpdStatus, PlayState};
+pub(crate) use types::{
+    derive_source_codec_name, IdleSubsystem, MpdSong, MpdStatus, PlayState,
+};

@@ -287,6 +287,16 @@ async fn emit_now_playing(
             return;
         }
     };
+    // Publish the source codec name BEFORE now_playing. The
+    // source_codec is derived from the file extension on the
+    // currentsong file: path; `None` covers both "no current
+    // song" and "current song has an unknown extension". The
+    // stream_format subject's `source_codec` field is therefore
+    // always coherent with the currentsong state subscribers
+    // observe on `audio_playback_now_playing`.
+    let source_codec = song.as_ref().and_then(|s| s.codec_name.as_deref());
+    subject_emitter.update_source_codec(source_codec).await;
+
     // The ambient observer cannot know the operator's mute
     // intent (mute state is supervisor-task-local). Report the
     // raw MPD volume; consumers that distinguish muted-vs-zero

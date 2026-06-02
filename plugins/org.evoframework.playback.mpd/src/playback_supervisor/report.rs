@@ -291,6 +291,7 @@ mod tests {
             artist: Some("An Artist".to_string()),
             album: Some("An Album".to_string()),
             duration: Some(Duration::from_millis(180_000)),
+            codec_name: Some("flac".to_string()),
         };
         let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();
@@ -352,6 +353,7 @@ mod tests {
             artist: None,
             album: None,
             duration: None,
+            codec_name: Some("flac".to_string()),
         };
         let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();
@@ -465,6 +467,7 @@ mod tests {
             artist: Some("A".to_string()),
             album: Some("B".to_string()),
             duration: Some(Duration::from_millis(300)),
+            codec_name: Some("flac".to_string()),
         };
         let r = PlaybackStateReport::from_mpd(status, Some(song), false);
         let out = r.serialise();

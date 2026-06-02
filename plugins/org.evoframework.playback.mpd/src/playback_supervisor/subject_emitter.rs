@@ -129,6 +129,59 @@ const UNKNOWN_ARTIST: &str = "unknown";
 /// produces a valid (albeit slightly odd-looking) addressing.
 const ALBUM_ADDRESSING_SEPARATOR: char = '|';
 
+// ----- envelope merge state -----
+
+/// Typed in-memory state behind the `audio_playback_stream_format`
+/// subject's wire envelope.
+///
+/// The envelope has three independently-sourced inputs:
+///
+/// - `effective`: from the route-change reactor (the audio-plane
+///   endpoint after every chain transformation; what reaches the
+///   DAC).
+/// - `source_format`: a structured PCM/DSD shape MPD's surface
+///   does not honestly expose today. MPD's `audio:` field reports
+///   the OUTPUT format MPD produces (post-decode, post-resample,
+///   post-DoP-wrap), not the source. Held in the state so a
+///   future, honest source-shape signal (e.g. magic-byte probe)
+///   can flow through this merge point without further refactor.
+///   Currently always `None`.
+/// - `source_codec`: from the ambient observer's currentsong
+///   file-extension derivation. Authoritative source signal MPD
+///   does expose. `None` when the path lacks an extension or the
+///   extension is not in the well-known set.
+///
+/// Each input is settable independently. Every set republishes
+/// the merged envelope; subscribers see the same wire shape
+/// regardless of which input changed.
+#[derive(Debug, Clone, Default)]
+struct EnvelopeState {
+    effective: Option<AudioFormat>,
+    source_format: Option<AudioFormat>,
+    source_codec: Option<String>,
+}
+
+impl EnvelopeState {
+    /// Empty state — all three inputs unset. The wire envelope
+    /// rendered from this is the seeded announcement state.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Render the merged wire envelope. The shape is uniform:
+    /// any subset of inputs unset renders that field as JSON
+    /// null. Subscribers parse the same payload version + field
+    /// set in every state.
+    fn render(&self) -> serde_json::Value {
+        json!({
+            "v": STREAM_FORMAT_PAYLOAD_VERSION,
+            "effective": self.effective,
+            "source": self.source_format,
+            "source_codec": self.source_codec,
+        })
+    }
+}
+
 // ----- the emitter -----
 
 /// Bundle of subject and relation announcer handles.
@@ -141,16 +194,18 @@ const ALBUM_ADDRESSING_SEPARATOR: char = '|';
 pub(crate) struct SubjectEmitter {
     subjects: Arc<dyn SubjectAnnouncer>,
     relations: Arc<dyn RelationAnnouncer>,
-    /// In-memory mirror of the latest stream_format envelope
-    /// the emitter published (announce + every update). The
-    /// `get_stream_format` read-verb handler reads this so the
-    /// UI's read-then-subscribe pattern works without going
-    /// through the framework's subject-querier surface or
-    /// requiring custody. Cloned cheaply via Arc on every
-    /// SubjectEmitter::clone(); all consumers
-    /// (supervisor + ambient observer + plugin read handler)
-    /// share the same mirror.
-    latest_stream_format: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// In-memory typed state behind the
+    /// `audio_playback_stream_format` subject's wire envelope.
+    /// Three input setters (`update_effective`,
+    /// `update_stream_format`, `update_source_codec`) acquire
+    /// this mutex, update one or more fields, render the merged
+    /// envelope, drop the guard, and publish the envelope on the
+    /// subject. The `get_stream_format` read-verb handler reads
+    /// from the same state through
+    /// `latest_stream_format_envelope`, satisfying the UI's
+    /// read-then-subscribe pattern without a framework querier
+    /// round-trip or custody requirement.
+    envelope_state: Arc<std::sync::Mutex<EnvelopeState>>,
 }
 
 impl SubjectEmitter {
@@ -165,7 +220,9 @@ impl SubjectEmitter {
         Self {
             subjects,
             relations,
-            latest_stream_format: Arc::new(std::sync::Mutex::new(None)),
+            envelope_state: Arc::new(std::sync::Mutex::new(
+                EnvelopeState::empty(),
+            )),
         }
     }
 
@@ -179,28 +236,21 @@ impl SubjectEmitter {
     /// across pre-announce, post-announce, and post-update
     /// reads.
     pub(crate) fn latest_stream_format_envelope(&self) -> serde_json::Value {
-        let guard = self.latest_stream_format.lock();
+        let guard = self.envelope_state.lock();
         match guard {
-            Ok(g) => g
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(render_empty_stream_format),
+            Ok(g) => g.render(),
             Err(poisoned) => {
                 // Mutex poisoning shouldn't happen for a small
-                // JSON-value mirror, but defensively log and
-                // recover by returning the empty envelope —
-                // never crash a read request over a poisoned
-                // local cache.
+                // typed state mirror, but defensively log and
+                // recover by rendering the poisoned state's
+                // last value — never crash a read request over
+                // a poisoned local cache.
                 tracing::warn!(
                     plugin = PLUGIN_NAME,
-                    "latest_stream_format mutex poisoned; \
-                     returning empty envelope"
+                    "envelope_state mutex poisoned; \
+                     rendering last value defensively"
                 );
-                poisoned
-                    .into_inner()
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(render_empty_stream_format)
+                poisoned.into_inner().render()
             }
         }
     }
@@ -305,15 +355,23 @@ impl SubjectEmitter {
     pub(crate) async fn announce_stream_format(&self) {
         let addressing =
             ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_STREAM_FORMAT);
-        let initial_envelope = render_empty_stream_format();
-        // Seed the local mirror BEFORE the framework announce so
-        // any read-verb call that arrives between announce-on-the-
-        // wire and announce-acked-locally sees the empty envelope
-        // (consistent with what subscribers will see via the
-        // subject's seeded state).
-        if let Ok(mut g) = self.latest_stream_format.lock() {
-            *g = Some(initial_envelope.clone());
-        }
+        // The empty state's render is the seeded announcement
+        // shape; the local mirror is reset to empty so any
+        // read-verb call that arrives between announce-on-the-
+        // wire and announce-acked-locally sees the same shape
+        // subscribers see via the subject's seeded state.
+        let initial_envelope = {
+            let mut g = self.envelope_state.lock().unwrap_or_else(|p| {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_state mutex poisoned at announce; \
+                     resetting to empty"
+                );
+                p.into_inner()
+            });
+            *g = EnvelopeState::empty();
+            g.render()
+        };
         let announcement = SubjectAnnouncement::new(
             SUBJECT_TYPE_STREAM_FORMAT,
             vec![addressing],
@@ -346,24 +404,62 @@ impl SubjectEmitter {
         effective: &AudioFormat,
         source: Option<&AudioFormat>,
     ) {
+        let rendered = {
+            let mut g = self.envelope_state.lock().unwrap_or_else(|p| {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_state mutex poisoned at update_stream_format; \
+                     overwriting"
+                );
+                p.into_inner()
+            });
+            g.effective = Some(effective.clone());
+            g.source_format = source.cloned();
+            g.render()
+        };
+        self.publish_envelope(rendered).await;
+    }
+
+    /// Publish a source-codec-name update. The `source_codec`
+    /// field of the wire envelope carries the canonical lowercase
+    /// codec token (e.g. `"flac"`, `"mp3"`, `"dsf"`) derived from
+    /// MPD's current `file:` extension via
+    /// [`crate::mpd::derive_source_codec_name`]. Pass `None` to
+    /// clear the field (no song / unknown extension / stream
+    /// without a file path).
+    ///
+    /// Like every setter, the merged envelope is republished even
+    /// when only `source_codec` changed — subscribers always see
+    /// the same wire shape regardless of which input drove the
+    /// publish.
+    ///
+    /// Best-effort: announcer errors are logged but not
+    /// propagated. Playback never stops because a subject
+    /// publish failed.
+    pub(crate) async fn update_source_codec(&self, codec: Option<&str>) {
+        let rendered = {
+            let mut g = self.envelope_state.lock().unwrap_or_else(|p| {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "envelope_state mutex poisoned at update_source_codec; \
+                     overwriting"
+                );
+                p.into_inner()
+            });
+            g.source_codec = codec.map(str::to_string);
+            g.render()
+        };
+        self.publish_envelope(rendered).await;
+    }
+
+    /// Internal: publish a pre-rendered envelope to the
+    /// framework subject. The merge logic + mutex handling lives
+    /// at each setter; this method holds nothing across the
+    /// `.await`.
+    async fn publish_envelope(&self, envelope: serde_json::Value) {
         let addressing =
             ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_STREAM_FORMAT);
-        let state = json!({
-            "v": STREAM_FORMAT_PAYLOAD_VERSION,
-            "effective": effective,
-            "source": source,
-        });
-        // Update the in-memory mirror so `get_stream_format`
-        // read-verb callers see the latest envelope without
-        // going through the framework's subject querier.
-        // Mirror update happens BEFORE the framework publish
-        // so a same-process read that interleaves with the
-        // publish sees the new envelope (the mirror is the
-        // authoritative local view).
-        if let Ok(mut g) = self.latest_stream_format.lock() {
-            *g = Some(state.clone());
-        }
-        if let Err(e) = self.subjects.update_state(addressing, state).await {
+        if let Err(e) = self.subjects.update_state(addressing, envelope).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
                 error = %e,
@@ -444,21 +540,21 @@ impl SubjectEmitter {
 
 /// Build the empty-envelope payload for the stream_format
 /// subject's initial announcement state. Carries the wire-shape
-/// constants (`v`, `effective: null`, `source: null`) so a
-/// subscriber connecting before the reactor's first publish
-/// sees the full payload shape (just with no live values
-/// populated yet). The first `update_stream_format` call from
-/// the reactor overwrites this with the live envelope.
+/// constants (`v`, `effective: null`, `source: null`,
+/// `source_codec: null`) so a subscriber connecting before any
+/// setter has fired sees the full payload shape with no live
+/// values populated. The first input from any of the three
+/// setters (`update_stream_format`, `update_source_codec`)
+/// overwrites the corresponding field.
 ///
-/// Pure projection — no I/O, no state. Extracted out of the
-/// SubjectEmitter so the renderer is unit-testable against
-/// the wire contract.
+/// Pure projection — no I/O, no state. Renders directly from
+/// `EnvelopeState::empty()` so the empty-wire-shape contract is
+/// always co-defined with the state struct. Used by the
+/// wire-contract tests; production code goes through
+/// `EnvelopeState::render()` directly.
+#[cfg(test)]
 pub(crate) fn render_empty_stream_format() -> serde_json::Value {
-    json!({
-        "v": STREAM_FORMAT_PAYLOAD_VERSION,
-        "effective": serde_json::Value::Null,
-        "source": serde_json::Value::Null,
-    })
+    EnvelopeState::empty().render()
 }
 
 /// Build the JSON state payload for the now_playing subject.
@@ -541,7 +637,9 @@ impl SubjectEmitter {
         Self {
             subjects: Arc::new(NullSubjectAnnouncer),
             relations: Arc::new(NullRelationAnnouncer),
-            latest_stream_format: Arc::new(std::sync::Mutex::new(None)),
+            envelope_state: Arc::new(std::sync::Mutex::new(
+                EnvelopeState::empty(),
+            )),
         }
     }
 }
@@ -648,12 +746,14 @@ mod tests {
         artist: Option<&str>,
         album: Option<&str>,
     ) -> MpdSong {
+        let codec_name = crate::mpd::derive_source_codec_name(file_path);
         MpdSong {
             file_path: file_path.to_string(),
             title: title.map(String::from),
             artist: artist.map(String::from),
             album: album.map(String::from),
             duration: Some(Duration::from_secs(180)),
+            codec_name,
         }
     }
 
@@ -946,6 +1046,22 @@ mod tests {
         assert_eq!(state["v"], STREAM_FORMAT_PAYLOAD_VERSION);
         assert!(state["effective"].is_null());
         assert!(state["source"].is_null());
+        assert!(
+            state["source_codec"].is_null(),
+            "source_codec MUST be null in the seeded announcement; got {state}"
+        );
+        // The wire contract guarantees the field set is uniform
+        // across every observed state: the seeded announcement
+        // MUST carry the source_codec key (even if null).
+        // Subscribers parse the same schema on every publish.
+        assert!(
+            state
+                .as_object()
+                .expect("announcement state is an object")
+                .contains_key("source_codec"),
+            "source_codec key MUST be present on seeded \
+             announcement; got {state}"
+        );
     }
 
     #[test]
@@ -953,6 +1069,97 @@ mod tests {
         let state = render_empty_stream_format();
         assert_eq!(state["v"], STREAM_FORMAT_PAYLOAD_VERSION);
         assert!(state["effective"].is_null());
+        assert!(state["source"].is_null());
+        assert!(state["source_codec"].is_null());
+        // Field-set check: the empty envelope MUST carry every
+        // wire-contract key with a null value (not by omission),
+        // so subscribers see a stable schema across every
+        // observed state. The four-key set is the
+        // audio.playback.v1 contract; an extra key here is a
+        // contract drift, a missing key is a regression.
+        let obj = state.as_object().expect("envelope is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["effective", "source", "source_codec", "v"]);
+    }
+
+    #[tokio::test]
+    async fn update_source_codec_publishes_codec_with_null_audio_format_fields()
+    {
+        // Codec-only update: effective + source remain None
+        // (they were never set); source_codec becomes the
+        // supplied value. The merged envelope carries the new
+        // codec and the still-null audio-format fields. The
+        // ambient observer drives this path on every currentsong
+        // change, independent of the route-change reactor.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.update_source_codec(Some("flac")).await;
+        assert_eq!(subjects.state_update_count(), 1);
+        let (addressing, state) = subjects.state_update_at(0).unwrap();
+        assert_eq!(addressing.scheme, "evo.audio.playback");
+        assert_eq!(addressing.value, "stream_format");
+        assert_eq!(state["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert_eq!(state["source_codec"], "flac");
+        assert!(state["effective"].is_null());
+        assert!(state["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn update_source_codec_none_clears_codec_field() {
+        // Stopping playback (no current song) clears the
+        // source_codec. The envelope still publishes the empty
+        // codec field — subscribers see the explicit null,
+        // matching the no-song state in now_playing.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.update_source_codec(Some("mp3")).await;
+        emitter.update_source_codec(None).await;
+        assert_eq!(subjects.state_update_count(), 2);
+        let (_, state) = subjects.state_update_at(1).unwrap();
+        assert!(state["source_codec"].is_null());
+    }
+
+    #[tokio::test]
+    async fn update_effective_preserves_source_codec_across_publishes() {
+        // Crucial merge-semantics test: a route-change publish
+        // from the reactor (today: update_stream_format with
+        // source=None) MUST NOT clobber the source_codec field
+        // set by the ambient observer. Operator UI continues to
+        // show "FLAC source" across an output-format change.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        emitter.update_source_codec(Some("flac")).await;
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 192_000,
+            channels: 2,
+        };
+        emitter.update_stream_format(&effective, None).await;
+        assert_eq!(subjects.state_update_count(), 2);
+        let (_, state) = subjects.state_update_at(1).unwrap();
+        assert_eq!(state["source_codec"], "flac");
+        assert_eq!(state["effective"]["kind"], "pcm");
+        assert_eq!(state["effective"]["rate_hz"], 192_000);
+    }
+
+    #[tokio::test]
+    async fn update_source_codec_preserves_effective_across_publishes() {
+        // Mirror of the above: a currentsong-change publish from
+        // the ambient observer MUST NOT clobber the effective
+        // field set by the route-change reactor. Operator UI
+        // continues to show the live DAC-bound format while a
+        // codec hint refreshes.
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS32Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter.update_stream_format(&effective, None).await;
+        emitter.update_source_codec(Some("alac")).await;
+        assert_eq!(subjects.state_update_count(), 2);
+        let (_, state) = subjects.state_update_at(1).unwrap();
+        assert_eq!(state["source_codec"], "alac");
+        assert_eq!(state["effective"]["kind"], "pcm");
+        assert_eq!(state["effective"]["rate_hz"], 96_000);
         assert!(state["source"].is_null());
     }
 
@@ -1102,6 +1309,51 @@ mod tests {
         let envelope = emitter.latest_stream_format_envelope();
         assert_eq!(envelope["effective"]["kind"], "dsd");
         assert_eq!(envelope["effective"]["transport"], "native_usb");
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_carries_source_codec() {
+        // The get_stream_format read-verb handler returns the
+        // mirror; the mirror reflects every setter, including
+        // update_source_codec from the ambient observer.
+        // UI clients reading right after a song change see the
+        // codec without having to subscribe and wait for the
+        // next happening.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        emitter.update_source_codec(Some("flac")).await;
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["source_codec"], "flac");
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_merges_all_three_inputs() {
+        // Full merge fan-in: reactor sets effective, ambient
+        // observer sets source_codec, hypothetical future
+        // source-format setter via update_stream_format. The
+        // mirror combines all three into one envelope the read
+        // verb returns coherently.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS32Le,
+            rate_hz: 192_000,
+            channels: 2,
+        };
+        let source = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter
+            .update_stream_format(&effective, Some(&source))
+            .await;
+        emitter.update_source_codec(Some("flac")).await;
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert_eq!(envelope["effective"]["kind"], "pcm");
+        assert_eq!(envelope["effective"]["rate_hz"], 192_000);
+        assert_eq!(envelope["source"]["kind"], "pcm");
+        assert_eq!(envelope["source"]["rate_hz"], 96_000);
+        assert_eq!(envelope["source_codec"], "flac");
     }
 
     #[tokio::test]

@@ -790,12 +790,15 @@ fn parse_current_song(fields: &[Field]) -> Result<Option<MpdSong>, MpdError> {
         return Ok(None);
     };
 
+    let codec_name = super::derive_source_codec_name(&file_path);
+
     Ok(Some(MpdSong {
         file_path,
         title,
         artist,
         album,
         duration,
+        codec_name,
     }))
 }
 

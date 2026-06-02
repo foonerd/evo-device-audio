@@ -1054,6 +1054,10 @@ async fn emit_initial_report(
     }
     maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
         .await;
+    let source_codec = song_for_emitter
+        .as_ref()
+        .and_then(|s| s.codec_name.as_deref());
+    subject_emitter.update_source_codec(source_codec).await;
     subject_emitter.update_now_playing(&report).await;
     Ok(())
 }
@@ -1135,6 +1139,10 @@ async fn emit_best_effort_report(
     }
     maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
         .await;
+    let source_codec = song_for_emitter
+        .as_ref()
+        .and_then(|s| s.codec_name.as_deref());
+    subject_emitter.update_source_codec(source_codec).await;
     subject_emitter.update_now_playing(&report).await;
 }
 
