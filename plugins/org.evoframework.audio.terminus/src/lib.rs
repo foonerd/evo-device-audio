@@ -83,10 +83,15 @@ mod capture;
 
 const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
 
-/// Canonical input PCM the plugin captures from. The base
-/// `/etc/asound.conf` defines `pcm.evo` as a multi-slave tee
-/// writing to `hw:CARD=<dac>` (primary) AND
-/// `hw:Loopback,DEV=0,SUBDEV=7` (this plugin's tap).
+/// Canonical input PCM the plugin captures from.
+///
+/// The base `/etc/asound.conf` defines `pcm.evo` as a
+/// multi-slave tee whose terminus branch writes to the
+/// snd-aloop pair at `hw:Loopback,DEV=0,SUBDEV=7`. snd-aloop
+/// is paired: anything written to the playback side
+/// `hw:Loopback,DEV=0,SUBDEV=N` is readable from the capture
+/// side `hw:Loopback,DEV=1,SUBDEV=N`. The constant below is
+/// the read side of that pair.
 const TERMINUS_INPUT_PCM: &str = "hw:Loopback,1,7";
 
 /// Embedded in-process manifest. Production OOP path uses
