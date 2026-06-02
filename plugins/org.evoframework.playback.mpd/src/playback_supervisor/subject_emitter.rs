@@ -141,6 +141,16 @@ const ALBUM_ADDRESSING_SEPARATOR: char = '|';
 pub(crate) struct SubjectEmitter {
     subjects: Arc<dyn SubjectAnnouncer>,
     relations: Arc<dyn RelationAnnouncer>,
+    /// In-memory mirror of the latest stream_format envelope
+    /// the emitter published (announce + every update). The
+    /// `get_stream_format` read-verb handler reads this so the
+    /// UI's read-then-subscribe pattern works without going
+    /// through the framework's subject-querier surface or
+    /// requiring custody. Cloned cheaply via Arc on every
+    /// SubjectEmitter::clone(); all consumers
+    /// (supervisor + ambient observer + plugin read handler)
+    /// share the same mirror.
+    latest_stream_format: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
 }
 
 impl SubjectEmitter {
@@ -155,6 +165,43 @@ impl SubjectEmitter {
         Self {
             subjects,
             relations,
+            latest_stream_format: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Return the latest stream_format envelope the emitter has
+    /// published (announce or update). The `get_stream_format`
+    /// source-verb handler calls this to satisfy the UI's
+    /// read-then-subscribe pattern without a custody or
+    /// framework-querier round-trip. Returns the empty-envelope
+    /// shape (matching `render_empty_stream_format`) when no
+    /// publish has happened yet — the wire shape is uniform
+    /// across pre-announce, post-announce, and post-update
+    /// reads.
+    pub(crate) fn latest_stream_format_envelope(&self) -> serde_json::Value {
+        let guard = self.latest_stream_format.lock();
+        match guard {
+            Ok(g) => g
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(render_empty_stream_format),
+            Err(poisoned) => {
+                // Mutex poisoning shouldn't happen for a small
+                // JSON-value mirror, but defensively log and
+                // recover by returning the empty envelope —
+                // never crash a read request over a poisoned
+                // local cache.
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "latest_stream_format mutex poisoned; \
+                     returning empty envelope"
+                );
+                poisoned
+                    .into_inner()
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(render_empty_stream_format)
+            }
         }
     }
 
@@ -258,11 +305,20 @@ impl SubjectEmitter {
     pub(crate) async fn announce_stream_format(&self) {
         let addressing =
             ExternalAddressing::new(SCHEME_STREAM_FORMAT, VALUE_STREAM_FORMAT);
+        let initial_envelope = render_empty_stream_format();
+        // Seed the local mirror BEFORE the framework announce so
+        // any read-verb call that arrives between announce-on-the-
+        // wire and announce-acked-locally sees the empty envelope
+        // (consistent with what subscribers will see via the
+        // subject's seeded state).
+        if let Ok(mut g) = self.latest_stream_format.lock() {
+            *g = Some(initial_envelope.clone());
+        }
         let announcement = SubjectAnnouncement::new(
             SUBJECT_TYPE_STREAM_FORMAT,
             vec![addressing],
         )
-        .with_state(render_empty_stream_format());
+        .with_state(initial_envelope);
         if let Err(e) = self.subjects.announce(announcement).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -297,6 +353,16 @@ impl SubjectEmitter {
             "effective": effective,
             "source": source,
         });
+        // Update the in-memory mirror so `get_stream_format`
+        // read-verb callers see the latest envelope without
+        // going through the framework's subject querier.
+        // Mirror update happens BEFORE the framework publish
+        // so a same-process read that interleaves with the
+        // publish sees the new envelope (the mirror is the
+        // authoritative local view).
+        if let Ok(mut g) = self.latest_stream_format.lock() {
+            *g = Some(state.clone());
+        }
         if let Err(e) = self.subjects.update_state(addressing, state).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -475,6 +541,7 @@ impl SubjectEmitter {
         Self {
             subjects: Arc::new(NullSubjectAnnouncer),
             relations: Arc::new(NullRelationAnnouncer),
+            latest_stream_format: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -960,6 +1027,81 @@ mod tests {
         let (_addressing, state) = subjects.state_update_at(0).unwrap();
         assert!(state.as_object().unwrap().contains_key("source"));
         assert!(state["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_returns_empty_before_any_publish() {
+        // The mirror is empty before announce/update fires; the
+        // getter is defensive: if a caller invokes it before the
+        // plugin has run announce_stream_format(), the
+        // wire-contract empty envelope is returned anyway. UI
+        // clients can rely on the field set + payload version
+        // without conditional handling.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert!(envelope["effective"].is_null());
+        assert!(envelope["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_seeded_by_announce() {
+        // announce_stream_format() seeds the mirror with the
+        // empty envelope BEFORE the framework announce, so a
+        // read-then-subscribe consumer that calls
+        // get_stream_format right after plugin load sees the
+        // empty wire contract — not whatever a defensive
+        // fallback might invent.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        emitter.announce_stream_format().await;
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert!(envelope["effective"].is_null());
+        assert!(envelope["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_returns_live_state_after_update() {
+        // The mirror tracks the most recent update_stream_format
+        // payload verbatim. Reading it after a PCM update
+        // surfaces the same envelope the subscribers received on
+        // the SubjectStateChanged happening.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        let effective = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS24Le,
+            rate_hz: 96_000,
+            channels: 2,
+        };
+        emitter.update_stream_format(&effective, None).await;
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["v"], STREAM_FORMAT_PAYLOAD_VERSION);
+        assert_eq!(envelope["effective"]["kind"], "pcm");
+        assert_eq!(envelope["effective"]["rate_hz"], 96_000);
+        assert_eq!(envelope["effective"]["channels"], 2);
+        assert!(envelope["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn latest_stream_format_envelope_overwrites_on_subsequent_update() {
+        // Successive updates overwrite the mirror; the getter
+        // always returns the latest payload — no merging, no
+        // staleness.
+        let (_subjects, _relations, emitter) = capturing_emitter();
+        let first = AudioFormat::Pcm {
+            codec: evo_plugin_sdk::audio::PcmCodec::PcmS16Le,
+            rate_hz: 44_100,
+            channels: 2,
+        };
+        emitter.update_stream_format(&first, None).await;
+        let second = AudioFormat::Dsd {
+            rate: evo_plugin_sdk::audio::DsdRate::Dsd128,
+            transport: evo_plugin_sdk::audio::DsdTransport::NativeUsb,
+            channels: 2,
+        };
+        emitter.update_stream_format(&second, None).await;
+        let envelope = emitter.latest_stream_format_envelope();
+        assert_eq!(envelope["effective"]["kind"], "dsd");
+        assert_eq!(envelope["effective"]["transport"], "native_usb");
     }
 
     #[tokio::test]

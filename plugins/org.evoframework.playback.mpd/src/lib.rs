@@ -216,6 +216,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "set_single",
     "set_consume",
     "get_now_playing",
+    "get_stream_format",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -2551,6 +2552,7 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_single" => self.handle_set_bool(req, "set_single").await,
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 "get_now_playing" => self.handle_get_now_playing(req).await,
+                "get_stream_format" => self.handle_get_stream_format(req).await,
                 other => Err(PluginError::Permanent(format!(
                     "request type {other:?} declared but no handler wired; \
                      this is a manifest/runtime drift bug"
@@ -2674,6 +2676,41 @@ impl MpdPlaybackPlugin {
         let body = serde_json::to_vec(&state).map_err(|e| {
             PluginError::Permanent(format!(
                 "get_now_playing response JSON encode failed: {e}"
+            ))
+        })?;
+        Ok(Response::for_request(req, body))
+    }
+
+    /// Handle a `get_stream_format` source-verb request: read
+    /// the current envelope from the subject emitter's in-memory
+    /// mirror.
+    ///
+    /// Custody is NOT required — the mirror is maintained by
+    /// the route-change reactor (independent of any custody
+    /// supervisor's lifecycle) and seeded by
+    /// `announce_stream_format` at plugin load. UI clients
+    /// running the read-then-subscribe pattern call this on
+    /// connect, get the live envelope (or the seeded empty
+    /// envelope when no reactor publish has fired yet), then
+    /// subscribe to the `audio_playback_stream_format`
+    /// subject for subsequent transitions.
+    async fn handle_get_stream_format(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let _: EmptyPayload =
+            parse_versioned_payload(req, "get_stream_format")?;
+        let emitter = self.subject_emitter.as_ref().ok_or_else(|| {
+            PluginError::Permanent(
+                "get_stream_format requested before plugin load completed; \
+                 subject emitter not yet initialised"
+                    .to_string(),
+            )
+        })?;
+        let state = emitter.latest_stream_format_envelope();
+        let body = serde_json::to_vec(&state).map_err(|e| {
+            PluginError::Permanent(format!(
+                "get_stream_format response JSON encode failed: {e}"
             ))
         })?;
         Ok(Response::for_request(req, body))
