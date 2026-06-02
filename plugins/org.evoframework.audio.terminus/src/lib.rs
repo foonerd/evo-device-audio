@@ -24,11 +24,15 @@
 //!   on-device transcription) can read post-mixer audio without
 //!   each consumer running their own ALSA capture.
 //!
-//! Tier-adaptive cadence: target 30 Hz; server tier may sustain
-//! 60 Hz; MCU tier may step down to 15 Hz on backpressure. Wire
-//! shape is constant (256 bins stereo Float32 [0, 1] +
-//! peak_hold + onsets + correlation); the cadence field in the
-//! payload reflects actual rate.
+//! Cadence is ALSA-paced: every successful FFT compute
+//! (FFT_SIZE samples drawn at the configured sample rate)
+//! emits one frame. At the canonical 48 kHz / 1024-point FFT
+//! chain that is 47 Hz on the wire. The wire `rate_hz` field
+//! carries this value (derived via `fft::frame_rate_hz`) so
+//! subscribers see the cadence they actually receive frames at.
+//!
+//! Wire shape is constant: 256 bins stereo Float32 [0, 1] +
+//! peak_hold + onsets + correlation.
 //!
 //! Lifecycle gates:
 //! - Emission is silent unless `transport_state == "playing"`
@@ -134,12 +138,6 @@ pub struct PluginConfig {
     /// `SpectrumAnalyser::new(sample_rate_hz)`).
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: u32,
-    /// Target frame rate. 30 Hz is the canonical cadence per
-    /// the spectrum subject contract. Server-tier deployments
-    /// may configure 60 Hz; MCU-tier may step down to 15 Hz on
-    /// backpressure.
-    #[serde(default = "default_target_frame_rate_hz")]
-    pub target_frame_rate_hz: u32,
 }
 
 impl Default for PluginConfig {
@@ -147,7 +145,6 @@ impl Default for PluginConfig {
         Self {
             input_pcm: default_input_pcm(),
             sample_rate_hz: default_sample_rate_hz(),
-            target_frame_rate_hz: default_target_frame_rate_hz(),
         }
     }
 }
@@ -158,10 +155,6 @@ fn default_input_pcm() -> String {
 
 fn default_sample_rate_hz() -> u32 {
     48_000
-}
-
-fn default_target_frame_rate_hz() -> u32 {
-    30
 }
 
 /// The terminus plugin's mutable state.
@@ -314,7 +307,6 @@ impl Plugin for AudioTerminusPlugin {
                     plugin = PLUGIN_NAME,
                     input_pcm = %self.config.input_pcm,
                     sample_rate_hz = self.config.sample_rate_hz,
-                    target_frame_rate_hz = self.config.target_frame_rate_hz,
                     "capture task spawned"
                 );
             }
