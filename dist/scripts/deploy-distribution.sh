@@ -148,10 +148,10 @@ echo "Repo root:     ${REPO_ROOT}"
 echo
 
 # ----------------------------------------------------------
-# [0/5] Pre-flight: target reachable + base install present
+# [0/6] Pre-flight: target reachable + base install present
 # + signing key resolvable when OOP plugins are shipped.
 # ----------------------------------------------------------
-echo "[0/5] pre-flight ..."
+echo "[0/6] pre-flight ..."
 
 if [[ ${#OOP_PLUGINS[@]} -gt 0 ]]; then
     # Verify the commons-plugin trust root is on the target.
@@ -218,12 +218,12 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [1/5] Cross-build the steward binary + every OOP plugin's
+# [1/6] Cross-build the steward binary + every OOP plugin's
 # wire binary listed in OOP_PLUGINS. Each build is invoked
 # independently so a failure in one bundle's wire binary
 # leaves the others' artefacts intact for inspection.
 # ----------------------------------------------------------
-echo "[1/5] cross-build ${DIST_CRATE} + OOP wire binaries for ${TARGET_TRIPLE} ..."
+echo "[1/6] cross-build ${DIST_CRATE} + OOP wire binaries for ${TARGET_TRIPLE} ..."
 cd "${REPO_ROOT}"
 
 CROSS_HELPER="${REPO_ROOT}/scripts/cross-build.sh"
@@ -273,9 +273,9 @@ done
 echo
 
 # ----------------------------------------------------------
-# [2/5] Stop the steward; preserve previous binary.
+# [2/6] Stop the steward; preserve previous binary.
 # ----------------------------------------------------------
-echo "[2/5] stop steward + preserve previous binary as evo-device-audio.prev ..."
+echo "[2/6] stop steward + preserve previous binary as evo-device-audio.prev ..."
 if ! ssh "${SSH_TARGET}" "
     set -e
     sudo -n systemctl stop evo || true
@@ -290,7 +290,7 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [3/5] scp the new steward binary + every OOP plugin bundle
+# [3/6] scp the new steward binary + every OOP plugin bundle
 # + install in place. Each plugin bundle is staged locally as
 # a directory containing `manifest.toml` (renamed from the
 # `manifest.oop.toml` template) and `plugin.bin` (the wire
@@ -300,7 +300,7 @@ echo
 # discovery walks `/opt/evo/plugins/` at boot and admits each
 # bundle.
 # ----------------------------------------------------------
-echo "[3/5] scp + install steward binary + OOP plugin bundles ..."
+echo "[3/6] scp + install steward binary + OOP plugin bundles ..."
 
 # Sweep stale OOP bundle dirs on the target. Plugin dirs
 # under `/opt/evo/plugins/` that are NOT in this deploy's
@@ -416,9 +416,67 @@ done
 echo
 
 # ----------------------------------------------------------
-# [4/5] Start steward.
+# [4/6] Install catalogue. Composes the same way bootstrap.sh
+# does (prepend `schema_version = 1` to dist/catalogue/
+# audio-rack.toml) and atomically installs at the canonical
+# /opt/evo/catalogue/default.toml path. Catalogue updates MUST
+# travel with binary updates — a steward that declares a new
+# subject type in code but does not see it in the catalogue
+# refuses the announce at admission (catalogue/binary version
+# skew is a textbook operational landmine). Running this on
+# every deploy makes the steward + catalogue coherent by
+# construction; if dist/catalogue/audio-rack.toml hasn't
+# changed the install is a byte-identical no-op.
+#
+# Backup posture mirrors bootstrap.sh: when the new composed
+# file differs from the prior install, the prior is preserved
+# as default.toml.prev for single-step rollback.
 # ----------------------------------------------------------
-echo "[4/5] start steward ..."
+echo "[4/6] install catalogue (composed from dist/catalogue/audio-rack.toml) ..."
+CATALOGUE_LOCAL_FRAGMENT="${REPO_ROOT}/dist/catalogue/audio-rack.toml"
+if [[ ! -f "${CATALOGUE_LOCAL_FRAGMENT}" ]]; then
+    echo "FAIL: catalogue fragment missing at ${CATALOGUE_LOCAL_FRAGMENT}" >&2
+    exit 3
+fi
+CATALOGUE_COMPOSED="$(mktemp)"
+{
+    echo "# Composed by dist/scripts/deploy-distribution.sh"
+    echo "# Source fragment: ${CATALOGUE_LOCAL_FRAGMENT}"
+    echo
+    echo "schema_version = 1"
+    echo
+    cat "${CATALOGUE_LOCAL_FRAGMENT}"
+} > "${CATALOGUE_COMPOSED}"
+CATALOGUE_REMOTE_TMP="/tmp/evo-catalogue-$$.toml"
+if ! scp -q "${CATALOGUE_COMPOSED}" \
+    "${SSH_TARGET}:${CATALOGUE_REMOTE_TMP}"; then
+    rm -f "${CATALOGUE_COMPOSED}"
+    echo "FAIL: scp catalogue to target failed" >&2
+    exit 3
+fi
+rm -f "${CATALOGUE_COMPOSED}"
+if ! ssh "${SSH_TARGET}" "
+    set -e
+    sudo -n install -d -m 0755 -o root -g root /opt/evo/catalogue
+    if [[ -f /opt/evo/catalogue/default.toml ]] && \
+       ! cmp -s ${CATALOGUE_REMOTE_TMP} /opt/evo/catalogue/default.toml; then
+        sudo -n cp -a /opt/evo/catalogue/default.toml \
+            /opt/evo/catalogue/default.toml.prev
+    fi
+    sudo -n install -m 0644 -o root -g root \
+        ${CATALOGUE_REMOTE_TMP} /opt/evo/catalogue/default.toml
+    rm -f ${CATALOGUE_REMOTE_TMP}
+"; then
+    echo "FAIL: install catalogue on target failed" >&2
+    exit 3
+fi
+echo "  ok"
+echo
+
+# ----------------------------------------------------------
+# [5/6] Start steward.
+# ----------------------------------------------------------
+echo "[5/6] start steward ..."
 if ! ssh "${SSH_TARGET}" 'sudo -n systemctl start evo'; then
     echo "FAIL: systemctl start evo returned non-zero" >&2
     exit 4
@@ -429,9 +487,9 @@ echo "  ok"
 echo
 
 # ----------------------------------------------------------
-# [5/5] Verify service is active + steward emitted ready.
+# [6/6] Verify service is active + steward emitted ready.
 # ----------------------------------------------------------
-echo "[5/5] verify ..."
+echo "[6/6] verify ..."
 ACTIVE_STATE="$(ssh "${SSH_TARGET}" 'systemctl is-active evo' 2>/dev/null || true)"
 if [[ "${ACTIVE_STATE}" != "active" ]]; then
     echo "FAIL: evo.service is not active (state=${ACTIVE_STATE})" >&2
