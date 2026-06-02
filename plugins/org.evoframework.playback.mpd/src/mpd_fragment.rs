@@ -258,17 +258,14 @@ pub const PROC_ASOUND_CARDS_PATH: &str = "/proc/asound/cards";
 /// `hw:Loopback,1,7` to read the same frames MPD writes here.
 const TERMINUS_OUTPUT_DEVICE: &str = "evo_terminus_tap";
 
-/// Wire format of the terminus loopback contract. Pinned at
-/// the rate + width + channels the terminus capture loop opens
-/// the loopback's capture half with (see
-/// `audio.terminus/src/capture.rs`'s HwParams setup). MPD's
-/// terminus audio_output writes in this exact format; MPD
-/// resamples / re-quantises the source internally if it
-/// differs from the listening output's format. snd-aloop's
-/// playback + capture halves must agree on the format, so this
-/// constant is the wire-shape contract between the two
-/// plugins.
-const TERMINUS_FORMAT_STR: &str = "48000:32:2";
+/// Wire format of the terminus loopback contract, imported
+/// from the shared crate that is the single source of truth
+/// for the rate / bit-depth / channel-count contract between
+/// MPD's terminus audio_output and the audio.terminus plugin's
+/// capture loop. snd-aloop's playback + capture halves MUST
+/// agree on the format — a mismatch causes the capture-side
+/// open to fail and the visualiser to go silent.
+use evo_device_audio_shared::terminus_loopback::TERMINUS_LOOPBACK_MPD_FORMAT;
 
 /// Render the MPD fragment carrying the audio_output blocks
 /// the playback chain needs.
@@ -282,7 +279,7 @@ const TERMINUS_FORMAT_STR: &str = "48000:32:2";
 ///
 /// 2. **terminus output** — fixed device
 ///    `pcm.evo_terminus_tap`, fixed format
-///    `[TERMINUS_FORMAT_STR]`, mixer_type `none`. The terminus
+///    `[TERMINUS_LOOPBACK_MPD_FORMAT]`, mixer_type `none`. The terminus
 ///    output is always full-scale source audio — never
 ///    attenuated by MPD's mixer — so the audio-terminus
 ///    plugin's tap captures pre-fader signal regardless of the
@@ -336,7 +333,7 @@ pub fn render_audio_output_fragment(
          type            \"alsa\"\n    \
          name            \"evo-audio-terminus-tap\"\n    \
          device          \"{TERMINUS_OUTPUT_DEVICE}\"\n    \
-         format          \"{TERMINUS_FORMAT_STR}\"\n    \
+         format          \"{TERMINUS_LOOPBACK_MPD_FORMAT}\"\n    \
          mixer_type      \"none\"\n\
          }}\n"
     ))

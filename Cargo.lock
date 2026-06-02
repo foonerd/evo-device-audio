@@ -3200,6 +3200,7 @@ dependencies = [
  "alsa",
  "anyhow",
  "base64",
+ "evo-device-audio-shared",
  "evo-plugin-sdk",
  "rustfft",
  "semver",

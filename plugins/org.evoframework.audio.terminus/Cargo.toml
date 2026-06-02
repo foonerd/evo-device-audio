@@ -20,6 +20,7 @@ alsa-substrate = ["dep:alsa"]
 
 [dependencies]
 anyhow = { workspace = true }
+evo-device-audio-shared = { path = "../../crates/evo-device-audio-shared" }
 evo-plugin-sdk = { workspace = true }
 rustfft = "6"
 semver = { workspace = true }

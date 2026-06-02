@@ -162,7 +162,24 @@ fn default_input_pcm() -> String {
 }
 
 fn default_sample_rate_hz() -> u32 {
-    48_000
+    // The terminus capture loop reads from the snd-aloop pair
+    // whose playback side is opened by MPD's terminus
+    // audio_output. snd-aloop locks the format at the rate the
+    // playback side opens with, so the capture side MUST match.
+    // The shared contract constant is the single source of
+    // truth — MPD's terminus output's `format` directive uses
+    // the matching `TERMINUS_LOOPBACK_MPD_FORMAT` from the
+    // same module, so any future change happens in one place.
+    //
+    // Note: operators who override this field in their plugin
+    // config to a non-contract value will get a capture-open
+    // error at runtime because the loopback's playback half
+    // has already been opened by MPD at the contract rate.
+    // The field stays operator-tunable for symmetry with
+    // future deployments that wire a different capture source,
+    // but the canonical reference deployment pins to the
+    // contract.
+    evo_device_audio_shared::terminus_loopback::TERMINUS_LOOPBACK_RATE_HZ
 }
 
 /// The terminus plugin's mutable state.
