@@ -659,6 +659,7 @@ mod tests {
                 codec: "dts".to_string(),
                 rate_hz: 48_000,
                 channels: 6,
+                bitrate_kbps: None,
             },
             buffer_frames: 1024,
         };
