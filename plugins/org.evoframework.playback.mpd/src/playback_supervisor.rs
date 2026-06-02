@@ -31,6 +31,7 @@
 //!   this module's tests and the warden's integration tests.
 
 mod actor;
+mod ambient_observer;
 mod command;
 mod report;
 mod subject_emitter;
@@ -43,5 +44,8 @@ pub(crate) mod test_mock;
 // re-exported because they are internal helpers used only inside
 // the module graph.
 pub(crate) use actor::{spawn, SupervisorCommandSender, SupervisorHandle};
+pub(crate) use ambient_observer::{
+    spawn as spawn_ambient_observer, AmbientObserverHandle,
+};
 pub(crate) use command::{PlaybackCommand, PlaybackError};
 pub(crate) use subject_emitter::{render_now_playing_state, SubjectEmitter};

@@ -368,6 +368,16 @@ pub struct MpdPlaybackPlugin {
     /// Spawned at load; signals shutdown + awaits completion
     /// in unload.
     envelope_subscriber: Option<envelope_subscriber::EnvelopeSubscriberHandle>,
+    /// Ambient now-playing state observer task handle. Runs for
+    /// the plugin's load lifetime (NOT tied to custody). Owns
+    /// its own MPD command + idle connections; publishes the
+    /// `audio_playback_now_playing` subject on every observed
+    /// state change. Closes the gap where the custody-gated
+    /// supervisor leaves the subject's state unset on a fresh
+    /// boot — downstream consumers (audio.terminus visualiser
+    /// gate) need state publication regardless of whether any
+    /// operator has taken custody yet.
+    ambient_observer: Option<playback_supervisor::AmbientObserverHandle>,
     /// `/etc/asound.d/` composition-change watcher. Spawned at
     /// plugin load; on every observed change dispatches a
     /// `CycleOutput` to the currently-active custody's
@@ -578,6 +588,7 @@ impl MpdPlaybackPlugin {
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
+            ambient_observer: None,
             asound_watcher: None,
             test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -1985,6 +1996,39 @@ impl Plugin for MpdPlaybackPlugin {
 
             self.subject_emitter = Some(emitter);
 
+            // Spawn the ambient now-playing observer. Runs for
+            // the plugin's load lifetime regardless of custody —
+            // closes the gap where the custody-gated supervisor
+            // leaves the `audio_playback_now_playing` subject's
+            // state unset on a fresh boot. Downstream consumers
+            // (audio.terminus's leader gate) need state
+            // publication on every observed MPD transition,
+            // whether or not an operator has gestured a play
+            // action through the warden surface.
+            //
+            // The ambient observer + the supervisor coexist:
+            // both see the same MPD state via independent IDLE
+            // channels; both render byte-identical reports;
+            // both publish the same update_state. The framework's
+            // subject substrate dedups identical content, so the
+            // duplicate publish under custody is a cheap no-op.
+            let ambient_emitter = self
+                .subject_emitter
+                .as_ref()
+                .expect("subject_emitter set above")
+                .clone();
+            self.ambient_observer =
+                Some(playback_supervisor::spawn_ambient_observer(
+                    self.endpoint.clone(),
+                    self.timeouts,
+                    ambient_emitter,
+                ));
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                endpoint = %self.endpoint,
+                "ambient now-playing observer spawned (publishes regardless of custody)"
+            );
+
             // Spawn the route-change reactor and the
             // fragment-writer worker. The reactor watches
             // the framework's topology rewires; the worker
@@ -2122,6 +2166,12 @@ impl Plugin for MpdPlaybackPlugin {
             // supervisor before unload tears the custody
             // down.
             if let Some(handle) = self.envelope_subscriber.take() {
+                handle.stop().await;
+            }
+            // Stop the ambient now-playing observer. Independent
+            // of any custody supervisor; safe to stop any time
+            // after the custodies drain above.
+            if let Some(handle) = self.ambient_observer.take() {
                 handle.stop().await;
             }
             // Stop the asound watcher last. The supervisor's
