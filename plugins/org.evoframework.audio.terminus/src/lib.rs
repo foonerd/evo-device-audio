@@ -73,10 +73,12 @@ use evo_plugin_sdk::Manifest;
 use serde::Deserialize;
 
 mod fft;
+mod local_role;
 mod spectrum_subject;
 mod transport_gate;
 
 pub use fft::{PerceptualFrame, SpectrumAnalyser};
+pub use local_role::LocalRole;
 pub use spectrum_subject::{
     render_spectrum_frame, SpectrumEmitter, SPECTRUM_PAYLOAD_VERSION,
     SPECTRUM_SUBJECT_ADDRESSING_SCHEME, SPECTRUM_SUBJECT_ADDRESSING_VALUE,
@@ -86,6 +88,8 @@ pub use transport_gate::TransportGate;
 
 #[cfg(feature = "alsa-substrate")]
 mod capture;
+#[cfg(feature = "alsa-substrate")]
+mod local_role_subscriber;
 #[cfg(feature = "alsa-substrate")]
 mod now_playing_subscriber;
 
@@ -189,6 +193,14 @@ pub struct AudioTerminusPlugin {
     /// task.
     #[cfg(feature = "alsa-substrate")]
     transport_gate_subscriber: Option<now_playing_subscriber::SubscriberHandle>,
+    /// Local-role subscriber handle. Watches the singleton
+    /// `audio_multiroom_local_role` subject and pushes
+    /// `LocalRole` updates the capture loop reads alongside the
+    /// transport gate. `Some` after a successful load; the
+    /// plugin's `unload` notifies its shutdown + awaits the
+    /// task.
+    #[cfg(feature = "alsa-substrate")]
+    local_role_subscriber: Option<local_role_subscriber::SubscriberHandle>,
 }
 
 impl AudioTerminusPlugin {
@@ -204,6 +216,8 @@ impl AudioTerminusPlugin {
             capture_task: None,
             #[cfg(feature = "alsa-substrate")]
             transport_gate_subscriber: None,
+            #[cfg(feature = "alsa-substrate")]
+            local_role_subscriber: None,
         }
     }
 
@@ -344,9 +358,25 @@ impl Plugin for AudioTerminusPlugin {
                         )
                     })?,
                 );
-                let subscriber_handle =
-                    now_playing_subscriber::spawn(subscriber, querier, gate_tx);
+                let subscriber_handle = now_playing_subscriber::spawn(
+                    Arc::clone(&subscriber),
+                    Arc::clone(&querier),
+                    gate_tx,
+                );
                 self.transport_gate_subscriber = Some(subscriber_handle);
+
+                // Local-role gate channel. Initial value `Auto`
+                // — the permissive default for the operational
+                // majority case where no multi-room plugin is
+                // admitted on this node, or the local node is
+                // a solo device. Only an explicit `Receiver`
+                // value from the singleton local-role subject
+                // closes this half of the combined gate.
+                let (role_tx, role_rx) =
+                    tokio::sync::watch::channel(LocalRole::Auto);
+                let role_subscriber_handle =
+                    local_role_subscriber::spawn(subscriber, querier, role_tx);
+                self.local_role_subscriber = Some(role_subscriber_handle);
 
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let capture_handle = capture::spawn(
@@ -359,6 +389,7 @@ impl Plugin for AudioTerminusPlugin {
                     ),
                     Arc::clone(&shutdown),
                     gate_rx,
+                    role_rx,
                 );
                 self.capture_shutdown = Some(shutdown);
                 self.capture_task = Some(capture_handle);
@@ -400,6 +431,10 @@ impl Plugin for AudioTerminusPlugin {
                     let _ = handle.await;
                 }
                 if let Some(sub) = self.transport_gate_subscriber.take() {
+                    sub.shutdown.notify_waiters();
+                    let _ = sub.task.await;
+                }
+                if let Some(sub) = self.local_role_subscriber.take() {
                     sub.shutdown.notify_waiters();
                     let _ = sub.task.await;
                 }

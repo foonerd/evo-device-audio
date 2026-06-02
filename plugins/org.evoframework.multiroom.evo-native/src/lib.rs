@@ -381,6 +381,13 @@ impl RoleEngagement {
 /// instead of a dozen captured `Arc`s.
 struct RoleEngagementContext {
     audio_plane: Arc<dyn AudioPlaneHandle>,
+    /// Subject-announcer handle. Used by `engage_role` to
+    /// publish the local-role singleton subject
+    /// (`audio_multiroom_local_role`) on every engagement
+    /// change so on-node consumers (audio.terminus's
+    /// leader-of-active-group gate) see the effective role
+    /// without needing the local device id.
+    subject_announcer: Arc<dyn SubjectAnnouncer>,
     alsa_pcm: String,
     source_pcm: String,
     // Receiver-side counters live in this context so the
@@ -515,6 +522,15 @@ async fn engage_role(
     engaged.shutdown = Arc::clone(&shutdown);
     engaged.role = effective_role;
     engaged.group_id = group_id.clone();
+
+    // Publish the local-role singleton subject. Consumers on
+    // the same node (audio.terminus's leader-of-active-group
+    // gate; future post-mixer plugins) subscribe to the fixed
+    // addressing `(LOCAL_ROLE_SCHEME, LOCAL_ROLE_VALUE)` and
+    // gate on the effective role. Publish AFTER the engagement
+    // state mutation so subscribers' next read of the role
+    // matches what the engagement just transitioned to.
+    publish_local_role(&ctx.subject_announcer, effective_role).await;
 
     // Spawn the role-appropriate tasks. The match key is the
     // *effective* role — the live-group gate above may have
@@ -744,6 +760,94 @@ async fn engage_role(
                 );
             }
         }
+    }
+}
+
+/// Catalogue-declared subject type for the singleton
+/// local-role subject. Matches
+/// `[[subjects]] name = "audio_multiroom_local_role"` in
+/// `dist/catalogue/audio-rack.toml` (schema lives in
+/// `evo-catalogue-schemas/schemas/org.evoframework/audio/
+/// multiroom.v1.toml`).
+const LOCAL_ROLE_SUBJECT_TYPE: &str = "audio_multiroom_local_role";
+
+/// External-addressing scheme for the singleton local-role
+/// subject. One instance per node, addressing value is the
+/// constant `LOCAL_ROLE_VALUE`.
+const LOCAL_ROLE_SCHEME: &str = "evo.audio.multiroom.local_role";
+
+/// Singleton addressing value. Fixed string so consumers
+/// can subscribe to the local node's role without needing
+/// to learn its device id.
+const LOCAL_ROLE_VALUE: &str = "local";
+
+/// Render the local-role subject's payload for the supplied
+/// effective role. Single field `role` carrying the wire
+/// string ("source" / "receiver" / "auto"). Matches the
+/// catalogue schema's `local_role` enum exactly.
+fn render_local_role_state(role: Role) -> serde_json::Value {
+    serde_json::json!({ "role": role.as_wire_str() })
+}
+
+/// Announce the singleton local-role subject at plugin load
+/// with the supplied initial effective role seeded into the
+/// announcement's `state` field. Subscribers connecting
+/// between this announce and the first `engage_role`
+/// transition see the effective role immediately — no
+/// separate read round-trip required.
+///
+/// Best-effort: announcer failures log at WARN and do not
+/// fail plugin load. The subject surface degrades honestly
+/// — consumers (audio.terminus's gate) fall back to their
+/// conservative default (NotPlaying / silent emission) when
+/// the subject isn't available.
+async fn announce_local_role(
+    announcer: &Arc<dyn SubjectAnnouncer>,
+    initial_role: Role,
+) {
+    let addressing =
+        ExternalAddressing::new(LOCAL_ROLE_SCHEME, LOCAL_ROLE_VALUE);
+    let announcement = SubjectAnnouncement {
+        subject_type: LOCAL_ROLE_SUBJECT_TYPE.to_string(),
+        addressings: vec![addressing],
+        claims: Vec::new(),
+        state: render_local_role_state(initial_role),
+        announced_at: std::time::SystemTime::now(),
+    };
+    if let Err(e) = announcer.announce(announcement).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            initial_role = initial_role.as_wire_str(),
+            "announce audio_multiroom_local_role subject failed; \
+             on-node leader-gate consumers will fall back to silent \
+             emission until the next admit"
+        );
+    }
+}
+
+/// Publish a fresh local-role value on the singleton subject.
+/// Called from `engage_role` after every effective-role
+/// transition so subscribers see the new value within one
+/// broadcast round-trip.
+///
+/// Best-effort: announcer errors log at WARN and do not
+/// fail the engagement. The next engage_role transition
+/// republishes — if the announce path comes back the next
+/// transition publishes the live state.
+async fn publish_local_role(announcer: &Arc<dyn SubjectAnnouncer>, role: Role) {
+    let addressing =
+        ExternalAddressing::new(LOCAL_ROLE_SCHEME, LOCAL_ROLE_VALUE);
+    let state = render_local_role_state(role);
+    if let Err(e) = announcer.update_state(addressing, state).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            role = role.as_wire_str(),
+            "update_state audio_multiroom_local_role failed; \
+             on-node leader-gate consumers may see a stale role \
+             until the next transition republishes"
+        );
     }
 }
 
@@ -1394,6 +1498,11 @@ impl Plugin for MultiroomEvoNativePlugin {
             let trace_state_slot = Arc::clone(&self.trace_state);
             let role_ctx = Arc::new(RoleEngagementContext {
                 audio_plane: Arc::clone(&audio_plane),
+                subject_announcer: Arc::clone(
+                    self.subject_announcer
+                        .as_ref()
+                        .expect("subject_announcer set during load"),
+                ),
                 alsa_pcm: self.config.alsa_pcm.clone(),
                 source_pcm: self.config.source_pcm.clone(),
                 frames_received: Arc::clone(&self.frames_received),
@@ -1443,6 +1552,24 @@ impl Plugin for MultiroomEvoNativePlugin {
                      source-mode body may persist until next engage"
                 );
             }
+
+            // Announce the singleton local-role subject BEFORE
+            // the first engage_role call. engage_role's
+            // publish_local_role uses update_state, which
+            // requires the subject to be in the registry —
+            // announce here registers + seeds the initial
+            // payload so on-node consumers (audio.terminus's
+            // leader-of-active-group gate) can subscribe + read
+            // the role from the moment this plugin's load
+            // completes, independent of when the first
+            // operator-gestured engagement happens.
+            announce_local_role(
+                self.subject_announcer
+                    .as_ref()
+                    .expect("subject_announcer set above"),
+                initial_role,
+            )
+            .await;
 
             // Initial engagement — the engage_role function is
             // the same function the substrate subscriber will

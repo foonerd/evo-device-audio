@@ -24,17 +24,23 @@
 //!   the loop cleanly within one read budget (configured to be
 //!   small — ~33 ms at the 30 Hz target).
 //!
-//! Lifecycle gating (transport_state) is enforced in this
-//! module by checking a `watch::Receiver<TransportGate>` before
-//! each emit. The capture loop continues running regardless of
-//! gate state (a resume picks up at the next tick without spawn
-//! latency); only the spectrum-subject emit is skipped when the
-//! gate is `NotPlaying`. The gate is fed by the
-//! `now_playing_subscriber` task the plugin spawns; the watch
-//! channel's initial value is `NotPlaying`, so emission is
-//! silent until the subscriber seeds the gate from the
-//! now-playing subject's current state (or a stream update
-//! delivers `transport_state == "playing"`).
+//! Lifecycle gating is enforced in this module by checking
+//! two `watch::Receiver`s before each emit:
+//!
+//! - `TransportGate` (from the `now_playing_subscriber`):
+//!   `Playing` opens this half of the gate; anything else
+//!   closes it.
+//! - `LocalRole` (from the `local_role_subscriber`): `Source`
+//!   and `Auto` open this half; `Receiver` closes it
+//!   (followers of an active multi-room group MUST NOT
+//!   publish a parallel spectrum subject — the source-host's
+//!   spectrum is the authoritative wavefront).
+//!
+//! Both halves MUST be open for `spectrum_subject::emit_frame`
+//! to fire. The capture loop continues running regardless of
+//! gate state (a resume picks up at the next tick without
+//! spawn latency); only the subject emit is skipped when
+//! either half is closed.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +51,7 @@ use evo_plugin_sdk::contract::SubjectAnnouncer;
 use tokio::sync::{watch, Notify};
 
 use crate::fft::{PerceptualFrame, SpectrumAnalyser, CHANNEL_COUNT, FFT_SIZE};
+use crate::local_role::LocalRole;
 use crate::spectrum_subject;
 use crate::transport_gate::TransportGate;
 use crate::PluginConfig;
@@ -68,6 +75,7 @@ pub fn spawn(
     announcer: Arc<dyn SubjectAnnouncer>,
     shutdown: Arc<Notify>,
     transport_gate: watch::Receiver<TransportGate>,
+    local_role: watch::Receiver<LocalRole>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         run_capture_loop(
@@ -76,6 +84,7 @@ pub fn spawn(
             announcer,
             shutdown,
             transport_gate,
+            local_role,
         );
     })
 }
@@ -86,6 +95,7 @@ fn run_capture_loop(
     announcer: Arc<dyn SubjectAnnouncer>,
     shutdown: Arc<Notify>,
     transport_gate: watch::Receiver<TransportGate>,
+    local_role: watch::Receiver<LocalRole>,
 ) {
     let mut analyser = SpectrumAnalyser::new(config.sample_rate_hz);
     // Single source of truth for the wire `rate_hz` field. Derived
@@ -158,6 +168,7 @@ fn run_capture_loop(
             &shutdown,
             rate_hz,
             &transport_gate,
+            &local_role,
         );
         match exit_inner {
             InnerExit::Shutdown => return,
@@ -187,6 +198,7 @@ fn run_fft_loop(
     shutdown: &Arc<Notify>,
     rate_hz: u32,
     transport_gate: &watch::Receiver<TransportGate>,
+    local_role: &watch::Receiver<LocalRole>,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
     // -> FFT_SIZE * 2 i32s per frame.
@@ -240,14 +252,17 @@ fn run_fft_loop(
                 if let Ok(mut guard) = latest_frame.lock() {
                     *guard = Some(frame);
                 }
-                // Transport-state gate. Cheap atomic-shaped read
-                // of the watch receiver; skip the announcer emit
-                // when transport is not playing. The frame is
-                // still computed + cached so a resume picks up at
-                // the next tick without spawn latency (the
-                // `get_spectrum_frame` read verb continues to
-                // surface the latest cached frame).
-                if !transport_gate.borrow().should_emit() {
+                // Combined gate: both halves MUST be open. Two
+                // cheap atomic-shaped reads of the watch
+                // receivers; skip the announcer emit when either
+                // is closed. The frame is still computed + cached
+                // so a resume picks up at the next tick without
+                // spawn latency (the `get_spectrum_frame` read
+                // verb continues to surface the latest cached
+                // frame regardless of gate state).
+                let transport_open = transport_gate.borrow().should_emit();
+                let role_open = local_role.borrow().should_emit();
+                if !transport_open || !role_open {
                     continue;
                 }
                 let announcer = Arc::clone(announcer);

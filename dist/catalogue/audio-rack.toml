@@ -407,6 +407,21 @@ name = "audio_multiroom_frame_trace"
 [[subjects]]
 name = "audio_multiroom_device_card"
 
+# Singleton-per-node subject the multi-room plugin
+# announces at load with the local node's current
+# effective role (source / receiver / auto), updating on
+# every `engage_role` transition. Consumers on the same
+# node (audio.terminus's leader-of-active-group gate,
+# future post-mixer plugins) subscribe to fixed addressing
+# `(evo.audio.multiroom.local_role, local)` and gate
+# behaviour on the role without having to acquire the
+# local device id through the `audio_plane` capability.
+# The schema's canonical declaration lives in
+# `evo-catalogue-schemas` under `schemas/org.evoframework/
+# audio/multiroom.v1.toml`.
+[[subjects]]
+name = "audio_multiroom_local_role"
+
 # Subject type the delivery.alsa plugin announces at load
 # carrying the resolved-outputs list (one entry per ALSA
 # card / subdevice the host kernel exposes). The plugin
