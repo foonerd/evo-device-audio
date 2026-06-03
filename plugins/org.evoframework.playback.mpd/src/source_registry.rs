@@ -558,7 +558,7 @@ impl Default for SourceRegistry {
 }
 
 /// Wire shape persisted to `sources.toml`. Carries the version
-/// + the source records; missing fields on rehydration get
+/// and the source records; missing fields on rehydration get
 /// their serde defaults so additive shape extensions ride
 /// without a migration step.
 #[derive(Debug, Clone, Serialize, Deserialize)]

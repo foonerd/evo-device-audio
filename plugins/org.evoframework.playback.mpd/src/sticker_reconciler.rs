@@ -409,8 +409,8 @@ mod tests {
     #[test]
     fn batch_size_default_is_reasonable_for_large_libraries() {
         // 100k tracks @ 200 per batch = 500 round-trips.
-        assert!(STICKER_WRITE_BATCH_SIZE >= 100);
-        assert!(STICKER_WRITE_BATCH_SIZE <= 1000);
+        const _: () = assert!(STICKER_WRITE_BATCH_SIZE >= 100);
+        const _: () = assert!(STICKER_WRITE_BATCH_SIZE <= 1000);
     }
 
     #[test]
@@ -449,6 +449,7 @@ mod tests {
         assert!(res.is_ok());
     }
 
+    #[allow(dead_code)]
     fn local_record(id: &str) -> SourceRecord {
         SourceRecord {
             id: id.to_string(),

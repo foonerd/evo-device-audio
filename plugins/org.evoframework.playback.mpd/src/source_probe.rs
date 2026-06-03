@@ -106,12 +106,33 @@ pub(crate) fn load_music_directory_from_mpd_conf(
 /// Pure parsing logic for `music_directory`. Extracted so the
 /// parsing is unit-testable without filesystem I/O.
 fn parse_music_directory(contents: &str) -> Option<PathBuf> {
+    parse_mpd_directive(contents, "music_directory")
+}
+
+/// Load `playlist_directory` from `/etc/mpd.conf` (or an
+/// alternate path passed in). Used by the playlist shelf's
+/// `create_playlist` verb to materialise empty .m3u files.
+pub(crate) fn load_playlist_directory_from_mpd_conf(
+    conf_path: &Path,
+) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(conf_path).ok()?;
+    parse_mpd_directive(&contents, "playlist_directory")
+}
+
+/// Generic single-line directive parser shared by
+/// `music_directory` + `playlist_directory`. Same syntax
+/// tolerance (quoted / unquoted / equals-style; comment
+/// lines via `#`; first non-comment hit wins).
+pub(crate) fn parse_mpd_directive(
+    contents: &str,
+    directive: &str,
+) -> Option<PathBuf> {
     for raw in contents.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let rest = match line.strip_prefix("music_directory") {
+        let rest = match line.strip_prefix(directive) {
             Some(r) => r,
             None => continue,
         };
@@ -1951,11 +1972,11 @@ music_directory "/right"
         head[1] = 0xF1; // MPEG-4, layer 0, no CRC
                         // sr_index = 4 (44100), profile bits = 01 (LC)
         head[2] = (0b01 << 6) | (4 << 2);
-        head[3] = ((2 & 0x3) << 6) | 0; // channel_config = 2
-                                        // frame_length = 384 (13 bits across bytes 3-5):
-                                        //   bits 11..12 (low 2 of byte 3): (384 >> 11) & 0x3 = 0
-                                        //   bits  3..10 (byte 4):           (384 >> 3)  & 0xFF = 48
-                                        //   bits  0..2  (high 3 of byte 5): (384 & 0x7) << 5 = 0
+        head[3] = (2 & 0x3) << 6; // channel_config = 2
+                                  // frame_length = 384 (13 bits across bytes 3-5):
+                                  //   bits 11..12 (low 2 of byte 3): (384 >> 11) & 0x3 = 0
+                                  //   bits  3..10 (byte 4):           (384 >> 3)  & 0xFF = 48
+                                  //   bits  0..2  (high 3 of byte 5): (384 & 0x7) << 5 = 0
         head[4] = 48;
         head[5] = 0;
         match parse_aac_or_m4a(&head).unwrap() {
@@ -2057,15 +2078,15 @@ music_directory "/right"
         // variant discriminant. UI subscribers parse on the
         // `kind` tag.
         let cbr = EncodedBitrate::Cbr { kbps: 320 };
-        let j = serde_json::to_value(&cbr).unwrap();
+        let j = serde_json::to_value(cbr).unwrap();
         assert_eq!(j["kind"], "cbr");
         assert_eq!(j["kbps"], 320);
         let vbr = EncodedBitrate::Vbr { avg_kbps: 245 };
-        let j = serde_json::to_value(&vbr).unwrap();
+        let j = serde_json::to_value(vbr).unwrap();
         assert_eq!(j["kind"], "vbr");
         assert_eq!(j["avg_kbps"], 245);
         let unk = EncodedBitrate::Unknown;
-        let j = serde_json::to_value(&unk).unwrap();
+        let j = serde_json::to_value(unk).unwrap();
         assert_eq!(j["kind"], "unknown");
     }
 

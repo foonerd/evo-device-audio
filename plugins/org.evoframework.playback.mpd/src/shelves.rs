@@ -1,0 +1,839 @@
+//! Shelf integration bundle.
+//!
+//! Holds the four new audio.queue / audio.playlist /
+//! audio.favourites / audio.library shelf contexts plus the
+//! sticker reconciler handle in one struct so the plugin
+//! lifecycle (load/unload) and the verb dispatcher each touch
+//! a single Option<ShelfBundle> instead of N fields.
+//!
+//! # Verb dispatch
+//!
+//! [`ShelfBundle::dispatch_request`] handles all 31 new
+//! request_types (9 queue + 8 playlist + 6 favourites + 8
+//! library). The plugin's existing
+//! `handle_request` match falls through to this entry-point
+//! when the request_type matches none of its existing arms.
+//!
+//! Each verb spawns its own short-lived MpdConnection — bulk
+//! sticker writes happen on the sticker reconciler's dedicated
+//! connection; the verbs' per-request connections are cheap
+//! and avoid serialising operator gestures on the supervisor's
+//! command connection.
+//!
+//! # Lifecycle
+//!
+//! - [`ShelfBundle::init`] runs at plugin load. Parses
+//!   music_directory + playlist_directory from /etc/mpd.conf;
+//!   constructs the SourceRegistry, loads from state dir,
+//!   registers the floor source if absent; constructs the
+//!   DispositionEmitter, SkipTraversal, and four shelf
+//!   contexts; announces every subject; spawns the sticker
+//!   reconciler.
+//! - [`ShelfBundle::shutdown`] runs at plugin unload. Stops
+//!   the sticker reconciler, persists the registry +
+//!   disposition emitter snapshots.
+//!
+//! # Error translation
+//!
+//! Each shelf module's `VerbError` enum maps to PluginError
+//! variants via the `into_plugin_error` helpers below — kept
+//! local so a future contributor changing the mapping touches
+//! a single place.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use evo_plugin_sdk::contract::{
+    PluginError, Request, Response, SubjectAnnouncer,
+};
+
+use crate::disposition_emitter::DispositionEmitter;
+use crate::favourites::{self, FavouritesContext};
+use crate::library::{self, LibraryContext};
+use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
+use crate::playlist::{
+    self, PlaylistContext, DEFAULT_FAVOURITES_PLAYLIST_NAME,
+};
+use crate::queue::{self, QueueContext};
+use crate::skip_traversal::SkipTraversal;
+use crate::source_probe;
+use crate::source_registry::SourceRegistry;
+use crate::sticker_reconciler::{self, StickerReconcilerHandle};
+
+const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
+
+/// The bundled shelf state. Created at plugin load by
+/// [`ShelfBundle::init`]; dropped at unload by
+/// [`ShelfBundle::shutdown`].
+pub(crate) struct ShelfBundle {
+    pub(crate) registry: SourceRegistry,
+    /// Disposition emitter Arc-clone is held by
+    /// [`SkipTraversal`] (and therefore by the queue
+    /// context). Kept on the bundle so future read verbs
+    /// (e.g. `get_dispositions`) can reach it without
+    /// threading another Arc through.
+    #[allow(dead_code)]
+    pub(crate) disposition_emitter: DispositionEmitter,
+    /// Skip-traversal is cloned into [`QueueContext`]; the
+    /// bundle field is the canonical source. Kept on the
+    /// bundle so a future verb that bypasses the queue
+    /// (e.g. a "skip from MPD-side state change") can reach
+    /// the same instance.
+    #[allow(dead_code)]
+    pub(crate) skip_traversal: SkipTraversal,
+    pub(crate) queue: QueueContext,
+    pub(crate) playlist: PlaylistContext,
+    pub(crate) favourites: FavouritesContext,
+    pub(crate) library: LibraryContext,
+    pub(crate) sticker_reconciler: Option<StickerReconcilerHandle>,
+    pub(crate) endpoint: MpdEndpoint,
+    pub(crate) timeouts: ConnectTimeouts,
+}
+
+impl ShelfBundle {
+    /// Construct + initialise the shelves at plugin load.
+    ///
+    /// `state_dir` is the plugin's per-load filesystem state
+    /// directory (sources.toml + dispositions.toml live under
+    /// it). `subjects` is the framework's
+    /// `SubjectAnnouncer`. `endpoint` + `timeouts` are the MPD
+    /// connection parameters the rest of the plugin uses.
+    pub(crate) async fn init(
+        state_dir: PathBuf,
+        subjects: Arc<dyn SubjectAnnouncer>,
+        endpoint: MpdEndpoint,
+        timeouts: ConnectTimeouts,
+    ) -> Self {
+        let music_directory = source_probe::load_music_directory_from_mpd_conf(
+            Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
+        )
+        .unwrap_or_else(|| PathBuf::from("/var/lib/evo/music"));
+        let playlist_directory =
+            source_probe::load_playlist_directory_from_mpd_conf(Path::new(
+                source_probe::DEFAULT_MPD_CONF_PATH,
+            ))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/mpd/playlists"));
+
+        // Construct + rehydrate the source registry.
+        let registry =
+            SourceRegistry::with_state_path(state_dir.join("sources.toml"));
+        if let Err(e) = registry.load_from_disk().await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "source registry rehydrate failed; starting empty"
+            );
+        }
+
+        // Construct the disposition emitter with persistence.
+        let disposition_emitter = DispositionEmitter::with_state_path(
+            subjects.clone(),
+            state_dir.join("dispositions.toml"),
+        );
+        if let Err(e) = disposition_emitter.load_from_disk().await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "disposition emitter rehydrate failed; starting empty"
+            );
+        }
+
+        // Skip-traversal owns Arc clones of registry + emitter.
+        let skip_traversal =
+            SkipTraversal::new(registry.clone(), disposition_emitter.clone());
+
+        // Construct each shelf's context.
+        let queue = QueueContext::new(
+            music_directory.clone(),
+            registry.clone(),
+            subjects.clone(),
+            skip_traversal.clone(),
+        );
+        let playlist = PlaylistContext::new(
+            music_directory.clone(),
+            playlist_directory.clone(),
+            registry.clone(),
+            subjects.clone(),
+            DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+        );
+        let favourites = FavouritesContext::new(
+            music_directory.clone(),
+            registry.clone(),
+            subjects.clone(),
+            DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+        );
+        let library = LibraryContext::new(
+            music_directory.clone(),
+            registry.clone(),
+            subjects.clone(),
+        );
+
+        // Ensure the local-internal floor source is registered.
+        if let Err(e) =
+            library::ensure_local_internal_registered(&library).await
+        {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "ensure_local_internal_registered failed; \
+                 floor library source unavailable until next plugin load"
+            );
+        }
+
+        // Announce every subject at load.
+        disposition_emitter.announce().await;
+        queue::announce_queue(&queue).await;
+        playlist::announce_index(&playlist).await;
+        favourites::announce_favourites(&favourites).await;
+        library::announce_subjects(&library).await;
+
+        // Spawn the sticker reconciler against the registry's
+        // broadcast.
+        let sticker_reconciler = Some(sticker_reconciler::spawn(
+            endpoint.clone(),
+            timeouts,
+            registry.clone(),
+        ));
+
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            music_directory = %music_directory.display(),
+            playlist_directory = %playlist_directory.display(),
+            "shelf integration initialised: queue / playlist / favourites / library subjects announced"
+        );
+
+        Self {
+            registry,
+            disposition_emitter,
+            skip_traversal,
+            queue,
+            playlist,
+            favourites,
+            library,
+            sticker_reconciler,
+            endpoint,
+            timeouts,
+        }
+    }
+
+    /// Tear down at plugin unload. Stops the sticker
+    /// reconciler + persists the registry to disk so the next
+    /// load rehydrates without operator effort. The
+    /// disposition emitter persists synchronously on every
+    /// `emit` call so no explicit unload-time persist is
+    /// needed.
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(handle) = self.sticker_reconciler.take() {
+            handle.stop().await;
+        }
+        if let Err(e) = self.registry.persist().await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "source registry persist on unload failed; \
+                 next load may rehydrate from stale state"
+            );
+        }
+    }
+
+    /// Open a fresh MPD connection for one verb dispatch.
+    /// Connections are cheap on localhost and isolate each
+    /// verb's failure mode.
+    async fn open_conn(&self) -> Result<MpdConnection, PluginError> {
+        MpdConnection::connect_with_timeouts(
+            self.endpoint.clone(),
+            self.timeouts,
+        )
+        .await
+        .map_err(|e| PluginError::Transient(format!("MPD connect failed: {e}")))
+    }
+
+    /// Verb dispatcher entry point. Returns `Ok(Some(Response))`
+    /// when the request_type matched a shelf verb;
+    /// `Ok(None)` when it didn't (caller's other arms continue
+    /// dispatching).
+    pub(crate) async fn dispatch_request(
+        &self,
+        req: &Request,
+    ) -> Result<Option<Response>, PluginError> {
+        match req.request_type.as_str() {
+            // Queue verbs
+            "queue.get_queue" => {
+                Ok(Some(self.dispatch_queue_get_queue(req).await?))
+            }
+            "queue.enqueue" => {
+                Ok(Some(self.dispatch_queue_enqueue(req).await?))
+            }
+            "queue.remove_queue_item" => {
+                Ok(Some(self.dispatch_queue_remove_queue_item(req).await?))
+            }
+            "queue.move_queue_item" => {
+                Ok(Some(self.dispatch_queue_move_queue_item(req).await?))
+            }
+            "queue.clear_queue" => {
+                Ok(Some(self.dispatch_queue_clear_queue(req).await?))
+            }
+            "queue.load_playlist_to_queue" => {
+                Ok(Some(self.dispatch_queue_load_playlist_to_queue(req).await?))
+            }
+            "queue.append_playlist_to_queue" => Ok(Some(
+                self.dispatch_queue_append_playlist_to_queue(req).await?,
+            )),
+            "queue.save_queue_as_playlist" => {
+                Ok(Some(self.dispatch_queue_save_queue_as_playlist(req).await?))
+            }
+            "queue.skip_to_next_available" => {
+                Ok(Some(self.dispatch_queue_skip_to_next_available(req).await?))
+            }
+            // Playlist verbs
+            "playlist.list_playlists" => {
+                Ok(Some(self.dispatch_playlist_list_playlists(req).await?))
+            }
+            "playlist.get_playlist" => {
+                Ok(Some(self.dispatch_playlist_get_playlist(req).await?))
+            }
+            "playlist.create_playlist" => {
+                Ok(Some(self.dispatch_playlist_create_playlist(req).await?))
+            }
+            "playlist.delete_playlist" => {
+                Ok(Some(self.dispatch_playlist_delete_playlist(req).await?))
+            }
+            "playlist.rename_playlist" => {
+                Ok(Some(self.dispatch_playlist_rename_playlist(req).await?))
+            }
+            "playlist.add_to_playlist" => {
+                Ok(Some(self.dispatch_playlist_add_to_playlist(req).await?))
+            }
+            "playlist.remove_from_playlist" => Ok(Some(
+                self.dispatch_playlist_remove_from_playlist(req).await?,
+            )),
+            "playlist.move_in_playlist" => {
+                Ok(Some(self.dispatch_playlist_move_in_playlist(req).await?))
+            }
+            // Favourites verbs
+            "favourites.list_favourites" => {
+                Ok(Some(self.dispatch_favourites_list_favourites(req).await?))
+            }
+            "favourites.is_favourite" => {
+                Ok(Some(self.dispatch_favourites_is_favourite(req).await?))
+            }
+            "favourites.add_favourite" => {
+                Ok(Some(self.dispatch_favourites_add_favourite(req).await?))
+            }
+            "favourites.remove_favourite" => {
+                Ok(Some(self.dispatch_favourites_remove_favourite(req).await?))
+            }
+            "favourites.clear_favourites" => {
+                Ok(Some(self.dispatch_favourites_clear_favourites(req).await?))
+            }
+            "favourites.move_favourite" => {
+                Ok(Some(self.dispatch_favourites_move_favourite(req).await?))
+            }
+            // Library verbs
+            "library.list_sources" => {
+                Ok(Some(self.dispatch_library_list_sources(req).await?))
+            }
+            "library.add_source" => {
+                Ok(Some(self.dispatch_library_add_source(req).await?))
+            }
+            "library.remove_source" => {
+                Ok(Some(self.dispatch_library_remove_source(req).await?))
+            }
+            "library.probe_source" => {
+                Ok(Some(self.dispatch_library_probe_source(req).await?))
+            }
+            "library.wake_source" => {
+                Ok(Some(self.dispatch_library_wake_source(req).await?))
+            }
+            "library.update_source" => {
+                Ok(Some(self.dispatch_library_update_source(req).await?))
+            }
+            "library.browse_library" => {
+                Ok(Some(self.dispatch_library_browse_library(req).await?))
+            }
+            "library.search_library" => {
+                Ok(Some(self.dispatch_library_search_library(req).await?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // ----- queue dispatchers -----
+
+    async fn dispatch_queue_get_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let state = queue::handle_get_queue(&self.queue).await;
+        encode_json_response(req, &state)
+    }
+
+    async fn dispatch_queue_enqueue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::EnqueuePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_enqueue(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_remove_queue_item(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::RemoveQueueItemPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_remove_queue_item(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_move_queue_item(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::MoveQueueItemPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_move_queue_item(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_clear_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let mut conn = self.open_conn().await?;
+        queue::handle_clear_queue(&self.queue, &mut conn)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_load_playlist_to_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::LoadPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_load_playlist_to_queue(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_append_playlist_to_queue(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::AppendPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_append_playlist_to_queue(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_save_queue_as_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::SaveQueueAsPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_save_queue_as_playlist(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_queue_skip_to_next_available(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::SkipToNextAvailablePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let outcome = queue::handle_skip_to_next_available(
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(queue_verb_to_plugin_error)?;
+        let body = serde_json::json!({
+            "v":      queue::QUEUE_PAYLOAD_VERSION,
+            "outcome": outcome_to_wire(&outcome),
+        });
+        encode_json_response(req, &body)
+    }
+
+    // ----- playlist dispatchers -----
+
+    async fn dispatch_playlist_list_playlists(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let state = playlist::handle_list_playlists(&self.playlist).await;
+        encode_json_response(req, &state)
+    }
+
+    async fn dispatch_playlist_get_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::GetPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let env =
+            playlist::handle_get_playlist(&self.playlist, &mut conn, payload)
+                .await
+                .map_err(playlist_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+
+    async fn dispatch_playlist_create_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::CreatePlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_create_playlist(&self.playlist, &mut conn, payload)
+            .await
+            .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_delete_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::DeletePlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_delete_playlist(&self.playlist, &mut conn, payload)
+            .await
+            .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_rename_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::RenamePlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_rename_playlist(&self.playlist, &mut conn, payload)
+            .await
+            .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_add_to_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::AddToPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_add_to_playlist(&self.playlist, &mut conn, payload)
+            .await
+            .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_remove_from_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::RemoveFromPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_remove_from_playlist(
+            &self.playlist,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_move_in_playlist(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::MoveInPlaylistPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        playlist::handle_move_in_playlist(&self.playlist, &mut conn, payload)
+            .await
+            .map_err(playlist_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    // ----- favourites dispatchers -----
+
+    async fn dispatch_favourites_list_favourites(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let state = favourites::handle_list_favourites(&self.favourites).await;
+        encode_json_response(req, &state)
+    }
+
+    async fn dispatch_favourites_is_favourite(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: favourites::IsFavouritePayload = parse_json(req)?;
+        let res = favourites::handle_is_favourite(&self.favourites, payload)
+            .await
+            .map_err(favourites_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_favourites_add_favourite(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: favourites::AddFavouritePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        favourites::handle_add_favourite(&self.favourites, &mut conn, payload)
+            .await
+            .map_err(favourites_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_favourites_remove_favourite(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: favourites::RemoveFavouritePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        favourites::handle_remove_favourite(
+            &self.favourites,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(favourites_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_favourites_clear_favourites(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: favourites::ClearFavouritesPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        favourites::handle_clear_favourites(
+            &self.favourites,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(favourites_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_favourites_move_favourite(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: favourites::MoveFavouritePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        favourites::handle_move_favourite(&self.favourites, &mut conn, payload)
+            .await
+            .map_err(favourites_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    // ----- library dispatchers -----
+
+    async fn dispatch_library_list_sources(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let state = library::handle_list_sources(&self.library).await;
+        encode_json_response(req, &state)
+    }
+
+    async fn dispatch_library_add_source(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::AddSourcePayload = parse_json(req)?;
+        let res = library::handle_add_source(&self.library, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_remove_source(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::RemoveSourcePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        library::handle_remove_source(&self.library, &mut conn, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_ok_response(req)
+    }
+
+    async fn dispatch_library_probe_source(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::ProbeSourcePayload = parse_json(req)?;
+        let res = library::handle_probe_source(&self.library, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_wake_source(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::WakeSourcePayload = parse_json(req)?;
+        let res = library::handle_wake_source(&self.library, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_update_source(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::UpdateSourcePayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res =
+            library::handle_update_source(&self.library, &mut conn, payload)
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_browse_library(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::BrowseLibraryPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let env =
+            library::handle_browse_library(&self.library, &mut conn, payload)
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+
+    async fn dispatch_library_search_library(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::SearchLibraryPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let env =
+            library::handle_search_library(&self.library, &mut conn, payload)
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+}
+
+// ----- helpers -----
+
+fn parse_json<T: serde::de::DeserializeOwned>(
+    req: &Request,
+) -> Result<T, PluginError> {
+    serde_json::from_slice(&req.payload).map_err(|e| {
+        PluginError::Permanent(format!(
+            "{:?} payload is not valid JSON: {e}",
+            req.request_type
+        ))
+    })
+}
+
+fn encode_json_response<T: serde::Serialize>(
+    req: &Request,
+    body: &T,
+) -> Result<Response, PluginError> {
+    let bytes = serde_json::to_vec(body).map_err(|e| {
+        PluginError::Permanent(format!(
+            "{:?} response JSON encode failed: {e}",
+            req.request_type
+        ))
+    })?;
+    Ok(Response::for_request(req, bytes))
+}
+
+fn encode_ok_response(req: &Request) -> Result<Response, PluginError> {
+    let body = serde_json::json!({ "v": 1, "status": "ok" });
+    encode_json_response(req, &body)
+}
+
+fn outcome_to_wire(
+    outcome: &crate::skip_traversal::SkipOutcome,
+) -> serde_json::Value {
+    use crate::skip_traversal::SkipOutcome;
+    match outcome {
+        SkipOutcome::Playing { position } => {
+            serde_json::json!({ "kind": "playing", "position": position })
+        }
+        SkipOutcome::Paused { last_attempted } => serde_json::json!({
+            "kind": "paused",
+            "last_attempted": last_attempted,
+        }),
+        SkipOutcome::Stopped => {
+            serde_json::json!({ "kind": "stopped" })
+        }
+    }
+}
+
+fn queue_verb_to_plugin_error(e: queue::VerbError) -> PluginError {
+    use queue::VerbError;
+    match e {
+        VerbError::PayloadVersion { .. } | VerbError::EmptyUris => {
+            PluginError::Permanent(e.to_string())
+        }
+        VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+    }
+}
+
+fn playlist_verb_to_plugin_error(e: playlist::VerbError) -> PluginError {
+    use playlist::VerbError;
+    match e {
+        VerbError::PayloadVersion { .. }
+        | VerbError::InvalidName { .. }
+        | VerbError::NotFound { .. }
+        | VerbError::DuplicateName { .. }
+        | VerbError::FavouritesProtected { .. } => {
+            PluginError::Permanent(e.to_string())
+        }
+        VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+    }
+}
+
+fn favourites_verb_to_plugin_error(e: favourites::VerbError) -> PluginError {
+    use favourites::VerbError;
+    match e {
+        VerbError::PayloadVersion { .. } | VerbError::NotFavourite { .. } => {
+            PluginError::Permanent(e.to_string())
+        }
+        VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+    }
+}
+
+fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
+    use library::VerbError;
+    match e {
+        VerbError::PayloadVersion { .. }
+        | VerbError::UnknownSource { .. }
+        | VerbError::NonRemovableLocalInternal
+        | VerbError::CloudEagerScanRequiresAcknowledgement
+        | VerbError::SourceOffline { .. }
+        | VerbError::Register { .. } => PluginError::Permanent(e.to_string()),
+        VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+    }
+}

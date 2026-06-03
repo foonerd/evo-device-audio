@@ -384,6 +384,7 @@ async fn emit_single(
 /// advance loop (the ambient observer's source-offline-on-
 /// playing-song detection) can emit it through the shared
 /// disposition emitter.
+#[allow(dead_code)]
 pub(crate) async fn emit_playback_paused_source_offline(
     emitter: &DispositionEmitter,
     source_id: String,
@@ -408,9 +409,6 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-// Re-export for the queue / supervisor consumer modules.
-pub(crate) use SkipOutcome::*;
 
 // Silence Clippy on the broadcast use we don't yet consume —
 // will go away when the queue module wires up.
@@ -553,7 +551,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let queue = vec![item(0, Some("nas"), false)];
+        let queue = [item(0, Some("nas"), false)];
         // We can't call advance without a real MPD; the cached-
         // Offline path doesn't reach MPD before the queue
         // exhausts, but the exhausted path still emits a

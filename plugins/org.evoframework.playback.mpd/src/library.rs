@@ -126,6 +126,7 @@ impl LibraryContext {
 /// `fetched_at_ms` is the wall-clock at which the cache was
 /// populated; subscribers display "fetched 5 minutes ago"
 /// stale-cache hints in the UI.
+#[allow(dead_code)]
 #[derive(Clone)]
 struct CachedBrowse {
     entries: Vec<serde_json::Value>,
@@ -488,10 +489,8 @@ fn sanitise_id(name: &str) -> String {
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
-        } else if matches!(ch, ' ' | '-' | '_') {
-            if !out.ends_with('-') {
-                out.push('-');
-            }
+        } else if matches!(ch, ' ' | '-' | '_') && !out.ends_with('-') {
+            out.push('-');
         }
     }
     let trimmed = out.trim_matches('-').to_string();

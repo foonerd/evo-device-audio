@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::mpd::{MpdConnection, MpdQueueItem};
+use crate::mpd::MpdConnection;
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
 use crate::sticker_reconciler::EVO_AVAILABLE_STICKER;
@@ -456,7 +456,11 @@ pub(crate) struct SkipToNextAvailablePayload {
     pub(crate) v: u32,
 }
 
-/// Common-shape response for mutating verbs.
+/// Common-shape response for mutating verbs. Constructed by
+/// the shelves' verb dispatcher via the JSON literal
+/// `{ "v": 1, "status": "ok" }`; kept here as a type to anchor
+/// the wire-shape contract.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub(crate) struct SimpleQueueResponse {
     /// Envelope version.

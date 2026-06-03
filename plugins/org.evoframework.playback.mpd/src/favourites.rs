@@ -296,6 +296,7 @@ pub(crate) struct IsFavouriteResponse {
     pub(crate) is_favourite: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub(crate) struct SimpleFavouritesResponse {
     pub(crate) v: u32,

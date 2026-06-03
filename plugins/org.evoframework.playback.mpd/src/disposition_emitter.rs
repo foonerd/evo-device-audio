@@ -105,6 +105,7 @@ impl DispositionEmitter {
     /// Construct an emitter backed by a live subject announcer.
     /// No persistence — use [`Self::with_state_path`] to attach
     /// a state file.
+    #[allow(dead_code)]
     pub(crate) fn new(subjects: Arc<dyn SubjectAnnouncer>) -> Self {
         Self {
             inner: Arc::new(EmitterInner {
@@ -222,8 +223,10 @@ impl DispositionEmitter {
     }
 
     /// Read-only snapshot of the ring buffer for the
-    /// (future) `get_dispositions` read verb. Most-recent-first
-    /// order matches the subject state's wire shape.
+    /// `get_dispositions` read verb (not yet wired into the
+    /// dispatcher). Most-recent-first order matches the
+    /// subject state's wire shape.
+    #[allow(dead_code)]
     pub(crate) async fn snapshot(&self) -> Vec<Disposition> {
         let ring = self.inner.ring.lock().await;
         ring.iter().rev().cloned().collect()

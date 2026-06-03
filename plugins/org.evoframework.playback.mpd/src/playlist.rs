@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::mpd::{MpdConnection, MpdPlaylistEntry, MpdPlaylistSummary};
+use crate::mpd::{MpdConnection, MpdPlaylistEntry};
 use crate::queue::resolve_source;
 use crate::source_registry::SourceRegistry;
 use crate::sticker_reconciler::EVO_AVAILABLE_STICKER;
@@ -429,6 +429,7 @@ pub(crate) struct MoveInPlaylistPayload {
     pub(crate) to_position: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub(crate) struct SimplePlaylistResponse {
     pub(crate) v: u32,

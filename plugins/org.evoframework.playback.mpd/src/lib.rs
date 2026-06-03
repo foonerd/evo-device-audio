@@ -116,6 +116,7 @@ mod mpd_restart;
 mod playback_supervisor;
 mod playlist;
 mod queue;
+mod shelves;
 mod skip_traversal;
 mod source_probe;
 mod source_registry;
@@ -226,6 +227,41 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "set_consume",
     "get_now_playing",
     "get_stream_format",
+    // audio.queue.v1 shelf verbs
+    "queue.get_queue",
+    "queue.enqueue",
+    "queue.remove_queue_item",
+    "queue.move_queue_item",
+    "queue.clear_queue",
+    "queue.load_playlist_to_queue",
+    "queue.append_playlist_to_queue",
+    "queue.save_queue_as_playlist",
+    "queue.skip_to_next_available",
+    // audio.playlist.v1 shelf verbs
+    "playlist.list_playlists",
+    "playlist.get_playlist",
+    "playlist.create_playlist",
+    "playlist.delete_playlist",
+    "playlist.rename_playlist",
+    "playlist.add_to_playlist",
+    "playlist.remove_from_playlist",
+    "playlist.move_in_playlist",
+    // audio.favourites.v1 shelf verbs
+    "favourites.list_favourites",
+    "favourites.is_favourite",
+    "favourites.add_favourite",
+    "favourites.remove_favourite",
+    "favourites.clear_favourites",
+    "favourites.move_favourite",
+    // audio.library.v1 shelf verbs
+    "library.list_sources",
+    "library.add_source",
+    "library.remove_source",
+    "library.probe_source",
+    "library.wake_source",
+    "library.update_source",
+    "library.browse_library",
+    "library.search_library",
 ];
 
 /// Wire-protocol payload version every source-verb request
@@ -476,6 +512,17 @@ pub struct MpdPlaybackPlugin {
     /// fixtures, OOP transports). Held here so
     /// `Plugin::unload` can stop it cleanly.
     capabilities_watcher: Option<CapabilitiesWatcherHandle>,
+    /// Shelf integration bundle holding source registry,
+    /// disposition emitter, skip-traversal, the four shelf
+    /// contexts (queue / playlist / favourites / library), and
+    /// the sticker reconciler handle. Constructed at
+    /// `Plugin::load` after the existing subject emitter
+    /// setup; consumed at `Plugin::unload` via
+    /// [`shelves::ShelfBundle::shutdown`]. `None` before first
+    /// load and after `Plugin::unload`. The respondent
+    /// dispatcher's per-shelf request_types route through
+    /// [`shelves::ShelfBundle::dispatch_request`].
+    shelves: Option<shelves::ShelfBundle>,
 }
 
 /// Operator-selected MPD-protocol settings carried on the
@@ -613,6 +660,7 @@ impl MpdPlaybackPlugin {
             audio_protocol_settings_tx,
             auto_restarter: None,
             capabilities_watcher: None,
+            shelves: None,
         }
     }
 
@@ -2198,6 +2246,21 @@ impl Plugin for MpdPlaybackPlugin {
                 &self.active_command_sender,
             )));
 
+            // Initialise the shelf integration: source
+            // registry + sticker reconciler + four shelf
+            // contexts (queue / playlist / favourites /
+            // library) + disposition emitter. Subjects are
+            // announced inside `init`; rehydration from the
+            // plugin's state directory happens there too.
+            let shelves = shelves::ShelfBundle::init(
+                ctx.state_dir.clone(),
+                Arc::clone(&ctx.subject_announcer) as Arc<dyn SubjectAnnouncer>,
+                self.endpoint.clone(),
+                self.timeouts,
+            )
+            .await;
+            self.shelves = Some(shelves);
+
             self.loaded = true;
 
             tracing::info!(
@@ -2272,6 +2335,13 @@ impl Plugin for MpdPlaybackPlugin {
             // observed outcome that path is designed for.
             if let Some(handle) = self.asound_watcher.take() {
                 handle.stop().await;
+            }
+            // Tear down the shelf integration last. Stops the
+            // sticker reconciler and persists the source
+            // registry so the next load rehydrates state
+            // without operator effort.
+            if let Some(shelves) = self.shelves.take() {
+                shelves.shutdown().await;
             }
             self.audio_routing = None;
 
@@ -2584,10 +2654,30 @@ impl Respondent for MpdPlaybackPlugin {
                 "set_consume" => self.handle_set_bool(req, "set_consume").await,
                 "get_now_playing" => self.handle_get_now_playing(req).await,
                 "get_stream_format" => self.handle_get_stream_format(req).await,
-                other => Err(PluginError::Permanent(format!(
-                    "request type {other:?} declared but no handler wired; \
-                     this is a manifest/runtime drift bug"
-                ))),
+                _ => {
+                    // Shelf verbs (queue / playlist /
+                    // favourites / library). The bundle's
+                    // dispatcher returns `Ok(Some(resp))`
+                    // when the request_type matched a shelf
+                    // verb, `Ok(None)` when it did not. A
+                    // None response with a declared verb is
+                    // the manifest/runtime drift bug the
+                    // legacy arm used to catch.
+                    let bundle = self.shelves.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "shelves not initialised; load() was not called"
+                                .to_string(),
+                        )
+                    })?;
+                    match bundle.dispatch_request(req).await? {
+                        Some(resp) => Ok(resp),
+                        None => Err(PluginError::Permanent(format!(
+                            "request type {:?} declared but no handler wired; \
+                             this is a manifest/runtime drift bug",
+                            req.request_type
+                        ))),
+                    }
+                }
             }
         }
     }

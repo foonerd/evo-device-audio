@@ -106,6 +106,66 @@ Role flips dynamically per the framework's source-host election.
 """
 
 [[racks.shelves]]
+name = "queue"
+shape = 1
+description = """
+Operator-facing audio playback queue management. Source-state \
+aware: every queue item carries `available` semantics derived \
+from per-source state + an `evo:available` MPD sticker, so \
+mixed-source queues (local + USB + NAS + cloud) survive a \
+source going offline mid-playlist by skipping unreachable \
+items + emitting a typed `Disposition`. Owns the canonical \
+queue projection on the `audio.queue.v1` shelf subject. \
+Verbs: get_queue, enqueue, remove_queue_item, move_queue_item, \
+clear_queue, load_playlist_to_queue, append_playlist_to_queue, \
+save_queue_as_playlist, skip_to_next_available.
+"""
+
+[[racks.shelves]]
+name = "playlist"
+shape = 1
+description = """
+Operator-facing stored playlist management. Wraps MPD's \
+stored-playlist namespace as the single source of truth; \
+favourites are a reserved internal playlist name protected \
+from delete + rename. Publishes the playlist index on the \
+`audio.playlist.v1` shelf subject. Verbs: list_playlists, \
+get_playlist, create_playlist, delete_playlist, rename_playlist, \
+add_to_playlist, remove_from_playlist, move_in_playlist.
+"""
+
+[[racks.shelves]]
+name = "favourites"
+shape = 1
+description = """
+Operator-facing favourites set. A set-semantic view onto a \
+reserved internal MPD playlist (`__favourites__`); add is \
+idempotent (silent no-op on duplicates); membership query \
+served from an in-memory mirror refreshed on every mutating \
+verb. Publishes the favourites projection on the \
+`audio.favourites.v1` shelf subject. Verbs: list_favourites, \
+is_favourite, add_favourite, remove_favourite, clear_favourites, \
+move_favourite.
+"""
+
+[[racks.shelves]]
+name = "library"
+shape = 1
+description = """
+Operator-facing library + source management. Owns the source \
+registry (local-internal floor + operator-attached USB / NAS / \
+cloud sources) with a state machine (Probing / Online / \
+Degraded / Offline / Retired). Lazy-browse for cloud sources, \
+eager scan for local + NAS. Browse_library returns the last \
+known listing with `stale: true` when the source is Offline \
+(stale-cache-on-offline contract — never refuses, never empty). \
+Publishes the source listing, browse, and search projections on \
+the `audio.library.v1` shelf subject. Verbs: list_sources, \
+add_source, remove_source, probe_source, wake_source, \
+update_source, browse_library, search_library.
+"""
+
+[[racks.shelves]]
 name = "terminus"
 shape = 1
 description = """
