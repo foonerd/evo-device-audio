@@ -113,6 +113,7 @@ mod mpd_restart;
 mod playback_supervisor;
 mod source_probe;
 mod source_registry;
+mod sticker_reconciler;
 
 #[cfg(test)]
 mod test_support_routing;

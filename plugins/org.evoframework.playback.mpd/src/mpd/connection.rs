@@ -1002,6 +1002,88 @@ impl MpdConnection {
         let fields = self.dispatch("listneighbors", &[]).await?;
         Ok(parse_neighbors(&fields))
     }
+
+    // ----- command list batching -----
+
+    /// Run a batch of commands in a single MPD round-trip via
+    /// `command_list_begin` / `command_list_end`. Each command's
+    /// fields are concatenated into one response; the caller
+    /// reads aggregate Ok or the first Ack.
+    ///
+    /// Used by the sticker reconciler for bulk
+    /// `sticker set song <uri> evo:available <0|1>` writes
+    /// against an entire source's mount path — 100k sticker
+    /// writes batch into ~1k command-list groups instead of
+    /// 100k individual round-trips.
+    ///
+    /// Each entry is `(command, args)`; arguments are quoted
+    /// per the existing dispatch path. Empty batch is a no-op
+    /// (no command_list issued).
+    pub(crate) async fn command_list(
+        &mut self,
+        commands: &[(&str, Vec<String>)],
+    ) -> Result<(), MpdError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        // Build the serialised command_list_begin ... command_list_end
+        // payload as a single write.
+        let mut payload: Vec<u8> = Vec::with_capacity(
+            commands
+                .iter()
+                .map(|(c, a)| {
+                    c.len() + a.iter().map(|s| s.len() + 3).sum::<usize>() + 2
+                })
+                .sum::<usize>()
+                + 40,
+        );
+        payload.extend_from_slice(b"command_list_begin\n");
+        for (cmd, args) in commands {
+            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let bytes = protocol::serialise_command(cmd, &args_ref)?;
+            payload.extend_from_slice(&bytes);
+        }
+        payload.extend_from_slice(b"command_list_end\n");
+
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            endpoint = %self.endpoint,
+            command_count = commands.len(),
+            payload_bytes = payload.len(),
+            "mpd command_list dispatch"
+        );
+
+        let budget = self.command_timeout;
+        self.framing
+            .write_all_with_timeout(&payload, budget, "command_list_write")
+            .await?;
+
+        // Drain fields until OK / Ack.
+        let mut _fields: Vec<Field> = Vec::new();
+        loop {
+            let line = self
+                .framing
+                .read_line_with_timeout(budget, "command_list_response")
+                .await?;
+            match protocol::classify_line(&line)? {
+                ClassifiedLine::Ok => return Ok(()),
+                ClassifiedLine::Ack {
+                    code,
+                    list_position,
+                    command,
+                    message,
+                } => {
+                    return Err(MpdError::Ack {
+                        code,
+                        list_position,
+                        command,
+                        message,
+                    });
+                }
+                ClassifiedLine::Field(f) => _fields.push(f),
+            }
+        }
+    }
 }
 
 /// Open the appropriate transport for `endpoint`, with a hard
