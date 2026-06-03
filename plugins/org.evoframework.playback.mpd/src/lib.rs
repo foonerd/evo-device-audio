@@ -108,6 +108,7 @@ mod asound_watcher;
 mod config;
 mod disposition_emitter;
 mod envelope_subscriber;
+mod favourites;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
