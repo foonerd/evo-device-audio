@@ -1430,6 +1430,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-parity-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "evo-plugin-sdk"
 version = "0.1.12"
 dependencies = [

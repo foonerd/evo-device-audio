@@ -1,0 +1,23 @@
+[package]
+name = "evo-parity-harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parity-equivalence harness for the four-shelf audio media-management surface. Connects to a deployed steward's admin Unix socket, drives every mutating verb across audio.queue / audio.playlist / audio.favourites / audio.library with structured pre-state -> mutate -> post-state assertions, exercises the skip-traversal disposition scenario, observes the update-source scan-progress subject, and emits one JSON line per case for CI consumption. Run against a live target rig; not part of the runtime distribution."
+publish = false
+
+[[bin]]
+name = "evo-parity-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

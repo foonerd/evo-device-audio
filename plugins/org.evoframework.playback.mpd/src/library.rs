@@ -652,11 +652,41 @@ pub(crate) async fn handle_update_source(
             source_id: payload.source_id.clone(),
         });
     }
-    let path = record.mount_path.to_string_lossy().into_owned();
-    let result = if payload.force_rescan {
-        conn.rescan(Some(&path)).await
+    // MPD's `update` / `rescan` take a database-relative path
+    // rooted at music_directory, NOT an absolute filesystem
+    // path. Passing an absolute path triggers MPD's "Malformed
+    // path" refusal — the same shape mistake browse_library
+    // made before its fix. Convert the source's mount_path to
+    // the music_directory-relative form before dispatch.
+    let path = mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    )
+    .map_err(|e| match e {
+        VerbError::SourceOutsideMusicDirectory {
+            mount_path,
+            music_directory,
+            ..
+        } => VerbError::SourceOutsideMusicDirectory {
+            source_id: payload.source_id.clone(),
+            mount_path,
+            music_directory,
+        },
+        other => other,
+    })?;
+    // MPD's update with empty-path is the database-root case;
+    // pass None so the wire frame becomes `update` (root) vs.
+    // `update PATH`.
+    let path_arg = if path.is_empty() {
+        None
     } else {
-        conn.update(Some(&path)).await
+        Some(path.as_str())
+    };
+    let result = if payload.force_rescan {
+        conn.rescan(path_arg).await
+    } else {
+        conn.update(path_arg).await
     };
     result.map_err(|e| VerbError::Mpd {
         verb: "update_source".to_string(),

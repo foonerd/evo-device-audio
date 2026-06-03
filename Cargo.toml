@@ -4,6 +4,7 @@ members = [
     "crates/evo-device-audio-shared",
     "crates/evo-device-audio-distribution",
     "crates/evo-multiroom",
+    "crates/evo-parity-harness",
     "plugins/org.evoframework.playback.mpd",
     "plugins/org.evoframework.metadata.local",
     "plugins/org.evoframework.artwork.local",
