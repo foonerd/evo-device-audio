@@ -106,6 +106,7 @@
 
 mod asound_watcher;
 mod config;
+mod disposition_emitter;
 mod envelope_subscriber;
 mod mpd;
 mod mpd_fragment;
