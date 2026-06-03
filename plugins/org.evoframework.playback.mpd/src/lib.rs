@@ -112,6 +112,7 @@ mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
 mod playback_supervisor;
+mod skip_traversal;
 mod source_probe;
 mod source_registry;
 mod sticker_reconciler;
