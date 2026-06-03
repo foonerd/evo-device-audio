@@ -4,9 +4,93 @@ name = "org.evoframework.playback.mpd"
 version = "0.1.0"
 contract = 1
 
-[target]
+# Multi-stocking declaration: this plugin stocks five shelves on
+# the audio rack from one process. See manifest.toml for the
+# carving rationale; the OOP wire-side manifest mirrors it verbatim
+# so the OOP build admits with the same stocking topology as the
+# in-process build.
+[[stockings]]
 shelf = "audio.playback"
 shape = 1
+role  = "warden"
+request_types = [
+    "play_now",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "next",
+    "previous",
+    "seek",
+    "seek_by_delta",
+    "set_volume",
+    "set_mute",
+    "set_repeat",
+    "set_shuffle",
+    "set_single",
+    "set_consume",
+    "get_now_playing",
+    "get_stream_format",
+]
+
+[[stockings]]
+shelf = "audio.queue"
+shape = 1
+role  = "respondent"
+request_types = [
+    "queue.get_queue",
+    "queue.enqueue",
+    "queue.remove_queue_item",
+    "queue.move_queue_item",
+    "queue.clear_queue",
+    "queue.load_playlist_to_queue",
+    "queue.append_playlist_to_queue",
+    "queue.save_queue_as_playlist",
+    "queue.skip_to_next_available",
+]
+
+[[stockings]]
+shelf = "audio.playlist"
+shape = 1
+role  = "respondent"
+request_types = [
+    "playlist.list_playlists",
+    "playlist.get_playlist",
+    "playlist.create_playlist",
+    "playlist.delete_playlist",
+    "playlist.rename_playlist",
+    "playlist.add_to_playlist",
+    "playlist.remove_from_playlist",
+    "playlist.move_in_playlist",
+]
+
+[[stockings]]
+shelf = "audio.favourites"
+shape = 1
+role  = "respondent"
+request_types = [
+    "favourites.list_favourites",
+    "favourites.is_favourite",
+    "favourites.add_favourite",
+    "favourites.remove_favourite",
+    "favourites.clear_favourites",
+    "favourites.move_favourite",
+]
+
+[[stockings]]
+shelf = "audio.library"
+shape = 1
+role  = "respondent"
+request_types = [
+    "library.list_sources",
+    "library.add_source",
+    "library.remove_source",
+    "library.probe_source",
+    "library.wake_source",
+    "library.update_source",
+    "library.browse_library",
+    "library.search_library",
+]
 
 [kind]
 instance = "singleton"
