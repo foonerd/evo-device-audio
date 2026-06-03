@@ -112,6 +112,7 @@ mod mpd_fragment;
 mod mpd_restart;
 mod playback_supervisor;
 mod source_probe;
+mod source_registry;
 
 #[cfg(test)]
 mod test_support_routing;
