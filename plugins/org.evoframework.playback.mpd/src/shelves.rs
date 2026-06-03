@@ -833,7 +833,10 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::NonRemovableLocalInternal
         | VerbError::CloudEagerScanRequiresAcknowledgement
         | VerbError::SourceOffline { .. }
-        | VerbError::Register { .. } => PluginError::Permanent(e.to_string()),
+        | VerbError::Register { .. }
+        | VerbError::SourceOutsideMusicDirectory { .. } => {
+            PluginError::Permanent(e.to_string())
+        }
         VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
     }
 }

@@ -383,6 +383,16 @@ pub(crate) enum VerbError {
     Mpd { verb: String, reason: String },
     #[error("library.add_source: source registration failed: {reason}")]
     Register { reason: String },
+    #[error(
+        "library.browse_library: source {source_id:?} mount_path {mount_path:?} \
+         is not under MPD's music_directory {music_directory:?}; \
+         browse over MPD requires the source to be mounted under MPD's library tree"
+    )]
+    SourceOutsideMusicDirectory {
+        source_id: String,
+        mount_path: String,
+        music_directory: String,
+    },
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -694,11 +704,33 @@ pub(crate) async fn handle_browse_library(
         }));
     }
     // Online / Degraded / Probing: read from MPD.
-    let mpd_path = if path.is_empty() {
-        record.mount_path.to_string_lossy().into_owned()
-    } else {
-        record.mount_path.join(&path).to_string_lossy().into_owned()
-    };
+    //
+    // MPD's `lsinfo` takes a **database-relative path** rooted at
+    // `music_directory`, NOT an absolute filesystem path. Passing
+    // an absolute path triggers MPD's filesystem-traversal guard
+    // and refuses on TCP connections with
+    // "Access to local files via TCP is not allowed" — the same
+    // refusal a malicious TCP client trying to enumerate
+    // `/etc/shadow` would receive. The handler MUST convert the
+    // source's mount_path + the operator-supplied browse path
+    // into a single database-relative path before issuing lsinfo.
+    let mpd_path = mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        &path,
+    )
+    .map_err(|e| match e {
+        VerbError::SourceOutsideMusicDirectory {
+            mount_path,
+            music_directory,
+            ..
+        } => VerbError::SourceOutsideMusicDirectory {
+            source_id: payload.source_id.clone(),
+            mount_path,
+            music_directory,
+        },
+        other => other,
+    })?;
     let entries = conn.lsinfo(&mpd_path).await.map_err(|e| VerbError::Mpd {
         verb: "browse_library".to_string(),
         reason: e.to_string(),
@@ -724,6 +756,52 @@ pub(crate) async fn handle_browse_library(
         "stale":        false,
         "source_state": record.state,
     }))
+}
+
+/// Compute the **database-relative path** MPD's `lsinfo` expects.
+///
+/// MPD's library is rooted at `music_directory`; every wire command
+/// that names a path (lsinfo / find / search / listallinfo) takes
+/// the path RELATIVE to that root. Passing an absolute filesystem
+/// path triggers MPD's filesystem-traversal guard and refuses on
+/// TCP connections — the daemon treats the request as a malicious
+/// attempt to enumerate paths outside the music database.
+///
+/// This helper:
+/// - Computes the source's mount_path RELATIVE to music_directory.
+/// - Joins the operator-supplied browse `user_path` underneath.
+/// - Returns the empty string for the database root case (when the
+///   source mounts at music_directory itself).
+/// - Refuses with [`VerbError::SourceOutsideMusicDirectory`] when
+///   the source's mount_path is not under music_directory (a
+///   misconfigured source — fix at registration, not at browse
+///   time).
+///
+/// The operator-supplied path is taken as-is — separator
+/// normalisation is the caller's responsibility (the browse
+/// shelf's wire contract pins POSIX `/` separators).
+fn mpd_database_relative_path(
+    music_directory: &std::path::Path,
+    mount_path: &std::path::Path,
+    user_path: &str,
+) -> Result<String, VerbError> {
+    let source_relative =
+        mount_path.strip_prefix(music_directory).map_err(|_| {
+            VerbError::SourceOutsideMusicDirectory {
+                source_id: String::new(),
+                mount_path: mount_path.to_string_lossy().into_owned(),
+                music_directory: music_directory.to_string_lossy().into_owned(),
+            }
+        })?;
+    let source_relative = source_relative.to_string_lossy();
+    let trimmed_user = user_path.trim_start_matches('/');
+    let joined = match (source_relative.is_empty(), trimmed_user.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => trimmed_user.to_string(),
+        (false, true) => source_relative.into_owned(),
+        (false, false) => format!("{source_relative}/{trimmed_user}"),
+    };
+    Ok(joined)
 }
 
 fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
@@ -1104,5 +1182,90 @@ mod tests {
         // the cap constant matches what the handler uses.
         let _ = payload;
         assert_eq!(SEARCH_MAX_RESULTS_CAP, 1000);
+    }
+
+    // ----- mpd_database_relative_path -----
+
+    #[test]
+    fn mpd_path_source_at_subdirectory_with_user_path() {
+        // Local-internal floor source: mount_path =
+        // /var/lib/evo/music/INTERNAL, music_directory =
+        // /var/lib/evo/music. User browses "Albums/Album1".
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music/INTERNAL"),
+            "Albums/Album1",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "INTERNAL/Albums/Album1");
+    }
+
+    #[test]
+    fn mpd_path_source_at_subdirectory_root_browse() {
+        // Same source, user browses the source root (empty path).
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music/INTERNAL"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "INTERNAL");
+    }
+
+    #[test]
+    fn mpd_path_source_equals_music_directory() {
+        // Edge case: source mounts at music_directory itself.
+        // The MPD-relative root is the empty string (the database
+        // root path lsinfo accepts).
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "");
+    }
+
+    #[test]
+    fn mpd_path_source_equals_music_directory_with_user_path() {
+        // Source at music_directory; user browses into "Albums".
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music"),
+            "Albums",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "Albums");
+    }
+
+    #[test]
+    fn mpd_path_user_path_with_leading_slash_is_normalised() {
+        // The wire contract pins POSIX `/` separators; an
+        // operator-supplied leading slash collapses cleanly
+        // rather than producing a double-slash join.
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music/INTERNAL"),
+            "/Albums/Album1",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "INTERNAL/Albums/Album1");
+    }
+
+    #[test]
+    fn mpd_path_source_outside_music_directory_refuses() {
+        // External mount NOT under music_directory: the helper
+        // refuses with a structured error rather than emitting an
+        // absolute-path lsinfo that MPD would reject.
+        let err = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/mnt/external/library"),
+            "",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, VerbError::SourceOutsideMusicDirectory { .. }),
+            "expected SourceOutsideMusicDirectory, got {err:?}"
+        );
     }
 }
