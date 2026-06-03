@@ -387,6 +387,74 @@ name = "audio_playback_spectrum_frame"
 [[subjects]]
 name = "audio_playback_now_playing"
 
+# Disposition audit trail published by the playback warden.
+# Carries the typed record (kind, optional run, recovery hint)
+# of every autonomous device decision (a track skipped because
+# its source was offline, a queue exhausted with no playable
+# items, etc.). The audit trail is the operator's window into
+# decisions the device made without an explicit gesture; the
+# UI surfaces it as a recent-activity panel with per-entry
+# recovery hints.
+[[subjects]]
+name = "audio_playback_disposition"
+
+# Operator-facing queue projection on the audio.queue.v1
+# shelf. Carries the current MPD queue with per-item
+# `available` semantics derived from the per-source state +
+# the song's `evo:available` MPD sticker. Truncated to a
+# bounded window (queue head) for subject-wire size; the full
+# queue stays addressable via `queue.get_queue` for
+# long-running operator inspection.
+[[subjects]]
+name = "audio_queue"
+
+# Operator-facing stored-playlist index projection on the
+# audio.playlist.v1 shelf. Carries the list of stored
+# playlists with per-item summaries (name, item count, last
+# modified). The favourites reserved internal playlist is
+# excluded from the index — favourites have their own
+# subject.
+[[subjects]]
+name = "audio_playlist_index"
+
+# Operator-facing favourites projection on the
+# audio.favourites.v1 shelf. Carries the membership of the
+# reserved internal favourites playlist as an ordered list
+# of URIs; the framework's subject-state subscribers serve
+# membership queries from this snapshot without a per-query
+# MPD round-trip.
+[[subjects]]
+name = "audio_favourites"
+
+# Operator-facing library source listing on the
+# audio.library.v1 shelf. Carries every registered source
+# (local-internal floor + operator-attached USB / NAS /
+# cloud) with its kind, mount path, current state, scan
+# policy, and track count. Subscribers render the source
+# list in the operator UI; state transitions republish.
+[[subjects]]
+name = "audio_library_sources"
+
+# Operator-facing per-source state-machine projection on the
+# audio.library.v1 shelf. Carries the current state
+# (Probing / Online / Degraded / Offline / Retired) for each
+# registered source with the last-known transition timestamp
+# and the reason string when present. Distinct from
+# `audio_library_sources` (which carries the full source
+# record set) because the state changes more frequently than
+# the source set.
+[[subjects]]
+name = "audio_library_state"
+
+# Operator-facing library scan progress projection on the
+# audio.library.v1 shelf. Carries the per-source scan
+# progress when an eager-incremental scan is in flight
+# (items found, items scanned, current path). Stays present
+# at idle with the last completed scan's summary so the UI
+# surfaces "last scanned N items at HH:MM" between scans.
+[[subjects]]
+name = "audio_library_scan_progress"
+
 # Subject type the playback.options plugin announces as a
 # durable projection of the operator's audiophile-grade
 # settings (resampling / mixer_type / dop / output_device /
