@@ -109,6 +109,7 @@ mod config;
 mod disposition_emitter;
 mod envelope_subscriber;
 mod favourites;
+mod library;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
