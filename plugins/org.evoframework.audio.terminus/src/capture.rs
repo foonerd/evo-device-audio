@@ -116,6 +116,38 @@ fn run_capture_loop(
             return;
         }
 
+        // Transport-state gate at the outer-loop boundary.
+        // When transport_state is NotPlaying, the capture
+        // task holds no ALSA handle — no read, no FFT
+        // compute, no reconnect cycle, no spin against an
+        // idle snd-aloop. The task sleeps on the
+        // watch::Receiver until the gate transitions to
+        // Playing, at which point a fresh PCM is opened
+        // below.
+        //
+        // The inner-emit gate (further down in
+        // `run_fft_loop`) remains in place as the second
+        // line of defence: it gates the announcer emit
+        // when role is Receiver-without-source even if
+        // transport is Playing locally. The two gates are
+        // independent and both load-bearing.
+        if !transport_gate.borrow().should_emit() {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "transport not playing; capture task idle until \
+                 next Playing transition"
+            );
+            if wait_for_gate_or_shutdown(&mut transport_gate.clone(), &shutdown)
+            {
+                return;
+            }
+            // Gate just opened; reset reconnect backoff so
+            // the first open attempt under fresh playback
+            // is unthrottled.
+            consecutive_failures = 0;
+            backoff = RECONNECT_INITIAL;
+        }
+
         let pcm = match open_capture(&config.input_pcm, config.sample_rate_hz) {
             Ok(p) => p,
             Err(e) => {
@@ -252,17 +284,23 @@ fn run_fft_loop(
                 if let Ok(mut guard) = latest_frame.lock() {
                     *guard = Some(frame);
                 }
-                // Combined gate: both halves MUST be open. Two
-                // cheap atomic-shaped reads of the watch
-                // receivers; skip the announcer emit when either
-                // is closed. The frame is still computed + cached
-                // so a resume picks up at the next tick without
-                // spawn latency (the `get_spectrum_frame` read
-                // verb continues to surface the latest cached
-                // frame regardless of gate state).
+                // Combined gate. The transport half, when it
+                // closes, breaks the inner loop and releases
+                // the PCM handle so the outer loop can sleep on
+                // the gate. The role half (Receiver-without-
+                // source) is a per-emit skip (FFT continues so a
+                // role flip picks up at the next tick).
                 let transport_open = transport_gate.borrow().should_emit();
+                if !transport_open {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "transport-state closed mid-capture; releasing PCM \
+                         handle and idling outer loop"
+                    );
+                    return InnerExit::TransportFailed;
+                }
                 let role_open = local_role.borrow().should_emit();
-                if !transport_open || !role_open {
+                if !role_open {
                     continue;
                 }
                 let announcer = Arc::clone(announcer);
@@ -346,6 +384,49 @@ fn shutdown_check(shutdown: &Arc<Notify>) -> bool {
         tokio::time::timeout(Duration::from_millis(0), shutdown.notified())
             .await
             .is_ok()
+    })
+}
+
+/// Block the blocking-thread capture task until either the
+/// transport_gate transitions to `Playing` or shutdown
+/// fires. Returns `true` on shutdown (caller should exit the
+/// task), `false` on gate-opened (caller proceeds to open
+/// the PCM).
+///
+/// The watch::Receiver's `changed()` future drives the wake;
+/// we cancel on the shutdown Notify. The gate may be
+/// `Playing` already on entry (e.g. the caller polled it
+/// just before this call but a state update slipped in); in
+/// that case the function returns immediately without
+/// sleeping.
+fn wait_for_gate_or_shutdown(
+    gate: &mut watch::Receiver<TransportGate>,
+    shutdown: &Arc<Notify>,
+) -> bool {
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    handle.block_on(async {
+        loop {
+            if gate.borrow_and_update().should_emit() {
+                return false;
+            }
+            tokio::select! {
+                _ = shutdown.notified() => return true,
+                changed = gate.changed() => {
+                    match changed {
+                        Ok(()) => continue,
+                        Err(_) => {
+                            // Sender dropped — plugin
+                            // shutting down. Treat as
+                            // shutdown to exit cleanly.
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     })
 }
 

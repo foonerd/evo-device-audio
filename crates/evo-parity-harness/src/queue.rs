@@ -196,11 +196,7 @@ async fn case_clear_starts_empty(wire: &mut Wire) -> CaseResult {
 
 async fn case_enqueue_two(wire: &mut Wire, songs: &[String]) -> CaseResult {
     match wire
-        .request(
-            SHELF,
-            "queue.enqueue",
-            json!({ "v": 1, "uris": songs }),
-        )
+        .request(SHELF, "queue.enqueue", json!({ "v": 1, "uris": songs }))
         .await
     {
         Ok(_) => CaseResult::pass_with(
