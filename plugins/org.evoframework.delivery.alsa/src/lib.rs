@@ -154,9 +154,10 @@ const REQUEST_TYPES: &[&str] = &[
 /// Subject scheme + value for the resolved-outputs surface.
 /// Published once at load and read back by the
 /// `delivery.list_outputs` respondent verb. Hot-plug re-publish
-/// and reactive subscription on hardware change land in a
-/// follow-on chunk; the load-time publish is the canonical
-/// boot-state surface UI consumes today.
+/// and reactive subscription on hardware change are out of
+/// scope of the load-time enumeration this surface owns; the
+/// load-time publish is the canonical boot-state surface UI
+/// consumes today.
 const SUBJECT_SCHEME_DELIVERY: &str = "evo.audio.delivery";
 const SUBJECT_VALUE_OUTPUTS: &str = "outputs";
 const SUBJECT_TYPE_OUTPUTS: &str = "audio_delivery_outputs";
@@ -243,7 +244,8 @@ pub struct AlsaDeliveryPlugin {
     subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
     /// Cached snapshot of the resolved ALSA outputs published at
     /// load time. `delivery.list_outputs` returns this verbatim;
-    /// hot-plug re-enumeration lands in a follow-on chunk.
+    /// hot-plug re-enumeration is out of scope of this load-time
+    /// surface.
     cached_outputs: Arc<RwLock<Vec<ResolvedAlsaOutput>>>,
 }
 
@@ -1538,8 +1540,8 @@ impl AlsaDeliveryPlugin {
 
     /// `delivery.list_outputs` — return the cached resolved-
     /// outputs list captured at load. Hot-plug re-enumeration
-    /// lands in a follow-on chunk; today's surface is the
-    /// boot-state snapshot.
+    /// is out of scope of this load-time surface; today's
+    /// surface is the boot-state snapshot.
     async fn handle_list_outputs(
         &self,
         req: &Request,

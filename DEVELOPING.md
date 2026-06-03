@@ -200,7 +200,7 @@ evo-core a prior release maintains a framework-side `TimeTrust` state that consu
 
 **Plugin authoring (declare what you need):**
 
--   **Plugins requiring trustworthy time declare** `capabilities.requires_synced_time = true` in their manifest. The framework signals current trust state via `LoadContext.time_trust` plus subsequent `ClockTrustChanged` happenings; the plugin defers its real work until trust transitions to `Trusted`.
+-   **Plugins requiring trustworthy time declare** `capabilities.requires_synced_time = true` in their manifest. The framework signals current trust state via `LoadContext.time_trust` plus subsequent `ClockTrustChanged` happenings; the plugin waits to begin its real work until trust transitions to `Trusted`.
 -   **Plugins with stricter tolerances declare** `capabilities.synced_time_tolerance_ms` (e.g., 1000 for "needs sync within 1s"; multi-device audio sync plugins may need much stricter). The framework respects the stricter value when signalling per-plugin trust state.
 -   **Plugins managing their own time-dependent state subscribe to `Happening::ClockAdjusted`** and re-evaluate their internal schedules (cached future timestamps, OAuth refresh windows, etc.). The framework re-evaluates appointment + watch schedules automatically on clock adjustment; plugins managing their own future timestamps re-evaluate themselves.
 

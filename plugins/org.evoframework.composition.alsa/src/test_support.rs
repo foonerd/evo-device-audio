@@ -13,8 +13,7 @@
 //! [`StubAudioRouting::set_endpoints`] to publish an
 //! endpoint pair + format. The most-recently-registered
 //! `RouteChangeCallback` is captured for inspection by
-//! tests that exercise route-change reactions
-//! (chunk C onwards).
+//! tests that exercise route-change reactions.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,9 +58,8 @@ impl StubAudioRouting {
 
     /// Convenience constructor pre-loaded with a typical
     /// 44.1 kHz / 16-bit / stereo PCM ALSA-loopback
-    /// topology. Used by chunk-C and onward tests that
-    /// need an active topology without caring about the
-    /// specific format.
+    /// topology. Used by tests that need an active topology
+    /// without caring about the specific format.
     #[allow(dead_code)]
     pub(crate) fn with_default_alsa_topology() -> Self {
         let s = Self::new();

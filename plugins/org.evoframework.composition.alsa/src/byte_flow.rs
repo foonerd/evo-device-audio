@@ -52,8 +52,8 @@ use crate::{EqRuntimeState, MODE_EQ_ONLY};
 
 /// Errors raised by the byte-flow substrate. Surfaced via
 /// the worker status channel so observability surfaces
-/// (chunk-D test harness, future operator UI) can render
-/// the failure mode without losing structure.
+/// (test harness + operator UI) can render the failure
+/// mode without losing structure.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ByteFlowError {
     /// The endpoints declared a substrate kind this build

@@ -56,8 +56,8 @@ target host.
   `ReadWritePaths=/etc/evo`, `NoNewPrivileges=no`, and
   `Environment=EVO_SYSTEMCTL=/usr/bin/systemctl`. Vendor
   distributions that prefer to run the steward as root, or
-  that park the playback.mpd restart leg, can omit this
-  drop-in.
+  that leave the playback.mpd restart leg disabled, can omit
+  this drop-in.
 - `sudoers.d/evo-mpd-restart.in` — narrow NOPASSWD sudoers
   template granting the steward service user the exact
   command `/usr/bin/systemctl restart mpd` (only). The

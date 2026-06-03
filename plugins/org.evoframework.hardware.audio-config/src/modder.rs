@@ -29,8 +29,8 @@
 //!    overlays from there).
 //!
 //! Wire-op integration (the register_overlay / list_overlays /
-//! remove_overlay surface) consumes these primitives in a
-//! follow-on layer; the primitives stand alone for testability.
+//! remove_overlay surface) consumes these primitives at the
+//! shelf layer; the primitives stand alone for testability.
 
 use std::path::PathBuf;
 

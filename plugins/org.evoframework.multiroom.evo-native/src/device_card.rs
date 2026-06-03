@@ -66,11 +66,14 @@ pub enum StateBadge {
     LeaderOfGroup,
     /// Entity is a non-leader member of a group.
     MemberOfGroup,
-    /// Entity is a subgroup within a master group
-    /// (master-group hierarchy lands in a follow-on release).
+    /// Entity is a subgroup within a master group. Schema-
+    /// declared so the wire shape is stable; the
+    /// master-group hierarchy is flat in the current
+    /// distribution.
     SubgroupOfMaster,
-    /// Entity is itself a master group (master-group
-    /// hierarchy lands in a follow-on release).
+    /// Entity is itself a master group. Schema-declared so
+    /// the wire shape is stable; the master-group hierarchy
+    /// is flat in the current distribution.
     MasterGroup,
 }
 
@@ -133,9 +136,9 @@ pub struct TrackSummary {
 
 /// Master-group context carried in the card envelope when
 /// the entity is a member of a master group. None for the
-/// other states. Lands populated in a follow-on release; the
-/// current release's first cut never sets it (flat groups
-/// only).
+/// other states. The current distribution always reports
+/// None — the master-group hierarchy is flat, so this field
+/// is reserved-but-unset for forward wire-shape stability.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MasterGroupContext {
     /// Canonical id of the master group.

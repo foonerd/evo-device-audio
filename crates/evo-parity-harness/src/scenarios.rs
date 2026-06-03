@@ -2,7 +2,7 @@
 //!
 //! The harness's per-shelf modules cover each shelf's
 //! verb-level mutations in isolation. This module covers the
-//! integrated scenarios that make the ADR-0144 contract a
+//! integrated scenarios that make the four-shelf contract a
 //! load-bearing operator-facing surface:
 //!
 //! - Update-source lifecycle. Triggers
@@ -11,13 +11,12 @@
 //!   subject emit during the scan, and confirms the source
 //!   transitions back to a steady-state count.
 //!
-//! Future scenarios (named, not parked): mixed-source
-//! skip-traversal with deliberately-offline source +
-//! coalesced disposition observation. That scenario requires
-//! a real queue with non-floor-source items, which in turn
-//! requires either USB / NAS source mounted on the rig with
-//! known content OR an MPD mock harness — neither present on
-//! today's three-rig set.
+//! Additional scenario family — mixed-source skip-traversal
+//! with deliberately-offline source + coalesced disposition
+//! observation — is hardware-gated. It requires a real queue
+//! with non-floor-source items, which in turn requires either
+//! USB / NAS source mounted with known content or an MPD mock
+//! harness; the three-rig set today carries neither.
 
 use anyhow::Result;
 use serde_json::{json, Value};

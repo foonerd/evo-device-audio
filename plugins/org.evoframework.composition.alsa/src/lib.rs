@@ -89,9 +89,9 @@
 //!
 //! This build implements the `EndpointKind::NamedPipe`
 //! substrate (filesystem FIFOs read+written via tokio
-//! async I/O). The `EndpointKind::AlsaPcm` substrate lands
-//! in the next chunk together with the libasound link and
-//! reference target cross-compile + real-hardware verification.
+//! async I/O). The `EndpointKind::AlsaPcm` substrate is
+//! hardware-gated on the libasound link and real-hardware
+//! cross-target verification, not yet wired in this build.
 //! `SharedMemory` and `JackPort` substrates are vendor-
 //! distribution territory and report as unsupported.
 //!
@@ -2055,9 +2055,9 @@ mod tests {
     async fn worker_unsupported_when_substrate_kind_unimplemented() {
         let mut p = AlsaCompositionPlugin::new();
         let stub = Arc::new(StubAudioRouting::new());
-        // Default ALSA endpoints point at AlsaPcm — not
-        // implemented in chunk D. Worker must publish
-        // Unsupported, not Failed or Running.
+        // Default ALSA endpoints point at AlsaPcm — the
+        // libasound link is not wired in this build. Worker
+        // must publish Unsupported, not Failed or Running.
         stub.set_endpoints(crate::test_support::default_alsa_endpoints());
         p.install_routing(Some(Arc::clone(&stub) as _)).unwrap();
         p.spawn_reactor().await.unwrap();

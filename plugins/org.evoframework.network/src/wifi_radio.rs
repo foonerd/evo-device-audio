@@ -32,13 +32,13 @@
 //! applier issues `nmcli radio wifi on` which clears the soft-
 //! block (NetworkManager goes through rfkill under the hood).
 //!
-//! ## Coordination with future radio plugins
+//! ## Coordination with additional radio plugins
 //!
 //! `flight_mode` is the cross-radio master switch. The plugin
 //! that owns it today (this one) exposes it via the existing
 //! `network.nm.flight_mode.get|set` wire ops. When a Bluetooth
 //! radio plugin (or any second consumer) lands, the natural
-//! next chunk extracts `flight_mode` to a domain-neutral
+//! evolution is to extract `flight_mode` to a domain-neutral
 //! `device.options` (or equivalent) plugin so both radio
 //! plugins read from one source of truth. The state-machine
 //! shape stays unchanged — only the storage / wire-op owner

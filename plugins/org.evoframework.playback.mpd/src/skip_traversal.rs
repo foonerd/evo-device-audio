@@ -6,8 +6,8 @@
 //! advances to a track whose source is unreachable the device
 //! MUST NOT crash (Volumio's documented failure mode); it MUST
 //! skip to the next playable track + emit a typed Disposition
-//! with a recovery hint. ADR-0144 names this the load-bearing
-//! mixed-source resilience contract.
+//! with a recovery hint. This is the load-bearing mixed-source
+//! resilience contract the four operator-facing shelves rely on.
 //!
 //! # Algorithm
 //!

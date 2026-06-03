@@ -1373,14 +1373,14 @@ impl MultiroomEvoNativePlugin {
             Role::Receiver => device_card::StateBadge::MemberOfGroup,
             Role::Auto => device_card::StateBadge::Solo,
         };
-        // The display name mirrors the device id prefix in the
-        // current first cut (the framework's device-identity
+        // The display name mirrors the device id prefix at the
+        // load-context boundary (the framework's device-identity
         // wire op surfaces the operator-editable display name;
-        // threading it onto the plugin's load context lands as
-        // part of the publish-on-happening iteration). The card
-        // envelope's display_name field is operator-visible;
-        // rendering surfaces fall back to the device-id prefix
-        // until the richer plumbing lands.
+        // threading it onto the plugin's load context is owned by
+        // the publish-on-happening surface, not this load-time
+        // initialiser). The card envelope's display_name field is
+        // operator-visible; rendering surfaces fall back to the
+        // device-id prefix when the richer plumbing is unset.
         let display_name = format!(
             "evo-{}",
             device_id.split('-').next().unwrap_or(device_id.as_str())

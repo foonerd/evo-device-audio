@@ -1716,7 +1716,7 @@ struct RegisterOverlayPayload {
     /// `dtbo_sha256_hex` MUST also match.
     dtbo_sha256_hex: String,
     /// Raw DTBO blob bytes. Plugin hashes + verifies + persists
-    /// (in the follow-on filesystem-integration step).
+    /// once the filesystem-integration leg is wired through.
     #[serde(default)]
     dtbo_bytes: Vec<u8>,
     /// Two-step-confirm token. Must equal the literal

@@ -1,7 +1,7 @@
 //! Favourites-shelf parity round-trips.
 //!
 //! Drives every mutating verb on `audio.favourites` with the
-//! set-semantic idempotence assertion the ADR-0144 contract
+//! set-semantic idempotence assertion the shelf contract
 //! pins (add-add-add yields one membership, not three).
 //!
 //! Test sequence:

@@ -5,7 +5,7 @@
 //! DLNA), each carrying a per-source reachability state machine
 //! plus a type-specific scan policy. The registry is the
 //! load-bearing primitive for the device's mixed-source
-//! resilience contract (ADR-0144): consumer shelves
+//! resilience contract: the consumer shelves
 //! ([`crate::queue`], [`crate::playlist`], [`crate::favourites`],
 //! [`crate::library`]) project per-song availability through the
 //! `evo:available` sticker the registry's sticker reconciler
