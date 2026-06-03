@@ -2427,6 +2427,9 @@ impl Warden for MpdPlaybackPlugin {
                 assignment.custody_state_reporter,
                 emitter,
                 self.audio_protocol_settings_tx.subscribe(),
+                source_probe::load_music_directory_from_mpd_conf(
+                    std::path::Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
+                ),
             )
             .await
             {
@@ -5706,6 +5709,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             rx,
+            None,
         )
         .await
         .expect("spawn should succeed against a Standard mock");

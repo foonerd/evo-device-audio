@@ -372,7 +372,16 @@ async fn emit_now_playing(
 /// The probe is cached by file_path: a status cycle on the same
 /// song is zero I/O. The cache is reset to `None` when the song
 /// goes away, so re-entering the same song afterwards re-probes.
-async fn maybe_probe_source_format(
+///
+/// **Shared with the actor (custody supervisor).** Both the
+/// ambient observer and the custody supervisor must drive this
+/// probe on every track transition so the `audio_playback_stream_format`
+/// subject's `source` field stays coherent with the currently-
+/// playing track. A `Some(prior-track-format)` MUST be replaced
+/// by either `Some(new-track-format)` (if the parser succeeds)
+/// or `None` (if it doesn't) — never silently left in place
+/// across a track change.
+pub(super) async fn maybe_probe_source_format(
     song: Option<&MpdSong>,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
@@ -446,5 +455,173 @@ async fn sleep_or_shutdown(shutdown: &Arc<Notify>, dur: Duration) {
     tokio::select! {
         _ = shutdown.notified() => {}
         _ = tokio::time::sleep(dur) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end acceptance tests for the source-format probe's
+    //! track-transition semantics.
+    //!
+    //! Driving these in isolation (without standing the full
+    //! ambient observer + MPD mock) means writing synthetic
+    //! file heads directly into a tempdir and calling
+    //! [`maybe_probe_source_format`] with the matching
+    //! [`MpdSong`] shape. The capturing emitter records every
+    //! published envelope so the test asserts the EXACT
+    //! `source` field shape after each transition.
+    //!
+    //! Acceptance criteria match the UI team's bug report:
+    //!
+    //! 1. A track transition from a parser-recognised source
+    //!    (DSF / DSD64) to a different track replaces the
+    //!    prior `source` field's shape. The new field is
+    //!    either the new parser's result OR `None`, never the
+    //!    stale prior shape.
+    //! 2. The `source_codec` field stays current alongside
+    //!    (the actor's update_source_codec runs in parallel;
+    //!    here we focus on source_format and assume the
+    //!    sibling field's invariant from
+    //!    `subject_emitter::tests`).
+
+    use super::*;
+    use crate::mpd::MpdSong;
+    use crate::playback_supervisor::test_mock::capturing_emitter;
+    use std::time::Duration;
+
+    /// Build a synthetic DSF file head the parser recognises as
+    /// DSD64 stereo. Mirror of `source_probe::tests::make_dsf_head`
+    /// (private to source_probe). Inlining the few bytes here
+    /// avoids cross-module visibility changes on a 24-byte
+    /// fixture.
+    fn dsf_head_dsd64_stereo() -> Vec<u8> {
+        let mut v = vec![0u8; 0x50];
+        v[0..4].copy_from_slice(b"DSD ");
+        v[4..12].copy_from_slice(&28u64.to_le_bytes());
+        v[0x1C..0x20].copy_from_slice(b"fmt ");
+        v[0x20..0x28].copy_from_slice(&52u64.to_le_bytes());
+        v[0x34..0x38].copy_from_slice(&2u32.to_le_bytes());
+        v[0x38..0x3C].copy_from_slice(&2_822_400u32.to_le_bytes());
+        v[0x3C..0x40].copy_from_slice(&1u32.to_le_bytes());
+        v
+    }
+
+    fn song_for(rel_path: &str) -> MpdSong {
+        let codec_name = crate::mpd::derive_source_codec_name(rel_path);
+        MpdSong {
+            file_path: rel_path.to_string(),
+            title: None,
+            artist: None,
+            album: None,
+            duration: Some(Duration::from_secs(180)),
+            codec_name,
+        }
+    }
+
+    #[tokio::test]
+    async fn track_transition_dsf_to_mp3_clears_prior_dsd_source() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First track: synthetic DSF (DSD64 / stereo).
+        std::fs::write(tmp.path().join("track-a.dsf"), dsf_head_dsd64_stereo())
+            .unwrap();
+
+        // Second track: synthetic MP3 file with a head that
+        // does NOT contain a valid MPEG frame header. The MP3
+        // parser returns None on this — exactly the case the
+        // bug surfaced (a parser that can't yield a shape MUST
+        // clear, not leave the prior DSD shape in place).
+        std::fs::write(tmp.path().join("track-b.mp3"), b"not a valid mp3 head")
+            .unwrap();
+
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let music_dir: std::path::PathBuf = tmp.path().to_path_buf();
+        let mut last_probed_file: Option<String> = None;
+
+        // First track: probe + publish; expect source.kind = "dsd".
+        maybe_probe_source_format(
+            Some(&song_for("track-a.dsf")),
+            Some(music_dir.as_path()),
+            &mut last_probed_file,
+            &emitter,
+        )
+        .await;
+        let publish_count_after_dsf = subjects.state_update_count();
+        assert!(
+            publish_count_after_dsf >= 1,
+            "DSF probe must publish the envelope"
+        );
+        let (_, state_dsf) = subjects
+            .state_update_at(publish_count_after_dsf - 1)
+            .expect("post-DSF envelope present");
+        assert_eq!(
+            state_dsf["source"]["kind"], "dsd",
+            "DSF parser must yield Dsd shape on the source field; \
+             got {}",
+            state_dsf["source"]
+        );
+
+        // Second track: probe + publish; expect source field
+        // either cleared (null) OR re-parsed as PCM — but
+        // NEVER the stale DSD shape from track A.
+        maybe_probe_source_format(
+            Some(&song_for("track-b.mp3")),
+            Some(music_dir.as_path()),
+            &mut last_probed_file,
+            &emitter,
+        )
+        .await;
+        let publish_count_after_mp3 = subjects.state_update_count();
+        assert!(
+            publish_count_after_mp3 > publish_count_after_dsf,
+            "track transition must publish a new envelope"
+        );
+        let (_, state_mp3) = subjects
+            .state_update_at(publish_count_after_mp3 - 1)
+            .expect("post-MP3 envelope present");
+        // The exact assertion the UI team named: source.kind
+        // MUST NOT be "dsd" after the transition. The cleanest
+        // outcome is null (parser returned None); a PCM shape
+        // would also be acceptable but the head we wrote is
+        // not a valid MP3 frame, so we expect null.
+        let new_source = &state_mp3["source"];
+        assert!(
+            new_source.is_null() || new_source["kind"] != "dsd",
+            "post-transition source must NOT carry stale DSD shape; \
+             got {new_source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_track_repeat_does_not_republish() {
+        // Cache hit: same file_path twice in a row → second call
+        // is zero-publish (the cached probe stays valid).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("track.dsf"), dsf_head_dsd64_stereo())
+            .unwrap();
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let music_dir = tmp.path().to_path_buf();
+        let mut last_probed_file: Option<String> = None;
+        maybe_probe_source_format(
+            Some(&song_for("track.dsf")),
+            Some(music_dir.as_path()),
+            &mut last_probed_file,
+            &emitter,
+        )
+        .await;
+        let after_first = subjects.state_update_count();
+        // Same path, second call. Cache hit → no publish.
+        maybe_probe_source_format(
+            Some(&song_for("track.dsf")),
+            Some(music_dir.as_path()),
+            &mut last_probed_file,
+            &emitter,
+        )
+        .await;
+        assert_eq!(
+            subjects.state_update_count(),
+            after_first,
+            "repeated probe on same file_path must not republish"
+        );
     }
 }

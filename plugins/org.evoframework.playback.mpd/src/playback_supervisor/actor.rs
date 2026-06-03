@@ -291,6 +291,7 @@ pub(crate) async fn spawn(
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
     audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
+    music_directory: Option<std::path::PathBuf>,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
         plugin = PLUGIN_NAME,
@@ -328,6 +329,14 @@ pub(crate) async fn spawn(
     // subsequent idle wake on the same song will not re-announce
     // it.
     let mut last_emitted_file: Option<String> = None;
+    // Per-session file-side source-format probe cache. Mirrors
+    // the ambient observer's cache: a non-empty value means
+    // "we already probed THIS file; another emit cycle on the
+    // same file is zero I/O." A track transition replaces the
+    // value AND drives an update_source_format (Some or None)
+    // so the stream_format envelope's `source` field never
+    // carries the prior track's shape into the new track.
+    let mut last_probed_file: Option<String> = None;
     // Sessions start unmuted with a 50% pre-mute fallback. A
     // first `set_mute(true)` will capture the live MPD volume
     // before silencing; `set_mute(false)` ahead of any prior
@@ -341,6 +350,8 @@ pub(crate) async fn spawn(
         reporter.as_ref(),
         &subject_emitter,
         &mut last_emitted_file,
+        &mut last_probed_file,
+        music_directory.as_deref(),
         initial_muted,
     )
     .await?;
@@ -368,6 +379,8 @@ pub(crate) async fn spawn(
         reporter,
         subject_emitter,
         last_emitted_file,
+        last_probed_file,
+        music_directory,
         muted: initial_muted,
         pre_mute_volume: initial_pre_mute_volume,
     };
@@ -526,6 +539,21 @@ struct SupervisorTask {
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
     last_emitted_file: Option<String>,
+    /// Per-session file-side source-format probe cache. Held
+    /// here (mirroring `last_emitted_file`) so the
+    /// stream_format envelope's `source` field stays coherent
+    /// across track transitions inside one supervisor session.
+    /// See [`super::ambient_observer::maybe_probe_source_format`]
+    /// for the shared probe + publish semantics.
+    last_probed_file: Option<String>,
+    /// MPD's music_directory at supervisor-spawn time. Used to
+    /// resolve the absolute filesystem path of the current
+    /// song for the head-bytes probe. `None` when the
+    /// plugin's load context could not resolve mpd.conf's
+    /// music_directory directive; the probe path then
+    /// publishes None on every track change, which clears the
+    /// source field rather than carrying stale data forward.
+    music_directory: Option<std::path::PathBuf>,
     /// Operator-toggled mute state. MPD has no native mute
     /// primitive — mute is synthesised as `setvol 0` with the
     /// pre-mute volume captured for restore on unmute. Defaults to
@@ -601,6 +629,8 @@ impl SupervisorTask {
                                     self.reporter.as_ref(),
                                     &self.subject_emitter,
                                     &mut self.last_emitted_file,
+                                    &mut self.last_probed_file,
+                                    self.music_directory.as_deref(),
                                     self.muted,
                                 ).await;
                             }
@@ -683,6 +713,8 @@ impl SupervisorTask {
                                 self.reporter.as_ref(),
                                 &self.subject_emitter,
                                 &mut self.last_emitted_file,
+                                &mut self.last_probed_file,
+                                self.music_directory.as_deref(),
                                 self.muted,
                             ).await;
                         }
@@ -1028,6 +1060,8 @@ async fn emit_initial_report(
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
     last_emitted_file: &mut Option<String>,
+    last_probed_file: &mut Option<String>,
+    music_directory: Option<&std::path::Path>,
     muted: bool,
 ) -> Result<(), PlaybackError> {
     let status = cmd_conn.status().await.map_err(classify_command_error)?;
@@ -1058,6 +1092,19 @@ async fn emit_initial_report(
         .as_ref()
         .and_then(|s| s.codec_name.as_deref());
     subject_emitter.update_source_codec(source_codec).await;
+    // Drive the source-format probe at the same call site as
+    // update_source_codec so both halves of the source-side
+    // envelope shape stay coherent on every track change. A
+    // prior Some(format) must be replaced by either the new
+    // track's parser result or `None`; the helper handles both
+    // and the publish path republishes the merged envelope.
+    super::ambient_observer::maybe_probe_source_format(
+        song_for_emitter.as_ref(),
+        music_directory,
+        last_probed_file,
+        subject_emitter,
+    )
+    .await;
     subject_emitter.update_now_playing(&report).await;
     Ok(())
 }
@@ -1068,6 +1115,8 @@ async fn emit_best_effort_report(
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
     last_emitted_file: &mut Option<String>,
+    last_probed_file: &mut Option<String>,
+    music_directory: Option<&std::path::Path>,
     muted: bool,
 ) {
     let status = match cmd_conn.status().await {
@@ -1143,6 +1192,17 @@ async fn emit_best_effort_report(
         .as_ref()
         .and_then(|s| s.codec_name.as_deref());
     subject_emitter.update_source_codec(source_codec).await;
+    // Same probe-and-publish call as emit_initial_report — the
+    // best-effort cycle MUST drive update_source_format on
+    // every track change for the stream_format envelope's
+    // source field to stay coherent.
+    super::ambient_observer::maybe_probe_source_format(
+        song_for_emitter.as_ref(),
+        music_directory,
+        last_probed_file,
+        subject_emitter,
+    )
+    .await;
     subject_emitter.update_now_playing(&report).await;
 }
 
@@ -1329,6 +1389,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1362,6 +1423,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1411,6 +1473,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1454,6 +1517,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1504,6 +1568,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1540,6 +1605,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1571,6 +1637,7 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1615,6 +1682,7 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1665,6 +1733,7 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1706,6 +1775,7 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
@@ -1765,6 +1835,7 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
+            None,
         )
         .await
         .unwrap();
