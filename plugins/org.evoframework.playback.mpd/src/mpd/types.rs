@@ -309,6 +309,212 @@ impl IdleSubsystem {
     }
 }
 
+// ----- queue / stored-playlist / sticker / library types -----
+
+/// One entry in MPD's live playback queue. Projected from
+/// `playlistinfo`'s response — every queue entry MPD reports
+/// is one of these.
+///
+/// Distinct from [`MpdSong`] (which is `currentsong`'s narrower
+/// projection). Queue items carry the per-entry `id` (MPD's
+/// `Id:` field, stable across queue reorderings within MPD's
+/// current lifetime) + `position` (the `Pos:` field, mutates on
+/// reorder). The plugin's queue subject emitter projects these
+/// onto the wire's `audio_queue.items` array with the addition
+/// of the per-song `evo:available` sticker as the wire's
+/// `available` flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdQueueItem {
+    /// MPD songid (`Id:`); stable across queue reorderings within
+    /// MPD's current lifetime, but NOT durable across MPD restart.
+    pub(crate) id: u32,
+    /// Zero-based queue position (`Pos:`); mutates when items move.
+    pub(crate) position: u32,
+    /// MPD-relative file path (or external URI for streams).
+    pub(crate) file_path: String,
+    /// Track title tag, if present.
+    pub(crate) title: Option<String>,
+    /// Artist tag, if present.
+    pub(crate) artist: Option<String>,
+    /// Album tag, if present.
+    pub(crate) album: Option<String>,
+    /// Track duration; from `duration:` (0.21+) or `Time:` (older).
+    pub(crate) duration: Option<Duration>,
+}
+
+/// Summary of one stored playlist. Projected from `listplaylists`'s
+/// response: each entry is a `playlist:` line + optional
+/// `Last-Modified:` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdPlaylistSummary {
+    /// Playlist name (operator-facing identifier).
+    pub(crate) name: String,
+    /// MPD's `Last-Modified:` field as an ISO-8601 string when
+    /// reported by MPD; absent for very old MPD versions.
+    pub(crate) last_modified: Option<String>,
+}
+
+/// One entry in a stored playlist's listing. Projected from
+/// `listplaylistinfo NAME`'s response — same per-song metadata
+/// shape as `playlistinfo` but without the queue-specific `Id` /
+/// `Pos` fields. The playlist module assigns positions by parse
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdPlaylistEntry {
+    /// Zero-based position within the playlist (assigned by parse
+    /// order; not reported by MPD).
+    pub(crate) position: u32,
+    /// MPD-relative file path (or external URI).
+    pub(crate) file_path: String,
+    /// Track title tag, if present.
+    pub(crate) title: Option<String>,
+    /// Artist tag, if present.
+    pub(crate) artist: Option<String>,
+    /// Album tag, if present.
+    pub(crate) album: Option<String>,
+    /// Track duration; from `duration:` (0.21+) or `Time:` (older).
+    pub(crate) duration: Option<Duration>,
+}
+
+/// One sticker key/value pair. Projected from `sticker get`,
+/// `sticker list`, and `sticker find` responses. MPD's sticker
+/// subsystem attaches durable per-song key/value pairs that
+/// survive MPD restart, database update, and mount-unmount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdSticker {
+    /// Sticker name (the framework uses `evo:available` for the
+    /// per-song availability flag).
+    pub(crate) name: String,
+    /// Sticker value (opaque string; framework convention is `0`
+    /// / `1` for boolean stickers).
+    pub(crate) value: String,
+}
+
+/// One entry returned by `sticker find`. Projected from the
+/// per-match repeated `file:` + `sticker:` lines MPD emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdStickerMatch {
+    /// MPD-relative file path the sticker is attached to.
+    pub(crate) file_path: String,
+    /// The matching sticker.
+    pub(crate) sticker: MpdSticker,
+}
+
+/// One entry in MPD's library tree listing, projected from
+/// `lsinfo PATH`. MPD interleaves directory / file / playlist
+/// entries in the response, separated by leading key types.
+/// Operator UI's browse view consumes the projected
+/// `BrowseEntry` shape on the wire; the plugin's library module
+/// translates these MPD-domain entries to the wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MpdLibraryEntry {
+    /// A subdirectory under the queried path.
+    Directory {
+        /// Path relative to MPD's music_directory.
+        path: String,
+        /// MPD's `Last-Modified:` field when reported.
+        last_modified: Option<String>,
+    },
+    /// A music file.
+    File {
+        /// Path relative to MPD's music_directory.
+        path: String,
+        /// Track title tag.
+        title: Option<String>,
+        /// Artist tag.
+        artist: Option<String>,
+        /// Album tag.
+        album: Option<String>,
+        /// Track duration.
+        duration: Option<Duration>,
+    },
+    /// A stored playlist file (`.m3u` etc.) discovered in the tree.
+    Playlist {
+        /// Playlist path relative to MPD's music_directory (or
+        /// the bare playlist name when under MPD's playlist
+        /// directory).
+        path: String,
+        /// MPD's `Last-Modified:` field when reported.
+        last_modified: Option<String>,
+    },
+}
+
+/// One MPD mount, projected from `listmounts`. A mount makes
+/// remote storage (NAS over CIFS/SMB/NFS, cloud via WebDAV,
+/// network attached storage via the smb_client / nfs / curl /
+/// webdav storage plugins) accessible under a named alias that
+/// scopes the resulting songs in MPD's database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdMount {
+    /// The mount alias name. MPD `lsinfo "NAME"` lists songs
+    /// from this mount; the path scope for `update NAME` and
+    /// `unmount NAME` is the mount alias.
+    pub(crate) name: String,
+    /// The storage URI MPD has mounted. Empty for the root
+    /// (un-aliased) storage; non-empty for explicit mounts.
+    pub(crate) storage: String,
+}
+
+/// One MPD storage neighbour, projected from `listneighbors`.
+/// Neighbours are storage providers MPD discovered via its
+/// neighbor plugins (smbclient discovery, upnp, etc.); the
+/// operator can subsequently issue `mount NAME URI` to mount
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MpdNeighbor {
+    /// The storage URI the neighbour offers (e.g.
+    /// `smb://server/share`, `upnp://uuid:abc.../`).
+    pub(crate) uri: String,
+    /// Operator-facing display name MPD reports (server name,
+    /// share name, etc.). May be empty.
+    pub(crate) name: String,
+}
+
+/// Search field MPD's `find` / `search` commands accept as the
+/// `TYPE` argument. The MPD protocol allows tag names verbatim;
+/// this enum bounds the surface the plugin exposes to the
+/// operator-facing library shelf so a contributor cannot
+/// accidentally surface every internal MPD tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MpdSearchField {
+    /// `any` — matches against every tag MPD indexes.
+    Any,
+    /// `artist`.
+    Artist,
+    /// `albumartist`.
+    AlbumArtist,
+    /// `album`.
+    Album,
+    /// `title`.
+    Title,
+    /// `genre`.
+    Genre,
+    /// `composer`.
+    Composer,
+    /// `file` — the relative file path.
+    File,
+    /// `base` — anchor the search at a directory prefix; MPD
+    /// 0.20+ accepts this as a filter against the file path.
+    Base,
+}
+
+impl MpdSearchField {
+    /// Wire token the MPD protocol expects.
+    pub(crate) fn as_protocol_str(&self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Artist => "artist",
+            Self::AlbumArtist => "albumartist",
+            Self::Album => "album",
+            Self::Title => "title",
+            Self::Genre => "genre",
+            Self::Composer => "composer",
+            Self::File => "file",
+            Self::Base => "base",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

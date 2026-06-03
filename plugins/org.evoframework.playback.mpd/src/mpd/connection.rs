@@ -23,7 +23,11 @@ use super::endpoint::MpdEndpoint;
 use super::error::{MpdError, ProtocolError, TransportError};
 use super::framing::Framing;
 use super::protocol::{self, ClassifiedLine, Field};
-use super::types::{IdleSubsystem, MpdSong, MpdStatus, MpdVersion, PlayState};
+use super::types::{
+    IdleSubsystem, MpdLibraryEntry, MpdMount, MpdNeighbor, MpdPlaylistEntry,
+    MpdPlaylistSummary, MpdQueueItem, MpdSearchField, MpdSong, MpdStatus,
+    MpdSticker, MpdStickerMatch, MpdVersion, PlayState,
+};
 
 /// Timeout budgets for a single connection.
 ///
@@ -565,6 +569,439 @@ impl MpdConnection {
             }
         }
     }
+
+    // ----- queue inspection + mutation -----
+
+    /// Read the full queue listing.
+    ///
+    /// Wire form: `playlistinfo\n`. MPD returns one repeated
+    /// block per queue item, each starting with `file:` and
+    /// containing the per-song metadata + `Pos:` + `Id:`.
+    pub(crate) async fn playlistinfo(
+        &mut self,
+    ) -> Result<Vec<MpdQueueItem>, MpdError> {
+        let fields = self.dispatch("playlistinfo", &[]).await?;
+        Ok(parse_queue_items(&fields))
+    }
+
+    /// Add a URI to the queue and return its assigned songid.
+    /// Distinct from [`Self::add`] which does not return the
+    /// songid (and is consequently fine for `play_now`-shape
+    /// fire-and-forget appends but not for the queue.enqueue
+    /// verb which the wire surface needs the id for).
+    ///
+    /// Wire form: `addid "<uri>" "<pos>"\n` (when position
+    /// non-null) or `addid "<uri>"\n` (when null).
+    pub(crate) async fn addid(
+        &mut self,
+        uri: &str,
+        position: Option<u32>,
+    ) -> Result<u32, MpdError> {
+        let pos_str: String;
+        let args: Vec<&str> = match position {
+            Some(p) => {
+                pos_str = p.to_string();
+                vec![uri, pos_str.as_str()]
+            }
+            None => vec![uri],
+        };
+        let fields = self.dispatch("addid", &args).await?;
+        for f in &fields {
+            if f.key == "Id" {
+                return parse_u32_field("Id", &f.value);
+            }
+        }
+        Err(MpdError::Protocol(ProtocolError::MissingField {
+            field: "Id",
+        }))
+    }
+
+    /// Remove a queue item by songid.
+    ///
+    /// Wire form: `deleteid "<id>"\n`.
+    pub(crate) async fn deleteid(&mut self, id: u32) -> Result<(), MpdError> {
+        let arg = id.to_string();
+        self.dispatch("deleteid", &[arg.as_str()]).await?;
+        Ok(())
+    }
+
+    /// Move a queue item to a new position by songid.
+    ///
+    /// Wire form: `moveid "<id>" "<to_position>"\n`.
+    pub(crate) async fn moveid(
+        &mut self,
+        id: u32,
+        to_position: u32,
+    ) -> Result<(), MpdError> {
+        let id_str = id.to_string();
+        let pos_str = to_position.to_string();
+        self.dispatch("moveid", &[id_str.as_str(), pos_str.as_str()])
+            .await?;
+        Ok(())
+    }
+
+    // ----- stored playlist operations -----
+
+    /// List every stored playlist.
+    ///
+    /// Wire form: `listplaylists\n`. MPD returns one repeated
+    /// block per playlist with `playlist:` and optional
+    /// `Last-Modified:`.
+    pub(crate) async fn listplaylists(
+        &mut self,
+    ) -> Result<Vec<MpdPlaylistSummary>, MpdError> {
+        let fields = self.dispatch("listplaylists", &[]).await?;
+        Ok(parse_playlist_summaries(&fields))
+    }
+
+    /// Read one stored playlist's contents.
+    ///
+    /// Wire form: `listplaylistinfo "<name>"\n`.
+    pub(crate) async fn listplaylistinfo(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<MpdPlaylistEntry>, MpdError> {
+        let fields = self.dispatch("listplaylistinfo", &[name]).await?;
+        Ok(parse_playlist_entries(&fields))
+    }
+
+    /// Load a stored playlist's contents to the queue, appending.
+    ///
+    /// Wire form: `load "<name>"\n`.
+    pub(crate) async fn load_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("load", &[name]).await?;
+        Ok(())
+    }
+
+    /// Save the current queue as a stored playlist.
+    ///
+    /// Wire form: `save "<name>"\n`. MPD refuses with ACK 56
+    /// (exists) when the playlist already exists.
+    pub(crate) async fn save_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("save", &[name]).await?;
+        Ok(())
+    }
+
+    /// Append a URI to a stored playlist.
+    ///
+    /// Wire form: `playlistadd "<name>" "<uri>"\n`.
+    pub(crate) async fn playlistadd(
+        &mut self,
+        name: &str,
+        uri: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("playlistadd", &[name, uri]).await?;
+        Ok(())
+    }
+
+    /// Remove an entry from a stored playlist by position.
+    ///
+    /// Wire form: `playlistdelete "<name>" "<position>"\n`.
+    pub(crate) async fn playlistdelete(
+        &mut self,
+        name: &str,
+        position: u32,
+    ) -> Result<(), MpdError> {
+        let pos = position.to_string();
+        self.dispatch("playlistdelete", &[name, pos.as_str()])
+            .await?;
+        Ok(())
+    }
+
+    /// Empty a stored playlist (without removing it).
+    ///
+    /// Wire form: `playlistclear "<name>"\n`.
+    pub(crate) async fn playlistclear(
+        &mut self,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("playlistclear", &[name]).await?;
+        Ok(())
+    }
+
+    /// Move an entry within a stored playlist.
+    ///
+    /// Wire form: `playlistmove "<name>" "<from>" "<to>"\n`.
+    pub(crate) async fn playlistmove(
+        &mut self,
+        name: &str,
+        from_position: u32,
+        to_position: u32,
+    ) -> Result<(), MpdError> {
+        let from = from_position.to_string();
+        let to = to_position.to_string();
+        self.dispatch("playlistmove", &[name, from.as_str(), to.as_str()])
+            .await?;
+        Ok(())
+    }
+
+    /// Rename a stored playlist.
+    ///
+    /// Wire form: `rename "<from>" "<to>"\n`.
+    pub(crate) async fn rename_playlist(
+        &mut self,
+        from_name: &str,
+        to_name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("rename", &[from_name, to_name]).await?;
+        Ok(())
+    }
+
+    /// Delete a stored playlist.
+    ///
+    /// Wire form: `rm "<name>"\n`.
+    pub(crate) async fn rm_playlist(
+        &mut self,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("rm", &[name]).await?;
+        Ok(())
+    }
+
+    // ----- sticker operations -----
+    //
+    // MPD's sticker subsystem attaches durable per-song key-value
+    // pairs that survive update / rescan / mount-unmount / MPD
+    // restart. The framework uses `evo:available` as the canonical
+    // per-song availability flag (0 = unavailable, 1 = available).
+
+    /// Read a single sticker on a song.
+    ///
+    /// Wire form: `sticker get song "<uri>" "<name>"\n`.
+    /// Returns `None` when the sticker is not set (MPD ACKs with
+    /// code 50; the method translates that to `Ok(None)` for the
+    /// caller's ergonomic).
+    pub(crate) async fn sticker_get(
+        &mut self,
+        uri: &str,
+        name: &str,
+    ) -> Result<Option<String>, MpdError> {
+        match self.dispatch("sticker", &["get", "song", uri, name]).await {
+            Ok(fields) => {
+                for f in &fields {
+                    if f.key == "sticker" {
+                        if let Some(value) = sticker_parse_value(&f.value, name)
+                        {
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(MpdError::Ack { code: 50, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Set a sticker on a song. Overwrites the existing value
+    /// when one is already set.
+    ///
+    /// Wire form: `sticker set song "<uri>" "<name>" "<value>"\n`.
+    pub(crate) async fn sticker_set(
+        &mut self,
+        uri: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("sticker", &["set", "song", uri, name, value])
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a single sticker on a song.
+    ///
+    /// Wire form: `sticker delete song "<uri>" "<name>"\n`. MPD
+    /// ACKs with code 50 when the sticker is not set; the method
+    /// translates that to `Ok(())` for idempotency.
+    pub(crate) async fn sticker_delete(
+        &mut self,
+        uri: &str,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        match self
+            .dispatch("sticker", &["delete", "song", uri, name])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(MpdError::Ack { code: 50, .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List every sticker on a song.
+    ///
+    /// Wire form: `sticker list song "<uri>"\n`.
+    pub(crate) async fn sticker_list(
+        &mut self,
+        uri: &str,
+    ) -> Result<Vec<MpdSticker>, MpdError> {
+        let fields = self.dispatch("sticker", &["list", "song", uri]).await?;
+        Ok(parse_sticker_list(&fields))
+    }
+
+    /// Find every song under `base` whose sticker `name` matches
+    /// (existence only when `equal_to` is `None`; exact value match
+    /// when set).
+    ///
+    /// Wire form: `sticker find song "<base>" "<name>"\n` or
+    /// `sticker find song "<base>" "<name>" = "<value>"\n`.
+    pub(crate) async fn sticker_find(
+        &mut self,
+        base: &str,
+        name: &str,
+        equal_to: Option<&str>,
+    ) -> Result<Vec<MpdStickerMatch>, MpdError> {
+        let fields = match equal_to {
+            Some(value) => {
+                self.dispatch(
+                    "sticker",
+                    &["find", "song", base, name, "=", value],
+                )
+                .await?
+            }
+            None => {
+                self.dispatch("sticker", &["find", "song", base, name])
+                    .await?
+            }
+        };
+        Ok(parse_sticker_find(&fields))
+    }
+
+    // ----- library browse / search / update -----
+
+    /// List the contents of a directory in MPD's library.
+    ///
+    /// Wire form: `lsinfo "<path>"\n`. Empty path lists the root.
+    pub(crate) async fn lsinfo(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
+        let fields = if path.is_empty() {
+            self.dispatch("lsinfo", &[]).await?
+        } else {
+            self.dispatch("lsinfo", &[path]).await?
+        };
+        Ok(parse_library_entries(&fields))
+    }
+
+    /// Exact-match search across MPD's library.
+    ///
+    /// Wire form: `find "<field>" "<query>"\n`. Case-sensitive
+    /// exact match; for substring search use [`Self::search`].
+    pub(crate) async fn find(
+        &mut self,
+        field: MpdSearchField,
+        query: &str,
+    ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
+        let fields = self
+            .dispatch("find", &[field.as_protocol_str(), query])
+            .await?;
+        Ok(parse_library_entries(&fields))
+    }
+
+    /// Case-insensitive substring search across MPD's library.
+    ///
+    /// Wire form: `search "<field>" "<query>"\n`.
+    pub(crate) async fn search(
+        &mut self,
+        field: MpdSearchField,
+        query: &str,
+    ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
+        let fields = self
+            .dispatch("search", &[field.as_protocol_str(), query])
+            .await?;
+        Ok(parse_library_entries(&fields))
+    }
+
+    /// Trigger an incremental library scan.
+    ///
+    /// Wire form: `update "<path>"\n` (when path non-empty) or
+    /// `update\n`. MPD reads files whose mtime changed since the
+    /// last scan; for a force-rescan that re-reads every file see
+    /// [`Self::rescan`].
+    pub(crate) async fn update(
+        &mut self,
+        path: Option<&str>,
+    ) -> Result<(), MpdError> {
+        match path {
+            Some(p) => {
+                self.dispatch("update", &[p]).await?;
+            }
+            None => {
+                self.dispatch("update", &[]).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Trigger a full library rescan.
+    ///
+    /// Wire form: `rescan "<path>"\n` or `rescan\n`. Re-reads
+    /// every file's metadata regardless of mtime.
+    pub(crate) async fn rescan(
+        &mut self,
+        path: Option<&str>,
+    ) -> Result<(), MpdError> {
+        match path {
+            Some(p) => {
+                self.dispatch("rescan", &[p]).await?;
+            }
+            None => {
+                self.dispatch("rescan", &[]).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// List MPD's current mounts.
+    ///
+    /// Wire form: `listmounts\n`.
+    pub(crate) async fn listmounts(
+        &mut self,
+    ) -> Result<Vec<MpdMount>, MpdError> {
+        let fields = self.dispatch("listmounts", &[]).await?;
+        Ok(parse_mounts(&fields))
+    }
+
+    /// Mount a storage URI under an alias.
+    ///
+    /// Wire form: `mount "<name>" "<storage>"\n`. MPD ACKs when
+    /// the storage URI scheme is not supported.
+    pub(crate) async fn mount_storage(
+        &mut self,
+        name: &str,
+        storage: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("mount", &[name, storage]).await?;
+        Ok(())
+    }
+
+    /// Unmount a storage by alias.
+    ///
+    /// Wire form: `unmount "<name>"\n`.
+    pub(crate) async fn unmount_storage(
+        &mut self,
+        name: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("unmount", &[name]).await?;
+        Ok(())
+    }
+
+    /// List discovered storage neighbours.
+    ///
+    /// Wire form: `listneighbors\n`.
+    pub(crate) async fn listneighbors(
+        &mut self,
+    ) -> Result<Vec<MpdNeighbor>, MpdError> {
+        let fields = self.dispatch("listneighbors", &[]).await?;
+        Ok(parse_neighbors(&fields))
+    }
 }
 
 /// Open the appropriate transport for `endpoint`, with a hard
@@ -799,6 +1236,430 @@ fn parse_current_song(fields: &[Field]) -> Result<Option<MpdSong>, MpdError> {
         duration,
         codec_name,
     }))
+}
+
+// ----- queue + playlist + sticker + library parsers -----
+
+/// Parse MPD's `playlistinfo` response into queue items. Each
+/// repeated block starts with `file:`; subsequent fields up to
+/// the next `file:` belong to that item.
+fn parse_queue_items(fields: &[Field]) -> Vec<MpdQueueItem> {
+    let mut items: Vec<MpdQueueItem> = Vec::new();
+    let mut current: Option<QueueItemBuilder> = None;
+    for f in fields {
+        if f.key == "file" {
+            if let Some(b) = current.take() {
+                if let Some(item) = b.build() {
+                    items.push(item);
+                }
+            }
+            current = Some(QueueItemBuilder {
+                file_path: f.value.clone(),
+                title: None,
+                artist: None,
+                album: None,
+                duration: None,
+                position: None,
+                id: None,
+            });
+            continue;
+        }
+        let Some(b) = current.as_mut() else { continue };
+        match f.key.as_str() {
+            "Title" => b.title = Some(f.value.clone()),
+            "Artist" => b.artist = Some(f.value.clone()),
+            "Album" => b.album = Some(f.value.clone()),
+            "duration" => {
+                if let Ok(Some(d)) =
+                    parse_duration_secs_field("duration", &f.value)
+                {
+                    b.duration = Some(d);
+                }
+            }
+            "Time" if b.duration.is_none() => {
+                if let Ok(secs) = f.value.parse::<u64>() {
+                    b.duration = Some(Duration::from_secs(secs));
+                }
+            }
+            "Pos" => {
+                if let Ok(p) = f.value.parse::<u32>() {
+                    b.position = Some(p);
+                }
+            }
+            "Id" => {
+                if let Ok(id) = f.value.parse::<u32>() {
+                    b.id = Some(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = current.take() {
+        if let Some(item) = b.build() {
+            items.push(item);
+        }
+    }
+    items
+}
+
+struct QueueItemBuilder {
+    file_path: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    duration: Option<Duration>,
+    position: Option<u32>,
+    id: Option<u32>,
+}
+
+impl QueueItemBuilder {
+    fn build(self) -> Option<MpdQueueItem> {
+        let position = self.position?;
+        let id = self.id?;
+        Some(MpdQueueItem {
+            id,
+            position,
+            file_path: self.file_path,
+            title: self.title,
+            artist: self.artist,
+            album: self.album,
+            duration: self.duration,
+        })
+    }
+}
+
+/// Parse MPD's `listplaylists` response into playlist summaries.
+/// Each block starts with `playlist:`; an optional
+/// `Last-Modified:` follows.
+fn parse_playlist_summaries(fields: &[Field]) -> Vec<MpdPlaylistSummary> {
+    let mut out: Vec<MpdPlaylistSummary> = Vec::new();
+    let mut current: Option<MpdPlaylistSummary> = None;
+    for f in fields {
+        if f.key == "playlist" {
+            if let Some(s) = current.take() {
+                out.push(s);
+            }
+            current = Some(MpdPlaylistSummary {
+                name: f.value.clone(),
+                last_modified: None,
+            });
+            continue;
+        }
+        if f.key == "Last-Modified" {
+            if let Some(s) = current.as_mut() {
+                s.last_modified = Some(f.value.clone());
+            }
+        }
+    }
+    if let Some(s) = current.take() {
+        out.push(s);
+    }
+    out
+}
+
+/// Parse MPD's `listplaylistinfo NAME` response into playlist
+/// entries. The block shape mirrors `playlistinfo` minus the
+/// queue-specific `Pos:` / `Id:` (positions are assigned by
+/// parse order).
+fn parse_playlist_entries(fields: &[Field]) -> Vec<MpdPlaylistEntry> {
+    let mut entries: Vec<MpdPlaylistEntry> = Vec::new();
+    let mut current: Option<MpdPlaylistEntry> = None;
+    let mut next_pos: u32 = 0;
+    for f in fields {
+        if f.key == "file" {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            current = Some(MpdPlaylistEntry {
+                position: next_pos,
+                file_path: f.value.clone(),
+                title: None,
+                artist: None,
+                album: None,
+                duration: None,
+            });
+            next_pos = next_pos.saturating_add(1);
+            continue;
+        }
+        let Some(e) = current.as_mut() else { continue };
+        match f.key.as_str() {
+            "Title" => e.title = Some(f.value.clone()),
+            "Artist" => e.artist = Some(f.value.clone()),
+            "Album" => e.album = Some(f.value.clone()),
+            "duration" => {
+                if let Ok(Some(d)) =
+                    parse_duration_secs_field("duration", &f.value)
+                {
+                    e.duration = Some(d);
+                }
+            }
+            "Time" if e.duration.is_none() => {
+                if let Ok(secs) = f.value.parse::<u64>() {
+                    e.duration = Some(Duration::from_secs(secs));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(e) = current.take() {
+        entries.push(e);
+    }
+    entries
+}
+
+/// Parse the `sticker:` value field. MPD encodes it as
+/// `NAME=VALUE`; the method strips the leading `NAME=` to return
+/// just the value.
+fn sticker_parse_value(raw: &str, expected_name: &str) -> Option<String> {
+    let prefix = format!("{}=", expected_name);
+    raw.strip_prefix(prefix.as_str()).map(str::to_string)
+}
+
+/// Parse a generic `NAME=VALUE` sticker line into the name and
+/// value parts. MPD's `sticker list` response repeats this shape
+/// without a separating field, so the parser uses the first `=`
+/// as the boundary.
+fn sticker_split_pair(raw: &str) -> Option<(String, String)> {
+    let eq = raw.find('=')?;
+    Some((raw[..eq].to_string(), raw[eq + 1..].to_string()))
+}
+
+/// Parse MPD's `sticker list song <uri>` response.
+fn parse_sticker_list(fields: &[Field]) -> Vec<MpdSticker> {
+    fields
+        .iter()
+        .filter(|f| f.key == "sticker")
+        .filter_map(|f| sticker_split_pair(&f.value))
+        .map(|(name, value)| MpdSticker { name, value })
+        .collect()
+}
+
+/// Parse MPD's `sticker find` response. Each match is a `file:`
+/// followed by one or more `sticker:` lines.
+fn parse_sticker_find(fields: &[Field]) -> Vec<MpdStickerMatch> {
+    let mut out: Vec<MpdStickerMatch> = Vec::new();
+    let mut current_file: Option<String> = None;
+    for f in fields {
+        if f.key == "file" {
+            current_file = Some(f.value.clone());
+            continue;
+        }
+        if f.key == "sticker" {
+            if let (Some(path), Some((name, value))) =
+                (current_file.as_ref(), sticker_split_pair(&f.value))
+            {
+                out.push(MpdStickerMatch {
+                    file_path: path.clone(),
+                    sticker: MpdSticker { name, value },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Parse MPD's `lsinfo PATH` / `find` / `search` response into
+/// library entries. The response interleaves `directory:`,
+/// `file:`, and `playlist:` blocks.
+fn parse_library_entries(fields: &[Field]) -> Vec<MpdLibraryEntry> {
+    let mut out: Vec<MpdLibraryEntry> = Vec::new();
+    let mut current: Option<LibraryEntryBuilder> = None;
+    for f in fields {
+        match f.key.as_str() {
+            "directory" => {
+                if let Some(b) = current.take() {
+                    if let Some(e) = b.build() {
+                        out.push(e);
+                    }
+                }
+                current = Some(LibraryEntryBuilder::Directory {
+                    path: f.value.clone(),
+                    last_modified: None,
+                });
+            }
+            "file" => {
+                if let Some(b) = current.take() {
+                    if let Some(e) = b.build() {
+                        out.push(e);
+                    }
+                }
+                current = Some(LibraryEntryBuilder::File {
+                    path: f.value.clone(),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    duration: None,
+                });
+            }
+            "playlist" => {
+                if let Some(b) = current.take() {
+                    if let Some(e) = b.build() {
+                        out.push(e);
+                    }
+                }
+                current = Some(LibraryEntryBuilder::Playlist {
+                    path: f.value.clone(),
+                    last_modified: None,
+                });
+            }
+            _ => {
+                if let Some(b) = current.as_mut() {
+                    b.absorb_field(&f.key, &f.value);
+                }
+            }
+        }
+    }
+    if let Some(b) = current.take() {
+        if let Some(e) = b.build() {
+            out.push(e);
+        }
+    }
+    out
+}
+
+enum LibraryEntryBuilder {
+    Directory {
+        path: String,
+        last_modified: Option<String>,
+    },
+    File {
+        path: String,
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        duration: Option<Duration>,
+    },
+    Playlist {
+        path: String,
+        last_modified: Option<String>,
+    },
+}
+
+impl LibraryEntryBuilder {
+    fn absorb_field(&mut self, key: &str, value: &str) {
+        match (self, key) {
+            (Self::Directory { last_modified, .. }, "Last-Modified") => {
+                *last_modified = Some(value.to_string());
+            }
+            (Self::Playlist { last_modified, .. }, "Last-Modified") => {
+                *last_modified = Some(value.to_string());
+            }
+            (Self::File { title, .. }, "Title") => {
+                *title = Some(value.to_string())
+            }
+            (Self::File { artist, .. }, "Artist") => {
+                *artist = Some(value.to_string())
+            }
+            (Self::File { album, .. }, "Album") => {
+                *album = Some(value.to_string())
+            }
+            (Self::File { duration, .. }, "duration") => {
+                if let Ok(Some(d)) =
+                    parse_duration_secs_field("duration", value)
+                {
+                    *duration = Some(d);
+                }
+            }
+            (Self::File { duration, .. }, "Time") if duration.is_none() => {
+                if let Ok(secs) = value.parse::<u64>() {
+                    *duration = Some(Duration::from_secs(secs));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn build(self) -> Option<MpdLibraryEntry> {
+        Some(match self {
+            Self::Directory {
+                path,
+                last_modified,
+            } => MpdLibraryEntry::Directory {
+                path,
+                last_modified,
+            },
+            Self::File {
+                path,
+                title,
+                artist,
+                album,
+                duration,
+            } => MpdLibraryEntry::File {
+                path,
+                title,
+                artist,
+                album,
+                duration,
+            },
+            Self::Playlist {
+                path,
+                last_modified,
+            } => MpdLibraryEntry::Playlist {
+                path,
+                last_modified,
+            },
+        })
+    }
+}
+
+/// Parse MPD's `listmounts` response into mount records. Each
+/// mount is a `mount:` followed by a `storage:` line.
+fn parse_mounts(fields: &[Field]) -> Vec<MpdMount> {
+    let mut out: Vec<MpdMount> = Vec::new();
+    let mut current: Option<MpdMount> = None;
+    for f in fields {
+        match f.key.as_str() {
+            "mount" => {
+                if let Some(m) = current.take() {
+                    out.push(m);
+                }
+                current = Some(MpdMount {
+                    name: f.value.clone(),
+                    storage: String::new(),
+                });
+            }
+            "storage" => {
+                if let Some(m) = current.as_mut() {
+                    m.storage = f.value.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(m) = current.take() {
+        out.push(m);
+    }
+    out
+}
+
+/// Parse MPD's `listneighbors` response. Each neighbour is a
+/// `neighbor:` (URI) followed by a `name:` (display name).
+fn parse_neighbors(fields: &[Field]) -> Vec<MpdNeighbor> {
+    let mut out: Vec<MpdNeighbor> = Vec::new();
+    let mut current: Option<MpdNeighbor> = None;
+    for f in fields {
+        match f.key.as_str() {
+            "neighbor" => {
+                if let Some(n) = current.take() {
+                    out.push(n);
+                }
+                current = Some(MpdNeighbor {
+                    uri: f.value.clone(),
+                    name: String::new(),
+                });
+            }
+            "name" => {
+                if let Some(n) = current.as_mut() {
+                    n.name = f.value.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(n) = current.take() {
+        out.push(n);
+    }
+    out
 }
 
 fn parse_u32_field(field: &'static str, value: &str) -> Result<u32, MpdError> {
@@ -1834,5 +2695,234 @@ mod tests {
         }];
         let s = parse_current_song(&fields).unwrap();
         assert!(s.is_none());
+    }
+
+    // ----- queue / playlist / sticker / library parser tests -----
+
+    fn field(key: &str, value: &str) -> Field {
+        Field {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn parse_queue_items_collects_each_item_by_pos_and_id() {
+        let fields = vec![
+            field("file", "INTERNAL/a.flac"),
+            field("Title", "Track A"),
+            field("Artist", "Someone"),
+            field("Album", "Album A"),
+            field("Time", "180"),
+            field("duration", "180.500"),
+            field("Pos", "0"),
+            field("Id", "7"),
+            field("file", "INTERNAL/b.flac"),
+            field("Title", "Track B"),
+            field("Pos", "1"),
+            field("Id", "8"),
+        ];
+        let items = parse_queue_items(&fields);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, 7);
+        assert_eq!(items[0].position, 0);
+        assert_eq!(items[0].file_path, "INTERNAL/a.flac");
+        assert_eq!(items[0].title.as_deref(), Some("Track A"));
+        assert_eq!(items[0].duration, Some(Duration::from_millis(180_500)));
+        assert_eq!(items[1].id, 8);
+        assert_eq!(items[1].position, 1);
+    }
+
+    #[test]
+    fn parse_queue_items_drops_items_missing_pos_or_id() {
+        // Item without Pos/Id (defensive — should not break).
+        let fields = vec![
+            field("file", "INTERNAL/a.flac"),
+            field("Title", "incomplete"),
+        ];
+        let items = parse_queue_items(&fields);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_playlist_summaries_handles_optional_last_modified() {
+        let fields = vec![
+            field("playlist", "rock"),
+            field("Last-Modified", "2025-01-02T03:04:05Z"),
+            field("playlist", "jazz"),
+        ];
+        let summaries = parse_playlist_summaries(&fields);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].name, "rock");
+        assert_eq!(
+            summaries[0].last_modified.as_deref(),
+            Some("2025-01-02T03:04:05Z")
+        );
+        assert_eq!(summaries[1].name, "jazz");
+        assert!(summaries[1].last_modified.is_none());
+    }
+
+    #[test]
+    fn parse_playlist_entries_assigns_positions_by_parse_order() {
+        let fields = vec![
+            field("file", "INTERNAL/a.flac"),
+            field("Title", "A"),
+            field("file", "INTERNAL/b.flac"),
+            field("Title", "B"),
+            field("file", "INTERNAL/c.flac"),
+        ];
+        let entries = parse_playlist_entries(&fields);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].position, 0);
+        assert_eq!(entries[0].title.as_deref(), Some("A"));
+        assert_eq!(entries[1].position, 1);
+        assert_eq!(entries[2].position, 2);
+        assert!(entries[2].title.is_none());
+    }
+
+    #[test]
+    fn sticker_parse_value_strips_named_prefix() {
+        let v = sticker_parse_value("evo:available=1", "evo:available");
+        assert_eq!(v.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn sticker_parse_value_returns_none_on_mismatched_name() {
+        let v = sticker_parse_value("rating=4", "evo:available");
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn sticker_split_pair_splits_on_first_equals() {
+        let p = sticker_split_pair("rating=4=stars").unwrap();
+        assert_eq!(p.0, "rating");
+        assert_eq!(p.1, "4=stars");
+    }
+
+    #[test]
+    fn parse_sticker_list_collects_every_sticker_line() {
+        let fields = vec![
+            field("sticker", "evo:available=1"),
+            field("sticker", "rating=4"),
+        ];
+        let stickers = parse_sticker_list(&fields);
+        assert_eq!(stickers.len(), 2);
+        assert_eq!(stickers[0].name, "evo:available");
+        assert_eq!(stickers[0].value, "1");
+        assert_eq!(stickers[1].name, "rating");
+    }
+
+    #[test]
+    fn parse_sticker_find_attaches_each_sticker_to_its_file() {
+        let fields = vec![
+            field("file", "INTERNAL/a.flac"),
+            field("sticker", "evo:available=1"),
+            field("file", "INTERNAL/b.flac"),
+            field("sticker", "evo:available=0"),
+        ];
+        let matches = parse_sticker_find(&fields);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].file_path, "INTERNAL/a.flac");
+        assert_eq!(matches[0].sticker.value, "1");
+        assert_eq!(matches[1].file_path, "INTERNAL/b.flac");
+        assert_eq!(matches[1].sticker.value, "0");
+    }
+
+    #[test]
+    fn parse_library_entries_distinguishes_kind_per_block() {
+        let fields = vec![
+            field("directory", "Artist A"),
+            field("Last-Modified", "2025-01-01T00:00:00Z"),
+            field("file", "Artist A/Album 1/01 Track.flac"),
+            field("Title", "Opener"),
+            field("duration", "210.000"),
+            field("playlist", "Favourites"),
+            field("Last-Modified", "2025-02-02T02:00:00Z"),
+        ];
+        let entries = parse_library_entries(&fields);
+        assert_eq!(entries.len(), 3);
+        match &entries[0] {
+            MpdLibraryEntry::Directory {
+                path,
+                last_modified,
+            } => {
+                assert_eq!(path, "Artist A");
+                assert!(last_modified.is_some());
+            }
+            other => panic!("expected directory, got {other:?}"),
+        }
+        match &entries[1] {
+            MpdLibraryEntry::File {
+                path,
+                title,
+                duration,
+                ..
+            } => {
+                assert_eq!(path, "Artist A/Album 1/01 Track.flac");
+                assert_eq!(title.as_deref(), Some("Opener"));
+                assert_eq!(*duration, Some(Duration::from_secs(210)));
+            }
+            other => panic!("expected file, got {other:?}"),
+        }
+        match &entries[2] {
+            MpdLibraryEntry::Playlist {
+                path,
+                last_modified,
+            } => {
+                assert_eq!(path, "Favourites");
+                assert!(last_modified.is_some());
+            }
+            other => panic!("expected playlist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mounts_pairs_each_alias_with_storage() {
+        let fields = vec![
+            field("mount", ""),
+            field("storage", ""),
+            field("mount", "nas"),
+            field("storage", "smb://nas.local/music"),
+        ];
+        let mounts = parse_mounts(&fields);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].name, "");
+        assert_eq!(mounts[0].storage, "");
+        assert_eq!(mounts[1].name, "nas");
+        assert_eq!(mounts[1].storage, "smb://nas.local/music");
+    }
+
+    #[test]
+    fn parse_neighbors_collects_uri_and_name_pairs() {
+        let fields = vec![
+            field("neighbor", "smb://NAS"),
+            field("name", "Home NAS"),
+            field("neighbor", "upnp://uuid:abc.../"),
+            field("name", "Living Room TV"),
+        ];
+        let neighbours = parse_neighbors(&fields);
+        assert_eq!(neighbours.len(), 2);
+        assert_eq!(neighbours[0].uri, "smb://NAS");
+        assert_eq!(neighbours[0].name, "Home NAS");
+        assert_eq!(neighbours[1].uri, "upnp://uuid:abc.../");
+        assert_eq!(neighbours[1].name, "Living Room TV");
+    }
+
+    #[test]
+    fn mpd_search_field_protocol_tokens_cover_every_variant() {
+        let pairs = [
+            (MpdSearchField::Any, "any"),
+            (MpdSearchField::Artist, "artist"),
+            (MpdSearchField::AlbumArtist, "albumartist"),
+            (MpdSearchField::Album, "album"),
+            (MpdSearchField::Title, "title"),
+            (MpdSearchField::Genre, "genre"),
+            (MpdSearchField::Composer, "composer"),
+            (MpdSearchField::File, "file"),
+            (MpdSearchField::Base, "base"),
+        ];
+        for (f, token) in pairs {
+            assert_eq!(f.as_protocol_str(), token);
+        }
     }
 }

@@ -86,5 +86,7 @@ pub(crate) use connection::{ConnectTimeouts, MpdConnection};
 pub(crate) use endpoint::MpdEndpoint;
 pub(crate) use error::MpdError;
 pub(crate) use types::{
-    derive_source_codec_name, IdleSubsystem, MpdSong, MpdStatus, PlayState,
+    derive_source_codec_name, IdleSubsystem, MpdLibraryEntry, MpdMount,
+    MpdNeighbor, MpdPlaylistEntry, MpdPlaylistSummary, MpdQueueItem,
+    MpdSearchField, MpdSong, MpdStatus, MpdSticker, MpdStickerMatch, PlayState,
 };
