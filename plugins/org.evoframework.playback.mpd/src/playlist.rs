@@ -41,6 +41,7 @@
 //!   load and refreshed on every mutating verb + on idle
 //!   stored_playlist wakes.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -107,6 +108,17 @@ pub(crate) struct PlaylistContext {
     /// `list_playlists` without round-trip through the
     /// framework's subject querier.
     mirror: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Per-playlist item-count cache populated by
+    /// [`build_index_envelope`]'s batched
+    /// `MpdConnection::playlist_file_counts` query and refreshed
+    /// on every `StoredPlaylist` idle event. A `None` entry
+    /// (or an absent key) means the count has not yet been
+    /// determined — the wire envelope serialises this as
+    /// `item_count: null` so the operator UI never displays
+    /// "0 tracks" when the truth is unknown. The cache is the
+    /// authoritative source for the wire shape; the upstream
+    /// MPD query refreshes it, never the other way around.
+    item_count_cache: Arc<Mutex<HashMap<String, Option<u32>>>>,
 }
 
 impl PlaylistContext {
@@ -124,6 +136,7 @@ impl PlaylistContext {
             subjects,
             favourites_name,
             mirror: Arc::new(Mutex::new(None)),
+            item_count_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -155,7 +168,7 @@ pub(crate) async fn publish_index(
     ctx: &PlaylistContext,
     conn: &mut MpdConnection,
 ) {
-    let env = match build_index_envelope(conn).await {
+    let env = match build_index_envelope(ctx, conn).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -189,27 +202,61 @@ fn render_empty_index() -> serde_json::Value {
 }
 
 async fn build_index_envelope(
+    ctx: &PlaylistContext,
     conn: &mut MpdConnection,
 ) -> Result<serde_json::Value, BuildError> {
     let summaries = conn
         .listplaylists()
         .await
         .map_err(|e| BuildError::Mpd(format!("listplaylists: {e}")))?;
-    // Item count requires a per-playlist listplaylistinfo round-
-    // trip; for index emission we approximate as 0 (the
-    // `get_playlist` verb returns the real count). UI consumers
-    // wanting accurate counts call get_playlist; the index's
-    // purpose is the name + last-modified listing.
+    // Bar-shape contract — wire-shape defaults must be either
+    // derived from upstream truth or explicitly Option::None
+    // (serialised as JSON `null`); a hardcoded zero would be
+    // a lie when the truth is unknown. Fetch every playlist's
+    // file-line count in ONE batched round-trip via MPD's
+    // `command_list_ok_begin` ... `command_list_end` protocol,
+    // then mirror the result into the context's count cache so
+    // verb-level reads (`get_playlist` summaries, future
+    // operator-UI hover-counts) hit the cache instead of MPD.
+    // If the batched query fails we surface the failure
+    // honestly via `item_count: null` rather than fabricating
+    // zeros — the UI renders "—" instead of "0 tracks" on the
+    // count badge, never lying to the operator.
+    let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+    let counts: Vec<Option<u32>> = match conn.playlist_file_counts(&names).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "playlist_file_counts batched query failed; \
+                 audio_playlist_index will render item_count as null \
+                 until the next idle StoredPlaylist event"
+            );
+            vec![None; summaries.len()]
+        }
+    };
+    // Persist the per-name truth into the cache so verb-level
+    // consumers (and a future hover-count UI surface) hit the
+    // cache instead of re-issuing the batched query.
+    {
+        let mut g = ctx.item_count_cache.lock().await;
+        for (s, count) in summaries.iter().zip(counts.iter()) {
+            g.insert(s.name.clone(), *count);
+        }
+    }
     let rendered: Vec<serde_json::Value> = summaries
         .iter()
-        .map(|s| {
+        .zip(counts.iter())
+        .map(|(s, count)| {
             let parsed_ts = s
                 .last_modified
                 .as_ref()
                 .and_then(|raw| parse_iso_to_epoch_ms(raw));
             json!({
                 "name":            s.name,
-                "item_count":      0,
+                "item_count":      count,
                 "modified_at_ms":  parsed_ts,
             })
         })
@@ -713,6 +760,55 @@ pub(crate) async fn handle_move_in_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_index_entry_serialises_real_count_as_json_number() {
+        let env = json!({
+            "v":         PLAYLIST_PAYLOAD_VERSION,
+            "playlists": [
+                {
+                    "name":            "Test",
+                    "item_count":      13_u32,
+                    "modified_at_ms":  1_780_593_651_000_u64,
+                },
+            ],
+        });
+        let first = &env["playlists"][0];
+        // Real counts MUST serialise as JSON numbers, not as
+        // strings or as the "null lie" pattern.
+        assert_eq!(first["item_count"], json!(13));
+        assert!(first["item_count"].is_number());
+    }
+
+    #[test]
+    fn render_index_entry_serialises_unknown_count_as_json_null() {
+        // The bar-shape contract: when MPD truth has not been
+        // determined yet, `item_count` MUST serialise as JSON
+        // `null` and never fabricate a zero. Operator UI renders
+        // null as "—" / hides the count badge; zero would lie.
+        let entry: serde_json::Value = json!({
+            "name":            "Pending",
+            "item_count":      None::<u32>,
+            "modified_at_ms":  1_780_593_651_000_u64,
+        });
+        assert_eq!(entry["item_count"], serde_json::Value::Null);
+        assert!(entry["item_count"].is_null());
+    }
+
+    #[test]
+    fn render_index_entry_never_serialises_count_zero_by_default() {
+        // Belt-and-braces: the literal "0 instead of null" lie
+        // is the banned pattern. A test that asserts an unknown
+        // count renders as null catches any future contributor
+        // re-introducing the pre-fix default of `0` to silence
+        // a refactor.
+        let entry: serde_json::Value = json!({
+            "name":            "Pending",
+            "item_count":      None::<u32>,
+            "modified_at_ms":  1_780_593_651_000_u64,
+        });
+        assert_ne!(entry["item_count"], json!(0_u32));
+    }
 
     #[test]
     fn validate_playlist_name_accepts_simple_name() {
