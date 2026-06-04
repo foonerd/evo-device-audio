@@ -25,8 +25,8 @@ use super::framing::Framing;
 use super::protocol::{self, ClassifiedLine, Field};
 use super::types::{
     IdleSubsystem, MpdLibraryEntry, MpdMount, MpdNeighbor, MpdPlaylistEntry,
-    MpdPlaylistSummary, MpdQueueItem, MpdSearchField, MpdSong, MpdStatus,
-    MpdSticker, MpdStickerMatch, MpdVersion, PlayState,
+    MpdPlaylistSummary, MpdQueueItem, MpdSearchField, MpdSong, MpdStats,
+    MpdStatus, MpdSticker, MpdStickerMatch, MpdVersion, PlayState,
 };
 
 /// Timeout budgets for a single connection.
@@ -148,6 +148,17 @@ impl MpdConnection {
     pub(crate) async fn ping(&mut self) -> Result<(), MpdError> {
         self.dispatch("ping", &[]).await?;
         Ok(())
+    }
+
+    /// Dispatch `stats` and project the response into [`MpdStats`].
+    ///
+    /// Drives library-state rehydration: `audio_library_state`'s
+    /// `total_tracks` field comes from [`MpdStats::songs`];
+    /// `last_full_scan_at_ms` derives from
+    /// [`MpdStats::db_update_unix_s`].
+    pub(crate) async fn stats(&mut self) -> Result<MpdStats, MpdError> {
+        let fields = self.dispatch("stats", &[]).await?;
+        parse_stats(&fields)
     }
 
     // ----- transport commands -----
@@ -1753,6 +1764,32 @@ fn parse_u32_field(field: &'static str, value: &str) -> Result<u32, MpdError> {
     })
 }
 
+fn parse_u64_field(field: &'static str, value: &str) -> Result<u64, MpdError> {
+    value.parse::<u64>().map_err(|_| {
+        MpdError::Protocol(ProtocolError::UnparseableField {
+            field,
+            value: value.to_string(),
+        })
+    })
+}
+
+fn parse_stats(fields: &[Field]) -> Result<MpdStats, MpdError> {
+    let mut stats = MpdStats::default();
+    for f in fields {
+        match f.key.as_str() {
+            "artists" => stats.artists = parse_u32_field("artists", &f.value)?,
+            "albums" => stats.albums = parse_u32_field("albums", &f.value)?,
+            "songs" => stats.songs = parse_u32_field("songs", &f.value)?,
+            "db_update" => {
+                stats.db_update_unix_s =
+                    Some(parse_u64_field("db_update", &f.value)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(stats)
+}
+
 fn parse_duration_secs_field(
     field: &'static str,
     value: &str,
@@ -2767,6 +2804,61 @@ mod tests {
         ];
         let s = parse_status(&fields).unwrap();
         assert_eq!(s.state, PlayState::Playing);
+    }
+
+    #[test]
+    fn parse_stats_extracts_songs_and_db_update() {
+        let fields = vec![
+            Field {
+                key: "artists".into(),
+                value: "62".into(),
+            },
+            Field {
+                key: "albums".into(),
+                value: "86".into(),
+            },
+            Field {
+                key: "songs".into(),
+                value: "1134".into(),
+            },
+            Field {
+                key: "db_update".into(),
+                value: "1717527921".into(),
+            },
+            Field {
+                key: "uptime".into(),
+                value: "3600".into(),
+            },
+        ];
+        let s = parse_stats(&fields).unwrap();
+        assert_eq!(s.artists, 62);
+        assert_eq!(s.albums, 86);
+        assert_eq!(s.songs, 1134);
+        assert_eq!(s.db_update_unix_s, Some(1_717_527_921));
+    }
+
+    #[test]
+    fn parse_stats_db_update_absent_yields_none() {
+        let fields = vec![Field {
+            key: "songs".into(),
+            value: "0".into(),
+        }];
+        let s = parse_stats(&fields).unwrap();
+        assert_eq!(s.songs, 0);
+        assert_eq!(s.db_update_unix_s, None);
+    }
+
+    #[test]
+    fn parse_stats_unparseable_songs_returns_protocol_error() {
+        let fields = vec![Field {
+            key: "songs".into(),
+            value: "not-a-number".into(),
+        }];
+        let err = parse_stats(&fields).unwrap_err();
+        assert!(
+            matches!(err, MpdError::Protocol(ProtocolError::UnparseableField { field, .. }) if field == "songs"),
+            "got: {err:?}"
+        );
     }
 
     #[test]

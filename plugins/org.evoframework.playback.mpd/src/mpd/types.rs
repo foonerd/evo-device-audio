@@ -107,6 +107,33 @@ pub(crate) struct MpdStatus {
     pub(crate) crossfade_seconds: u32,
 }
 
+/// Narrow view of MPD's `stats` response.
+///
+/// Drives library-state rehydration on plugin init: the
+/// `audio_library_state` subject's `total_tracks` field comes
+/// from [`Self::songs`]; `last_full_scan_at_ms` derives from
+/// [`Self::db_update_unix_s`] when present. Other fields MPD
+/// reports (artists, albums, uptime, db_playtime, playtime) are
+/// surfaced for diagnostics + cross-shelf consumers but not
+/// every consumer needs every field.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MpdStats {
+    /// Number of unique artists in the database. `0` when MPD
+    /// omits the field.
+    pub(crate) artists: u32,
+    /// Number of unique albums in the database. `0` when MPD
+    /// omits the field.
+    pub(crate) albums: u32,
+    /// Number of songs in the database. `0` when MPD omits the
+    /// field. Drives library-state `total_tracks`.
+    pub(crate) songs: u32,
+    /// Unix timestamp (seconds) of MPD's last database update.
+    /// `None` when the field is absent (fresh MPD with no
+    /// completed scan). Drives library-state
+    /// `last_full_scan_at_ms` (multiplied by 1000).
+    pub(crate) db_update_unix_s: Option<u64>,
+}
+
 /// Narrow view of MPD's `currentsong` response.
 ///
 /// Only the fields the playback warden needs today. A richer shape
