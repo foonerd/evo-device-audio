@@ -1001,8 +1001,8 @@ pub(crate) async fn rehydrate_from_mpd(
     // when the reconciler is up to date; on cold-start the sticker
     // set is empty so we mirror the total as the available count
     // (best-faith starting point) and the reconciler corrects it
-    // shortly. The contract documented on ADR-0144 is that the
-    // counts reflect MPD truth, not a frozen snapshot.
+    // shortly. The wider contract is that the counts always
+    // reflect MPD truth, not a frozen snapshot.
     let last_scan_ms = stats.db_update_unix_s.map(|s| s * 1000);
     if let Err(e) = ctx
         .registry
