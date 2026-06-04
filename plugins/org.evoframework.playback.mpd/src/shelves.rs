@@ -49,6 +49,7 @@ use evo_plugin_sdk::contract::{
 
 use crate::disposition_emitter::DispositionEmitter;
 use crate::favourites::{self, FavouritesContext};
+use crate::idle_observer::{self, IdleObserverHandle};
 use crate::library::{self, LibraryContext};
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
 use crate::playlist::{
@@ -86,6 +87,11 @@ pub(crate) struct ShelfBundle {
     pub(crate) favourites: FavouritesContext,
     pub(crate) library: LibraryContext,
     pub(crate) sticker_reconciler: Option<StickerReconcilerHandle>,
+    /// Reactive sync — MPD's idle subprotocol drives the four
+    /// shelf subjects when MPD-side state mutates outside this
+    /// plugin's verbs. The handle is held here so plugin
+    /// unload can stop the observer cleanly.
+    pub(crate) idle_observer: Option<IdleObserverHandle>,
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
 }
@@ -219,11 +225,24 @@ impl ShelfBundle {
             registry.clone(),
         ));
 
+        // Spawn the idle-subprotocol observer so MPD-side
+        // mutations outside this plugin's verbs propagate into
+        // the shelf subjects.
+        let idle_observer = Some(idle_observer::spawn(
+            endpoint.clone(),
+            timeouts,
+            queue.clone(),
+            playlist.clone(),
+            favourites.clone(),
+            library.clone(),
+        ));
+
         tracing::info!(
             plugin = PLUGIN_NAME,
             music_directory = %music_directory.display(),
             playlist_directory = %playlist_directory.display(),
-            "shelf integration initialised: subjects announced + rehydrated from MPD"
+            "shelf integration initialised: subjects announced + rehydrated \
+             from MPD + idle observer subscribed"
         );
 
         Self {
@@ -235,6 +254,7 @@ impl ShelfBundle {
             favourites,
             library,
             sticker_reconciler,
+            idle_observer,
             endpoint,
             timeouts,
         }
@@ -285,6 +305,9 @@ impl ShelfBundle {
     /// `emit` call so no explicit unload-time persist is
     /// needed.
     pub(crate) async fn shutdown(mut self) {
+        if let Some(handle) = self.idle_observer.take() {
+            handle.stop().await;
+        }
         if let Some(handle) = self.sticker_reconciler.take() {
             handle.stop().await;
         }
