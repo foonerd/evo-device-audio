@@ -180,12 +180,36 @@ impl ShelfBundle {
             );
         }
 
-        // Announce every subject at load.
+        // Announce every subject at load. The announcement
+        // seeds the subject_states mirror with a wire-shape
+        // empty envelope so consumers connecting between
+        // announce and the subsequent rehydrate-publish see a
+        // well-formed payload immediately.
         disposition_emitter.announce().await;
         queue::announce_queue(&queue).await;
         playlist::announce_index(&playlist).await;
         favourites::announce_favourites(&favourites).await;
         library::announce_subjects(&library).await;
+
+        // Warm-start rehydration: replace the empty envelopes
+        // with MPD's persisted truth (queue, stored playlists,
+        // favourites entries, library stats). MPD is the
+        // durable source; the framework subject_states mirror
+        // is a cache. A cache that ignores its upstream on
+        // cold-start is broken — the operator sees a fresh-
+        // install device until they manually mutate state.
+        // Best-effort: a failed rehydrate logs but does not
+        // block plugin admission; the subjects stay empty
+        // until the next mutation or the next idle event.
+        Self::rehydrate_all(
+            &endpoint,
+            timeouts,
+            &queue,
+            &playlist,
+            &favourites,
+            &library,
+        )
+        .await;
 
         // Spawn the sticker reconciler against the registry's
         // broadcast.
@@ -199,7 +223,7 @@ impl ShelfBundle {
             plugin = PLUGIN_NAME,
             music_directory = %music_directory.display(),
             playlist_directory = %playlist_directory.display(),
-            "shelf integration initialised: queue / playlist / favourites / library subjects announced"
+            "shelf integration initialised: subjects announced + rehydrated from MPD"
         );
 
         Self {
@@ -214,6 +238,44 @@ impl ShelfBundle {
             endpoint,
             timeouts,
         }
+    }
+
+    /// Warm-start rehydration of every shelf subject from MPD's
+    /// persisted state. Opens a single short-lived MpdConnection
+    /// and drives each shelf's existing `publish_*` / `refresh_*`
+    /// helper. Best-effort: connection failure or per-shelf
+    /// publish failure logs a warning and continues; the failed
+    /// shelves stay at their empty-envelope announcement until
+    /// the next mutation or idle event.
+    async fn rehydrate_all(
+        endpoint: &MpdEndpoint,
+        timeouts: ConnectTimeouts,
+        queue: &QueueContext,
+        playlist: &PlaylistContext,
+        favourites: &FavouritesContext,
+        library: &LibraryContext,
+    ) {
+        let mut conn = match MpdConnection::connect_with_timeouts(
+            endpoint.clone(),
+            timeouts,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "warm-start rehydrate: MPD connect failed; subjects \
+                     stay empty until next mutation or idle wake"
+                );
+                return;
+            }
+        };
+        queue::publish_queue(queue, &mut conn).await;
+        playlist::publish_index(playlist, &mut conn).await;
+        favourites::refresh_favourites(favourites, &mut conn).await;
+        library::rehydrate_from_mpd(library, &mut conn).await;
     }
 
     /// Tear down at plugin unload. Stops the sticker

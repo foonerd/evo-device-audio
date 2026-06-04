@@ -478,6 +478,36 @@ impl SourceRegistry {
         Ok(())
     }
 
+    /// Update a source's track-count snapshot AND override the
+    /// last-scan timestamp with an externally-supplied value
+    /// (e.g. MPD's `db_update` field on warm-start). Distinct
+    /// from [`Self::update_track_counts`] which stamps "now":
+    /// warm-start rehydration carries the wire truth that MPD
+    /// last scanned at a particular wall-clock moment, not that
+    /// the plugin learned about it just now. `last_scan_at_ms`
+    /// is left unset when `at_ms` is `None`.
+    pub(crate) async fn apply_track_counts_with_scan_time(
+        &self,
+        source_id: &str,
+        total: u32,
+        available: u32,
+        at_ms: Option<u64>,
+    ) -> Result<(), RegistryError> {
+        let mut guard = self.inner.sources.write().await;
+        let record =
+            guard
+                .get_mut(source_id)
+                .ok_or_else(|| RegistryError::Unknown {
+                    source_id: source_id.to_string(),
+                })?;
+        record.track_count = total;
+        record.track_count_available = available;
+        if at_ms.is_some() {
+            record.last_scan_at_ms = at_ms;
+        }
+        Ok(())
+    }
+
     /// Load the registry from its state file. Returns `Ok(0)`
     /// when no state file is configured or when it doesn't yet
     /// exist; returns the number of sources rehydrated otherwise.
@@ -964,6 +994,42 @@ mod tests {
         assert_eq!(rec.track_count, 100);
         assert_eq!(rec.track_count_available, 95);
         assert!(rec.last_scan_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_apply_track_counts_with_scan_time_uses_supplied_ts() {
+        let r = SourceRegistry::new();
+        r.register(local_record("a", PathBuf::from("/tmp/a")))
+            .await
+            .unwrap();
+        // MPD's db_update 2026-06-04 15:05:21 UTC → 1_780_678_321 s.
+        let stamp_ms: u64 = 1_780_678_321 * 1000;
+        r.apply_track_counts_with_scan_time("a", 1134, 1134, Some(stamp_ms))
+            .await
+            .unwrap();
+        let rec = r.get("a").await.unwrap();
+        assert_eq!(rec.track_count, 1134);
+        assert_eq!(rec.track_count_available, 1134);
+        assert_eq!(rec.last_scan_at_ms, Some(stamp_ms));
+    }
+
+    #[tokio::test]
+    async fn registry_apply_track_counts_with_none_ts_leaves_existing_ts() {
+        let r = SourceRegistry::new();
+        r.register(local_record("a", PathBuf::from("/tmp/a")))
+            .await
+            .unwrap();
+        // First call stamps a value.
+        r.update_track_counts("a", 10, 10).await.unwrap();
+        let prior = r.get("a").await.unwrap().last_scan_at_ms;
+        assert!(prior.is_some());
+        // Second call with None ts must NOT clear the prior stamp.
+        r.apply_track_counts_with_scan_time("a", 20, 20, None)
+            .await
+            .unwrap();
+        let after = r.get("a").await.unwrap();
+        assert_eq!(after.track_count, 20);
+        assert_eq!(after.last_scan_at_ms, prior);
     }
 
     #[test]

@@ -967,6 +967,63 @@ pub(crate) async fn ensure_local_internal_registered(
     Ok(())
 }
 
+/// Warm-start rehydration of the library subjects from MPD.
+///
+/// Called by `ShelfBundle::init` after `announce_subjects` to
+/// replace the registry-snapshot-only zero envelope with the
+/// real MPD database state. Reads MPD's `stats` for the floor-
+/// source track total + last-scan timestamp, mirrors them onto
+/// the `local-internal` registry record via `update_track_counts`,
+/// then re-publishes both `audio_library_sources` and
+/// `audio_library_state`.
+///
+/// Best-effort: any MPD error logs a warning and returns
+/// without panicking. The plugin's later course-correct verbs
+/// (`update_source` / `probe_source`) re-establish the counts
+/// on operator command.
+pub(crate) async fn rehydrate_from_mpd(
+    ctx: &LibraryContext,
+    conn: &mut crate::mpd::MpdConnection,
+) {
+    let stats = match conn.stats().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "library rehydrate: mpd stats failed; library counts \
+                 will stay at zero until next scan"
+            );
+            return;
+        }
+    };
+    // `available` count derives from the evo:available sticker
+    // when the reconciler is up to date; on cold-start the sticker
+    // set is empty so we mirror the total as the available count
+    // (best-faith starting point) and the reconciler corrects it
+    // shortly. The contract documented on ADR-0144 is that the
+    // counts reflect MPD truth, not a frozen snapshot.
+    let last_scan_ms = stats.db_update_unix_s.map(|s| s * 1000);
+    if let Err(e) = ctx
+        .registry
+        .apply_track_counts_with_scan_time(
+            LOCAL_INTERNAL_SOURCE_ID,
+            stats.songs,
+            stats.songs,
+            last_scan_ms,
+        )
+        .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "library rehydrate: registry apply_track_counts_with_scan_time failed"
+        );
+        return;
+    }
+    publish_subjects(ctx).await;
+}
+
 // ----- tests -----
 
 #[cfg(test)]
