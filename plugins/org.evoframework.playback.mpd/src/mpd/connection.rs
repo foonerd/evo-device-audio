@@ -506,6 +506,11 @@ impl MpdConnection {
             };
             match protocol::classify_line(&line)? {
                 ClassifiedLine::Ok => return Ok(changed),
+                ClassifiedLine::ListOk => {
+                    return Err(MpdError::Protocol(
+                        ProtocolError::UnexpectedListOk,
+                    ));
+                }
                 ClassifiedLine::Ack {
                     code,
                     list_position,
@@ -563,6 +568,11 @@ impl MpdConnection {
                 .await?;
             match protocol::classify_line(&line)? {
                 ClassifiedLine::Ok => return Ok(fields),
+                ClassifiedLine::ListOk => {
+                    return Err(MpdError::Protocol(
+                        ProtocolError::UnexpectedListOk,
+                    ));
+                }
                 ClassifiedLine::Ack {
                     code,
                     list_position,
@@ -663,6 +673,54 @@ impl MpdConnection {
     ) -> Result<Vec<MpdPlaylistSummary>, MpdError> {
         let fields = self.dispatch("listplaylists", &[]).await?;
         Ok(parse_playlist_summaries(&fields))
+    }
+
+    /// Fetch the file-line count of every named stored playlist
+    /// in a single batched round-trip via
+    /// [`Self::command_list_ok`].
+    ///
+    /// Wire form (for N names): one
+    /// `command_list_ok_begin` ... `listplaylist NAME1` ...
+    /// `listplaylist NAME2` ... `command_list_end\n` payload.
+    /// MPD responds with the file lines of each playlist
+    /// separated by `list_OK` terminators; this method counts
+    /// the `file:` lines per group and returns the count for
+    /// every input name in the input order.
+    ///
+    /// Returns an empty `Vec` for an empty input. The result is
+    /// `Vec<Option<u32>>` not `Vec<u32>`: if MPD's response
+    /// carries fewer groups than commands sent (a corner case
+    /// some MPD versions trigger when a playlist name is
+    /// invalid mid-list), missing entries surface as `None`
+    /// rather than silently aliasing to a neighbour. The caller
+    /// can decide whether `None` means "absent" or "skip this
+    /// row" based on the wider contract.
+    ///
+    /// Used by the audio.playlist warden's index rehydration to
+    /// populate `audio_playlist_index.items[].item_count` with
+    /// MPD truth in O(1) round-trips instead of O(N).
+    pub(crate) async fn playlist_file_counts(
+        &mut self,
+        names: &[&str],
+    ) -> Result<Vec<Option<u32>>, MpdError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let commands: Vec<(&str, Vec<String>)> = names
+            .iter()
+            .map(|n| ("listplaylist", vec![(*n).to_string()]))
+            .collect();
+        let groups = self.command_list_ok(&commands).await?;
+        let mut out: Vec<Option<u32>> = Vec::with_capacity(names.len());
+        for i in 0..names.len() {
+            if let Some(group) = groups.get(i) {
+                let count = group.iter().filter(|f| f.key == "file").count();
+                out.push(Some(count as u32));
+            } else {
+                out.push(None);
+            }
+        }
+        Ok(out)
     }
 
     /// Read one stored playlist's contents.
@@ -1078,6 +1136,11 @@ impl MpdConnection {
                 .await?;
             match protocol::classify_line(&line)? {
                 ClassifiedLine::Ok => return Ok(()),
+                ClassifiedLine::ListOk => {
+                    return Err(MpdError::Protocol(
+                        ProtocolError::UnexpectedListOk,
+                    ));
+                }
                 ClassifiedLine::Ack {
                     code,
                     list_position,
@@ -1092,6 +1155,108 @@ impl MpdConnection {
                     });
                 }
                 ClassifiedLine::Field(f) => _fields.push(f),
+            }
+        }
+    }
+
+    /// Dispatch a batched group of commands with per-command
+    /// response groups via MPD's `command_list_ok_begin` ...
+    /// `command_list_end` protocol. Returns one
+    /// `Vec<Field>` per command in the input order, separated
+    /// on the wire by `list_OK` terminators.
+    ///
+    /// Use this when N commands must round-trip together with
+    /// per-command results — e.g. fetching the file-line count
+    /// of every stored playlist (`listplaylist NAME` ×N) in one
+    /// TCP round-trip instead of N. Fire-and-forget batches
+    /// (where per-command results are not needed) belong on the
+    /// existing [`Self::command_list`] method.
+    ///
+    /// Each entry is `(command, args)`; arguments are quoted
+    /// per the existing dispatch path. Empty batch is a no-op
+    /// returning an empty `Vec`.
+    ///
+    /// A `command_list` ACK (any single command in the batch
+    /// fails) aborts the whole dispatch — no partial results
+    /// are returned. The caller can split the batch and retry
+    /// per-command if that semantic matters.
+    pub(crate) async fn command_list_ok(
+        &mut self,
+        commands: &[(&str, Vec<String>)],
+    ) -> Result<Vec<Vec<Field>>, MpdError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut payload: Vec<u8> = Vec::with_capacity(
+            commands
+                .iter()
+                .map(|(c, a)| {
+                    c.len() + a.iter().map(|s| s.len() + 3).sum::<usize>() + 2
+                })
+                .sum::<usize>()
+                + 48,
+        );
+        payload.extend_from_slice(b"command_list_ok_begin\n");
+        for (cmd, args) in commands {
+            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let bytes = protocol::serialise_command(cmd, &args_ref)?;
+            payload.extend_from_slice(&bytes);
+        }
+        payload.extend_from_slice(b"command_list_end\n");
+
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            endpoint = %self.endpoint,
+            command_count = commands.len(),
+            payload_bytes = payload.len(),
+            "mpd command_list_ok dispatch"
+        );
+
+        let budget = self.command_timeout;
+        self.framing
+            .write_all_with_timeout(&payload, budget, "command_list_ok_write")
+            .await?;
+
+        let mut groups: Vec<Vec<Field>> = Vec::with_capacity(commands.len());
+        let mut current: Vec<Field> = Vec::new();
+        loop {
+            let line = self
+                .framing
+                .read_line_with_timeout(budget, "command_list_ok_response")
+                .await?;
+            match protocol::classify_line(&line)? {
+                ClassifiedLine::ListOk => {
+                    groups.push(std::mem::take(&mut current));
+                }
+                ClassifiedLine::Ok => {
+                    // MPD emits exactly one `list_OK` per
+                    // command in the list. If the caller
+                    // accidentally finished before all groups
+                    // were closed, the residual `current`
+                    // would otherwise be silently dropped; we
+                    // include it as the final group so the
+                    // count matches `commands.len()`. In
+                    // practice MPD's contract makes this a
+                    // no-op (current is empty here).
+                    if !current.is_empty() {
+                        groups.push(std::mem::take(&mut current));
+                    }
+                    return Ok(groups);
+                }
+                ClassifiedLine::Ack {
+                    code,
+                    list_position,
+                    command,
+                    message,
+                } => {
+                    return Err(MpdError::Ack {
+                        code,
+                        list_position,
+                        command,
+                        message,
+                    });
+                }
+                ClassifiedLine::Field(f) => current.push(f),
             }
         }
     }

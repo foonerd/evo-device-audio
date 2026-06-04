@@ -36,6 +36,12 @@ pub(crate) const LINE_MAX: usize = 64 * 1024;
 pub(crate) enum ClassifiedLine {
     /// The response-ending `OK` terminator.
     Ok,
+    /// The per-command terminator emitted by MPD inside a
+    /// `command_list_ok` response. Marks the end of one
+    /// command's response group within a batched list. MPD
+    /// emits one `list_OK` per command in the list, followed
+    /// by a single final `OK`.
+    ListOk,
     /// The response-ending `ACK` terminator, with its parts broken
     /// out per the MPD protocol.
     Ack {
@@ -158,6 +164,9 @@ pub(crate) fn classify_line(
 ) -> Result<ClassifiedLine, ProtocolError> {
     if line == "OK" {
         return Ok(ClassifiedLine::Ok);
+    }
+    if line == "list_OK" {
+        return Ok(ClassifiedLine::ListOk);
     }
     if line.starts_with("ACK [") {
         return parse_ack_line(line);
@@ -433,6 +442,34 @@ mod tests {
     #[test]
     fn classify_line_ok_terminator() {
         assert_eq!(classify_line("OK").unwrap(), ClassifiedLine::Ok);
+    }
+
+    #[test]
+    fn classify_line_list_ok_terminator() {
+        // MPD emits `list_OK` between command response groups
+        // inside a `command_list_ok_begin` ... `command_list_end`
+        // batched dispatch.
+        assert_eq!(classify_line("list_OK").unwrap(), ClassifiedLine::ListOk);
+    }
+
+    #[test]
+    fn classify_line_list_ok_is_distinct_from_ok() {
+        // Belt-and-braces: distinct tokens must classify
+        // distinctly so the command_list_ok consumer does not
+        // close the dispatch on the per-command terminator.
+        assert_ne!(
+            classify_line("OK").unwrap(),
+            classify_line("list_OK").unwrap()
+        );
+    }
+
+    #[test]
+    fn classify_line_list_ok_is_not_a_field_with_colon_value() {
+        // The token `list_OK` has no `: ` separator and must
+        // not fall through to `parse_field_line` (which would
+        // surface a MalformedKeyValue error otherwise).
+        let c = classify_line("list_OK").unwrap();
+        assert!(!matches!(c, ClassifiedLine::Field(_)));
     }
 
     #[test]

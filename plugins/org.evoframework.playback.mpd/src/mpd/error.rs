@@ -171,6 +171,16 @@ pub(crate) enum ProtocolError {
         /// The offending character.
         ch: char,
     },
+
+    /// MPD emitted a `list_OK` terminator outside the body of a
+    /// `command_list_ok_begin` ... `command_list_end` batched
+    /// dispatch. Surfacing this as a typed protocol error
+    /// catches the rare case where a peer (or a misbehaving
+    /// MPD build) interleaves `list_OK` into the response of a
+    /// single command. `command_list_ok` consumes the variant
+    /// directly without surfacing the error.
+    #[error("unexpected list_OK terminator outside command_list_ok")]
+    UnexpectedListOk,
 }
 
 /// Configuration errors (caught before any I/O is attempted).
