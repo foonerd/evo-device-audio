@@ -858,21 +858,34 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
             artist,
             album,
             duration,
-            classical: _,
+            classical,
         } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
             json!({
-                "kind":        "file",
-                "name":        name,
-                "uri":         path,
-                "title":       title,
-                "artist":      artist,
-                "album":       album,
-                "duration_ms": duration.map(|d| d.as_millis() as u64),
+                "kind":            "file",
+                "name":            name,
+                "uri":             path,
+                "title":           title,
+                "artist":          artist,
+                "album":           album,
+                "duration_ms":     duration.map(|d| d.as_millis() as u64),
                 // available defaults to true at browse time; the
                 // skip-traversal / queue path consults the sticker
                 // for authoritative checks during play.
-                "available":   true,
+                "available":       true,
+                "composer":        classical.composer,
+                "composer_sort":   classical.composer_sort,
+                "conductor":       classical.conductor,
+                "ensemble":        classical.ensemble,
+                "performer":       classical.performer,
+                "work":            classical.work,
+                "work_sort":       classical.work_sort,
+                "movement":        classical.movement,
+                "movement_number": classical.movement_number,
+                "original_date":   classical.original_date,
+                "recording_date":  classical.recording_date,
+                "label":           classical.label,
+                "medium":          classical.medium,
             })
         }
     }

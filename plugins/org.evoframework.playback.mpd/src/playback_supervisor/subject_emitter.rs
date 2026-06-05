@@ -632,10 +632,23 @@ pub(crate) fn render_now_playing_state(
         // Stopped or no current song → track is null.
         (PlayState::Stopped, _) | (_, None) => serde_json::Value::Null,
         (_, Some(song)) => json!({
-            "title":    song.title,
-            "artist":   song.artist,
-            "album":    song.album,
-            "mpd_path": song.file_path,
+            "title":           song.title,
+            "artist":          song.artist,
+            "album":           song.album,
+            "mpd_path":        song.file_path,
+            "composer":        song.classical.composer,
+            "composer_sort":   song.classical.composer_sort,
+            "conductor":       song.classical.conductor,
+            "ensemble":        song.classical.ensemble,
+            "performer":       song.classical.performer,
+            "work":            song.classical.work,
+            "work_sort":       song.classical.work_sort,
+            "movement":        song.classical.movement,
+            "movement_number": song.classical.movement_number,
+            "original_date":   song.classical.original_date,
+            "recording_date":  song.classical.recording_date,
+            "label":           song.classical.label,
+            "medium":          song.classical.medium,
         }),
     };
     let elapsed_ms = match report.state {
@@ -1557,6 +1570,7 @@ mod tests {
                 artist: Some("An Artist".to_string()),
                 album: Some("An Album".to_string()),
                 duration_ms: Some(180_000),
+                classical: Default::default(),
             }),
         }
     }

@@ -250,15 +250,28 @@ pub(crate) async fn build_envelope(
         )
         .await;
         rendered.push(json!({
-            "id":          item.id,
-            "position":    item.position,
-            "uri":         item.file_path,
-            "source_id":   source_id,
-            "title":       item.title,
-            "artist":      item.artist,
-            "album":       item.album,
-            "duration_ms": item.duration.map(|d| d.as_millis() as u64),
-            "available":   available,
+            "id":              item.id,
+            "position":        item.position,
+            "uri":             item.file_path,
+            "source_id":       source_id,
+            "title":           item.title,
+            "artist":          item.artist,
+            "album":           item.album,
+            "duration_ms":     item.duration.map(|d| d.as_millis() as u64),
+            "available":       available,
+            "composer":        item.classical.composer,
+            "composer_sort":   item.classical.composer_sort,
+            "conductor":       item.classical.conductor,
+            "ensemble":        item.classical.ensemble,
+            "performer":       item.classical.performer,
+            "work":            item.classical.work,
+            "work_sort":       item.classical.work_sort,
+            "movement":        item.classical.movement,
+            "movement_number": item.classical.movement_number,
+            "original_date":   item.classical.original_date,
+            "recording_date":  item.classical.recording_date,
+            "label":           item.classical.label,
+            "medium":          item.classical.medium,
         }));
     }
 

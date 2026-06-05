@@ -81,6 +81,10 @@ pub(crate) struct CurrentSongReport {
     pub(crate) album: Option<String>,
     /// Track duration, in milliseconds.
     pub(crate) duration_ms: Option<u64>,
+    /// Classical-music metadata tags carried from the MpdSong;
+    /// projected onto the now_playing track envelope by the
+    /// subject emitter.
+    pub(crate) classical: crate::mpd::ClassicalTags,
 }
 
 impl PlaybackStateReport {
@@ -180,6 +184,7 @@ impl CurrentSongReport {
             artist: song.artist,
             album: song.album,
             duration_ms: song.duration.map(duration_to_millis_u64),
+            classical: song.classical,
         }
     }
 }

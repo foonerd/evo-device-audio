@@ -191,21 +191,34 @@ pub(crate) async fn refresh_favourites(
         )
         .await;
         items.push(json!({
-            "position":     entry.position,
-            "uri":          entry.file_path,
-            "source_id":    source_id,
-            "title":        entry.title,
-            "artist":       entry.artist,
-            "album":        entry.album,
-            "duration_ms":  entry.duration.map(|d| d.as_millis() as u64),
-            "available":    available,
+            "position":        entry.position,
+            "uri":             entry.file_path,
+            "source_id":       source_id,
+            "title":           entry.title,
+            "artist":          entry.artist,
+            "album":           entry.album,
+            "duration_ms":     entry.duration.map(|d| d.as_millis() as u64),
+            "available":       available,
             // Per the catalogue contract: null on entries not
             // tracked by the framework's own add path
             // (MPD stored playlists do not preserve per-entry
             // add timestamps). The acceptance row
             // favourites-persisted-as-system-managed-playlist
             // refuses a parallel store; null is honest.
-            "added_at_ms":  serde_json::Value::Null,
+            "added_at_ms":     serde_json::Value::Null,
+            "composer":        entry.classical.composer,
+            "composer_sort":   entry.classical.composer_sort,
+            "conductor":       entry.classical.conductor,
+            "ensemble":        entry.classical.ensemble,
+            "performer":       entry.classical.performer,
+            "work":            entry.classical.work,
+            "work_sort":       entry.classical.work_sort,
+            "movement":        entry.classical.movement,
+            "movement_number": entry.classical.movement_number,
+            "original_date":   entry.classical.original_date,
+            "recording_date":  entry.classical.recording_date,
+            "label":           entry.classical.label,
+            "medium":          entry.classical.medium,
         }));
     }
     let envelope = json!({
