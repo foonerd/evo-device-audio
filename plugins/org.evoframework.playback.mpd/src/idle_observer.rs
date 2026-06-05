@@ -68,11 +68,27 @@ use crate::mpd::{
 use crate::playlist::{self, PlaylistContext};
 use crate::queue::{self, QueueContext};
 
-/// Per-call idle budget. MPD returns as soon as one or more
-/// subsystems change; this budget bounds the wait when MPD is
-/// silent so the loop checks the shutdown notifier on a
-/// predictable cadence without hot-spinning.
-const IDLE_BUDGET: Duration = Duration::from_secs(30);
+/// Per-call idle budget. MPD's `idle` subprotocol is a long-
+/// poll: the server blocks indefinitely until one of the
+/// subscribed subsystems fires, suppressing the
+/// `connection_timeout` MPD would otherwise apply to a quiet
+/// command connection. The observer races the idle read
+/// against the shutdown notifier via `tokio::select!`, so
+/// shutdown latency is bounded by tokio's cancellation, not
+/// by this budget.
+///
+/// The budget is therefore deliberately very long (one day).
+/// A shorter budget would create a reconnect-storm pattern:
+/// when the local read times out before MPD has a chance to
+/// send anything, the observer's next `idle` re-uses a
+/// connection MPD still considers in-flight; MPD treats the
+/// new command as a protocol violation and closes the
+/// connection, surfacing as `transport: connection closed by
+/// MPD` in the journal. The framework-side fix is to keep the
+/// idle read pending until MPD responds or shutdown fires;
+/// network-level disconnects continue to surface via the
+/// idle dispatcher's error arm and trigger reconnect there.
+const IDLE_BUDGET: Duration = Duration::from_secs(86_400);
 
 /// Backoff between reconnect attempts when the dedicated idle
 /// connection is dropped or fails. The connection is permanent
