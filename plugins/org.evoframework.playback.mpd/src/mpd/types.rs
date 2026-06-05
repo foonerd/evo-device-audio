@@ -10,6 +10,148 @@
 
 use std::time::Duration;
 
+/// Classical-music metadata tags extracted from MPD's per-song
+/// tag set.
+///
+/// Every field is `Option<String>` (or `Option<u32>` for the
+/// numeric MovementNumber) per the wire-shape-defaults-must-be-
+/// truth-or-null invariant (see PLUGIN_CONTRACT.md §15): an
+/// absent or empty MPD tag serialises as JSON `null`, never as
+/// an empty string masquerading as known-empty. Empty strings
+/// arriving from MPD (rare but possible — MPD can emit a tag
+/// line with an empty value) are normalised to `None` at parse
+/// time via [`some_if_non_empty`].
+///
+/// Carried alongside the always-on title / artist / album
+/// triplet on every track-bearing MPD type
+/// (MpdSong / MpdQueueItem / MpdPlaylistEntry /
+/// MpdLibraryEntry::File) so every track-bearing wire envelope
+/// projects the same fields from the same source. The per-shelf
+/// envelope serialisers flatten this struct into their JSON
+/// output (see queue / favourites / playlist / library / playback
+/// modules).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ClassicalTags {
+    /// MPD `Composer` tag — name of the composition's composer.
+    pub(crate) composer: Option<String>,
+    /// MPD `ComposerSort` tag — sort-form of composer name
+    /// (e.g. "Beethoven, Ludwig van" for sorting under "B").
+    pub(crate) composer_sort: Option<String>,
+    /// MPD `Conductor` tag — conductor of the recording.
+    pub(crate) conductor: Option<String>,
+    /// MPD `Ensemble` tag — orchestra / chamber group / quartet.
+    pub(crate) ensemble: Option<String>,
+    /// MPD `Performer` tag — soloist or featured performer.
+    pub(crate) performer: Option<String>,
+    /// MPD `Work` tag — canonical composition name
+    /// (e.g. "Symphony No. 5 in C minor, Op. 67").
+    pub(crate) work: Option<String>,
+    /// MPD `WorkSort` tag — sort-form of work name.
+    pub(crate) work_sort: Option<String>,
+    /// MPD `Movement` tag — movement name within the work
+    /// (e.g. "Allegro con brio").
+    pub(crate) movement: Option<String>,
+    /// MPD `MovementNumber` tag — movement number (1, 2, 3, ...).
+    /// Parsed as u32; non-numeric values surface as `None`.
+    pub(crate) movement_number: Option<u32>,
+    /// MPD `OriginalDate` tag — year the recording was made.
+    /// The audiophile-relevant year, distinct from `Date`
+    /// which is the issue / release year.
+    pub(crate) original_date: Option<String>,
+    /// MPD `Date` tag — year of release / issue.
+    pub(crate) recording_date: Option<String>,
+    /// MPD `Label` tag — record label (DG / EMI / Sony / etc.).
+    pub(crate) label: Option<String>,
+    /// MPD `Media` tag — physical or distribution medium
+    /// (e.g. "CD", "SACD", "Vinyl", "Streaming").
+    pub(crate) medium: Option<String>,
+}
+
+impl ClassicalTags {
+    /// Apply one MPD field to the appropriate classical-tag
+    /// slot. Returns `true` when the key matched a classical
+    /// tag (caller can skip the default arm); `false` when the
+    /// key is not one of the classical tags (caller continues
+    /// the match).
+    ///
+    /// Empty-string values are normalised to `None` per the
+    /// truth-or-null invariant — MPD's wire occasionally emits
+    /// a tag line with an empty value, and the wire MUST NOT
+    /// surface that as a known-empty string.
+    pub(crate) fn try_apply(&mut self, key: &str, value: &str) -> bool {
+        match key {
+            "Composer" => {
+                self.composer = some_if_non_empty(value);
+                true
+            }
+            "ComposerSort" => {
+                self.composer_sort = some_if_non_empty(value);
+                true
+            }
+            "Conductor" => {
+                self.conductor = some_if_non_empty(value);
+                true
+            }
+            "Ensemble" => {
+                self.ensemble = some_if_non_empty(value);
+                true
+            }
+            "Performer" => {
+                self.performer = some_if_non_empty(value);
+                true
+            }
+            "Work" => {
+                self.work = some_if_non_empty(value);
+                true
+            }
+            "WorkSort" => {
+                self.work_sort = some_if_non_empty(value);
+                true
+            }
+            "Movement" => {
+                self.movement = some_if_non_empty(value);
+                true
+            }
+            "MovementNumber" => {
+                // Non-numeric values surface as None, not as
+                // a fabricated zero — the truth-or-null
+                // contract.
+                self.movement_number = value.trim().parse::<u32>().ok();
+                true
+            }
+            "OriginalDate" => {
+                self.original_date = some_if_non_empty(value);
+                true
+            }
+            "Date" => {
+                self.recording_date = some_if_non_empty(value);
+                true
+            }
+            "Label" => {
+                self.label = some_if_non_empty(value);
+                true
+            }
+            "Media" => {
+                self.medium = some_if_non_empty(value);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Normalise an MPD tag value to `Option<String>`: empty or
+/// whitespace-only strings become `None`. Used by
+/// [`ClassicalTags::try_apply`] and any other parser path that
+/// surfaces MPD-tag values to the wire.
+pub(crate) fn some_if_non_empty(v: &str) -> Option<String> {
+    if v.trim().is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
 /// MPD playback state, as reported by the `status` command's
 /// `state:` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -154,6 +296,11 @@ pub(crate) struct MpdSong {
     /// Track duration from the `duration:` field (MPD 0.21+) or
     /// `Time:` (older).
     pub(crate) duration: Option<Duration>,
+    /// Classical-music metadata tags. Carried alongside the
+    /// always-on title / artist / album triplet so every
+    /// track-bearing envelope can project the same fields without
+    /// extra round-trips. See [`ClassicalTags`].
+    pub(crate) classical: ClassicalTags,
     /// Source codec name derived from the file path's extension at
     /// parse time, lowercased and normalised to the canonical token
     /// the audio.playback.v1 wire contract uses (see
@@ -367,6 +514,8 @@ pub(crate) struct MpdQueueItem {
     pub(crate) album: Option<String>,
     /// Track duration; from `duration:` (0.21+) or `Time:` (older).
     pub(crate) duration: Option<Duration>,
+    /// Classical-music metadata tags; see [`ClassicalTags`].
+    pub(crate) classical: ClassicalTags,
 }
 
 /// Summary of one stored playlist. Projected from `listplaylists`'s
@@ -401,6 +550,8 @@ pub(crate) struct MpdPlaylistEntry {
     pub(crate) album: Option<String>,
     /// Track duration; from `duration:` (0.21+) or `Time:` (older).
     pub(crate) duration: Option<Duration>,
+    /// Classical-music metadata tags; see [`ClassicalTags`].
+    pub(crate) classical: ClassicalTags,
 }
 
 /// One sticker key/value pair. Projected from `sticker get`,
@@ -454,6 +605,8 @@ pub(crate) enum MpdLibraryEntry {
         album: Option<String>,
         /// Track duration.
         duration: Option<Duration>,
+        /// Classical-music metadata tags; see [`ClassicalTags`].
+        classical: ClassicalTags,
     },
     /// A stored playlist file (`.m3u` etc.) discovered in the tree.
     Playlist {

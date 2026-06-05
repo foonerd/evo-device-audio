@@ -515,6 +515,7 @@ mod tests {
             album: None,
             duration: Some(Duration::from_secs(180)),
             codec_name,
+            classical: Default::default(),
         }
     }
 

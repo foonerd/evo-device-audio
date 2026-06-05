@@ -858,6 +858,7 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
             artist,
             album,
             duration,
+            classical: _,
         } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
             json!({

@@ -1455,8 +1455,17 @@ fn parse_current_song(fields: &[Field]) -> Result<Option<MpdSong>, MpdError> {
     let mut artist: Option<String> = None;
     let mut album: Option<String> = None;
     let mut duration: Option<Duration> = None;
+    let mut classical = super::types::ClassicalTags::default();
 
     for f in fields {
+        // Classical tags first — `try_apply` consumes the field
+        // when it matches and returns true so we skip the
+        // default arm. The bespoke arms below cover MPD fields
+        // not handled by the classical tag set (file/Title/
+        // Artist/Album/duration/Time).
+        if classical.try_apply(&f.key, &f.value) {
+            continue;
+        }
         match f.key.as_str() {
             "file" => file_path = Some(f.value.clone()),
             "Title" => title = Some(f.value.clone()),
@@ -1493,6 +1502,7 @@ fn parse_current_song(fields: &[Field]) -> Result<Option<MpdSong>, MpdError> {
         album,
         duration,
         codec_name,
+        classical,
     }))
 }
 
@@ -1519,10 +1529,14 @@ fn parse_queue_items(fields: &[Field]) -> Vec<MpdQueueItem> {
                 duration: None,
                 position: None,
                 id: None,
+                classical: super::types::ClassicalTags::default(),
             });
             continue;
         }
         let Some(b) = current.as_mut() else { continue };
+        if b.classical.try_apply(&f.key, &f.value) {
+            continue;
+        }
         match f.key.as_str() {
             "Title" => b.title = Some(f.value.clone()),
             "Artist" => b.artist = Some(f.value.clone()),
@@ -1568,6 +1582,7 @@ struct QueueItemBuilder {
     duration: Option<Duration>,
     position: Option<u32>,
     id: Option<u32>,
+    classical: super::types::ClassicalTags,
 }
 
 impl QueueItemBuilder {
@@ -1582,6 +1597,7 @@ impl QueueItemBuilder {
             artist: self.artist,
             album: self.album,
             duration: self.duration,
+            classical: self.classical,
         })
     }
 }
@@ -1635,11 +1651,15 @@ fn parse_playlist_entries(fields: &[Field]) -> Vec<MpdPlaylistEntry> {
                 artist: None,
                 album: None,
                 duration: None,
+                classical: super::types::ClassicalTags::default(),
             });
             next_pos = next_pos.saturating_add(1);
             continue;
         }
         let Some(e) = current.as_mut() else { continue };
+        if e.classical.try_apply(&f.key, &f.value) {
+            continue;
+        }
         match f.key.as_str() {
             "Title" => e.title = Some(f.value.clone()),
             "Artist" => e.artist = Some(f.value.clone()),
@@ -1747,6 +1767,7 @@ fn parse_library_entries(fields: &[Field]) -> Vec<MpdLibraryEntry> {
                     artist: None,
                     album: None,
                     duration: None,
+                    classical: super::types::ClassicalTags::default(),
                 });
             }
             "playlist" => {
@@ -1786,6 +1807,7 @@ enum LibraryEntryBuilder {
         artist: Option<String>,
         album: Option<String>,
         duration: Option<Duration>,
+        classical: super::types::ClassicalTags,
     },
     Playlist {
         path: String,
@@ -1795,6 +1817,13 @@ enum LibraryEntryBuilder {
 
 impl LibraryEntryBuilder {
     fn absorb_field(&mut self, key: &str, value: &str) {
+        // Classical tags first on File entries — try_apply
+        // consumes the field when matched.
+        if let Self::File { classical, .. } = self {
+            if classical.try_apply(key, value) {
+                return;
+            }
+        }
         match (self, key) {
             (Self::Directory { last_modified, .. }, "Last-Modified") => {
                 *last_modified = Some(value.to_string());
@@ -1842,12 +1871,14 @@ impl LibraryEntryBuilder {
                 artist,
                 album,
                 duration,
+                classical,
             } => MpdLibraryEntry::File {
                 path,
                 title,
                 artist,
                 album,
                 duration,
+                classical,
             },
             Self::Playlist {
                 path,
