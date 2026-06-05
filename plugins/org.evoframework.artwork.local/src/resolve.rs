@@ -16,14 +16,60 @@ pub(crate) const SCHEME_MPD_PATH: &str = "mpd-path";
 /// `mpd-album` scheme: value is `Artist|Album` (see MPD warden).
 pub(crate) const SCHEME_MPD_ALBUM: &str = "mpd-album";
 
+/// Priority-ordered cover-art filenames in **lowercase**. The
+/// directory walk lowercases each entry against this list, so
+/// `Cover.JPG`, `FOLDER.jpg`, `CoVeR.JpG`, and Unicode-cased
+/// variants all resolve without listing every permutation.
+///
+/// Ordering follows the established convention (cover > folder >
+/// front > coverart > albumart > artist variants > scan > album)
+/// and matches volumio-evo's reference list. `.webp` entries are
+/// included so libraries already adopting modern formats are
+/// served without operator action.
+///
+/// Operator-curated sidecars in the music tree work identically
+/// whether the audio file resolves under `LocalInternal`,
+/// `LocalUsb`, `NetworkNasSmb`, `NetworkNasNfs`, or any other
+/// mount the framework's source registry exposes: the cascade
+/// walks the audio file's parent directory regardless of which
+/// source ID resolved the file. Network-bound sources are
+/// preflight-gated by source state via the registry; the
+/// walk never blocks on an Offline mount because the source
+/// resolver refuses to materialise the path in the first place.
 const COVER_FILE_NAMES: &[&str] = &[
     "cover.jpg",
     "folder.jpg",
-    "front.jpg",
     "cover.png",
     "folder.png",
+    "coverart.jpg",
+    "albumart.jpg",
+    "coverart.png",
+    "albumart.png",
+    "artists.jpg",
+    "artist.jpg",
+    "artists.png",
+    "artist.png",
+    "front.jpg",
     "front.png",
+    "album.jpg",
+    "scan.jpg",
+    "cover.webp",
+    "folder.webp",
+    "front.webp",
+    "artists.webp",
 ];
+
+/// Image file extensions accepted as last-resort cover candidates
+/// when the priority list above misses. Matches volumio-evo's
+/// fallback: any image in the audio file's parent directory is
+/// treated as cover art unless it exceeds [`MAX_COVER_BYTES`].
+const FALLBACK_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+
+/// Maximum sidecar file size accepted as cover art. Above this
+/// the file is rejected as cover-art-too-large — embedded
+/// extraction or online providers take over downstream.
+/// Matches volumio-evo's 5 MB ceiling.
+const MAX_COVER_BYTES: u64 = 5_000_000;
 
 /// Request body for `artwork.resolve` (JSON, UTF-8).
 #[derive(Debug, Deserialize)]
@@ -88,18 +134,85 @@ fn mime_for_path(p: &Path) -> Option<&'static str> {
     })
 }
 
-/// If `mpd_file` is a local audio file path, look for a well-known cover
-/// image in the same directory. Returns the first match in
-/// [`COVER_FILE_NAMES`] order.
+/// If `mpd_file` is a local audio file path, look for a cover
+/// image in the same directory.
+///
+/// Resolution proceeds in two passes against the file's parent:
+///
+/// 1. **Priority pass** — directory entries are read once and
+///    lowercased; the first match against [`COVER_FILE_NAMES`]
+///    (in priority order) wins. This catches `Cover.JPG`,
+///    `FOLDER.png`, mixed-case Unicode filenames, etc., without
+///    listing every casing permutation.
+/// 2. **Fallback pass** — if no priority name matched, the first
+///    file in directory-traversal order with an extension in
+///    [`FALLBACK_IMAGE_EXTENSIONS`] is returned, provided its
+///    size is under [`MAX_COVER_BYTES`]. This handles libraries
+///    where the operator names cover files after the album
+///    (e.g. `Symphony No. 5.jpg`) rather than `cover.jpg`.
+///
+/// File sizes above [`MAX_COVER_BYTES`] are skipped so an
+/// accidentally-dropped multi-megabyte PSD or scan PDF doesn't
+/// override a smaller cover image elsewhere in the directory.
+///
+/// Source-kind agnostic: the parent-directory walk applies
+/// identically whether `mpd_file` resolves to a local-internal
+/// path, a USB mount, or a NAS-mounted share. The framework's
+/// source registry preflights mount reachability before this
+/// function is invoked.
 pub(crate) fn find_cover_beside_audio_file(mpd_file: &Path) -> Option<PathBuf> {
     let dir = mpd_file.parent()?;
-    for name in COVER_FILE_NAMES {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
+        Ok(it) => it.filter_map(Result::ok).collect(),
+        Err(_) => return None,
+    };
+    // Priority pass — exact case-insensitive match against the
+    // ordered list. Build a lowercase→entry map so each priority
+    // lookup is O(1) on the directory size.
+    let mut by_lower: std::collections::HashMap<String, &std::fs::DirEntry> =
+        std::collections::HashMap::with_capacity(entries.len());
+    for e in &entries {
+        if let Some(name) = e.file_name().to_str() {
+            by_lower.insert(name.to_lowercase(), e);
+        }
+    }
+    for priority_name in COVER_FILE_NAMES {
+        if let Some(entry) = by_lower.get(*priority_name) {
+            let path = entry.path();
+            if cover_size_ok(&path) {
+                return Some(path);
+            }
+        }
+    }
+    // Fallback pass — any image in the directory, first hit.
+    for e in &entries {
+        let path = e.path();
+        let Some(ext) = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        if !FALLBACK_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        if cover_size_ok(&path) {
+            return Some(path);
         }
     }
     None
+}
+
+/// True when the candidate file exists and is below
+/// [`MAX_COVER_BYTES`]. A metadata error (transient I/O,
+/// permission denied) skips the candidate without aborting
+/// the walk — the next priority entry gets a fair attempt.
+fn cover_size_ok(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file() && m.len() <= MAX_COVER_BYTES,
+        Err(_) => false,
+    }
 }
 
 /// Resolve MPD `file` string to a local [`PathBuf`] if the file exists.
@@ -360,6 +473,102 @@ mod tests {
         // COVER_FILE_NAMES has cover.jpg before folder.jpg
         let got = find_cover_beside_audio_file(&flac).unwrap();
         assert_eq!(got.file_name().unwrap(), "cover.jpg");
+    }
+
+    #[test]
+    fn find_cover_case_insensitive_match() {
+        // Cover.JPG / FOLDER.png / mixed-case Unicode all match
+        // the priority list — operator-side casing is irrelevant.
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("track.flac");
+        std::fs::write(&flac, b"x").unwrap();
+        std::fs::write(dir.path().join("Cover.JPG"), b"j").unwrap();
+        let got = find_cover_beside_audio_file(&flac).unwrap();
+        assert_eq!(got.file_name().unwrap(), "Cover.JPG");
+    }
+
+    #[test]
+    fn find_cover_serves_webp_when_only_webp_present() {
+        // Modern libraries adopting WebP for cover art are
+        // served without operator action.
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("track.flac");
+        std::fs::write(&flac, b"x").unwrap();
+        std::fs::write(dir.path().join("cover.webp"), b"webp").unwrap();
+        let got = find_cover_beside_audio_file(&flac).unwrap();
+        assert_eq!(got.file_name().unwrap(), "cover.webp");
+    }
+
+    #[test]
+    fn find_cover_fallback_to_arbitrary_image_when_no_priority_name() {
+        // Operator named the file after the album rather than
+        // using a conventional name — the fallback walk picks
+        // the first image-typed entry in the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("track.flac");
+        std::fs::write(&flac, b"x").unwrap();
+        std::fs::write(dir.path().join("Symphony No. 5.jpg"), b"j").unwrap();
+        let got = find_cover_beside_audio_file(&flac).unwrap();
+        assert!(
+            got.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Symphony No. 5"),
+            "fallback walk picked {:?}",
+            got
+        );
+    }
+
+    #[test]
+    fn find_cover_rejects_oversize_sidecar() {
+        // A 6 MB sidecar (operator-dropped scan / PSD) exceeds
+        // MAX_COVER_BYTES and is skipped so smaller priority
+        // entries still win.
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("track.flac");
+        std::fs::write(&flac, b"x").unwrap();
+        let oversize = vec![0u8; 6_000_000];
+        std::fs::write(dir.path().join("cover.jpg"), &oversize).unwrap();
+        std::fs::write(dir.path().join("folder.png"), b"ok").unwrap();
+        let got = find_cover_beside_audio_file(&flac).unwrap();
+        // cover.jpg is the higher priority entry but is rejected
+        // on size; folder.png wins.
+        assert_eq!(got.file_name().unwrap(), "folder.png");
+    }
+
+    #[test]
+    fn find_cover_returns_none_when_directory_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("track.flac");
+        std::fs::write(&flac, b"x").unwrap();
+        assert!(find_cover_beside_audio_file(&flac).is_none());
+    }
+
+    #[test]
+    fn cover_priority_widened_to_match_volumio_evo_reference() {
+        // Regression test pinning the catalogue-of-expected
+        // names; the conventional set must include the
+        // historical Volumio names AND modern WebP variants so
+        // libraries migrated from earlier reference systems
+        // resolve without re-tagging.
+        let expected_subset = [
+            "cover.jpg",
+            "folder.jpg",
+            "cover.png",
+            "folder.png",
+            "coverart.jpg",
+            "albumart.jpg",
+            "front.jpg",
+            "cover.webp",
+            "folder.webp",
+        ];
+        for name in expected_subset {
+            assert!(
+                COVER_FILE_NAMES.contains(&name),
+                "missing priority name: {}",
+                name
+            );
+        }
     }
 
     #[test]
