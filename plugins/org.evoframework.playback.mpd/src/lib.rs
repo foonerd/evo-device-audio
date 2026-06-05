@@ -265,6 +265,8 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.update_source",
     "library.browse_library",
     "library.search_library",
+    "library.list_works",
+    "library.get_work_recordings",
 ];
 
 /// Wire-protocol payload version every source-verb request

@@ -162,7 +162,8 @@ known listing with `stale: true` when the source is Offline \
 Publishes the source listing, browse, and search projections on \
 the `audio.library.v1` shelf subject. Verbs: list_sources, \
 add_source, remove_source, probe_source, wake_source, \
-update_source, browse_library, search_library.
+update_source, browse_library, search_library, list_works, \
+get_work_recordings.
 """
 
 [[racks.shelves]]
