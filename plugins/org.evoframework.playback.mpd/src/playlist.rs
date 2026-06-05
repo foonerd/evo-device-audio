@@ -55,7 +55,6 @@ use tokio::sync::Mutex;
 use crate::mpd::{MpdConnection, MpdPlaylistEntry};
 use crate::queue::resolve_source;
 use crate::source_registry::SourceRegistry;
-use crate::sticker_reconciler::EVO_AVAILABLE_STICKER;
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 
@@ -371,19 +370,11 @@ async fn compute_available(
     file_path: &str,
     source_id: Option<&str>,
     registry: &SourceRegistry,
-) -> bool {
-    if let Some(sid) = source_id {
-        if let Some(record) = registry.get(sid).await {
-            if !record.state.is_reachable() {
-                return false;
-            }
-        }
-    }
-    match conn.sticker_get(file_path, EVO_AVAILABLE_STICKER).await {
-        Ok(Some(value)) => value != "0",
-        Ok(None) => true,
-        Err(_) => true,
-    }
+) -> Option<bool> {
+    crate::availability::compute_item_available(
+        conn, file_path, source_id, registry,
+    )
+    .await
 }
 
 // ----- name validation -----

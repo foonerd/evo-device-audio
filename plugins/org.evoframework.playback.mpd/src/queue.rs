@@ -66,7 +66,6 @@ use tokio::sync::Mutex;
 use crate::mpd::MpdConnection;
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
-use crate::sticker_reconciler::EVO_AVAILABLE_STICKER;
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 
@@ -338,31 +337,21 @@ pub(crate) async fn resolve_source(
     None
 }
 
-/// Compute the per-item `available` flag. Per the catalogue
-/// acceptance row: derived from the `evo:available` sticker
-/// AND the resolved source's current state. Items with no
-/// sticker default to the source's reachability.
+/// Compute the per-item `available` flag — delegates to the
+/// shared availability cascade so the three shelves
+/// (queue / favourites / playlist) project per-item truth
+/// through one primitive. See [`crate::availability`] for the
+/// cascade contract: sticker > source-state > None.
 async fn compute_available(
     conn: &mut MpdConnection,
     file_path: &str,
     source_id: Option<&str>,
     registry: &SourceRegistry,
-) -> bool {
-    // Source state pre-flight: if the source is not reachable,
-    // the item is not available regardless of sticker.
-    if let Some(sid) = source_id {
-        if let Some(record) = registry.get(sid).await {
-            if !record.state.is_reachable() {
-                return false;
-            }
-        }
-    }
-    // Source reachable (or unknown). Check sticker.
-    match conn.sticker_get(file_path, EVO_AVAILABLE_STICKER).await {
-        Ok(Some(value)) => value != "0",
-        Ok(None) => true, // no sticker → optimistic; source state is the gate
-        Err(_) => true,   // sticker read transient error; optimistic
-    }
+) -> Option<bool> {
+    crate::availability::compute_item_available(
+        conn, file_path, source_id, registry,
+    )
+    .await
 }
 
 // ----- error type -----

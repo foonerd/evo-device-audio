@@ -105,6 +105,7 @@
 #![allow(clippy::manual_async_fn)]
 
 mod asound_watcher;
+mod availability;
 mod config;
 mod disposition_emitter;
 mod envelope_subscriber;

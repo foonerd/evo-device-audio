@@ -225,6 +225,27 @@ impl ShelfBundle {
             registry.clone(),
         ));
 
+        // Spawn the warm-start probe kick: every registered
+        // source begins in SourceState::Probing on cold start
+        // (and after registry rehydrate from disk on every
+        // load). The reconciler can only write evo:available
+        // stickers in response to source-state transitions —
+        // until a probe fires the registry never leaves
+        // Probing, the broadcast never carries a transition,
+        // the reconciler never writes a sticker, and the
+        // per-item availability cascade has nothing to cascade
+        // from. Kick a probe for every source registered at
+        // init time so the steady-state truth converges in
+        // seconds rather than waiting for an operator-issued
+        // probe verb.
+        //
+        // Best-effort: each per-source probe runs concurrently
+        // in its own spawned task; failures log and leave the
+        // source in Probing so the cascade emits `null` per
+        // the wire-shape-default-truth invariant — never
+        // fabricated false.
+        Self::spawn_warm_start_probes(registry.clone());
+
         // Spawn the idle-subprotocol observer so MPD-side
         // mutations outside this plugin's verbs propagate into
         // the shelf subjects.
@@ -296,6 +317,56 @@ impl ShelfBundle {
         playlist::publish_index(playlist, &mut conn).await;
         favourites::refresh_favourites(favourites, &mut conn).await;
         library::rehydrate_from_mpd(library, &mut conn).await;
+    }
+
+    /// Kick a background probe for every source the registry
+    /// holds at warm-start time so Probing → Online/Degraded/
+    /// Offline transitions fire promptly. The sticker reconciler
+    /// subscribes to source-state-change broadcasts; until
+    /// transitions fire, the sticker DB stays empty and the
+    /// per-item availability cascade falls through to `null`.
+    ///
+    /// Implementation: snapshot the registry, then for each
+    /// source spawn an independent tokio task that runs
+    /// `probe_source` against the source's mount path with a
+    /// short budget, transitions the registry on completion,
+    /// and lets the existing source-state-change broadcast +
+    /// sticker reconciler fan-out do the rest. The function
+    /// returns immediately; warm-start is not gated on probe
+    /// completion (probes can take hundreds of ms; gating
+    /// init would delay every dependent plugin's load).
+    ///
+    /// Idempotent against repeated invocation: each per-source
+    /// probe transitions to a determinate state, after which
+    /// subsequent probes are operator-initiated via the
+    /// `library.probe_source` verb.
+    fn spawn_warm_start_probes(registry: SourceRegistry) {
+        tokio::spawn(async move {
+            let snapshot = registry.snapshot().await;
+            for record in snapshot {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    let full = match registry.get(&record.id).await {
+                        Some(r) => r,
+                        None => return, // removed mid-probe
+                    };
+                    let budget = std::time::Duration::from_millis(3_000);
+                    let outcome =
+                        crate::source_registry::probe_source(&full, budget)
+                            .await;
+                    if let Err(e) =
+                        registry.transition(&record.id, outcome.new_state).await
+                    {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            source_id = %record.id,
+                            error = %e,
+                            "warm-start probe: registry transition failed"
+                        );
+                    }
+                });
+            }
+        });
     }
 
     /// Tear down at plugin unload. Stops the sticker

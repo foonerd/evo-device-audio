@@ -72,10 +72,13 @@ pub(crate) struct PlayableQueueItem {
     pub(crate) source_id: Option<String>,
     /// Per-item availability derived from the song's
     /// `evo:available` sticker AND the resolved source's state
-    /// at the queue-read snapshot. Pre-flight cache only —
-    /// the reactive MPD play_position is the authority for
-    /// available-flagged items.
-    pub(crate) available: bool,
+    /// at the queue-read snapshot. `None` when the cascade
+    /// could not determine truth (Probing source + no sticker,
+    /// or unregistered source). `Some(false)` means KNOWN
+    /// unreachable; `Some(true)` means KNOWN reachable.
+    /// Pre-flight cache only — the reactive MPD play_position
+    /// is the authority for available-flagged items.
+    pub(crate) available: Option<bool>,
 }
 
 /// Outcome of one skip-traversal advance call.
@@ -143,7 +146,13 @@ impl SkipTraversal {
             // flag from sticker.
             let source_state = self.source_state_for(&item.source_id).await;
 
-            if !item.available && !source_state.is_reachable() {
+            // Skip-traversal hops only on KNOWN unreachable
+            // (Some(false)) AND a not-reachable source. `None`
+            // means "we don't know yet" — optimistic; let MPD's
+            // own playback try and surface the truth via ACK
+            // codes (handled below). The truth-or-null contract
+            // forbids treating None as a hard unavailable.
+            if item.available == Some(false) && !source_state.is_reachable() {
                 accumulate_or_flush(
                     &mut coalesce,
                     DispositionKind::TrackSkippedSourceOffline,
@@ -534,7 +543,7 @@ mod tests {
             id: position + 1,
             file_path: format!("INTERNAL/track{position}.flac"),
             source_id: source.map(str::to_string),
-            available,
+            available: Some(available),
         }
     }
 
