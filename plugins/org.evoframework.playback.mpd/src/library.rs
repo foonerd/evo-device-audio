@@ -103,6 +103,16 @@ pub(crate) struct LibraryContext {
     sources_mirror: Arc<Mutex<Option<serde_json::Value>>>,
     /// Mirror of last published audio_library_state envelope.
     state_mirror: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Works aggregate cache. Populated by
+    /// [`recompute_works_aggregate`] on warm-start + on every
+    /// `Database` / `Update` idle event. `library.list_works`
+    /// and `library.get_work_recordings` read from this cache;
+    /// the library_state envelope reads the embedded
+    /// ClassicalCounters. `None` until the first scan completes
+    /// — the wire reports the counters as JSON null per the
+    /// truth-or-null invariant.
+    pub(crate) works_aggregate:
+        Arc<Mutex<Option<crate::works::WorksAggregate>>>,
 }
 
 impl LibraryContext {
@@ -118,6 +128,7 @@ impl LibraryContext {
             browse_cache: Arc::new(Mutex::new(HashMap::new())),
             sources_mirror: Arc::new(Mutex::new(None)),
             state_mirror: Arc::new(Mutex::new(None)),
+            works_aggregate: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -246,12 +257,23 @@ async fn render_state_envelope(ctx: &LibraryContext) -> serde_json::Value {
     let available: u32 = snapshot.iter().map(|r| r.track_count_available).sum();
     let last_full_scan: Option<u64> =
         snapshot.iter().filter_map(|r| r.last_scan_at_ms).max();
+    // Classical counters from the works aggregate cache.
+    // `None` until the first scan completes — projected as
+    // JSON `null` per the truth-or-null invariant; the wire
+    // never carries a fabricated 0 for "not yet computed".
+    let counters = {
+        let g = ctx.works_aggregate.lock().await;
+        g.as_ref().map(|w| w.counters.clone()).unwrap_or_default()
+    };
     json!({
-        "v":                       LIBRARY_PAYLOAD_VERSION,
-        "total_tracks":            total,
-        "total_tracks_available":  available,
-        "last_full_scan_at_ms":    last_full_scan,
-        "active_scans":            Vec::<String>::new(),
+        "v":                                  LIBRARY_PAYLOAD_VERSION,
+        "total_tracks":                       total,
+        "total_tracks_available":             available,
+        "last_full_scan_at_ms":               last_full_scan,
+        "active_scans":                       Vec::<String>::new(),
+        "total_tracks_with_composer":         counters.total_tracks_with_composer,
+        "distinct_works":                     counters.distinct_works,
+        "works_with_multiple_recordings":     counters.works_with_multiple_recordings,
     })
 }
 
@@ -393,6 +415,10 @@ pub(crate) enum VerbError {
         mount_path: String,
         music_directory: String,
     },
+    #[error("library.get_work_recordings: work aggregate not yet computed; try again after the next Database / Update event")]
+    WorkAggregateNotReady,
+    #[error("library.get_work_recordings: work_id {work_id:?} not found in the current aggregate")]
+    UnknownWork { work_id: String },
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -1035,7 +1061,250 @@ pub(crate) async fn rehydrate_from_mpd(
         );
         return;
     }
+    // Compute the works aggregate from MPD's full database
+    // walk so the library_state counters + the
+    // library.list_works / library.get_work_recordings verb
+    // surfaces have a populated cache from the first publish.
+    recompute_works_aggregate(ctx, conn).await;
     publish_subjects(ctx).await;
+}
+
+/// Walk MPD's full database via `listallinfo` and compute the
+/// works aggregate (works list + per-work recordings + classical
+/// counters). Stores the result in
+/// [`LibraryContext::works_aggregate`] so the verb handlers and
+/// the library_state envelope read from a shared cache. Called
+/// on warm-start rehydration AND on every `Database` / `Update`
+/// idle event (the idle observer dispatches it).
+///
+/// Best-effort: listallinfo failure logs and leaves the cache
+/// unchanged. A cache that previously held a populated
+/// aggregate stays populated; a fresh-start cache stays `None`
+/// so the wire reports counters as JSON `null` per the
+/// truth-or-null contract.
+pub(crate) async fn recompute_works_aggregate(
+    ctx: &LibraryContext,
+    conn: &mut crate::mpd::MpdConnection,
+) {
+    let entries = match conn.listallinfo("").await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "works aggregate refresh: mpd listallinfo failed; \
+                 keeping prior cache"
+            );
+            return;
+        }
+    };
+    // Resolve source_id per track using the same prefix-walk
+    // the queue / favourites / playlist surfaces use.
+    let music_dir = ctx.music_directory.clone();
+    let registry = ctx.registry.clone();
+    // Take a registry snapshot once; the resolver closure walks
+    // it without touching the lock on every track.
+    let snapshot = registry.snapshot().await;
+    let source_id_for_path = |rel: &str| -> Option<String> {
+        let abs = music_dir.join(rel);
+        snapshot
+            .iter()
+            .find(|r| abs.starts_with(&r.mount_path))
+            .map(|r| r.id.clone())
+    };
+    let aggregate = crate::works::aggregate(&entries, source_id_for_path);
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        works = aggregate.works.len(),
+        distinct_works = aggregate.counters.distinct_works.unwrap_or(0),
+        works_with_multiple_recordings = aggregate
+            .counters
+            .works_with_multiple_recordings
+            .unwrap_or(0),
+        total_tracks_with_composer =
+            aggregate.counters.total_tracks_with_composer.unwrap_or(0),
+        "works aggregate refreshed"
+    );
+    let mut g = ctx.works_aggregate.lock().await;
+    *g = Some(aggregate);
+}
+
+// ----- Works browse verb handlers (Section B) -----
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListWorksPayload {
+    pub(crate) v: u32,
+    /// Optional filter — only works appearing under this
+    /// source_id. None matches every source.
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    /// Optional substring filter on composer (case-insensitive).
+    /// None matches every composer.
+    #[serde(default)]
+    pub(crate) composer: Option<String>,
+    /// Optional sort order. "name" sorts by work name; "composer"
+    /// (default) sorts by composer then name; "recording_count"
+    /// sorts by recording count descending then composer + name.
+    #[serde(default)]
+    pub(crate) sort: Option<String>,
+}
+
+pub(crate) async fn handle_list_works(
+    ctx: &LibraryContext,
+    payload: ListWorksPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "library.list_works")?;
+    let aggregate = {
+        let g = ctx.works_aggregate.lock().await;
+        g.as_ref().cloned()
+    };
+    let aggregate = match aggregate {
+        Some(a) => a,
+        None => {
+            // Not yet computed — return an empty list with
+            // total: 0. UI distinguishes "no scan yet" via the
+            // library_state counters (which carry null for
+            // unknown).
+            return Ok(json!({
+                "v":     LIBRARY_PAYLOAD_VERSION,
+                "works": Vec::<serde_json::Value>::new(),
+                "total": 0,
+            }));
+        }
+    };
+    let mut works: Vec<&crate::works::WorkSummary> =
+        aggregate.works.iter().collect();
+    // Apply source_id filter.
+    if let Some(sid) = payload.source_id.as_deref() {
+        works.retain(|w| w.sources.iter().any(|s| s == sid));
+    }
+    // Apply composer substring filter (case-insensitive).
+    if let Some(needle) = payload.composer.as_deref() {
+        let needle_lower = needle.to_lowercase();
+        works.retain(|w| match w.composer.as_deref() {
+            Some(c) => c.to_lowercase().contains(&needle_lower),
+            None => false,
+        });
+    }
+    // Sort order. Default is "composer" (already the aggregate's
+    // baseline ordering).
+    match payload.sort.as_deref() {
+        Some("name") => works.sort_by(|a, b| a.name.cmp(&b.name)),
+        Some("recording_count") => works.sort_by(|a, b| {
+            b.recording_count.cmp(&a.recording_count).then_with(|| {
+                a.composer
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.composer.as_deref().unwrap_or(""))
+            })
+        }),
+        _ => {} // baseline order already by composer then name
+    }
+    let rendered: Vec<serde_json::Value> = works
+        .iter()
+        .map(|w| {
+            json!({
+                "work_id":          w.work_id,
+                "name":             w.name,
+                "composer":         w.composer,
+                "recording_count":  w.recording_count,
+                "sources":          w.sources,
+            })
+        })
+        .collect();
+    let total = rendered.len();
+    Ok(json!({
+        "v":     LIBRARY_PAYLOAD_VERSION,
+        "works": rendered,
+        "total": total,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct GetWorkRecordingsPayload {
+    pub(crate) v: u32,
+    pub(crate) work_id: String,
+    /// Optional source_id filter — only recordings whose tracks
+    /// resolve under this source.
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+}
+
+pub(crate) async fn handle_get_work_recordings(
+    ctx: &LibraryContext,
+    payload: GetWorkRecordingsPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "library.get_work_recordings")?;
+    let aggregate = {
+        let g = ctx.works_aggregate.lock().await;
+        g.as_ref().cloned()
+    };
+    let aggregate = match aggregate {
+        Some(a) => a,
+        None => {
+            // Not yet computed — refuse with a structured
+            // error rather than fabricating an empty
+            // recordings list (the consumer cannot
+            // distinguish "scan didn't run" from "work has
+            // no recordings"). The library_state envelope
+            // carries the counters as null so the UI can
+            // gate this verb on the counters being Some.
+            return Err(VerbError::WorkAggregateNotReady);
+        }
+    };
+    let summary = aggregate
+        .works
+        .iter()
+        .find(|w| w.work_id == payload.work_id)
+        .cloned();
+    let summary = match summary {
+        Some(s) => s,
+        None => {
+            return Err(VerbError::UnknownWork {
+                work_id: payload.work_id,
+            });
+        }
+    };
+    let mut recordings: Vec<crate::works::WorkRecording> = aggregate
+        .recordings_by_work
+        .get(&payload.work_id)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(sid) = payload.source_id.as_deref() {
+        // Filter recordings whose first track resolves under
+        // the filter source. The source map was applied during
+        // aggregation so a recording's source comes from the
+        // parent work's resolved sources. Soft filter — drop
+        // recordings whose work doesn't list the source.
+        if !summary.sources.iter().any(|s| s == sid) {
+            recordings.clear();
+        }
+    }
+    let rendered: Vec<serde_json::Value> = recordings
+        .iter()
+        .map(|r| {
+            json!({
+                "recording_id":      r.recording_id,
+                "conductor":         r.conductor,
+                "ensemble":          r.ensemble,
+                "performer":         r.performer,
+                "original_date":     r.original_date,
+                "recording_date":    r.recording_date,
+                "label":             r.label,
+                "medium":            r.medium,
+                "album_uri":         r.album_uri,
+                "track_uris":        r.track_uris,
+                "total_duration_ms": r.total_duration_ms,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "v":          LIBRARY_PAYLOAD_VERSION,
+        "work_id":    summary.work_id,
+        "name":       summary.name,
+        "composer":   summary.composer,
+        "recordings": rendered,
+    }))
 }
 
 // ----- tests -----

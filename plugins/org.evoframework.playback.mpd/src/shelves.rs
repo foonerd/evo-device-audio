@@ -541,6 +541,12 @@ impl ShelfBundle {
             "library.search_library" => {
                 Ok(Some(self.dispatch_library_search_library(req).await?))
             }
+            "library.list_works" => {
+                Ok(Some(self.dispatch_library_list_works(req).await?))
+            }
+            "library.get_work_recordings" => {
+                Ok(Some(self.dispatch_library_get_work_recordings(req).await?))
+            }
             _ => Ok(None),
         }
     }
@@ -927,6 +933,28 @@ impl ShelfBundle {
                 .map_err(library_verb_to_plugin_error)?;
         encode_json_response(req, &env)
     }
+
+    async fn dispatch_library_list_works(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::ListWorksPayload = parse_json(req)?;
+        let env = library::handle_list_works(&self.library, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+
+    async fn dispatch_library_get_work_recordings(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::GetWorkRecordingsPayload = parse_json(req)?;
+        let env = library::handle_get_work_recordings(&self.library, payload)
+            .await
+            .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
 }
 
 // ----- helpers -----
@@ -1021,9 +1049,16 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::CloudEagerScanRequiresAcknowledgement
         | VerbError::SourceOffline { .. }
         | VerbError::Register { .. }
-        | VerbError::SourceOutsideMusicDirectory { .. } => {
+        | VerbError::SourceOutsideMusicDirectory { .. }
+        | VerbError::UnknownWork { .. } => {
             PluginError::Permanent(e.to_string())
         }
-        VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
+        // WorkAggregateNotReady is transient — the next
+        // Database / Update idle event populates the cache.
+        // Operator retry succeeds; treat as transient so
+        // the steward's retry policy applies.
+        VerbError::Mpd { .. } | VerbError::WorkAggregateNotReady => {
+            PluginError::Transient(e.to_string())
+        }
     }
 }
