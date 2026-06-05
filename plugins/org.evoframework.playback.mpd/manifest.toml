@@ -93,6 +93,8 @@ request_types = [
     "library.update_source",
     "library.browse_library",
     "library.search_library",
+    "library.list_works",
+    "library.get_work_recordings",
 ]
 
 [kind]
@@ -259,5 +261,7 @@ request_types = [
     "library.update_source",
     "library.browse_library",
     "library.search_library",
+    "library.list_works",
+    "library.get_work_recordings",
 ]
 response_budget_ms = 2000
