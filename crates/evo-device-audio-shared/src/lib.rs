@@ -26,6 +26,118 @@ pub const UNKNOWN_ARTIST: &str = "unknown";
 /// At most this many local audio files are read for tag match per request.
 pub const MAX_MPD_ALBUM_SCAN_CANDIDATES: u32 = 100_000;
 
+/// Canonical relative URL for an artwork target on the framework's
+/// HTTPS surface. Constructs the URL the operator UI consumes from
+/// the now-playing / queue / favourites / playlist / library
+/// envelopes (the playback warden emits one per track-bearing
+/// item). The framework's `GET /api/v1/audio/artwork` endpoint
+/// resolves the target via the artwork-providers shelf and
+/// 302-redirects to the content-hash endpoint that serves the
+/// bytes from the asset cache.
+///
+/// `scheme` is the external-addressing scheme (`mpd-path` or
+/// `mpd-album` per the playback warden); `value` is the scheme-
+/// specific opaque value (MPD's `file` path or compound
+/// `"{artist}|{album}"` respectively). The UI appends `&size=…`
+/// to the returned URL when it needs a sub-original variant —
+/// the framework endpoint passes the size through to the
+/// resolver, which transcodes + caches the variant under a
+/// distinct content hash.
+///
+/// The returned URL is **relative** so it composes with whichever
+/// origin the UI is loaded from (same-origin in the typical
+/// deployment, but no assumption baked in). Value is percent-
+/// encoded per RFC 3986 query-component rules (alphanumerics +
+/// `-_.~` unreserved; everything else `%XX`).
+pub fn artwork_target_url(scheme: &str, value: &str) -> String {
+    format!(
+        "/api/v1/audio/artwork?scheme={}&value={}",
+        percent_encode_query_value(scheme),
+        percent_encode_query_value(value),
+    )
+}
+
+/// Percent-encode a string for use as a URL query-component
+/// value. Conservative: encodes everything except the
+/// RFC 3986 "unreserved" set (alphanumerics + `-`, `_`, `.`,
+/// `~`). This keeps the artwork URL safe across every MPD path
+/// content (spaces, brackets, `&`, `=`, `?`, `#`, Unicode
+/// filenames, etc.) without pulling a URL crate.
+fn percent_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~' => out.push(*b as char),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod artwork_url_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_filename_stays_readable() {
+        let url = artwork_target_url("mpd-path", "Artist/Album/Track.flac");
+        assert_eq!(
+            url,
+            "/api/v1/audio/artwork?scheme=mpd-path&value=Artist%2FAlbum%2FTrack.flac"
+        );
+    }
+
+    #[test]
+    fn spaces_and_special_chars_encoded() {
+        let url = artwork_target_url(
+            "mpd-path",
+            "The Beatles/Abbey Road/01 - Come Together.flac",
+        );
+        // Spaces → %20, slashes → %2F, hyphens preserved
+        assert!(url.contains("%20"));
+        assert!(url.contains("%2F"));
+        assert!(url.contains("Beatles"));
+        assert!(!url.contains(" ")); // no raw spaces
+    }
+
+    #[test]
+    fn ampersand_encoded_so_query_does_not_break() {
+        // An MPD path containing `&` would corrupt the query
+        // shape without encoding. The framework's query parser
+        // would split on the raw `&`.
+        let url = artwork_target_url("mpd-path", "AC&DC/Back In Black.flac");
+        assert!(url.contains("AC%26DC"));
+        assert!(!url.contains("AC&DC/"));
+    }
+
+    #[test]
+    fn unicode_filename_encoded_as_utf8_bytes() {
+        // Sigur Rós's `Ágætis byrjun` — UTF-8 multi-byte
+        // characters per code-point.
+        let url =
+            artwork_target_url("mpd-path", "Sigur Rós/Ágætis byrjun/01.flac");
+        assert!(url.contains("%C3%81")); // Á
+        assert!(url.contains("%C3%B3")); // ó
+    }
+
+    #[test]
+    fn mpd_album_compound_value_encodes_pipe_separator() {
+        // mpd-album values are `Artist|Album`; the pipe is not
+        // unreserved so it must be percent-encoded.
+        let url = artwork_target_url("mpd-album", "Beatles|Revolver");
+        assert!(url.contains("%7C")); // |
+    }
+}
+
 const AUDIO_EXTS: &[&str] = &[
     "flac", "mp3", "m4a", "mp4", "m4b", "aac", "ogg", "oga", "opus", "wma",
     "wav", "aif", "aiff", "wv", "ape", "mpc", "mka", "webm", "3gp", "aax",

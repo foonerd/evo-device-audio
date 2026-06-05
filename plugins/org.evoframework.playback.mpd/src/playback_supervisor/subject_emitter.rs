@@ -636,6 +636,10 @@ pub(crate) fn render_now_playing_state(
             "artist":          song.artist,
             "album":           song.album,
             "mpd_path":        song.file_path,
+            "artwork_url":     evo_device_audio_shared::artwork_target_url(
+                "mpd-path",
+                &song.file_path,
+            ),
             "composer":        song.classical.composer,
             "composer_sort":   song.classical.composer_sort,
             "conductor":       song.classical.conductor,

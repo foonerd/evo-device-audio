@@ -899,6 +899,10 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
                 // skip-traversal / queue path consults the sticker
                 // for authoritative checks during play.
                 "available":       true,
+                "artwork_url":     evo_device_audio_shared::artwork_target_url(
+                    "mpd-path",
+                    path,
+                ),
                 "composer":        classical.composer,
                 "composer_sort":   classical.composer_sort,
                 "conductor":       classical.conductor,
