@@ -40,6 +40,13 @@ anyhow = { workspace = true }
 # (per the audio.playback shape contract).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Stable work_id / recording_id hashing for the Works browse
+# verbs (library.list_works / library.get_work_recordings).
+# Truncated SHA-256 of a normalised input so the identifiers
+# are deterministic across plugin restarts and device reboots
+# while staying short enough to embed in operator-UI URLs.
+sha2 = { workspace = true }
+hex = { workspace = true }
 # Plugin-local: used to parse `LoadContext::config` in `src/config.rs`.
 # Matches the version the SDK carries transitively; direct declaration is
 # required to name `toml::Table` as a type in this crate. Not a workspace

@@ -959,6 +959,35 @@ impl MpdConnection {
         Ok(parse_library_entries(&fields))
     }
 
+    /// Recursive listing of every song in MPD's database with
+    /// full tag content. Returns only `MpdLibraryEntry::File`
+    /// entries (directories and playlists are suppressed by
+    /// MPD's `listallinfo` itself).
+    ///
+    /// Wire form: `listallinfo "<path>"\n`. Empty path walks
+    /// the entire database. Used by the works-aggregation
+    /// path (`library.list_works` / `library.get_work_recordings`)
+    /// + the library-state counter computation (composer count,
+    /// distinct-works count, works-with-multiple-recordings
+    /// count). The walk visits every track once; for a 1134-
+    /// track library this is sub-second over the Unix socket.
+    ///
+    /// MPD's response carries the full classical-tag set per
+    /// entry, so the aggregation consumer sees Work / Composer
+    /// / Conductor / Ensemble / etc. through the same
+    /// `ClassicalTags` projection the per-track envelopes use.
+    pub(crate) async fn listallinfo(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
+        let fields = if path.is_empty() {
+            self.dispatch("listallinfo", &[]).await?
+        } else {
+            self.dispatch("listallinfo", &[path]).await?
+        };
+        Ok(parse_library_entries(&fields))
+    }
+
     /// Exact-match search across MPD's library.
     ///
     /// Wire form: `find "<field>" "<query>"\n`. Case-sensitive

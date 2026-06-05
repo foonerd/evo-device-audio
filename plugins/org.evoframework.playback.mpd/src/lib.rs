@@ -123,6 +123,7 @@ mod skip_traversal;
 mod source_probe;
 mod source_registry;
 mod sticker_reconciler;
+mod works;
 
 #[cfg(test)]
 mod test_support_routing;
