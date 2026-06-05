@@ -46,6 +46,7 @@
 mod config;
 mod embedded;
 mod resolve;
+mod transcode;
 
 use std::future::Future;
 
@@ -88,6 +89,15 @@ pub struct ArtworkLocalPlugin {
     config: PluginConfig,
     /// `LoadContext::state_dir`; used for embedded cover cache.
     state_dir: Option<std::path::PathBuf>,
+    /// `LoadContext::asset_cache`; populated during resolve so
+    /// the framework's `/api/v1/audio/artwork/:content_hash`
+    /// endpoint serves bytes for every size variant the plugin
+    /// produces. `None` when the framework did not wire the
+    /// cache (test harnesses, degraded boot); resolve still
+    /// returns the file path so legacy in-process callers keep
+    /// working, just without cache-hosted bytes.
+    asset_cache:
+        Option<std::sync::Arc<dyn evo_plugin_sdk::contract::AssetCache>>,
     /// Count of `handle_request` invocations.
     requests_handled: u64,
 }
@@ -99,6 +109,7 @@ impl ArtworkLocalPlugin {
             loaded: false,
             config: PluginConfig::defaults(),
             state_dir: None,
+            asset_cache: None,
             requests_handled: 0,
         }
     }
@@ -176,6 +187,18 @@ impl Plugin for ArtworkLocalPlugin {
                 );
             }
             self.state_dir = Some(ctx.state_dir.clone());
+            // Asset-cache handle is plumbed by the framework's
+            // admission engine into LoadContext.asset_cache.
+            // Capture it so resolve can push transcoded bytes
+            // into the content-hash store; the framework's
+            // existing /api/v1/audio/artwork/:hash endpoint
+            // serves whatever lands here.
+            self.asset_cache = ctx.asset_cache.clone();
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                asset_cache_wired = self.asset_cache.is_some(),
+                "load complete"
+            );
             self.loaded = true;
             Ok(())
         }
@@ -188,6 +211,7 @@ impl Plugin for ArtworkLocalPlugin {
             self.loaded = false;
             self.config = PluginConfig::defaults();
             self.state_dir = None;
+            self.asset_cache = None;
             Ok(())
         }
     }
@@ -248,7 +272,7 @@ impl Respondent for ArtworkLocalPlugin {
             let library_roots = self.config.library_roots.clone();
             let state_dir = self.state_dir.clone();
             let payload = req.payload.clone();
-            let out = match tokio::task::spawn_blocking(move || {
+            let resolve_output = match tokio::task::spawn_blocking(move || {
                 resolve::resolve_artwork(
                     &library_roots,
                     state_dir.as_deref(),
@@ -265,7 +289,34 @@ impl Respondent for ArtworkLocalPlugin {
                     )));
                 }
             };
-            let body = out.json_bytes().map_err(|e| {
+            // Push the resolved bytes to the framework's
+            // content-hash asset cache. The /api/v1/audio/
+            // artwork/:content_hash endpoint serves whatever
+            // lands here. On cache-write failure the response
+            // still carries the content_hash; subsequent fetch
+            // attempts surface as 404 and the UI's placeholder
+            // rule covers — we DON'T fail the verb because
+            // partial-success is better than a wholesale
+            // refusal for a structurally-valid resolve.
+            if let Some((content_hash, bytes)) = resolve_output.cache_payload {
+                if let Some(cache) = &self.asset_cache {
+                    if let Err(e) = cache.put(&content_hash, bytes).await {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            content_hash = %content_hash,
+                            error = %e,
+                            "artwork.resolve: asset cache put failed; response still carries content_hash"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        content_hash = %content_hash,
+                        "artwork.resolve: no asset cache wired; content_hash returned for path-only consumers"
+                    );
+                }
+            }
+            let body = resolve_output.response.json_bytes().map_err(|e| {
                 PluginError::Permanent(format!("artwork response JSON: {e}"))
             })?;
             Ok(Response::for_request(req, body))

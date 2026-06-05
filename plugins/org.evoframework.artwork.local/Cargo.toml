@@ -32,6 +32,19 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Artwork transcoding: image decode + Lanczos3 resize + WebP
+# encode. The plugin owns the resize work so the framework
+# HTTPS surface stays thin (resolve + redirect).
+image = { workspace = true }
+# Stable content_hash for resized variants — SHA-256 truncated
+# / hex-encoded for the asset-cache key surface.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Base64 encode/decode for the artwork.resolve verb's
+# wire-shape response: the plugin writes bytes to the asset
+# cache and returns the content_hash; legacy in-process
+# callers may still read the path field.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

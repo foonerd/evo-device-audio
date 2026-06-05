@@ -78,6 +78,14 @@ pub(crate) struct ArtworkResolveRequest {
     pub(crate) v: u8,
     /// Which subject to resolve art for; mirrors external addressing.
     pub(crate) target: ResolveTarget,
+    /// Size variant requested. One of
+    /// `tiny | medium | large | original`. Default `original`
+    /// when absent (legacy callers receive the master bytes).
+    /// Resized variants are encoded as WebP per the plugin's
+    /// transcoding posture; original-size carries the source
+    /// bytes verbatim.
+    #[serde(default)]
+    pub(crate) size: Option<String>,
 }
 
 /// Subject selector: must match a registered scheme from the playback warden.
@@ -93,12 +101,34 @@ pub(crate) struct ArtworkResolveResponse {
     v: u8,
     status: ResponseStatus,
     /// Absolute path to an image file on this device, when `status` is
-    /// [`ResponseStatus::Ok`].
+    /// [`ResponseStatus::Ok`]. Retained on the resolve response so
+    /// in-process callers that prefer file paths to bytes keep
+    /// working; HTTPS callers consume `content_hash` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// `image/jpeg`, `image/png`, etc., when `path` is set.
+    /// SHA-256 (lowercase hex, 64 chars) of the resolved variant's
+    /// bytes. Set when `status` is [`ResponseStatus::Ok`]. The
+    /// framework's `/api/v1/audio/artwork/:content_hash` endpoint
+    /// serves these bytes from the asset cache the plugin
+    /// populated during resolve. UI consumers construct
+    /// `<img src="/api/v1/audio/artwork/{content_hash}">` and
+    /// browsers/CDNs treat the URL as forever-cacheable per the
+    /// hash endpoint's immutable Cache-Control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+    /// MIME type for the resolved variant. `image/jpeg` /
+    /// `image/png` / `image/webp` for `Original` size (matches
+    /// the source); `image/webp` for resized variants per the
+    /// plugin's transcoding posture.
     #[serde(skip_serializing_if = "Option::is_none")]
     mime: Option<String>,
+    /// Size variant the response carries — round-trips with the
+    /// request's `size` parameter (`tiny | medium | large |
+    /// original`). Defaults to `original` on unset requests; set
+    /// here so consumers correlate the response to the variant
+    /// they asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
     /// Extra context for operators and UIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -247,30 +277,61 @@ fn resolve_audio_path(
 
 /// Build the JSON response body. Returns [`Err`] only for internal failures
 /// (non-UTF-8 path, cache I/O) that should map to [`PluginError::Permanent`].
+/// Output of [`resolve_artwork`].
+///
+/// Carries the wire-shape [`ArtworkResolveResponse`] (which goes
+/// back to the caller as JSON) plus an optional
+/// `(content_hash, bytes)` tuple the caller pushes into the
+/// framework's asset cache asynchronously. The split keeps the
+/// synchronous path here (decode + resize + WebP encode + hash)
+/// inside the [`tokio::task::spawn_blocking`] wrapper the
+/// caller already uses, while the cache write — which is async
+/// in the SDK trait — runs in the outer async context.
+pub(crate) struct ResolveOutput {
+    pub(crate) response: ArtworkResolveResponse,
+    /// `(content_hash, bytes)` pair to push to the asset cache,
+    /// when resolve produced a transcoded variant. `None` when
+    /// the resolve was a structured refusal (NotFound,
+    /// BadRequest) or when transcode failed (the response
+    /// degrades to a path-only payload so legacy in-process
+    /// callers keep working).
+    pub(crate) cache_payload: Option<(String, Vec<u8>)>,
+}
+
 pub(crate) fn resolve_artwork(
     library_roots: &[PathBuf],
     state_dir: Option<&Path>,
     payload: &[u8],
-) -> Result<ArtworkResolveResponse, String> {
+) -> Result<ResolveOutput, String> {
     if payload.is_empty() {
-        return Ok(ArtworkResolveResponse {
-            v: 1,
-            status: ResponseStatus::BadRequest,
-            path: None,
-            mime: None,
-            detail: Some("empty payload".to_string()),
+        return Ok(ResolveOutput {
+            response: ArtworkResolveResponse {
+                v: 1,
+                status: ResponseStatus::BadRequest,
+                path: None,
+                content_hash: None,
+                mime: None,
+                size: None,
+                detail: Some("empty payload".to_string()),
+            },
+            cache_payload: None,
         });
     }
 
     let text = match std::str::from_utf8(payload) {
         Ok(t) => t,
         Err(e) => {
-            return Ok(ArtworkResolveResponse {
-                v: 1,
-                status: ResponseStatus::BadRequest,
-                path: None,
-                mime: None,
-                detail: Some(format!("payload is not UTF-8: {e}")),
+            return Ok(ResolveOutput {
+                response: ArtworkResolveResponse {
+                    v: 1,
+                    status: ResponseStatus::BadRequest,
+                    path: None,
+                    content_hash: None,
+                    size: None,
+                    mime: None,
+                    detail: Some(format!("payload is not UTF-8: {e}")),
+                },
+                cache_payload: None,
             });
         }
     };
@@ -278,39 +339,156 @@ pub(crate) fn resolve_artwork(
     let req: ArtworkResolveRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            return Ok(ArtworkResolveResponse {
-                v: 1,
-                status: ResponseStatus::BadRequest,
-                path: None,
-                mime: None,
-                detail: Some(format!("invalid JSON: {e}")),
+            return Ok(ResolveOutput {
+                response: ArtworkResolveResponse {
+                    v: 1,
+                    status: ResponseStatus::BadRequest,
+                    path: None,
+                    content_hash: None,
+                    size: None,
+                    mime: None,
+                    detail: Some(format!("invalid JSON: {e}")),
+                },
+                cache_payload: None,
             });
         }
     };
     if req.v != 1 {
-        return Ok(ArtworkResolveResponse {
-            v: 1,
-            status: ResponseStatus::BadRequest,
-            path: None,
-            mime: None,
-            detail: Some(format!("unsupported request v: {}", req.v)),
+        return Ok(ResolveOutput {
+            response: ArtworkResolveResponse {
+                v: 1,
+                status: ResponseStatus::BadRequest,
+                path: None,
+                content_hash: None,
+                mime: None,
+                size: None,
+                detail: Some(format!("unsupported request v: {}", req.v)),
+            },
+            cache_payload: None,
         });
     }
+    // Parse the optional size; default to Original. An unknown
+    // value surfaces as a structured BadRequest so the operator
+    // UI sees a recognisable refusal rather than a silent
+    // coercion to Original.
+    let size_str = req.size.as_deref().unwrap_or("original");
+    let size = match crate::transcode::ArtworkSize::parse(size_str) {
+        Some(s) => s,
+        None => {
+            return Ok(ResolveOutput {
+                response: ArtworkResolveResponse {
+                    v: 1,
+                    status: ResponseStatus::BadRequest,
+                    path: None,
+                    content_hash: None,
+                    mime: None,
+                    size: None,
+                    detail: Some(format!(
+                        "unknown size: {size_str} (expected tiny | medium | large | original)"
+                    )),
+                },
+                cache_payload: None,
+            });
+        }
+    };
 
-    match req.target.scheme.as_str() {
+    let inner_response = match req.target.scheme.as_str() {
         SCHEME_MPD_ALBUM => {
-            resolve_mpd_album(library_roots, state_dir, &req.target.value)
+            resolve_mpd_album(library_roots, state_dir, &req.target.value)?
         }
         SCHEME_MPD_PATH => {
-            resolve_mpd_path(library_roots, state_dir, &req.target.value)
+            resolve_mpd_path(library_roots, state_dir, &req.target.value)?
         }
-        other => Ok(ArtworkResolveResponse {
+        other => ArtworkResolveResponse {
             v: 1,
             status: ResponseStatus::BadRequest,
             path: None,
+            content_hash: None,
             mime: None,
+            size: None,
             detail: Some(format!("unknown target.scheme: {other}")),
-        }),
+        },
+    };
+
+    // Post-resolve transcode: when the inner resolver landed
+    // an Ok response with a path, read the bytes, transcode
+    // for the requested size, and produce the cache-ready
+    // (content_hash, bytes) payload. On transcode failure the
+    // response keeps its path-only payload — operator UI
+    // degrades gracefully via the placeholder rule rather
+    // than seeing a hard refusal for a structurally-valid
+    // cover that just couldn't decode.
+    let response_path = inner_response.path.clone();
+    if inner_response.status == ResponseStatus::Ok {
+        if let Some(path_str) = response_path {
+            return finalise_with_transcode(inner_response, &path_str, size);
+        }
+    }
+    Ok(ResolveOutput {
+        response: inner_response,
+        cache_payload: None,
+    })
+}
+
+/// Read bytes from the resolved cover path, transcode to the
+/// requested size, and stamp `content_hash` + `size` + `mime`
+/// onto the response. Returns the `(content_hash, bytes)`
+/// pair for the caller to push into the asset cache.
+fn finalise_with_transcode(
+    mut response: ArtworkResolveResponse,
+    cover_path: &str,
+    size: crate::transcode::ArtworkSize,
+) -> Result<ResolveOutput, String> {
+    let bytes = match std::fs::read(cover_path) {
+        Ok(b) => b,
+        Err(e) => {
+            // Read failure degrades the response to path-only
+            // (caller's framework hash endpoint will 404 but
+            // the operator UI's placeholder rule takes over).
+            tracing::warn!(
+                cover_path = %cover_path,
+                error = %e,
+                "artwork.resolve: cover file read failed; degrading to path-only"
+            );
+            return Ok(ResolveOutput {
+                response,
+                cache_payload: None,
+            });
+        }
+    };
+    let source_mime = response.mime.clone().unwrap_or_else(|| {
+        // Fall back to a generic image MIME so the encoder
+        // sees a non-empty type; transcode picks an output
+        // MIME independent of this hint for resized variants.
+        "application/octet-stream".to_string()
+    });
+    match crate::transcode::transcode(bytes, &source_mime, size) {
+        Ok(transcoded) => {
+            response.content_hash = Some(transcoded.content_hash.clone());
+            response.size = Some(size.as_str().to_string());
+            response.mime = Some(transcoded.mime);
+            Ok(ResolveOutput {
+                response,
+                cache_payload: Some((
+                    transcoded.content_hash,
+                    transcoded.bytes,
+                )),
+            })
+        }
+        Err(e) => {
+            // Transcode failure degrades the same way as read
+            // failure; the path field is still set so legacy
+            // callers keep going.
+            tracing::warn!(
+                cover_path = %cover_path,
+                error = %e,
+                "artwork.resolve: transcode failed; degrading to path-only"
+            );
+            Ok(ResolveOutput {
+                response,
+                cache_payload: None,
+            })
+        }
     }
 }
 
@@ -327,6 +505,8 @@ fn resolve_mpd_album(
                 v: 1,
                 status: ResponseStatus::BadRequest,
                 path: None,
+                content_hash: None,
+                size: None,
                 mime: None,
                 detail: Some(
                     "invalid mpd-album value: expected \"artist|album\" (see \
@@ -347,6 +527,8 @@ fn resolve_mpd_album(
                 v: 1,
                 status: ResponseStatus::NotFound,
                 path: None,
+                content_hash: None,
+                size: None,
                 mime: None,
                 detail: Some(format!(
                     "mpd_album: scan limit ({} files) reached under [library] roots",
@@ -359,6 +541,8 @@ fn resolve_mpd_album(
                 v: 1,
                 status: ResponseStatus::NotFound,
                 path: None,
+                content_hash: None,
+                size: None,
                 mime: None,
                 detail: Some(m),
             });
@@ -369,7 +553,9 @@ fn resolve_mpd_album(
             v: 1,
             status: ResponseStatus::NotFound,
             path: None,
+            content_hash: None,
             mime: None,
+            size: None,
             detail: Some(
                 "mpd_album: no file under [library] roots with matching track artist and album \
                  tags"
@@ -395,6 +581,8 @@ fn resolve_cover_for_audio_file(
                 v: 1,
                 status: ResponseStatus::NotFound,
                 path: None,
+                content_hash: None,
+                size: None,
                 mime: None,
                 detail: Some(
                     "embedded cover in tags but no state_dir to write cache; cannot expose path"
@@ -410,6 +598,8 @@ fn resolve_cover_for_audio_file(
         v: 1,
         status: ResponseStatus::NotFound,
         path: None,
+        content_hash: None,
+        size: None,
         mime: None,
         detail: Some("no sidecar or embedded cover for this track".to_string()),
     })
@@ -425,7 +615,9 @@ fn ok_from_path(cover: PathBuf) -> Result<ArtworkResolveResponse, String> {
         v: 1,
         status: ResponseStatus::Ok,
         path: Some(path),
+        content_hash: None,
         mime,
+        size: None,
         detail: None,
     })
 }
@@ -440,7 +632,9 @@ fn resolve_mpd_path(
             v: 1,
             status: ResponseStatus::BadRequest,
             path: None,
+            content_hash: None,
             mime: None,
+            size: None,
             detail: Some("empty mpd-path value".to_string()),
         });
     }
@@ -450,7 +644,9 @@ fn resolve_mpd_path(
             v: 1,
             status: ResponseStatus::NotFound,
             path: None,
+            content_hash: None,
             mime: None,
+            size: None,
             detail: Some("audio file not found for mpd_path".to_string()),
         });
     };
@@ -587,9 +783,9 @@ mod tests {
         let r =
             resolve_artwork(&[dir.path().to_path_buf()], None, body.as_bytes())
                 .unwrap();
-        assert_eq!(r.status, ResponseStatus::Ok);
-        assert!(r.path.as_ref().unwrap().ends_with("folder.jpg"));
-        assert_eq!(r.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(r.response.status, ResponseStatus::Ok);
+        assert!(r.response.path.as_ref().unwrap().ends_with("folder.jpg"));
+        assert_eq!(r.response.mime.as_deref(), Some("image/jpeg"));
     }
 
     #[test]
@@ -600,7 +796,7 @@ mod tests {
             r#"{"v":1,"target":{"scheme":"mpd-path","value":"http://x/a.flac"}}"#.as_bytes(),
         )
         .unwrap();
-        assert_eq!(r.status, ResponseStatus::NotFound);
+        assert_eq!(r.response.status, ResponseStatus::NotFound);
     }
 
     #[test]
@@ -631,8 +827,8 @@ mod tests {
         let r =
             resolve_artwork(&[dir.path().to_path_buf()], None, body.as_bytes())
                 .unwrap();
-        assert_eq!(r.status, ResponseStatus::Ok);
-        assert!(r.path.as_ref().unwrap().ends_with("folder.jpg"));
-        assert_eq!(r.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(r.response.status, ResponseStatus::Ok);
+        assert!(r.response.path.as_ref().unwrap().ends_with("folder.jpg"));
+        assert_eq!(r.response.mime.as_deref(), Some("image/jpeg"));
     }
 }

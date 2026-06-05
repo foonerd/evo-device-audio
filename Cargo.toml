@@ -68,6 +68,12 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 regex = "1"
 hex = "0.4"
+# image: image decoding + resize (Lanczos3) for the artwork
+# pipeline. default-features off + explicit format gates keeps
+# the dep surface tight (jpeg + png + webp for both decode AND
+# encode; ico/tiff/bmp/etc disabled). Cross-build to aarch64 /
+# armv7 stays clean — no platform-specific encoder pulls.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "rayon"] }
 
 # Mirrors evo-core's workspace lints. No unsafe; all public items
 # documented.
