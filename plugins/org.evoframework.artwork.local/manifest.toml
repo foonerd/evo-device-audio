@@ -4,9 +4,17 @@ name = "org.evoframework.artwork.local"
 version = "0.1.0"
 contract = 1
 
-[target]
+[[stockings]]
 shelf = "artwork.providers"
 shape = 1
+role = "respondent"
+# Multi-occupant shelf per the Stocking primitive: this plugin
+# owns the `artwork.resolve` verb (local sidecar + embedded
+# cascade), while `org.evoframework.artwork.online` co-occupies
+# the same shelf and owns `artwork.resolve_online` (CAA / Last.fm
+# / iTunes / Volumio meta cascade). The framework's partition
+# gate routes each verb to its declaring plugin.
+request_types = ["artwork.resolve"]
 
 [kind]
 instance = "singleton"
