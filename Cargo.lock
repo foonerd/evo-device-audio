@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "evo"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "evo-auth-bearer"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "evo-coalesce-labels"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "evo-graphql"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "evo-grpc"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "async-trait",
  "prost 0.13.5",
@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "evo-http3"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "evo-multiroom-sdk"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "evo-observatory"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "evo-os-clock"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "evo-otel-export"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-observatory",
  "opentelemetry",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "evo-plugin-sdk"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "base64",
  "ciborium",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "evo-primitives"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "evo-projection-core"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "evo-projection-rest"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "serde",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "evo-projection-ws"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "serde",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "evo-runtime-http"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -1696,14 +1696,14 @@ dependencies = [
 
 [[package]]
 name = "evo-sdk-genkit"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
 ]
 
 [[package]]
 name = "evo-sdk-kotlin"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "evo-sdk-python"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "evo-sdk-rust"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "evo-sdk-swift"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "evo-sdk-typescript"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "evo-tls-certs"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "evo-observatory",
  "rcgen 0.13.2",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "evo-trust"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "evo-witness"
-version = "0.1.12"
+version = "0.1.13-rc.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
