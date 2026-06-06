@@ -70,10 +70,20 @@ regex = "1"
 hex = "0.4"
 # image: image decoding + resize (Lanczos3) for the artwork
 # pipeline. default-features off + explicit format gates keeps
-# the dep surface tight (jpeg + png + webp for both decode AND
-# encode; ico/tiff/bmp/etc disabled). Cross-build to aarch64 /
-# armv7 stays clean — no platform-specific encoder pulls.
+# the dep surface tight (jpeg + png for decode; lossless WebP
+# decode/encode via image-webp; ico/tiff/bmp/etc disabled).
+# Cross-build to aarch64 / armv7 stays clean — no platform-
+# specific encoder pulls.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "rayon"] }
+# webp: libwebp bindings for LOSSY WebP encoding at quality 82
+# (Roon-class default). image-webp v0.2 only exposes lossless
+# encoding which paradoxically inflates thumbnail bytes vs
+# JPEG; this crate's libwebp-sys backend ships the canonical
+# lossy encoder the catalogue acceptance row pins against.
+# default-features off retires the optional image-crate
+# convenience helper which would pull in a parallel image-crate
+# version axis; we encode from raw rgba8 buffers directly.
+webp = { version = "0.3", default-features = false }
 
 # Mirrors evo-core's workspace lints. No unsafe; all public items
 # documented.

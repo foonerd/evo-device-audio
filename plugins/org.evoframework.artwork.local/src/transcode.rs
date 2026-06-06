@@ -52,10 +52,15 @@
 //! a square slot; this preserves photographic content rather
 //! than distorting it via forced square crop.
 
-use std::io::Cursor;
-
 use image::imageops::FilterType;
 use sha2::{Digest, Sha256};
+
+/// Quality factor for the lossy WebP encoder. The Roon-class
+/// default — perceptually identical to quality 95 at thumbnail
+/// resolutions; 40-60% bytes smaller than equivalent JPEG. Set
+/// here as a module constant so a documented quality change is
+/// a one-line edit reviewers can audit.
+const WEBP_QUALITY_FACTOR: f32 = 82.0;
 
 /// Size variant the operator UI requests via the
 /// `?size=` query parameter on `/api/v1/audio/artwork`.
@@ -192,38 +197,25 @@ pub(crate) fn transcode(
         } else {
             dyn_image.resize(bounding, bounding, FilterType::Lanczos3)
         };
-    // Encode as lossy WebP at quality 82. The image crate's
-    // WebP encoder takes the RGBA8 pixel buffer + a quality
-    // factor.
+    // Encode as lossy WebP at quality 82 via libwebp bindings.
+    // Quality 82 matches the Roon-class default — perceptually
+    // identical to quality 95 at thumbnail resolutions; 40-60%
+    // smaller bytes than equivalent JPEG; smaller still than
+    // lossless WebP at the same visual quality for
+    // photographic content (typical album art).
+    //
+    // The image crate's `image-webp` backend (v0.2) only
+    // exposes a lossless encoder, which paradoxically inflates
+    // thumbnail bytes versus a JPEG of equivalent perceived
+    // quality. We use the `webp` crate's libwebp bindings to
+    // deliver the lossy encoding the catalogue acceptance row
+    // pins against.
     let rgba = resized.to_rgba8();
     let width = rgba.width();
     let height = rgba.height();
-    let mut encoded = Vec::new();
-    {
-        let encoder = image::codecs::webp::WebPEncoder::new_lossless(
-            Cursor::new(&mut encoded),
-        );
-        // The image crate's lossless WebP encoder produces
-        // the smallest perceptually-identical output for
-        // graphical content (typical album-art posters,
-        // illustrations); for photographic covers, a lossy
-        // encoder at quality 82 would be marginally smaller
-        // but image v0.25's lossy WebP support is limited to
-        // unstable features. Lossless WebP at thumbnail
-        // resolutions still beats JPEG quality 95 on bytes
-        // for most content. Refinement to lossy with quality
-        // 82 lands when the `image` crate exposes a stable
-        // lossy WebP encoder.
-        use image::ImageEncoder;
-        encoder
-            .write_image(
-                rgba.as_raw(),
-                width,
-                height,
-                image::ExtendedColorType::Rgba8,
-            )
-            .map_err(|e| TranscodeError::Encode(e.to_string()))?;
-    }
+    let encoder = webp::Encoder::from_rgba(rgba.as_raw(), width, height);
+    let memory = encoder.encode(WEBP_QUALITY_FACTOR);
+    let encoded = memory.to_vec();
     let content_hash = hash_bytes(&encoded);
     Ok(TranscodedArtwork {
         bytes: encoded,
@@ -245,6 +237,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn make_test_jpeg(width: u32, height: u32) -> Vec<u8> {
         // Tiny synthetic image — solid grey, just to exercise
@@ -350,5 +343,116 @@ mod tests {
         let result =
             transcode(b"not an image".to_vec(), "image/png", ArtworkSize::Tiny);
         assert!(matches!(result, Err(TranscodeError::Decode(_))));
+    }
+
+    /// Construct a small JPEG fixture and inject an EXIF APP1
+    /// marker after the SOI so the input genuinely carries
+    /// metadata for the strip-on-transcode test to bite on.
+    /// The minimal EXIF payload is just a "Exif\0\0" tag —
+    /// enough to satisfy a metadata-walker looking for the
+    /// signature, even if the TIFF body is degenerate.
+    fn make_jpeg_with_exif() -> Vec<u8> {
+        // Encode a small JPEG via the image crate.
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(
+                128,
+                128,
+                image::Rgb([100u8, 150, 200]),
+            );
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "encoded JPEG missing SOI");
+
+        // Inject an EXIF APP1 marker right after the SOI.
+        // APP1 frame: FF E1 [length bytes 2] "Exif\0\0" [data].
+        // The length value is big-endian and INCLUDES the length
+        // bytes themselves but NOT the marker bytes.
+        let exif_signature: &[u8] = b"Exif\0\0";
+        let exif_tiff_stub: &[u8] = &[
+            b'I', b'I', // little-endian TIFF byte order
+            0x2A, 0x00, // TIFF magic 42
+            0x08, 0x00, 0x00, 0x00, // IFD0 offset
+            0x00, 0x00, // entry count = 0 (degenerate IFD)
+        ];
+        let payload_len = exif_signature.len() + exif_tiff_stub.len();
+        let frame_len = (payload_len + 2) as u16; // includes the 2 length bytes
+        let mut with_exif = Vec::new();
+        with_exif.extend_from_slice(&jpeg[..2]); // SOI
+        with_exif.push(0xFF);
+        with_exif.push(0xE1); // APP1 marker
+        with_exif.extend_from_slice(&frame_len.to_be_bytes());
+        with_exif.extend_from_slice(exif_signature);
+        with_exif.extend_from_slice(exif_tiff_stub);
+        with_exif.extend_from_slice(&jpeg[2..]); // rest of JPEG
+        with_exif
+    }
+
+    /// Pin the wire-shape contract: resized WebP variants MUST
+    /// NOT embed EXIF / XMP / ICC profile metadata. The
+    /// `webp::Encoder::from_rgba` path takes pure pixel bytes
+    /// and has no metadata source — so the invariant holds by
+    /// construction today, but a future encoder swap that adds
+    /// metadata pass-through would silently violate the
+    /// catalogue's `EXIF stripped on resized variants` claim
+    /// without this test catching it.
+    ///
+    /// Asserts: the output WebP container carries no RIFF
+    /// chunks with the known metadata chunk IDs (`EXIF`,
+    /// `XMP `, `ICCP`).
+    #[test]
+    fn resized_variants_emit_no_webp_metadata_chunks() {
+        let jpeg_with_exif = make_jpeg_with_exif();
+        // Confirm our fixture genuinely carries an EXIF marker.
+        assert!(
+            jpeg_with_exif.windows(4).any(|w| w == b"Exif"),
+            "fixture JPEG should carry an EXIF marker"
+        );
+
+        // WebP RIFF chunk IDs that the spec uses for metadata.
+        let metadata_chunk_ids: &[&[u8; 4]] = &[
+            b"EXIF", // EXIF block
+            b"XMP ", // XMP metadata (note trailing space)
+            b"ICCP", // ICC color profile
+        ];
+
+        for size in [ArtworkSize::Tiny, ArtworkSize::Medium, ArtworkSize::Large]
+        {
+            let result = transcode(jpeg_with_exif.clone(), "image/jpeg", size)
+                .expect("transcode succeeds");
+            assert_eq!(result.mime, "image/webp");
+
+            for chunk_id in metadata_chunk_ids {
+                assert!(
+                    !result.bytes.windows(4).any(|w| w == *chunk_id),
+                    "size={:?}: transcoded WebP contains metadata chunk {:?}",
+                    size,
+                    std::str::from_utf8(*chunk_id).unwrap()
+                );
+            }
+        }
+    }
+
+    /// Original-size passthrough does NOT strip metadata —
+    /// archival callers + multi-room propagation receive the
+    /// master bytes verbatim. The contract is "stripped on
+    /// resized variants ONLY"; pin the asymmetry here so a
+    /// future change to strip on Original (which would reduce
+    /// archival fidelity) is caught.
+    #[test]
+    fn original_size_preserves_input_metadata() {
+        let jpeg_with_exif = make_jpeg_with_exif();
+        let result = transcode(
+            jpeg_with_exif.clone(),
+            "image/jpeg",
+            ArtworkSize::Original,
+        )
+        .expect("transcode succeeds");
+        assert_eq!(result.bytes, jpeg_with_exif);
+        assert!(
+            result.bytes.windows(4).any(|w| w == b"Exif"),
+            "Original-size output must preserve input EXIF marker"
+        );
     }
 }

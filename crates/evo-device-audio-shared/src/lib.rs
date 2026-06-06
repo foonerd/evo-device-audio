@@ -20,11 +20,153 @@ pub mod audio_ui_pack;
 pub mod terminus_loopback;
 pub mod transition_envelope;
 
+/// Default path to MPD's main configuration file on Linux. Used as
+/// the source-of-truth for `music_directory` + `playlist_directory`
+/// auto-derivation by every plugin in the audio reference
+/// distribution that needs to resolve MPD-relative file paths
+/// (artwork.local, metadata.local, future siblings). Operator
+/// override remains available via plugin-specific TOML config; the
+/// auto-derived value is the primary truth path, the operator value
+/// is the additive override.
+pub const DEFAULT_MPD_CONF_PATH: &str = "/etc/mpd.conf";
+
 /// MPD warden: missing artist in `mpd-album` is encoded as this literal.
 pub const UNKNOWN_ARTIST: &str = "unknown";
 
 /// At most this many local audio files are read for tag match per request.
 pub const MAX_MPD_ALBUM_SCAN_CANDIDATES: u32 = 100_000;
+
+/// Read `/etc/mpd.conf` (or alternate path) and return the parsed
+/// `music_directory` value. `None` when the file cannot be read,
+/// when the directive is absent, or when the value is empty.
+///
+/// Single source of truth for every plugin in the audio reference
+/// distribution that needs to resolve MPD-relative file paths.
+/// Eliminates per-plugin config drift — operator can't get the
+/// path wrong because there's nothing to configure; the value
+/// comes from MPD's own canonical config.
+pub fn load_music_directory_from_mpd_conf(conf_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(conf_path).ok()?;
+    parse_mpd_directive(&contents, "music_directory")
+}
+
+/// Read `/etc/mpd.conf` (or alternate path) and return the parsed
+/// `playlist_directory` value. Same shape as
+/// [`load_music_directory_from_mpd_conf`]; consumed by the playlist
+/// shelf's `create_playlist` verb to materialise empty `.m3u`
+/// files.
+pub fn load_playlist_directory_from_mpd_conf(
+    conf_path: &Path,
+) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(conf_path).ok()?;
+    parse_mpd_directive(&contents, "playlist_directory")
+}
+
+/// Pure single-line MPD directive parser. Tolerates quoted /
+/// unquoted / equals-style syntax; comment lines (`#`); first
+/// non-comment hit wins.
+///
+/// Lifted from the playback plugin's `source_probe` module so
+/// every plugin in the audio distribution consumes one
+/// production-validated parser rather than rolling its own.
+pub fn parse_mpd_directive(contents: &str, directive: &str) -> Option<PathBuf> {
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let rest = match line.strip_prefix(directive) {
+            Some(r) => r,
+            None => continue,
+        };
+        // The directive name is followed by whitespace, then the
+        // value (quoted or unquoted). Strip leading whitespace +
+        // leading equals (some MPD configs use key=value style).
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+        let value = if let Some(stripped) = rest.strip_prefix('"') {
+            // Quoted: take up to next quote.
+            let end = stripped.find('"')?;
+            &stripped[..end]
+        } else {
+            // Unquoted: take first whitespace-delimited token.
+            rest.split_whitespace().next()?
+        };
+        if value.is_empty() {
+            continue;
+        }
+        return Some(PathBuf::from(value));
+    }
+    None
+}
+
+#[cfg(test)]
+mod mpd_conf_tests {
+    use super::*;
+
+    #[test]
+    fn parses_quoted_value() {
+        let contents = r#"music_directory "/var/lib/evo/music""#;
+        assert_eq!(
+            parse_mpd_directive(contents, "music_directory"),
+            Some(PathBuf::from("/var/lib/evo/music"))
+        );
+    }
+
+    #[test]
+    fn parses_unquoted_value() {
+        let contents = "music_directory /var/lib/evo/music";
+        assert_eq!(
+            parse_mpd_directive(contents, "music_directory"),
+            Some(PathBuf::from("/var/lib/evo/music"))
+        );
+    }
+
+    #[test]
+    fn parses_equals_style() {
+        let contents = "music_directory=/var/lib/evo/music";
+        assert_eq!(
+            parse_mpd_directive(contents, "music_directory"),
+            Some(PathBuf::from("/var/lib/evo/music"))
+        );
+    }
+
+    #[test]
+    fn skips_commented_directive() {
+        let contents = r#"
+# music_directory "/wrong"
+music_directory "/var/lib/evo/music"
+"#;
+        assert_eq!(
+            parse_mpd_directive(contents, "music_directory"),
+            Some(PathBuf::from("/var/lib/evo/music"))
+        );
+    }
+
+    #[test]
+    fn returns_none_when_directive_absent() {
+        let contents = "playlist_directory \"/var/lib/mpd/playlists\"";
+        assert_eq!(parse_mpd_directive(contents, "music_directory"), None);
+    }
+
+    #[test]
+    fn returns_none_when_value_empty() {
+        let contents = "music_directory \"\"";
+        assert_eq!(parse_mpd_directive(contents, "music_directory"), None);
+    }
+
+    #[test]
+    fn first_non_comment_hit_wins() {
+        let contents = r#"
+music_directory "/first"
+music_directory "/second"
+"#;
+        assert_eq!(
+            parse_mpd_directive(contents, "music_directory"),
+            Some(PathBuf::from("/first"))
+        );
+    }
+}
 
 /// Canonical relative URL for an artwork target on the framework's
 /// HTTPS surface. Constructs the URL the operator UI consumes from
