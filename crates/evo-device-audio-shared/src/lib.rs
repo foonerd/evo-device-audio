@@ -18,6 +18,7 @@ use lofty::tag::Accessor;
 
 pub mod audio_ui_pack;
 pub mod terminus_loopback;
+pub mod transcode;
 pub mod transition_envelope;
 
 /// Default path to MPD's main configuration file on Linux. Used as

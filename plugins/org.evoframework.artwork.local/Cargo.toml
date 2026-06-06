@@ -32,23 +32,15 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Artwork transcoding: image decode + Lanczos3 resize + WebP
-# encode. The plugin owns the resize work so the framework
-# HTTPS surface stays thin (resolve + redirect).
-image = { workspace = true }
-# Lossy WebP encoder for resized variants. quality 82 — the
-# Roon-class default; perceptually identical to quality 95 at
-# thumbnail sizes; 40-60% bytes smaller than equivalent JPEG.
-webp = { workspace = true }
-# Stable content_hash for resized variants — SHA-256 truncated
-# / hex-encoded for the asset-cache key surface.
-sha2 = { workspace = true }
-hex = { workspace = true }
 # Base64 encode/decode for the artwork.resolve verb's
 # wire-shape response: the plugin writes bytes to the asset
 # cache and returns the content_hash; legacy in-process
 # callers may still read the path field.
 base64 = { workspace = true }
+# Transcode primitive (image decode + Lanczos3 resize + lossy
+# WebP encode + SHA-256 content_hash) lives in
+# evo-device-audio-shared so artwork.local and artwork.online
+# consume one production-validated pipeline.
 
 [dev-dependencies]
 tempfile = { workspace = true }

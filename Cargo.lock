@@ -1475,10 +1475,16 @@ name = "evo-device-audio-shared"
 version = "0.1.0"
 dependencies = [
  "evo-plugin-sdk",
+ "hex",
+ "image",
  "lofty",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "webp",
 ]
 
 [[package]]
@@ -2328,6 +2334,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -3509,9 +3516,29 @@ dependencies = [
  "base64",
  "evo-device-audio-shared",
  "evo-plugin-sdk",
+ "lofty",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "org-evoframework-artwork-online"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "evo-device-audio-shared",
+ "evo-plugin-sdk",
  "hex",
  "image",
- "lofty",
+ "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",
@@ -4462,6 +4489,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

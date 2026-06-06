@@ -1,0 +1,67 @@
+# In-process manifest for org.evoframework.artwork.online.
+#
+# Co-occupies the artwork.providers shelf with
+# org.evoframework.artwork.local: the two plugins partition the
+# shelf's verb set (this plugin owns `artwork.resolve_online`,
+# the local plugin owns `artwork.resolve`). Callers invoke
+# whichever cascade tier they want — local-first or online-first.
+# The framework's Stocking primitive enforces the partition.
+
+[plugin]
+name = "org.evoframework.artwork.online"
+version = "0.1.0"
+contract = 1
+
+[[stockings]]
+shelf = "artwork.providers"
+shape = 1
+role = "respondent"
+request_types = [
+    "artwork.resolve_online",
+]
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.13-rc.1"
+os_family = "linux"
+filesystem_scopes = []
+# The differentiator vs artwork.local: this plugin fetches
+# bytes from public artwork providers (Cover Art Archive
+# / Last.fm / iTunes / Volumio meta proxy). The framework's
+# admission gate refuses to load if the outbound network
+# capability is not granted at the distribution level.
+outbound_network = true
+
+[resources]
+# Resize + WebP encode of a worst-case 5 MB cover plus the
+# per-request HTTPS handshakes; matches the local plugin's
+# budget which already covers the same image-processing path.
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+# Operator-tunable state is the per-provider config (API keys,
+# enabled flag, UA, timeouts). A TOML edit triggers teardown +
+# re-admit; the plugin is stateless across requests so the
+# cycle is cheap.
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["artwork.resolve_online"]
+# Online providers respond within ~2-3s under good network
+# conditions; the budget allows for one slow upstream + the
+# transcode + asset-cache put.
+response_budget_ms = 15000

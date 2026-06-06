@@ -16,6 +16,20 @@ evo-plugin-sdk = { workspace = true }
 lofty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Artwork transcode pipeline: image decode + Lanczos3 resize +
+# WebP encode + SHA-256 content_hash. Shared so every artwork
+# provider plugin (local + online + future siblings) consumes
+# one production-validated primitive — single truth path for
+# size taxonomy, encoder quality, content_hash shape.
+thiserror = { workspace = true }
+image = { workspace = true }
+webp = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# tracing is already a workspace dep used by everything
+# downstream; declare here so the shared crate can log
+# resize / encode outcomes consistently.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

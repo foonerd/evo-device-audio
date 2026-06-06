@@ -131,6 +131,7 @@ fi
 #   <plugin-name>:<plugin-crate>:<wire-binary-name>:<features>
 OOP_PLUGINS=(
     "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire:"
+    "org.evoframework.artwork.online:org-evoframework-artwork-online:artwork-online-wire:"
     "org.evoframework.network:org-evoframework-network:network-wire:"
     "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
     "org.evoframework.hardware.audio-config:org-evoframework-hardware-audio-config:hardware-audio-config-wire:"

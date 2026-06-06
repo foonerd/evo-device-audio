@@ -1,0 +1,43 @@
+[package]
+name = "org-evoframework-artwork-online"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Online album-artwork respondent: Cover Art Archive (MusicBrainz), Last.fm, iTunes, Volumio meta cascade. Co-occupies the artwork.providers shelf with org.evoframework.artwork.local."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "artwork-online-wire"
+path = "src/bin/artwork-online-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+evo-device-audio-shared = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Outbound HTTPS for online artwork providers. rustls backend
+# matches the framework's existing TLS posture (no system OpenSSL
+# dependency on cross-build targets).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Stable content_hash + URL-safe artwork addressing.
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+# Image decode + Lanczos3 resize + WebP encode — same posture
+# as artwork.local, so the size taxonomy round-trip is shared.
+image = { workspace = true }
+webp = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

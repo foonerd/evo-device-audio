@@ -1,0 +1,18 @@
+schema_version: "1.0"
+plugin: org.evoframework.artwork.online
+owner: evo-device-audio
+isolation: oop
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.artwork.online/`. The
+# differentiator vs the local plugin: this one fetches artwork
+# from public providers over HTTPS. The framework's admission
+# gate enforces the outbound_network prerequisite declared in
+# the manifest; the capability_intent below records the
+# operator-readable intent for audit.
+
+capability_intent:
+  - id: outbound_https
+    need: fetch album artwork from public providers (Cover Art Archive / MusicBrainz, Last.fm, iTunes, Volumio meta proxy) when the local artwork cascade misses. All providers reached over HTTPS with operator-tunable per-provider enable/disable + API key configuration.
+    access_path: network/outbound_https
+    failure_mode: respond with structured not_found per cascade miss; never panic; honest log on per-provider error.
