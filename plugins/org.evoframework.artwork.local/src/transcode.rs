@@ -8,12 +8,13 @@
 //! validated primitive. Each plugin's request handler still
 //! sits in its own crate, but the bytes-to-cache-payload
 //! pipeline is shared.
+//!
+//! Only the items this crate actually names are re-exported:
+//! the `transcode` function (called from resolve.rs) and the
+//! `ArtworkSize` enum (constructed via its `parse` method and
+//! used as a parameter type). `TranscodedArtwork` is consumed
+//! via field access on the returned value rather than by name,
+//! so it does not appear here; `TranscodeError` flows through
+//! `?` into `String` and is not named directly either.
 
-pub(crate) use evo_device_audio_shared::transcode::{
-    transcode, ArtworkSize, TranscodeError,
-};
-
-// `TranscodedArtwork` is destructured directly by `resolve.rs`
-// when it constructs the cache payload; re-export it under the
-// same name so existing callers keep compiling.
-pub(crate) use evo_device_audio_shared::transcode::TranscodedArtwork;
+pub(crate) use evo_device_audio_shared::transcode::{transcode, ArtworkSize};
