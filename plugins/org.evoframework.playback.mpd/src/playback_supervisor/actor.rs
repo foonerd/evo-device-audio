@@ -324,19 +324,17 @@ pub(crate) async fn spawn(
 
     // Initial report: failure here means MPD is unusable, so bail
     // before spawning anything. The same query populates
-    // `last_emitted_file` so the supervisor task starts with an
-    // accurate "what has been announced already" state; a
-    // subsequent idle wake on the same song will not re-announce
-    // it.
-    let mut last_emitted_file: Option<String> = None;
-    // Per-session file-side source-format probe cache. Mirrors
-    // the ambient observer's cache: a non-empty value means
-    // "we already probed THIS file; another emit cycle on the
-    // same file is zero I/O." A track transition replaces the
-    // value AND drives an update_source_format (Some or None)
-    // so the stream_format envelope's `source` field never
+    // `file_tracker.emitted_file` so the supervisor task starts
+    // with an accurate "what has been announced already" state;
+    // a subsequent idle wake on the same song will not
+    // re-announce it. `file_tracker.probed_file` is the
+    // session's file-side source-format probe cache: a non-empty
+    // value means "we already probed THIS file; another emit
+    // cycle on the same file is zero I/O." A track transition
+    // replaces both values AND drives an `update_source_format`
+    // so the `stream_format` envelope's `source` field never
     // carries the prior track's shape into the new track.
-    let mut last_probed_file: Option<String> = None;
+    let mut file_tracker = FileEmissionTracker::default();
     // Sessions start unmuted with a 50% pre-mute fallback. A
     // first `set_mute(true)` will capture the live MPD volume
     // before silencing; `set_mute(false)` ahead of any prior
@@ -349,8 +347,7 @@ pub(crate) async fn spawn(
         &custody_handle,
         reporter.as_ref(),
         &subject_emitter,
-        &mut last_emitted_file,
-        &mut last_probed_file,
+        &mut file_tracker,
         music_directory.as_deref(),
         initial_muted,
     )
@@ -378,8 +375,7 @@ pub(crate) async fn spawn(
         custody_handle,
         reporter,
         subject_emitter,
-        last_emitted_file,
-        last_probed_file,
+        file_tracker,
         music_directory,
         muted: initial_muted,
         pre_mute_volume: initial_pre_mute_volume,
@@ -520,6 +516,29 @@ impl BackoffState {
 
 /// Per-task state for the main supervisor loop.
 ///
+/// Per-session emission and probe tracker.
+///
+/// Bundles the two `Option<String>` cross-call states that the
+/// emit functions read and update in lockstep: which MPD `file:`
+/// last triggered a `now_playing` envelope, and which `file:` the
+/// source-format probe last ran against. Pairing them here
+/// retires arg-count complexity at every call site and keeps the
+/// rule that the two values move together within one supervisor
+/// session.
+#[derive(Default)]
+struct FileEmissionTracker {
+    /// Last MPD `file:` value that triggered a `now_playing`
+    /// envelope emission. Gates duplicate-track suppression so
+    /// the emitter does not flood the subject with the same
+    /// envelope on every status poll.
+    emitted_file: Option<String>,
+    /// Last MPD `file:` value the source-format probe ran
+    /// against. Held so the `stream_format` envelope's `source`
+    /// field stays coherent across track transitions inside one
+    /// supervisor session.
+    probed_file: Option<String>,
+}
+
 /// Bundles every piece of state the run loop carries across
 /// iterations. Reduces what would otherwise be a ten-parameter
 /// free function to a single `self` plus the three channel
@@ -538,14 +557,11 @@ struct SupervisorTask {
     custody_handle: CustodyHandle,
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
-    last_emitted_file: Option<String>,
-    /// Per-session file-side source-format probe cache. Held
-    /// here (mirroring `last_emitted_file`) so the
-    /// stream_format envelope's `source` field stays coherent
-    /// across track transitions inside one supervisor session.
-    /// See [`super::ambient_observer::maybe_probe_source_format`]
-    /// for the shared probe + publish semantics.
-    last_probed_file: Option<String>,
+    /// Per-session emission and probe tracker; bundled so the
+    /// emit functions take one cross-call state handle instead
+    /// of two correlated `Option<String>` fields that are
+    /// always read and updated together.
+    file_tracker: FileEmissionTracker,
     /// MPD's music_directory at supervisor-spawn time. Used to
     /// resolve the absolute filesystem path of the current
     /// song for the head-bytes probe. `None` when the
@@ -628,8 +644,7 @@ impl SupervisorTask {
                                     &self.custody_handle,
                                     self.reporter.as_ref(),
                                     &self.subject_emitter,
-                                    &mut self.last_emitted_file,
-                                    &mut self.last_probed_file,
+                                    &mut self.file_tracker,
                                     self.music_directory.as_deref(),
                                     self.muted,
                                 ).await;
@@ -712,8 +727,7 @@ impl SupervisorTask {
                                 &self.custody_handle,
                                 self.reporter.as_ref(),
                                 &self.subject_emitter,
-                                &mut self.last_emitted_file,
-                                &mut self.last_probed_file,
+                                &mut self.file_tracker,
                                 self.music_directory.as_deref(),
                                 self.muted,
                             ).await;
@@ -1059,8 +1073,7 @@ async fn emit_initial_report(
     custody_handle: &CustodyHandle,
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
-    last_emitted_file: &mut Option<String>,
-    last_probed_file: &mut Option<String>,
+    file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
     muted: bool,
 ) -> Result<(), PlaybackError> {
@@ -1086,8 +1099,12 @@ async fn emit_initial_report(
             "initial state report delivery failed; spawn proceeds anyway"
         );
     }
-    maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
-        .await;
+    maybe_emit_subjects(
+        &song_for_emitter,
+        subject_emitter,
+        &mut file_tracker.emitted_file,
+    )
+    .await;
     let source_codec = song_for_emitter
         .as_ref()
         .and_then(|s| s.codec_name.as_deref());
@@ -1101,7 +1118,7 @@ async fn emit_initial_report(
     super::ambient_observer::maybe_probe_source_format(
         song_for_emitter.as_ref(),
         music_directory,
-        last_probed_file,
+        &mut file_tracker.probed_file,
         subject_emitter,
     )
     .await;
@@ -1114,8 +1131,7 @@ async fn emit_best_effort_report(
     custody_handle: &CustodyHandle,
     reporter: &dyn CustodyStateReporter,
     subject_emitter: &SubjectEmitter,
-    last_emitted_file: &mut Option<String>,
-    last_probed_file: &mut Option<String>,
+    file_tracker: &mut FileEmissionTracker,
     music_directory: Option<&std::path::Path>,
     muted: bool,
 ) {
@@ -1186,8 +1202,12 @@ async fn emit_best_effort_report(
             "state report delivery failed"
         );
     }
-    maybe_emit_subjects(&song_for_emitter, subject_emitter, last_emitted_file)
-        .await;
+    maybe_emit_subjects(
+        &song_for_emitter,
+        subject_emitter,
+        &mut file_tracker.emitted_file,
+    )
+    .await;
     let source_codec = song_for_emitter
         .as_ref()
         .and_then(|s| s.codec_name.as_deref());
@@ -1199,7 +1219,7 @@ async fn emit_best_effort_report(
     super::ambient_observer::maybe_probe_source_format(
         song_for_emitter.as_ref(),
         music_directory,
-        last_probed_file,
+        &mut file_tracker.probed_file,
         subject_emitter,
     )
     .await;

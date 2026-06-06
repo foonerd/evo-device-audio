@@ -309,11 +309,11 @@ async fn dispatch_refresh(
                     stored_playlist_handled = true;
                 }
             }
-            IdleSubsystem::Database | IdleSubsystem::Update => {
-                if !database_rehydrated {
-                    library::rehydrate_from_mpd(library, &mut conn).await;
-                    database_rehydrated = true;
-                }
+            IdleSubsystem::Database | IdleSubsystem::Update
+                if !database_rehydrated =>
+            {
+                library::rehydrate_from_mpd(library, &mut conn).await;
+                database_rehydrated = true;
             }
             _ => {
                 // Subsystem observed but not handled by the

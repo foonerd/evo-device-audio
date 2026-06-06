@@ -20,6 +20,7 @@
 //! keeps zero I/O so the parser is trivially testable against
 //! synthesised state payloads.
 
+#[cfg(any(test, feature = "alsa-substrate"))]
 use serde_json::Value;
 
 /// Whether the capture loop should emit the current FFT frame.
@@ -59,6 +60,12 @@ impl TransportGate {
 /// string `"playing"` opens the gate; every other value
 /// (including missing field, non-string value, unknown string)
 /// keeps the gate closed.
+///
+/// Gated on `alsa-substrate` because the only non-test
+/// consumer (`now_playing_subscriber`) is itself
+/// feature-gated. The unit tests below stay accessible to
+/// the default build via the standard `#[cfg(test)]` block.
+#[cfg(any(test, feature = "alsa-substrate"))]
 pub fn parse_from_state(state: &Value) -> TransportGate {
     match state.get("transport_state").and_then(Value::as_str) {
         Some("playing") => TransportGate::Playing,

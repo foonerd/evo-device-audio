@@ -584,6 +584,16 @@ pub(crate) struct MpdStickerMatch {
 /// Operator UI's browse view consumes the projected
 /// `BrowseEntry` shape on the wire; the plugin's library module
 /// translates these MPD-domain entries to the wire shape.
+///
+/// The variant-size difference is intentional. Entries are
+/// produced by the streaming `listallinfo` parser, projected to
+/// the wire `BrowseEntry`, and dropped — they never live past
+/// the request-handling call. Boxing the `File` variant would
+/// add one heap allocation per parsed track (1000+ on a typical
+/// library walk) for zero correctness benefit; the lint's
+/// optimisation pressure does not apply to short-lived
+/// projection types.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MpdLibraryEntry {
     /// A subdirectory under the queried path.

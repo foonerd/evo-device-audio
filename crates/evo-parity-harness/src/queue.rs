@@ -129,12 +129,7 @@ async fn discover_two_songs(wire: &mut Wire) -> Result<Vec<String>> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut taken = 0;
-        for entry in entries {
-            if taken >= DISCOVERY_MAX_BREADTH {
-                break;
-            }
-            taken += 1;
+        for entry in entries.into_iter().take(DISCOVERY_MAX_BREADTH) {
             let kind = entry.get("kind").and_then(Value::as_str);
             let uri = entry.get("uri").and_then(Value::as_str);
             match (kind, uri) {

@@ -965,12 +965,13 @@ impl MpdConnection {
     /// MPD's `listallinfo` itself).
     ///
     /// Wire form: `listallinfo "<path>"\n`. Empty path walks
-    /// the entire database. Used by the works-aggregation
-    /// path (`library.list_works` / `library.get_work_recordings`)
-    /// + the library-state counter computation (composer count,
-    /// distinct-works count, works-with-multiple-recordings
-    /// count). The walk visits every track once; for a 1134-
-    /// track library this is sub-second over the Unix socket.
+    /// the entire database. Used by the works-aggregation path
+    /// (`library.list_works` and `library.get_work_recordings`)
+    /// as well as the library-state counter computation
+    /// (composer count, distinct-works count, and the
+    /// works-with-multiple-recordings count). The walk visits
+    /// every track once; for a 1134-track library this is
+    /// sub-second over the Unix socket.
     ///
     /// MPD's response carries the full classical-tag set per
     /// entry, so the aggregation consumer sees Work / Composer
@@ -1825,6 +1826,11 @@ fn parse_library_entries(fields: &[Field]) -> Vec<MpdLibraryEntry> {
     out
 }
 
+/// In-flight accumulator paired with [`MpdLibraryEntry`]; see
+/// that type for the variant-size rationale (short-lived
+/// projection types in a streaming parser, allocating per
+/// entry harms the hot path with no upside).
+#[allow(clippy::large_enum_variant)]
 enum LibraryEntryBuilder {
     Directory {
         path: String,

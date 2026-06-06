@@ -249,9 +249,9 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
-    /// Capturing announcer for testing. Records every `announce`
-    /// + `update_state` call so tests can assert what the
-    /// production code emitted onto the wire.
+    /// Capturing announcer for testing. Records every
+    /// `announce` and `update_state` call so tests can assert
+    /// what the production code emitted onto the wire.
     struct CapturingAnnouncer {
         announced: Mutex<Vec<SubjectAnnouncement>>,
     }
@@ -409,8 +409,8 @@ mod tests {
         let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let corr = v["correlation"].as_array().expect("correlation is array");
         assert_eq!(corr.len(), BIN_COUNT);
-        for i in 0..BIN_COUNT {
-            assert!((corr[i].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        for sample in corr.iter().take(BIN_COUNT) {
+            assert!((sample.as_f64().unwrap() - 0.5).abs() < 1e-6);
         }
     }
 

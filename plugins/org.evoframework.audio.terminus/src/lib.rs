@@ -107,8 +107,8 @@ const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
 const TERMINUS_INPUT_PCM: &str = "hw:Loopback,1,7";
 
 /// Embedded in-process manifest. Production OOP path uses
-/// `manifest.oop.toml`; both share the same shelf + interaction
-/// + capabilities surface. Consumed by tests that assert the
+/// `manifest.oop.toml`; both share the same shelf, interaction,
+/// and capabilities surface. Consumed by tests that assert the
 /// describe() identity matches the manifest declaration.
 #[cfg(test)]
 const EMBEDDED_MANIFEST: &str = include_str!("../manifest.toml");
@@ -221,6 +221,9 @@ pub struct AudioTerminusPlugin {
 }
 
 impl AudioTerminusPlugin {
+    /// Construct an unloaded plugin. State is empty until
+    /// [`Plugin::load`] runs; calling any [`Respondent`] verb
+    /// before load returns [`PluginError::Permanent`].
     pub fn new() -> Self {
         Self {
             loaded: false,
@@ -544,7 +547,7 @@ mod tests {
         let desc = plugin.describe().await;
         let mf = parse_embedded_manifest();
         assert_eq!(desc.identity.name, mf.plugin.name);
-        assert_eq!(desc.identity.contract, mf.plugin.contract as u32);
+        assert_eq!(desc.identity.contract, mf.plugin.contract);
         assert!(!desc.runtime_capabilities.accepts_custody);
         // Every declared request type in the manifest must
         // appear in the runtime capabilities.

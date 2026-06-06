@@ -478,11 +478,13 @@ mod tests {
         album: Option<&str>,
         duration_ms: Option<u64>,
     ) -> MpdLibraryEntry {
-        let mut classical = ClassicalTags::default();
-        classical.composer = composer.map(String::from);
-        classical.work = work.map(String::from);
-        classical.conductor = conductor.map(String::from);
-        classical.original_date = original_date.map(String::from);
+        let classical = ClassicalTags {
+            composer: composer.map(String::from),
+            work: work.map(String::from),
+            conductor: conductor.map(String::from),
+            original_date: original_date.map(String::from),
+            ..Default::default()
+        };
         MpdLibraryEntry::File {
             path: path.to_string(),
             title: None,

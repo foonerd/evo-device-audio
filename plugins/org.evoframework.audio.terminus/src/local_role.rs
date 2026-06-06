@@ -23,6 +23,7 @@
 //! subject lives in `local_role_subscriber.rs`; this module
 //! keeps zero I/O so the parser is trivially testable.
 
+#[cfg(any(test, feature = "alsa-substrate"))]
 use serde_json::Value;
 
 /// Effective multi-room engagement role for the local node,
@@ -68,6 +69,12 @@ impl LocalRole {
 /// `"source"` / `"receiver"` / `"auto"`. Any unknown / missing
 /// / non-string value defaults to `Auto` (the permissive
 /// default — solo-device behaviour).
+///
+/// Gated on `alsa-substrate` because the only non-test
+/// consumer (`local_role_subscriber`) is itself
+/// feature-gated. The unit tests below stay accessible to
+/// the default build via the standard `#[cfg(test)]` block.
+#[cfg(any(test, feature = "alsa-substrate"))]
 pub fn parse_from_state(state: &Value) -> LocalRole {
     match state.get("role").and_then(Value::as_str) {
         Some("source") => LocalRole::Source,

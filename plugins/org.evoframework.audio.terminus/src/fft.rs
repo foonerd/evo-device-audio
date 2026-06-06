@@ -193,6 +193,12 @@ impl SpectrumAnalyser {
         }
     }
 
+    /// Return the precomputed FFT-bin band ranges this analyser
+    /// uses to project the BIN_COUNT-wide magnitude vector onto
+    /// the four perceptual bands published on the spectrum
+    /// subject. The ranges are sample-rate-derived at
+    /// construction and stable for the lifetime of this
+    /// instance.
     pub fn band_ranges(&self) -> BandRanges {
         self.bands
     }
