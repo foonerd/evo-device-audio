@@ -141,11 +141,18 @@ async fn run(
                         )
                         .await
                         {
-                            tracing::warn!(
+                            // Transient reconcile error with automatic
+                            // retry on the next source transition. Logged
+                            // at debug per LOGGING.md §2 because the
+                            // recovery path is intrinsic to this loop and
+                            // the operator has no action to take. WARN is
+                            // reserved for budget-exhausted or non-
+                            // recoverable conditions.
+                            tracing::debug!(
                                 plugin = crate::PLUGIN_NAME,
                                 source_id = %change.source_id,
                                 error = %e,
-                                "sticker reconcile failed; will retry on next transition"
+                                "sticker reconcile error; will retry on next transition"
                             );
                         }
                     }

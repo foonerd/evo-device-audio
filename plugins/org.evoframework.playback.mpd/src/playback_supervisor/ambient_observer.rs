@@ -201,10 +201,16 @@ async fn open_pair(
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
+                // Transient connect error during the bootstrap
+                // window (MPD's TCP listener not ready, socket
+                // reset, restart in flight). The caller retries on
+                // the next supervisor tick, so this is DEBUG per
+                // LOGGING.md §2 — the operator has no action while
+                // the recovery loop is healing.
+                tracing::debug!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "ambient observer: command-conn open failed; retrying"
+                    "ambient observer: command-conn open error; retrying"
                 );
                 return Err(());
             }
@@ -215,10 +221,12 @@ async fn open_pair(
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
+                // Same bootstrap-race contract as the command-conn
+                // path above; DEBUG with retry-on-next-tick.
+                tracing::debug!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "ambient observer: idle-conn open failed; retrying"
+                    "ambient observer: idle-conn open error; retrying"
                 );
                 return Err(());
             }

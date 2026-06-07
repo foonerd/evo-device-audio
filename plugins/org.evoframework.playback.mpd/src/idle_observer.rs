@@ -220,10 +220,18 @@ async fn run(
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        // Transient transport error (MPD restart,
+                        // socket reset, boot race before MPD's TCP
+                        // listener is ready). The reconnect path is
+                        // intrinsic to this loop — DEBUG per
+                        // LOGGING.md §2; the operator has no action
+                        // to take during the retry window. WARN is
+                        // reserved for budget-exhausted conditions
+                        // the recovery loop cannot self-heal.
+                        tracing::debug!(
                             plugin = crate::PLUGIN_NAME,
                             error = %e,
-                            "idle observer: idle dispatch failed; \
+                            "idle observer: idle dispatch error; \
                              dropping connection and reconnecting"
                         );
                         conn = None;
