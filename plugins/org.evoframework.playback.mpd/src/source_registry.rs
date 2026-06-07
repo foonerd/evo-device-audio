@@ -722,11 +722,11 @@ pub(crate) struct ProbeOutcome {
 ///   (the mount is OS-managed; the probe asserts the mount is
 ///   currently usable; mount-down surfaces as Offline).
 /// - `CloudGdrive` / `CloudOnedrive` / `NetworkDlna`: not
-///   probable from the framework today (substrate landing
-///   under v0.1.14 when the cloud-account / DLNA-discovery
-///   primitives compose). For these kinds the probe returns
-///   Probing until the substrate lands — acceptance row honesty
-///   over fabricated "probably online" claims.
+///   probable from the framework today (the cloud-account and
+///   DLNA-discovery substrate is a follow-on primitive). For
+///   these kinds the probe returns Probing until that substrate
+///   lands — acceptance row honesty over fabricated "probably
+///   online" claims.
 ///
 /// `budget` bounds the wall-clock time spent in the probe; on
 /// budget exhaustion the result is Degraded.

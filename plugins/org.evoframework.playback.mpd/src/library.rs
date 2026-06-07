@@ -18,8 +18,8 @@
 //! - `library.browse_library` — directory-tree walk; serves
 //!   stale cache when source is Offline.
 //! - `library.search_library` — query via MPD search/find or
-//!   the cloud native search (cloud substrate v0.1.14;
-//!   delegates to local for now).
+//!   the cloud native search (cloud substrate is a follow-on
+//!   primitive; this implementation delegates to local for now).
 //!
 //! # Catalogue acceptance rows honoured
 //!
@@ -950,8 +950,9 @@ pub(crate) async fn handle_search_library(
             }
             continue;
         }
-        // Skip cloud + DLNA — cloud-native search substrate is
-        // v0.1.14; for now those don't appear in the search.
+        // Skip cloud + DLNA — cloud-native search substrate is a
+        // follow-on primitive; for now those source kinds don't
+        // appear in the search results.
         if matches!(
             record.kind,
             SourceKind::CloudGdrive { .. }
