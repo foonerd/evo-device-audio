@@ -623,9 +623,10 @@ pub(crate) async fn handle_wake_source(
                 source_id: payload.source_id.clone(),
             }
         })?;
-    // Wake handler is type-dispatched. For v0.1.13 scope the
-    // cloud + DLNA substrate is not yet landed so wake for
-    // those returns passive-probe semantics.
+    // Wake handler is type-dispatched. The cloud + DLNA
+    // substrate is not yet landed in this crate, so wake for
+    // those source kinds returns passive-probe semantics
+    // (no side effects, the registry record is returned as-is).
     let woke = !matches!(
         record.kind,
         SourceKind::CloudGdrive { .. }
