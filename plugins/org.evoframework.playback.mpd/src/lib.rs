@@ -782,8 +782,8 @@ impl MpdPlaybackPlugin {
         // to match the legacy hard-coded behaviour. The framework's
         // `playback.options` policy plugin owns the operator-
         // facing surface; dynamic propagation rides the subject-
-        // state subscription wire-up (R-021 substrate already
-        // lit). Operators picking Hardware or None today set
+        // state subscription wire-up (framework substrate is
+        // already lit). Operators picking Hardware or None today set
         // [mixer_type] in /etc/evo/plugins.d/playback.mpd.toml
         // and bounce the steward.
         let mixer_cfg = mixer_config_from_toml(table)?;

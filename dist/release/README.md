@@ -1,13 +1,13 @@
 # dist/release/
 
-Release-cut tooling per ADR-0134. Three scripts, one gated flow.
+Release-cut tooling: three scripts, one gated flow that keeps a release cut from advancing until signed evidence exists for every install / reset primitive on every supported architecture.
 
 ## Files
 
-- `build-time-lint.sh` — item 3. Cross-checks structured sources (plugin manifests × dist/catalogue × dist/sudoers × known-target-binaries table). Refuses the release build on any violation.
-- `harness/run-primitive.sh` — item 4 (one primitive). Executes one install/reset primitive end-to-end on a target rig via SSH, retrieves the signed evidence record.
-- `harness/run-all.sh` — item 4 (orchestrator). Drives `run-primitive.sh` across every `(primitive × arch)` pair the release cut needs.
-- `preflight-cut.sh` — item 5. Consumes the signed evidence set and refuses to advance the release cut if anything is missing, stale, unsigned, or post-condition-mismatched.
+- `build-time-lint.sh` — build-time lint. Cross-checks structured sources (plugin manifests × dist/catalogue × dist/sudoers × known-target-binaries table). Refuses the release build on any contract violation.
+- `harness/run-primitive.sh` — validation harness (one primitive). Executes one install / reset primitive end-to-end on a target rig via SSH, retrieves the signed evidence record.
+- `harness/run-all.sh` — validation harness orchestrator. Drives `run-primitive.sh` across every `(primitive × arch)` pair the release cut needs.
+- `preflight-cut.sh` — release-cut preflight. Consumes the signed evidence set and refuses to advance the cut if anything is missing, stale, unsigned, or post-condition-mismatched.
 
 ## Evidence directory
 

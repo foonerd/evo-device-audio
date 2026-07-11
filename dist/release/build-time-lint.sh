@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dist/release/build-time-lint.sh
 #
-# Build-time lint pass per ADR-0134 item 3. Cross-checks the
+# Build-time lint pass. Cross-checks the
 # structured sources this distribution ships and refuses the build
 # if any contract violation is found:
 #
@@ -156,7 +156,7 @@ lint_sudoers_binaries() {
 
     # Canonical target-binary presence table. Each entry names a
     # binary that must exist on a supported target for a sudoers
-    # rule to be valid. The harness (item 4) cross-checks the
+    # rule to be valid. The validation harness cross-checks the
     # actual presence on running rigs; this lint pass catches
     # obvious typos + reference drift at build time by comparing
     # against the known-good set.

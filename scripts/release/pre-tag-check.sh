@@ -5,7 +5,7 @@
 #
 # Mirrors the evo-core-eng discipline: five workspace gates plus
 # two distribution-specific gates (catalogue-schemas alignment
-# preflight + ADR-0134 build-time lint).
+# preflight + the release-cut build-time lint).
 #
 # Run this immediately before `git tag <release>`. Exits 0 only
 # when every gate is clean.
@@ -84,7 +84,7 @@ else
 fi
 
 # -------------------------------------------------------------
-# Gate 5: catalogue-schemas alignment (R-009)
+# Gate 5: catalogue-schemas alignment (foot-lock preflight)
 # -------------------------------------------------------------
 
 log_step "Gate 5/7: scripts/preflight/check-catalogue-schemas-alignment.sh"
@@ -100,7 +100,7 @@ else
 fi
 
 # -------------------------------------------------------------
-# Gate 6: ADR-0134 build-time lint
+# Gate 6: the release-cut build-time lint
 # -------------------------------------------------------------
 
 log_step "Gate 6/7: dist/release/build-time-lint.sh"
@@ -135,8 +135,7 @@ cat >&2 <<'BANNER'
 
 Next steps:
   1. Run dist/release/harness/run-all.sh to produce signed
-     ADR-0134 evidence across every supported (primitive x arch)
-     pair.
+     evidence across every supported (primitive x arch) pair.
   2. Verify with dist/release/preflight-cut.sh.
   3. Mint the tag: v<MAJOR>.<MINOR>.<PATCH>[.<CLOSURE>][-<PRERELEASE>]
      Tag-format regex enforced at publish:

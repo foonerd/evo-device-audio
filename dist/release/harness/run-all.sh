@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dist/release/harness/run-all.sh
 #
-# Validation harness orchestrator per ADR-0134 item 4. Drives
+# Validation harness orchestrator. Drives
 # run-primitive.sh across every (primitive x arch) pair the release
 # cut requires, so `dist/release/preflight-cut.sh` finds complete
 # per-arch signed evidence for all four primitives.
@@ -10,12 +10,12 @@
 # each supported architecture. Format:
 #
 #   [rigs.aarch64-unknown-linux-gnu]
-#   host = "192.168.30.24"
-#   user = "evoproto"
+#   host = "<host-or-ip>"
+#   user = "<ssh-user>"
 #
 #   [rigs.x86_64-unknown-linux-gnu]
-#   host = "192.168.30.41"
-#   user = "evoproto"
+#   host = "<host-or-ip>"
+#   user = "<ssh-user>"
 #
 # The rig-map lives OUT-OF-REPO (rig IPs / hostnames are internal
 # and never checked in per project discipline).

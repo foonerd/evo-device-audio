@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # dist/release/harness/run-primitive.sh
 #
-# Validation harness runner per ADR-0134 item 4. Executes one
-# install/reset primitive end-to-end on a target rig via SSH,
-# captures the signed evidence file the rig-side evo-install.sh
-# writes, and stores it under
+# Validation harness runner. Executes one install/reset primitive
+# end-to-end on a target rig via SSH, captures the signed evidence
+# file the rig-side evo-install.sh writes, and stores it under
 # dist/release/evidence/<version>/<arch>/<primitive>.toml.
 #
-# The dist/release/preflight-cut.sh script (item 5) later verifies
-# these evidence files at release-cut time.
+# The dist/release/preflight-cut.sh script later verifies these
+# evidence files at release-cut time.
 #
 # One primitive per invocation. The orchestrator (run-all.sh)
 # fans out across primitives and arches by invoking this script

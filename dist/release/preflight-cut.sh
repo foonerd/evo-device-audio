@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # dist/release/preflight-cut.sh
 #
-# Release-cut preflight per ADR-0134. Refuses to advance a release
-# cut on foonerd/evo-device-audio (and analogous distribution repos)
+# Release-cut preflight. Refuses to advance a release cut on
+# foonerd/evo-device-audio (and analogous distribution repos)
 # until valid signed evidence exists for all four install/reset
 # primitives on every supported architecture.
 #
@@ -50,7 +50,7 @@ VERSION=""
 ARCHES=""
 EVIDENCE_DIR=""
 PUBLIC_KEY=""
-MAX_AGE_SECS=$((7 * 24 * 60 * 60))   # 7 days per ADR-0134
+MAX_AGE_SECS=$((7 * 24 * 60 * 60))   # 7 days: evidence older than this is refused as stale
 
 usage() {
     cat <<EOF >&2
@@ -61,7 +61,7 @@ Usage: $(basename "$0") \\
     --public-key <path-to-ed25519-public-pem>
 
 Refuses a release cut without valid signed evidence for all four
-primitives on every supported architecture. See ADR-0134.
+install/reset primitives on every supported architecture.
 EOF
     exit 1
 }

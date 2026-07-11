@@ -5,10 +5,9 @@
 # this distribution has a corresponding schema file in the
 # canonical `foonerd/evo-catalogue-schemas` repository.
 #
-# Closes RISKS.md R-009 (schemas-repo foot-lock not enforced).
-# Backfill of the v0.1.12-era 5-plugin gap was committed to the
-# schemas repo at `9cbf6a9` 2026-05-02; this preflight catches
-# any future drift before it ships.
+# Preflight-enforces the schemas-repo foot-lock. Catches drift
+# between shipped plugin manifests and the canonical schema set
+# before it lands in a distribution release.
 #
 # Mechanism:
 #
