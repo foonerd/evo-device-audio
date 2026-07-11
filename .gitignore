@@ -22,3 +22,6 @@ CLAUDE.local.md
 .zed/
 .junie/
 .github/copilot-instructions.md
+
+# Signed evidence records per ADR-0134 — runtime artefacts, never checked in.
+dist/release/evidence/
