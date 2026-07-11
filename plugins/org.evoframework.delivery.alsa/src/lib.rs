@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! # org-evoframework-delivery-alsa
 //!
 //! Delivery-stage plugin for the evo audio data plane. Owns the

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Multi-source network plugin for the evo framework.
 //!
 //! Stocks the `networking.link` shelf. Composes a unified reachability

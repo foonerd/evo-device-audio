@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! evo-parity-harness binary entry point.
 //!
 //! Connects to the steward's admin Unix socket and drives the

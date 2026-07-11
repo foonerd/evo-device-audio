@@ -54,6 +54,21 @@ fi
 log_ok "tests pass"
 
 # -------------------------------------------------------------
+# Gate 4a: SPDX headers on crates/ + plugins/
+# -------------------------------------------------------------
+
+log_step "Gate 4a/7: scripts/preflight/check-spdx-headers.sh"
+if [[ -x "${REPO_ROOT}/scripts/preflight/check-spdx-headers.sh" ]]; then
+    if ! bash "${REPO_ROOT}/scripts/preflight/check-spdx-headers.sh"; then
+        log_fail "SPDX header gate hit"
+        exit 1
+    fi
+else
+    log_fail "scripts/preflight/check-spdx-headers.sh missing"
+    exit 1
+fi
+
+# -------------------------------------------------------------
 # Gate 4: public-leak grep
 # -------------------------------------------------------------
 
@@ -90,7 +105,7 @@ fi
 
 log_step "Gate 6/7: dist/release/build-time-lint.sh"
 if [[ -x "${REPO_ROOT}/dist/release/build-time-lint.sh" ]]; then
-    if ! REPO_ROOT="${REPO_ROOT}" bash "${REPO_ROOT}/dist/release/build-time-lint.sh"; then
+    if ! env REPO_ROOT="${REPO_ROOT}" bash "${REPO_ROOT}/dist/release/build-time-lint.sh"; then
         log_fail "build-time-lint gate hit"
         exit 1
     fi

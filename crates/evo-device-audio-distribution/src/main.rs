@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! # evo-device-audio-distribution
 //!
 //! Reference audio-domain steward binary. Composes evo-core's

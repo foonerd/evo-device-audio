@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! # org-evoframework-hardware-audio-config
 //!
 //! Reference-device hardware-audio configuration plugin. Owns the
