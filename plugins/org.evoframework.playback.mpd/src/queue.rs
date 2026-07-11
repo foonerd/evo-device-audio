@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Queue shelf — verb handlers + `audio_queue` subject emitter.
 //!
 //! Realises the `audio.queue.v1` catalogue contract: full queue

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Playback commands and their failure classification.
 //!
 //! The warden receives high-level `CourseCorrection` values from

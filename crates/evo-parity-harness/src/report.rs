@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Structured per-case report.
 //!
 //! Every case the harness drives emits one [`CaseResult`] as

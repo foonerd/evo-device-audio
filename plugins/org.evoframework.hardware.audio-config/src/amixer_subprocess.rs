@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! `amixer cget` / `amixer cset` subprocess invocation +
 //! response parsing. Shared between board-class providers so the
 //! amixer interaction surface is one canonical runtime path.

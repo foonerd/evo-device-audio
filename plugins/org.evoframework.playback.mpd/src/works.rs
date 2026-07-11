@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Works browse aggregation + library state counter computation.
 //!
 //! Single source of truth for the `library.list_works` and

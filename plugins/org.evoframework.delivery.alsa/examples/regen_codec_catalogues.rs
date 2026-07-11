@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Regen example — rewrites the `[[hda_codecs]]` and
 //! `[[ac97_codecs]]` sections of `data/alsa-cards.toml` from
 //! the kernel source files checked into `data/import/`.

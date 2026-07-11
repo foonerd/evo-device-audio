@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Audio-terminus loopback wire-shape contract.
 //!
 //! The terminus plugin captures from `pcm.evo_terminus_tap`

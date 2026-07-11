@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Volumio JSON → evo-native catalog importer.
 //!
 //! Build-time / developer-runnable conversion from the frozen

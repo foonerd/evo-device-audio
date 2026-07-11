@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Raspberry Pi hardware-audio provider.
 //!
 //! Owns the dtoverlay block in the Pi's boot config

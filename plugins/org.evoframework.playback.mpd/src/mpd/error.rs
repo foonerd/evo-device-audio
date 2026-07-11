@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! MPD connection error hierarchy.
 //!
 //! Classified by cause so the warden can map failures to

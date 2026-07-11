@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! `metadata.query` v1: resolve tag metadata for a track or album subject (`mpd-path`, `mpd-album`).
 //! Response includes grouped fields for classical, credits, MusicBrainz, dates, and file properties.
 //!

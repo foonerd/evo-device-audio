@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Library-shelf parity round-trips.
 //!
 //! Drives every mutating verb on `audio.library` with safe

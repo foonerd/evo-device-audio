@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Favourites shelf — verb handlers + `audio_favourites`
 //! subject emitter.
 //!

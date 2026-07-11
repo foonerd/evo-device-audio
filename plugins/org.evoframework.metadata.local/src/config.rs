@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Operator configuration: library roots for MPD `file` paths (same convention as
 //! `org.evoframework.artwork.local`) and `metadata` response profile
 //! (see `docs/METADATA_QUERY_V1.md` — **Metadata profiles**).

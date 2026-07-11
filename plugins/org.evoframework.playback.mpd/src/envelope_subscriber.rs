@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Mixer-transition envelope subscriber for playback.mpd.
 //!
 //! The audio.options-shape orchestrator publishes the

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! MPD `audio_output` fragment renderer + atomic writer.
 //!
 //! Translates a framework-negotiated

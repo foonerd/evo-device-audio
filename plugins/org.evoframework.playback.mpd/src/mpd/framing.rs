@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Line-based framing over an async byte stream.
 //!
 //! Wraps a pair of `AsyncRead + AsyncWrite` halves with a

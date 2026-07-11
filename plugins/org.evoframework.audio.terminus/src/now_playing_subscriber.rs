@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Subscriber loop that watches the `audio_playback_now_playing`
 //! subject and pushes `TransportGate` updates to the capture
 //! loop's gate.

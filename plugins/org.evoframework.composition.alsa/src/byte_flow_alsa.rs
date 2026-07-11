@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! ALSA PCM substrate for the byte-flow worker.
 //!
 //! Compiled only when the `alsa-substrate` Cargo feature is

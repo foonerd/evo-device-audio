@@ -3028,7 +3028,7 @@ impl NmInner {
             }
         }
         steps.push(format!(
-            "warning: {} failed connection up after {} attempts",
+            "warning: {} did not come up after {} attempts",
             con_name, HOTSPOT_BRINGUP_ATTEMPTS
         ));
         false
@@ -3616,6 +3616,24 @@ impl NmInner {
         &self,
     ) -> Result<(), PluginError> {
         let intent = self.load_intent().await?;
+
+        // Precondition check: if the operator has not configured a
+        // wifi.sta_ssid the supervisor has no target to restore. A
+        // Wi-Fi role declared without an SSID is a legitimate
+        // operator configuration (device-with-no-Wi-Fi-fallback,
+        // Ethernet-only deployment) — the action is a no-op in that
+        // case, not an error. Historically this path returned a
+        // permanent PluginError which the supervisor logged at
+        // ERROR level containing the substring "failed", tripping
+        // the zero-fail-in-logs discipline on every cadence.
+        if intent.wifi.sta_ssid.trim().is_empty() {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "supervisor: autonomous STA-restore skipped — wifi.sta_ssid not configured (Ethernet-only intent)"
+            );
+            return Ok(());
+        }
+
         let sta_psk_path = self.sta_psk_path()?;
         let ap_psk_path = self.ap_psk_path()?;
         let sta_psk = self
@@ -3674,7 +3692,7 @@ impl NmInner {
             ])
             .await;
         steps.push(format!(
-            "critical: Ethernet no carrier + hotspot failed; forced open AP on {}",
+            "critical: Ethernet no-carrier persisted past grace; forcing open AP fallback on {}",
             hs_name
         ));
         Ok(self

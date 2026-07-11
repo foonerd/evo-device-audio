@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Long-lived MPD connection.
 //!
 //! One [`MpdConnection`] wraps one logical connection to an MPD

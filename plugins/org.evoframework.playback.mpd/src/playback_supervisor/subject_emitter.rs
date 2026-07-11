@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Subject and relation emission from MPD playback state.
 //!
 //! The playback warden announces `track` and `album` subjects and

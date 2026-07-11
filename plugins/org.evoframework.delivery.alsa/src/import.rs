@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Build-time codec-catalogue importers.
 //!
 //! Scrapes the Linux kernel's HDA + AC97 codec identification

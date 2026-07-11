@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Ambient now-playing state observer.
 //!
 //! Runs unconditionally for the plugin's load lifetime — does

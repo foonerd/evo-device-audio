@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Sticker reconciler — keeps MPD's `evo:available` sticker in
 //! lockstep with the source registry's per-source state machine.
 //!

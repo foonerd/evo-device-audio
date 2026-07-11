@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Tier 2 audio-reference shelves + widget kinds.
 //!
 //! The framework owns Tier 1 universals (`evo.prompt.*`,

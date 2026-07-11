@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Embedded cover art via [`lofty`] (ID3, Vorbis, MP4, …).
 
 use std::collections::hash_map::DefaultHasher;

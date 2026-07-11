@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 // FFT + mel-scale binning + perceptual signals — math-heavy
 // numerical code with explicit indexed loops; clippy's
 // needless_range_loop lint suggests iterator forms that obscure

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! MPD daemon restart strategy.
 //!
 //! After re-writing the framework-controlled `audio_output`

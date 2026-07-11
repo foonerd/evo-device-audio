@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! MPD server endpoint specification.
 //!
 //! Two transports are supported: TCP for remote MPD instances and the

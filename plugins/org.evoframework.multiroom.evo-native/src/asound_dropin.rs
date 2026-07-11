@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Runtime ALSA drop-in lifecycle for multi-room source mode.
 //!
 //! When the plugin engages source role on a live group it writes

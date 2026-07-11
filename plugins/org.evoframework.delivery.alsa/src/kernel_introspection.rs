@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Kernel runtime introspection — Layer 1 of the four-layer
 //! audio-card identification pipeline (per the kernel-introspection-authoritative discipline).
 //!

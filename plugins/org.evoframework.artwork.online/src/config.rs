@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Operator configuration for the artwork.online plugin.
 //!
 //! Per-provider enable/disable + API keys + HTTP user-agent +

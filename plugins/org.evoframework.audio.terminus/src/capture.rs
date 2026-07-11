@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! ALSA capture loop.
 //!
 //! Opens the configured input PCM (default `hw:Loopback,1,7`),

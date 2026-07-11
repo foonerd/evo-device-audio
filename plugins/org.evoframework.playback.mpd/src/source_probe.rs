@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! File-side source-format probe.
 //!
 //! Reads the head of a music file from MPD's library and parses

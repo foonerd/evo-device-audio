@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Subscriber loop that watches the singleton
 //! `audio_multiroom_local_role` subject and pushes `LocalRole`
 //! updates to the capture loop's leader-of-active-group gate.

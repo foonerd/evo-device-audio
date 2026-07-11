@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! DSP capability resolver — live-hardware-truth + presentation
 //! enrichment producing the operator-facing per-DAC DSP control
 //! set.

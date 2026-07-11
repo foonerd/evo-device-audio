@@ -131,6 +131,15 @@ pub struct SupervisorView {
     /// the current reachability state. Used to gate the
     /// critical-recovery trigger.
     pub state_ticks: u32,
+    /// `true` once the supervisor has observed at least one
+    /// serviceable reachability transition since it started.
+    /// Distinguishes boot-transient no-carrier ("interface has
+    /// never come up") from post-run-time carrier loss
+    /// ("interface went down after being up"). When `false` the
+    /// critical-recovery trigger applies `boot_transient_grace_ms`
+    /// instead of `critical_grace_ms` so slow-autoneg NICs
+    /// finishing bring-up do not trip a spurious recovery.
+    pub ever_serviceable: bool,
 }
 
 /// Connectivity-probe mode. Selects what the on-trigger
@@ -165,7 +174,24 @@ pub struct SupervisorConfig {
     pub interval_ms: u64,
     /// How long the supervisor must observe `Offline` before
     /// firing the critical-recovery action. Default 30 000 ms.
+    ///
+    /// Applies only after the supervisor has observed at least
+    /// one serviceable transition (see `ever_serviceable`). Before
+    /// the first serviceable observation the state machine treats
+    /// the observed `Offline` as a boot-transient state — an interface
+    /// that has never come up cannot be said to have "gone down" — and
+    /// applies `boot_transient_grace_ms` instead so a slow-autoneg NIC
+    /// or a wireless interface still finishing association gets time
+    /// to complete without a spurious critical-recovery firing.
     pub critical_grace_ms: u64,
+    /// Grace applied to sustained `Offline` when the supervisor has
+    /// not yet observed any serviceable state (i.e. we are still in
+    /// the boot-transient window since the supervisor's own start).
+    /// Default 300 000 ms (5 minutes) — long enough for typical
+    /// Ethernet autoneg + Wi-Fi association on slow SBC hardware, but
+    /// still short enough that a genuinely offline device eventually
+    /// gets its recovery hotspot raised.
+    pub boot_transient_grace_ms: u64,
     /// How long the supervisor must observe `Online` / `Limited`
     /// after a critical-recovery before firing the STA-restore
     /// action. Default 15 000 ms.
@@ -203,6 +229,12 @@ impl SupervisorConfig {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .filter(|v| *v >= 1000)
                 .unwrap_or(30_000);
+        let boot_transient_grace_ms =
+            std::env::var("EVO_NETWORK_SUPERVISOR_BOOT_TRANSIENT_GRACE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v >= 1000)
+                .unwrap_or(300_000);
         let restore_grace_ms =
             std::env::var("EVO_NETWORK_SUPERVISOR_RESTORE_GRACE_MS")
                 .ok()
@@ -236,6 +268,7 @@ impl SupervisorConfig {
         Self {
             interval_ms,
             critical_grace_ms,
+            boot_transient_grace_ms,
             restore_grace_ms,
             probe_kind,
             probe_url,
@@ -328,14 +361,38 @@ pub fn step(
         portal = None;
     }
 
+    // Track whether the supervisor has EVER observed a serviceable
+    // reachability transition since starting. This distinguishes:
+    //
+    //   (a) Boot-transient no-carrier — interface has never come up
+    //       yet since supervisor start; an in-progress NIC autoneg
+    //       or Wi-Fi association is not a "critical" state and MUST
+    //       NOT trigger the fallback hotspot on a normal grace window.
+    //
+    //   (b) Post-run-time no-carrier — interface came up, ran, then
+    //       lost carrier; this IS a genuine recovery signal and the
+    //       standard `critical_grace_ms` applies.
+    //
+    // See `ever_serviceable` field docstring.
+    let ever_serviceable =
+        prev.ever_serviceable || reachability.is_serviceable();
+
     // Critical-recovery trigger: Offline persisting longer than
-    // the grace window AND no recovery already active.
+    // the grace window AND no recovery already active. When the
+    // supervisor has never observed a serviceable state we apply
+    // the longer `boot_transient_grace_ms` so slow-autoneg NICs
+    // complete before a spurious recovery fires.
     let ticks_per_grace = ticks_to_cover(state_ticks, &reachability, config);
+    let effective_grace_ms = if ever_serviceable {
+        config.critical_grace_ms
+    } else {
+        config.boot_transient_grace_ms
+    };
     let mut decision = SupervisorDecision::NoAction;
     let mut critical = prev.critical_recovery_active;
     if !critical
         && reachability == ReachabilityState::Offline
-        && ticks_per_grace.offline_ms >= config.critical_grace_ms
+        && ticks_per_grace.offline_ms >= effective_grace_ms
     {
         decision = SupervisorDecision::RaiseCriticalRecovery;
         critical = true;
@@ -353,6 +410,7 @@ pub fn step(
         portal,
         critical_recovery_active: critical,
         state_ticks,
+        ever_serviceable,
     };
     (view, decision)
 }
@@ -810,10 +868,14 @@ mod tests {
         };
         // Build a starting view that already saw two offline
         // ticks (so the third tick crosses the 3s grace).
+        // `ever_serviceable = true` so this is a post-run-time
+        // no-carrier state, not a boot-transient — the standard
+        // `critical_grace_ms` applies.
         let prev = SupervisorView {
             reachability: ReachabilityState::Offline,
             state_ticks: 2,
             critical_recovery_active: false,
+            ever_serviceable: true,
             ..Default::default()
         };
         let (view, dec) = step(&prev, obs_offline(), &config);
@@ -821,6 +883,76 @@ mod tests {
         assert_eq!(view.state_ticks, 3);
         assert!(view.critical_recovery_active);
         assert_eq!(dec, SupervisorDecision::RaiseCriticalRecovery);
+    }
+
+    #[test]
+    fn step_suppresses_critical_recovery_during_boot_transient() {
+        // Boot-transient no-carrier: `ever_serviceable` is false
+        // and Offline persists past `critical_grace_ms` but has
+        // NOT reached `boot_transient_grace_ms`. The state machine
+        // must NOT raise critical-recovery on this cadence — an
+        // interface that has never come up yet cannot be said to
+        // have "gone down".
+        let config = SupervisorConfig {
+            interval_ms: 1000,
+            critical_grace_ms: 3000,
+            boot_transient_grace_ms: 300_000,
+            ..SupervisorConfig::default()
+        };
+        let prev = SupervisorView {
+            reachability: ReachabilityState::Offline,
+            state_ticks: 2,
+            critical_recovery_active: false,
+            ever_serviceable: false,
+            ..Default::default()
+        };
+        let (view, dec) = step(&prev, obs_offline(), &config);
+        assert_eq!(view.reachability, ReachabilityState::Offline);
+        assert_eq!(view.state_ticks, 3);
+        assert!(!view.critical_recovery_active);
+        assert_eq!(dec, SupervisorDecision::NoAction);
+    }
+
+    #[test]
+    fn step_raises_critical_recovery_after_boot_transient_grace_when_never_serviceable(
+    ) {
+        // Boot-transient no-carrier that has persisted past even
+        // the longer `boot_transient_grace_ms` window. A genuinely
+        // stuck device eventually gets its recovery hotspot raised.
+        let config = SupervisorConfig {
+            interval_ms: 1000,
+            critical_grace_ms: 3000,
+            boot_transient_grace_ms: 3000,
+            ..SupervisorConfig::default()
+        };
+        let prev = SupervisorView {
+            reachability: ReachabilityState::Offline,
+            state_ticks: 2,
+            critical_recovery_active: false,
+            ever_serviceable: false,
+            ..Default::default()
+        };
+        let (view, dec) = step(&prev, obs_offline(), &config);
+        assert_eq!(view.state_ticks, 3);
+        assert!(view.critical_recovery_active);
+        assert_eq!(dec, SupervisorDecision::RaiseCriticalRecovery);
+    }
+
+    #[test]
+    fn step_marks_ever_serviceable_on_first_serviceable_transition() {
+        // The first serviceable observation flips `ever_serviceable`
+        // to true and persists across subsequent transitions.
+        let config = SupervisorConfig::default();
+        let prev = SupervisorView {
+            reachability: ReachabilityState::Offline,
+            ever_serviceable: false,
+            ..Default::default()
+        };
+        let (view, _) = step(&prev, obs_online(), &config);
+        assert!(view.ever_serviceable);
+
+        let (view2, _) = step(&view, obs_offline(), &config);
+        assert!(view2.ever_serviceable);
     }
 
     #[test]

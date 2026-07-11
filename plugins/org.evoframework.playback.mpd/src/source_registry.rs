@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Source registry — typed, reachability-aware library sources.
 //!
 //! Owns the set of registered library sources (local-internal,

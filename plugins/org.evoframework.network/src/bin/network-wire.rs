@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Out-of-process wire binary for `org.evoframework.network`.
 
 #![forbid(unsafe_code)]

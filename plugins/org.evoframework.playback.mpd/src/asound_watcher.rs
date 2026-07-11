@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! `/etc/asound.d/` watcher.
 //!
 //! The plugin's `snd_pcm_t` handle for `pcm.evo` is opened once

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Playback supervisor actor.
 //!
 //! Long-lived orchestrator that holds two [`MpdConnection`]s for

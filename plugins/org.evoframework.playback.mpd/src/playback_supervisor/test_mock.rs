@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Shared test fixtures for the `playback_supervisor` module and
 //! its consumers.
 //!

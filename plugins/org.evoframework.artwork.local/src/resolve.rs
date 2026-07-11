@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! `artwork.resolve` JSON payload, sidecar file discovery, and embedded tags.
 //!
 //! Request `target` uses the same `scheme` / `value` shape as

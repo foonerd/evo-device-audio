@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Byte-flow worker substrate.
 //!
 //! The composition plugin's reactor (in the parent module)

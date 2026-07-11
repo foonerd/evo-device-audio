@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Idle-subprotocol observer.
 //!
 //! Subscribes to MPD's `idle` subprotocol on a dedicated long-

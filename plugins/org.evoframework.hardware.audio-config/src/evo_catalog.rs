@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Evo-native audio-hardware catalog — types + parser.
 //!
 //! The runtime catalog source-of-truth is `data/evo-catalog.toml`,

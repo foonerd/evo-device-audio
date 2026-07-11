@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Transport-state gate.
 //!
 //! The plugin's contract is that spectrum emission is silent

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Mixer-transition envelope coordination types + shared
 //! parse / build helpers for the two paired subjects:
 //!

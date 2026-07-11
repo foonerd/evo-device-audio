@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Regenerate `data/evo-catalog.toml` from the frozen Volumio
 //! sources under `data/import/`. Developer-runnable binary; the
 //! runtime never invokes this.

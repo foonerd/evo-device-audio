@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Disposition emitter — publishes typed autonomous-decision
 //! records to the `audio_playback_disposition` subject + maintains
 //! a durable ring buffer for operator-inspectable audit trail.

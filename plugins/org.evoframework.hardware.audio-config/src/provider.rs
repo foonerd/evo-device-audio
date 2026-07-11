@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Hardware-audio provider trait + types.
 //!
 //! The plugin's domain logic is board-class-agnostic: it owns the

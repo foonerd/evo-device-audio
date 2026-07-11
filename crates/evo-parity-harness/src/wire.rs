@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Wire client for the steward's admin Unix socket.
 //!
 //! The steward listens on `/run/evo/evo.sock` and speaks

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! State reports emitted by the playback supervisor.
 //!
 //! The report struct mirrors the narrow MPD status shape the

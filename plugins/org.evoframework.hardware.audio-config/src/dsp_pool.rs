@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Curated DSP control pool — types + loader.
 //!
 //! The pool is the middle layer of the three-layer DSP capability

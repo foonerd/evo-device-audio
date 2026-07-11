@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Operator configuration: library roots to resolve MPD `file` relative paths
 //! against local storage, matching paths reported by
 //! `org.evoframework.playback.mpd` (see `LoadContext::config`).

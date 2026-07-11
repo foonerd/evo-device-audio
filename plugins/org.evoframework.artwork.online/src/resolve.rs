@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! `artwork.resolve_online` request handler.
 //!
 //! Walks the online provider cascade (CAA → Last.fm → iTunes →

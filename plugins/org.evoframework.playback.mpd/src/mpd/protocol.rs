@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! MPD wire protocol: command serialisation and response parsing.
 //!
 //! This module is transport-agnostic. It operates on byte strings

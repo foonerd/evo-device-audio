@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
 //! Spectrum subject emitter + payload rendering.
 //!
 //! Owns the wire-side projection of the FFT module's
