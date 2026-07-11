@@ -10,7 +10,7 @@ Contributor workflow for the audio-domain plugin commons.
 ## Prerequisites
 
 -   Rust **1.85** or newer, matching the workspace `rust-version` (same MSRV as evo-core).
--   Network access for the SDK pin. `[workspace.dependencies]` resolves `evo-plugin-sdk` from `git = "https://github.com/foonerd/evo-core.git"` at `tag = "v0.1.9"`. No sibling clone required.
+-   `[workspace.dependencies]` resolves `evo-plugin-sdk` via a `path = "..."` dependency on the sibling `evo-core-eng` working tree during eng-side development; at release-cut time the pin flips to `git = "...evo-core.git", tag = "..."` against the matching published framework tag. Consumers building outside the eng workspace clone the sibling first.
 -   Cross-compile prerequisites if building for `aarch64-unknown-linux-gnu` locally: Docker, [`cross`](https://github.com/cross-rs/cross).
 
 ## Workspace conventions

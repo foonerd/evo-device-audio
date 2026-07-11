@@ -101,7 +101,7 @@ Three brand-neutral audio plugins live in this repository, signed by the evo pro
 
 A workspace-internal shared crate, `evo-device-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
 
-`evo-core` is pinned at tag `v0.1.9` via `[workspace.dependencies]` in `Cargo.toml`. Bumps are deliberate; see [DEVELOPING.md](DEVELOPING.md) for the procedure.
+`evo-core` is consumed via `[workspace.dependencies]` in `Cargo.toml`. During eng-side development the pin is a `path = "..."` dependency on the sibling `evo-core-eng` working tree; at release-cut time it flips to `git = "...evo-core.git", tag = "..."` against the matching published framework tag before the branch merges to main. See [DEVELOPING.md](DEVELOPING.md) for the flip procedure.
 
 ## For other domains
 
