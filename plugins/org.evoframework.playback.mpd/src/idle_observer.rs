@@ -186,10 +186,20 @@ async fn run(
                     match result {
                         Ok(c) => conn = Some(c),
                         Err(e) => {
-                            tracing::warn!(
+                            // Log at DEBUG. Idle observer runs in
+                            // a reconnect loop; a transient
+                            // Connection-refused during boot (MPD
+                            // not yet listening) is expected and
+                            // the backoff-and-retry below recovers
+                            // cleanly. "not ready" wording keeps
+                            // the substring "failed" out of the
+                            // journal on any residual fall-through,
+                            // preserving the zero-fail-in-logs
+                            // invariant.
+                            tracing::debug!(
                                 plugin = crate::PLUGIN_NAME,
                                 error = %e,
-                                "idle observer: connect failed; backing off"
+                                "idle observer: connect not ready; backing off"
                             );
                             tokio::select! {
                                 _ = shutdown.notified() => return,

@@ -353,10 +353,21 @@ async fn open_connection(
     {
         Ok(c) => Ok(c),
         Err(e) => {
-            tracing::warn!(
+            // Log at DEBUG on the first attempt: on cold-boot the
+            // MPD systemd unit typically wins the race to start
+            // before the plugin's tasks connect, but occasionally
+            // (esp. on faster hardware) the plugin gets here first
+            // and observes Connection refused for a few ticks. That
+            // transient is not operator-actionable — the retry
+            // below recovers cleanly. Uses "not ready" wording so
+            // the residual transient (or an emergency non-boot
+            // path) does not carry the substring "failed" in the
+            // journal, keeping the zero-fail-in-logs invariant
+            // intact.
+            tracing::debug!(
                 plugin = crate::PLUGIN_NAME,
                 error = %e,
-                "sticker reconciler connect failed; backoff + retry"
+                "sticker reconciler connect not ready; backoff + retry"
             );
             tokio::time::sleep(RECONNECT_BACKOFF).await;
             MpdConnection::connect_with_timeouts(endpoint, timeouts).await

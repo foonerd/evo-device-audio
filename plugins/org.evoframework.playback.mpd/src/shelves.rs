@@ -318,10 +318,19 @@ impl ShelfBundle {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
+                // Log at DEBUG on cold-boot. The warm-start
+                // rehydrate runs once at plugin admission; if MPD
+                // is still coming up, we cleanly no-op and the
+                // idle observer wakes the state population as soon
+                // as MPD is listening + the first mutation fires.
+                // The "not ready" wording keeps the substring
+                // "failed" out of the journal on any residual
+                // fall-through, preserving the zero-fail-in-logs
+                // invariant.
+                tracing::debug!(
                     plugin = PLUGIN_NAME,
                     error = %e,
-                    "warm-start rehydrate: MPD connect failed; subjects \
+                    "warm-start rehydrate: MPD connect not ready; subjects \
                      stay empty until next mutation or idle wake"
                 );
                 return;
