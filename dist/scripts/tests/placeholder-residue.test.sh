@@ -114,24 +114,6 @@ if [[ -d "$DIST_DIR/sudoers.d" ]]; then
     fi
 fi
 
-# Fixture: dist/systemd/evo.service.d/*.in — every template
-# carries at least one @EVO_SERVICE_USER@ placeholder.
-# Iterate over the directory so an added template is
-# exercised automatically, matching the sudoers.d pattern.
-if [[ -d "$DIST_DIR/systemd/evo.service.d" ]]; then
-    found_any=0
-    for tmpl in "$DIST_DIR/systemd/evo.service.d/"*.in; do
-        [[ -f "$tmpl" ]] || continue
-        found_any=1
-        assert_residue_detected \
-            "$(basename "$tmpl") carries a placeholder" \
-            "$(cat "$tmpl")"
-    done
-    if [[ $found_any -eq 0 ]]; then
-        echo "SKIP  no *.in templates under dist/systemd/evo.service.d (none to check)"
-    fi
-fi
-
 # Fixture: dist/plugins.d/org.evoframework.multiroom.evo-native.toml.in
 # carries multiple placeholders. The regex must catch all of
 # them, not just one.

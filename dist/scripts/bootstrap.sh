@@ -191,64 +191,23 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Resolve the steward service user. Precedence:
-#   1. Operator override via --service-user / EVO_SERVICE_USER
-#      (may name either an existing account or one this
-#      script should create).
-#   2. First non-system login account (uid >= 1000 < 65534) —
-#      appliance-class default matching the framework's
-#      PLUGIN_PACKAGING.md convention for boxes brought up
-#      with an operator login already provisioned.
-#   3. Canonical `evo` system tenant, created here — the
-#      fresh-OS fallback so an unattended install path
-#      (minimum OS with only root) still produces an
-#      unprivileged steward tenant. Refusing to fall back
-#      to root is the point: the steward must NOT run as
-#      root once the installer completes.
+# Resolve the steward service user. Operator override wins;
+# otherwise pick the appliance-class default (operator's
+# first user at uid >= 1000), matching the convention in
+# the framework's PLUGIN_PACKAGING.md.
 if [[ -z "$SERVICE_USER" ]]; then
     SERVICE_USER="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }')"
     if [[ -z "$SERVICE_USER" ]]; then
-        SERVICE_USER="evo"
-        echo "[bootstrap] no login account present; provisioning canonical system tenant \`$SERVICE_USER\`"
+        echo "could not resolve service user (no uid >= 1000 found); pass --service-user <name>" >&2
+        exit 1
     fi
 fi
 echo "[bootstrap] service user: $SERVICE_USER"
 
-# Provision the account when it does not yet exist. The
-# tenant is a locked-shell system user with the state
-# directory as its home; login as the tenant is not part of
-# the operator flow. `useradd -U` creates the personal group
-# alongside so `Group=$SERVICE_USER` in the systemd drop-in
-# resolves.
+# Verify the user exists.
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    if ! command -v useradd >/dev/null 2>&1; then
-        echo "cannot create service user $SERVICE_USER: useradd(8) not on PATH" >&2
-        echo "  (install shadow-utils / passwd-tools, or pre-create the account and re-run)" >&2
-        exit 1
-    fi
-    install -d -m 0750 -o root -g root /var/lib/evo
-    useradd --system --user-group \
-        --home-dir /var/lib/evo --no-create-home \
-        --shell /usr/sbin/nologin \
-        --comment "evo device steward tenant" \
-        "$SERVICE_USER"
-    echo "[bootstrap] created system tenant $SERVICE_USER (uid=$(id -u "$SERVICE_USER"))"
-fi
-
-# Ensure the tenant is in the `audio` group — required for
-# ALSA device access (/dev/snd/*). `usermod -aG` is
-# idempotent: adding an already-member is a no-op. The
-# `audio` group is provisioned by every mainstream Linux
-# distribution's alsa-utils package; if it is missing this
-# system is not a valid audio target.
-if ! getent group audio >/dev/null 2>&1; then
-    echo "[bootstrap] FAIL: group \`audio\` does not exist on this host" >&2
-    echo "  (install alsa-utils; the steward cannot open ALSA devices without it)" >&2
+    echo "service user $SERVICE_USER does not exist" >&2
     exit 1
-fi
-if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx audio; then
-    usermod -aG audio "$SERVICE_USER"
-    echo "[bootstrap] added $SERVICE_USER to group audio"
 fi
 
 # Resolve the systemctl binary.
@@ -467,34 +426,6 @@ fi
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; then
     install -d -m 0755 "$SYSTEMD_DROPIN_DIR"
-
-    # service-user.conf: the load-bearing tenant-identity
-    # drop-in. Rendered from a `.in` template so the
-    # resolved SERVICE_USER lands as-installed rather than
-    # via a runtime environment lookup (systemd unit values
-    # are static). Without this drop-in the framework
-    # reference unit runs as root, invalidating every
-    # scoped sudoers grant this distribution ships.
-    SU_TEMPLATE="$DIST_DIR/systemd/evo.service.d/service-user.conf.in"
-    if [[ ! -f "$SU_TEMPLATE" ]]; then
-        echo "systemd drop-in template not found at $SU_TEMPLATE" >&2
-        exit 2
-    fi
-    SU_TMP="$(mktemp)"
-    trap 'rm -f "$SU_TMP"' EXIT
-    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" "$SU_TEMPLATE" > "$SU_TMP"
-    if grep -q '@EVO_SERVICE_USER@' "$SU_TMP"; then
-        echo "rendered service-user.conf still carries placeholder; refusing to install" >&2
-        rm -f "$SU_TMP"
-        trap - EXIT
-        exit 2
-    fi
-    install -m 0644 -o root -g root "$SU_TMP" \
-        "$SYSTEMD_DROPIN_DIR/service-user.conf"
-    rm -f "$SU_TMP"
-    trap - EXIT
-    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/service-user.conf (User=$SERVICE_USER Group=$SERVICE_USER SupplementaryGroups=audio)"
-
     install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/exec-start.conf" \
         "$SYSTEMD_DROPIN_DIR/exec-start.conf"
@@ -527,33 +458,6 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
 
     "$SYSTEMCTL_BIN" daemon-reload
     echo "[bootstrap] systemctl daemon-reload"
-
-    # Reconcile state-directory ownership with the tenant
-    # named in service-user.conf. On a first install the
-    # StateDirectory=evo directive in the base unit creates
-    # /var/lib/evo owned by the tenant; on an upgrade from
-    # an earlier root-steward install the directory already
-    # exists owned by root and systemd will NOT chown it on
-    # restart (StateDirectory= applies only at directory
-    # CREATION time). Without this chown the new tenant
-    # cannot read its own signing key, subject state,
-    # ledger, or persistence chain — every consumer would
-    # fail at first restart.
-    if [[ -d /var/lib/evo ]]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
-        chmod 0750 /var/lib/evo
-        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750)"
-    fi
-    # /run/evo is a tmpfs directory systemd re-creates from
-    # RuntimeDirectory=evo on every start, chowned to the
-    # tenant — no persistent-ownership reconciliation
-    # needed there. Same for /run/evo/plugins (per-plugin
-    # sockets under the runtime directory).
-
-    # /opt/evo/plugins: plugin bundle files installed by
-    # place_opt_evo(). Read-only for the tenant; owned by
-    # root so the tenant cannot mutate the plugin bytes at
-    # runtime. Explicitly not chowned to the tenant.
 else
     echo "[bootstrap] systemd drop-ins skipped (EVO_INSTALL_SYSTEMD_DROP_INS=0 or --skip-systemd)"
 fi

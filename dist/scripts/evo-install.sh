@@ -655,40 +655,7 @@ verify_post_condition() {
         JOURNAL_FAIL_COUNT=0
     fi
 
-    verify_tenant_identity
     verify_pcm_playback
-}
-
-# Tenant-identity assertion: after the steward restarts under
-# the service-user.conf drop-in, its process (and every
-# steward-spawned plugin child process) MUST run as the
-# resolved tenant, not root. This is the acceptance gate for
-# the per-plugin isolated-identity contract at the OS level.
-#
-# STEWARD_RUNTIME_USER captures the effective steward user
-# reported by systemd; ROOT_EVO_PROCESSES captures any evo
-# process still running as uid 0. Either divergence is a
-# post-install failure the operator must see loudly.
-STEWARD_RUNTIME_USER=""
-ROOT_EVO_PROCESSES=""
-verify_tenant_identity() {
-    STEWARD_RUNTIME_USER="$(systemctl show evo.service -p User --value 2>/dev/null || true)"
-    # Empty User= means the drop-in was not installed; systemd
-    # then runs as root. Explicit "root" means an operator or
-    # override forced Strategy C. Both are failure at the
-    # showcase acceptance bar.
-    if [[ -z "${STEWARD_RUNTIME_USER}" || "${STEWARD_RUNTIME_USER}" == "root" ]]; then
-        STEWARD_RUNTIME_USER="${STEWARD_RUNTIME_USER:-<unset>}"
-    fi
-    # Cross-check by inspecting ACTUAL process ownership: the
-    # steward's MainPID + every OOP plugin binary spawned
-    # under /opt/evo/plugins/. Anything running as root here
-    # (excluding sudo helper transients we ourselves invoke)
-    # is Pillar I regression on the shipping surface.
-    ROOT_EVO_PROCESSES="$(
-        ps -eo user,pid,cmd --no-headers 2>/dev/null \
-            | awk '$1 == "root" && $3 ~ /\/opt\/evo\/(bin|plugins)\// { print }'
-    )"
 }
 
 # Active PCM playback-path probe at post-condition time. The
@@ -804,8 +771,6 @@ music_library_hash_post = ${music_hash_post_field}
 music_library_hash_preserved = ${MUSIC_HASH_PRESERVED}
 music_library_hash_changed = ${MUSIC_HASH_CHANGED}
 pcm_playback_probe = "${PCM_PLAYBACK_PROBE}"
-steward_runtime_user = "${STEWARD_RUNTIME_USER}"
-root_evo_process_count = $(printf '%s' "${ROOT_EVO_PROCESSES}" | grep -c . || true)
 
 EOF
 
@@ -897,15 +862,12 @@ esac
 
 echo ""
 echo "  service:               ${ACTIVE_STATE}"
-echo "  steward runtime user:  ${STEWARD_RUNTIME_USER}"
 echo "  plugins admitted:      ${PLUGINS_ADMITTED}"
 echo "  admission failures:    ${ADMISSION_FAILURES}"
 echo "  not-declared warnings: ${NOT_DECLARED}"
 echo "  catalogue source:      ${CATALOGUE_SOURCE:-unknown}"
 echo "  journal fail hits:     ${JOURNAL_FAIL_COUNT}"
 echo "  pcm.evo playback:      ${PCM_PLAYBACK_PROBE}"
-ROOT_EVO_PROCESS_COUNT="$(printf '%s' "${ROOT_EVO_PROCESSES}" | grep -c . || true)"
-echo "  root evo processes:    ${ROOT_EVO_PROCESS_COUNT}"
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     echo "  music library hash:    ${MUSIC_HASH_PRESERVED} (pre=${MUSIC_HASH_PRE} post=${MUSIC_HASH_POST})"
 fi
@@ -913,11 +875,6 @@ if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then
     echo ""
     echo "  journal fail lines:"
     printf '%s\n' "${JOURNAL_FAIL_HITS}" | sed 's/^/    /'
-fi
-if [[ "${ROOT_EVO_PROCESS_COUNT}" -gt 0 ]]; then
-    echo ""
-    echo "  root evo processes (per-plugin isolated-identity regression):"
-    printf '%s\n' "${ROOT_EVO_PROCESSES}" | sed 's/^/    /'
 fi
 echo ""
 
@@ -927,8 +884,6 @@ if [[ "${PLUGINS_ADMITTED}" -lt 1 ]]; then POST_OK=0; fi
 if [[ "${ADMISSION_FAILURES}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${NOT_DECLARED}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi
-if [[ -z "${STEWARD_RUNTIME_USER}" || "${STEWARD_RUNTIME_USER}" == "root" || "${STEWARD_RUNTIME_USER}" == "<unset>" ]]; then POST_OK=0; fi
-if [[ "${ROOT_EVO_PROCESS_COUNT}" -gt 0 ]]; then POST_OK=0; fi
 # The PCM playback-path probe is the dedicated catch for the
 # regression class that the old gate missed: a placement that
 # leaves pcm.evo unopenable for playback while the steward +
