@@ -228,6 +228,40 @@ if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx audio; then
     echo "[bootstrap] added $SERVICE_USER to group audio"
 fi
 
+# HL-001 rule 11: purge accumulating backup-file litter left by
+# earlier bootstrap runs, earlier release cycles, or manual
+# dev-cycle artefacts (`.pre-<risk-id>`, `.pre-<feature-tag>`).
+# Idempotent. `.prev` files created by deploy-distribution.sh
+# for single-step operator rollback are preserved.
+BACKUP_LITTER_PURGED=0
+for pattern in \
+    '/opt/evo/bin' \
+    '/opt/evo/catalogue' \
+    '/etc/evo' \
+    '/etc/asound.d' \
+    ; do
+    if [[ -d "$pattern" ]]; then
+        while IFS= read -r -d '' f; do
+            rm -f "$f"
+            BACKUP_LITTER_PURGED=$((BACKUP_LITTER_PURGED + 1))
+        done < <(find "$pattern" -maxdepth 1 -type f \
+            \( -name '*.pre-evo.*' -o -name '*.pre-evo' \
+               -o -name '*.pre-r*' -o -name '*.bak' \
+               -o -name '*.backup' \) \
+            -print0 2>/dev/null)
+    fi
+done
+for f in /etc/asound.conf.pre-evo.* /etc/mpd.conf.pre-evo-music \
+         /etc/mpd.conf.pre-evo-purge; do
+    if [[ -f "$f" ]]; then
+        rm -f "$f"
+        BACKUP_LITTER_PURGED=$((BACKUP_LITTER_PURGED + 1))
+    fi
+done
+if [[ $BACKUP_LITTER_PURGED -gt 0 ]]; then
+    echo "[bootstrap] purged $BACKUP_LITTER_PURGED backup-litter file(s) per HL-001 rule 11"
+fi
+
 # Resolve the systemctl binary.
 if [[ ! -x "$SYSTEMCTL_BIN" ]]; then
     # Fall back to PATH lookup so distributions on non-
@@ -817,12 +851,10 @@ if [[ "${EVO_INSTALL_CLIENT_ACL:-1}" != "0" ]]; then
         exit 2
     fi
     install -d -m 0755 -o root -g root "$(dirname "$CLIENT_ACL_PATH")"
-    if [[ -f "$CLIENT_ACL_PATH" ]] && \
-       ! cmp -s "$CLIENT_ACL_TEMPLATE" "$CLIENT_ACL_PATH"; then
-        backup="$CLIENT_ACL_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
-        cp -a "$CLIENT_ACL_PATH" "$backup"
-        echo "[bootstrap] backed up prior $CLIENT_ACL_PATH to $backup"
-    fi
+    # HL-001 rule 11: atomic overwrite only; no accumulating
+    # backup file. `install` writes-to-temp + renames atomically;
+    # prior version is retained in git and in the release artefact
+    # channel, not on-disk.
     install -m 0644 -o root -g root \
         "$CLIENT_ACL_TEMPLATE" "$CLIENT_ACL_PATH"
     echo "[bootstrap] installed $CLIENT_ACL_PATH"
@@ -903,7 +935,10 @@ if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
     # the current value differs.
     if [[ -f /etc/mpd.conf ]] \
         && ! grep -qE '^\s*music_directory\s+"/var/lib/evo/music"' /etc/mpd.conf; then
-        sed -i.pre-evo-music -E \
+        # HL-001 rule 11: sed -i without extension (in-place edit,
+        # no backup file). Prior /etc/mpd.conf state is a
+        # distribution-owned config and is not retained on-disk.
+        sed -i -E \
             's|^\s*music_directory\s+".*"|music_directory "/var/lib/evo/music"|' \
             /etc/mpd.conf
         echo "[bootstrap] pinned music_directory in /etc/mpd.conf to /var/lib/evo/music"
@@ -932,12 +967,9 @@ if [[ "${EVO_INSTALL_CATALOGUE:-1}" != "0" ]]; then
         exit 2
     fi
     install -d -m 0755 -o root -g root "$(dirname "$CATALOGUE_PATH")"
-    if [[ -f "$CATALOGUE_PATH" ]] && \
-       ! cmp -s "$CATALOGUE_TEMPLATE" "$CATALOGUE_PATH"; then
-        backup="$CATALOGUE_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
-        cp -a "$CATALOGUE_PATH" "$backup"
-        echo "[bootstrap] backed up prior $CATALOGUE_PATH to $backup"
-    fi
+    # HL-001 rule 11: atomic overwrite only; no accumulating
+    # backup file. Prior version is retained in the release
+    # artefact channel.
     # The audio-rack.toml dist fragment is NOT a complete
     # catalogue — it omits schema_version on purpose so it can
     # be included from a larger catalogue. Render a complete
@@ -1100,17 +1132,9 @@ if [[ "${EVO_INSTALL_ASOUND_CONF:-1}" != "0" ]]; then
         trap - EXIT
         exit 2
     fi
-    # If an existing /etc/asound.conf is present with different
-    # contents (compared against the rendered form, not the
-    # template), back it up first so the operator never loses
-    # state silently. Idempotent: re-running after a clean
-    # install does not stack backups.
-    if [[ -f "$ASOUND_CONF_PATH" ]] && \
-       ! cmp -s "$ASOUND_RENDERED" "$ASOUND_CONF_PATH"; then
-        backup="$ASOUND_CONF_PATH.pre-evo.$(date +%Y%m%d%H%M%S)"
-        cp -a "$ASOUND_CONF_PATH" "$backup"
-        echo "[bootstrap] backed up prior $ASOUND_CONF_PATH to $backup"
-    fi
+    # HL-001 rule 11: atomic overwrite only; no accumulating
+    # backup file. `install` writes-to-temp + renames atomically;
+    # prior version is retained in the release artefact channel.
     install -m 0644 -o root -g root "$ASOUND_RENDERED" "$ASOUND_CONF_PATH"
     rm -f "$ASOUND_RENDERED"
     trap - EXIT
