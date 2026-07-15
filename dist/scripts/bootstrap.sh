@@ -535,6 +535,30 @@ UCONF
     "$SYSTEMCTL_BIN" daemon-reload
     echo "[bootstrap] systemctl daemon-reload"
 
+    # Silence the `mpd.service: Referenced but unset environment
+    # variable evaluates to an empty string: MPDCONF` systemd
+    # warning that fires on every mpd start. Debian's shipped
+    # mpd.service has `EnvironmentFile=/etc/default/mpd` +
+    # `ExecStart=/usr/bin/mpd --systemd $MPDCONF`, but the
+    # `/etc/default/mpd` shipped by the package leaves MPDCONF
+    # commented out. Systemd's variable substitution then flags
+    # $MPDCONF as unset at every start. A drop-in setting the
+    # canonical MPDCONF path retires the warning class without
+    # touching the Debian package's own files.
+    MPD_DROPIN_DIR="/etc/systemd/system/mpd.service.d"
+    install -d -m 0755 -o root -g root "$MPD_DROPIN_DIR"
+    MPDCONF_DROPIN="$MPD_DROPIN_DIR/evo-mpdconf.conf"
+    MPDCONF_TEMP="$(mktemp)"
+    trap 'rm -f "$MPDCONF_TEMP"' EXIT
+    cat > "$MPDCONF_TEMP" <<MDROP
+[Service]
+Environment=MPDCONF=/etc/mpd.conf
+MDROP
+    install -m 0644 -o root -g root "$MPDCONF_TEMP" "$MPDCONF_DROPIN"
+    rm -f "$MPDCONF_TEMP"
+    trap - EXIT
+    echo "[bootstrap] installed $MPDCONF_DROPIN (Environment=MPDCONF=/etc/mpd.conf)"
+
     # HL-001 rule 6: state-directory ownership must match the
     # tenant. On first install systemd's StateDirectory=evo
     # creates /var/lib/evo owned by the tenant; on upgrade from

@@ -834,7 +834,15 @@ async fn handle_query(
             return Err(classify_command_error(e));
         }
         Err(e) => {
-            tracing::warn!(
+            // `error_calls_for_reconnect(&e)` returned true, which
+            // covers the expected transport-close class (Broken
+            // pipe, connection closed by MPD) that fires on every
+            // mpd restart. Debug-class here retires journal noise
+            // on install/reset/deploy primitives; the reconnect
+            // itself is deterministic and the subsequent retry
+            // failure surfaces at warn-class through the caller if
+            // reconnection is truly stuck.
+            tracing::debug!(
                 plugin = PLUGIN_NAME,
                 error = %e,
                 "query hit transient error; reconnecting"

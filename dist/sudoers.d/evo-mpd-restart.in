@@ -38,7 +38,8 @@
 # rewrite invocation hit this; without the directive, each
 # call produces 3 journal lines.
 Cmnd_Alias EVO_MPD_RESTART = \
-    /usr/bin/systemctl restart mpd
+    /usr/bin/systemctl restart mpd, \
+    /usr/bin/systemctl restart mpd.service
 
 Defaults!EVO_MPD_RESTART !pam_session, !syslog
 

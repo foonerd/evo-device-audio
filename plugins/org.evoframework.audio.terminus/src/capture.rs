@@ -207,7 +207,15 @@ fn run_capture_loop(
         match exit_inner {
             InnerExit::Shutdown => return,
             InnerExit::TransportFailed => {
-                tracing::warn!(
+                // Transport-failure exits are the expected signal
+                // that the steward (and therefore the ALSA capture
+                // chain the terminus taps) has restarted. Outer
+                // loop re-opens deterministically; a warn-class
+                // emit on every steward-restart cycle is journal
+                // noise, not a fault. Debug-class is the correct
+                // level: observable when the operator enables
+                // debug logging, silent in normal operation.
+                tracing::debug!(
                     plugin = PLUGIN_NAME,
                     "capture inner loop bailed on transport error; \
                      re-opening capture"

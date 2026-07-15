@@ -284,7 +284,17 @@ async fn run_inner(
                         .await;
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        // Idle-conn errors are the expected signal
+                        // that MPD has restarted (transport closed
+                        // by the peer). The outer loop reconnects
+                        // deterministically; a warn-class emit on
+                        // every mpd-restart cycle is journal noise
+                        // that fires on every install/reset/deploy
+                        // primitive, not a fault. Debug-class is
+                        // the correct level: observable when the
+                        // operator enables debug logging, silent
+                        // in normal operation.
+                        tracing::debug!(
                             plugin = PLUGIN_NAME,
                             error = %e,
                             "ambient observer: idle errored; reconnecting"
