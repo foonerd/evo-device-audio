@@ -711,7 +711,12 @@ impl SupervisorTask {
                 evt = idle_rx.recv() => {
                     match evt {
                         None | Some(IdleEvent::Exhausted) => {
-                            tracing::warn!(
+                            // Idle-task termination is the expected
+                            // signal on MPD restart. Debug-class
+                            // avoids install/reset/deploy-cycle
+                            // journal noise; command-only mode is
+                            // the deterministic fallback.
+                            tracing::debug!(
                                 plugin = PLUGIN_NAME,
                                 handle = %self.custody_handle.id,
                                 "idle task terminated; continuing command-only"
@@ -790,7 +795,13 @@ async fn handle_command(
             return Err(classify_command_error(e));
         }
         Err(e) => {
-            tracing::warn!(
+            // `error_calls_for_reconnect(&e)` covers the expected
+            // transport-close class on MPD restart (Broken pipe,
+            // connection closed). Debug-class here retires the
+            // per-restart journal noise; genuine reconnect
+            // exhaustion surfaces at warn-class from the loop that
+            // owns the retry budget.
+            tracing::debug!(
                 plugin = PLUGIN_NAME,
                 error = %e,
                 "command hit transient error; reconnecting"
@@ -884,7 +895,9 @@ async fn handle_cycle_output(
             return Err(classify_command_error(e));
         }
         Err(e) => {
-            tracing::warn!(
+            // Expected transport-close on MPD restart; deterministic
+            // reconnect below. Debug-class retires per-restart noise.
+            tracing::debug!(
                 plugin = PLUGIN_NAME,
                 error = %e,
                 "output-cycle hit transient error; reconnecting"
@@ -1292,7 +1305,12 @@ async fn idle_task(
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                // Expected transport-close on MPD restart; backoff
+                // loop below handles reconnect deterministically.
+                // The `idle task exhausted reconnect attempts`
+                // warn-class emit further down handles the
+                // exhaustion case where reconnect truly fails.
+                tracing::debug!(
                     plugin = PLUGIN_NAME,
                     error = %e,
                     "idle failed; will reconnect"

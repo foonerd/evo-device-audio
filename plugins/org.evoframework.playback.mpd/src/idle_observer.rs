@@ -302,7 +302,11 @@ async fn dispatch_refresh(
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
+                // Expected transport-close on MPD restart; this
+                // burst is skipped, the next idle event triggers a
+                // fresh connect attempt. Debug-class retires the
+                // per-restart journal noise.
+                tracing::debug!(
                     plugin = crate::PLUGIN_NAME,
                     error = %e,
                     "idle observer: command connect failed; refresh skipped \
