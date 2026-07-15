@@ -210,6 +210,24 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     exit 1
 fi
 
+# HL-001 rule 3: the tenant must be a member of the `audio`
+# group. This is the single supplementary group the framework
+# adds so ALSA plane consumers (delivery.alsa, composition.alsa)
+# can open /dev/snd/*. Any other group broadens the privilege
+# surface and requires a separate scoped grant instead. The
+# `audio` group is provisioned by every mainstream Linux
+# distribution's alsa-utils package; absence means this host is
+# not a valid audio target.
+if ! getent group audio >/dev/null 2>&1; then
+    echo "group \`audio\` does not exist on this host" >&2
+    echo "  (install alsa-utils; the steward cannot open ALSA devices without it)" >&2
+    exit 1
+fi
+if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx audio; then
+    usermod -aG audio "$SERVICE_USER"
+    echo "[bootstrap] added $SERVICE_USER to group audio"
+fi
+
 # Resolve the systemctl binary.
 if [[ ! -x "$SYSTEMCTL_BIN" ]]; then
     # Fall back to PATH lookup so distributions on non-
@@ -426,6 +444,30 @@ fi
 # ----------------------------------------------------------
 if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; then
     install -d -m 0755 "$SYSTEMD_DROPIN_DIR"
+
+    # HL-001 rules 1-5: the steward's runtime identity drop-in.
+    # Rendered here (rather than shipped as a template file)
+    # because SERVICE_USER is a per-target install-time resolution
+    # and systemd unit values are static. No UMask directive:
+    # systemd's default (0022) applies so files the steward and
+    # its plugin children write into shared config paths remain
+    # world-readable. Every scoped sudoers drop-in this
+    # distribution ships is load-bearing only under this identity;
+    # a root steward makes them theatrical.
+    SU_TEMP="$(mktemp)"
+    trap 'rm -f "$SU_TEMP"' EXIT
+    cat > "$SU_TEMP" <<UCONF
+[Service]
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+SupplementaryGroups=audio
+UCONF
+    install -m 0644 -o root -g root "$SU_TEMP" \
+        "$SYSTEMD_DROPIN_DIR/service-user.conf"
+    rm -f "$SU_TEMP"
+    trap - EXIT
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/service-user.conf (User=$SERVICE_USER Group=$SERVICE_USER SupplementaryGroups=audio)"
+
     install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/exec-start.conf" \
         "$SYSTEMD_DROPIN_DIR/exec-start.conf"
@@ -458,6 +500,21 @@ if [[ "${EVO_INSTALL_SYSTEMD_DROP_INS:-1}" != "0" && "$SKIP_SYSTEMD" == "0" ]]; 
 
     "$SYSTEMCTL_BIN" daemon-reload
     echo "[bootstrap] systemctl daemon-reload"
+
+    # HL-001 rule 6: state-directory ownership must match the
+    # tenant. On first install systemd's StateDirectory=evo
+    # creates /var/lib/evo owned by the tenant; on upgrade from
+    # an earlier root-steward install the directory already
+    # exists owned by root and systemd does NOT chown it on
+    # restart (StateDirectory= applies only at directory CREATION
+    # time). Without this chown the new tenant cannot read its
+    # own signing key, subject state, ledger, or persistence
+    # chain. Idempotent: chowning to the same owner is a no-op.
+    if [[ -d /var/lib/evo ]]; then
+        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
+        chmod 0750 /var/lib/evo
+        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750)"
+    fi
 else
     echo "[bootstrap] systemd drop-ins skipped (EVO_INSTALL_SYSTEMD_DROP_INS=0 or --skip-systemd)"
 fi
