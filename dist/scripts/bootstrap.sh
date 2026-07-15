@@ -549,6 +549,21 @@ UCONF
         chmod 0750 /var/lib/evo
         echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750)"
     fi
+
+    # HL-001 rule 8: /opt/evo/* is the operator's install tree,
+    # tenant-owned end to end. Chowning here (idempotent) closes
+    # the gap left by earlier install paths (prototype-install.sh
+    # and deploy-distribution.sh) that placed files as root:root.
+    # Plugin bundle immutability at runtime is enforced by mode
+    # (steward reads + executes; does not chmod +w at runtime),
+    # not by root ownership. Tenant ownership is what enables
+    # evo-plugin-tool install (running as tenant) to place new
+    # plugin bundles into /opt/evo/plugins/ without a subsequent
+    # chown step, per the design contract in PLUGIN_TOOL.md.
+    if [[ -d /opt/evo ]]; then
+        chown -R "$SERVICE_USER:$SERVICE_USER" /opt/evo
+        echo "[bootstrap] chowned /opt/evo -> $SERVICE_USER:$SERVICE_USER (recursive)"
+    fi
 else
     echo "[bootstrap] systemd drop-ins skipped (EVO_INSTALL_SYSTEMD_DROP_INS=0 or --skip-systemd)"
 fi
