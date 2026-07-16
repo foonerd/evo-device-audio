@@ -1,0 +1,79 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-network-shares with mode 0440,
+# owned root:root.
+#
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to the binaries the framework's NetworkSharesRuntime
+# invokes to mount / unmount / discover network shares (SMB /
+# NFS).
+#
+# Scoped Cmnd_Alias declarations:
+#
+# 1. `EVO_NETWORK_SHARES_MOUNT` — mount + umount for CIFS /
+#    NFS shares. The runtime dispatches these via its
+#    SubprocessMountExecutor with argv lists composed by
+#    `build_cifs_mount_args`, `build_nfs_mount_args`, and
+#    `build_umount_args`. `mount` requires elevation because
+#    it edits the kernel mount table. `umount` (including the
+#    lazy-detach variant `-l` used for busy CIFS mounts) is
+#    granted the same way — refusing lazy detach would leave
+#    stuck mounts across share edit / remove operations.
+#
+# 2. `EVO_NETWORK_SHARES_DISCOVERY` — the LAN NAS discovery
+#    substrate invokes `avahi-browse` and `smbclient` under
+#    fixed argv shapes (`-atrkp _smb._tcp` for browse; `-N -L
+#    <ip> -m SMB3_11 --debuglevel=4` for smbclient). These are
+#    read-only enumeration commands that the framework may run
+#    on a 5-minute cadence + on operator-issued
+#    `network.discovery.refresh`, so `!pam_session, !syslog`
+#    suppresses PAM session lines for the alias to keep the
+#    journal free of litter for a benign read.
+#
+# Path discipline: the mount + umount paths MUST match
+# `NetworkSharesRuntimeBuilder::with_mount_program` /
+# `with_umount_program` (defaults `/bin/mount` + `/bin/umount`).
+# `avahi-browse` and `smbclient` paths MUST match the runtime
+# builder's `with_avahi_browse_program` /
+# `with_smbclient_program` (defaults `/usr/bin/avahi-browse` +
+# `/usr/bin/smbclient`). Distributions with non-standard
+# paths override via the builder and add new substitutions
+# to the bootstrap script.
+#
+# Argv scoping: `/bin/mount` and `/bin/umount` intentionally
+# accept any argument list. Sudoers argv-match against mount's
+# option flags (comma-separated `-o vers=3.0,file_mode=0777,...`
+# for CIFS; `-t nfs4 -o vers=4.2,timeo=30,retrans=5,...` for
+# NFS) is brittle — any operator advanced_options rewrite
+# reorders the flags and breaks the match, and the mount
+# binary itself is the trust boundary. `avahi-browse` and
+# `smbclient` are similarly wildcarded because the runtime's
+# argv builders are pinned by the framework and re-scoping at
+# the sudoers layer duplicates the runtime's own construction
+# invariants.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh --install-network-shares-sudoers
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-network-shares.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-network-shares
+#
+# `visudo -c -f /etc/sudoers.d/evo-network-shares` verifies
+# syntactically valid sudoers.
+
+Cmnd_Alias EVO_NETWORK_SHARES_MOUNT = \
+    /bin/mount, \
+    /bin/umount
+
+Cmnd_Alias EVO_NETWORK_SHARES_DISCOVERY = \
+    /usr/bin/avahi-browse, \
+    /usr/bin/smbclient
+
+Defaults!EVO_NETWORK_SHARES_MOUNT !pam_session, !syslog
+Defaults!EVO_NETWORK_SHARES_DISCOVERY !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NETWORK_SHARES_MOUNT
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NETWORK_SHARES_DISCOVERY

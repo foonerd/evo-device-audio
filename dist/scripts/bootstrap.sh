@@ -80,6 +80,7 @@ SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
 SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
+NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
@@ -447,6 +448,45 @@ if [[ "${EVO_INSTALL_SYSTEM_POWER_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $SYSTEM_POWER_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_SYSTEM_POWER_SUDOERS=0 — skipping system-power sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1e: /etc/sudoers.d/evo-network-shares (narrow NOPASSWD)
+# ----------------------------------------------------------
+# NOPASSWD grant for the framework NetworkSharesRuntime's
+# mount / umount + LAN NAS discovery surface. The steward
+# executes `mount` / `umount` with argv composed by
+# `build_cifs_mount_args` / `build_nfs_mount_args` /
+# `build_umount_args`, and `avahi-browse` / `smbclient` under
+# fixed argv shapes on a 5-minute cadence + on operator-issued
+# `network.discovery.refresh`. Argv-scoping at the sudoers
+# layer is intentionally not applied — mount option flags
+# vary with the operator's advanced_options and the runtime
+# builders are the trust boundary.
+if [[ "${EVO_INSTALL_NETWORK_SHARES_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-network-shares.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$NETWORK_SHARES_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $NETWORK_SHARES_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_NETWORK_SHARES_SUDOERS=0 — skipping network-shares sudoers drop-in"
 fi
 
 # ----------------------------------------------------------
@@ -1363,6 +1403,20 @@ if [[ -f "$HARDWARE_AUDIO_SUDOERS_FILE" ]]; then
     echo "  [ok]    hardware-audio sudoers drop-in installed at $HARDWARE_AUDIO_SUDOERS_FILE"
 else
     echo "  [skip]  hardware-audio sudoers drop-in not installed"
+fi
+
+# network-shares sudoers drop-in present + the service user can
+# dry-run the mount + umount binaries the runtime invokes.
+if [[ -f "$NETWORK_SHARES_SUDOERS_FILE" ]]; then
+    if sudo -u "$SERVICE_USER" sudo -n -l -- /bin/mount >/dev/null 2>&1 \
+        && sudo -u "$SERVICE_USER" sudo -n -l -- /bin/umount >/dev/null 2>&1; then
+        echo "  [ok]    $SERVICE_USER permitted to run \`mount\` + \`umount\` via NOPASSWD"
+    else
+        echo "  [WARN]  sudo -n -l -- /bin/mount or /bin/umount did not match for $SERVICE_USER"
+        echo "          (review $NETWORK_SHARES_SUDOERS_FILE; ensure binary paths match NetworkSharesRuntime defaults)"
+    fi
+else
+    echo "  [skip]  network-shares sudoers drop-in not installed"
 fi
 if [[ -f "$DACS_CATALOGUE_PATH" ]]; then
     echo "  [ok]    DAC catalogue installed at $DACS_CATALOGUE_PATH"
