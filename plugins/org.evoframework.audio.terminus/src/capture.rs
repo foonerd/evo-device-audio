@@ -267,6 +267,7 @@ fn run_fft_loop(
     let io = pcm.io_i32().expect("io_i32 should succeed for S32_LE");
 
     let mut consecutive_read_failures = 0u32;
+    let mut frames_processed_this_session: u64 = 0;
     loop {
         if shutdown_check(shutdown) {
             return InnerExit::Shutdown;
@@ -275,6 +276,8 @@ fn run_fft_loop(
         match io.readi(&mut raw_buf) {
             Ok(frames_read) => {
                 consecutive_read_failures = 0;
+                frames_processed_this_session =
+                    frames_processed_this_session.saturating_add(1);
                 if frames_read < FFT_SIZE {
                     // Partial frame; drop and retry (next read
                     // gets the remainder). FFT needs a full
@@ -332,20 +335,59 @@ fn run_fft_loop(
                     "ALSA read errored; attempting recovery"
                 );
                 if let Err(recover_err) = pcm.recover(e.errno() as i32, true) {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        recover_error = %recover_err,
-                        consecutive_read_failures,
-                        "pcm.recover() failed; bailing inner loop"
-                    );
+                    // LOGGING.md §2: two classes here.
+                    //   - warn: a session that was producing
+                    //     frames just lost the transport
+                    //     mid-flight — operator-visible fault.
+                    //   - debug: no frames were processed yet
+                    //     this session, so the recover-fail is
+                    //     the "just-opened-but-no-audio-yet"
+                    //     cycling pattern the outer loop
+                    //     already debug-classes on
+                    //     InnerExit::TransportFailed. Firing
+                    //     warn here on every cycling boot on a
+                    //     hardware-less target (VM without a
+                    //     real ALSA source) is journal noise,
+                    //     not a fault.
+                    if frames_processed_this_session > 0 {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            recover_error = %recover_err,
+                            consecutive_read_failures,
+                            frames_processed_this_session,
+                            "pcm.recover() failed after captured frames; bailing inner loop"
+                        );
+                    } else {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            recover_error = %recover_err,
+                            consecutive_read_failures,
+                            "pcm.recover() failed with no frames captured this session; \
+                             expected cycling pattern on hardware-less targets"
+                        );
+                    }
                     return InnerExit::TransportFailed;
                 }
                 if consecutive_read_failures >= RECONNECT_MAX_ATTEMPTS {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        consecutive_read_failures,
-                        "sustained read failures despite recover(); bailing"
-                    );
+                    // LOGGING.md §2: warn only when we had
+                    // successful frames earlier this session
+                    // (a real degradation); otherwise debug (the
+                    // "no source at all" pattern the outer loop
+                    // already debug-classes).
+                    if frames_processed_this_session > 0 {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            consecutive_read_failures,
+                            frames_processed_this_session,
+                            "sustained read failures despite recover() after captured frames; bailing"
+                        );
+                    } else {
+                        tracing::debug!(
+                            plugin = PLUGIN_NAME,
+                            consecutive_read_failures,
+                            "sustained read failures with no frames captured this session; bailing"
+                        );
+                    }
                     return InnerExit::TransportFailed;
                 }
                 // Brief pause before next read to avoid a hot
