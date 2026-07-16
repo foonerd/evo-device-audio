@@ -596,6 +596,65 @@ name = "hardware_audio_dsp_capabilities"
 [[subjects]]
 name = "hardware_audio_modder_overlays"
 
+# Framework-primitive subject types the steward publishes
+# from its own runtime primitives (notifications dispatcher,
+# NetworkSharesRuntime, SambaServerRuntime). These are NOT
+# owned by any plugin — the framework registers each subject
+# on boot via its own RegistrySubjectAnnouncer. The catalogue
+# lists them here so the announcer's per-boot subject-type
+# validation gate does not refuse the announcement with an
+# `UnknownSubjectType` error, which would leave every UI
+# consumer subscribed to a subject that never publishes.
+#
+# Adding a new framework-primitive subject type requires
+# adding an entry here; the framework's discovery walker
+# does NOT auto-declare types from source constants.
+
+# Notifications dispatcher: `system_notifications_active`.
+# Singleton per node (`evo.system.notifications.active` /
+# `local`) carrying the operator-facing active-notification
+# tray + base mode + quiet-hours state. Republished on every
+# send / cancel / mode-change / auto-dismiss transition. See
+# crates/evo/src/notifications.rs::ACTIVE_SUBJECT_TYPE.
+[[subjects]]
+name = "system_notifications_active"
+
+# NetworkSharesRuntime: singleton
+# `system_network_shares_configured` carrying the current set
+# of operator-configured SMB / NFS share records. Republished
+# on every add_share / edit_share / remove_share. See
+# crates/evo/src/network_shares.rs::CONFIGURED_SUBJECT_TYPE.
+[[subjects]]
+name = "system_network_shares_configured"
+
+# NetworkSharesRuntime: singleton
+# `system_network_shares_discovered` carrying the discovered
+# NAS inventory (mDNS-SD + per-host smbclient sweep).
+# Republished on every operator-issued discovery.refresh + on
+# the 5-min background cadence. See
+# crates/evo/src/network_shares.rs::DISCOVERED_SUBJECT_TYPE.
+[[subjects]]
+name = "system_network_shares_discovered"
+
+# NetworkSharesRuntime: per-share `network_share_state`. One
+# instance per configured share (addressing value =
+# share_id); carries mount state + operator-facing failure
+# reason + negotiated dialect. Announced on add_share,
+# retracted on remove_share, updated on every mount /
+# unmount transition. See
+# crates/evo/src/network_shares.rs::SHARE_STATE_SUBJECT_TYPE.
+[[subjects]]
+name = "network_share_state"
+
+# SambaServerRuntime: singleton `system_smb_server` carrying
+# evo-as-SMB-server enabled state + min_protocol +
+# extra_shares + smb_users list (no credential_key on the
+# wire). Republished on every apply / user_add /
+# user_revoke. See
+# crates/evo/src/samba_server.rs::SYSTEM_SMB_SERVER_SUBJECT_TYPE.
+[[subjects]]
+name = "system_smb_server"
+
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from
 # the playing track to its album on every song change;
