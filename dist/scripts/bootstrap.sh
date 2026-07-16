@@ -81,6 +81,7 @@ NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
 SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
 NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
+SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
@@ -487,6 +488,43 @@ if [[ "${EVO_INSTALL_NETWORK_SHARES_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $NETWORK_SHARES_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_NETWORK_SHARES_SUDOERS=0 — skipping network-shares sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1f: /etc/sudoers.d/evo-samba-server (narrow NOPASSWD)
+# ----------------------------------------------------------
+# NOPASSWD grant for the framework SambaServerRuntime's
+# testparm + smbpasswd + systemctl-restart-smbd surface. The
+# steward invokes `testparm -s <candidate>` to validate the
+# rendered smb.conf before installing over /etc/samba/smb.conf,
+# then `smbpasswd -a -s <user>` / `-x <user>` to add / revoke
+# SMB users (password piped through stdin from the vault; argv
+# never carries it), and `systemctl restart smbd` on every
+# successful apply where enabled=true.
+if [[ "${EVO_INSTALL_SAMBA_SERVER_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-samba-server.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$SAMBA_SERVER_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $SAMBA_SERVER_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_SAMBA_SERVER_SUDOERS=0 — skipping samba-server sudoers drop-in"
 fi
 
 # ----------------------------------------------------------
@@ -1417,6 +1455,21 @@ if [[ -f "$NETWORK_SHARES_SUDOERS_FILE" ]]; then
     fi
 else
     echo "  [skip]  network-shares sudoers drop-in not installed"
+fi
+
+# samba-server sudoers drop-in present + the service user can
+# dry-run testparm + smbpasswd + systemctl restart smbd.
+if [[ -f "$SAMBA_SERVER_SUDOERS_FILE" ]]; then
+    if sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/testparm >/dev/null 2>&1 \
+        && sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/smbpasswd >/dev/null 2>&1 \
+        && sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/systemctl restart smbd >/dev/null 2>&1; then
+        echo "  [ok]    $SERVICE_USER permitted to run \`testparm\` + \`smbpasswd\` + \`systemctl restart smbd\` via NOPASSWD"
+    else
+        echo "  [WARN]  one of testparm / smbpasswd / systemctl restart smbd did not match for $SERVICE_USER"
+        echo "          (review $SAMBA_SERVER_SUDOERS_FILE; ensure binary paths match SambaServerRuntime defaults)"
+    fi
+else
+    echo "  [skip]  samba-server sudoers drop-in not installed"
 fi
 if [[ -f "$DACS_CATALOGUE_PATH" ]]; then
     echo "  [ok]    DAC catalogue installed at $DACS_CATALOGUE_PATH"

@@ -1,0 +1,71 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-samba-server with mode 0440,
+# owned root:root.
+#
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to the binaries the framework's SambaServerRuntime
+# invokes to render + validate + install /etc/samba/smb.conf,
+# manage SMB users, and restart smbd.
+#
+# Scoped Cmnd_Alias declarations:
+#
+# 1. `EVO_SAMBA_SERVER_CONFIG` — `testparm -s <candidate>`
+#    validates the rendered smb.conf against the samba parser
+#    before the runtime installs over /etc/samba/smb.conf.
+#    Read-only per invocation but requires elevated read on
+#    the target if the operator's candidate path is under
+#    a privileged directory.
+#
+# 2. `EVO_SAMBA_SERVER_USERS` — `smbpasswd -a -s <user>` +
+#    `smbpasswd -x <user>` add + revoke SMB users. Passwords
+#    are piped through the child's stdin from the evo
+#    credential vault; the argv itself never carries them.
+#
+# 3. `EVO_SAMBA_SERVER_RESTART` — `systemctl restart smbd`.
+#    Fires on every successful apply where enabled=true.
+#
+# Path discipline: the testparm, smbpasswd, systemctl paths
+# MUST match the runtime builder's defaults
+# (`with_testparm_program` / `with_smbpasswd_program` /
+# `with_systemctl_program` — default `/usr/bin/testparm`,
+# `/usr/bin/smbpasswd`, `/usr/bin/systemctl`). Distributions
+# with non-standard paths override via the builder and add new
+# substitutions to the bootstrap script.
+#
+# Argv scoping: the runtime's argv builders emit fixed shapes
+# — `testparm -s <path>`, `smbpasswd -a -s <user>`,
+# `smbpasswd -x <user>`, `systemctl restart smbd`. Argv
+# wildcarding at the sudoers layer is intentionally not
+# applied on the smbpasswd surface (usernames vary at
+# operator control); the runtime's builder is the trust
+# boundary. `systemctl restart` is scoped exactly to `smbd`.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh --install-samba-server-sudoers
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-samba-server.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-samba-server
+#
+# `visudo -c -f /etc/sudoers.d/evo-samba-server` verifies
+# syntactically valid sudoers.
+
+Cmnd_Alias EVO_SAMBA_SERVER_CONFIG = \
+    /usr/bin/testparm
+
+Cmnd_Alias EVO_SAMBA_SERVER_USERS = \
+    /usr/bin/smbpasswd
+
+Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
+    /usr/bin/systemctl restart smbd
+
+Defaults!EVO_SAMBA_SERVER_CONFIG !pam_session, !syslog
+Defaults!EVO_SAMBA_SERVER_USERS !pam_session, !syslog
+Defaults!EVO_SAMBA_SERVER_RESTART !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_CONFIG
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_USERS
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_RESTART
