@@ -483,6 +483,9 @@ impl ShelfBundle {
             "queue.skip_to_next_available" => {
                 Ok(Some(self.dispatch_queue_skip_to_next_available(req).await?))
             }
+            "queue.play_from_position" => {
+                Ok(Some(self.dispatch_queue_play_from_position(req).await?))
+            }
             // Playlist verbs
             "playlist.list_playlists" => {
                 Ok(Some(self.dispatch_playlist_list_playlists(req).await?))
@@ -673,6 +676,18 @@ impl ShelfBundle {
             "outcome": outcome_to_wire(&outcome),
         });
         encode_json_response(req, &body)
+    }
+
+    async fn dispatch_queue_play_from_position(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::PlayFromPositionPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        queue::handle_play_from_position(&self.queue, &mut conn, payload)
+            .await
+            .map_err(queue_verb_to_plugin_error)?;
+        encode_ok_response(req)
     }
 
     // ----- playlist dispatchers -----
@@ -1020,9 +1035,10 @@ fn outcome_to_wire(
 fn queue_verb_to_plugin_error(e: queue::VerbError) -> PluginError {
     use queue::VerbError;
     match e {
-        VerbError::PayloadVersion { .. } | VerbError::EmptyUris => {
-            PluginError::Permanent(e.to_string())
-        }
+        VerbError::PayloadVersion { .. }
+        | VerbError::EmptyUris
+        | VerbError::PositionOutOfRange { .. }
+        | VerbError::QueueEmpty => PluginError::Permanent(e.to_string()),
         VerbError::Mpd { .. } => PluginError::Transient(e.to_string()),
     }
 }

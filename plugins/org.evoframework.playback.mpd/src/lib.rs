@@ -242,6 +242,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "queue.append_playlist_to_queue",
     "queue.save_queue_as_playlist",
     "queue.skip_to_next_available",
+    "queue.play_from_position",
     // audio.playlist.v1 shelf verbs
     "playlist.list_playlists",
     "playlist.get_playlist",

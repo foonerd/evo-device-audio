@@ -10,7 +10,7 @@
 //! writes the flag; this module reads it via
 //! [`crate::mpd::MpdConnection::sticker_get`]).
 //!
-//! # Verb surface (9)
+//! # Verb surface (10)
 //!
 //! - `queue.get_queue` — read current queue
 //! - `queue.enqueue` — append/insert items
@@ -23,6 +23,9 @@
 //! - `queue.save_queue_as_playlist` — save current queue
 //! - `queue.skip_to_next_available` — operator-issued skip-
 //!   traversal (consumes [`crate::skip_traversal`])
+//! - `queue.play_from_position` — set current queue position
+//!   and start playback in one call (positional address —
+//!   tap-to-play + play-from-this-track surfaces consume this)
 //!
 //! # Catalogue acceptance rows honoured
 //!
@@ -464,6 +467,17 @@ pub(crate) struct SkipToNextAvailablePayload {
     pub(crate) v: u32,
 }
 
+/// `queue.play_from_position` request payload.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlayFromPositionPayload {
+    /// Envelope version.
+    pub(crate) v: u32,
+    /// Zero-based queue position of the entry to play. Refuses
+    /// with a structured Permanent error when out of range or
+    /// when the queue is empty.
+    pub(crate) position: u32,
+}
+
 /// Common-shape response for mutating verbs. Constructed by
 /// the shelves' verb dispatcher via the JSON literal
 /// `{ "v": 1, "status": "ok" }`; kept here as a type to anchor
@@ -508,9 +522,48 @@ pub(crate) enum VerbError {
     /// `queue.enqueue` rejected the empty `uris` list.
     #[error("queue.enqueue: uris must not be empty")]
     EmptyUris,
+    /// `queue.play_from_position` addressed an out-of-range
+    /// position. Carries the offending index and the current
+    /// queue length so operator UI can render the specific
+    /// mismatch inline.
+    #[error(
+        "queue.play_from_position: position {position} out of range \
+         (queue length {length})"
+    )]
+    PositionOutOfRange {
+        /// The zero-based position the caller supplied.
+        position: u32,
+        /// The current queue length at the time of the check.
+        length: u32,
+    },
+    /// `queue.play_from_position` refused because the queue is
+    /// empty.
+    #[error("queue.play_from_position: queue is empty")]
+    QueueEmpty,
     /// MPD-side error during the verb's wire dispatch.
     #[error("queue.{verb}: MPD error: {reason}")]
     Mpd { verb: String, reason: String },
+}
+
+/// Pure position-validation used by
+/// [`handle_play_from_position`]. Returns `Ok(())` when
+/// `position < length`; returns [`VerbError::QueueEmpty`] when
+/// `length == 0`; otherwise returns
+/// [`VerbError::PositionOutOfRange`].
+///
+/// Extracted so unit tests can exercise every refusal branch
+/// without an MPD wire round-trip.
+pub(crate) fn validate_play_from_position(
+    position: u32,
+    length: u32,
+) -> Result<(), VerbError> {
+    if length == 0 {
+        return Err(VerbError::QueueEmpty);
+    }
+    if position >= length {
+        return Err(VerbError::PositionOutOfRange { position, length });
+    }
+    Ok(())
 }
 
 // ----- verb handlers -----
@@ -718,6 +771,50 @@ pub(crate) async fn handle_skip_to_next_available(
     Ok(outcome)
 }
 
+/// `queue.play_from_position` — set the current queue position
+/// and start playback in one call. Pre-validates the requested
+/// position against MPD's current queue length via
+/// `playlistinfo` BEFORE dispatching `play <pos>`; empty queue
+/// or out-of-range refuses with a structured Permanent error
+/// and leaves MPD untouched. On success, dispatches
+/// [`MpdConnection::play_position`] which sets both the
+/// current position AND the Play state in the same MPD command
+/// regardless of prior state (Stop / Pause / already-Playing at
+/// a different position).
+///
+/// After a successful dispatch, the queue subject is refreshed
+/// so the operator UI's Queue panel reflects the new
+/// `current_position` immediately (the `audio_now_playing`
+/// subject also republishes via the playback shelf's idle-wake
+/// path — no explicit fan-out is needed here).
+///
+/// Shuffle-active behaviour: MPD's `play <pos>` addresses the
+/// operator-facing queue position regardless of `random 1`; the
+/// shuffle order continues from the addressed entry. No plugin
+/// action is needed to preserve this — the pass-through matches
+/// MPD's native semantics.
+pub(crate) async fn handle_play_from_position(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    payload: PlayFromPositionPayload,
+) -> Result<(), VerbError> {
+    check_version(payload.v, "queue.play_from_position")?;
+    let items = conn.playlistinfo().await.map_err(|e| VerbError::Mpd {
+        verb: "play_from_position".to_string(),
+        reason: e.to_string(),
+    })?;
+    let length = u32::try_from(items.len()).unwrap_or(u32::MAX);
+    validate_play_from_position(payload.position, length)?;
+    conn.play_position(payload.position)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "play_from_position".to_string(),
+            reason: e.to_string(),
+        })?;
+    publish_queue(ctx, conn).await;
+    Ok(())
+}
+
 // ----- tests -----
 
 #[cfg(test)]
@@ -862,5 +959,77 @@ mod tests {
         let err = VerbError::EmptyUris;
         let msg = format!("{err}");
         assert!(msg.contains("must not be empty"));
+    }
+
+    // ----- play_from_position validation -----
+
+    #[test]
+    fn validate_play_from_position_accepts_valid_index() {
+        assert!(validate_play_from_position(0, 1).is_ok());
+        assert!(validate_play_from_position(4, 5).is_ok());
+        assert!(validate_play_from_position(0, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn validate_play_from_position_rejects_empty_queue_with_queue_empty() {
+        let err = validate_play_from_position(0, 0).unwrap_err();
+        assert!(matches!(err, VerbError::QueueEmpty));
+        let msg = format!("{err}");
+        assert!(msg.contains("queue is empty"));
+    }
+
+    #[test]
+    fn validate_play_from_position_rejects_out_of_range_at_boundary() {
+        // position == length is invalid (zero-based indexing).
+        let err = validate_play_from_position(5, 5).unwrap_err();
+        match err {
+            VerbError::PositionOutOfRange { position, length } => {
+                assert_eq!(position, 5);
+                assert_eq!(length, 5);
+            }
+            other => panic!("expected PositionOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_play_from_position_rejects_far_out_of_range() {
+        let err = validate_play_from_position(1_000, 5).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("1000"));
+        assert!(msg.contains("5"));
+    }
+
+    #[test]
+    fn play_from_position_payload_parses_v1_shape() {
+        let json = serde_json::json!({ "v": 1, "position": 3 });
+        let payload: PlayFromPositionPayload =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(payload.v, 1);
+        assert_eq!(payload.position, 3);
+    }
+
+    #[test]
+    fn play_from_position_payload_rejects_missing_position() {
+        let json = serde_json::json!({ "v": 1 });
+        let err = serde_json::from_value::<PlayFromPositionPayload>(json)
+            .unwrap_err();
+        assert!(err.to_string().contains("position"));
+    }
+
+    #[test]
+    fn check_version_flags_play_from_position_envelope_mismatch() {
+        let err = check_version(2, "queue.play_from_position").unwrap_err();
+        match err {
+            VerbError::PayloadVersion {
+                verb,
+                got,
+                expected,
+            } => {
+                assert_eq!(verb, "queue.play_from_position");
+                assert_eq!(got, 2);
+                assert_eq!(expected, QUEUE_PAYLOAD_VERSION);
+            }
+            other => panic!("expected PayloadVersion, got {other:?}"),
+        }
     }
 }
