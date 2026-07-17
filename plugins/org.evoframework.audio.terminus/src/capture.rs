@@ -54,6 +54,7 @@ use tokio::sync::{watch, Notify};
 
 use crate::fft::{PerceptualFrame, SpectrumAnalyser, CHANNEL_COUNT, FFT_SIZE};
 use crate::local_role::LocalRole;
+use crate::read_fail_class::{classify_read_failure, ReadFailClass};
 use crate::spectrum_subject;
 use crate::transport_gate::TransportGate;
 use crate::PluginConfig;
@@ -335,58 +336,61 @@ fn run_fft_loop(
                     "ALSA read errored; attempting recovery"
                 );
                 if let Err(recover_err) = pcm.recover(e.errno() as i32, true) {
-                    // LOGGING.md §2: two classes here.
-                    //   - warn: a session that was producing
-                    //     frames just lost the transport
-                    //     mid-flight — operator-visible fault.
-                    //   - debug: no frames were processed yet
-                    //     this session, so the recover-fail is
-                    //     the "just-opened-but-no-audio-yet"
-                    //     cycling pattern the outer loop
-                    //     already debug-classes on
-                    //     InnerExit::TransportFailed. Firing
-                    //     warn here on every cycling boot on a
-                    //     hardware-less target (VM without a
-                    //     real ALSA source) is journal noise,
-                    //     not a fault.
-                    if frames_processed_this_session > 0 {
-                        tracing::warn!(
+                    // LOGGING.md §2 classification via
+                    // `classify_read_failure` (single source of
+                    // truth for this plugin's read-fault log level).
+                    match classify_read_failure(
+                        frames_processed_this_session,
+                        transport_gate.borrow().should_emit(),
+                    ) {
+                        ReadFailClass::Warn => tracing::warn!(
                             plugin = PLUGIN_NAME,
                             recover_error = %recover_err,
                             consecutive_read_failures,
                             frames_processed_this_session,
-                            "pcm.recover() failed after captured frames; bailing inner loop"
-                        );
-                    } else {
-                        tracing::debug!(
+                            "pcm.recover() failed mid-playback; bailing inner loop"
+                        ),
+                        ReadFailClass::Info => tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            recover_error = %recover_err,
+                            consecutive_read_failures,
+                            frames_processed_this_session,
+                            "pcm.recover() failed after transport transitioned to NotPlaying; \
+                             expected loopback-writer lifecycle"
+                        ),
+                        ReadFailClass::Debug => tracing::debug!(
                             plugin = PLUGIN_NAME,
                             recover_error = %recover_err,
                             consecutive_read_failures,
                             "pcm.recover() failed with no frames captured this session; \
                              expected cycling pattern on hardware-less targets"
-                        );
+                        ),
                     }
                     return InnerExit::TransportFailed;
                 }
                 if consecutive_read_failures >= RECONNECT_MAX_ATTEMPTS {
-                    // LOGGING.md §2: warn only when we had
-                    // successful frames earlier this session
-                    // (a real degradation); otherwise debug (the
-                    // "no source at all" pattern the outer loop
-                    // already debug-classes).
-                    if frames_processed_this_session > 0 {
-                        tracing::warn!(
+                    match classify_read_failure(
+                        frames_processed_this_session,
+                        transport_gate.borrow().should_emit(),
+                    ) {
+                        ReadFailClass::Warn => tracing::warn!(
                             plugin = PLUGIN_NAME,
                             consecutive_read_failures,
                             frames_processed_this_session,
-                            "sustained read failures despite recover() after captured frames; bailing"
-                        );
-                    } else {
-                        tracing::debug!(
+                            "sustained read failures despite recover() mid-playback; bailing"
+                        ),
+                        ReadFailClass::Info => tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            consecutive_read_failures,
+                            frames_processed_this_session,
+                            "sustained read failures after transport transitioned to NotPlaying; \
+                             expected loopback-writer lifecycle"
+                        ),
+                        ReadFailClass::Debug => tracing::debug!(
                             plugin = PLUGIN_NAME,
                             consecutive_read_failures,
                             "sustained read failures with no frames captured this session; bailing"
-                        );
+                        ),
                     }
                     return InnerExit::TransportFailed;
                 }

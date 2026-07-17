@@ -76,6 +76,8 @@ use serde::Deserialize;
 
 mod fft;
 mod local_role;
+#[cfg(any(test, feature = "alsa-substrate"))]
+mod read_fail_class;
 mod spectrum_subject;
 mod transport_gate;
 
