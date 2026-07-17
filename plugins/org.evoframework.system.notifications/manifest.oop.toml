@@ -1,0 +1,58 @@
+[plugin]
+name = "org.evoframework.system.notifications"
+# Keep in sync with this crate's Cargo.toml [package].version.
+version = "0.1.0"
+contract = 1
+
+# Singleton-occupant respondent shelf on the framework-tier
+# `system` rack. Stocks the five notification verbs the schema
+# declares (list_active / set_base_mode / set_quiet_hours /
+# send / cancel). Owns the in-memory NotificationDispatcher +
+# the system_notifications_active singleton subject.
+[target]
+shelf = "system.notifications"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "system.notifications.list_active",
+    "system.notifications.set_base_mode",
+    "system.notifications.set_quiet_hours",
+    "system.notifications.send",
+    "system.notifications.cancel",
+]
+response_budget_ms = 5000
+
+[capabilities.respondent.verb_capabilities]
+"system.notifications.list_active" = { kind = "none" }
+"system.notifications.send" = { kind = "none" }
+"system.notifications.cancel" = { kind = "none" }
+"system.notifications.set_base_mode" = { kind = "step_up", scope = "system_admin" }
+"system.notifications.set_quiet_hours" = { kind = "step_up", scope = "system_admin" }

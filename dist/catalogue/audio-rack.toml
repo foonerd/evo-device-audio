@@ -346,6 +346,30 @@ shutdown semantics (hardware watchdog, alternate init system) \
 ship a vendor-namespace replacement under the same verb shape.
 """
 
+[[racks.shelves]]
+name = "notifications"
+shape = 1
+description = """
+Operator-visible notifications respondent: answers \
+`list_active` / `set_base_mode` / `set_quiet_hours` / `send` / \
+`cancel` for the operator's notifications tray and any plugin \
+that programmatically emits a notification. Reference \
+implementation is the `org.evoframework.system.notifications` \
+plugin, which owns the in-memory NotificationDispatcher (active \
+list + operator-configured base mode + quiet-hours policy + \
+group-coalescing) and republishes the `system_notifications_active` \
+singleton subject on every send / cancel / mode-change / \
+auto-dismiss transition. Notifications are ephemeral by charter \
+(no persistence — restart drops the active list; recurring \
+conditions re-emit, transient conditions are gone). Vendor \
+distributions that need a different notification back-end \
+(desktop-environment integration, mobile push, siren) ship a \
+vendor-namespace replacement under the same verb shape. Mode + \
+quiet-hours verbs are step-up-gated against `system_admin`; \
+list_active / send / cancel are anonymous — send-time \
+attribution comes from the payload's `source_plugin` field.
+"""
+
 # Subject types the audio playback warden announces on
 # every song change. The track subject is keyed by
 # `mpd-path` URI scheme; the album subject is keyed by

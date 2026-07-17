@@ -1,0 +1,80 @@
+[plugin]
+name = "org.evoframework.system.notifications"
+# Keep in sync with this crate's Cargo.toml [package].version.
+version = "0.1.0"
+contract = 1
+
+# Singleton-occupant respondent shelf on the framework-tier
+# `system` rack. Stocks the five notification verbs the schema
+# declares (list_active / set_base_mode / set_quiet_hours /
+# send / cancel). Owns the in-memory NotificationDispatcher +
+# the system_notifications_active singleton subject.
+[target]
+shelf = "system.notifications"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+# Requires the framework's subject-announcer substrate + the
+# multi-occupant router (structurally single-occupant here, but
+# admission passes through the same code path).
+evo_min_version = "0.1.13"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+# In-memory only (no persistence, no external process spawn).
+# Active list is small (banner-visible entries; ~O(10) max in
+# practice); the dispatcher's mutex + coalescing bookkeeping
+# fit comfortably in a few MB.
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+# Reload-cleanable: base mode + quiet-hours policy are
+# operator-tunable via set_base_mode / set_quiet_hours verbs.
+# No persistence — notifications are ephemeral by charter
+# (restart drops the active list; recurring conditions
+# re-emit, transient conditions are gone).
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "system.notifications.list_active",
+    "system.notifications.set_base_mode",
+    "system.notifications.set_quiet_hours",
+    "system.notifications.send",
+    "system.notifications.cancel",
+]
+# In-memory operations — response budget is generous but not
+# unbounded to catch runaway coalescing / mutex contention.
+response_budget_ms = 5000
+
+[capabilities.respondent.verb_capabilities]
+# Read verb: anonymous (tray widget seed).
+"system.notifications.list_active" = { kind = "none" }
+# Emit verb: any plugin can send. Attribution comes from the
+# request payload's source_plugin field; forgery is a
+# plugin-to-plugin trust concern outside framework scope.
+"system.notifications.send" = { kind = "none" }
+# Cancel verb: any caller can dismiss an active handle (banner
+# widget's operator-gesture path lands here).
+"system.notifications.cancel" = { kind = "none" }
+# Operator-configuration verbs: step-up-gated against
+# system_admin (same scope class as the power shelf).
+"system.notifications.set_base_mode" = { kind = "step_up", scope = "system_admin" }
+"system.notifications.set_quiet_hours" = { kind = "step_up", scope = "system_admin" }

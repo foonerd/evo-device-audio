@@ -133,6 +133,7 @@ OOP_PLUGINS=(
     "org.evoframework.system.power:org-evoframework-system-power:system-power-wire:"
     "org.evoframework.network.shares:org-evoframework-network-shares:network-shares-wire:"
     "org.evoframework.network.smb-server:org-evoframework-network-smb-server:network-smb-server-wire:"
+    "org.evoframework.system.notifications:org-evoframework-system-notifications:notifications-wire:"
 )
 
 # Every reference-distribution plugin now ships out-of-process.

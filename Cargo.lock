@@ -3771,6 +3771,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-system-notifications"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "org-evoframework-system-power"
 version = "0.1.0"
 dependencies = [

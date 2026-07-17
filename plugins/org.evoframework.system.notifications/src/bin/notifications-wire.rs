@@ -1,16 +1,20 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
-//! # network-smb-server-wire
+//! # notifications-wire
 //!
 //! Out-of-process reference binary for the
-//! `org.evoframework.network.smb-server` plugin.
+//! `org.evoframework.system.notifications` plugin. Listens on the
+//! Unix socket given as its sole positional argument, accepts
+//! exactly one connection, serves it through the plugin SDK's
+//! [`evo_plugin_sdk::host::run_oop`] helper, and exits when the
+//! steward disconnects.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use anyhow::{anyhow, Result};
 use evo_plugin_sdk::host::{run_oop, HostConfig};
-use org_evoframework_network_smb_server::{SmbServerPlugin, PLUGIN_NAME};
+use org_evoframework_system_notifications::{NotificationsPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -21,12 +25,12 @@ async fn main() -> Result<()> {
     tracing::info!(
         socket = %socket_path.display(),
         plugin = PLUGIN_NAME,
-        "network-smb-server-wire starting"
+        "notifications-wire starting"
     );
-    let plugin = SmbServerPlugin::new();
+    let plugin = NotificationsPlugin::new();
     let config = HostConfig::new(PLUGIN_NAME);
     run_oop(plugin, config, &socket_path).await?;
-    tracing::info!("network-smb-server-wire: steward disconnected, exiting");
+    tracing::info!("notifications-wire: steward disconnected, exiting");
     Ok(())
 }
 
@@ -42,12 +46,12 @@ fn init_logging() {
 
 fn parse_args() -> Result<PathBuf> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().ok_or_else(|| {
-        anyhow!("usage: network-smb-server-wire <socket-path>")
-    })?;
+    let path = args
+        .next()
+        .ok_or_else(|| anyhow!("usage: notifications-wire <socket-path>"))?;
     if args.next().is_some() {
         return Err(anyhow!(
-            "usage: network-smb-server-wire <socket-path> (too many arguments)"
+            "usage: notifications-wire <socket-path> (too many arguments)"
         ));
     }
     Ok(PathBuf::from(path))

@@ -1,0 +1,40 @@
+[package]
+name = "org-evoframework-system-notifications"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Framework-reference notifications plugin. Stocks the system.notifications shelf's five verbs (list_active, set_base_mode, set_quiet_hours, send, cancel), owns the in-memory NotificationDispatcher (active list + operator-configured base mode + quiet-hours policy + group coalescing), and republishes the system_notifications_active singleton subject on every send / cancel / mode-change / auto-dismiss transition. Optional rotating demo emitter (EVO_NOTIFICATIONS_DEMO=1) exercises every envelope shape for UI development."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary cross-built by `dist/scripts/deploy-distribution.sh`
+# and staged under `/opt/evo/plugins/org.evoframework.system.notifications/`; the
+# framework's Phase-2 discovery walks the search root at boot and admits the
+# bundle.
+[[bin]]
+name = "notifications-wire"
+path = "src/bin/notifications-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
