@@ -1613,6 +1613,21 @@ async fn run_fragment_worker(
 
 /// One render + write + restart cycle. Returns the worker
 /// status the caller should publish.
+///
+/// **Dedupe invariant:** the reactor's `wake` is triggered by
+/// every `RouteChange` event the framework's routing service
+/// emits. A spurious event whose downstream `WriteEndpoint`
+/// snapshot equals the current one still propagates through the
+/// watch channel; without the compare-before-write below, this
+/// cycle would proceed to rewrite the fragment (with byte-
+/// identical content) and then unconditionally call
+/// `systemctl restart mpd` — which stops MPD mid-playback for
+/// zero configuration benefit, causing an audible glitch and a
+/// downstream `audio.terminus` mid-playback WARN. The dedupe
+/// step reads the current fragment file, compares to the freshly
+/// rendered content, and returns `FragmentWorkerStatus::Idle`
+/// without touching MPD when they match. See
+/// [`fragment_content_matches`] and its unit tests.
 async fn apply_fragment_cycle(
     endpoint: &WriteEndpoint,
     mixer: &MixerConfig,
@@ -1633,6 +1648,22 @@ async fn apply_fragment_cycle(
             };
         }
     };
+
+    // Dedupe: read the current fragment content (if present) and
+    // compare byte-for-byte with the freshly rendered content.
+    // When they match, skip the write + restart entirely — MPD's
+    // audio_output is already what we would have written and
+    // restarting it under active playback is exactly the fault
+    // the audio.terminus WARN classifier flagged.
+    let existing = tokio::fs::read_to_string(fragment_path).await.ok();
+    if fragment_content_matches(existing.as_deref(), &rendered) {
+        tracing::debug!(
+            plugin = PLUGIN_NAME,
+            path = %fragment_path.display(),
+            "fragment content unchanged; skipping write + MPD restart"
+        );
+        return FragmentWorkerStatus::Idle;
+    }
 
     if let Err(e) = atomic_write_fragment(fragment_path, &rendered).await {
         tracing::warn!(
@@ -1664,6 +1695,22 @@ async fn apply_fragment_cycle(
     );
     FragmentWorkerStatus::Restarted {
         endpoint: endpoint.clone(),
+    }
+}
+
+/// Whether the rendered fragment content matches what is already
+/// on disk. Returns `true` only when the on-disk read succeeded
+/// AND the content strings are byte-identical. Any read failure
+/// (missing file, permission error, decode error) returns
+/// `false` — the safe default is to proceed with the write +
+/// restart when we cannot prove the file is already correct.
+///
+/// Isolated from `apply_fragment_cycle` so the dedupe rule is
+/// unit-testable without a filesystem or a restarter mock.
+fn fragment_content_matches(existing: Option<&str>, rendered: &str) -> bool {
+    match existing {
+        Some(prev) => prev == rendered,
+        None => false,
     }
 }
 
@@ -3585,6 +3632,58 @@ fn parse_mpd_path_uri(uri: &str) -> Result<&str, PluginError> {
              scheme this plugin owns; framework's URI router should not \
              have dispatched it here"
         )))
+    }
+}
+
+#[cfg(test)]
+mod fragment_dedupe_tests {
+    use super::fragment_content_matches;
+
+    #[test]
+    fn matches_when_bytes_identical() {
+        let fragment =
+            "audio_output {\n    type \"alsa\"\n    device \"hw:2,0\"\n}\n";
+        assert!(
+            fragment_content_matches(Some(fragment), fragment),
+            "dedupe must skip when on-disk fragment already matches"
+        );
+    }
+
+    #[test]
+    fn mismatch_when_bytes_differ() {
+        let existing =
+            "audio_output {\n    type \"alsa\"\n    device \"hw:2,0\"\n}\n";
+        let rendered =
+            "audio_output {\n    type \"alsa\"\n    device \"hw:3,0\"\n}\n";
+        assert!(
+            !fragment_content_matches(Some(existing), rendered),
+            "real endpoint change must not be deduped"
+        );
+    }
+
+    #[test]
+    fn mismatch_when_no_existing_file() {
+        // First boot / first render on a fresh system: no file
+        // yet. Safe default is to proceed with write + restart
+        // so MPD picks up the initial fragment.
+        let rendered = "audio_output {\n    type \"alsa\"\n}\n";
+        assert!(
+            !fragment_content_matches(None, rendered),
+            "first render must proceed with write + restart"
+        );
+    }
+
+    #[test]
+    fn mismatch_when_trailing_whitespace_differs() {
+        // Guard against fragile string equality that would treat
+        // a stray newline as "equivalent" and skip a restart that
+        // MPD needed. Bytes are bytes.
+        let existing = "audio_output {\n    type \"alsa\"\n}";
+        let rendered = "audio_output {\n    type \"alsa\"\n}\n";
+        assert!(
+            !fragment_content_matches(Some(existing), rendered),
+            "byte-differing content must not be deduped"
+        );
     }
 }
 
