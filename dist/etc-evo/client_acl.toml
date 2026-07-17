@@ -45,3 +45,22 @@ allow_local = true
 # subject types change across release boundaries; not
 # strictly required for runtime playback.
 allow_local = true
+
+[capabilities.user_interaction_responder]
+# Operator UI session responding to plugin-initiated prompts
+# (device-pairing, credential entry, "the SMB share needs a
+# password" style modals). Two arrival paths:
+#
+#   1. Local Unix-socket connection under the steward's UID —
+#      granted by `allow_local = true` below.
+#   2. HTTPS-arriving browser session carrying a bearer token
+#      whose capability set includes `user_interaction_responder`.
+#      That path is gated at the framework by the bearer branch
+#      of the negotiate handler and does not consult this ACL
+#      block.
+#
+# Only one responder holds the claim at a time (framework single-
+# responder lock); first-claimer-wins. This block does not
+# widen `allow_uids` because a non-steward-UID local caller
+# claiming the responder role would disrupt the operator UI.
+allow_local = true
