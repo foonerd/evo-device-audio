@@ -245,6 +245,28 @@ at admission (direct under root, sudo -n under a non-root \
 service user).
 """
 
+[[racks.shelves]]
+name = "shares"
+shape = 1
+description = """
+Network file-share management surface. Multi-occupant \
+respondent shelf co-stocked by two plugins with disjoint \
+verb sets: the share-management + discovery half \
+(network.share.add / edit / remove / mount / unmount / \
+list_configured / get_state + network.discovery.refresh / \
+list) and the SMB-server half (network.smb_server.apply / \
+user_add / user_revoke / get_state). Framework's admission \
+gate refuses overlapping stockings; dispatch-time \
+verb-aware routing lands each verb on its declaring \
+plugin. Both plugins publish reactive subjects the \
+operator UI consumes for read-then-subscribe: \
+system_network_shares_configured / _discovered / \
+network_share_state (per share) / system_smb_server. \
+Distributions shipping local-storage-only can omit either \
+or both plugins; the shelf declaration remains so the \
+UI's subject-subscribe path resolves.
+"""
+
 [[racks]]
 name = "metadata"
 family = "domain"
