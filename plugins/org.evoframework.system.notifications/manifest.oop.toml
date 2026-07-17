@@ -25,7 +25,7 @@ exec = "plugin.bin"
 class = "platform"
 
 [prerequisites]
-evo_min_version = "0.1.13"
+evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 filesystem_scopes = []

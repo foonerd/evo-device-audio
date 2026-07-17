@@ -28,7 +28,7 @@ class = "platform"
 # Requires the framework's subject-announcer substrate + the
 # multi-occupant router (structurally single-occupant here, but
 # admission passes through the same code path).
-evo_min_version = "0.1.13"
+evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 filesystem_scopes = []
