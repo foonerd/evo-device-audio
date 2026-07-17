@@ -454,16 +454,16 @@ fi
 # ----------------------------------------------------------
 # Step 1e: /etc/sudoers.d/evo-network-shares (narrow NOPASSWD)
 # ----------------------------------------------------------
-# NOPASSWD grant for the framework NetworkSharesRuntime's
-# mount / umount + LAN NAS discovery surface. The steward
-# executes `mount` / `umount` with argv composed by
+# NOPASSWD grant for the org.evoframework.network.shares
+# plugin's mount / umount + LAN NAS discovery surface. The
+# plugin executes `mount` / `umount` with argv composed by
 # `build_cifs_mount_args` / `build_nfs_mount_args` /
 # `build_umount_args`, and `avahi-browse` / `smbclient` under
 # fixed argv shapes on a 5-minute cadence + on operator-issued
 # `network.discovery.refresh`. Argv-scoping at the sudoers
 # layer is intentionally not applied — mount option flags
-# vary with the operator's advanced_options and the runtime
-# builders are the trust boundary.
+# vary with the operator's advanced_options and the plugin's
+# argv builders are the trust boundary.
 if [[ "${EVO_INSTALL_NETWORK_SHARES_SUDOERS:-1}" != "0" ]]; then
     # Sudoers drop-in moved to per-plugin ownership when the
     # runtime became a plugin (each plugin ships its own narrow
@@ -496,11 +496,12 @@ fi
 # ----------------------------------------------------------
 # Step 1f: /etc/sudoers.d/evo-samba-server (narrow NOPASSWD)
 # ----------------------------------------------------------
-# NOPASSWD grant for the framework SambaServerRuntime's
-# testparm + smbpasswd + systemctl-restart-smbd surface. The
-# steward invokes `testparm -s <candidate>` to validate the
-# rendered smb.conf before installing over /etc/samba/smb.conf,
-# then `smbpasswd -a -s <user>` / `-x <user>` to add / revoke
+# NOPASSWD grant for the
+# org.evoframework.network.smb-server plugin's testparm +
+# smbpasswd + systemctl-restart-smbd surface. The plugin
+# invokes `testparm -s <candidate>` to validate the rendered
+# smb.conf before installing over /etc/samba/smb.conf, then
+# `smbpasswd -a -s <user>` / `-x <user>` to add / revoke
 # SMB users (password piped through stdin from the vault; argv
 # never carries it), and `systemctl restart smbd` on every
 # successful apply where enabled=true.
@@ -1457,7 +1458,7 @@ if [[ -f "$NETWORK_SHARES_SUDOERS_FILE" ]]; then
         echo "  [ok]    $SERVICE_USER permitted to run \`mount\` + \`umount\` via NOPASSWD"
     else
         echo "  [WARN]  sudo -n -l -- /bin/mount or /bin/umount did not match for $SERVICE_USER"
-        echo "          (review $NETWORK_SHARES_SUDOERS_FILE; ensure binary paths match NetworkSharesRuntime defaults)"
+        echo "          (review $NETWORK_SHARES_SUDOERS_FILE; ensure binary paths match the plugin's defaults)"
     fi
 else
     echo "  [skip]  network-shares sudoers drop-in not installed"
@@ -1472,7 +1473,7 @@ if [[ -f "$SAMBA_SERVER_SUDOERS_FILE" ]]; then
         echo "  [ok]    $SERVICE_USER permitted to run \`testparm\` + \`smbpasswd\` + \`systemctl restart smbd\` via NOPASSWD"
     else
         echo "  [WARN]  one of testparm / smbpasswd / systemctl restart smbd did not match for $SERVICE_USER"
-        echo "          (review $SAMBA_SERVER_SUDOERS_FILE; ensure binary paths match SambaServerRuntime defaults)"
+        echo "          (review $SAMBA_SERVER_SUDOERS_FILE; ensure binary paths match the plugin's defaults)"
     fi
 else
     echo "  [skip]  samba-server sudoers drop-in not installed"
