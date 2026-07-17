@@ -1,0 +1,37 @@
+[package]
+name = "org-evoframework-network-smb-server"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Framework-reference SMB-server plugin. Stocks the networking.shares shelf's SMB-server verb subset (network.smb_server.apply / user_add / user_revoke / get_state). Owns the persisted SMB-server configuration (enabled + min_protocol + extra_shares + smb_users), renders smb.conf with path-allowlist enforcement, validates via testparm, restarts smbd, adds/revokes SMB users via smbpasswd (password piped through stdin from the vault; never on argv), and publishes the reactive system_smb_server subject. Independent of the shares mount client — a distribution shipping mount-only omits this plugin."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "network-smb-server-wire"
+path = "src/bin/network-smb-server-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

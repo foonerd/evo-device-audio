@@ -1,0 +1,84 @@
+[plugin]
+name = "org.evoframework.network.shares"
+# Keep in sync with this crate's Cargo.toml [package].version.
+version = "0.1.0"
+contract = 1
+
+# Multi-occupant respondent shelf: this plugin stocks the
+# share-management + discovery verb subset on networking.shares;
+# the sibling org.evoframework.network.smb-server plugin stocks
+# the SMB-server verb subset on the same shelf. The framework's
+# admission-time verb-partition gate + dispatch-time verb-aware
+# routing partitions request_types across occupants so each
+# verb reaches exactly one plugin. No special manifest
+# declaration required — admission structurally refuses
+# overlapping verb sets.
+[target]
+shelf = "networking.shares"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+# Requires the framework's multi-occupant respondent shelf +
+# subject-announcer substrate.
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+# Mount points under /mnt/NAS + related music-source paths.
+filesystem_scopes = ["/mnt/NAS", "/data/INTERNAL", "/mnt/USB"]
+
+[resources]
+# Mount lifecycle tasks + discovery cache; conservative upper bounds.
+max_memory_mb = 32
+max_cpu_percent = 2
+
+[lifecycle]
+# Reload-cleanable: operator-tunable share record set + discovery
+# cadence + timeouts. A TOML edit against the plugin config
+# triggers teardown + re-admit; the runtime persists shares to
+# <state_dir>/network_shares.toml which survives the reload cycle.
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "network.share.add",
+    "network.share.edit",
+    "network.share.remove",
+    "network.share.mount",
+    "network.share.unmount",
+    "network.discovery.refresh",
+    # Read verbs (read-then-subscribe seed for UI consumers).
+    "network.share.list_configured",
+    "network.discovery.list",
+    "network.share.get_state",
+]
+# CIFS dialect probe ladder worst-case is 5 attempts × 30 s each;
+# discovery avahi-browse + per-host smbclient adds another ~30 s
+# in the worst case. 180 s covers both.
+response_budget_ms = 180000
+
+[capabilities.respondent.verb_capabilities]
+# Read verbs anonymous (UI widget-seed reads).
+"network.share.list_configured" = { kind = "none" }
+"network.discovery.list" = { kind = "none" }
+"network.share.get_state" = { kind = "none" }
+# Mutating + probing verbs step-up-gated against network_admin.
+"network.share.add" = { kind = "step_up", scope = "network_admin" }
+"network.share.edit" = { kind = "step_up", scope = "network_admin" }
+"network.share.remove" = { kind = "step_up", scope = "network_admin" }
+"network.share.mount" = { kind = "step_up", scope = "network_admin" }
+"network.share.unmount" = { kind = "step_up", scope = "network_admin" }
+"network.discovery.refresh" = { kind = "step_up", scope = "network_admin" }

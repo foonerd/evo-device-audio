@@ -1,0 +1,63 @@
+[plugin]
+name = "org.evoframework.network.smb-server"
+# Keep in sync with this crate's Cargo.toml [package].version.
+version = "0.1.0"
+contract = 1
+
+# Multi-occupant respondent shelf: this plugin stocks the
+# SMB-server verb subset on networking.shares; the sibling
+# org.evoframework.network.shares plugin stocks the
+# share-management + discovery subset on the same shelf. The
+# framework's admission-time verb-partition gate + dispatch-time
+# verb-aware routing partitions request_types across occupants.
+[target]
+shelf = "networking.shares"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+# Writes /etc/samba/smb.conf; sudoers-scoped writes + smbd
+# restart happen via testparm/smbpasswd/systemctl.
+filesystem_scopes = ["/etc/samba"]
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "network.smb_server.apply",
+    "network.smb_server.user_add",
+    "network.smb_server.user_revoke",
+    "network.smb_server.get_state",
+]
+# testparm + smbpasswd + systemctl restart smbd; conservative
+# budget for a full apply cycle.
+response_budget_ms = 10000
+
+[capabilities.respondent.verb_capabilities]
+# Read verb anonymous (widget seed).
+"network.smb_server.get_state" = { kind = "none" }
+# Mutating verbs step-up-gated against network_admin.
+"network.smb_server.apply" = { kind = "step_up", scope = "network_admin" }
+"network.smb_server.user_add" = { kind = "step_up", scope = "network_admin" }
+"network.smb_server.user_revoke" = { kind = "step_up", scope = "network_admin" }

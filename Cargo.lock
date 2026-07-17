@@ -3695,6 +3695,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-network-shares"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "org-evoframework-network-smb-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "org-evoframework-playback-mpd"
 version = "0.1.0"
 dependencies = [

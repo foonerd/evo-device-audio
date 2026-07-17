@@ -465,7 +465,10 @@ fi
 # vary with the operator's advanced_options and the runtime
 # builders are the trust boundary.
 if [[ "${EVO_INSTALL_NETWORK_SHARES_SUDOERS:-1}" != "0" ]]; then
-    TEMPLATE="$DIST_DIR/sudoers.d/evo-network-shares.in"
+    # Sudoers drop-in moved to per-plugin ownership when the
+    # runtime became a plugin (each plugin ships its own narrow
+    # sudoers scope in its plugin directory).
+    TEMPLATE="$DIST_DIR/../plugins/org.evoframework.network.shares/dist/sudoers.d/evo-network-shares.in"
     if [[ ! -f "$TEMPLATE" ]]; then
         echo "sudoers template not found at $TEMPLATE" >&2
         exit 2
@@ -502,7 +505,10 @@ fi
 # never carries it), and `systemctl restart smbd` on every
 # successful apply where enabled=true.
 if [[ "${EVO_INSTALL_SAMBA_SERVER_SUDOERS:-1}" != "0" ]]; then
-    TEMPLATE="$DIST_DIR/sudoers.d/evo-samba-server.in"
+    # Sudoers drop-in lives with the plugin that consumes it
+    # (each plugin ships its own narrow sudoers scope in its
+    # plugin directory).
+    TEMPLATE="$DIST_DIR/../plugins/org.evoframework.network.smb-server/dist/sudoers.d/evo-samba-server.in"
     if [[ ! -f "$TEMPLATE" ]]; then
         echo "sudoers template not found at $TEMPLATE" >&2
         exit 2

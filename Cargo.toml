@@ -17,6 +17,8 @@ members = [
     "plugins/org.evoframework.hardware.audio-config",
     "plugins/org.evoframework.system.power",
     "plugins/org.evoframework.audio.terminus",
+    "plugins/org.evoframework.network.shares",
+    "plugins/org.evoframework.network.smb-server",
 ]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching
