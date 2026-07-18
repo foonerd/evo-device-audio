@@ -171,19 +171,49 @@ impl Plugin for NetworkSharesPlugin {
             // `mount.nfs` fail with `os error 2` (ENOENT) even
             // when the helper binary is installed and the NAS
             // is reachable. Idempotent create_dir_all is the
-            // correct posture: a downstream distribution's
-            // installer may have already provisioned the
-            // directory with its own ownership + mode; this
-            // call is a belt-and-braces guarantee against
-            // handover onto a host where no installer ran.
-            std::fs::create_dir_all(crate::runtime::NAS_MOUNT_ROOT).map_err(
-                |e| {
-                    PluginError::Permanent(format!(
+            // correct posture on writable filesystems: a
+            // downstream distribution's installer may have
+            // already provisioned the directory with its own
+            // ownership + mode; this call is a belt-and-braces
+            // guarantee against handover onto a host where no
+            // installer ran.
+            //
+            // On hosts where `/mnt` is a read-only filesystem
+            // (immutable OS images, some appliance targets),
+            // the create call fails with `EROFS`. That is NOT
+            // a plugin-level admission fault — the distribution
+            // is responsible for provisioning the mount root
+            // into the image at build time. Log the condition
+            // as a warning naming the failure; the mount verbs
+            // themselves surface the actual missing-directory
+            // error at invocation with a clearer per-verb
+            // failure_mode.
+            // EROFS = 30 on Linux (read-only filesystem). Match
+            // on raw_os_error rather than `ErrorKind::ReadOnlyFilesystem`
+            // because the latter is unstable at the time of
+            // writing; the numeric constant is stable ABI on
+            // every Linux target the framework supports.
+            const EROFS: i32 = 30;
+            match std::fs::create_dir_all(crate::runtime::NAS_MOUNT_ROOT) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(EROFS) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        mount_root = crate::runtime::NAS_MOUNT_ROOT,
+                        error = %e,
+                        "mount root cannot be auto-created on this host \
+                         (filesystem is read-only); provisioning must \
+                         land it at image build time; mount verbs will \
+                         refuse with the missing-directory error"
+                    );
+                }
+                Err(e) => {
+                    return Err(PluginError::Permanent(format!(
                         "create mount root {}: {e}",
                         crate::runtime::NAS_MOUNT_ROOT
-                    ))
-                },
-            )?;
+                    )));
+                }
+            }
 
             // Open the runtime against the plugin's state_dir.
             // The builder path lets us swap the executor +
