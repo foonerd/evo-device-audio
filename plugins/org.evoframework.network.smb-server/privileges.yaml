@@ -1,0 +1,62 @@
+schema_version: "1.0"
+plugin: org.evoframework.network.smb-server
+owner: evo-device-audio
+isolation: oop
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.network.smb-server/`. The
+# steward spawns the wire binary as a subprocess and wires the
+# SDK contract over a Unix domain socket. The plugin's core
+# function is server-side SMB — publishing operator-configured
+# share exports over the LAN so paired devices can upload to the
+# host running evo. Every mutating verb requires out-of-plugin
+# host binaries (`smbd` runtime, `testparm` for config
+# validation, `smbpasswd` for user provisioning, `systemctl` for
+# smbd lifecycle); their absence makes the plugin non-functional
+# and admission MUST refuse or degrade to `Unhealthy` with the
+# missing binary named.
+
+capability_intent:
+  - id: smbd_config_validate
+    need: invoke `testparm -s --suppress-prompt` against the plugin's rendered `smb.conf` fragment to validate syntax and reject a bad config before `smbd` reloads. Read-only; no elevation required.
+    access_path: direct exec
+    failure_mode: absent testparm makes the plugin refuse the apply verb before writing the fragment; the plugin remains healthy but every apply returns `PluginError::Permanent` naming the missing binary.
+  - id: smbd_restart
+    need: invoke `systemctl restart smbd` after a config apply so `smbd` re-reads the rendered fragment. Runs as root because systemctl unit control is a privileged action; a non-root service identity dispatches via `sudo -n /usr/bin/systemctl restart smbd` against a narrow NOPASSWD drop-in shipped by the distribution's bootstrap.
+    access_path: sudoers/command
+    failure_mode: absent smbd-restart privilege leaves the newly-rendered fragment on disk but not in effect; the apply verb returns `PluginError::Transient` naming the sudo strategy + the underlying stderr; the operator UI's remedy string names the missing sudoers entry.
+  - id: smb_user_provision
+    need: invoke `smbpasswd -a <user>` (add) and `smbpasswd -x <user>` (remove) to provision the Samba TDB entries the plugin's user_add / user_revoke verbs manage. Runs as root because smbpasswd's TDB write requires root; non-root service identity dispatches via `sudo -n /usr/bin/smbpasswd` against a narrow NOPASSWD drop-in.
+    access_path: sudoers/command
+    failure_mode: absent smbpasswd or its sudoers surface makes user_add / user_revoke return `PluginError::Permanent` naming the missing binary or privilege; existing users remain functional; smbd continues to serve.
+
+required_binaries:
+  - name: smbd
+    min_version: "4.10"
+    failure_mode: refuse to admit; the plugin's core function is publishing SMB shares — smbd is the runtime that does this. Structured admission error names the missing binary and the `samba` package that provides it.
+  - name: testparm
+    min_version: "4.10"
+    failure_mode: refuse to admit; without config validation the plugin cannot safely mutate `smb.conf`. Ships in the same `samba` (Debian) / `samba-common-tools` (Fedora) / `samba` (Alpine, Arch) package as smbd.
+  - name: smbpasswd
+    min_version: "4.10"
+    failure_mode: warn at admission and mark the plugin degraded with reason `smbpasswd_missing`; existing users continue to work; user_add / user_revoke verbs refuse at boundary. The `samba-common-bin` (Debian) / `samba-common-tools` (Fedora) / `samba` (Alpine, Arch) package provides this.
+  - name: systemctl
+    min_version: "245"
+    failure_mode: warn at admission and mark the plugin degraded with reason `systemctl_missing`; smbd cannot be restarted after a config change; the fragment is written but not applied. Debian bookworm and every supported distribution ship systemd 245+.
+
+required_kernel_modules: []
+
+required_system_services:
+  - smbd.service
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "which smbd"
+    - "which testparm"
+  expected:
+    - state directory exists as the steward identity
+    - smbd binary in PATH
+    - testparm binary in PATH
+
+host_provisioning: {}

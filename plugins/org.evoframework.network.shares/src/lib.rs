@@ -166,6 +166,25 @@ impl Plugin for NetworkSharesPlugin {
                 ))
             })?;
 
+            // Ensure the mount root exists before any verb tries
+            // to mount into it. Absent, `mount.cifs` /
+            // `mount.nfs` fail with `os error 2` (ENOENT) even
+            // when the helper binary is installed and the NAS
+            // is reachable. Idempotent create_dir_all is the
+            // correct posture: a downstream distribution's
+            // installer may have already provisioned the
+            // directory with its own ownership + mode; this
+            // call is a belt-and-braces guarantee against
+            // handover onto a host where no installer ran.
+            std::fs::create_dir_all(crate::runtime::NAS_MOUNT_ROOT).map_err(
+                |e| {
+                    PluginError::Permanent(format!(
+                        "create mount root {}: {e}",
+                        crate::runtime::NAS_MOUNT_ROOT
+                    ))
+                },
+            )?;
+
             // Open the runtime against the plugin's state_dir.
             // The builder path lets us swap the executor +
             // credentials fetcher for tests; the plugin's load
