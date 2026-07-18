@@ -364,7 +364,7 @@ for entry in "${OOP_PLUGINS[@]}"; do
 
     # Stage the bundle locally so the layout matches what the
     # framework's Phase 2 walks: <plugin-name>/{manifest.toml,
-    # plugin.bin}. The staging dir is per-target-triple so
+    # plugin.bin, privileges.yaml}. The staging dir is per-target-triple so
     # parallel deploys to different architectures don't trample
     # each other.
     p_stage_dir="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/bundles/${p_name}"
@@ -373,6 +373,18 @@ for entry in "${OOP_PLUGINS[@]}"; do
     cp "${p_manifest_src}" "${p_stage_dir}/manifest.toml"
     cp "${p_local_bin}" "${p_stage_dir}/plugin.bin"
     chmod 0755 "${p_stage_dir}/plugin.bin"
+
+    # Ship the plugin's privileges contract. Every functional
+    # plugin bundle MUST carry privileges.yaml — the steward's
+    # compulsory admission-time OS-dependency parity gate reads
+    # it before spawn. Not part of the signing message (only
+    # manifest.toml + plugin.bin sign), so this is a simple copy.
+    p_privileges_src="${REPO_ROOT}/plugins/${p_name}/privileges.yaml"
+    if [[ ! -f "${p_privileges_src}" ]]; then
+        echo "FAIL: ${p_name} privileges.yaml missing at ${p_privileges_src}" >&2
+        exit 3
+    fi
+    cp "${p_privileges_src}" "${p_stage_dir}/privileges.yaml"
 
     # Sign the bundle. The framework's discovery refuses
     # unsigned bundles at admission with an explicit error;
@@ -410,6 +422,9 @@ for entry in "${OOP_PLUGINS[@]}"; do
         sudo -n install -m 0755 -o root -g root \
             ${p_remote_tmp}/plugin.bin \
             /opt/evo/plugins/${p_name}/plugin.bin
+        sudo -n install -m 0644 -o root -g root \
+            ${p_remote_tmp}/privileges.yaml \
+            /opt/evo/plugins/${p_name}/privileges.yaml
         rm -rf ${p_remote_tmp}
     "; then
         echo "FAIL: install ${p_name} bundle on target failed" >&2
@@ -587,9 +602,20 @@ if [[ "${ACTIVE_STATE}" != "active" ]]; then
 fi
 echo "  [ok]  evo.service active"
 
+# `grep -c` returns 1 when it counts zero matches. Under
+# `set -euo pipefail`, that exit status propagates out of the
+# ssh command and out of the command substitution, and Bash 5
+# treats the failure as a `set -e` trigger even for
+# assignment-form command substitutions. `|| true` on the
+# remote side coerces "no matches" to a clean exit 0; grep -c
+# has already printed its zero count to stdout before exiting,
+# so PLUGIN_HITS captures the count either way. `|| echo 0`
+# would double-print (grep prints 0, then echo prints 0),
+# yielding "0\n0" and breaking the numeric comparison below.
 READY_HITS="$(ssh "${SSH_TARGET}" \
     'sudo -n journalctl -u evo --since "30 seconds ago" --no-pager 2>&1 \
-        | grep -cE "evo ready|server listening|fast path listening"')"
+        | grep -cE "evo ready|server listening|fast path listening" \
+        || true')"
 if [[ "${READY_HITS}" -ge 1 ]]; then
     echo "  [ok]  steward emitted ready / listening signals (${READY_HITS} matching lines)"
 else
@@ -602,12 +628,15 @@ fi
 # `plugin_discovery::discover_and_admit` emits a per-bundle
 # admit line; presence of every plugin name in the recent
 # journal confirms the bundle layout was correct and the
-# admit handshake succeeded.
+# admit handshake succeeded. Same `|| echo 0` guard as above
+# so zero-match on any single plugin never fails the whole
+# verify step under `set -e`.
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ <<< "${entry}"
     PLUGIN_HITS="$(ssh "${SSH_TARGET}" \
         "sudo -n journalctl -u evo --since '30 seconds ago' --no-pager 2>&1 \
-            | grep -cE 'plugin.*${p_name}|${p_name}.*admit'")"
+            | grep -cE 'plugin.*${p_name}|${p_name}.*admit' \
+            || true")"
     if [[ "${PLUGIN_HITS}" -ge 1 ]]; then
         echo "  [ok]  plugin ${p_name} discovered + admitted (${PLUGIN_HITS} matching lines)"
     else
