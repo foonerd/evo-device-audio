@@ -578,8 +578,53 @@ echo "  ok (card=${CARD_NAME})"
 echo
 
 # ----------------------------------------------------------
-# [6/7] Start steward.
+# [6/7] Enable + start every declared required_system_services
+# unit across the OOP plugin set, then start the steward.
+#
+# Symmetric with `evo-install.sh`'s ensure_system_packages step
+# (which handles the same responsibility on the production
+# install path): the steward's compulsory admission-time parity
+# gate refuses admission when a plugin declares
+# required_system_services but the unit is inactive. The dev
+# deploy path must bring the units up before restarting the
+# steward or the parity gate refuses on next start.
+#
+# Extraction mirrors `evo-install.sh`'s awk parser: bounded by
+# ^required_system_services: through the next top-level key.
+# Unit strings match the schema pattern (letters + digits + `.`
+# + `-` + `_` + `@`).
 # ----------------------------------------------------------
+echo "[6/7] ensure required_system_services enabled + started ..."
+declare -A UNITS_SEEN
+for entry in "${OOP_PLUGINS[@]}"; do
+    IFS=':' read -r p_name _ _ _ <<< "${entry}"
+    p_privileges_src="${REPO_ROOT}/plugins/${p_name}/privileges.yaml"
+    [[ -f "${p_privileges_src}" ]] || continue
+    while IFS= read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        [[ -n "${UNITS_SEEN[$unit]:-}" ]] && continue
+        UNITS_SEEN[$unit]=1
+        if ! ssh "${SSH_TARGET}" "sudo -n systemctl enable --now ${unit}" \
+                >/dev/null 2>&1; then
+            echo "FAIL: plugin ${p_name} declares required_system_service ${unit} but enable --now failed on target" >&2
+            ssh "${SSH_TARGET}" "sudo -n systemctl status --no-pager ${unit}" \
+                >&2 || true
+            exit 4
+        fi
+        echo "  ok (${unit})"
+    done < <(awk '
+        /^required_system_services:/ { in_block=1; next }
+        in_block && /^[a-z_][a-z_0-9]*:/ && !/^required_system_services:/ { in_block=0 }
+        in_block && /^[[:space:]]*-[[:space:]]/ {
+            sub(/^[[:space:]]*-[[:space:]]+/, "")
+            gsub(/[[:space:]]+$/, "")
+            gsub(/["'\'']/, "")
+            print
+        }
+    ' "${p_privileges_src}")
+done
+echo
+
 echo "[6/7] start steward ..."
 if ! ssh "${SSH_TARGET}" 'sudo -n systemctl start evo'; then
     echo "FAIL: systemctl start evo returned non-zero" >&2

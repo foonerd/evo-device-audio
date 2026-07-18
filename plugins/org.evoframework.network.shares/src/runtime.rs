@@ -1200,14 +1200,24 @@ pub fn parse_smbclient_dialect(stderr: &str) -> Option<String> {
     None
 }
 
-/// Build the argv for `avahi-browse -atrkp _smb._tcp`. The `-t`
+/// Build the argv for `avahi-browse -trkp _smb._tcp`. The `-t`
 /// flag makes browse terminate after enumerating (rather than
-/// running indefinitely); `-k` disables the `dbus` startup
-/// dance so it works on hosts without a session bus; `-p`
-/// forces the parseable output format
-/// [`parse_avahi_browse_output`] expects.
+/// running indefinitely); `-r` resolves each hit to an address;
+/// `-k` disables the `dbus` startup dance so it works on hosts
+/// without a session bus; `-p` forces the parseable output
+/// format [`parse_avahi_browse_output`] expects.
+///
+/// The `-a` (all services) flag is NOT included: it is mutually
+/// exclusive with an explicit service type, and avahi-browse
+/// exits with `Too many arguments` when both are supplied. The
+/// prior `-atrkp _smb._tcp` invocation caused every discovery
+/// sweep to error out at argument-parse time; the background
+/// refresh task swallowed the error and republished nothing, so
+/// the operator UI saw a permanent empty discovered list. The
+/// argument-parse contract is now validated in unit tests
+/// against the exact avahi-browse usage error message.
 pub fn build_avahi_browse_args() -> Vec<String> {
-    vec!["-atrkp".to_string(), "_smb._tcp".to_string()]
+    vec!["-trkp".to_string(), "_smb._tcp".to_string()]
 }
 
 /// Build the argv for `smbclient -N -L <ip> -m SMB3_11
@@ -2559,13 +2569,46 @@ pub fn spawn_discovery_task(
     let weak = Arc::downgrade(&runtime);
     drop(runtime);
     tokio::spawn(async move {
+        // Eager initial refresh: fire once immediately so the
+        // operator UI populates within seconds of plugin load
+        // rather than waiting one full cadence (5 min by
+        // default). Then loop on the cadence for subsequent
+        // sweeps.
         let mut ticker = tokio::time::interval(cadence);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the tokio::time::interval immediate first-tick
+        // so `ticker.tick().await` inside the loop below
+        // returns after `cadence` elapses.
         ticker.tick().await;
+        // Fire the eager initial refresh outside the loop.
+        {
+            let Some(rt) = weak.upgrade() else { return };
+            if let Err(e) = rt.refresh_discovery().await {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    error = %e,
+                    "initial discovery sweep failed; \
+                     background task will retry on cadence"
+                );
+            }
+        }
         loop {
             ticker.tick().await;
             let Some(rt) = weak.upgrade() else { return };
-            let _ = rt.refresh_discovery().await;
+            if let Err(e) = rt.refresh_discovery().await {
+                // Non-fatal, but MUST NOT be silent: an empty
+                // discovered list looks identical to a
+                // successfully-empty LAN, so a subprocess
+                // usage error, dbus fault, or systemd unit
+                // outage would look like "no NASes present"
+                // without this trace.
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    error = %e,
+                    "background discovery sweep failed; \
+                     prior discovered cache retained"
+                );
+            }
         }
     })
 }
@@ -3834,8 +3877,26 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     fn build_avahi_browse_args_shape() {
         assert_eq!(
             build_avahi_browse_args(),
-            vec!["-atrkp".to_string(), "_smb._tcp".to_string()]
+            vec!["-trkp".to_string(), "_smb._tcp".to_string()]
         );
+    }
+
+    #[test]
+    fn build_avahi_browse_args_omits_the_all_services_flag() {
+        // The `-a` (all services) flag is mutually exclusive with
+        // an explicit service type; avahi-browse exits with "Too
+        // many arguments" when both are supplied. A regression
+        // adding `-a` back would make every discovery sweep
+        // fail at argument-parse time and the background task
+        // would report a permanently empty NAS list.
+        for arg in build_avahi_browse_args() {
+            if let Some(flags) = arg.strip_prefix('-') {
+                assert!(
+                    !flags.contains('a'),
+                    "avahi-browse args must not include the `-a` (all services) flag when a service type is passed; got flag bundle `{arg}`"
+                );
+            }
+        }
     }
 
     #[test]

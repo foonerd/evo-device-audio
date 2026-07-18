@@ -342,6 +342,27 @@ extract_has_os_dependencies() {
     ' "$yaml_path"
 }
 
+# Extract every required_system_services unit name from a
+# plugin's privileges.yaml. Reads the block bounded by
+# ^required_system_services: through the next top-level key.
+# Emits one unit name per line; empty output when the plugin
+# has an empty required_system_services vector. Recognises the
+# YAML shape `- unit.service` (list of strings, per the
+# privileges v1.0 schema).
+extract_required_system_services() {
+    local yaml_path="$1"
+    awk '
+        /^required_system_services:/ { in_block=1; next }
+        in_block && /^[a-z_][a-z_0-9]*:/ && !/^required_system_services:/ { in_block=0 }
+        in_block && /^[[:space:]]*-[[:space:]]/ {
+            sub(/^[[:space:]]*-[[:space:]]+/, "")
+            gsub(/[[:space:]]+$/, "")
+            gsub(/[\"'\'']/, "")
+            print
+        }
+    ' "$yaml_path"
+}
+
 ensure_system_packages() {
     # Baseline packages the reference distribution needs regardless
     # of which plugins are bundled: the framework depends on
@@ -406,11 +427,38 @@ ensure_system_packages() {
         fi
     fi
 
-    # Post-install verification: after apt-install runs, every
-    # plugin that declared has_os_dependencies:true MUST see every
-    # required_binary on PATH. This closes the parity contract on
-    # the distribution-installer side. Steward admission runs the
-    # same gate independently as a symmetric check.
+    # Enable + start every declared required_system_services unit.
+    # A plugin that declares `avahi-daemon.service` and shells out
+    # to `avahi-browse` cannot succeed if the daemon is not
+    # running, even when the binary is present. Symmetric with
+    # the steward's admission-time parity gate: install brings the
+    # units up; admission refuses if the units are down.
+    local unit
+    if [[ -d "${STAGE_DIR}/plugins" ]]; then
+        for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
+            [[ -d "${plugin_dir}" ]] || continue
+            yaml_path="${plugin_dir}privileges.yaml"
+            plugin_id="$(basename "${plugin_dir%/}")"
+            has_deps="$(extract_has_os_dependencies "${yaml_path}")"
+            [[ "${has_deps}" == "true" ]] || continue
+            while IFS= read -r unit; do
+                [[ -n "${unit}" ]] || continue
+                if ! systemctl enable --now "${unit}" >/dev/null 2>&1; then
+                    echo "FAIL: plugin ${plugin_id} declares required_system_service '${unit}' but systemctl enable --now failed — plugin cannot admit; refusing to proceed" >&2
+                    systemctl status --no-pager "${unit}" >&2 || true
+                    exit 8
+                fi
+            done < <(extract_required_system_services "${yaml_path}")
+        done
+    fi
+
+    # Post-install verification: after apt-install + systemctl
+    # enable --now runs, every plugin that declared
+    # has_os_dependencies:true MUST see every required_binary on
+    # PATH AND every required_system_services unit active. This
+    # closes the parity contract on the distribution-installer
+    # side. Steward admission runs the same gate independently as
+    # a symmetric check.
     if [[ -d "${STAGE_DIR}/plugins" ]]; then
         for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
             [[ -d "${plugin_dir}" ]] || continue
@@ -425,6 +473,13 @@ ensure_system_packages() {
                     exit 7
                 fi
             done < <(extract_required_binaries "${yaml_path}")
+            while IFS= read -r unit; do
+                [[ -n "${unit}" ]] || continue
+                if ! systemctl is-active --quiet "${unit}"; then
+                    echo "FAIL: plugin ${plugin_id} declares required_system_service '${unit}' but it is not active after enable --now — the parity gate would refuse admission; refusing to proceed" >&2
+                    exit 9
+                fi
+            done < <(extract_required_system_services "${yaml_path}")
         done
     fi
 }
