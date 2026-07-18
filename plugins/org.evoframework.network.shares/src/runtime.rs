@@ -43,7 +43,9 @@
 
 use async_trait::async_trait;
 use evo_plugin_sdk::contract::{
-    ExternalAddressing, SubjectAnnouncement, SubjectAnnouncer,
+    ExternalAddressing, PromptOutcome, PromptRequest, PromptResponse,
+    PromptType, ReportError, SubjectAnnouncement, SubjectAnnouncer,
+    UserInteractionRequester,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -692,6 +694,50 @@ pub enum MountError {
         /// The credential-vault key the record referenced.
         key: String,
     },
+    /// The plugin was wired without a read-write credential
+    /// store, so the prompt-on-add flow cannot persist an
+    /// operator-supplied password. Legacy fixtures only; the
+    /// production wiring in `lib.rs` always installs the
+    /// file-backed store, so this variant never fires on the
+    /// reference distribution.
+    #[error(
+        "runtime was wired without a credential store; \
+         cannot prompt for password"
+    )]
+    CredentialStoreUnavailable,
+    /// The operator declined to answer the password prompt
+    /// (cancelled or timed out). The share record is left in
+    /// place so the operator can retry mount later, at which
+    /// point the prompt fires again.
+    #[error("operator declined password prompt for key {key}")]
+    CredentialPromptCancelled {
+        /// The credential-vault key the aborted prompt targeted.
+        key: String,
+    },
+    /// The password prompt could not be issued — the framework's
+    /// user-interaction responder returned a
+    /// [`ReportError`](evo_plugin_sdk::contract::ReportError).
+    /// The reason is preserved verbatim for operator visibility.
+    #[error("password prompt failed for key {key}: {reason}")]
+    CredentialPromptFailed {
+        /// The credential-vault key the prompt targeted.
+        key: String,
+        /// The framework-level reason (typically "no responder
+        /// connected" or "steward shutting down").
+        reason: String,
+    },
+    /// The prompt returned an answer but writing it to the
+    /// credential store failed at the IO layer. Rare — the
+    /// framework guarantees the credentials directory is
+    /// writable and mode 0700 — but a full disk or a filesystem
+    /// remount to read-only would surface here.
+    #[error("credential store write failed for key {key}: {reason}")]
+    CredentialStoreWriteFailed {
+        /// The credential-vault key the write targeted.
+        key: String,
+        /// Verbatim IO error.
+        reason: String,
+    },
     /// Subprocess invocation of `mount` failed at the process
     /// layer — the executable was not found, the runtime could
     /// not spawn it, or I/O error while collecting output.
@@ -836,6 +882,255 @@ pub struct NoCredentialFetcher;
 impl CredentialFetcher for NoCredentialFetcher {
     async fn fetch_password(&self, _credential_key: &str) -> Option<Vec<u8>> {
         None
+    }
+}
+
+/// Read-write credential store. Extends [`CredentialFetcher`] with
+/// `store_password`, used by the prompt-on-add flow to persist an
+/// operator-supplied password into the plugin's credentials
+/// directory. The framework guarantees the credentials directory is
+/// mode-0600 and scoped to this plugin's identity; each entry is a
+/// file named for the `credential_key` a share record references.
+#[async_trait]
+pub trait CredentialStore: CredentialFetcher {
+    /// Persist `value` under `credential_key`. Overwrites any prior
+    /// entry. Returns Err on IO failure (unwritable directory,
+    /// out-of-disk, etc.); success guarantees a subsequent
+    /// `fetch_password(credential_key)` on the same store instance
+    /// returns `Some(value)`.
+    async fn store_password(
+        &self,
+        credential_key: &str,
+        value: &[u8],
+    ) -> Result<(), CredentialStoreError>;
+}
+
+/// Error kinds a [`CredentialStore::store_password`] call can
+/// surface. Kept narrow so the operator UI has a small vocabulary
+/// to render.
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialStoreError {
+    /// The `credential_key` failed the store's identifier policy
+    /// (empty, path-traversal characters, oversize). Message names
+    /// the failing constraint.
+    #[error("invalid credential_key: {0}")]
+    InvalidKey(String),
+    /// Filesystem-side failure — write refused, disk full, etc.
+    #[error("credential store IO: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// File-backed [`CredentialStore`] that reads and writes files
+/// under a plugin's credentials directory. Each entry is one file
+/// named for the `credential_key`; the file contents are the raw
+/// password bytes.
+///
+/// Path safety: `credential_key` is validated against
+/// `[A-Za-z0-9._-]+` to prevent traversal via `..` or `/`. The
+/// framework's `credentials_dir` is already mode-0600 and scoped
+/// to the plugin, so a valid key resolves to a single file the
+/// plugin owns exclusively. Written files are set to mode 0600
+/// even though the parent directory is already restrictive; the
+/// intent is to survive umask oddities on vendor targets.
+#[derive(Debug, Clone)]
+pub struct FileCredentialStore {
+    root: PathBuf,
+}
+
+impl FileCredentialStore {
+    /// Construct a store backed by `root`. The directory is
+    /// expected to exist with mode 0700 from the framework's
+    /// per-plugin credentials-dir provisioning; the store does
+    /// not create it.
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn validate_key(key: &str) -> Result<(), CredentialStoreError> {
+        if key.is_empty() {
+            return Err(CredentialStoreError::InvalidKey(
+                "credential_key is empty".into(),
+            ));
+        }
+        if key.len() > 128 {
+            return Err(CredentialStoreError::InvalidKey(
+                "credential_key exceeds 128 chars".into(),
+            ));
+        }
+        for c in key.chars() {
+            let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+            if !ok {
+                return Err(CredentialStoreError::InvalidKey(format!(
+                    "credential_key contains disallowed char `{c}`; permitted set is [A-Za-z0-9._-]"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn key_path(&self, key: &str) -> PathBuf {
+        self.root.join(key)
+    }
+}
+
+#[async_trait]
+impl CredentialFetcher for FileCredentialStore {
+    async fn fetch_password(&self, credential_key: &str) -> Option<Vec<u8>> {
+        if Self::validate_key(credential_key).is_err() {
+            return None;
+        }
+        let path = self.key_path(credential_key);
+        // Small read (typical password: <1 KiB), so the
+        // synchronous std::fs is fine — the surrounding
+        // `mount_share` is already spawning subprocesses on the
+        // order of 10s of ms.
+        tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+}
+
+#[async_trait]
+impl CredentialStore for FileCredentialStore {
+    async fn store_password(
+        &self,
+        credential_key: &str,
+        value: &[u8],
+    ) -> Result<(), CredentialStoreError> {
+        Self::validate_key(credential_key)?;
+        let path = self.key_path(credential_key);
+        // Write via a temp file + rename for atomicity — a mid-
+        // write crash never leaves a truncated password on disk.
+        // std::fs on spawn_blocking so we don't add a tokio "fs"
+        // feature dependency for a one-shot write.
+        let tmp = self.root.join(format!(".{credential_key}.tmp"));
+        let value = value.to_vec();
+        let tmp_clone = tmp.clone();
+        let path_clone = path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            std::fs::write(&tmp_clone, &value)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(&tmp_clone, perms)?;
+            }
+            std::fs::rename(&tmp_clone, &path_clone)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            CredentialStoreError::Io(io::Error::other(format!(
+                "credential store write task panicked: {e}"
+            )))
+        })??;
+        Ok(())
+    }
+}
+
+/// Adapter over the framework's [`UserInteractionRequester`]
+/// specialised for a single-field password prompt. Wrapping the
+/// framework handle behind a plugin-local trait lets tests
+/// deterministic-mock the responder without spinning up the
+/// framework's prompt-ledger substrate.
+#[async_trait]
+pub trait PasswordPrompter: Send + Sync + std::fmt::Debug {
+    /// Raise a password prompt with the supplied operator-visible
+    /// label and await the operator's answer.
+    ///
+    /// Returns:
+    /// - `Ok(Some(bytes))` — operator answered; bytes are the raw
+    ///   password.
+    /// - `Ok(None)` — prompt cancelled by either side or timed
+    ///   out. Caller decides whether to retry.
+    /// - `Err(ReportError::*)` — framework-level failure (no
+    ///   responder connected, steward shutting down).
+    async fn prompt_password(
+        &self,
+        label: String,
+    ) -> Result<Option<Vec<u8>>, ReportError>;
+}
+
+/// Production [`PasswordPrompter`] that dispatches through the
+/// framework's [`UserInteractionRequester`] handle stamped on
+/// `LoadContext`. Tests inject a mock; production wires this one.
+#[derive(Clone)]
+pub struct FrameworkPasswordPrompter {
+    requester: Arc<dyn UserInteractionRequester>,
+}
+
+impl std::fmt::Debug for FrameworkPasswordPrompter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameworkPasswordPrompter").finish()
+    }
+}
+
+impl FrameworkPasswordPrompter {
+    /// Wrap a framework requester so the runtime can raise a
+    /// password prompt without knowing about the underlying
+    /// prompt-ledger substrate.
+    pub fn new(requester: Arc<dyn UserInteractionRequester>) -> Self {
+        Self { requester }
+    }
+}
+
+#[async_trait]
+impl PasswordPrompter for FrameworkPasswordPrompter {
+    async fn prompt_password(
+        &self,
+        label: String,
+    ) -> Result<Option<Vec<u8>>, ReportError> {
+        // The prompt_id encodes the shares plugin's namespace plus
+        // a monotonic wall-clock component so re-issues of the
+        // same operator flow (add / retry-mount) share a session
+        // marker but do not collide with each other. Rendered by
+        // the responder as its stable prompt identity.
+        let ts = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let request = PromptRequest {
+            prompt_id: format!("org.evoframework.network.shares/password/{ts}"),
+            prompt_type: PromptType::Password { label },
+            timeout_ms: None,
+            session_id: None,
+            retention_hint: None,
+            error_context: None,
+            previous_answer: None,
+            priority: None,
+        };
+        let outcome = self.requester.request_user_interaction(request).await?;
+        match outcome {
+            PromptOutcome::Answered { response, .. } => match response {
+                PromptResponse::Password { value } => {
+                    Ok(Some(value.into_bytes()))
+                }
+                other => Err(ReportError::Invalid(format!(
+                    "network.shares password prompt received wrong response \
+                     shape from responder: {other:?}"
+                ))),
+            },
+            PromptOutcome::Cancelled { .. } | PromptOutcome::TimedOut => {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// [`PasswordPrompter`] that always returns `Ok(None)`. Used by
+/// tests and by the framework's fixture builder when no
+/// user-interaction responder is wired.
+#[derive(Debug, Default, Clone)]
+pub struct NoPasswordPrompter;
+
+#[async_trait]
+impl PasswordPrompter for NoPasswordPrompter {
+    async fn prompt_password(
+        &self,
+        _label: String,
+    ) -> Result<Option<Vec<u8>>, ReportError> {
+        Ok(None)
     }
 }
 
@@ -1404,6 +1699,21 @@ pub struct NetworkSharesRuntime {
     inner: Arc<Mutex<NetworkSharesInner>>,
     executor: Arc<dyn MountExecutor>,
     credentials: Arc<dyn CredentialFetcher>,
+    /// Read+write credential store. Some when the plugin was
+    /// wired with a store that supports `store_password` (the
+    /// production path via [`FileCredentialStore`]); None in
+    /// legacy fixtures that only supply a read-side fetcher.
+    /// When None, the prompt-on-add flow is skipped and any
+    /// UserPassword mount attempt reaches the mount helper with
+    /// whatever the fetcher returns (typically None → operator
+    /// sees the honest "credential vault has no entry" error).
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    /// Handle for raising password prompts. Defaults to
+    /// [`NoPasswordPrompter`] in test / builder-omitted paths
+    /// so unit tests never race the framework's prompt-ledger.
+    /// Production wires [`FrameworkPasswordPrompter`] via the
+    /// LoadContext's `user_interaction_requester`.
+    prompter: Arc<dyn PasswordPrompter>,
     mount_program: String,
     umount_program: String,
     mount_timeout_ms: u64,
@@ -1445,6 +1755,8 @@ impl NetworkSharesRuntime {
             inner: Arc::new(Mutex::new(NetworkSharesInner { state, path })),
             executor: Arc::new(SubprocessMountExecutor),
             credentials: Arc::new(NoCredentialFetcher),
+            credential_store: None,
+            prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
             umount_program: "/bin/umount".to_string(),
             mount_timeout_ms: DEFAULT_MOUNT_TIMEOUT_MS,
@@ -1460,8 +1772,8 @@ impl NetworkSharesRuntime {
     }
 
     /// Start a builder for constructing a runtime with custom
-    /// executor / credential fetcher / mount program / timeout
-    /// / clock.
+    /// executor / credential fetcher / credential store / password
+    /// prompter / mount program / timeout / clock.
     pub fn builder(
         state_dir: &Path,
     ) -> Result<NetworkSharesRuntimeBuilder, SharesStateError> {
@@ -1472,6 +1784,8 @@ impl NetworkSharesRuntime {
             path,
             executor: None,
             credentials: None,
+            credential_store: None,
+            prompter: None,
             mount_program: None,
             umount_program: None,
             mount_timeout_ms: None,
@@ -1495,6 +1809,8 @@ impl NetworkSharesRuntime {
             inner: Arc::new(Mutex::new(NetworkSharesInner { state, path })),
             executor: Arc::new(SubprocessMountExecutor),
             credentials: Arc::new(NoCredentialFetcher),
+            credential_store: None,
+            prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
             umount_program: "/bin/umount".to_string(),
             mount_timeout_ms: DEFAULT_MOUNT_TIMEOUT_MS,
@@ -1507,6 +1823,74 @@ impl NetworkSharesRuntime {
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
         }
+    }
+
+    /// Ensure the credential vault has an entry for the record's
+    /// `credential_key`, raising a password prompt to the operator
+    /// when it does not. Guest / KeyFile shares short-circuit to
+    /// `Ok(())` — they carry no vault dependency.
+    ///
+    /// Returns:
+    /// - `Ok(())` — vault already carried the entry, OR the
+    ///   prompt was answered and the answer was stored.
+    /// - `Err(MountError::CredentialPromptCancelled)` — the
+    ///   responder cancelled or the prompt timed out; the caller
+    ///   surfaces this as a mount_error the operator can retry.
+    /// - `Err(MountError::CredentialStoreUnavailable)` — the
+    ///   record needs a password but the runtime was wired
+    ///   without a credential store (legacy path); the operator
+    ///   sees the honest "no store wired" message rather than a
+    ///   silent hang.
+    ///
+    /// Called by `network.share.add` and `network.share.mount`
+    /// before dispatching the mount helper; both entry points
+    /// share the same lookup-then-prompt-then-store pattern so a
+    /// re-mount after a cancelled prompt re-prompts.
+    pub async fn ensure_credential_stocked(
+        &self,
+        record: &ShareRecord,
+    ) -> Result<(), MountError> {
+        let Credentials::UserPassword {
+            credential_key,
+            username,
+            ..
+        } = &record.credentials
+        else {
+            return Ok(());
+        };
+        if self
+            .credentials
+            .fetch_password(credential_key)
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(store) = self.credential_store.as_ref() else {
+            return Err(MountError::CredentialStoreUnavailable);
+        };
+        let label =
+            format!("Password for {}@{}{}", username, record.host, record.path);
+        let answer =
+            self.prompter.prompt_password(label).await.map_err(|e| {
+                MountError::CredentialPromptFailed {
+                    key: credential_key.clone(),
+                    reason: format!("{e}"),
+                }
+            })?;
+        let Some(bytes) = answer else {
+            return Err(MountError::CredentialPromptCancelled {
+                key: credential_key.clone(),
+            });
+        };
+        store
+            .store_password(credential_key, &bytes)
+            .await
+            .map_err(|e| MountError::CredentialStoreWriteFailed {
+                key: credential_key.clone(),
+                reason: format!("{e}"),
+            })?;
+        Ok(())
     }
 }
 
@@ -1528,6 +1912,8 @@ pub struct NetworkSharesRuntimeBuilder {
     path: PathBuf,
     executor: Option<Arc<dyn MountExecutor>>,
     credentials: Option<Arc<dyn CredentialFetcher>>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    prompter: Option<Arc<dyn PasswordPrompter>>,
     mount_program: Option<String>,
     umount_program: Option<String>,
     mount_timeout_ms: Option<u64>,
@@ -1554,6 +1940,31 @@ impl NetworkSharesRuntimeBuilder {
         credentials: Arc<dyn CredentialFetcher>,
     ) -> Self {
         self.credentials = Some(credentials);
+        self
+    }
+
+    /// Install a read-write [`CredentialStore`]. The production
+    /// path passes [`FileCredentialStore`] wrapping the plugin's
+    /// `credentials_dir`; test fixtures pass a mock. When both
+    /// `with_credentials` and `with_credential_store` are called,
+    /// the store also supplies the fetcher (the store's own
+    /// `fetch_password` is used).
+    pub fn with_credential_store(
+        mut self,
+        store: Arc<dyn CredentialStore>,
+    ) -> Self {
+        self.credential_store = Some(store);
+        self
+    }
+
+    /// Install a [`PasswordPrompter`]. Production passes
+    /// [`FrameworkPasswordPrompter`] wrapping the LoadContext's
+    /// `user_interaction_requester`; tests pass a mock.
+    pub fn with_password_prompter(
+        mut self,
+        prompter: Arc<dyn PasswordPrompter>,
+    ) -> Self {
+        self.prompter = Some(prompter);
         self
     }
 
@@ -1632,9 +2043,19 @@ impl NetworkSharesRuntimeBuilder {
             executor: self
                 .executor
                 .unwrap_or_else(|| Arc::new(SubprocessMountExecutor)),
-            credentials: self
-                .credentials
-                .unwrap_or_else(|| Arc::new(NoCredentialFetcher)),
+            credentials: self.credentials.unwrap_or_else(|| {
+                // When only a credential_store was supplied,
+                // route reads through the store — it implements
+                // CredentialFetcher too.
+                self.credential_store
+                    .as_ref()
+                    .map(|s| Arc::clone(s) as Arc<dyn CredentialFetcher>)
+                    .unwrap_or_else(|| Arc::new(NoCredentialFetcher))
+            }),
+            credential_store: self.credential_store,
+            prompter: self
+                .prompter
+                .unwrap_or_else(|| Arc::new(NoPasswordPrompter)),
             mount_program: self
                 .mount_program
                 .unwrap_or_else(|| "/bin/mount".to_string()),
@@ -1792,6 +2213,15 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 }
             })?
         };
+
+        // Prompt-on-mount: for UserPassword shares whose
+        // credential_key is not in the vault, raise a password
+        // prompt via the framework's user-interaction responder
+        // and stash the answer before proceeding. Guest / KeyFile
+        // records short-circuit to Ok(()). Cancelled / timed-out
+        // prompts surface as MountError variants the operator UI
+        // renders per the mount_error contract on the wire.
+        self.ensure_credential_stocked(&record).await?;
 
         let start_ms = (self.now_fn)();
 
@@ -2835,6 +3265,15 @@ impl NetworkSharesRuntime {
                     (self.now_fn)() as i64,
                 );
                 let share_id = self.add_share(record).await?;
+                // mount_share now runs the prompt-on-mount flow
+                // internally: for UserPassword shares whose
+                // credential_key is not in the vault, it raises
+                // a password prompt via the framework's user-
+                // interaction responder and stashes the answer
+                // before dispatching the mount helper. A
+                // cancelled prompt surfaces as a MountError the
+                // caller renders as mount_error; the operator
+                // retries via network.share.mount, which re-prompts.
                 let mount_res = self.mount_share(&share_id).await;
                 let response = match mount_res {
                     Ok(report) => AddShareResponse {
@@ -2872,6 +3311,10 @@ impl NetworkSharesRuntime {
             "network.share.mount" => {
                 let req: MountShareRequest =
                     decode_payload(request_type, payload_bytes)?;
+                // mount_share runs the prompt-on-mount flow
+                // internally, so a re-mount after a cancelled
+                // prompt re-prompts symmetrically with
+                // network.share.add.
                 let report = self.mount_share(&req.share_id).await?;
                 encode_response(request_type, &MountShareResponse { report })
             }
@@ -3566,6 +4009,11 @@ mod tests {
         let dir = tempdir();
         // Executor never fires because we bail before mount.
         let executor = ScriptedExecutor::new(Vec::new());
+        // Neither a store nor a prompter is wired — the legacy
+        // fixture path. The prompt-on-mount flow surfaces
+        // CredentialStoreUnavailable to make the "no store"
+        // condition operator-visible instead of silently
+        // hanging.
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
@@ -3582,7 +4030,156 @@ mod tests {
 
         let err = rt.mount_share(&id).await.unwrap_err();
         assert!(
-            matches!(err, MountError::CredentialMissing { key } if key == "not_in_vault")
+            matches!(err, MountError::CredentialStoreUnavailable),
+            "expected CredentialStoreUnavailable when the runtime was wired without a store; got {err:?}"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingPrompter {
+        answer: std::sync::Mutex<Option<Vec<u8>>>,
+        calls: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl PasswordPrompter for RecordingPrompter {
+        async fn prompt_password(
+            &self,
+            _label: String,
+        ) -> Result<Option<Vec<u8>>, ReportError> {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            let a = self.answer.lock().unwrap().clone();
+            Ok(a)
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_userpassword_prompts_and_stores_then_mounts() {
+        // Runtime with a real file store + a prompter that
+        // returns the password on demand. The mount executor is
+        // a single canned success reply — proves the mount was
+        // attempted after the prompt round-trip.
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root.clone()));
+        let prompter = Arc::new(RecordingPrompter {
+            answer: std::sync::Mutex::new(Some(b"hunter2".to_vec())),
+            calls: std::sync::Mutex::new(0),
+        });
+        let executor = ScriptedExecutor::new(vec![CommandOutput {
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_password_prompter(
+                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+            )
+            .build();
+
+        let mut record = built_record("auth_success", "192.0.2.32");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "auth_success_key".to_string(),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.mount_share(&id)
+            .await
+            .expect("mount should succeed after prompt");
+
+        assert_eq!(
+            *prompter.calls.lock().unwrap(),
+            1,
+            "prompter fires exactly once"
+        );
+        // The password bytes are now in the file store.
+        let bytes = store.fetch_password("auth_success_key").await.unwrap();
+        assert_eq!(bytes, b"hunter2");
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_userpassword_cancelled_prompt_surfaces_error() {
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+        // Prompter returns None: operator cancelled or timed out.
+        let prompter = Arc::new(RecordingPrompter::default());
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(store as Arc<dyn CredentialStore>)
+            .with_password_prompter(prompter as Arc<dyn PasswordPrompter>)
+            .build();
+
+        let mut record = built_record("auth_cancel", "192.0.2.33");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "cancelled_key".to_string(),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(&err, MountError::CredentialPromptCancelled { key } if key == "cancelled_key"),
+            "expected CredentialPromptCancelled; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_userpassword_reuses_stored_password_without_reprompting(
+    ) {
+        // Pre-populate the store, then mount. The prompter must
+        // not fire because the vault already carries the entry.
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+        store
+            .store_password("cached_key", b"already_stored")
+            .await
+            .unwrap();
+        let prompter = Arc::new(RecordingPrompter::default());
+        let executor = ScriptedExecutor::new(vec![CommandOutput {
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(store as Arc<dyn CredentialStore>)
+            .with_password_prompter(
+                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+            )
+            .build();
+
+        let mut record = built_record("auth_cached", "192.0.2.34");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "cached_key".to_string(),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.mount_share(&id)
+            .await
+            .expect("mount should succeed against cached credential");
+        assert_eq!(
+            *prompter.calls.lock().unwrap(),
+            0,
+            "prompter must not fire when the vault already carries the entry"
         );
     }
 

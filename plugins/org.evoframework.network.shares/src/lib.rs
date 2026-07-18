@@ -176,18 +176,31 @@ impl Plugin for NetworkSharesPlugin {
             // surfaces the missing-directory error with the
             // per-verb failure_mode.
 
-            // Open the runtime against the plugin's state_dir.
-            // The builder path lets us swap the executor +
-            // credentials fetcher for tests; the plugin's load
-            // path uses the production defaults (subprocess
-            // executor + no credential fetcher — vault access
-            // for password shares lands in a follow-on ship).
+            // Open the runtime against the plugin's state_dir
+            // via the builder so we can wire the file-backed
+            // credential store (against the framework-provisioned
+            // `credentials_dir`) and the framework's user-
+            // interaction responder for the prompt-on-mount
+            // flow. Guest shares never need either handle;
+            // UserPassword shares need both.
+            let credential_store =
+                Arc::new(crate::runtime::FileCredentialStore::new(
+                    ctx.credentials_dir.clone(),
+                ));
+            let prompter =
+                Arc::new(crate::runtime::FrameworkPasswordPrompter::new(
+                    Arc::clone(&ctx.user_interaction_requester),
+                ));
             let rt = Arc::new(
-                NetworkSharesRuntime::open(&ctx.state_dir).map_err(|e| {
-                    PluginError::Permanent(format!(
-                        "network.shares runtime open failed: {e}"
-                    ))
-                })?,
+                NetworkSharesRuntime::builder(&ctx.state_dir)
+                    .map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "network.shares runtime open failed: {e}"
+                        ))
+                    })?
+                    .with_credential_store(credential_store)
+                    .with_password_prompter(prompter)
+                    .build(),
             );
 
             // Attach the plugin's subject-announcer handle so
