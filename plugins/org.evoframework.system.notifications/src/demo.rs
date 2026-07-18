@@ -3,7 +3,7 @@
 
 //! Reference-data emitter for the notifications substrate.
 //!
-//! Off by default. UI-team developers building widgets against
+//! Off by default. Distribution and UI developers building widgets against
 //! the `system_notifications_active` subject enable this
 //! emitter by setting `EVO_NOTIFICATIONS_DEMO=1` before boot.
 //! Once enabled, the framework spawns a background task that

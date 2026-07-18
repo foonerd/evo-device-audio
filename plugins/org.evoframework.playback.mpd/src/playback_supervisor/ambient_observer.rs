@@ -491,7 +491,7 @@ mod tests {
     //! published envelope so the test asserts the EXACT
     //! `source` field shape after each transition.
     //!
-    //! Acceptance criteria match the UI team's bug report:
+    //! Acceptance criteria match the reported bug:
     //!
     //! 1. A track transition from a parser-recognised source
     //!    (DSF / DSD64) to a different track replaces the
@@ -600,7 +600,7 @@ mod tests {
         let (_, state_mp3) = subjects
             .state_update_at(publish_count_after_mp3 - 1)
             .expect("post-MP3 envelope present");
-        // The exact assertion the UI team named: source.kind
+        // The exact assertion the bug named: source.kind
         // MUST NOT be "dsd" after the transition. The cleanest
         // outcome is null (parser returned None); a PCM shape
         // would also be acceptable but the head we wrote is
