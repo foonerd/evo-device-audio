@@ -191,6 +191,26 @@ impl Plugin for NetworkSharesPlugin {
                 Arc::new(crate::runtime::FrameworkPasswordPrompter::new(
                     Arc::clone(&ctx.user_interaction_requester),
                 ));
+            // Detect effective UID so we know whether the mount
+            // helper needs `sudo -n` wrapping. Root plugins call
+            // `mount` directly; non-root plugins need the
+            // narrow NOPASSWD sudoers drop-in the distribution
+            // ships at `dist/sudoers.d/evo-network-shares.in`.
+            // Read from `/proc/self/status` because the crate
+            // forbids `unsafe_code` (which rules out
+            // `libc::geteuid` directly) and does not carry
+            // `rustix` / `nix` as a dependency.
+            let needs_sudo = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find(|l| l.starts_with("Uid:")).and_then(|l| {
+                        l.split_whitespace()
+                            .nth(2)
+                            .and_then(|effective| effective.parse::<u32>().ok())
+                    })
+                })
+                .map(|euid| euid != 0)
+                .unwrap_or(true);
             let rt = Arc::new(
                 NetworkSharesRuntime::builder(&ctx.state_dir)
                     .map_err(|e| {
@@ -200,6 +220,7 @@ impl Plugin for NetworkSharesPlugin {
                     })?
                     .with_credential_store(credential_store)
                     .with_password_prompter(prompter)
+                    .with_sudo_wrapping(needs_sudo)
                     .build(),
             );
 

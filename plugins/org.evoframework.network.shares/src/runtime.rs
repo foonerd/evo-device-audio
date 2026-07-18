@@ -143,17 +143,29 @@ pub enum Credentials {
     /// Guest access (SMB anonymous / NFS with no user mapping).
     Guest,
     /// Username plus password. The password is stored in the
-    /// framework credential vault under this key; the vault's
-    /// per-plugin scoping isolates share credentials from every
-    /// other credential consumer.
+    /// framework credential vault under `credential_key`; the
+    /// vault's per-plugin scoping isolates share credentials from
+    /// every other credential consumer. `domain` carries the AD /
+    /// workgroup name when the target NAS requires one; empty /
+    /// absent means "no explicit domain — mount.cifs infers".
     UserPassword {
-        /// The username portion of the credential — passes
-        /// through to `mount.cifs`'s `username=` option verbatim.
+        /// The username portion of the credential — written into
+        /// the mount credentials file's `username=` line, never
+        /// on argv.
         username: String,
         /// Handle into the framework credential vault where the
         /// password bytes live. Scoped by the shares primitive's
-        /// plugin-id at the vault boundary.
+        /// plugin-id at the vault boundary. The password itself
+        /// is written into the mount credentials file's
+        /// `password=` line, never on argv.
         credential_key: String,
+        /// Optional AD workgroup / domain name. Required when the
+        /// target NAS is domain-joined (any Synology in AD mode,
+        /// most Windows Server shares); left absent for
+        /// standalone SMB servers. Written into the mount
+        /// credentials file's `domain=` line when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
     },
     /// Key-file credential (NFS-style keytab; operator-managed).
     /// Framework does not manage the file's lifecycle — the
@@ -753,17 +765,38 @@ pub enum MountError {
         timeout_ms: u64,
     },
     /// CIFS dialect probe iterated the full [`CIFS_VERS_PROBE_LADDER`]
-    /// and no dialect succeeded. Attempted-dialect list is
-    /// preserved so operator UI can render "we tried 2.0, 2.1,
-    /// 3.0, 3.02, 3.1.1 — none worked".
+    /// and no dialect succeeded WITHOUT hitting an auth-refusal.
+    /// Reserved for the case where every attempt failed at the
+    /// wire / dialect layer (protocol / negotiation), not the
+    /// auth layer. Auth-refusal short-circuits to
+    /// [`MountError::AuthenticationRefused`] to avoid the
+    /// operator-confusing mislabelling ("dialect probe exhausted"
+    /// when the credential was actually wrong).
     #[error("CIFS dialect probe exhausted; attempted: {attempted:?}")]
     DialectProbeExhausted {
         /// The dialects that were tried, in order.
         attempted: Vec<String>,
         /// The last error's exit code + stderr snippet, for
-        /// operator visibility ("all attempts returned
-        /// permission-denied — check credentials").
+        /// operator visibility.
         last_error: String,
+    },
+    /// The mount helper refused authentication (typically exit
+    /// 13 / EACCES with an "NT_STATUS_LOGON_FAILURE" or
+    /// "Permission denied" stderr fragment on CIFS; exit 32 with
+    /// "access denied" on NFS). Distinct from dialect exhaustion
+    /// so the operator UI renders "check username / password /
+    /// domain", not "unsupported protocol version".
+    #[error(
+        "authentication refused for share {id}: exit={exit_code:?}, stderr={stderr}"
+    )]
+    AuthenticationRefused {
+        /// The share that refused auth.
+        id: ShareId,
+        /// The mount process's exit code (`None` if terminated
+        /// by signal).
+        exit_code: Option<i32>,
+        /// Verbatim stderr snippet (bounded by the executor).
+        stderr: String,
     },
     /// mount returned non-zero. Verbatim stderr snippet
     /// preserved so operator UI can render an operator-legible
@@ -1170,14 +1203,14 @@ pub const DEFAULT_SMBCLIENT_TIMEOUT_MS: u64 = 15_000;
 ///
 /// Credentials handling:
 /// - [`Credentials::Guest`] → adds `guest`.
-/// - [`Credentials::UserPassword`] → adds
-///   `username=<username>,password=<password>` when
-///   `password` is `Some`, else `username=<username>` alone.
-///   NOTE: passing the password on the command line is visible
-///   via `ps`; the runtime should prefer credential-file
-///   injection in production. This function keeps the shape
-///   simple; the injection path lands in a follow-on ship.
-/// - [`Credentials::KeyFile`] → adds `credentials=<path>`.
+/// - [`Credentials::UserPassword`] → the caller passes a
+///   `credentials_file` path (the runtime writes it earlier
+///   with `username=`, `password=`, and optionally `domain=`
+///   lines at mode 0600); this function only adds
+///   `credentials=<path>` to the option list. Passwords NEVER
+///   travel on argv — `ps` and audit logs never see the value.
+/// - [`Credentials::KeyFile`] → adds `credentials=<path>`
+///   pointing at the operator-managed key file.
 ///
 /// This function is pure — no I/O, no clock, no state — so it
 /// is trivially unit-testable and the tests can assert exact
@@ -1185,7 +1218,7 @@ pub const DEFAULT_SMBCLIENT_TIMEOUT_MS: u64 = 15_000;
 pub fn build_cifs_mount_args(
     record: &ShareRecord,
     dialect: &str,
-    password: Option<&str>,
+    credentials_file: Option<&Path>,
 ) -> Vec<String> {
     let mut options: Vec<String> = vec![
         format!("vers={}", dialect),
@@ -1196,11 +1229,14 @@ pub fn build_cifs_mount_args(
 
     match &record.credentials {
         Credentials::Guest => options.push("guest".to_string()),
-        Credentials::UserPassword { username, .. } => {
-            options.push(format!("username={}", username));
-            if let Some(pw) = password {
-                options.push(format!("password={}", pw));
+        Credentials::UserPassword { .. } => {
+            if let Some(path) = credentials_file {
+                options.push(format!("credentials={}", path.display()));
             }
+            // else: caller failed to stage the credentials file —
+            // options list has no username/password, mount.cifs
+            // falls back to anonymous and the auth-refusal parser
+            // surfaces the honest error.
         }
         Credentials::KeyFile { path } => {
             options.push(format!("credentials={}", path.display()));
@@ -1225,6 +1261,80 @@ pub fn build_cifs_mount_args(
         remote,
         record.mount_root.to_string_lossy().into_owned(),
     ]
+}
+
+/// RAII guard that deletes the staged mount-credentials file on
+/// drop, so a mid-mount panic or early return still leaves no
+/// password bytes on disk after this function returns. Deletion
+/// errors are logged at debug (nothing sensitive to expose;
+/// nothing operational to remediate — the next mount attempt
+/// overwrites the file anyway).
+pub struct MountCredentialsFileGuard(PathBuf);
+
+impl Drop for MountCredentialsFileGuard {
+    fn drop(&mut self) {
+        // Best-effort delete. std::fs::remove_file is synchronous
+        // but the file is tiny and Drop is not on the hot path.
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            tracing::debug!(
+                path = %self.0.display(),
+                error = %e,
+                "mount credentials file cleanup failed"
+            );
+        }
+    }
+}
+
+/// True when the mount.cifs exit code + stderr fragment indicate
+/// an authentication failure rather than a dialect / protocol
+/// failure. Read by [`NetworkSharesRuntime::mount_cifs`] to
+/// short-circuit the dialect probe on auth-refusal.
+///
+/// The canonical CIFS auth-refusal signals:
+/// - Exit 13 (EACCES) — mount.cifs returns errno 13 when the
+///   server refused the credential at tree-connect.
+/// - `NT_STATUS_LOGON_FAILURE` — the Samba client's stderr
+///   render of the wire-level SMB status when the username /
+///   password / domain triplet is refused.
+/// - `Permission denied` — the human-readable rendering
+///   mount.cifs emits alongside the exit code.
+pub fn is_cifs_auth_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
+    if exit_code == Some(13) {
+        return true;
+    }
+    let s = stderr.to_ascii_uppercase();
+    s.contains("NT_STATUS_LOGON_FAILURE")
+        || s.contains("PERMISSION DENIED")
+        || s.contains("STATUS_ACCOUNT_DISABLED")
+        || s.contains("STATUS_LOGON_FAILURE")
+        || s.contains("STATUS_ACCOUNT_LOCKED_OUT")
+        || s.contains("STATUS_PASSWORD_EXPIRED")
+}
+
+/// Compose the body of a `mount.cifs` credentials file. Contains
+/// one `key=value` line per non-empty field, terminated with a
+/// newline. Password bytes are written verbatim — mount.cifs
+/// documents no escaping requirement for the credentials file
+/// format, and the runtime already validates `credential_key`
+/// against a strict character set.
+///
+/// Callers write this body to a temp file at mode 0600 and pass
+/// the path via `credentials=<path>` to mount.cifs (see
+/// [`build_cifs_mount_args`]).
+pub fn compose_cifs_credentials_file(
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    body.push_str(&format!("username={username}\n"));
+    body.push_str(&format!("password={password}\n"));
+    if let Some(d) = domain {
+        if !d.is_empty() {
+            body.push_str(&format!("domain={d}\n"));
+        }
+    }
+    body
 }
 
 /// Build the argument list for an NFS mount attempt.
@@ -1715,7 +1825,16 @@ pub struct NetworkSharesRuntime {
     /// LoadContext's `user_interaction_requester`.
     prompter: Arc<dyn PasswordPrompter>,
     mount_program: String,
+    /// Args prepended to every mount invocation, ahead of the
+    /// generated `-t / -o` argv. Empty when the plugin's service
+    /// identity is root (invocation is `mount ...` directly);
+    /// `["-n", "/bin/mount"]` when non-root and the sudoers
+    /// drop-in permits `sudo -n /bin/mount ...`. Set at
+    /// production wiring time from the effective UID.
+    mount_wrapper_args: Vec<String>,
     umount_program: String,
+    /// Same shape as `mount_wrapper_args` for `umount`.
+    umount_wrapper_args: Vec<String>,
     mount_timeout_ms: u64,
     avahi_browse_program: String,
     avahi_browse_timeout_ms: u64,
@@ -1758,7 +1877,9 @@ impl NetworkSharesRuntime {
             credential_store: None,
             prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
+            mount_wrapper_args: Vec::new(),
             umount_program: "/bin/umount".to_string(),
+            umount_wrapper_args: Vec::new(),
             mount_timeout_ms: DEFAULT_MOUNT_TIMEOUT_MS,
             avahi_browse_program: "/usr/bin/avahi-browse".to_string(),
             avahi_browse_timeout_ms: DEFAULT_AVAHI_BROWSE_TIMEOUT_MS,
@@ -1787,7 +1908,9 @@ impl NetworkSharesRuntime {
             credential_store: None,
             prompter: None,
             mount_program: None,
+            mount_wrapper_args: None,
             umount_program: None,
+            umount_wrapper_args: None,
             mount_timeout_ms: None,
             avahi_browse_program: None,
             avahi_browse_timeout_ms: None,
@@ -1812,7 +1935,9 @@ impl NetworkSharesRuntime {
             credential_store: None,
             prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
+            mount_wrapper_args: Vec::new(),
             umount_program: "/bin/umount".to_string(),
+            umount_wrapper_args: Vec::new(),
             mount_timeout_ms: DEFAULT_MOUNT_TIMEOUT_MS,
             avahi_browse_program: "/usr/bin/avahi-browse".to_string(),
             avahi_browse_timeout_ms: DEFAULT_AVAHI_BROWSE_TIMEOUT_MS,
@@ -1915,7 +2040,9 @@ pub struct NetworkSharesRuntimeBuilder {
     credential_store: Option<Arc<dyn CredentialStore>>,
     prompter: Option<Arc<dyn PasswordPrompter>>,
     mount_program: Option<String>,
+    mount_wrapper_args: Option<Vec<String>>,
     umount_program: Option<String>,
+    umount_wrapper_args: Option<Vec<String>>,
     mount_timeout_ms: Option<u64>,
     avahi_browse_program: Option<String>,
     avahi_browse_timeout_ms: Option<u64>,
@@ -2030,6 +2157,35 @@ impl NetworkSharesRuntimeBuilder {
         self
     }
 
+    /// Wrap mount + umount with `sudo -n` so the plugin can
+    /// invoke the mount helper as root even when running under a
+    /// non-root service identity. Sets `mount_program = "sudo"`
+    /// with wrapper args `["-n", "/bin/mount"]` (and the umount
+    /// equivalents). Requires a distribution-provided sudoers
+    /// drop-in permitting the exact commands; the reference
+    /// distribution ships one at
+    /// `dist/sudoers.d/evo-network-shares.in`.
+    ///
+    /// Callers pass `true` when the plugin's service identity is
+    /// non-root, `false` when the identity is root. Production
+    /// wiring picks up the effective UID at load time.
+    pub fn with_sudo_wrapping(mut self, sudo: bool) -> Self {
+        if sudo {
+            self.mount_program = Some("sudo".to_string());
+            self.mount_wrapper_args =
+                Some(vec!["-n".to_string(), "/bin/mount".to_string()]);
+            self.umount_program = Some("sudo".to_string());
+            self.umount_wrapper_args =
+                Some(vec!["-n".to_string(), "/bin/umount".to_string()]);
+        } else {
+            self.mount_program = Some("/bin/mount".to_string());
+            self.mount_wrapper_args = Some(Vec::new());
+            self.umount_program = Some("/bin/umount".to_string());
+            self.umount_wrapper_args = Some(Vec::new());
+        }
+        self
+    }
+
     /// Finalise into a runtime.
     pub fn build(self) -> NetworkSharesRuntime {
         let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
@@ -2059,9 +2215,11 @@ impl NetworkSharesRuntimeBuilder {
             mount_program: self
                 .mount_program
                 .unwrap_or_else(|| "/bin/mount".to_string()),
+            mount_wrapper_args: self.mount_wrapper_args.unwrap_or_default(),
             umount_program: self
                 .umount_program
                 .unwrap_or_else(|| "/bin/umount".to_string()),
+            umount_wrapper_args: self.umount_wrapper_args.unwrap_or_default(),
             mount_timeout_ms: self
                 .mount_timeout_ms
                 .unwrap_or(DEFAULT_MOUNT_TIMEOUT_MS),
@@ -2273,7 +2431,8 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // reference network_mounts.rs:818). NFS is unmounted
         // synchronously; kernel handles NFS-busy differently.
         let lazy = matches!(record.fstype, FsType::Cifs);
-        let args = build_umount_args(&record.mount_root, lazy);
+        let args =
+            self.wrap_umount_args(build_umount_args(&record.mount_root, lazy));
         let umount_program = self.umount_program.clone();
         let output = self
             .executor
@@ -2410,31 +2569,30 @@ impl NetworkSharesRuntime {
         record: &ShareRecord,
         start_ms: u64,
     ) -> Result<MountReport, MountError> {
-        // Fetch credentials once — used by every probe attempt.
-        let password =
-            if let Credentials::UserPassword { credential_key, .. } =
-                &record.credentials
-            {
-                match self.credentials.fetch_password(credential_key).await {
-                    Some(bytes) => {
-                        Some(String::from_utf8(bytes).map_err(|e| {
-                            MountError::CredentialMissing {
-                                key: format!(
-                                    "{credential_key} (non-utf8 payload: {e})"
-                                ),
-                            }
-                        })?)
-                    }
-                    None => {
-                        return Err(MountError::CredentialMissing {
-                            key: credential_key.clone(),
-                        })
-                    }
-                }
-            } else {
-                None
-            };
+        // Stage a credentials file for UserPassword records. The
+        // path is returned so build_cifs_mount_args can reference
+        // it via `credentials=<path>`; the file body carries
+        // username / password / domain — the password never
+        // touches argv. The file is deleted at the end of this
+        // function regardless of success / failure.
+        let creds_file = self.stage_mount_credentials_file(record).await?;
+        let creds_path: Option<PathBuf> =
+            creds_file.as_ref().map(|g| g.0.clone());
 
+        let result = self
+            .mount_cifs_with_creds_file(record, start_ms, creds_path.as_deref())
+            .await;
+
+        drop(creds_file);
+        result
+    }
+
+    async fn mount_cifs_with_creds_file(
+        &self,
+        record: &ShareRecord,
+        start_ms: u64,
+        creds_path: Option<&Path>,
+    ) -> Result<MountReport, MountError> {
         // Determine which dialect(s) to try.
         let ladder: Vec<&str> =
             if let Some(persisted) = record.persisted_vers.as_deref() {
@@ -2450,8 +2608,9 @@ impl NetworkSharesRuntime {
         let mut last_stderr = String::new();
         for dialect in &ladder {
             attempted.push(dialect.to_string());
-            let args =
-                build_cifs_mount_args(record, dialect, password.as_deref());
+            let args = self.wrap_mount_args(build_cifs_mount_args(
+                record, dialect, creds_path,
+            ));
             let output = self
                 .executor
                 .run(&self.mount_program, &args, self.mount_timeout_ms)
@@ -2462,6 +2621,17 @@ impl NetworkSharesRuntime {
                     .await;
             }
             last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            // Auth-refusal short-circuits: no point trying more
+            // dialects when the credential itself is being
+            // refused. The operator UI renders "check
+            // credentials", not "unsupported protocol version".
+            if is_cifs_auth_refusal(output.exit_code, &last_stderr) {
+                return Err(MountError::AuthenticationRefused {
+                    id: record.share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr: last_stderr,
+                });
+            }
         }
 
         // Fast-path exhausted with a persisted dialect that no
@@ -2474,8 +2644,9 @@ impl NetworkSharesRuntime {
                     continue;
                 }
                 attempted.push(dialect.to_string());
-                let args =
-                    build_cifs_mount_args(record, dialect, password.as_deref());
+                let args = self.wrap_mount_args(build_cifs_mount_args(
+                    record, dialect, creds_path,
+                ));
                 let output = self
                     .executor
                     .run(&self.mount_program, &args, self.mount_timeout_ms)
@@ -2487,6 +2658,13 @@ impl NetworkSharesRuntime {
                 }
                 last_stderr =
                     String::from_utf8_lossy(&output.stderr).into_owned();
+                if is_cifs_auth_refusal(output.exit_code, &last_stderr) {
+                    return Err(MountError::AuthenticationRefused {
+                        id: record.share_id.clone(),
+                        exit_code: output.exit_code,
+                        stderr: last_stderr,
+                    });
+                }
             }
         }
 
@@ -2494,6 +2672,90 @@ impl NetworkSharesRuntime {
             attempted,
             last_error: last_stderr,
         })
+    }
+
+    /// Prepend the runtime's configured `mount_wrapper_args` to a
+    /// mount-args vector. When wrapping is off, the returned
+    /// vector equals the input.
+    fn wrap_mount_args(&self, mount_args: Vec<String>) -> Vec<String> {
+        let mut full = self.mount_wrapper_args.clone();
+        full.extend(mount_args);
+        full
+    }
+
+    /// Same shape as [`Self::wrap_mount_args`] for umount.
+    fn wrap_umount_args(&self, umount_args: Vec<String>) -> Vec<String> {
+        let mut full = self.umount_wrapper_args.clone();
+        full.extend(umount_args);
+        full
+    }
+
+    /// Stage a credentials file at `<state_dir>/.mount-creds-<share_id>`
+    /// containing `username=` / `password=` / `domain=` lines
+    /// mount.cifs consumes via `credentials=<path>`. Returns
+    /// `Ok(None)` for Guest / KeyFile records (no file to stage).
+    /// The returned guard deletes the file on drop; the mount
+    /// path calls it explicitly at the end of `mount_cifs`.
+    async fn stage_mount_credentials_file(
+        &self,
+        record: &ShareRecord,
+    ) -> Result<Option<MountCredentialsFileGuard>, MountError> {
+        let Credentials::UserPassword {
+            username,
+            credential_key,
+            domain,
+        } = &record.credentials
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .credentials
+            .fetch_password(credential_key)
+            .await
+            .ok_or_else(|| MountError::CredentialMissing {
+                key: credential_key.clone(),
+            })?;
+        let password = String::from_utf8(bytes).map_err(|e| {
+            MountError::CredentialMissing {
+                key: format!("{credential_key} (non-utf8 payload: {e})"),
+            }
+        })?;
+        let body = compose_cifs_credentials_file(
+            username,
+            &password,
+            domain.as_deref(),
+        );
+        let state_dir = {
+            let g = self.inner.lock().await;
+            g.path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let path =
+            state_dir.join(format!(".mount-creds-{}", record.share_id.0));
+        let path_clone = path.clone();
+        let body_bytes = body.into_bytes();
+        tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            std::fs::write(&path_clone, body_bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(&path_clone, perms)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            MountError::SubprocessIo(format!(
+                "stage credentials file task panicked: {e}"
+            ))
+        })?
+        .map_err(|e| {
+            MountError::SubprocessIo(format!("stage credentials file: {e}"))
+        })?;
+        Ok(Some(MountCredentialsFileGuard(path)))
     }
 
     async fn finalise_mount_success(
@@ -2539,7 +2801,7 @@ impl NetworkSharesRuntime {
         record: &ShareRecord,
         start_ms: u64,
     ) -> Result<MountReport, MountError> {
-        let args = build_nfs_mount_args(record);
+        let args = self.wrap_mount_args(build_nfs_mount_args(record));
         let output = self
             .executor
             .run(&self.mount_program, &args, self.mount_timeout_ms)
@@ -3428,6 +3690,7 @@ mod tests {
         second.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "studio-nas-password".to_string(),
+            domain: None,
         };
         second.fstype = FsType::Nfs;
         state.insert(second).unwrap();
@@ -3810,16 +4073,89 @@ mod tests {
     }
 
     #[test]
-    fn build_cifs_mount_args_userpassword_with_bytes() {
+    fn build_cifs_mount_args_userpassword_uses_credentials_file() {
+        // UserPassword credentials never travel on argv. The
+        // caller stages a credentials file elsewhere and passes
+        // its path; `build_cifs_mount_args` emits
+        // `credentials=<path>` and no other credential option.
         let mut record = built_record("auth_share", "192.0.2.11");
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_share_pw".to_string(),
+            domain: Some("INTRANET".to_string()),
         };
-        let args = build_cifs_mount_args(&record, "3.1.1", Some("hunter2"));
-        assert!(args[3].contains("username=engineer"));
-        assert!(args[3].contains("password=hunter2"));
+        let args = build_cifs_mount_args(
+            &record,
+            "3.1.1",
+            Some(std::path::Path::new("/tmp/creds")),
+        );
+        assert!(args[3].contains("credentials=/tmp/creds"));
+        assert!(!args[3].contains("username="));
+        assert!(!args[3].contains("password="));
+        assert!(!args[3].contains("domain="));
         assert!(!args[3].contains("guest"));
+    }
+
+    #[test]
+    fn build_cifs_mount_args_userpassword_with_no_creds_file_omits_credentials()
+    {
+        // Regression: when the caller failed to stage the
+        // credentials file, no credential option is emitted at
+        // all. mount.cifs falls back to anonymous and the
+        // auth-refusal parser surfaces the honest error.
+        let mut record = built_record("auth_share", "192.0.2.11");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "auth_share_pw".to_string(),
+            domain: None,
+        };
+        let args = build_cifs_mount_args(&record, "3.1.1", None);
+        assert!(!args[3].contains("credentials="));
+        assert!(!args[3].contains("username="));
+        assert!(!args[3].contains("password="));
+    }
+
+    #[test]
+    fn compose_cifs_credentials_file_carries_all_three_fields() {
+        let body = compose_cifs_credentials_file(
+            "engineer",
+            "hunter2",
+            Some("INTRANET"),
+        );
+        assert!(body.contains("username=engineer\n"));
+        assert!(body.contains("password=hunter2\n"));
+        assert!(body.contains("domain=INTRANET\n"));
+    }
+
+    #[test]
+    fn compose_cifs_credentials_file_omits_domain_when_absent() {
+        let body = compose_cifs_credentials_file("engineer", "hunter2", None);
+        assert!(body.contains("username=engineer\n"));
+        assert!(body.contains("password=hunter2\n"));
+        assert!(!body.contains("domain="));
+    }
+
+    #[test]
+    fn is_cifs_auth_refusal_recognises_common_signatures() {
+        assert!(is_cifs_auth_refusal(Some(13), ""));
+        assert!(is_cifs_auth_refusal(
+            Some(32),
+            "mount error(13): NT_STATUS_LOGON_FAILURE"
+        ));
+        assert!(is_cifs_auth_refusal(Some(32), "Permission denied"));
+        assert!(is_cifs_auth_refusal(
+            Some(1),
+            "Status: STATUS_ACCOUNT_LOCKED_OUT"
+        ));
+    }
+
+    #[test]
+    fn is_cifs_auth_refusal_rejects_dialect_errors() {
+        assert!(!is_cifs_auth_refusal(
+            Some(32),
+            "cifs: bad option 'vers=1.0'"
+        ));
+        assert!(!is_cifs_auth_refusal(Some(2), "No such device"));
     }
 
     #[test]
@@ -3927,12 +4263,16 @@ mod tests {
     #[tokio::test]
     async fn mount_cifs_probe_exhausted_errors_with_full_attempt_list() {
         let dir = tempdir();
+        // All five dialect attempts return a NON-auth failure —
+        // otherwise the auth-refusal short-circuit would fire
+        // before the ladder is exhausted. Use bad-option style
+        // errors to exercise the wire-layer failure path.
         let executor = ScriptedExecutor::new(vec![
-            failure_output("no way"),
-            failure_output("no way"),
-            failure_output("no way"),
-            failure_output("no way"),
-            failure_output("permission denied"),
+            failure_output("cifs: bad option 'vers=2.0'"),
+            failure_output("cifs: bad option 'vers=2.1'"),
+            failure_output("cifs: bad option 'vers=3.0'"),
+            failure_output("cifs: bad option 'vers=3.02'"),
+            failure_output("cifs: bad option 'vers=3.1.1'"),
         ]);
         let rt = build_runtime_with_executor(&dir, executor);
         let record = built_record("unreachable", "192.0.2.23");
@@ -3947,10 +4287,53 @@ mod tests {
             } => {
                 assert_eq!(attempted.len(), 5);
                 assert_eq!(attempted, CIFS_VERS_PROBE_LADDER);
-                assert!(last_error.contains("permission denied"));
+                assert!(last_error.contains("bad option"));
             }
             other => panic!("expected DialectProbeExhausted, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_userpassword_auth_refusal_short_circuits_ladder() {
+        // A single permission-denied response — since auth-
+        // refusal is short-circuited, subsequent dialects are
+        // NOT attempted and the error is AuthenticationRefused,
+        // not DialectProbeExhausted.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let store = Arc::new(FileCredentialStore::new(dir.clone()));
+        store.store_password("auth_key", b"wrong").await.unwrap();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .build();
+        let mut record = built_record("auth_share", "192.0.2.99");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "auth_key".to_string(),
+            domain: Some("INTRANET".to_string()),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::AuthenticationRefused { .. } => {}
+            other => panic!("expected AuthenticationRefused, got {:?}", other),
+        }
+        let calls = executor.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "auth-refusal must short-circuit before the second dialect",
+        );
     }
 
     #[tokio::test]
@@ -3964,6 +4347,7 @@ mod tests {
 
     /// Credential fetcher that always returns caller-supplied
     /// bytes. Used to exercise the UserPassword mount path.
+    #[allow(dead_code)]
     struct StaticCredentialFetcher(Vec<u8>);
 
     #[async_trait]
@@ -3973,16 +4357,66 @@ mod tests {
         }
     }
 
+    /// One captured (argv, credentials-file-body) pair from a
+    /// `CredsCapturingExecutor` call.
+    type CapturedCall = (Vec<String>, Option<String>);
+
+    /// Executor that snapshots the credentials file's contents at
+    /// call time before the RAII guard cleans it up. Purely a
+    /// test aid so the assertion below can inspect the body
+    /// mount.cifs would have seen.
+    #[derive(Clone)]
+    struct CredsCapturingExecutor {
+        captured: Arc<tokio::sync::Mutex<Vec<CapturedCall>>>,
+        script: Arc<tokio::sync::Mutex<Vec<CommandOutput>>>,
+    }
+
+    impl CredsCapturingExecutor {
+        fn new(script: Vec<CommandOutput>) -> Self {
+            Self {
+                captured: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                script: Arc::new(tokio::sync::Mutex::new(script)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MountExecutor for CredsCapturingExecutor {
+        async fn run(
+            &self,
+            _program: &str,
+            args: &[String],
+            _timeout_ms: u64,
+        ) -> Result<CommandOutput, MountError> {
+            // Look for `credentials=<path>` in args and snapshot
+            // the file contents.
+            let creds_body = args.iter().find_map(|a| {
+                a.split(',').find_map(|opt| {
+                    opt.strip_prefix("credentials=")
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                })
+            });
+            self.captured.lock().await.push((args.to_vec(), creds_body));
+            self.script
+                .lock()
+                .await
+                .pop()
+                .ok_or_else(|| MountError::SubprocessIo("script empty".into()))
+        }
+    }
+
     #[tokio::test]
-    async fn mount_cifs_userpassword_fetches_and_injects_password() {
+    async fn mount_cifs_userpassword_fetches_and_stages_credentials_file() {
         let dir = tempdir();
-        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let executor = CredsCapturingExecutor::new(vec![success_output()]);
+        let store = Arc::new(FileCredentialStore::new(dir.clone()));
+        store.store_password("auth_pw", b"s3cret").await.unwrap();
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
-            .with_executor(executor.clone())
-            .with_credentials(Arc::new(StaticCredentialFetcher(
-                b"s3cret".to_vec(),
-            )))
+            .with_executor(Arc::new(executor.clone()))
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
             .with_mount_timeout_ms(1_000)
             .with_now_fn(Arc::new(|| 1_700_000_100_000))
             .build();
@@ -3991,6 +4425,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_pw".to_string(),
+            domain: Some("INTRANET".to_string()),
         };
         record.persisted_vers = Some("3.1.1".to_string());
         let id = record.share_id.clone();
@@ -3998,10 +4433,23 @@ mod tests {
 
         rt.mount_share(&id).await.unwrap();
 
-        let calls = executor.calls.lock().await;
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].1.iter().any(|a| a.contains("username=engineer")));
-        assert!(calls[0].1.iter().any(|a| a.contains("password=s3cret")));
+        let captured = executor.captured.lock().await;
+        assert_eq!(captured.len(), 1);
+        // Credentials MUST reach mount.cifs via `credentials=<path>`
+        // — never as `username=` / `password=` on argv.
+        let flat: String = captured[0].0.join(" ");
+        assert!(flat.contains("credentials="));
+        assert!(!flat.contains("username=engineer"));
+        assert!(!flat.contains("password=s3cret"));
+        // The staged file body carries the record's identity as
+        // key=value lines mount.cifs reads.
+        let body = captured[0]
+            .1
+            .as_ref()
+            .expect("credentials file must exist at call time");
+        assert!(body.contains("username=engineer\n"));
+        assert!(body.contains("password=s3cret\n"));
+        assert!(body.contains("domain=INTRANET\n"));
     }
 
     #[tokio::test]
@@ -4024,6 +4472,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "not_in_vault".to_string(),
+            domain: None,
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -4088,6 +4537,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_success_key".to_string(),
+            domain: None,
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -4126,6 +4576,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "cancelled_key".to_string(),
+            domain: None,
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -4169,6 +4620,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "cached_key".to_string(),
+            domain: None,
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -5139,10 +5591,15 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     fn err_mount_output() -> CommandOutput {
+        // Non-auth-signature failure so the dialect probe walks
+        // the full ladder in tests exercising the retry path.
+        // Auth-refusal now short-circuits mid-ladder; tests that
+        // want AuthenticationRefused should craft an auth
+        // stderr and assert on the variant directly.
         CommandOutput {
             exit_code: Some(32),
             stdout: Vec::new(),
-            stderr: b"permission denied".to_vec(),
+            stderr: b"cifs: bad option".to_vec(),
         }
     }
 
