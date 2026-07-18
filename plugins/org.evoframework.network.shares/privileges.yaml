@@ -2,13 +2,14 @@ schema_version: "1.0"
 plugin: org.evoframework.network.shares
 owner: evo-device-audio
 isolation: oop
+has_os_dependencies: true
 
 # Out-of-process plugin shipped as a signed bundle under
 # `/opt/evo/plugins/org.evoframework.network.shares/`. The
 # steward spawns the wire binary as a subprocess and wires the
 # SDK contract over a Unix domain socket. The plugin's core
 # function is discovery and mounting of NAS-hosted SMB and NFS
-# shares under `/mnt/NAS/<alias>`. Every mount path requires
+# shares under `/var/lib/evo/music/NAS/<alias>`. Every mount path requires
 # out-of-plugin host binaries (`mount.cifs`, `mount.nfs`,
 # `smbclient`, `avahi-browse`); their absence is not a
 # recoverable runtime condition — a plugin admitted onto a host
@@ -19,11 +20,11 @@ isolation: oop
 
 capability_intent:
   - id: cifs_mount
-    need: invoke `mount.cifs` to mount an SMB / CIFS share under `/mnt/NAS/<alias>`. Called from the `network.share.mount` verb after credential negotiation; called again on service restart to re-establish previously-persisted mounts. Runs as root because Linux mount() is a privileged syscall regardless of the target filesystem; a non-root service identity dispatches via `sudo -n mount.cifs` against a narrow NOPASSWD drop-in shipped by the distribution's bootstrap. Failure surfaces as a structured `MountFailed { code, stderr }` on the share subject; the steward keeps running.
+    need: invoke `mount.cifs` to mount an SMB / CIFS share under `/var/lib/evo/music/NAS/<alias>`. Called from the `network.share.mount` verb after credential negotiation; called again on service restart to re-establish previously-persisted mounts. Runs as root because Linux mount() is a privileged syscall regardless of the target filesystem; a non-root service identity dispatches via `sudo -n mount.cifs` against a narrow NOPASSWD drop-in shipped by the distribution's bootstrap. Failure surfaces as a structured `MountFailed { code, stderr }` on the share subject; the steward keeps running.
     access_path: sudoers/command
     failure_mode: The `network.share.mount` returns PluginError::Permanent naming the mount helper; the share stays in the discovered state; the operator UI's remedy string names the missing binary.
   - id: nfs_mount
-    need: invoke `mount.nfs` to mount an NFS share under `/mnt/NAS/<alias>`. Same dispatch shape as `cifs_mount` (root direct, sudo -n against a distribution drop-in when service identity is non-root). NFSv3 and NFSv4 share the same helper.
+    need: invoke `mount.nfs` to mount an NFS share under `/var/lib/evo/music/NAS/<alias>`. Same dispatch shape as `cifs_mount` (root direct, sudo -n against a distribution drop-in when service identity is non-root). NFSv3 and NFSv4 share the same helper.
     access_path: sudoers/command
     failure_mode: The `network.share.mount` on an NFS-typed share returns PluginError::Permanent naming the missing helper; the share stays discovered; SMB shares continue to work if `mount.cifs` is present.
   - id: smbclient_probe
@@ -59,10 +60,10 @@ required_system_services:
 verification:
   commands:
     - "test -d /var/lib/evo"
-    - "test -d /mnt/NAS || mkdir -p /mnt/NAS"
+    - "test -d /var/lib/evo/music/NAS"
   expected:
     - state directory exists as the steward identity
-    - mount root exists at /mnt/NAS (created if absent)
+    - mount root exists at /var/lib/evo/music/NAS (created by the distribution installer per the four-primitive install/reset contract; the plugin never creates it)
 
 # Per-distribution package hints for the online installer.
 # The privileges schema's `host_provisioning` block describes

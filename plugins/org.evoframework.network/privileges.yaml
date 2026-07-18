@@ -2,6 +2,7 @@ schema_version: "1.0"
 plugin: org.evoframework.network
 owner: evo-device-audio
 isolation: oop
+has_os_dependencies: true
 
 # Out-of-process plugin shipped as a signed bundle under
 # `/opt/evo/plugins/org.evoframework.network/`. The steward

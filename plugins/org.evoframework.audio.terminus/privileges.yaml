@@ -1,0 +1,30 @@
+schema_version: "1.0"
+plugin: org.evoframework.audio.terminus
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.audio.terminus/`. Stocks
+# the framework-tier `audio.terminus` shelf as a singleton
+# respondent. Owns per-plugin state under
+# `<state_dir>/audio_terminus/`. No host binaries, kernel
+# modules, or system services are required — the plugin's
+# outputs travel through the framework's audio routing.
+
+capability_intent:
+  - id: audio_routing_participation
+    need: participate in the framework's audio-routing plane so composition and delivery stages route through this terminus without touching host audio APIs directly.
+    access_path: framework/audio_routing
+    failure_mode: framework absent → plugin admits with routing-degraded state; structured event; no panic.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+host_provisioning: {}

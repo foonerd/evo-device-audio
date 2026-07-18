@@ -71,9 +71,14 @@ pub const CIFS_VERS_PROBE_LADDER: &[&str] =
 pub const NETWORK_SHARES_FILE: &str = "network_shares.toml";
 
 /// The mount-point root under which per-share mount points are
-/// created. Matches volumio-evo convention so operators moving
-/// from vendor to framework substrate see the same paths.
-pub const NAS_MOUNT_ROOT: &str = "/mnt/NAS";
+/// created. Lives under the framework's `/var/lib/evo/music/`
+/// data-plane convention (INTERNAL / USB / NAS) so operators
+/// browsing the music library see a single unified tree. The
+/// distribution installer creates the root at first-boot per the
+/// four-primitive install/reset contract; this crate never
+/// creates the directory itself and never falls back to any
+/// other location.
+pub const NAS_MOUNT_ROOT: &str = "/var/lib/evo/music/NAS";
 
 /// Stable per-share identifier. UUIDv4 rendered as canonical
 /// lowercase hex-with-hyphens. Survives operator renames of
@@ -209,7 +214,7 @@ pub struct ShareRecord {
     #[serde(default)]
     pub persisted_vers: Option<String>,
     /// Local mount-point path. Defaults to
-    /// `/mnt/NAS/<sanitized_alias>` at record-creation time.
+    /// `/var/lib/evo/music/NAS/<sanitized_alias>` at record-creation time.
     pub mount_root: PathBuf,
     /// Wall-clock millis when this record was first created.
     /// Used by operator UI for "added <n> ago" freshness.
@@ -648,7 +653,7 @@ pub struct MountReport {
     /// The share this report describes.
     pub share_id: ShareId,
     /// The mount root the share is available at (usually
-    /// `/mnt/NAS/<sanitized_alias>`).
+    /// `/var/lib/evo/music/NAS/<sanitized_alias>`).
     pub mount_root: PathBuf,
     /// For CIFS, the negotiated dialect string (e.g. `"3.0"`);
     /// for NFS, the version string parsed from `/proc/mounts`
@@ -3018,15 +3023,15 @@ mod tests {
     fn default_mount_root_sanitises_alias() {
         assert_eq!(
             ShareRecord::default_mount_root("Family NAS"),
-            PathBuf::from("/mnt/NAS/Family_NAS")
+            PathBuf::from("/var/lib/evo/music/NAS/Family_NAS")
         );
         assert_eq!(
             ShareRecord::default_mount_root("dev-rig/2024"),
-            PathBuf::from("/mnt/NAS/dev-rig_2024")
+            PathBuf::from("/var/lib/evo/music/NAS/dev-rig_2024")
         );
         assert_eq!(
             ShareRecord::default_mount_root(""),
-            PathBuf::from("/mnt/NAS/share")
+            PathBuf::from("/var/lib/evo/music/NAS/share")
         );
     }
 
@@ -3315,7 +3320,7 @@ mod tests {
         assert!(args[3].contains("iocharset=utf8"));
         assert!(args[3].contains("guest"));
         assert_eq!(args[4], "//192.0.2.10/Music");
-        assert_eq!(args[5], "/mnt/NAS/guest_share");
+        assert_eq!(args[5], "/var/lib/evo/music/NAS/guest_share");
     }
 
     #[test]
@@ -3556,7 +3561,7 @@ mod tests {
         assert!(args[3].contains("noauto"));
         // NFS remote is host:/path (colon-separated, path leading /).
         assert_eq!(args[4], "192.0.2.100:/export/music");
-        assert_eq!(args[5], "/mnt/NAS/nfs");
+        assert_eq!(args[5], "/var/lib/evo/music/NAS/nfs");
     }
 
     #[test]
@@ -3574,26 +3579,35 @@ mod tests {
 
     #[test]
     fn build_umount_args_plain() {
-        let args = build_umount_args(&PathBuf::from("/mnt/NAS/plain"), false);
-        assert_eq!(args, vec!["/mnt/NAS/plain".to_string()]);
+        let args = build_umount_args(
+            &PathBuf::from("/var/lib/evo/music/NAS/plain"),
+            false,
+        );
+        assert_eq!(args, vec!["/var/lib/evo/music/NAS/plain".to_string()]);
     }
 
     #[test]
     fn build_umount_args_lazy_prepends_flag() {
-        let args = build_umount_args(&PathBuf::from("/mnt/NAS/lazy"), true);
-        assert_eq!(args, vec!["-l".to_string(), "/mnt/NAS/lazy".to_string()]);
+        let args = build_umount_args(
+            &PathBuf::from("/var/lib/evo/music/NAS/lazy"),
+            true,
+        );
+        assert_eq!(
+            args,
+            vec!["-l".to_string(), "/var/lib/evo/music/NAS/lazy".to_string()]
+        );
     }
 
     #[test]
     fn parse_nfs_version_finds_vers_option() {
         let mounts = "\
 proc /proc proc rw,nosuid,nodev,noexec 0 0
-192.0.2.100:/export/music /mnt/NAS/nfs nfs4 ro,vers=4.2,rsize=1048576 0 0
+192.0.2.100:/export/music /var/lib/evo/music/NAS/nfs nfs4 ro,vers=4.2,rsize=1048576 0 0
 ";
         assert_eq!(
             parse_nfs_version_from_proc_mounts(
                 mounts,
-                &PathBuf::from("/mnt/NAS/nfs")
+                &PathBuf::from("/var/lib/evo/music/NAS/nfs")
             ),
             Some("4.2".to_string())
         );
@@ -3601,11 +3615,11 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
 
     #[test]
     fn parse_nfs_version_finds_nfsvers_option() {
-        let mounts = "192.0.2.101:/e /mnt/NAS/alt nfs ro,soft,nfsvers=3 0 0\n";
+        let mounts = "192.0.2.101:/e /var/lib/evo/music/NAS/alt nfs ro,soft,nfsvers=3 0 0\n";
         assert_eq!(
             parse_nfs_version_from_proc_mounts(
                 mounts,
-                &PathBuf::from("/mnt/NAS/alt")
+                &PathBuf::from("/var/lib/evo/music/NAS/alt")
             ),
             Some("3".to_string())
         );
@@ -3617,7 +3631,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(
             parse_nfs_version_from_proc_mounts(
                 mounts,
-                &PathBuf::from("/mnt/NAS/missing")
+                &PathBuf::from("/var/lib/evo/music/NAS/missing")
             ),
             None
         );
@@ -3627,11 +3641,11 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     fn parse_nfs_version_ignores_non_nfs_fstype_at_same_mount() {
         // A bind-mount at the same target does not confuse the
         // parser — the fstype must be nfs or nfs4.
-        let mounts = "/dev/sda1 /mnt/NAS/x ext4 rw 0 0\n";
+        let mounts = "/dev/sda1 /var/lib/evo/music/NAS/x ext4 rw 0 0\n";
         assert_eq!(
             parse_nfs_version_from_proc_mounts(
                 mounts,
-                &PathBuf::from("/mnt/NAS/x")
+                &PathBuf::from("/var/lib/evo/music/NAS/x")
             ),
             None
         );
@@ -3703,7 +3717,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1[0], "-l", "CIFS unmount uses lazy detach");
-        assert_eq!(calls[0].1[1], "/mnt/NAS/cifs_share");
+        assert_eq!(calls[0].1[1], "/var/lib/evo/music/NAS/cifs_share");
     }
 
     #[tokio::test]
@@ -3720,7 +3734,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].1[0], "/mnt/NAS/nfs_share",
+            calls[0].1[0], "/var/lib/evo/music/NAS/nfs_share",
             "NFS unmount does NOT use lazy detach"
         );
     }
@@ -3738,7 +3752,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     async fn unmount_failure_returns_mount_failed_error() {
         let dir = tempdir();
         let executor = ScriptedExecutor::new(vec![failure_output(
-            "umount: /mnt/NAS/x: not mounted",
+            "umount: /var/lib/evo/music/NAS/x: not mounted",
         )]);
         let rt = build_runtime_with_executor(&dir, executor);
         let record = built_record("not_mounted", "192.0.2.52");

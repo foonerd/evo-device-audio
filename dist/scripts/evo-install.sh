@@ -274,22 +274,158 @@ echo "Music library: $([[ ${EVO_INSTALL_MUSIC_LIBRARY} != 0 ]] && echo create-or
 echo ""
 
 # -------- Pre-flight: install system packages --------
+#
+# Compulsory OS-dependency provisioning. The framework's install
+# contract (evo-plugin-tool install + steward admission) both
+# enforce the parity gate: has_os_dependencies=true + any absent
+# required_binary = HARD FAIL. This distribution installer is
+# the Strategy A owner that BRINGS the packages so admission and
+# tool-install both find every binary present. Absence of a
+# required binary after apt-install runs is a failed install.
+#
+# The mapping below mirrors the SDK's binary→package registry
+# (`evo_plugin_sdk::privileges::DistroFamily::binary_to_package`).
+# Keep the two in sync when adding a new binary.
+
+debian_package_for_binary() {
+    case "$1" in
+        aplay|amixer)        echo "alsa-utils" ;;
+        mpc)                 echo "mpc" ;;
+        mpd)                 echo "mpd" ;;
+        curl)                echo "curl" ;;
+        ffmpeg)              echo "ffmpeg" ;;
+        systemctl)           echo "systemd" ;;
+        nmcli)               echo "network-manager" ;;
+        iw)                  echo "iw" ;;
+        rfkill)              echo "rfkill" ;;
+        smbclient)           echo "smbclient" ;;
+        mount.cifs)          echo "cifs-utils" ;;
+        mount.nfs)           echo "nfs-common" ;;
+        avahi-browse)        echo "avahi-utils" ;;
+        smbd)                echo "samba" ;;
+        testparm|smbpasswd)  echo "samba-common-bin" ;;
+        sudo)                echo "sudo" ;;
+        tee|cat)             echo "coreutils" ;;
+        *)                   echo "" ;;
+    esac
+}
+
+# Extract every required_binary name from a plugin's privileges.yaml.
+# Reads the block bounded by ^required_binaries: through the next
+# top-level key. Emits one binary name per line; empty output when
+# the plugin has an empty required_binaries vector.
+extract_required_binaries() {
+    local yaml_path="$1"
+    awk '
+        /^required_binaries:/ { in_block=1; next }
+        in_block && /^[a-z_][a-z_0-9]*:/ && !/^required_binaries:/ { in_block=0 }
+        in_block && /^[[:space:]]*-[[:space:]]*name:/ {
+            sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "")
+            gsub(/[[:space:]]+$/, "")
+            print
+        }
+    ' "$yaml_path"
+}
+
+# Read has_os_dependencies from a privileges.yaml. Emits `true`,
+# `false`, or empty (schema-invalid record; treated as failure by
+# the caller).
+extract_has_os_dependencies() {
+    local yaml_path="$1"
+    awk '
+        /^has_os_dependencies:[[:space:]]*/ {
+            sub(/^has_os_dependencies:[[:space:]]*/, "")
+            gsub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$yaml_path"
+}
+
 ensure_system_packages() {
+    # Baseline packages the reference distribution needs regardless
+    # of which plugins are bundled: the framework depends on
+    # network-manager for LAN control regardless of the network
+    # plugin's admission, and mpd + mpc + alsa-utils are the
+    # audio-reference bundle's steady-state runtime.
     local pkgs_needed=()
     local pkg
-    # network-manager: required by the network plugin's
-    # wifi radio policy enforcement (`nmcli radio wifi on`).
-    # Hosts without nmcli emit "spawn direct failed:
-    # No such file or directory" at every steward start.
     for pkg in mpd alsa-utils mpc network-manager; do
         if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
             pkgs_needed+=("${pkg}")
         fi
     done
+
+    # Walk every bundled plugin's privileges.yaml. For each plugin
+    # that declares has_os_dependencies:true, resolve every
+    # required_binaries[].name → providing package via the mapping
+    # above and add unique packages to pkgs_needed. Refuse install
+    # HARD if any plugin's privileges.yaml is unreadable or its
+    # has_os_dependencies flag is absent — the SDK requires the
+    # field and the parity gate reads it first.
+    local plugin_dir yaml_path plugin_id has_deps binary pkg_name
+    if [[ -d "${STAGE_DIR}/plugins" ]]; then
+        for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
+            [[ -d "${plugin_dir}" ]] || continue
+            yaml_path="${plugin_dir}privileges.yaml"
+            plugin_id="$(basename "${plugin_dir%/}")"
+            if [[ ! -f "${yaml_path}" ]]; then
+                echo "FAIL: plugin ${plugin_id} missing privileges.yaml — every bundled plugin MUST ship its privileges contract" >&2
+                exit 5
+            fi
+            has_deps="$(extract_has_os_dependencies "${yaml_path}")"
+            if [[ -z "${has_deps}" ]]; then
+                echo "FAIL: plugin ${plugin_id} privileges.yaml has no has_os_dependencies field (compulsory per schema v1.0)" >&2
+                exit 5
+            fi
+            if [[ "${has_deps}" != "true" ]]; then
+                continue
+            fi
+            while IFS= read -r binary; do
+                [[ -n "${binary}" ]] || continue
+                pkg_name="$(debian_package_for_binary "${binary}")"
+                if [[ -z "${pkg_name}" ]]; then
+                    echo "FAIL: plugin ${plugin_id} declares required_binary '${binary}' with no debian package mapping in evo-install.sh — extend debian_package_for_binary() before shipping" >&2
+                    exit 5
+                fi
+                if ! dpkg -s "${pkg_name}" >/dev/null 2>&1; then
+                    if ! printf '%s\n' "${pkgs_needed[@]}" | grep -qxF "${pkg_name}"; then
+                        pkgs_needed+=("${pkg_name}")
+                    fi
+                fi
+            done < <(extract_required_binaries "${yaml_path}")
+        done
+    fi
+
     if [[ ${#pkgs_needed[@]} -gt 0 ]]; then
         echo "  installing: ${pkgs_needed[*]}"
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs_needed[@]}"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs_needed[@]}"; then
+            echo "FAIL: apt-get install of ${pkgs_needed[*]} did not succeed — plugin prerequisites are unmet; refusing to promote a bundle whose admission would fail" >&2
+            exit 6
+        fi
+    fi
+
+    # Post-install verification: after apt-install runs, every
+    # plugin that declared has_os_dependencies:true MUST see every
+    # required_binary on PATH. This closes the parity contract on
+    # the distribution-installer side. Steward admission runs the
+    # same gate independently as a symmetric check.
+    if [[ -d "${STAGE_DIR}/plugins" ]]; then
+        for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
+            [[ -d "${plugin_dir}" ]] || continue
+            yaml_path="${plugin_dir}privileges.yaml"
+            plugin_id="$(basename "${plugin_dir%/}")"
+            has_deps="$(extract_has_os_dependencies "${yaml_path}")"
+            [[ "${has_deps}" == "true" ]] || continue
+            while IFS= read -r binary; do
+                [[ -n "${binary}" ]] || continue
+                if ! command -v "${binary}" >/dev/null 2>&1; then
+                    echo "FAIL: plugin ${plugin_id} declares required_binary '${binary}' but it is absent from PATH after apt-install — the parity gate would refuse admission; refusing to proceed" >&2
+                    exit 7
+                fi
+            done < <(extract_required_binaries "${yaml_path}")
+        done
     fi
 }
 
@@ -818,18 +954,18 @@ init_work_dir
 
 case "${MODE}" in
     install)
-        echo "[1/7] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[2/7] fetch bundle ..."     ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[3/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
+        echo "[1/7] fetch bundle ..."     ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[2/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
+        echo "[3/7] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
         echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
         echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
         echo "[7/7] start + verify ..."   ; start_steward ; verify_post_condition
         ;;
     reinstall)
-        echo "[1/8] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[2/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[3/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[1/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[2/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[3/8] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
         echo "[4/8] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
         echo "[5/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
@@ -839,9 +975,9 @@ case "${MODE}" in
         ;;
     wipe-config)
         echo "[1/8] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
-        echo "[2/8] system packages ..." ; ensure_system_packages ; echo "  ok"
-        echo "[3/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[4/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[2/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[3/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[4/8] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
         echo "[5/8] CONFIG WIPE (binaries + config + state, music preserved) ..."
         wipe_config ; echo "  ok"
         echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"

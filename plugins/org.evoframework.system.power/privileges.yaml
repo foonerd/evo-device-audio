@@ -2,6 +2,7 @@ schema_version: "1.0"
 plugin: org.evoframework.system.power
 owner: evo-device-audio
 isolation: oop
+has_os_dependencies: true
 
 # Framework-reserved power management plugin. Stocks the
 # `system.power` shelf with two operator-gestured verbs

@@ -1,0 +1,32 @@
+schema_version: "1.0"
+plugin: org.evoframework.multiroom.evo-native
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.multiroom.evo-native/`.
+# The evo-native multi-room substrate runs entirely inside
+# the framework: the domain witness chain, group singleton
+# subject, and multi-carrier announce all live in
+# `evo-multiroom` linked into this plugin. No external host
+# binaries, kernel modules, or system services are consulted
+# at runtime — every intent is served over the wire against
+# the framework's substrate handles.
+
+capability_intent:
+  - id: multiroom_substrate_consume
+    need: subscribe to the framework's multi-room substrate handle and reconfigure endpoint / group / leader / trust records over the wire so paired devices stay in sync without local OS state.
+    access_path: framework/substrate
+    failure_mode: substrate-empty degradation (admit with defaults, do not subscribe); no panic; structured event names the missing substrate handle.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+host_provisioning: {}

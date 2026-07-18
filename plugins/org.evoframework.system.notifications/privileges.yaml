@@ -1,0 +1,31 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.notifications
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.system.notifications/`.
+# Owns the in-memory `NotificationDispatcher` and the
+# `system_notifications_active` singleton subject. Every
+# verb the plugin stocks (list_active / set_base_mode /
+# set_quiet_hours / send / cancel) runs against
+# framework-owned state; no host binaries, kernel modules,
+# or system services are consulted at runtime.
+
+capability_intent:
+  - id: notifications_state
+    need: read + write the per-plugin state directory holding the notification dispatcher's persistent settings (base mode, quiet hours, per-channel opt-outs).
+    access_path: filesystem/state
+    failure_mode: state_dir missing → plugin admits with defaults; structured event names the unreachable path; no panic.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+host_provisioning: {}

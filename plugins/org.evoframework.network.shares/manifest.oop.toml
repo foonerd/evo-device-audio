@@ -34,8 +34,10 @@ class = "platform"
 evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
-# Mount points under /mnt/NAS + related music-source paths.
-filesystem_scopes = ["/mnt/NAS", "/data/INTERNAL", "/mnt/USB"]
+# Mount points under /var/lib/evo/music/NAS + sibling
+# music-source roots (INTERNAL, USB) per the four-primitive
+# install/reset contract's data-plane layout.
+filesystem_scopes = ["/var/lib/evo/music/NAS", "/var/lib/evo/music/INTERNAL", "/var/lib/evo/music/USB"]
 
 [resources]
 # Mount lifecycle tasks + discovery cache; conservative upper bounds.

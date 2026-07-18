@@ -2,6 +2,7 @@ schema_version: "1.0"
 plugin: org.evoframework.composition.alsa
 owner: evo-device-audio
 isolation: oop
+has_os_dependencies: true
 
 # In-process plugin loaded into the steward identity per
 # manifest.toml (transport = "in-process"). Privileges declared here
