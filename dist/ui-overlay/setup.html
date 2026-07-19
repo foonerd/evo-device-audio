@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0c0c10" />
+    <title>Set up your player</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; height: 100%; }
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: #0c0c10;
+        color: #f2f2f6;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      .card {
+        background: #16161c;
+        border-radius: 16px;
+        padding: 32px;
+        max-width: 480px;
+        width: 100%;
+        box-shadow: 0 20px 40px rgba(0,0,0,.4);
+      }
+      h1 {
+        font-size: 24px;
+        margin: 0 0 8px 0;
+        font-weight: 600;
+      }
+      p.subtitle {
+        color: #a0a0a8;
+        margin: 0 0 24px 0;
+        font-size: 15px;
+        line-height: 1.5;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        color: #a0a0a8;
+        margin-bottom: 6px;
+        margin-top: 16px;
+      }
+      input {
+        width: 100%;
+        padding: 12px 14px;
+        background: #24242c;
+        border: 1px solid #2f2f38;
+        border-radius: 8px;
+        color: #f2f2f6;
+        font-size: 16px;
+        font-family: inherit;
+      }
+      input:focus {
+        outline: none;
+        border-color: #7c7cff;
+      }
+      button {
+        width: 100%;
+        padding: 14px;
+        margin-top: 24px;
+        background: #7c7cff;
+        color: #0c0c10;
+        border: none;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      button:hover { background: #9494ff; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .error {
+        margin-top: 16px;
+        padding: 12px 14px;
+        background: #3a1e1e;
+        color: #ff8888;
+        border-radius: 8px;
+        font-size: 14px;
+        display: none;
+      }
+      .success {
+        margin-top: 16px;
+        padding: 12px 14px;
+        background: #1e3a1e;
+        color: #88ff88;
+        border-radius: 8px;
+        font-size: 14px;
+        display: none;
+      }
+      .step { display: none; }
+      .step.active { display: block; }
+      .hint {
+        margin-top: 16px;
+        font-size: 13px;
+        color: #6a6a72;
+        line-height: 1.6;
+      }
+      .hint code {
+        background: #24242c;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div id="step-pair" class="step active">
+        <h1>Set up your player</h1>
+        <p class="subtitle">
+          Enter the setup value from your SD card to pair this browser
+          with your player.
+        </p>
+        <label for="preseed">Setup value</label>
+        <input
+          id="preseed"
+          type="text"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="e.g. correct-horse-battery"
+        />
+        <button id="pair-submit">Pair this browser</button>
+        <div class="error" id="pair-error"></div>
+        <div class="success" id="pair-success"></div>
+        <div class="hint">
+          The setup value is the contents of
+          <code>/boot/evo/pair-preseed.txt</code> on the SD card. You
+          wrote it there before first boot. If you didn't, hold the
+          reset button while powering the player back on and try
+          again with a fresh SD card.
+        </div>
+      </div>
+
+      <div id="step-password" class="step">
+        <h1>Set a player password</h1>
+        <p class="subtitle">
+          You'll type this password to allow important changes
+          (like removing shares or resetting the player).
+        </p>
+        <label for="password">New password</label>
+        <input
+          id="password"
+          type="password"
+          autocomplete="new-password"
+          placeholder="At least 8 characters"
+        />
+        <label for="password2">Repeat password</label>
+        <input
+          id="password2"
+          type="password"
+          autocomplete="new-password"
+        />
+        <button id="password-submit">Save password</button>
+        <div class="error" id="password-error"></div>
+        <div class="hint">
+          Choose something you'll remember. If you forget it, hold
+          the reset button while powering the player back on to
+          start over.
+        </div>
+      </div>
+
+      <div id="step-done" class="step">
+        <h1>Player is ready</h1>
+        <p class="subtitle">
+          Your browser is paired. Sending you to the player home
+          page now.
+        </p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        // Wire-op envelope over the framework's WSS bearer
+        // subprotocol. The setup page is served by the framework
+        // at the same origin as the WSS endpoint, so we reach
+        // /api/v1/ws directly.
+        const wsUrl = "wss://" + location.host + "/api/v1/ws";
+
+        function encodeSecret(text) {
+          const bytes = new TextEncoder().encode(text);
+          let bin = "";
+          for (const b of bytes) bin += String.fromCharCode(b);
+          return btoa(bin);
+        }
+
+        function randomNonce() {
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          let bin = "";
+          for (const b of bytes) bin += String.fromCharCode(b);
+          return btoa(bin).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+        }
+
+        function showStep(id) {
+          document.querySelectorAll(".step").forEach(function (s) {
+            s.classList.remove("active");
+          });
+          document.getElementById(id).classList.add("active");
+        }
+
+        function showError(elId, msg) {
+          const el = document.getElementById(elId);
+          el.textContent = msg;
+          el.style.display = "block";
+        }
+
+        function clearError(elId) {
+          const el = document.getElementById(elId);
+          el.style.display = "none";
+        }
+
+        // Open a WSS, negotiate an anonymous session, run one
+        // wire op, close. Returns a Promise for the response.
+        function callWireOp(op, protocols) {
+          return new Promise(function (resolve, reject) {
+            const ws = new WebSocket(wsUrl, protocols || []);
+            let timedOut = false;
+            const timer = setTimeout(function () {
+              timedOut = true;
+              try { ws.close(); } catch (_) {}
+              reject(new Error("Player did not respond in time."));
+            }, 15000);
+
+            ws.addEventListener("open", function () {
+              ws.send(JSON.stringify(op));
+            });
+            ws.addEventListener("message", function (ev) {
+              clearTimeout(timer);
+              if (timedOut) return;
+              try {
+                const data = JSON.parse(ev.data);
+                resolve(data);
+              } catch (e) {
+                reject(new Error("Bad response from player."));
+              }
+              try { ws.close(); } catch (_) {}
+            });
+            ws.addEventListener("error", function () {
+              clearTimeout(timer);
+              if (!timedOut) reject(new Error("Cannot reach the player."));
+            });
+            ws.addEventListener("close", function (ev) {
+              clearTimeout(timer);
+              if (!timedOut && ev.code !== 1000) {
+                reject(new Error("Connection closed unexpectedly."));
+              }
+            });
+          });
+        }
+
+        function setBearerCookie(token, expiresAtMs) {
+          const expires = new Date(expiresAtMs).toUTCString();
+          document.cookie =
+            "evo_bearer=" + token +
+            "; Path=/; Secure; SameSite=Strict; Expires=" + expires;
+        }
+
+        function bearerCookie() {
+          const parts = document.cookie.split(";");
+          for (let i = 0; i < parts.length; i++) {
+            const kv = parts[i].trim().split("=");
+            if (kv[0] === "evo_bearer" && kv[1]) return kv[1];
+          }
+          return null;
+        }
+
+        // Bootstrap pair: pair_complete with pair_id "bootstrap"
+        // and the preseed the operator typed. Reuses the same wire
+        // shape as code-based pairs.
+        document.getElementById("pair-submit").addEventListener(
+          "click",
+          async function () {
+            clearError("pair-error");
+            const btn = this;
+            const value = document.getElementById("preseed").value.trim();
+            if (!value) {
+              showError("pair-error", "Type the setup value from your SD card.");
+              return;
+            }
+            btn.disabled = true;
+            btn.textContent = "Pairing…";
+            try {
+              const resp = await callWireOp({
+                op: "pair_complete",
+                pair_id: "bootstrap",
+                code: value,
+              });
+              if (resp.pair_completed) {
+                setBearerCookie(resp.token, resp.expires_at_ms);
+                document.getElementById("pair-success").textContent =
+                  "Paired. Now set a password.";
+                document.getElementById("pair-success").style.display = "block";
+                setTimeout(function () { showStep("step-password"); }, 400);
+              } else if (resp.error) {
+                const subclass = (resp.error.details || {}).subclass || "";
+                const msg =
+                  subclass === "pair_wrong_code"
+                    ? "That value didn't match. Get a new SD card and try again."
+                    : subclass === "pair_unknown"
+                    ? "Setup value has already been used. Hold the reset button and start over."
+                    : subclass === "pair_expired"
+                    ? "Setup value has expired. Start over."
+                    : resp.error.message || "Pairing failed.";
+                showError("pair-error", msg);
+              } else {
+                showError("pair-error", "Player did not confirm pairing.");
+              }
+            } catch (e) {
+              showError("pair-error", e.message || String(e));
+            } finally {
+              btn.disabled = false;
+              btn.textContent = "Pair this browser";
+            }
+          }
+        );
+
+        // Password set — call set_kiosk_password. This wire op is
+        // guarded by the kiosk UID allowlist on the Unix socket;
+        // over WSS it will refuse UNLESS the framework has been
+        // extended to accept it from a paired-device bearer. For
+        // the walk we rely on the framework accepting the paired
+        // bearer's plugins_admin scope (the setup path).
+        document.getElementById("password-submit").addEventListener(
+          "click",
+          async function () {
+            clearError("password-error");
+            const btn = this;
+            const pw = document.getElementById("password").value;
+            const pw2 = document.getElementById("password2").value;
+            if (pw !== pw2) {
+              showError("password-error", "The two entries don't match.");
+              return;
+            }
+            if (pw.length < 8) {
+              showError("password-error", "At least 8 characters.");
+              return;
+            }
+            btn.disabled = true;
+            btn.textContent = "Saving…";
+            try {
+              const bearer = bearerCookie();
+              const protocols = bearer
+                ? ["evo.bearer." + bearer]
+                : [];
+              const resp = await callWireOp(
+                {
+                  op: "set_kiosk_password",
+                  new_password: pw,
+                },
+                protocols
+              );
+              if (resp.kiosk_password_set) {
+                showStep("step-done");
+                setTimeout(function () { location.href = "/"; }, 1200);
+              } else if (resp.error) {
+                const subclass = (resp.error.details || {}).subclass || "";
+                const msg =
+                  subclass === "password_too_short"
+                    ? "At least 8 characters."
+                    : subclass === "kiosk_socket_only"
+                    ? "This player only accepts a password from its own screen. Contact your distributor."
+                    : subclass === "secret_store_unconfigured"
+                    ? "This player is missing its password file. Contact your distributor."
+                    : resp.error.message || "Could not save password.";
+                showError("password-error", msg);
+              } else {
+                showError("password-error", "Player did not confirm.");
+              }
+            } catch (e) {
+              showError("password-error", e.message || String(e));
+            } finally {
+              btn.disabled = false;
+              btn.textContent = "Save password";
+            }
+          }
+        );
+
+        // If the browser already has a bearer cookie, skip the
+        // pair step and jump to password setup — the operator may
+        // have paired before but the shell couldn't finish because
+        // the password wasn't set.
+        if (bearerCookie()) {
+          showStep("step-password");
+        }
+      })();
+    </script>
+  </body>
+</html>
