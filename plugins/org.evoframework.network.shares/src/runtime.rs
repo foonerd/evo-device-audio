@@ -6180,6 +6180,70 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(report.failure_count(), 1);
     }
 
+    /// Reboot-survival regression: a share added under one runtime
+    /// instance must be re-mounted by a *fresh* runtime instance
+    /// pointing at the same state_dir. This is the substrate the
+    /// acceptance walk relies on for "playback survives a device
+    /// reboot" — a fresh boot constructs a new runtime and calls
+    /// `boot_mount_all`, which must reach every persisted share
+    /// even though the current process never saw the `add_share`
+    /// call.
+    #[tokio::test]
+    async fn reboot_survival_fresh_runtime_remounts_persisted_shares() {
+        let dir = tempdir();
+        // First runtime instance: add a share; it persists to
+        // `<state_dir>/network_shares.toml`.
+        {
+            let rt = NetworkSharesRuntime::builder(&dir)
+                .unwrap()
+                .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+                .with_mount_timeout_ms(1_000)
+                .with_now_fn(Arc::new(|| 1_700_000_777_000))
+                .build();
+            let record = built_record("Persisted", "192.0.2.30");
+            rt.add_share(record).await.unwrap();
+            // Confirm the record landed in state.
+            let g = rt.inner.lock().await;
+            assert_eq!(g.state.shares.len(), 1);
+        }
+
+        // A second runtime instance built against the SAME
+        // state_dir sees the persisted share and mounts it via
+        // boot_mount_all — the reboot path.
+        let rt2 = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_888_000))
+            .build();
+        // Fresh runtime: no share state until boot_mount_all fires
+        // — but the persisted TOML is already loaded into
+        // `state.shares` at builder time.
+        {
+            let g = rt2.inner.lock().await;
+            assert_eq!(
+                g.state.shares.len(),
+                1,
+                "fresh runtime must hydrate persisted shares from disk"
+            );
+            assert_eq!(g.state.shares[0].alias, "Persisted");
+        }
+        let report = rt2.boot_mount_all().await;
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            report.success_count(),
+            1,
+            "boot_mount_all on a fresh runtime must re-mount every \
+             persisted share"
+        );
+        // Post-boot state: the share is Mounted.
+        {
+            let g = rt2.share_states.lock().await;
+            let entry = g.values().next().expect("post-boot state");
+            assert_eq!(entry.state, MountState::Mounted);
+        }
+    }
+
     #[tokio::test]
     async fn remount_retry_pass_targets_failed_and_unmounted_only() {
         let dir = tempdir();
