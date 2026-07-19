@@ -177,10 +177,16 @@
         "use strict";
 
         // Wire-op envelope over the framework's WSS bearer
-        // subprotocol. The setup page is served by the framework
-        // at the same origin as the WSS endpoint, so we reach
-        // /api/v1/ws directly.
-        const wsUrl = "wss://" + location.host + "/api/v1/ws";
+        // subprotocol. The overlay MUST be served from the
+        // framework's HTTPS listener at :8443 so:
+        //   1. `wss://` targets the framework port (not :443 default);
+        //   2. the `Secure` cookie the pair step sets survives the
+        //      browser's insecure-origin rejection.
+        // Serving via a port-80 nginx front is incorrect; the WSS
+        // upgrade would go to :443 (closed) and the Secure cookie
+        // would be dropped by every modern browser.
+        const wsHostname = location.hostname;
+        const wsUrl = "wss://" + wsHostname + ":8443/api/v1/ws";
 
         function encodeSecret(text) {
           const bytes = new TextEncoder().encode(text);
