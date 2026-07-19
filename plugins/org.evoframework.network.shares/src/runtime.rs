@@ -66,6 +66,14 @@ pub const NETWORK_SHARES_SCHEMA_VERSION: u32 = 1;
 /// SMB1/NT1 is NEVER included by design — operators who need
 /// SMB1 must explicitly set `vers=1.0` or `vers=NT1` in
 /// [`ShareRecord::advanced_options`].
+///
+/// Order is preserved from the volumio-evo reference (years of
+/// production experience). Any change to the direction of this
+/// ladder MUST be gated on rig-level performance data across
+/// the target NAS matrix and explicit user authorization — the
+/// volumio-evo choice is not a "wrong default"; it is a proven
+/// default whose reasoning includes performance characteristics
+/// that a modern-first ladder can regress.
 pub const CIFS_VERS_PROBE_LADDER: &[&str] =
     &["2.0", "2.1", "3.0", "3.02", "3.1.1"];
 
@@ -961,6 +969,17 @@ pub trait CredentialStore: CredentialFetcher {
         credential_key: &str,
         value: &[u8],
     ) -> Result<(), CredentialStoreError>;
+
+    /// Remove the vault entry for `credential_key`. Idempotent —
+    /// deleting an already-absent entry succeeds silently. Used
+    /// by `mount_share` when the mount helper reports
+    /// `AuthenticationRefused` so the next mount attempt re-
+    /// prompts for the current credential (NAS-side password
+    /// rotation). See NETWORK-SOURCES-DESIGN.md §5.6.5.
+    async fn delete_password(
+        &self,
+        credential_key: &str,
+    ) -> Result<(), CredentialStoreError>;
 }
 
 /// Error kinds a [`CredentialStore::store_password`] call can
@@ -1081,6 +1100,32 @@ impl CredentialStore for FileCredentialStore {
         .map_err(|e| {
             CredentialStoreError::Io(io::Error::other(format!(
                 "credential store write task panicked: {e}"
+            )))
+        })??;
+        Ok(())
+    }
+
+    async fn delete_password(
+        &self,
+        credential_key: &str,
+    ) -> Result<(), CredentialStoreError> {
+        Self::validate_key(credential_key)?;
+        let path = self.key_path(credential_key);
+        tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                // Idempotent: an already-absent entry is a
+                // no-op — the caller's contract is "make sure
+                // this key is not in the vault", not "an entry
+                // was present and we removed it".
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| {
+            CredentialStoreError::Io(io::Error::other(format!(
+                "credential store delete task panicked: {e}"
             )))
         })??;
         Ok(())
@@ -1278,11 +1323,16 @@ pub fn build_cifs_mount_args(
         path = record.path.trim_start_matches('/'),
     );
 
+    // `systemd-mount --collect --type=<fs> --options=<opts>
+    // <remote> <mount_point>` — argv shape per NETWORK-SOURCES-
+    // DESIGN.md §5.6. The transient .mount unit lives at PID 1
+    // in the host namespace, so the mount is visible to every
+    // sibling systemd unit (mpd, artwork, metadata). `--collect`
+    // garbage-collects the unit on failure.
     vec![
-        "-t".to_string(),
-        FsType::Cifs.as_mount_type().to_string(),
-        "-o".to_string(),
-        options.join(","),
+        "--collect".to_string(),
+        format!("--type={}", FsType::Cifs.as_mount_type()),
+        format!("--options={}", options.join(",")),
         remote,
         record.mount_root.to_string_lossy().into_owned(),
     ]
@@ -1308,6 +1358,58 @@ impl Drop for MountCredentialsFileGuard {
             );
         }
     }
+}
+
+/// Compute the transient systemd .mount unit name for a mount
+/// point, per systemd's escape rules (`systemd-escape --path
+/// --suffix=mount`). Used to fetch the real mount.cifs / mount.nfs
+/// stderr from the unit's journal after `systemd-mount` returns
+/// its opaque "Job failed" message.
+///
+/// Rules:
+/// - Strip leading `/`.
+/// - Escape `\` and `-` and control / non-ASCII characters as
+///   `\xHH`.
+/// - Replace `/` with `-`.
+/// - Append `.mount`.
+///
+/// Special case: `/` maps to `-.mount` per systemd convention
+/// (the root itself is escaped to `-`).
+pub fn systemd_mount_unit_name(mount_root: &Path) -> String {
+    let s = mount_root.to_string_lossy();
+    let stripped = s.strip_prefix('/').unwrap_or(&s);
+    if stripped.is_empty() {
+        return "-.mount".to_string();
+    }
+    let mut out = String::with_capacity(stripped.len() + 8);
+    for c in stripped.chars() {
+        match c {
+            '/' => out.push('-'),
+            '-' | '\\' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_ascii_alphanumeric()
+                || c == '_'
+                || c == '.'
+                || c == ':' =>
+            {
+                out.push(c);
+            }
+            c if (c as u32) < 128 => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => {
+                // Non-ASCII: encode UTF-8 bytes as \xHH sequences.
+                let mut buf = [0u8; 4];
+                let bytes = c.encode_utf8(&mut buf).as_bytes();
+                for b in bytes {
+                    out.push_str(&format!("\\x{:02x}", b));
+                }
+            }
+        }
+    }
+    out.push_str(".mount");
+    out
 }
 
 /// True when the mount helper's stderr indicates the target
@@ -1411,11 +1513,12 @@ pub fn build_nfs_mount_args(record: &ShareRecord) -> Vec<String> {
             format!("/{}", record.path)
         }
     );
+    // systemd-mount argv shape — same rationale as
+    // `build_cifs_mount_args` (host-namespace visibility).
     vec![
-        "-t".to_string(),
-        FsType::Nfs.as_mount_type().to_string(),
-        "-o".to_string(),
-        options.join(","),
+        "--collect".to_string(),
+        format!("--type={}", FsType::Nfs.as_mount_type()),
+        format!("--options={}", options.join(",")),
         remote,
         record.mount_root.to_string_lossy().into_owned(),
     ]
@@ -1437,6 +1540,8 @@ pub fn build_nfs_mount_args(record: &ShareRecord) -> Vec<String> {
 /// ```text
 /// -l <mount_root>
 /// ```
+///
+/// `systemd-umount` accepts these flags directly.
 pub fn build_umount_args(mount_root: &Path, lazy: bool) -> Vec<String> {
     let mut args = Vec::new();
     if lazy {
@@ -1526,6 +1631,48 @@ pub struct DiscoveredNas {
 /// are collapsed to the first-seen name/ip pair.
 ///
 /// Pure over the input; unit-testable without avahi installed.
+/// Filter self-references out of a parsed avahi-browse hit list.
+///
+/// The sibling `org.evoframework.network.smb-server` plugin
+/// advertises `_smb._tcp` on the local host, so the discovery
+/// sweep observes the local device as a NAS. The operator never
+/// wants to add their own device; the filter drops:
+///
+/// 1. Loopback IPs (`127.0.0.1` and `::1`) — universally.
+/// 2. Entries whose `name` matches the local hostname (read from
+///    `/proc/sys/kernel/hostname`), case-insensitive.
+///
+/// Both checks combine — an entry passes the filter only when
+/// neither matches. Non-Linux hosts (no `/proc/sys/kernel/hostname`)
+/// fall through with only the loopback filter applied; that's the
+/// honest degradation on platforms without the same identity
+/// convention.
+///
+/// See NETWORK-SOURCES-DESIGN.md §5.6.6.
+pub fn filter_self_out(hits: Vec<(String, String)>) -> Vec<(String, String)> {
+    let local_hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    hits.into_iter()
+        .filter(|(name, ip)| {
+            if ip == "127.0.0.1" || ip == "::1" {
+                return false;
+            }
+            if let Some(h) = local_hostname.as_deref() {
+                if name.to_ascii_lowercase() == h {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Parse `avahi-browse -trkp _smb._tcp` stdout into `(name, ip)`
+/// hits. Each `=` prefixed record contains the resolved service
+/// name and address; other lines (`+` announcements, `#` comments)
+/// are skipped.
 pub fn parse_avahi_browse_output(stdout: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for line in stdout.lines() {
@@ -2212,18 +2359,28 @@ impl NetworkSharesRuntimeBuilder {
     /// Callers pass `true` when the plugin's service identity is
     /// non-root, `false` when the identity is root. Production
     /// wiring picks up the effective UID at load time.
+    ///
+    /// Both variants invoke `systemd-mount --collect` /
+    /// `systemd-umount` so the mount lands in the host mount
+    /// namespace, visible to every sibling systemd unit (mpd,
+    /// artwork, metadata). See NETWORK-SOURCES-DESIGN.md §5.6.1
+    /// for the namespace rationale.
     pub fn with_sudo_wrapping(mut self, sudo: bool) -> Self {
         if sudo {
             self.mount_program = Some("sudo".to_string());
-            self.mount_wrapper_args =
-                Some(vec!["-n".to_string(), "/bin/mount".to_string()]);
+            self.mount_wrapper_args = Some(vec![
+                "-n".to_string(),
+                "/usr/bin/systemd-mount".to_string(),
+            ]);
             self.umount_program = Some("sudo".to_string());
-            self.umount_wrapper_args =
-                Some(vec!["-n".to_string(), "/bin/umount".to_string()]);
+            self.umount_wrapper_args = Some(vec![
+                "-n".to_string(),
+                "/usr/bin/systemd-umount".to_string(),
+            ]);
         } else {
-            self.mount_program = Some("/bin/mount".to_string());
+            self.mount_program = Some("/usr/bin/systemd-mount".to_string());
             self.mount_wrapper_args = Some(Vec::new());
-            self.umount_program = Some("/bin/umount".to_string());
+            self.umount_program = Some("/usr/bin/systemd-umount".to_string());
             self.umount_wrapper_args = Some(Vec::new());
         }
         self
@@ -2458,6 +2615,38 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
             }
             Err(e) => {
+                // Password refresh on auth-refusal (NETWORK-
+                // SOURCES-DESIGN.md §5.6.5): delete the vault
+                // entry so the next mount attempt re-prompts.
+                // Honest response to NAS-side password rotation.
+                if let MountError::AuthenticationRefused { .. } = e {
+                    if let Credentials::UserPassword {
+                        credential_key, ..
+                    } = &record.credentials
+                    {
+                        if let Some(store) = self.credential_store.as_ref() {
+                            if let Err(delete_err) =
+                                store.delete_password(credential_key).await
+                            {
+                                tracing::warn!(
+                                    plugin = crate::PLUGIN_NAME,
+                                    key = credential_key,
+                                    error = %delete_err,
+                                    "auth-refused vault delete failed; \
+                                     next mount attempt will re-fetch the \
+                                     old (rejected) password"
+                                );
+                            } else {
+                                tracing::info!(
+                                    plugin = crate::PLUGIN_NAME,
+                                    key = credential_key,
+                                    "auth-refused; vault entry cleared so \
+                                     next mount re-prompts the operator"
+                                );
+                            }
+                        }
+                    }
+                }
                 self.set_share_state(
                     share_id,
                     MountState::Failed,
@@ -2557,7 +2746,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         }
         let browse_stdout =
             String::from_utf8_lossy(&browse_out.stdout).into_owned();
-        let hosts = parse_avahi_browse_output(&browse_stdout);
+        let hosts = filter_self_out(parse_avahi_browse_output(&browse_stdout));
 
         // Step 2: per host, enumerate shares via smbclient. A
         // per-host failure is NOT fatal — the NAS is still
@@ -2676,28 +2865,39 @@ impl NetworkSharesRuntime {
                     .finalise_mount_success(record, dialect, start_ms)
                     .await;
             }
+            // Fetch the transient .mount unit's journal for the
+            // real mount helper stderr, then classify. See
+            // `fetch_mount_unit_stderr` — systemd-mount itself
+            // returns opaque "Job failed" text.
+            let unit_stderr =
+                self.fetch_mount_unit_stderr(&record.mount_root).await;
             last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let classify_stderr = if unit_stderr.is_empty() {
+                &last_stderr
+            } else {
+                &unit_stderr
+            };
             // Directory-missing short-circuits: the mount
             // never reaches the wire, so every dialect will
             // report the same ENOENT. Report as
             // MountDirectoryMissing so the operator UI names
             // the real cause instead of a protocol diagnosis.
-            if is_mount_directory_missing(&last_stderr) {
+            if is_mount_directory_missing(classify_stderr) {
                 return Err(MountError::MountDirectoryMissing {
                     id: record.share_id.clone(),
                     mount_root: record.mount_root.clone(),
-                    reason: last_stderr,
+                    reason: classify_stderr.clone(),
                 });
             }
             // Auth-refusal short-circuits: no point trying more
             // dialects when the credential itself is being
             // refused. The operator UI renders "check
             // credentials", not "unsupported protocol version".
-            if is_cifs_auth_refusal(output.exit_code, &last_stderr) {
+            if is_cifs_auth_refusal(output.exit_code, classify_stderr) {
                 return Err(MountError::AuthenticationRefused {
                     id: record.share_id.clone(),
                     exit_code: output.exit_code,
-                    stderr: last_stderr,
+                    stderr: classify_stderr.clone(),
                 });
             }
         }
@@ -2724,13 +2924,20 @@ impl NetworkSharesRuntime {
                         .finalise_mount_success(record, dialect, start_ms)
                         .await;
                 }
+                let unit_stderr =
+                    self.fetch_mount_unit_stderr(&record.mount_root).await;
                 last_stderr =
                     String::from_utf8_lossy(&output.stderr).into_owned();
-                if is_cifs_auth_refusal(output.exit_code, &last_stderr) {
+                let classify_stderr = if unit_stderr.is_empty() {
+                    &last_stderr
+                } else {
+                    &unit_stderr
+                };
+                if is_cifs_auth_refusal(output.exit_code, classify_stderr) {
                     return Err(MountError::AuthenticationRefused {
                         id: record.share_id.clone(),
                         exit_code: output.exit_code,
-                        stderr: last_stderr,
+                        stderr: classify_stderr.clone(),
                     });
                 }
             }
@@ -2740,6 +2947,58 @@ impl NetworkSharesRuntime {
             attempted,
             last_error: last_stderr,
         })
+    }
+
+    /// Read the transient systemd .mount unit's recent journal
+    /// entries to get the real mount.cifs / mount.nfs stderr.
+    /// `systemd-mount` returns an opaque "Job failed. See
+    /// journalctl -xe for details." on any mount failure — the
+    /// real reason (auth refused / ENOENT / dialect mismatch) is
+    /// buried in the unit's journal. This helper fetches those
+    /// lines so the auth-refused and directory-missing detectors
+    /// can classify the failure correctly.
+    ///
+    /// Returns an empty string when the runtime is NOT using
+    /// systemd-mount (test environments with a mocked `mount`
+    /// executor) or when journalctl is unavailable / not
+    /// readable, so the caller falls back to whatever stderr the
+    /// executor itself produced.
+    async fn fetch_mount_unit_stderr(&self, mount_root: &Path) -> String {
+        if !self.uses_systemd_mount() {
+            return String::new();
+        }
+        let unit = systemd_mount_unit_name(mount_root);
+        let out = tokio::process::Command::new("journalctl")
+            .args([
+                "--no-pager",
+                "-u",
+                &unit,
+                "-n",
+                "30",
+                "--since",
+                "1 minute ago",
+            ])
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).into_owned()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// True when the runtime is wired to invoke systemd-mount
+    /// (either directly as the mount program or through the
+    /// sudo wrapper). Guards the journal-fetch fallback so test
+    /// fixtures with a mocked `MountExecutor` don't accidentally
+    /// shell out to real `journalctl`.
+    fn uses_systemd_mount(&self) -> bool {
+        self.mount_program.contains("systemd-mount")
+            || self
+                .mount_wrapper_args
+                .iter()
+                .any(|a| a.contains("systemd-mount"))
     }
 
     /// Ensure the per-share mount directory exists. The plugin's
@@ -2904,22 +3163,33 @@ impl NetworkSharesRuntime {
             .run(&self.mount_program, &args, self.mount_timeout_ms)
             .await?;
         if output.exit_code != Some(0) {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            // Fetch the transient .mount unit's journal for the
+            // real mount.nfs stderr — systemd-mount returns
+            // opaque "Job failed" text. Same rationale as CIFS.
+            let unit_stderr =
+                self.fetch_mount_unit_stderr(&record.mount_root).await;
+            let stderr_owned =
+                String::from_utf8_lossy(&output.stderr).into_owned();
+            let classify_stderr = if unit_stderr.is_empty() {
+                stderr_owned
+            } else {
+                unit_stderr
+            };
             // Same ENOENT short-circuit as the CIFS path: if the
             // mount root doesn't exist, mount.nfs errors at
             // chdir before touching the network. Report as
             // MountDirectoryMissing, not MountFailed.
-            if is_mount_directory_missing(&stderr) {
+            if is_mount_directory_missing(&classify_stderr) {
                 return Err(MountError::MountDirectoryMissing {
                     id: record.share_id.clone(),
                     mount_root: record.mount_root.clone(),
-                    reason: stderr,
+                    reason: classify_stderr,
                 });
             }
             return Err(MountError::MountFailed {
                 id: record.share_id.clone(),
                 exit_code: output.exit_code,
-                stderr,
+                stderr: classify_stderr,
             });
         }
         // Best-effort read of /proc/mounts for the negotiated
@@ -4178,15 +4448,16 @@ mod tests {
         let expected_mount_root =
             record.mount_root.to_string_lossy().into_owned();
         let args = build_cifs_mount_args(&record, "3.0", None);
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[1], "cifs");
-        assert_eq!(args[2], "-o");
-        assert!(args[3].contains("vers=3.0"));
-        assert!(args[3].contains("ro"));
-        assert!(args[3].contains("iocharset=utf8"));
-        assert!(args[3].contains("guest"));
-        assert_eq!(args[4], "//192.0.2.10/Music");
-        assert_eq!(args[5], expected_mount_root);
+        assert_eq!(args[0], "--collect");
+        assert_eq!(args[1], "--type=cifs");
+        assert!(args[2].starts_with("--options="));
+        let options = &args[2];
+        assert!(options.contains("vers=3.0"));
+        assert!(options.contains("ro"));
+        assert!(options.contains("iocharset=utf8"));
+        assert!(options.contains("guest"));
+        assert_eq!(args[3], "//192.0.2.10/Music");
+        assert_eq!(args[4], expected_mount_root);
     }
 
     #[test]
@@ -4206,11 +4477,12 @@ mod tests {
             "3.1.1",
             Some(std::path::Path::new("/tmp/creds")),
         );
-        assert!(args[3].contains("credentials=/tmp/creds"));
-        assert!(!args[3].contains("username="));
-        assert!(!args[3].contains("password="));
-        assert!(!args[3].contains("domain="));
-        assert!(!args[3].contains("guest"));
+        let options = &args[2];
+        assert!(options.contains("credentials=/tmp/creds"));
+        assert!(!options.contains("username="));
+        assert!(!options.contains("password="));
+        assert!(!options.contains("domain="));
+        assert!(!options.contains("guest"));
     }
 
     #[test]
@@ -4227,9 +4499,10 @@ mod tests {
             domain: None,
         };
         let args = build_cifs_mount_args(&record, "3.1.1", None);
-        assert!(!args[3].contains("credentials="));
-        assert!(!args[3].contains("username="));
-        assert!(!args[3].contains("password="));
+        let options = &args[2];
+        assert!(!options.contains("credentials="));
+        assert!(!options.contains("username="));
+        assert!(!options.contains("password="));
     }
 
     #[test]
@@ -4317,6 +4590,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_cifs_userpassword_auth_refused_deletes_vault_entry() {
+        // AuthenticationRefused triggers the runtime to clear
+        // the vault entry so the next mount attempt re-prompts.
+        // NETWORK-SOURCES-DESIGN.md §5.6.5 (password refresh on
+        // NAS-side rotation).
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root.clone()));
+        store.store_password("rotate_key", b"stale").await.unwrap();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .build();
+        let mut record = built_record("rotator", "192.0.2.77");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "rotate_key".to_string(),
+            domain: Some("INTRANET".to_string()),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(err, MountError::AuthenticationRefused { .. }));
+
+        // Vault entry MUST be gone so the next mount re-prompts.
+        assert!(
+            store.fetch_password("rotate_key").await.is_none(),
+            "auth-refusal must clear the stale vault entry",
+        );
+    }
+
+    #[test]
+    fn systemd_mount_unit_name_matches_systemd_escape() {
+        // Canonical case: /var/lib/evo/music/NAS/alias
+        // → var-lib-evo-music-NAS-alias.mount
+        assert_eq!(
+            systemd_mount_unit_name(std::path::Path::new(
+                "/var/lib/evo/music/NAS/Music"
+            )),
+            "var-lib-evo-music-NAS-Music.mount"
+        );
+        // Dash in the alias must be escaped to \x2d — this is
+        // the exact case the UI team's ls-from-host demo produced
+        // (`consumer-check` in the alias).
+        assert_eq!(
+            systemd_mount_unit_name(std::path::Path::new(
+                "/var/lib/evo/music/NAS/consumer-check"
+            )),
+            "var-lib-evo-music-NAS-consumer\\x2dcheck.mount"
+        );
+        // Root becomes -.mount per systemd convention.
+        assert_eq!(
+            systemd_mount_unit_name(std::path::Path::new("/")),
+            "-.mount"
+        );
+    }
+
+    #[test]
+    fn filter_self_out_removes_loopback_ips() {
+        let hits = vec![
+            ("PI5TARGET".to_string(), "127.0.0.1".to_string()),
+            ("NAS".to_string(), "192.168.30.1".to_string()),
+        ];
+        let filtered = filter_self_out(hits);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "192.168.30.1");
+    }
+
+    #[test]
+    fn filter_self_out_removes_ipv6_loopback() {
+        let hits = vec![
+            ("PI5TARGET".to_string(), "::1".to_string()),
+            ("NAS".to_string(), "192.168.30.1".to_string()),
+        ];
+        let filtered = filter_self_out(hits);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "192.168.30.1");
+    }
+
+    #[tokio::test]
     async fn mount_nfs_directory_missing_maps_to_directory_missing_variant() {
         let dir = tempdir();
         let executor = ScriptedExecutor::new(vec![failure_output(
@@ -4339,7 +4702,7 @@ mod tests {
             path: PathBuf::from("/etc/evo/cifs.creds"),
         };
         let args = build_cifs_mount_args(&record, "2.1", None);
-        assert!(args[3].contains("credentials=/etc/evo/cifs.creds"));
+        assert!(args[2].contains("credentials=/etc/evo/cifs.creds"));
     }
 
     #[test]
@@ -4347,7 +4710,7 @@ mod tests {
         let mut record = built_record("with_opts", "192.0.2.13");
         record.advanced_options = "rw,uid=1000".to_string();
         let args = build_cifs_mount_args(&record, "3.0", None);
-        assert!(args[3].contains("rw,uid=1000"));
+        assert!(args[2].contains("rw,uid=1000"));
     }
 
     #[tokio::test]
@@ -4372,7 +4735,7 @@ mod tests {
     #[tokio::test]
     async fn mount_cifs_probe_ladder_iterates_and_persists_first_success() {
         let dir = tempdir();
-        // Fail on 2.0, 2.1, 3.0; succeed on 3.02.
+        // Ascending ladder (volumio-evo shape): fail on 2.0, 2.1, 3.0; succeed on 3.02.
         let executor = ScriptedExecutor::new(vec![
             failure_output("mount error(112): Host is down"),
             failure_output("mount error(112): Host is down"),
@@ -4400,9 +4763,9 @@ mod tests {
     #[tokio::test]
     async fn mount_cifs_fast_path_failure_falls_back_to_full_ladder() {
         let dir = tempdir();
-        // fast-path 3.0 fails; then full ladder tries 2.0 (fail),
-        // 2.1 (success). Persisted 3.0 was skipped on the
-        // ladder-side iteration.
+        // fast-path 3.0 fails; then full ascending ladder tries
+        // 2.0 (fail), 2.1 (success). Persisted 3.0 is skipped
+        // on the ladder-side iteration.
         let executor = ScriptedExecutor::new(vec![
             failure_output("stale dialect"), // fast-path 3.0
             failure_output("still bad"),     // ladder 2.0
@@ -4423,10 +4786,12 @@ mod tests {
         assert!(calls[1].1.iter().any(|a| a.contains("vers=2.0")));
         assert!(calls[2].1.iter().any(|a| a.contains("vers=2.1")));
         // The 3.0 attempt is not re-tried on the ladder-side sweep.
+        // Match on `vers=3.0,` to avoid a false positive against
+        // `vers=3.02,` in the same option string.
         assert!(
             !calls[1..]
                 .iter()
-                .any(|(_, a)| a.iter().any(|s| s.contains("vers=3.0"))),
+                .any(|(_, a)| a.iter().any(|s| s.contains("vers=3.0,"))),
             "ladder pass must skip the fast-path dialect"
         );
 
@@ -4821,15 +5186,16 @@ mod tests {
         let expected_mount_root =
             record.mount_root.to_string_lossy().into_owned();
         let args = build_nfs_mount_args(&record);
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[1], "nfs");
-        assert_eq!(args[2], "-o");
-        assert!(args[3].contains("ro"));
-        assert!(args[3].contains("soft"));
-        assert!(args[3].contains("noauto"));
+        assert_eq!(args[0], "--collect");
+        assert_eq!(args[1], "--type=nfs");
+        assert!(args[2].starts_with("--options="));
+        let options = &args[2];
+        assert!(options.contains("ro"));
+        assert!(options.contains("soft"));
+        assert!(options.contains("noauto"));
         // NFS remote is host:/path (colon-separated, path leading /).
-        assert_eq!(args[4], "192.0.2.100:/export/music");
-        assert_eq!(args[5], expected_mount_root);
+        assert_eq!(args[3], "192.0.2.100:/export/music");
+        assert_eq!(args[4], expected_mount_root);
     }
 
     #[test]
@@ -4839,10 +5205,11 @@ mod tests {
         record.path = "/export/music".to_string();
         record.advanced_options = "nfsvers=4.2,rsize=1048576".to_string();
         let args = build_nfs_mount_args(&record);
-        assert!(args[3].contains("nfsvers=4.2"));
-        assert!(args[3].contains("rsize=1048576"));
+        let options = &args[2];
+        assert!(options.contains("nfsvers=4.2"));
+        assert!(options.contains("rsize=1048576"));
         // Absolute paths are preserved as-is (no leading double slash).
-        assert_eq!(args[4], "192.0.2.101:/export/music");
+        assert_eq!(args[3], "192.0.2.101:/export/music");
     }
 
     #[test]
@@ -4937,8 +5304,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
 
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1, "NFS is single-attempt (no probe ladder)");
-        assert_eq!(calls[0].1[0], "-t");
-        assert_eq!(calls[0].1[1], "nfs");
+        assert_eq!(calls[0].1[0], "--collect");
+        assert_eq!(calls[0].1[1], "--type=nfs");
 
         let after = rt.get_share(&id).await.unwrap().unwrap();
         assert!(after.persisted_vers.is_none(), "NFS never persists vers");
@@ -5658,6 +6025,9 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         );
         assert_eq!(
             latest.get("negotiated_vers").and_then(|v| v.as_str()),
+            // Ascending ladder (volumio-evo default): SMB 2.0 is
+            // the first dialect attempted, so the first-success
+            // test lands here.
             Some("2.0"),
         );
 

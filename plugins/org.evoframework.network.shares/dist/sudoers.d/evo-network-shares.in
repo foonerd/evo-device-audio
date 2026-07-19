@@ -65,6 +65,8 @@
 # syntactically valid sudoers.
 
 Cmnd_Alias EVO_NETWORK_SHARES_MOUNT = \
+    /usr/bin/systemd-mount, \
+    /usr/bin/systemd-umount, \
     /bin/mount, \
     /bin/umount
 
