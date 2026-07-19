@@ -215,8 +215,13 @@
           el.style.display = "none";
         }
 
-        // Open a WSS, negotiate an anonymous session, run one
-        // wire op, close. Returns a Promise for the response.
+        // Open a WSS, send one op wrapped in the framework's
+        // frame envelope (frame_type=request, request_id, op,
+        // payload), receive the matching response frame, close.
+        // Unwraps outcome.ok back to the same shape the Unix-
+        // socket API returns so downstream success/error handling
+        // stays uniform.
+        let _requestId = 0;
         function callWireOp(op, protocols) {
           return new Promise(function (resolve, reject) {
             const ws = new WebSocket(wsUrl, protocols || []);
@@ -227,14 +232,38 @@
               reject(new Error("Player did not respond in time."));
             }, 15000);
 
+            _requestId += 1;
+            const requestId = _requestId;
+            const opName = op.op;
+            const payload = Object.assign({}, op);
+            delete payload.op;
+            const frame = {
+              frame_type: "request",
+              request_id: requestId,
+              op: opName,
+              payload: payload,
+            };
             ws.addEventListener("open", function () {
-              ws.send(JSON.stringify(op));
+              ws.send(JSON.stringify(frame));
             });
             ws.addEventListener("message", function (ev) {
               clearTimeout(timer);
               if (timedOut) return;
               try {
-                const data = JSON.parse(ev.data);
+                const raw = JSON.parse(ev.data);
+                let data = raw;
+                if (raw && raw.frame_type === "response") {
+                  const outcome = raw.outcome || {};
+                  if (outcome.outcome === "ok") {
+                    data = outcome.value || {};
+                  } else {
+                    data = { error: {
+                      class: outcome.code || "unknown",
+                      message: outcome.message || "",
+                      details: { subclass: outcome.code || "unknown" },
+                    } };
+                  }
+                }
                 resolve(data);
               } catch (e) {
                 reject(new Error("Bad response from player."));
