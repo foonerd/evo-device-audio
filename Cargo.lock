@@ -1407,12 +1407,14 @@ dependencies = [
  "gethostname",
  "if-addrs 0.13.4",
  "mdns-sd",
+ "nix 0.30.1",
  "rand 0.8.6",
  "regex",
  "rusqlite",
  "semver",
  "serde",
  "serde_json",
+ "sha-crypt",
  "sha2",
  "socket2 0.5.10",
  "tar",
@@ -4952,6 +4954,18 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "sha-crypt"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88e79009728d8311d42d754f2f319a975f9e38f156fd5e422d2451486c78b286"
+dependencies = [
+ "base64ct",
+ "rand 0.8.6",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]
