@@ -717,6 +717,31 @@ pub enum MountError {
          cannot prompt for password"
     )]
     CredentialStoreUnavailable,
+    /// The per-share mount directory (`mount_root`) could not be
+    /// created before the mount attempt. Rare — the plugin's
+    /// service identity owns the NAS root by installer contract,
+    /// and `create_dir_all` needs no elevation on a directory
+    /// the caller owns. Distinct from
+    /// [`MountError::DialectProbeExhausted`] so the operator UI
+    /// renders the honest cause instead of a protocol
+    /// diagnosis. When the mount helper itself returns ENOENT
+    /// (typically because the plugin's own mkdir succeeded but a
+    /// vendor init script raced and removed the directory), the
+    /// same variant fires from the stderr short-circuit.
+    #[error(
+        "mount directory {mount_root} could not be prepared for share {id}: {reason}"
+    )]
+    MountDirectoryMissing {
+        /// The share that failed at the directory stage.
+        id: ShareId,
+        /// The mount root the plugin tried to create or that
+        /// mount.cifs / mount.nfs could not find.
+        mount_root: PathBuf,
+        /// Operator-readable reason (IO error from `mkdir_all`
+        /// on the plugin side, or the ENOENT-shaped stderr
+        /// snippet from the mount helper).
+        reason: String,
+    },
     /// The operator declined to answer the password prompt
     /// (cancelled or timed out). The share record is left in
     /// place so the operator can retry mount later, at which
@@ -1283,6 +1308,24 @@ impl Drop for MountCredentialsFileGuard {
             );
         }
     }
+}
+
+/// True when the mount helper's stderr indicates the target
+/// directory is absent (ENOENT). Read by
+/// [`NetworkSharesRuntime::mount_cifs`] to short-circuit the
+/// dialect probe on a missing-directory error rather than
+/// walking the full ladder and mislabelling five ENOENTs as
+/// "dialect probe exhausted".
+///
+/// mount.cifs and mount.nfs both write a recognisable snippet
+/// on ENOENT — mount.cifs typically prints
+/// `Couldn't chdir to <path>: No such file or directory`; the
+/// generic mount rendering is `mount: <path>: No such file or
+/// directory`. Matching case-insensitively on either phrase
+/// covers both helpers.
+pub fn is_mount_directory_missing(stderr: &str) -> bool {
+    let s = stderr.to_ascii_uppercase();
+    s.contains("NO SUCH FILE OR DIRECTORY")
 }
 
 /// True when the mount.cifs exit code + stderr fragment indicate
@@ -2381,6 +2424,19 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // renders per the mount_error contract on the wire.
         self.ensure_credential_stocked(&record).await?;
 
+        // Ensure the per-share mount directory exists. The
+        // distribution installer provisions the NAS root
+        // (`/var/lib/evo/music/NAS`) at first-boot per the
+        // four-primitive install/reset contract; it cannot know
+        // future operator-chosen aliases, so the per-share
+        // subdirectory is the plugin's responsibility. The
+        // service user owns the NAS root, so `create_dir_all`
+        // does not need elevation. Without this step, mount.cifs
+        // fails ENOENT at every dialect before touching the
+        // network — the operator sees "dialect probe exhausted"
+        // when the real cause is a missing folder.
+        self.ensure_mount_directory(share_id, &record.mount_root);
+
         let start_ms = (self.now_fn)();
 
         self.set_share_state(share_id, MountState::Mounting, None, None)
@@ -2621,6 +2677,18 @@ impl NetworkSharesRuntime {
                     .await;
             }
             last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            // Directory-missing short-circuits: the mount
+            // never reaches the wire, so every dialect will
+            // report the same ENOENT. Report as
+            // MountDirectoryMissing so the operator UI names
+            // the real cause instead of a protocol diagnosis.
+            if is_mount_directory_missing(&last_stderr) {
+                return Err(MountError::MountDirectoryMissing {
+                    id: record.share_id.clone(),
+                    mount_root: record.mount_root.clone(),
+                    reason: last_stderr,
+                });
+            }
             // Auth-refusal short-circuits: no point trying more
             // dialects when the credential itself is being
             // refused. The operator UI renders "check
@@ -2672,6 +2740,35 @@ impl NetworkSharesRuntime {
             attempted,
             last_error: last_stderr,
         })
+    }
+
+    /// Ensure the per-share mount directory exists. The plugin's
+    /// service identity owns the NAS root (`/var/lib/evo/music/NAS`)
+    /// by installer contract, so `create_dir_all` on a child of
+    /// the root needs no elevation on production hosts.
+    ///
+    /// A create failure here is NOT fatal at this call site —
+    /// the mount helper will surface the ENOENT with more
+    /// operator-useful context (which dialect, which mount
+    /// helper), and `mount_cifs` / `mount_nfs` translate that
+    /// stderr into [`MountError::MountDirectoryMissing`]. Logging
+    /// the create failure at WARN keeps the operator-diagnosable
+    /// signal on the tracing surface without duplicating the
+    /// error surface. The mock executors used in unit tests
+    /// never actually touch the mount root, so the create failure
+    /// is silently ignored there and the test's mock "success"
+    /// path proceeds unchanged.
+    fn ensure_mount_directory(&self, share_id: &ShareId, mount_root: &Path) {
+        if let Err(e) = std::fs::create_dir_all(mount_root) {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                share_id = %share_id.0,
+                mount_root = %mount_root.display(),
+                error = %e,
+                "network.shares mount directory create failed; \
+                 mount helper will surface ENOENT if the directory is truly absent"
+            );
+        }
     }
 
     /// Prepend the runtime's configured `mount_wrapper_args` to a
@@ -2807,10 +2904,22 @@ impl NetworkSharesRuntime {
             .run(&self.mount_program, &args, self.mount_timeout_ms)
             .await?;
         if output.exit_code != Some(0) {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            // Same ENOENT short-circuit as the CIFS path: if the
+            // mount root doesn't exist, mount.nfs errors at
+            // chdir before touching the network. Report as
+            // MountDirectoryMissing, not MountFailed.
+            if is_mount_directory_missing(&stderr) {
+                return Err(MountError::MountDirectoryMissing {
+                    id: record.share_id.clone(),
+                    mount_root: record.mount_root.clone(),
+                    reason: stderr,
+                });
+            }
             return Err(MountError::MountFailed {
                 id: record.share_id.clone(),
                 exit_code: output.exit_code,
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stderr,
             });
         }
         // Best-effort read of /proc/mounts for the negotiated
@@ -3824,7 +3933,7 @@ mod tests {
     // -----------------------------------------------------------
 
     fn built_record(alias: &str, host: &str) -> ShareRecord {
-        ShareRecord::new(
+        let mut r = ShareRecord::new(
             alias.to_string(),
             FsType::Cifs,
             host.to_string(),
@@ -3832,7 +3941,13 @@ mod tests {
             Credentials::Guest,
             String::new(),
             1_700_000_000_000,
-        )
+        );
+        // Production `ShareRecord::new` composes
+        // `/var/lib/evo/music/NAS/<alias>` for the mount_root; in
+        // tests the runtime's mkdir-before-mount step needs a
+        // writable path. Redirect to a per-test tempdir.
+        r.mount_root = tempdir().join(alias);
+        r
     }
 
     #[tokio::test]
@@ -4060,6 +4175,8 @@ mod tests {
     fn build_cifs_mount_args_guest_share() {
         let mut record = built_record("guest_share", "192.0.2.10");
         record.credentials = Credentials::Guest;
+        let expected_mount_root =
+            record.mount_root.to_string_lossy().into_owned();
         let args = build_cifs_mount_args(&record, "3.0", None);
         assert_eq!(args[0], "-t");
         assert_eq!(args[1], "cifs");
@@ -4069,7 +4186,7 @@ mod tests {
         assert!(args[3].contains("iocharset=utf8"));
         assert!(args[3].contains("guest"));
         assert_eq!(args[4], "//192.0.2.10/Music");
-        assert_eq!(args[5], "/var/lib/evo/music/NAS/guest_share");
+        assert_eq!(args[5], expected_mount_root);
     }
 
     #[test]
@@ -4156,6 +4273,63 @@ mod tests {
             "cifs: bad option 'vers=1.0'"
         ));
         assert!(!is_cifs_auth_refusal(Some(2), "No such device"));
+    }
+
+    #[test]
+    fn is_mount_directory_missing_matches_common_enoent_renderings() {
+        assert!(is_mount_directory_missing(
+            "Couldn't chdir to /var/lib/evo/music/NAS/foo: No such file or directory"
+        ));
+        assert!(is_mount_directory_missing(
+            "mount: /var/lib/evo/music/NAS/foo: No such file or directory"
+        ));
+        assert!(!is_mount_directory_missing("Permission denied"));
+        assert!(!is_mount_directory_missing("cifs: bad option"));
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_directory_missing_short_circuits_ladder() {
+        // First mount attempt returns ENOENT. The dialect probe
+        // must short-circuit — otherwise we'd walk the full
+        // ladder and mislabel five ENOENTs as
+        // DialectProbeExhausted, exactly the failure the UI
+        // team's memo #5 identified on the live rig.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "Couldn't chdir to /var/lib/evo/music/NAS/target: No such file or directory",
+        )]);
+        let rt = build_runtime_with_executor(&dir, executor.clone());
+        let record = built_record("target", "192.0.2.44");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match &err {
+            MountError::MountDirectoryMissing { .. } => {}
+            other => panic!("expected MountDirectoryMissing; got {other:?}"),
+        }
+        let calls = executor.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "ENOENT short-circuit must fire before the second dialect",
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_nfs_directory_missing_maps_to_directory_missing_variant() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount: /var/lib/evo/music/NAS/nfs: No such file or directory",
+        )]);
+        let rt = build_runtime_with_executor(&dir, executor);
+        let mut record = built_record("nfs", "192.0.2.100");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(err, MountError::MountDirectoryMissing { .. }));
     }
 
     #[test]
@@ -4644,6 +4818,8 @@ mod tests {
         let mut record = built_record("nfs", "192.0.2.100");
         record.fstype = FsType::Nfs;
         record.path = "export/music".to_string();
+        let expected_mount_root =
+            record.mount_root.to_string_lossy().into_owned();
         let args = build_nfs_mount_args(&record);
         assert_eq!(args[0], "-t");
         assert_eq!(args[1], "nfs");
@@ -4653,7 +4829,7 @@ mod tests {
         assert!(args[3].contains("noauto"));
         // NFS remote is host:/path (colon-separated, path leading /).
         assert_eq!(args[4], "192.0.2.100:/export/music");
-        assert_eq!(args[5], "/var/lib/evo/music/NAS/nfs");
+        assert_eq!(args[5], expected_mount_root);
     }
 
     #[test]
@@ -4802,6 +4978,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let executor = ScriptedExecutor::new(vec![success_output()]);
         let rt = build_runtime_with_executor(&dir, executor.clone());
         let record = built_record("cifs_share", "192.0.2.50");
+        let expected_mount_root =
+            record.mount_root.to_string_lossy().into_owned();
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
 
@@ -4809,7 +4987,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1[0], "-l", "CIFS unmount uses lazy detach");
-        assert_eq!(calls[0].1[1], "/var/lib/evo/music/NAS/cifs_share");
+        assert_eq!(calls[0].1[1], expected_mount_root);
     }
 
     #[tokio::test]
@@ -4819,6 +4997,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let rt = build_runtime_with_executor(&dir, executor.clone());
         let mut record = built_record("nfs_share", "192.0.2.51");
         record.fstype = FsType::Nfs;
+        let expected_mount_root =
+            record.mount_root.to_string_lossy().into_owned();
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
 
@@ -4826,7 +5006,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].1[0], "/var/lib/evo/music/NAS/nfs_share",
+            calls[0].1[0], expected_mount_root,
             "NFS unmount does NOT use lazy detach"
         );
     }
