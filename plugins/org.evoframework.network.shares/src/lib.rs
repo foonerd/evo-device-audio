@@ -347,12 +347,34 @@ impl Respondent for NetworkSharesPlugin {
 }
 
 fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
+    use crate::runtime::MountError;
+    use evo_plugin_sdk::error_taxonomy::ErrorClass;
     match e {
         VerbDispatchError::UnknownRequestType { .. }
         | VerbDispatchError::PayloadDecode { .. }
         | VerbDispatchError::Persistence(_) => {
             PluginError::Permanent(e.to_string())
         }
+        // NoResponderAvailable: carry the distinct subclass end-
+        // to-end through the plugin error chain (per 2026-07-20
+        // defect-1 memo). Message is the plugin's clean
+        // operator-authoritative text — the framework's
+        // plugin_error_to_wire_error will surface it unwrapped,
+        // no nested "transient error: verb execution failed
+        // (mount):" prefix stack.
+        VerbDispatchError::Mount(MountError::NoResponderAvailable {
+            key,
+            reason: _,
+        }) => PluginError::WithSubclass {
+            class: ErrorClass::PermissionDenied,
+            subclass: "no_responder_available".into(),
+            message: format!(
+                "network.share mutation refused: no user-interaction \
+                 responder session is currently connected to answer \
+                 the password prompt for credential key {key}. Try \
+                 again after a session claims the responder slot."
+            ),
+        },
         VerbDispatchError::Mount(_) => PluginError::Transient(e.to_string()),
         VerbDispatchError::ResponseSerialise { .. } => {
             PluginError::Permanent(e.to_string())

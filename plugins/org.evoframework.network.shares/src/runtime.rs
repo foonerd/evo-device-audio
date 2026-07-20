@@ -2073,7 +2073,41 @@ pub struct NetworkSharesRuntime {
     /// where the map entry is gone but the credential is not yet
     /// stored.
     pending_credential_prompts:
-        Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+        Arc<std::sync::Mutex<HashMap<String, PromptWaiterCell>>>,
+}
+
+/// Cloneable outcome the first prompt-caller broadcasts to
+/// concurrent waiters on the same credential key. Distinct
+/// from [`MountError`] because MountError is not Clone and
+/// waiters need their own copy of the outcome to raise a
+/// tailored error. Every variant maps back to a specific
+/// MountError shape on the waiter side.
+#[derive(Debug, Clone)]
+pub(crate) enum PromptDedupOutcome {
+    /// Credential answered + stored in the vault. Waiters
+    /// re-fetch from the vault and return `Ok(())`.
+    Success,
+    /// Responder cancelled or the framework's prompt TTL fired.
+    /// Waiters return [`MountError::CredentialPromptCancelled`].
+    Cancelled,
+    /// Framework fast-refused because no responder session was
+    /// connected. Waiters return
+    /// [`MountError::NoResponderAvailable`] with the same
+    /// reason the first caller received.
+    NoResponderAvailable(String),
+    /// Any other prompt / store failure. Waiters return a
+    /// generic [`MountError::CredentialPromptFailed`] carrying
+    /// this reason.
+    Other(String),
+}
+
+/// Broadcast-style waiter cell. `watch::Sender<Option<...>>`
+/// starts at `None`; the first caller writes `Some(outcome)`
+/// exactly once, and every waiter subscribes + awaits changed()
+/// + reads the value.
+#[derive(Clone)]
+pub(crate) struct PromptWaiterCell {
+    tx: tokio::sync::watch::Sender<Option<PromptDedupOutcome>>,
 }
 
 impl std::fmt::Debug for NetworkSharesRuntime {
@@ -2233,94 +2267,164 @@ impl NetworkSharesRuntime {
 
         // Prompt dedup on credential_key. Multiple concurrent
         // mount / add attempts against the same missing credential
-        // (a consumer double-tapping the mount button) collapse to
-        // one prompt on the responder's shelf; one operator answer
-        // resolves every waiter.
+        // collapse to one prompt on the responder's shelf; one
+        // operator answer (or one cancel, or one no-responder
+        // fast-refusal) resolves every waiter with the EXACT
+        // outcome the first caller received.
         //
-        // First caller: insert a fresh Notify and proceed to
-        // prompt. Later callers: clone the Notify, drop the map
-        // lock, `await notified()`. On the first caller's
-        // completion (any outcome) the entry is removed and
-        // `notify_waiters()` fires; every waiter wakes, re-checks
-        // the vault, and returns Ok if the credential was stored
-        // — otherwise re-enters this function (which will collapse
-        // again to a fresh dedup round if a responder is still
-        // absent, or issue a fresh prompt if the first caller's
-        // failure was transient).
-        let (notify, is_first_caller) = {
+        // Storage: `watch::Sender<Option<PromptDedupOutcome>>` in
+        // the shared map. The first caller inserts a fresh cell
+        // and drives the prompt. Later callers with the same key
+        // clone the sender, subscribe(), drop the map lock, and
+        // `changed().await` — when the first caller writes the
+        // outcome, every waiter reads it and maps to the matching
+        // MountError variant without re-issuing the prompt.
+        //
+        // Fixes the 2026-07-20 defect-2a symptom (cancel did not
+        // wake waiters within 30s): the shared cell means the
+        // wake happens IN the first caller's exit path, and
+        // waiters receive the cancel directly instead of falling
+        // into a re-prompt loop that would re-enter the framework
+        // and re-park.
+        let (waiter_cell, is_first_caller) = {
             let mut map = self
                 .pending_credential_prompts
                 .lock()
                 .expect("pending_credential_prompts mutex poisoned");
             if let Some(existing) = map.get(credential_key) {
-                (Arc::clone(existing), false)
+                (existing.clone(), false)
             } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                map.insert(credential_key.clone(), Arc::clone(&n));
-                (n, true)
+                let (tx, _rx) = tokio::sync::watch::channel(None);
+                let cell = PromptWaiterCell { tx };
+                map.insert(credential_key.clone(), cell.clone());
+                (cell, true)
             }
         };
         if !is_first_caller {
-            notify.notified().await;
-            // The first caller has finished. Re-check the vault:
-            // if the answer was stored, we are done. Otherwise
-            // re-enter ensure_credential_stocked so this caller
-            // gets its own error path — either a fresh prompt (if
-            // a responder connected mid-flight) or the same
-            // NoResponderAvailable / CredentialPromptCancelled
-            // shape the first caller received.
-            if self
-                .credentials
-                .fetch_password(credential_key)
-                .await
-                .is_some()
-            {
-                return Ok(());
+            let mut rx = waiter_cell.tx.subscribe();
+            // Wait for the first caller to write the outcome.
+            // A closed channel would mean the first caller
+            // dropped the sender WITHOUT writing (guarded
+            // against by the CellOnDrop guard below — always
+            // writes an outcome before drop). Treat a closed
+            // channel defensively as CredentialPromptFailed.
+            loop {
+                if rx.borrow_and_update().is_some() {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    return Err(MountError::CredentialPromptFailed {
+                        key: credential_key.clone(),
+                        reason: "dedup channel closed before first caller \
+                                 wrote outcome (defensive)"
+                            .into(),
+                    });
+                }
             }
-            // Retry once via the boxed recursion pattern (async
-            // Rust cannot self-recurse without boxing the future).
-            return Box::pin(self.ensure_credential_stocked(record)).await;
+            let outcome = rx
+                .borrow()
+                .clone()
+                .expect("break condition guarantees Some");
+            return match outcome {
+                PromptDedupOutcome::Success => {
+                    // Credential is in the vault; return Ok.
+                    // (Defensive: re-check to catch a rare race
+                    // where the store operation returned Ok but
+                    // the fetcher is not yet consistent. Both
+                    // should be atomic on the file-backed
+                    // store; the re-check costs one filesystem
+                    // stat.)
+                    if self
+                        .credentials
+                        .fetch_password(credential_key)
+                        .await
+                        .is_some()
+                    {
+                        Ok(())
+                    } else {
+                        Err(MountError::CredentialPromptFailed {
+                            key: credential_key.clone(),
+                            reason: "first caller reported Success but \
+                                     vault fetch returned None (store \
+                                     inconsistency)"
+                                .into(),
+                        })
+                    }
+                }
+                PromptDedupOutcome::Cancelled => {
+                    Err(MountError::CredentialPromptCancelled {
+                        key: credential_key.clone(),
+                    })
+                }
+                PromptDedupOutcome::NoResponderAvailable(reason) => {
+                    Err(MountError::NoResponderAvailable {
+                        key: credential_key.clone(),
+                        reason,
+                    })
+                }
+                PromptDedupOutcome::Other(reason) => {
+                    Err(MountError::CredentialPromptFailed {
+                        key: credential_key.clone(),
+                        reason,
+                    })
+                }
+            };
         }
 
-        // First-caller path. Guarantee waiters are notified on
-        // EVERY exit path (success, cancel, prompt error, store
-        // error) so no waiter parks indefinitely.
-        struct NotifyOnDrop {
+        // First-caller path. Guarantee EVERY exit writes an
+        // outcome to the cell and removes the map entry.
+        // CellOnDrop's Drop impl writes `Other(...)` if the
+        // caller panics or is cancelled before writing an
+        // explicit outcome, so waiters never park indefinitely.
+        struct CellOnDrop {
             key: String,
-            map: Arc<
-                std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
-            >,
-            notify: Arc<tokio::sync::Notify>,
+            map: Arc<std::sync::Mutex<HashMap<String, PromptWaiterCell>>>,
+            cell: PromptWaiterCell,
+            wrote_outcome: bool,
         }
-        impl Drop for NotifyOnDrop {
+        impl Drop for CellOnDrop {
             fn drop(&mut self) {
+                if !self.wrote_outcome {
+                    let _ = self.cell.tx.send(Some(PromptDedupOutcome::Other(
+                        "first caller dropped before writing outcome \
+                             (panic / cancellation)"
+                            .into(),
+                    )));
+                }
                 self.map
                     .lock()
                     .expect("pending_credential_prompts mutex poisoned")
                     .remove(&self.key);
-                self.notify.notify_waiters();
             }
         }
-        let _guard = NotifyOnDrop {
+        let mut guard = CellOnDrop {
             key: credential_key.clone(),
             map: Arc::clone(&self.pending_credential_prompts),
-            notify: Arc::clone(&notify),
+            cell: waiter_cell.clone(),
+            wrote_outcome: false,
         };
+
         let label =
             format!("Password for {}@{}{}", username, record.host, record.path);
         // The framework's forward_request_user_interaction fast-
         // refuses with a message prefixed `no_responder_available:`
         // when no session currently holds the responder slot. The
         // SDK's WireFrame::Error → ReportError::Invalid mapping
-        // (host.rs await_event_response) drops the structured
-        // details field and preserves only the message; we route
-        // on the well-defined prefix so the wire layer can surface
-        // the specific subclass instead of the generic
-        // credential_prompt_failed.
-        let answer =
-            self.prompter.prompt_password(label).await.map_err(|e| {
+        // drops the structured details field and preserves only the
+        // message; we route on the well-defined prefix.
+        let prompt_result = self.prompter.prompt_password(label).await;
+        let answer = match prompt_result {
+            Ok(a) => a,
+            Err(e) => {
                 let msg = format!("{e}");
-                if msg.contains("no_responder_available:") {
+                let outcome = if msg.contains("no_responder_available:") {
+                    PromptDedupOutcome::NoResponderAvailable(msg.clone())
+                } else {
+                    PromptDedupOutcome::Other(msg.clone())
+                };
+                let _ = guard.cell.tx.send(Some(outcome));
+                guard.wrote_outcome = true;
+                return Err(if msg.contains("no_responder_available:") {
                     MountError::NoResponderAvailable {
                         key: credential_key.clone(),
                         reason: msg,
@@ -2330,21 +2434,35 @@ impl NetworkSharesRuntime {
                         key: credential_key.clone(),
                         reason: msg,
                     }
-                }
-            })?;
+                });
+            }
+        };
         let Some(bytes) = answer else {
+            let _ = guard.cell.tx.send(Some(PromptDedupOutcome::Cancelled));
+            guard.wrote_outcome = true;
             return Err(MountError::CredentialPromptCancelled {
                 key: credential_key.clone(),
             });
         };
-        store
-            .store_password(credential_key, &bytes)
-            .await
-            .map_err(|e| MountError::CredentialStoreWriteFailed {
-                key: credential_key.clone(),
-                reason: format!("{e}"),
-            })?;
-        Ok(())
+        match store.store_password(credential_key, &bytes).await {
+            Ok(()) => {
+                let _ = guard.cell.tx.send(Some(PromptDedupOutcome::Success));
+                guard.wrote_outcome = true;
+                Ok(())
+            }
+            Err(e) => {
+                let reason = format!("{e}");
+                let _ = guard
+                    .cell
+                    .tx
+                    .send(Some(PromptDedupOutcome::Other(reason.clone())));
+                guard.wrote_outcome = true;
+                Err(MountError::CredentialStoreWriteFailed {
+                    key: credential_key.clone(),
+                    reason,
+                })
+            }
+        }
     }
 }
 
@@ -5451,6 +5569,257 @@ mod tests {
         assert!(
             matches!(&err, MountError::CredentialPromptCancelled { key } if key == "cancelled_key"),
             "expected CredentialPromptCancelled; got {err:?}"
+        );
+    }
+
+    /// Regression per operator wire-verification 2026-07-20
+    /// defect 2a: cancelling the collapsed prompt must wake ALL
+    /// waiters with the exact CredentialPromptCancelled outcome
+    /// (not fall into a re-prompt loop that leaves waiters
+    /// parked). The prior Notify-based dedup allowed this
+    /// symptom because waiters re-entered ensure_credential_stocked
+    /// on wake and issued their own prompts instead of receiving
+    /// the first caller's outcome.
+    #[tokio::test]
+    async fn ensure_credential_stocked_cancel_wakes_all_dedup_waiters() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+
+        // Prompter blocks on a Notify until the test releases
+        // it, then returns Ok(None) (operator cancelled). Also
+        // counts calls so we can assert exactly one prompt was
+        // issued across two concurrent callers.
+        #[derive(Debug)]
+        struct BlockingCancelPrompter {
+            release: tokio::sync::Notify,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl PasswordPrompter for BlockingCancelPrompter {
+            async fn prompt_password(
+                &self,
+                _label: String,
+            ) -> Result<Option<Vec<u8>>, ReportError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(None)
+            }
+        }
+
+        let prompter = Arc::new(BlockingCancelPrompter {
+            release: tokio::sync::Notify::new(),
+            calls: AtomicU32::new(0),
+        });
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = Arc::new(
+            NetworkSharesRuntime::builder(&dir)
+                .unwrap()
+                .with_executor(executor)
+                .with_credential_store(store as Arc<dyn CredentialStore>)
+                .with_password_prompter(
+                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+                )
+                .build(),
+        );
+
+        // Two records sharing the same credential_key so both
+        // enter the same dedup slot.
+        let mut record_a = built_record("share_a", "192.0.2.90");
+        record_a.credentials = Credentials::UserPassword {
+            username: "op".to_string(),
+            credential_key: "shared_key".to_string(),
+            domain: None,
+        };
+        let mut record_b = built_record("share_b", "192.0.2.91");
+        record_b.credentials = Credentials::UserPassword {
+            username: "op".to_string(),
+            credential_key: "shared_key".to_string(),
+            domain: None,
+        };
+        rt.add_share(record_a.clone()).await.unwrap();
+        rt.add_share(record_b.clone()).await.unwrap();
+
+        // Spawn both concurrently. First to enter becomes the
+        // first-caller; second becomes a dedup waiter.
+        let rt_a = Arc::clone(&rt);
+        let rt_b = Arc::clone(&rt);
+        let handle_a = tokio::spawn(async move {
+            rt_a.ensure_credential_stocked(&record_a).await
+        });
+        let handle_b = tokio::spawn(async move {
+            rt_b.ensure_credential_stocked(&record_b).await
+        });
+
+        // Give both tasks a moment to reach their await points.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Exactly one prompt fired.
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "dedup must collapse concurrent callers to one prompt"
+        );
+
+        // Fire the cancel (prompter returns None).
+        prompter.release.notify_waiters();
+
+        // Both callers must resolve with CredentialPromptCancelled
+        // within a tight window — no re-prompt, no 30s hang.
+        let a_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle_a)
+                .await
+                .expect("first caller must resolve fast")
+                .expect("task join");
+        let b_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle_b)
+                .await
+                .expect("dedup waiter must resolve fast (defect-2a regression)")
+                .expect("task join");
+
+        assert!(
+            matches!(
+                &a_result,
+                Err(MountError::CredentialPromptCancelled { key })
+                    if key == "shared_key"
+            ),
+            "first caller expected CredentialPromptCancelled, got: {:?}",
+            a_result
+        );
+        assert!(
+            matches!(
+                &b_result,
+                Err(MountError::CredentialPromptCancelled { key })
+                    if key == "shared_key"
+            ),
+            "dedup waiter expected the SAME cancel outcome without \
+             re-prompting; got: {:?}",
+            b_result
+        );
+
+        // Exactly one prompt still — waiter did not re-issue.
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "waiter must NOT re-prompt on wake (defect-2a regression)"
+        );
+    }
+
+    /// Regression per operator wire-verification 2026-07-20
+    /// defect 1: NoResponderAvailable must propagate through
+    /// the dedup path so both first-caller AND dedup-waiter
+    /// receive the specific MountError variant (not a generic
+    /// CredentialPromptFailed).
+    #[tokio::test]
+    async fn ensure_credential_stocked_no_responder_propagates_to_waiters() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+
+        // Prompter returns the framework's fast-refuse message
+        // shape (starts with `no_responder_available:`).
+        #[derive(Debug)]
+        struct NoResponderPrompter {
+            release: tokio::sync::Notify,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl PasswordPrompter for NoResponderPrompter {
+            async fn prompt_password(
+                &self,
+                _label: String,
+            ) -> Result<Option<Vec<u8>>, ReportError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Err(ReportError::Invalid(
+                    "no_responder_available: no user-interaction \
+                     responder session is currently connected"
+                        .into(),
+                ))
+            }
+        }
+
+        let prompter = Arc::new(NoResponderPrompter {
+            release: tokio::sync::Notify::new(),
+            calls: AtomicU32::new(0),
+        });
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = Arc::new(
+            NetworkSharesRuntime::builder(&dir)
+                .unwrap()
+                .with_executor(executor)
+                .with_credential_store(store as Arc<dyn CredentialStore>)
+                .with_password_prompter(
+                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+                )
+                .build(),
+        );
+
+        let mut record_a = built_record("share_a", "192.0.2.92");
+        record_a.credentials = Credentials::UserPassword {
+            username: "op".to_string(),
+            credential_key: "no_responder_key".to_string(),
+            domain: None,
+        };
+        let mut record_b = built_record("share_b", "192.0.2.93");
+        record_b.credentials = Credentials::UserPassword {
+            username: "op".to_string(),
+            credential_key: "no_responder_key".to_string(),
+            domain: None,
+        };
+        rt.add_share(record_a.clone()).await.unwrap();
+        rt.add_share(record_b.clone()).await.unwrap();
+
+        let rt_a = Arc::clone(&rt);
+        let rt_b = Arc::clone(&rt);
+        let handle_a = tokio::spawn(async move {
+            rt_a.ensure_credential_stocked(&record_a).await
+        });
+        let handle_b = tokio::spawn(async move {
+            rt_b.ensure_credential_stocked(&record_b).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        prompter.release.notify_waiters();
+
+        let a_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle_a)
+                .await
+                .expect("first caller resolves fast")
+                .expect("task join");
+        let b_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle_b)
+                .await
+                .expect("waiter resolves fast")
+                .expect("task join");
+
+        assert!(
+            matches!(
+                &a_result,
+                Err(MountError::NoResponderAvailable { key, .. })
+                    if key == "no_responder_key"
+            ),
+            "first caller expected NoResponderAvailable, got: {:?}",
+            a_result
+        );
+        assert!(
+            matches!(
+                &b_result,
+                Err(MountError::NoResponderAvailable { key, .. })
+                    if key == "no_responder_key"
+            ),
+            "dedup waiter expected the SAME NoResponderAvailable \
+             outcome; got: {:?}",
+            b_result
+        );
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "only one prompt call across two concurrent callers"
         );
     }
 
