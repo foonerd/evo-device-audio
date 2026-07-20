@@ -771,6 +771,28 @@ pub enum MountError {
         /// connected" or "steward shutting down").
         reason: String,
     },
+    /// The password prompt was refused fast by the framework
+    /// because no session currently holds the user-interaction-
+    /// responder slot. Distinct from
+    /// [`Self::CredentialPromptFailed`] so the wire layer can
+    /// return the specific `no_responder_available` subclass
+    /// and the operator surface can render "no answering client
+    /// is connected" instead of a generic prompt failure. The
+    /// mutation refuses in the current tokio poll rather than
+    /// waiting for the framework's prompt TTL (default 60 s) —
+    /// the whole point of the fast path.
+    #[error(
+        "no responder session is currently connected to answer the \
+         password prompt for key {key}: {reason}"
+    )]
+    NoResponderAvailable {
+        /// The credential-vault key the prompt targeted.
+        key: String,
+        /// The framework-supplied refusal reason (includes the
+        /// prompt TTL that would otherwise have elapsed before
+        /// the operator got a response).
+        reason: String,
+    },
     /// The prompt returned an answer but writing it to the
     /// credential store failed at the IO layer. Rare — the
     /// framework guarantees the credentials directory is
@@ -2034,6 +2056,24 @@ pub struct NetworkSharesRuntime {
     share_states: Arc<Mutex<HashMap<ShareId, ShareStateEntry>>>,
     publisher: StdMutex<Option<SharesPublisher>>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Deduplication map for in-flight credential prompts. Keyed
+    /// on `credential_key` (the vault key) so multiple concurrent
+    /// mount / add attempts against the same missing credential
+    /// collapse to a single prompt on the responder's shelf. The
+    /// first caller issues the prompt; later callers clone the
+    /// `Notify` and wait. On the first caller's completion (any
+    /// outcome) the entry is removed and waiters wake; they re-
+    /// check the vault and either return successfully (credential
+    /// was stored) or re-issue their own prompt (which the
+    /// framework fast-refuses if no responder is still connected).
+    ///
+    /// The store-side of a successful prompt writes the answer to
+    /// the credential vault BEFORE this map is unlocked, so
+    /// waking waiters observe the vault hit and never see a race
+    /// where the map entry is gone but the credential is not yet
+    /// stored.
+    pending_credential_prompts:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 impl std::fmt::Debug for NetworkSharesRuntime {
@@ -2079,6 +2119,9 @@ impl NetworkSharesRuntime {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
+            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
+                HashMap::new(),
+            )),
         })
     }
 
@@ -2137,6 +2180,9 @@ impl NetworkSharesRuntime {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
+            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
+                HashMap::new(),
+            )),
         }
     }
 
@@ -2184,13 +2230,106 @@ impl NetworkSharesRuntime {
         let Some(store) = self.credential_store.as_ref() else {
             return Err(MountError::CredentialStoreUnavailable);
         };
+
+        // Prompt dedup on credential_key. Multiple concurrent
+        // mount / add attempts against the same missing credential
+        // (a consumer double-tapping the mount button) collapse to
+        // one prompt on the responder's shelf; one operator answer
+        // resolves every waiter.
+        //
+        // First caller: insert a fresh Notify and proceed to
+        // prompt. Later callers: clone the Notify, drop the map
+        // lock, `await notified()`. On the first caller's
+        // completion (any outcome) the entry is removed and
+        // `notify_waiters()` fires; every waiter wakes, re-checks
+        // the vault, and returns Ok if the credential was stored
+        // — otherwise re-enters this function (which will collapse
+        // again to a fresh dedup round if a responder is still
+        // absent, or issue a fresh prompt if the first caller's
+        // failure was transient).
+        let (notify, is_first_caller) = {
+            let mut map = self
+                .pending_credential_prompts
+                .lock()
+                .expect("pending_credential_prompts mutex poisoned");
+            if let Some(existing) = map.get(credential_key) {
+                (Arc::clone(existing), false)
+            } else {
+                let n = Arc::new(tokio::sync::Notify::new());
+                map.insert(credential_key.clone(), Arc::clone(&n));
+                (n, true)
+            }
+        };
+        if !is_first_caller {
+            notify.notified().await;
+            // The first caller has finished. Re-check the vault:
+            // if the answer was stored, we are done. Otherwise
+            // re-enter ensure_credential_stocked so this caller
+            // gets its own error path — either a fresh prompt (if
+            // a responder connected mid-flight) or the same
+            // NoResponderAvailable / CredentialPromptCancelled
+            // shape the first caller received.
+            if self
+                .credentials
+                .fetch_password(credential_key)
+                .await
+                .is_some()
+            {
+                return Ok(());
+            }
+            // Retry once via the boxed recursion pattern (async
+            // Rust cannot self-recurse without boxing the future).
+            return Box::pin(self.ensure_credential_stocked(record)).await;
+        }
+
+        // First-caller path. Guarantee waiters are notified on
+        // EVERY exit path (success, cancel, prompt error, store
+        // error) so no waiter parks indefinitely.
+        struct NotifyOnDrop {
+            key: String,
+            map: Arc<
+                std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+            >,
+            notify: Arc<tokio::sync::Notify>,
+        }
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.map
+                    .lock()
+                    .expect("pending_credential_prompts mutex poisoned")
+                    .remove(&self.key);
+                self.notify.notify_waiters();
+            }
+        }
+        let _guard = NotifyOnDrop {
+            key: credential_key.clone(),
+            map: Arc::clone(&self.pending_credential_prompts),
+            notify: Arc::clone(&notify),
+        };
         let label =
             format!("Password for {}@{}{}", username, record.host, record.path);
+        // The framework's forward_request_user_interaction fast-
+        // refuses with a message prefixed `no_responder_available:`
+        // when no session currently holds the responder slot. The
+        // SDK's WireFrame::Error → ReportError::Invalid mapping
+        // (host.rs await_event_response) drops the structured
+        // details field and preserves only the message; we route
+        // on the well-defined prefix so the wire layer can surface
+        // the specific subclass instead of the generic
+        // credential_prompt_failed.
         let answer =
             self.prompter.prompt_password(label).await.map_err(|e| {
-                MountError::CredentialPromptFailed {
-                    key: credential_key.clone(),
-                    reason: format!("{e}"),
+                let msg = format!("{e}");
+                if msg.contains("no_responder_available:") {
+                    MountError::NoResponderAvailable {
+                        key: credential_key.clone(),
+                        reason: msg,
+                    }
+                } else {
+                    MountError::CredentialPromptFailed {
+                        key: credential_key.clone(),
+                        reason: msg,
+                    }
                 }
             })?;
         let Some(bytes) = answer else {
@@ -2439,6 +2578,9 @@ impl NetworkSharesRuntimeBuilder {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn,
+            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
+                HashMap::new(),
+            )),
         }
     }
 }
@@ -3922,6 +4064,25 @@ impl NetworkSharesRuntime {
                         mount_report: Some(report),
                         mount_error: None,
                     },
+                    Err(MountError::NoResponderAvailable { key, reason }) => {
+                        // Roll back the persisted share record on
+                        // this specific failure: the mutation
+                        // could not be answered by any client
+                        // (no responder session was connected at
+                        // dispatch time), so leaving a half-added
+                        // share behind would litter the state
+                        // with a record the operator did not
+                        // consent to keeping. Distinct from
+                        // cancelled / timed-out prompt failures,
+                        // where the operator DID see the prompt
+                        // and chose not to answer — those keep
+                        // the record so `network.share.mount`
+                        // can retry.
+                        let _ = self.remove_share(&share_id).await;
+                        return Err(VerbDispatchError::Mount(
+                            MountError::NoResponderAvailable { key, reason },
+                        ));
+                    }
                     Err(e) => AddShareResponse {
                         share_id,
                         mount_report: None,
