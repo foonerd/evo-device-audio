@@ -216,7 +216,7 @@ impl Plugin for SystemPowerPlugin {
 
 impl Respondent for SystemPowerPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

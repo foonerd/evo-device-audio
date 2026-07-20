@@ -199,7 +199,7 @@ impl Plugin for SmbServerPlugin {
 
 impl Respondent for SmbServerPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

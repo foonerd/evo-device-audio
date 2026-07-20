@@ -216,7 +216,7 @@ impl Plugin for ArtworkOnlinePlugin {
 
 impl Respondent for ArtworkOnlinePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -231,14 +231,14 @@ impl Respondent for ArtworkOnlinePlugin {
                 ));
             }
             if req.request_type != REQUEST_ARTWORK_RESOLVE_ONLINE {
-                self.requests_handled += 1;
+                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
                     [REQUEST_ARTWORK_RESOLVE_ONLINE]
                 )));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,
