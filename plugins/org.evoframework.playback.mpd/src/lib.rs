@@ -2903,6 +2903,34 @@ impl MpdPlaybackPlugin {
     /// Handle a `set_volume` source-verb request: clamp /
     /// validate the volume byte and issue a
     /// [`PlaybackCommand::SetVolume`].
+    ///
+    /// **Not a transformation point.** The value the caller
+    /// supplies is passed to MPD's `setvol` byte-for-byte. Any
+    /// deviation the operator observes between the requested
+    /// percent and the resulting hardware-mixer state (e.g.
+    /// "set_volume 77 lands as 79 on the DAC's Digital
+    /// control") lives BELOW this handler:
+    ///
+    /// 1. MPD's own hardware-mixer mapping applies a scaling
+    ///    from `setvol N` (0..100 wire percent) to the mixer
+    ///    control's units. For controls with a dB-scale
+    ///    quantised at a step > 1 dB, or with a non-linear
+    ///    dB→percent curve, adjacent wire percents may land at
+    ///    the same hardware mixer value or the hardware may
+    ///    round to its nearest quantised step.
+    /// 2. The DAC's mixer control step size itself (visible
+    ///    via `amixer -c <card> cget numid=<Digital>` — the
+    ///    `step=` field). Controls with `step=0` are logically
+    ///    continuous; a non-zero step forces quantisation at
+    ///    that granularity.
+    ///
+    /// The framework does not clamp or round volumes on the
+    /// framework side. The `77 → 79` observation the 2026-07-20
+    /// footnote memo names is DAC step-rounding, not framework
+    /// or MPD-level distortion — documented here so the
+    /// operator surface can render "requested vs achieved" if
+    /// UI wants to expose the delta, and so a future audit does
+    /// not chase a phantom framework bug.
     async fn handle_set_volume(
         &self,
         req: &Request,
