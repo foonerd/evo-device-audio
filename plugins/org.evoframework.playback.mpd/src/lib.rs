@@ -506,6 +506,24 @@ pub struct MpdPlaybackPlugin {
     /// from the start (single canonical apply path, no
     /// session-init / settings-update fork).
     audio_protocol_settings_tx: watch::Sender<AudioProtocolSettings>,
+    /// Watch channel carrying the operator's declared
+    /// startup-volume settings (startup + max). Seeded with
+    /// `None` at construction; the options-settings subscriber
+    /// publishes `Some(StartupVolume)` on the first parsed
+    /// state, and the startup-volume applier waits for that
+    /// first `Some` before touching MPD. `None` after a state
+    /// where the payload does not carry the fields (schema
+    /// drift; the applier treats this as "keep waiting").
+    startup_volume_tx:
+        watch::Sender<Option<playback_supervisor::StartupVolume>>,
+    /// Startup-volume applier task handle. Populated at
+    /// `Plugin::load` when the options-settings subscriber is
+    /// wired; runs a one-shot loop that waits for the first
+    /// published `StartupVolume`, retries MPD `setvol` until
+    /// accepted, then exits. Held here so `Plugin::unload` can
+    /// stop it cleanly if it is still waiting.
+    startup_volume_applier:
+        Option<playback_supervisor::StartupVolumeApplierHandle>,
     /// Concrete handle on the auto-restarter composite so a
     /// future capabilities-watch reactor can call `re_resolve`
     /// on it without going through the `Arc<dyn MpdRestarter>`
@@ -643,6 +661,7 @@ impl MpdPlaybackPlugin {
         let (mixer_config_tx, _) = watch::channel(MixerConfig::Software);
         let (audio_protocol_settings_tx, _) =
             watch::channel(AudioProtocolSettings::audiophile_default());
+        let (startup_volume_tx, _) = watch::channel(None);
         Self {
             loaded: false,
             endpoint,
@@ -666,6 +685,8 @@ impl MpdPlaybackPlugin {
             fragment_worker: None,
             mixer_config_tx,
             audio_protocol_settings_tx,
+            startup_volume_tx,
+            startup_volume_applier: None,
             auto_restarter: None,
             capabilities_watcher: None,
             shelves: None,
@@ -967,6 +988,7 @@ impl MpdPlaybackPlugin {
         let querier = Arc::clone(querier);
         let mixer_tx = self.mixer_config_tx.clone();
         let protocol_tx = self.audio_protocol_settings_tx.clone();
+        let startup_volume_tx = self.startup_volume_tx.clone();
         let addressing = ExternalAddressing {
             scheme: "evo.audio.options".to_string(),
             value: "settings".to_string(),
@@ -1037,6 +1059,11 @@ impl MpdPlaybackPlugin {
                 }
                 let protocol = parse_audio_protocol_settings_from_state(&state);
                 let _ = protocol_tx.send(protocol);
+                if let Some(sv) =
+                    parse_startup_volume_from_settings_state(&state)
+                {
+                    let _ = startup_volume_tx.send(Some(sv));
+                }
             }
 
             loop {
@@ -1057,6 +1084,18 @@ impl MpdPlaybackPlugin {
                             // session reads the latest value on
                             // subscribe.
                             let _ = protocol_tx.send_replace(protocol);
+                            // Publish updated startup volume too.
+                            // The applier consumes only the FIRST
+                            // Some(...); subsequent updates flow
+                            // to the watch channel for any future
+                            // consumer but do not re-fire the
+                            // one-shot apply.
+                            if let Some(sv) =
+                                parse_startup_volume_from_settings_state(state)
+                            {
+                                let _ =
+                                    startup_volume_tx.send_replace(Some(sv));
+                            }
                         }
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
@@ -1271,6 +1310,34 @@ async fn resolve_options_addressing_with_backoff(
          remains the operator surface)"
     );
     None
+}
+
+/// Extract the operator's declared startup-volume settings from
+/// an `audio.options.settings` subject-state payload. Returns
+/// `None` when the payload does not carry `startup_volume_percent`
+/// at all (schema drift; caller falls through to whatever the
+/// last applied value was).
+///
+/// `max_volume_percent` defaults to 100 when absent — the same
+/// posture the options plugin's `Settings::default` carries. The
+/// applier clamps `startup_percent` at `max_percent` before
+/// sending to MPD.
+fn parse_startup_volume_from_settings_state(
+    state: &serde_json::Value,
+) -> Option<playback_supervisor::StartupVolume> {
+    let startup_percent = state
+        .get("startup_volume_percent")
+        .and_then(|v| v.as_u64())?
+        .min(100) as u8;
+    let max_percent = state
+        .get("max_volume_percent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100)
+        .min(100) as u8;
+    Some(playback_supervisor::StartupVolume {
+        startup_percent,
+        max_percent,
+    })
 }
 
 /// Extract the operator's MPD-protocol settings (crossfade +
@@ -2287,6 +2354,33 @@ impl Plugin for MpdPlaybackPlugin {
             // plugin's own config table.
             self.spawn_options_settings_subscriber(ctx).await;
 
+            // Spawn the startup-volume applier. Once the
+            // options-settings subscriber above publishes the
+            // first parsed state carrying `startup_volume_percent`
+            // + `max_volume_percent`, the applier waits for MPD
+            // to accept a `setvol` and applies the effective
+            // startup value (clamped to `max_volume_percent`).
+            // This is the fix for the "MPD statefile wins over
+            // configured startup" defect: without this task the
+            // reboot volume is whatever MPD's own persistent
+            // state file carries in, not the operator's declared
+            // startup floor.
+            //
+            // One-shot per load: the task exits after a
+            // successful `setvol`; subsequent volume gestures
+            // flow through the normal `set_volume` wire path.
+            self.startup_volume_applier =
+                Some(playback_supervisor::spawn_startup_volume_applier(
+                    self.endpoint.clone(),
+                    self.timeouts,
+                    self.startup_volume_tx.subscribe(),
+                ));
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "startup-volume applier spawned; awaits options settings + \
+                 MPD acceptance"
+            );
+
             // Spawn the /etc/asound.d/ composition-change
             // watcher. On every detected change the watcher
             // dispatches a CycleOutput to the active custody's
@@ -2380,6 +2474,14 @@ impl Plugin for MpdPlaybackPlugin {
             // of any custody supervisor; safe to stop any time
             // after the custodies drain above.
             if let Some(handle) = self.ambient_observer.take() {
+                handle.stop().await;
+            }
+            // Stop the startup-volume applier if it is still
+            // waiting for options settings or in its retry
+            // loop. On the happy path the applier has already
+            // exited (successful `setvol`); the take + stop
+            // is a no-op when the join handle is completed.
+            if let Some(handle) = self.startup_volume_applier.take() {
                 handle.stop().await;
             }
             // Stop the asound watcher last. The supervisor's
@@ -5779,6 +5881,111 @@ mod tests {
         }));
         assert_eq!(s.crossfade_seconds, 12);
         assert!(s.gapless);
+    }
+
+    /// The startup-volume applier's source of truth is the
+    /// `startup_volume_percent` field on the options-settings
+    /// subject state. Without it, the applier never fires and
+    /// the pre-defect behaviour returns (MPD statefile wins).
+    #[test]
+    fn startup_volume_parses_startup_and_max_from_state() {
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "startup_volume_percent": 30,
+            "max_volume_percent": 80,
+        }))
+        .expect("startup present → Some");
+        assert_eq!(sv.startup_percent, 30);
+        assert_eq!(sv.max_percent, 80);
+        // Effective = min(startup, max) — startup wins here.
+        assert_eq!(sv.effective(), 30);
+    }
+
+    /// `max_volume_percent` defaults to 100 when absent — the
+    /// same posture the options plugin's `Settings::default`
+    /// carries. Startup < 100 stays as-is; effective = startup.
+    #[test]
+    fn startup_volume_defaults_max_to_100_when_absent() {
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "startup_volume_percent": 45,
+        }))
+        .expect("startup present → Some");
+        assert_eq!(sv.max_percent, 100);
+        assert_eq!(sv.effective(), 45);
+    }
+
+    /// Startup absent → parser returns None. The applier treats
+    /// None as "keep waiting" (schema-drift-tolerant); the caller
+    /// sends `None` to the watch channel, which the applier
+    /// filters via `borrow_and_update()`.
+    #[test]
+    fn startup_volume_returns_none_when_startup_field_missing() {
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "mixer_type": "hardware",
+            "output_device": "hw:CARD=DAC,DEV=0",
+        }));
+        assert!(sv.is_none());
+    }
+
+    /// Startup above max: applier clamps to max. This is the
+    /// invariant the operator relies on to keep the boot-time
+    /// volume below the ceiling regardless of what
+    /// `startup_volume_percent` records — the ceiling is the
+    /// hard limit.
+    #[test]
+    fn startup_volume_effective_clamps_startup_at_max() {
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "startup_volume_percent": 90,
+            "max_volume_percent": 50,
+        }))
+        .expect("startup present → Some");
+        assert_eq!(sv.effective(), 50);
+    }
+
+    /// The parser reads only the two fields it needs; unrelated
+    /// settings on the same subject state (mixer, output device,
+    /// crossfade) do not affect parsing.
+    #[test]
+    fn startup_volume_ignores_unrelated_fields() {
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "mixer_type": "hardware",
+            "output_device": "hw:CARD=DAC,DEV=0",
+            "exclusive_mode": true,
+            "crossfade_seconds": 12,
+            "gapless": true,
+            "startup_volume_percent": 22,
+            "max_volume_percent": 90,
+        }))
+        .expect("startup present → Some");
+        assert_eq!(sv.startup_percent, 22);
+        assert_eq!(sv.max_percent, 90);
+        assert_eq!(sv.effective(), 22);
+    }
+
+    /// Regression per the 2026-07-20 defect memo: the applier
+    /// receives the operator's configured startup value from
+    /// the subject state (not from MPD's statefile). The
+    /// effective volume it computes is the value the wire
+    /// setter would apply — parser + clamp is the whole
+    /// framework-side computation before the MPD `setvol`.
+    #[test]
+    fn startup_volume_regression_boot_with_statefile_volume_x_configured_startup_y_effective_is_y(
+    ) {
+        // Configured startup Y = 30 (options plugin default).
+        // Max = 100 (no ceiling). MPD's statefile could be
+        // carrying any value in [0, 100] — irrelevant to the
+        // parser + clamp. The applier's job downstream is to
+        // send this effective value over the wire so MPD's
+        // statefile-restored figure is overridden.
+        let sv = parse_startup_volume_from_settings_state(&json!({
+            "startup_volume_percent": 30,
+            "max_volume_percent": 100,
+        }))
+        .expect("startup present → Some");
+        assert_eq!(
+            sv.effective(),
+            30,
+            "post-boot effective volume must equal configured startup (Y)"
+        );
     }
 
     // ---- supervisor session-init apply path ----

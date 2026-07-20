@@ -35,6 +35,7 @@ mod actor;
 mod ambient_observer;
 mod command;
 mod report;
+mod startup_volume;
 mod subject_emitter;
 
 #[cfg(test)]
@@ -49,4 +50,8 @@ pub(crate) use ambient_observer::{
     spawn as spawn_ambient_observer, AmbientObserverHandle,
 };
 pub(crate) use command::{PlaybackCommand, PlaybackError};
+pub(crate) use startup_volume::{
+    spawn as spawn_startup_volume_applier, StartupVolume,
+    StartupVolumeApplierHandle,
+};
 pub(crate) use subject_emitter::{render_now_playing_state, SubjectEmitter};
