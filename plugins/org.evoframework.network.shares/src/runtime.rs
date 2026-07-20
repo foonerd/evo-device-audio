@@ -2348,6 +2348,51 @@ impl NetworkSharesRuntime {
     }
 }
 
+/// Fire-and-forget MPD library update for a single path via
+/// `/usr/bin/mpc update <path>`. Runs as a spawned blocking task
+/// so a hung mpc (framework does not wait) does not block the
+/// caller. Failures log at debug — an operator's next mount /
+/// manual update cycles the state; this is a convenience trigger,
+/// not a durability guarantee. Called from `remove_share` so a
+/// removed share's entries are pruned from MPD's database in the
+/// same operation, closing the "dead share kept appearing in the
+/// library" defect the 2026-07-20 audit named.
+fn trigger_mpd_update_best_effort(mount_root: &std::path::Path) {
+    if mount_root.as_os_str().is_empty() {
+        return;
+    }
+    let path_arg = mount_root.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("/usr/bin/mpc")
+            .arg("update")
+            .arg(&path_arg)
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::info!(
+                    path = %path_arg,
+                    "mpc update dispatched after share removal"
+                );
+            }
+            Ok(o) => {
+                tracing::debug!(
+                    path = %path_arg,
+                    exit_code = ?o.status.code(),
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "mpc update returned non-zero after share removal"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %path_arg,
+                    error = %e,
+                    "mpc update dispatch failed after share removal"
+                );
+            }
+        }
+    });
+}
+
 /// Wall-clock in milliseconds since UNIX epoch. Used as the
 /// runtime's default `now_fn` when the caller has not injected
 /// one via the builder.
@@ -2694,6 +2739,57 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             (removed, envelope)
         };
         self.drop_share_state_entry(share_id).await;
+
+        // Delete the mount-root directory if it is empty. The
+        // wire caller (network.share.remove handler) performs a
+        // best-effort unmount before calling us, so a clean
+        // remove should find the mount-root vacated. The empty-
+        // only guard means we never destroy operator files that
+        // happen to sit under the mount-root because unmount
+        // failed or the directory was populated outside the
+        // framework's flow — the operator sees a leftover
+        // directory in that case, distinct from silent data
+        // loss.
+        //
+        // Skipped when the mount-root path is empty (legacy
+        // records) or does not exist (already removed).
+        let mount_root = &removed.mount_root;
+        if !mount_root.as_os_str().is_empty() && mount_root.exists() {
+            match std::fs::remove_dir(mount_root) {
+                Ok(()) => {
+                    tracing::info!(
+                        share_id = %share_id,
+                        mount_root = %mount_root.display(),
+                        "removed empty mount-root directory after \
+                         share removal"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Race with something else deleting it; nothing
+                    // to do.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        share_id = %share_id,
+                        mount_root = %mount_root.display(),
+                        error = %e,
+                        "mount-root not removed (likely not empty — \
+                         operator data present or unmount did not \
+                         drain); leaving directory in place"
+                    );
+                }
+            }
+        }
+
+        // Trigger an MPD library update for the removed path.
+        // Without this, dead share entries linger in MPD's
+        // database until something else (a mount / restart /
+        // manual mpc update) forces a rescan — the operator
+        // sees a "dead share kept appearing in the library"
+        // condition the 2026-07-20 audit named. Best-effort:
+        // failure here does not fail the remove call.
+        trigger_mpd_update_best_effort(mount_root);
+
         self.schedule_republish_configured(configured_envelope);
         Ok(removed)
     }
@@ -4510,6 +4606,76 @@ mod tests {
         assert_eq!(removed.alias, "GoAway");
         let rt2 = NetworkSharesRuntime::open(&dir).unwrap();
         assert!(rt2.list_configured().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_remove_deletes_empty_mount_root_directory() {
+        // Regression per the 2026-07-20 audit item 8: dead mount-
+        // root directories left behind after remove_share appear
+        // as browsable garbage in the operator's library. Fix:
+        // remove deletes the directory when empty.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mount_root = dir.join("music").join("NAS").join("ShareToRemove");
+        std::fs::create_dir_all(&mount_root).unwrap();
+        assert!(mount_root.is_dir(), "test setup: mount-root exists");
+        let mut record = built_record("ShareToRemove", "192.0.2.60");
+        record.mount_root = mount_root.clone();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.remove_share(&id).await.unwrap();
+        assert!(
+            !mount_root.exists(),
+            "mount-root should have been deleted on remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_remove_preserves_non_empty_mount_root_directory() {
+        // Safety guard: never destroy operator files that sit
+        // under the mount-root (e.g. the unmount did not drain,
+        // or the operator placed content outside the framework's
+        // flow). The operator sees a leftover directory in that
+        // case — distinct from silent data loss.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mount_root = dir.join("music").join("NAS").join("HasFiles");
+        std::fs::create_dir_all(&mount_root).unwrap();
+        // Simulate a file left behind (an unmount that failed to
+        // drain the CIFS mount, or operator data outside the
+        // framework's flow).
+        std::fs::write(mount_root.join("residual.txt"), b"do not delete")
+            .unwrap();
+        let mut record = built_record("HasFiles", "192.0.2.61");
+        record.mount_root = mount_root.clone();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.remove_share(&id).await.unwrap();
+        assert!(
+            mount_root.exists(),
+            "mount-root should be preserved when non-empty; operator data \
+             must not be silently destroyed"
+        );
+        assert!(
+            mount_root.join("residual.txt").exists(),
+            "residual file must survive remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_remove_tolerates_missing_mount_root_directory() {
+        // Idempotence: removing a share whose mount-root was
+        // already gone (never mounted, previously cleaned, etc.)
+        // does not error.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mount_root = dir.join("music").join("NAS").join("NeverExisted");
+        let mut record = built_record("NeverExisted", "192.0.2.62");
+        record.mount_root = mount_root.clone();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        // mount_root never created on disk; remove tolerates it.
+        rt.remove_share(&id).await.unwrap();
     }
 
     #[tokio::test]
