@@ -4470,7 +4470,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_share_pw".to_string(),
-            domain: Some("INTRANET".to_string()),
+            domain: Some("EXAMPLE".to_string()),
         };
         let args = build_cifs_mount_args(
             &record,
@@ -4510,11 +4510,11 @@ mod tests {
         let body = compose_cifs_credentials_file(
             "engineer",
             "hunter2",
-            Some("INTRANET"),
+            Some("EXAMPLE"),
         );
         assert!(body.contains("username=engineer\n"));
         assert!(body.contains("password=hunter2\n"));
-        assert!(body.contains("domain=INTRANET\n"));
+        assert!(body.contains("domain=EXAMPLE\n"));
     }
 
     #[test]
@@ -4616,7 +4616,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "rotate_key".to_string(),
-            domain: Some("INTRANET".to_string()),
+            domain: Some("EXAMPLE".to_string()),
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -4660,23 +4660,23 @@ mod tests {
     #[test]
     fn filter_self_out_removes_loopback_ips() {
         let hits = vec![
-            ("PI5TARGET".to_string(), "127.0.0.1".to_string()),
-            ("NAS".to_string(), "192.168.30.1".to_string()),
+            ("SELF".to_string(), "127.0.0.1".to_string()),
+            ("NAS".to_string(), "192.0.2.100".to_string()),
         ];
         let filtered = filter_self_out(hits);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].1, "192.168.30.1");
+        assert_eq!(filtered[0].1, "192.0.2.100");
     }
 
     #[test]
     fn filter_self_out_removes_ipv6_loopback() {
         let hits = vec![
-            ("PI5TARGET".to_string(), "::1".to_string()),
-            ("NAS".to_string(), "192.168.30.1".to_string()),
+            ("SELF".to_string(), "::1".to_string()),
+            ("NAS".to_string(), "192.0.2.100".to_string()),
         ];
         let filtered = filter_self_out(hits);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].1, "192.168.30.1");
+        assert_eq!(filtered[0].1, "192.0.2.100");
     }
 
     #[tokio::test]
@@ -4857,7 +4857,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_key".to_string(),
-            domain: Some("INTRANET".to_string()),
+            domain: Some("EXAMPLE".to_string()),
         };
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
@@ -4964,7 +4964,7 @@ mod tests {
         record.credentials = Credentials::UserPassword {
             username: "engineer".to_string(),
             credential_key: "auth_pw".to_string(),
-            domain: Some("INTRANET".to_string()),
+            domain: Some("EXAMPLE".to_string()),
         };
         record.persisted_vers = Some("3.1.1".to_string());
         let id = record.share_id.clone();
@@ -4988,7 +4988,7 @@ mod tests {
             .expect("credentials file must exist at call time");
         assert!(body.contains("username=engineer\n"));
         assert!(body.contains("password=s3cret\n"));
-        assert!(body.contains("domain=INTRANET\n"));
+        assert!(body.contains("domain=EXAMPLE\n"));
     }
 
     #[tokio::test]

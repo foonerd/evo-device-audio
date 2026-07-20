@@ -1398,6 +1398,7 @@ dependencies = [
  "evo-sdk-rust",
  "evo-sdk-swift",
  "evo-sdk-typescript",
+ "evo-shadow-crypt",
  "evo-tls-certs",
  "evo-trust",
  "evo-witness",
@@ -1414,7 +1415,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha-crypt",
  "sha2",
  "socket2 0.5.10",
  "tar",
@@ -1741,6 +1741,15 @@ version = "0.1.13-dev"
 dependencies = [
  "evo-projection-core",
  "evo-sdk-genkit",
+]
+
+[[package]]
+name = "evo-shadow-crypt"
+version = "0.1.13-dev"
+dependencies = [
+ "libc",
+ "libloading",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2859,6 +2868,16 @@ checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]
@@ -4954,18 +4973,6 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
-]
-
-[[package]]
-name = "sha-crypt"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88e79009728d8311d42d754f2f319a975f9e38f156fd5e422d2451486c78b286"
-dependencies = [
- "base64ct",
- "rand 0.8.6",
- "sha2",
- "subtle",
 ]
 
 [[package]]
