@@ -297,7 +297,8 @@ impl HardwareAudioConfigPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Resolved board profile (e.g. `Raspberry PI`). `Unknown`
@@ -949,7 +950,8 @@ impl Respondent for HardwareAudioConfigPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "hardware.audio.list_dac_catalogue" => {
                     self.handle_list_dac_catalogue(req).await
@@ -2090,7 +2092,7 @@ mod tests {
         // verdicts (they depend on the host the test runs on),
         // only the shape: a `report` field carrying `status` +
         // `probes[]` of length 4 with the canonical names.
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let resp = p
             .handle_request(&dsp_request(
                 "hardware.audio.verify_install",
@@ -2136,7 +2138,7 @@ mod tests {
 
     #[tokio::test]
     async fn dsp_list_controls_returns_capability_set_for_active_dac() {
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let resp = p
             .handle_request(&dsp_request(
                 "hardware.audio.dsp.list_controls",
@@ -2156,7 +2158,7 @@ mod tests {
 
     #[tokio::test]
     async fn dsp_get_control_returns_named_control_or_refuses() {
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let resp = p
             .handle_request(&dsp_request(
                 "hardware.audio.dsp.get_control",
@@ -2181,7 +2183,7 @@ mod tests {
 
     #[tokio::test]
     async fn dsp_set_control_happy_path_emits_change_and_captures_write() {
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         // Retrieve the provider's captured-writes vec via a Arc
         // round-trip so we can assert after the handler runs.
         let captured_before = p.provider.clone();
@@ -2207,7 +2209,7 @@ mod tests {
 
     #[tokio::test]
     async fn dsp_set_control_refuses_unknown_control() {
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let err = p
             .handle_request(&dsp_request(
                 "hardware.audio.dsp.set_control",
@@ -2229,7 +2231,7 @@ mod tests {
 
     #[tokio::test]
     async fn dsp_set_control_refuses_value_out_of_range_for_enum() {
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let err = p
             .handle_request(&dsp_request(
                 "hardware.audio.dsp.set_control",
@@ -2254,7 +2256,7 @@ mod tests {
         // Deemphasis is a boolean control on Allo Katana; passing
         // a string value should refuse with ValueOutOfRange citing
         // the expected type.
-        let mut p = plugin_with_stubbed_pi_provider().await;
+        let p = plugin_with_stubbed_pi_provider().await;
         let err = p
             .handle_request(&dsp_request(
                 "hardware.audio.dsp.set_control",

@@ -118,7 +118,8 @@ impl ArtworkLocalPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// For unit tests: simulate load without a real [`LoadContext`].
@@ -248,7 +249,8 @@ impl Respondent for ArtworkLocalPlugin {
             }
 
             if req.request_type != REQUEST_ARTWORK_RESOLVE {
-                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.requests_handled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
@@ -256,7 +258,8 @@ impl Respondent for ArtworkLocalPlugin {
                 )));
             }
 
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,
@@ -455,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_rejects_before_load() {
-        let mut p = ArtworkLocalPlugin::new();
+        let p = ArtworkLocalPlugin::new();
         let r = Request {
             request_type: REQUEST_ARTWORK_RESOLVE.to_string(),
             payload: vec![],

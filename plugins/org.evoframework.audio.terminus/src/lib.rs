@@ -601,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_refuses_before_load() {
-        let mut plugin = AudioTerminusPlugin::new();
+        let plugin = AudioTerminusPlugin::new();
         let req = Request {
             request_type: "get_spectrum_frame".to_string(),
             payload: serde_json::to_vec(&serde_json::json!({"v": 1})).unwrap(),

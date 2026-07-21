@@ -122,7 +122,8 @@ impl ArtworkOnlinePlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -231,14 +232,16 @@ impl Respondent for ArtworkOnlinePlugin {
                 ));
             }
             if req.request_type != REQUEST_ARTWORK_RESOLVE_ONLINE {
-                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.requests_handled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
                     [REQUEST_ARTWORK_RESOLVE_ONLINE]
                 )));
             }
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,

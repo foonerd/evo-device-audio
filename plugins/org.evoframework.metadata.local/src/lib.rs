@@ -93,7 +93,8 @@ impl MetadataLocalPlugin {
 
     /// Count of [`Respondent::handle_request`] invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -205,7 +206,8 @@ impl Respondent for MetadataLocalPlugin {
                 ));
             }
             if req.request_type != REQUEST_METADATA_QUERY {
-                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.requests_handled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
@@ -213,7 +215,8 @@ impl Respondent for MetadataLocalPlugin {
                 )));
             }
 
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 request_type = %req.request_type,
@@ -379,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_rejects_before_load() {
-        let mut p = MetadataLocalPlugin::new();
+        let p = MetadataLocalPlugin::new();
         let r = Request {
             request_type: REQUEST_METADATA_QUERY.to_string(),
             payload: vec![],

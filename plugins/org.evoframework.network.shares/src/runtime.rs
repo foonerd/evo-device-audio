@@ -2332,9 +2332,7 @@ impl NetworkSharesRuntime {
                             .await
                         {
                             Ok(()) => PromptDedupOutcome::Success,
-                            Err(e) => {
-                                PromptDedupOutcome::Other(format!("{e}"))
-                            }
+                            Err(e) => PromptDedupOutcome::Other(format!("{e}")),
                         }
                     }
                     Ok(None) => PromptDedupOutcome::Cancelled,
@@ -2377,7 +2375,7 @@ impl NetworkSharesRuntime {
             }
         }
 
-        return match outcome {
+        match outcome {
             PromptDedupOutcome::Success => {
                 // Defensive re-check: the store completed Ok in the
                 // init closure, but confirm the fetcher observes
@@ -5626,11 +5624,13 @@ mod tests {
                 .await
                 .expect("first caller must resolve fast")
                 .expect("task join");
-        let b_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle_b)
-                .await
-                .expect("dedup waiter must resolve fast (cancel-wakes-all regression)")
-                .expect("task join");
+        let b_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_b,
+        )
+        .await
+        .expect("dedup waiter must resolve fast (cancel-wakes-all regression)")
+        .expect("task join");
 
         assert!(
             matches!(
@@ -5875,19 +5875,17 @@ mod tests {
         prompter.release.notify_waiters();
 
         for (i, h) in handles.into_iter().enumerate() {
-            let outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                h,
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(3), h)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
                     "caller {i} did not resolve within 3s of the shared \
                      answer — cancel-wake-all/answer-wake-all invariant \
                      broken under concurrent dispatch"
                 )
-            })
-            .expect("task join");
+                    })
+                    .expect("task join");
             assert!(
                 outcome.is_ok(),
                 "caller {i} expected Ok after shared answer; got {outcome:?}"
@@ -5968,12 +5966,14 @@ mod tests {
 
         let rt_a = Arc::clone(&rt);
         let rt_b = Arc::clone(&rt);
-        let h_a = tokio::spawn(async move {
-            rt_a.ensure_credential_stocked(&r_a).await
-        });
-        let h_b = tokio::spawn(async move {
-            rt_b.ensure_credential_stocked(&r_b).await
-        });
+        let h_a =
+            tokio::spawn(
+                async move { rt_a.ensure_credential_stocked(&r_a).await },
+            );
+        let h_b =
+            tokio::spawn(
+                async move { rt_b.ensure_credential_stocked(&r_b).await },
+            );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
@@ -5990,10 +5990,7 @@ mod tests {
                 .await
                 .expect("waiter resolves under 2s of answer")
                 .expect("task join");
-        assert!(
-            out_a.is_ok(),
-            "first caller Ok on answer; got {out_a:?}"
-        );
+        assert!(out_a.is_ok(), "first caller Ok on answer; got {out_a:?}");
         assert!(
             out_b.is_ok(),
             "waiter Ok on answer without re-prompting; got {out_b:?}"

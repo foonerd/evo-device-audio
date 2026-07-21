@@ -330,7 +330,8 @@ impl AlsaCompositionPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Currently active composition mode. Reads through `mode_tx`
@@ -1162,7 +1163,8 @@ impl Respondent for AlsaCompositionPlugin {
                 )));
             }
 
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let payload =
                 match serde_json::from_slice::<SelectModeRequest>(&req.payload)
@@ -1602,7 +1604,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_refused_when_not_loaded() {
-        let mut p = AlsaCompositionPlugin::new();
+        let p = AlsaCompositionPlugin::new();
         let req = Request {
             request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
             payload: json!({ "v": 1, "mode": "passthrough" })

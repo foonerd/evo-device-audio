@@ -409,7 +409,8 @@ impl AlsaDeliveryPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load contract isolated to its testable inputs: the audio
@@ -1410,7 +1411,8 @@ impl Respondent for AlsaDeliveryPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "delivery.probe_hardware" => {
                     self.handle_probe_hardware(req).await
@@ -2275,7 +2277,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn handle_request_refused_when_not_loaded() {
-        let mut p = AlsaDeliveryPlugin::new();
+        let p = AlsaDeliveryPlugin::new();
         let err = p
             .handle_request(&request("delivery.list_cards", json!({ "v": 1 })))
             .await
@@ -2285,7 +2287,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn unknown_verb_refused() {
-        let mut p = loaded_plugin().await;
+        let p = loaded_plugin().await;
         let err = p
             .handle_request(&request("delivery.nonsense", json!({ "v": 1 })))
             .await
@@ -2300,7 +2302,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn list_cards_accepts_legacy_payload_without_version_field() {
-        let mut p = loaded_plugin().await;
+        let p = loaded_plugin().await;
         // Empty payload (no `v`) parses with default version.
         let resp = p
             .handle_request(&request("delivery.list_cards", json!({})))
@@ -2313,7 +2315,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn list_mixers_requires_card_field() {
-        let mut p = loaded_plugin().await;
+        let p = loaded_plugin().await;
         // Missing `card` field — serde refuses with Permanent.
         let err = p
             .handle_request(&request("delivery.list_mixers", json!({ "v": 1 })))
@@ -2324,7 +2326,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn active_endpoint_reports_no_framework_endpoint_pre_topology() {
-        let mut p = loaded_plugin().await;
+        let p = loaded_plugin().await;
         let resp = p
             .handle_request(&request(
                 "delivery.active_endpoint",
@@ -2523,7 +2525,7 @@ pcm.evo {
 
     #[tokio::test]
     async fn requests_handled_counter_advances_per_verb() {
-        let mut p = loaded_plugin().await;
+        let p = loaded_plugin().await;
         assert_eq!(p.requests_handled(), 0);
         p.handle_request(&request("delivery.list_cards", json!({ "v": 1 })))
             .await

@@ -788,7 +788,8 @@ impl PlaybackOptionsPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current in-memory settings snapshot. Returns an owned
@@ -1496,10 +1497,8 @@ impl Plugin for PlaybackOptionsPlugin {
                 self.state_path = Some(ctx.state_dir.join(STATE_FILENAME));
             }
             let loaded_settings = self.load_settings_from_disk().await?;
-            *self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned") = loaded_settings;
+            *self.settings.write().expect("settings RwLock poisoned") =
+                loaded_settings;
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
             self.subject_state_subscriber =
@@ -1582,7 +1581,8 @@ impl Respondent for PlaybackOptionsPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "options.get_settings" => self.handle_get_settings(req).await,
                 "options.set_resampling" => {
@@ -1761,7 +1761,11 @@ impl PlaybackOptionsPlugin {
         // violation (operator picked hardware for a reason).
         let (from, mixer_device_empty, mixer_control_empty) = {
             let s = self.settings.read().expect("settings RwLock poisoned");
-            (s.mixer_type, s.mixer_device.is_empty(), s.mixer_control.is_empty())
+            (
+                s.mixer_type,
+                s.mixer_device.is_empty(),
+                s.mixer_control.is_empty(),
+            )
         };
         if matches!(target, MixerType::Hardware)
             && (mixer_device_empty || mixer_control_empty)
@@ -1814,10 +1818,8 @@ impl PlaybackOptionsPlugin {
                 // disk as the authoritative source so the next
                 // request observes a coherent self.settings.
                 if let Ok(restored) = self.load_settings_from_disk().await {
-                    *self
-                        .settings
-                        .write()
-                        .expect("settings RwLock poisoned") = restored;
+                    *self.settings.write().expect("settings RwLock poisoned") =
+                        restored;
                 }
                 // Emit the lifecycle.failed happening through a
                 // short budget so the happenings bus cannot also
@@ -1964,16 +1966,13 @@ impl PlaybackOptionsPlugin {
         // delivery.alsa + playback.mpd consume the settings
         // subject to render / restart).
         let prior_settings = self.settings();
-        self
-            .settings
+        self.settings
             .write()
             .expect("settings RwLock poisoned")
             .mixer_type = to;
         if let Err(e) = self.persist_settings().await {
-            *self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned") = prior_settings.clone();
+            *self.settings.write().expect("settings RwLock poisoned") =
+                prior_settings.clone();
             return self
                 .rollback_or_fail(from, to, "set_new_authority", e.to_string())
                 .await;
@@ -2217,7 +2216,8 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetDopPayload = parse_versioned(req)?;
-        self.settings.write().expect("settings RwLock poisoned").dop = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").dop =
+            payload.value;
         self.persist_settings().await?;
         self.emit_changed("dop", serde_json::Value::Bool(payload.value))
             .await;
@@ -2256,7 +2256,10 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetExclusiveModePayload = parse_versioned(req)?;
-        self.settings.write().expect("settings RwLock poisoned").exclusive_mode = payload.value;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .exclusive_mode = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "exclusive_mode",
@@ -2290,7 +2293,10 @@ impl PlaybackOptionsPlugin {
                 CROSSFADE_SECONDS_MAX, payload.value
             )));
         }
-        self.settings.write().expect("settings RwLock poisoned").crossfade_seconds = payload.value;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .crossfade_seconds = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "crossfade_seconds",
@@ -2315,7 +2321,10 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetGaplessPayload = parse_versioned(req)?;
-        self.settings.write().expect("settings RwLock poisoned").gapless = payload.value;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .gapless = payload.value;
         self.persist_settings().await?;
         self.emit_changed("gapless", serde_json::Value::Bool(payload.value))
             .await;
@@ -2338,7 +2347,10 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetEqEngagedPayload = parse_versioned(req)?;
-        self.settings.write().expect("settings RwLock poisoned").eq_engaged = payload.value;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .eq_engaged = payload.value;
         self.persist_settings().await?;
         self.emit_changed("eq_engaged", serde_json::Value::Bool(payload.value))
             .await;
@@ -2394,10 +2406,8 @@ impl PlaybackOptionsPlugin {
             q: payload.q,
         };
         let eq_bands_snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             // Defensive resize: the persisted state file might be
             // older than the current EQ_BAND_COUNT shape. Pad with
             // defaults to the canonical length before writing.
@@ -2410,8 +2420,7 @@ impl PlaybackOptionsPlugin {
         self.persist_settings().await?;
         self.emit_changed(
             "eq_bands",
-            serde_json::to_value(&eq_bands_snapshot)
-                .map_err(map_json_err)?,
+            serde_json::to_value(&eq_bands_snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(
@@ -2464,14 +2473,10 @@ impl PlaybackOptionsPlugin {
         // Overwrite-by-name semantics: scan for existing
         // entry; if absent, enforce library cap before push.
         let eq_presets_snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
-            if let Some(slot) = s
-                .eq_presets
-                .iter_mut()
-                .find(|p| p.name == payload.name)
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
+            if let Some(slot) =
+                s.eq_presets.iter_mut().find(|p| p.name == payload.name)
             {
                 slot.bands = payload.bands.clone();
             } else {
@@ -2516,24 +2521,19 @@ impl PlaybackOptionsPlugin {
         let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
         validate_preset_name(&payload.name)?;
         let eq_bands_snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
-            let bands = match s
-                .eq_presets
-                .iter()
-                .find(|p| p.name == payload.name)
-            {
-                Some(p) => p.bands.clone(),
-                None => {
-                    return Err(PluginError::Permanent(format!(
-                        "eq_preset {:?} not found in the library; \
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
+            let bands =
+                match s.eq_presets.iter().find(|p| p.name == payload.name) {
+                    Some(p) => p.bands.clone(),
+                    None => {
+                        return Err(PluginError::Permanent(format!(
+                            "eq_preset {:?} not found in the library; \
                          call list_eq_presets to enumerate",
-                        payload.name
-                    )));
-                }
-            };
+                            payload.name
+                        )));
+                    }
+                };
             if bands.len() != EQ_BAND_COUNT {
                 return Err(PluginError::Permanent(format!(
                     "eq_preset {:?} carries {} bands; expected {} \
@@ -2572,10 +2572,8 @@ impl PlaybackOptionsPlugin {
         let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
         validate_preset_name(&payload.name)?;
         let eq_presets_snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             let before = s.eq_presets.len();
             s.eq_presets.retain(|p| p.name != payload.name);
             if s.eq_presets.len() == before {
@@ -2618,7 +2616,10 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.write().expect("settings RwLock poisoned").mixer_device = payload.value.clone();
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .mixer_device = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "mixer_device",
@@ -2646,7 +2647,10 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.write().expect("settings RwLock poisoned").mixer_control = payload.value.clone();
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .mixer_control = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "mixer_control",
@@ -2677,7 +2681,10 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.write().expect("settings RwLock poisoned").output_device = payload.value.clone();
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .output_device = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "output_device",
@@ -2698,7 +2705,10 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumeNormalizationPayload = parse_versioned(req)?;
-        self.settings.write().expect("settings RwLock poisoned").volume_normalization = payload.value;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .volume_normalization = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_normalization",
@@ -2733,10 +2743,8 @@ impl PlaybackOptionsPlugin {
             )));
         }
         {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             if payload.value > s.max_volume_percent {
                 return Err(PluginError::Permanent(format!(
                     "startup_volume_percent {} cannot exceed max_volume_percent {}; \
@@ -2782,10 +2790,8 @@ impl PlaybackOptionsPlugin {
             )));
         }
         let startup_clamped = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             s.max_volume_percent = payload.value;
             let clamped = s.startup_volume_percent > payload.value;
             if clamped {
@@ -2828,7 +2834,10 @@ impl PlaybackOptionsPlugin {
         let payload: SetVolumeCurvePayload = parse_versioned(req)?;
         let curve = VolumeCurve::from_wire_str(&payload.value)
             .map_err(PluginError::Permanent)?;
-        self.settings.write().expect("settings RwLock poisoned").volume_curve = curve;
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .volume_curve = curve;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_curve",
@@ -2868,10 +2877,8 @@ impl PlaybackOptionsPlugin {
         parse_versioned::<EmptyPayload>(req)?;
         let restored = self.restore_from_last_known_good().await?;
         let snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             *s = restored;
             s.clone()
         };
@@ -2910,10 +2917,8 @@ impl PlaybackOptionsPlugin {
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
         let snapshot = {
-            let mut s = self
-                .settings
-                .write()
-                .expect("settings RwLock poisoned");
+            let mut s =
+                self.settings.write().expect("settings RwLock poisoned");
             *s = Settings::default();
             s.clone()
         };
@@ -3800,7 +3805,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_settings_returns_defaults_on_fresh_plugin() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let resp = p
             .handle_request(&req("options.get_settings", json!({ "v": 1 })))
             .await
@@ -3814,7 +3819,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_refused_when_not_loaded() {
-        let mut p = PlaybackOptionsPlugin::new();
+        let p = PlaybackOptionsPlugin::new();
         let err = p
             .handle_request(&req("options.get_settings", json!({ "v": 1 })))
             .await
@@ -3824,7 +3829,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_verb_refused() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req("options.fly_to_moon", json!({ "v": 1 })))
             .await
@@ -3834,7 +3839,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_type_persists_and_emits_happening() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Hardware mode requires mixer_device + mixer_control
         // populated first (contract: silent degrade is
         // forbidden). Set the coordinates, then switch
@@ -3873,7 +3878,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_type_refuses_invalid_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_mixer_type",
@@ -3892,7 +3897,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_device_persists_and_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_mixer_device",
             json!({ "v": 1, "value": "hw:CARD=Headphones" }),
@@ -3909,7 +3914,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_device_refuses_whitespace_only_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_mixer_device",
@@ -3928,7 +3933,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_device_accepts_empty_for_clear() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Seed a non-empty value first; then clear it.
         p.handle_request(&req(
             "options.set_mixer_device",
@@ -3952,7 +3957,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_control_persists_and_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_mixer_control",
             json!({ "v": 1, "value": "Master" }),
@@ -3969,7 +3974,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mixer_control_refuses_whitespace_only_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_mixer_control",
@@ -3987,7 +3992,7 @@ mod tests {
         // playback warden refuses (no silent degrade). The
         // defaults MUST be empty strings so the absence is
         // visible.
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let resp = p
             .handle_request(&req("options.get_settings", json!({ "v": 1 })))
             .await
@@ -3999,7 +4004,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_dop_persists_and_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_dop",
             json!({ "v": 1, "value": true }),
@@ -4016,7 +4021,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_output_device_accepts_empty_for_default() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_output_device",
             json!({ "v": 1, "value": "" }),
@@ -4028,7 +4033,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_output_device_refuses_whitespace_only() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_output_device",
@@ -4041,7 +4046,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_volume_normalization_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_volume_normalization",
             json!({ "v": 1, "value": true }),
@@ -4064,7 +4069,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_exclusive_mode_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         assert!(!p.settings().exclusive_mode);
         p.handle_request(&req(
             "options.set_exclusive_mode",
@@ -4083,7 +4088,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_exclusive_mode_clears_back_to_false() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_exclusive_mode",
             json!({ "v": 1, "value": true }),
@@ -4101,7 +4106,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_crossfade_seconds_persists_within_range() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_crossfade_seconds",
             json!({ "v": 1, "value": 5 }),
@@ -4129,7 +4134,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_crossfade_seconds_refuses_above_ceiling() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_crossfade_seconds",
@@ -4150,7 +4155,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_gapless_round_trips_and_persists() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Defaults to true; flip to false then back.
         assert!(p.settings().gapless);
         p.handle_request(&req(
@@ -4183,7 +4188,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_engaged_round_trips() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         assert!(!p.settings().eq_engaged);
         p.handle_request(&req(
             "options.set_eq_engaged",
@@ -4196,7 +4201,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_band_persists_valid_values() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_eq_band",
             json!({
@@ -4219,7 +4224,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_band_refuses_index_above_count() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_eq_band",
@@ -4246,7 +4251,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_band_refuses_freq_below_audible_band() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_eq_band",
@@ -4265,7 +4270,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_band_refuses_gain_above_max() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_eq_band",
@@ -4284,7 +4289,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_eq_band_refuses_q_outside_range() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_eq_band",
@@ -4312,7 +4317,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_eq_presets_empty_on_fresh_plugin() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let resp = p
             .handle_request(&req("options.list_eq_presets", json!({ "v": 1 })))
             .await
@@ -4323,7 +4328,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_persists_and_lists() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.save_eq_preset",
             json!({ "v": 1, "name": "vocal-boost", "bands": flat_bands_json() }),
@@ -4341,7 +4346,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_overwrites_by_name() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // First save with flat bands.
         p.handle_request(&req(
             "options.save_eq_preset",
@@ -4364,7 +4369,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_refuses_empty_name() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.save_eq_preset",
@@ -4385,7 +4390,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_refuses_overlong_name() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let long = "x".repeat(EQ_PRESET_NAME_MAX_LEN + 1);
         let err = p
             .handle_request(&req(
@@ -4407,7 +4412,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_refuses_wrong_band_count() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Only 5 bands — schema requires 10.
         let short_bands: Vec<_> = (0..5)
             .map(|_| json!({ "freq_hz": 1000, "gain_db": 0.0, "q": 1.0 }))
@@ -4424,7 +4429,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_refuses_out_of_range_field() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let mut bands = flat_bands_json();
         bands[3]["gain_db"] = json!(100.0); // outside -15..=15
         let err = p
@@ -4447,7 +4452,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_eq_preset_refuses_library_cap_overflow() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         for i in 0..EQ_PRESET_LIBRARY_MAX_COUNT {
             p.handle_request(&req(
                 "options.save_eq_preset",
@@ -4487,7 +4492,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_eq_preset_replaces_active_bands_atomically() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Save a preset with all bands at 4 kHz / +3 dB.
         let preset_bands: Vec<_> = (0..EQ_BAND_COUNT)
             .map(|_| json!({ "freq_hz": 4000, "gain_db": 3.0, "q": 1.5 }))
@@ -4517,7 +4522,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_eq_preset_refuses_unknown_name() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.recall_eq_preset",
@@ -4540,7 +4545,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_eq_preset_removes_and_lists_drop() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.save_eq_preset",
             json!({ "v": 1, "name": "tmp", "bands": flat_bands_json() }),
@@ -4559,7 +4564,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_eq_preset_refuses_unknown_name() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.delete_eq_preset",
@@ -4572,7 +4577,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_eq_preset_does_not_touch_eq_engaged() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Engage EQ.
         p.handle_request(&req(
             "options.set_eq_engaged",
@@ -4603,7 +4608,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_to_defaults_restores_new_fields() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_exclusive_mode",
             json!({ "v": 1, "value": true }),
@@ -4633,7 +4638,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_startup_volume_persists_within_range() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_startup_volume",
             json!({ "v": 1, "value": 25 }),
@@ -4645,7 +4650,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_startup_volume_refuses_out_of_range() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_startup_volume",
@@ -4663,7 +4668,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_startup_volume_refuses_above_max_volume() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_max_volume",
             json!({ "v": 1, "value": 40 }),
@@ -4687,7 +4692,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_max_volume_clamps_startup_when_below_it() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // Raise startup to a known value first.
         p.handle_request(&req(
             "options.set_startup_volume",
@@ -4710,7 +4715,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_max_volume_refuses_out_of_range() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_max_volume",
@@ -4723,7 +4728,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_volume_curve_persists_valid_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_volume_curve",
             json!({ "v": 1, "value": "log" }),
@@ -4735,7 +4740,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_volume_curve_refuses_invalid_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_volume_curve",
@@ -4772,7 +4777,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_resampling_validates_quality_value() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_resampling",
@@ -4796,7 +4801,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_resampling_accepts_valid_quality() {
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         p.handle_request(&req(
             "options.set_resampling",
             json!({
@@ -4904,7 +4909,7 @@ mod tests {
         // stream MUST be [muted, unmuted] in that order with
         // monotonic generations.
         const OBSERVED_CID: &str = "stub-envelope-observed-cid";
-        let (mut p, announcer, subscriber, _querier, _dir) =
+        let (p, announcer, subscriber, _querier, _dir) =
             envelope_wired_plugin().await;
 
         // Run the gesture; spawn a parallel acker that
@@ -4970,7 +4975,7 @@ mod tests {
         // emits rolled_back (no failed); the gesture returns
         // Err(Permanent) naming the at_phase + reason. The
         // chain is back at the prior valid state.
-        let (mut p, announcer, _subscriber, _querier, _dir) =
+        let (p, announcer, _subscriber, _querier, _dir) =
             envelope_wired_plugin().await;
 
         let err = p
@@ -5303,7 +5308,7 @@ mod tests {
         // structured Permanent error naming both required
         // fields. Silent automatic degrade-to-software is a
         // contract violation.
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         let err = p
             .handle_request(&req(
                 "options.set_mixer_type",
@@ -5351,7 +5356,7 @@ mod tests {
 
         let p1 = Arc::clone(&p);
         let h1 = tokio::spawn(async move {
-            let mut guard = p1.lock().await;
+            let guard = p1.lock().await;
             guard
                 .handle_request(&req(
                     "options.set_mixer_type",
@@ -5361,7 +5366,7 @@ mod tests {
         });
         let p2 = Arc::clone(&p);
         let h2 = tokio::spawn(async move {
-            let mut guard = p2.lock().await;
+            let guard = p2.lock().await;
             guard
                 .handle_request(&req(
                     "options.set_mixer_type",
@@ -5445,7 +5450,7 @@ mod tests {
         // exercised through the orchestrated handler).
         // Switching from the current mixer_type to itself
         // succeeds without emitting any lifecycle event.
-        let (mut p, _dir) = loaded_plugin().await;
+        let (p, _dir) = loaded_plugin().await;
         // default mixer_type is software; gesture software
         // again — no-op.
         let resp = p
@@ -5652,7 +5657,7 @@ mod tests {
         // `overall_budget` phase tag, and returns Permanent. This
         // is the safety net that prevents the wedge regardless of
         // how the inner step composition stalls.
-        let (mut p, _dir) = blocking_announcer_plugin(
+        let (p, _dir) = blocking_announcer_plugin(
             Duration::from_secs(5),
             Duration::from_millis(300),
         );
@@ -5701,7 +5706,7 @@ mod tests {
         // every later request queued behind it; the steward had
         // to be restarted. After the fix, the inner future is
         // dropped and the next request handles immediately.
-        let (mut p, _dir) = blocking_announcer_plugin(
+        let (p, _dir) = blocking_announcer_plugin(
             Duration::from_secs(5),
             Duration::from_millis(300),
         );
@@ -5762,7 +5767,7 @@ mod tests {
     async fn envelope_channel_resolved_and_subscribed_exactly_once_across_transitions(
     ) {
         const OBSERVED_CID: &str = "stub-envelope-observed-cid";
-        let (mut p, announcer, subscriber, querier, _dir) =
+        let (p, announcer, subscriber, querier, _dir) =
             envelope_wired_plugin().await;
 
         // Drive three full transitions. The orchestrator's

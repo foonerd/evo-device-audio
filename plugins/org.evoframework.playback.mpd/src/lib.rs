@@ -736,7 +736,8 @@ impl MpdPlaybackPlugin {
     /// Cumulative count of source-verb requests handled
     /// since construction.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
+        self.requests_handled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load contract isolated to its testable inputs: the
@@ -2773,7 +2774,8 @@ impl Respondent for MpdPlaybackPlugin {
                 )));
             }
 
-            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             match req.request_type.as_str() {
                 "play_now" => self.handle_play_now(req).await,
@@ -5328,7 +5330,7 @@ mod tests {
 
     #[tokio::test]
     async fn play_refuses_when_no_active_custody() {
-        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+        let (p, _mock) = loaded_plugin_with_mock(vec![
             F4Conn::Standard,
             F4Conn::HoldAfterWelcome,
         ])
@@ -5580,7 +5582,7 @@ mod tests {
         // there is no supervisor to query; the dispatcher must
         // refuse cleanly rather than panic or return an empty
         // response.
-        let (mut p, _mock) = loaded_plugin_with_mock(vec![
+        let (p, _mock) = loaded_plugin_with_mock(vec![
             F4Conn::Standard,
             F4Conn::HoldAfterWelcome,
         ])
