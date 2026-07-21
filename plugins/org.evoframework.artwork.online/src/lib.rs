@@ -105,7 +105,7 @@ pub struct ArtworkOnlinePlugin {
     /// Shared HTTP client. Built once at load; provides
     /// connection pooling + DNS cache reuse across the cascade.
     http_client: Option<reqwest::Client>,
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
 }
 
 impl ArtworkOnlinePlugin {
@@ -116,13 +116,13 @@ impl ArtworkOnlinePlugin {
             config: PluginConfig::defaults(),
             asset_cache: None,
             http_client: None,
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
