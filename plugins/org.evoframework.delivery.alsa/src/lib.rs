@@ -195,7 +195,7 @@ pub struct AlsaDeliveryPlugin {
     /// Cumulative respondent requests handled since
     /// construction. Surfaced for diagnostics; not part of the
     /// wire contract.
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
     /// Route-change reactor handle. `Some` after a successful
     /// `Plugin::load`; `None` before first load and after
     /// `Plugin::unload`. Mirrors the reactor shape composition
@@ -376,7 +376,7 @@ impl AlsaDeliveryPlugin {
             asound_options_drop_in_path: PathBuf::from(
                 ASOUND_OPTIONS_DROP_IN_PATH,
             ),
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
             reactor: None,
             options_observer: None,
             hardware_audio_observer: None,
@@ -409,7 +409,7 @@ impl AlsaDeliveryPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load contract isolated to its testable inputs: the audio
@@ -1364,7 +1364,7 @@ impl Plugin for AlsaDeliveryPlugin {
         async move {
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                requests_handled = self.requests_handled,
+                requests_handled = self.requests_handled(),
                 "plugin unload"
             );
             self.stop_reactor().await;
@@ -1390,7 +1390,7 @@ impl Plugin for AlsaDeliveryPlugin {
 
 impl Respondent for AlsaDeliveryPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -1410,7 +1410,7 @@ impl Respondent for AlsaDeliveryPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "delivery.probe_hardware" => {
                     self.handle_probe_hardware(req).await

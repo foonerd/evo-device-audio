@@ -105,7 +105,7 @@ pub struct ArtworkOnlinePlugin {
     /// Shared HTTP client. Built once at load; provides
     /// connection pooling + DNS cache reuse across the cascade.
     http_client: Option<reqwest::Client>,
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
 }
 
 impl ArtworkOnlinePlugin {
@@ -116,13 +116,13 @@ impl ArtworkOnlinePlugin {
             config: PluginConfig::defaults(),
             asset_cache: None,
             http_client: None,
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -216,7 +216,7 @@ impl Plugin for ArtworkOnlinePlugin {
 
 impl Respondent for ArtworkOnlinePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -231,14 +231,14 @@ impl Respondent for ArtworkOnlinePlugin {
                 ));
             }
             if req.request_type != REQUEST_ARTWORK_RESOLVE_ONLINE {
-                self.requests_handled += 1;
+                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
                     [REQUEST_ARTWORK_RESOLVE_ONLINE]
                 )));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,

@@ -457,7 +457,7 @@ pub struct MpdPlaybackPlugin {
     /// Cumulative count of source-verb requests handled.
     /// Mirrors `corrections_dispatched` on the respondent
     /// dispatch side.
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
     /// Path the route-change reactor's fragment writer renders
     /// MPD's `audio_output` block to. Populated from the
     /// operator's config (or the hardcoded default
@@ -678,7 +678,7 @@ impl MpdPlaybackPlugin {
                 false,
             )),
             corrections_dispatched: 0,
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
             restarter: Arc::new(SudoSystemctlRestarter::new()),
             reactor: None,
@@ -736,7 +736,7 @@ impl MpdPlaybackPlugin {
     /// Cumulative count of source-verb requests handled
     /// since construction.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load contract isolated to its testable inputs: the
@@ -2752,7 +2752,7 @@ impl Warden for MpdPlaybackPlugin {
 
 impl Respondent for MpdPlaybackPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -2773,7 +2773,7 @@ impl Respondent for MpdPlaybackPlugin {
                 )));
             }
 
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             match req.request_type.as_str() {
                 "play_now" => self.handle_play_now(req).await,

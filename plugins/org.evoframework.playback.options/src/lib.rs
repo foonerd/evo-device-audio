@@ -607,7 +607,16 @@ fn default_settings_version() -> u32 {
 /// Operator-facing playback-options plugin.
 pub struct PlaybackOptionsPlugin {
     loaded: bool,
-    settings: Settings,
+    /// Operator playback settings. Interior-mutable via
+    /// `std::sync::RwLock` so `handle_request` and all its setter
+    /// helpers can stay `&self` under the framework's
+    /// concurrent-dispatch contract. Reads take a read lock (many
+    /// concurrent); writes take a write lock briefly to swap in a
+    /// new value. The lock is NEVER held across an `.await` —
+    /// setter helpers hold `transition_lock` (async) for whole-
+    /// gesture atomicity and interact with this field only via
+    /// snapshot-then-swap.
+    settings: std::sync::RwLock<Settings>,
     state_path: Option<PathBuf>,
     happening_emitter: Option<Arc<dyn HappeningEmitter>>,
     /// Subject-announcer handle from `LoadContext`. The plugin
@@ -696,7 +705,7 @@ pub struct PlaybackOptionsPlugin {
     /// init attempt.
     envelope_observed_channel:
         tokio::sync::Mutex<Option<Arc<EnvelopeObservedChannel>>>,
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
 }
 
 /// Cached envelope_observed channel reused across mixer-
@@ -721,7 +730,7 @@ impl PlaybackOptionsPlugin {
     pub fn new() -> Self {
         Self {
             loaded: false,
-            settings: Settings::default(),
+            settings: std::sync::RwLock::new(Settings::default()),
             state_path: None,
             happening_emitter: None,
             subject_announcer: None,
@@ -733,7 +742,7 @@ impl PlaybackOptionsPlugin {
             subject_publish_timeout_override: None,
             transition_overall_timeout_override: None,
             envelope_observed_channel: tokio::sync::Mutex::new(None),
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -779,12 +788,17 @@ impl PlaybackOptionsPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Current in-memory settings snapshot.
+    /// Current in-memory settings snapshot. Returns an owned
+    /// clone; the internal RwLock is held only for the duration
+    /// of the read.
     pub fn settings(&self) -> Settings {
-        self.settings.clone()
+        self.settings
+            .read()
+            .expect("settings RwLock poisoned")
+            .clone()
     }
 
     /// Set the state-file path. Tests override this to point at
@@ -850,7 +864,8 @@ impl PlaybackOptionsPlugin {
                 );
             }
         }
-        let body = toml::to_string_pretty(&self.settings).map_err(|e| {
+        let snapshot = self.settings();
+        let body = toml::to_string_pretty(&snapshot).map_err(|e| {
             PluginError::Permanent(format!("settings serialise error: {e}"))
         })?;
         let parent = path.parent().ok_or_else(|| {
@@ -999,7 +1014,8 @@ impl PlaybackOptionsPlugin {
         let Some(announcer) = self.subject_announcer.as_ref() else {
             return;
         };
-        let state = match serde_json::to_value(&self.settings) {
+        let snapshot = self.settings();
+        let state = match serde_json::to_value(&snapshot) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -1343,7 +1359,8 @@ impl PlaybackOptionsPlugin {
         let Some(announcer) = self.subject_announcer.as_ref() else {
             return;
         };
-        let state = match serde_json::to_value(&self.settings) {
+        let snapshot = self.settings();
+        let state = match serde_json::to_value(&snapshot) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -1409,7 +1426,7 @@ impl PlaybackOptionsPlugin {
                 "v": PAYLOAD_VERSION,
                 "field": field,
                 "new_value": new_value,
-                "settings": self.settings.clone(),
+                "settings": self.settings(),
             });
             if let Err(e) = emitter
                 .emit_plugin_event(HAPPENING_EVENT_TYPE.to_string(), payload)
@@ -1478,7 +1495,11 @@ impl Plugin for PlaybackOptionsPlugin {
             if self.state_path.is_none() {
                 self.state_path = Some(ctx.state_dir.join(STATE_FILENAME));
             }
-            self.settings = self.load_settings_from_disk().await?;
+            let loaded_settings = self.load_settings_from_disk().await?;
+            *self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned") = loaded_settings;
             self.happening_emitter = Some(Arc::clone(&ctx.happening_emitter));
             self.subject_announcer = Some(Arc::clone(&ctx.subject_announcer));
             self.subject_state_subscriber =
@@ -1500,12 +1521,13 @@ impl Plugin for PlaybackOptionsPlugin {
             // step.
             self.announce_envelope_requested_subject().await;
             self.loaded = true;
+            let s = self.settings();
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 state_path = %self.state_path.as_ref().unwrap().display(),
-                mixer_type = self.settings.mixer_type.as_wire_str(),
-                resampling_enabled = self.settings.resampling.enabled,
-                output_device = %self.settings.output_device,
+                mixer_type = s.mixer_type.as_wire_str(),
+                resampling_enabled = s.resampling.enabled,
+                output_device = %s.output_device,
                 "plugin loaded; operator playback settings ready"
             );
             Ok(())
@@ -1518,7 +1540,7 @@ impl Plugin for PlaybackOptionsPlugin {
         async move {
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                requests_handled = self.requests_handled,
+                requests_handled = self.requests_handled(),
                 "plugin unload"
             );
             self.happening_emitter = None;
@@ -1540,7 +1562,7 @@ impl Plugin for PlaybackOptionsPlugin {
 
 impl Respondent for PlaybackOptionsPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -1560,7 +1582,7 @@ impl Respondent for PlaybackOptionsPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "options.get_settings" => self.handle_get_settings(req).await,
                 "options.set_resampling" => {
@@ -1638,11 +1660,12 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
-        encode(req, &self.settings)
+        let snapshot = self.settings();
+        encode(req, &snapshot)
     }
 
     async fn handle_set_resampling(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetResamplingPayload = parse_versioned(req)?;
@@ -1659,7 +1682,10 @@ impl PlaybackOptionsPlugin {
                 }
             }
         }
-        self.settings.resampling = payload.policy.clone();
+        self.settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .resampling = payload.policy.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "resampling",
@@ -1721,7 +1747,7 @@ impl PlaybackOptionsPlugin {
     /// terminal-event shape: every `started` is followed by
     /// exactly one of `applied` / `rolled_back` / `failed`.
     async fn handle_set_mixer_type(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetMixerTypePayload = parse_versioned(req)?;
@@ -1733,9 +1759,12 @@ impl PlaybackOptionsPlugin {
         // as `mixer-transition-hardware-mode-requires-device-
         // and-control` — silent degrade is a contract
         // violation (operator picked hardware for a reason).
+        let (from, mixer_device_empty, mixer_control_empty) = {
+            let s = self.settings.read().expect("settings RwLock poisoned");
+            (s.mixer_type, s.mixer_device.is_empty(), s.mixer_control.is_empty())
+        };
         if matches!(target, MixerType::Hardware)
-            && (self.settings.mixer_device.is_empty()
-                || self.settings.mixer_control.is_empty())
+            && (mixer_device_empty || mixer_control_empty)
         {
             return Err(PluginError::Permanent(
                 "mixer_type = hardware requires mixer_device + \
@@ -1746,7 +1775,6 @@ impl PlaybackOptionsPlugin {
             ));
         }
 
-        let from = self.settings.mixer_type;
         let to = target;
 
         // Acquire the transition lock for the duration of the
@@ -1786,7 +1814,10 @@ impl PlaybackOptionsPlugin {
                 // disk as the authoritative source so the next
                 // request observes a coherent self.settings.
                 if let Ok(restored) = self.load_settings_from_disk().await {
-                    self.settings = restored;
+                    *self
+                        .settings
+                        .write()
+                        .expect("settings RwLock poisoned") = restored;
                 }
                 // Emit the lifecycle.failed happening through a
                 // short budget so the happenings bus cannot also
@@ -1847,7 +1878,7 @@ impl PlaybackOptionsPlugin {
     /// machinery; the step ordering + rollback shape + four
     /// lifecycle emissions are identical between the two.
     async fn run_mixer_transition(
-        &mut self,
+        &self,
         from: MixerType,
         to: MixerType,
     ) -> transition::TransitionOutcome {
@@ -1900,7 +1931,7 @@ impl PlaybackOptionsPlugin {
         // across both authorities). Cross-plugin live-volume
         // read lands alongside the subordinate coordination
         // work.
-        let carried_level = self.settings.startup_volume_percent;
+        let carried_level = self.settings().startup_volume_percent;
 
         // Step 2 — pre-mute. Publishes envelope_requested
         // with state=Muted + a fresh generation, then awaits
@@ -1932,10 +1963,17 @@ impl PlaybackOptionsPlugin {
         // mutation mechanism; subordinate reactors on
         // delivery.alsa + playback.mpd consume the settings
         // subject to render / restart).
-        let prior_settings = self.settings.clone();
-        self.settings.mixer_type = to;
+        let prior_settings = self.settings();
+        self
+            .settings
+            .write()
+            .expect("settings RwLock poisoned")
+            .mixer_type = to;
         if let Err(e) = self.persist_settings().await {
-            self.settings = prior_settings.clone();
+            *self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned") = prior_settings.clone();
             return self
                 .rollback_or_fail(from, to, "set_new_authority", e.to_string())
                 .await;
@@ -1953,10 +1991,11 @@ impl PlaybackOptionsPlugin {
         // post-persist projection matches the gesture's
         // target (the in-memory self.settings should equal
         // what we just wrote).
-        if self.settings.mixer_type != to {
+        let current_mixer_type = self.settings().mixer_type;
+        if current_mixer_type != to {
             let reason = format!(
                 "post-persist mixer_type {:?} != target {to:?}",
-                self.settings.mixer_type
+                current_mixer_type
             );
             return self
                 .rollback_or_fail_restore(
@@ -2028,14 +2067,15 @@ impl PlaybackOptionsPlugin {
     /// occurred AFTER persistence; the live state file +
     /// subject must be reverted).
     async fn rollback_or_fail_restore(
-        &mut self,
+        &self,
         from: MixerType,
         to: MixerType,
         at_phase: &'static str,
         reason: String,
         prior_settings: Settings,
     ) -> transition::TransitionOutcome {
-        self.settings = prior_settings;
+        *self.settings.write().expect("settings RwLock poisoned") =
+            prior_settings;
         match self.persist_settings().await {
             Ok(()) => {
                 self.publish_settings_state().await;
@@ -2173,11 +2213,11 @@ impl PlaybackOptionsPlugin {
     }
 
     async fn handle_set_dop(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetDopPayload = parse_versioned(req)?;
-        self.settings.dop = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").dop = payload.value;
         self.persist_settings().await?;
         self.emit_changed("dop", serde_json::Value::Bool(payload.value))
             .await;
@@ -2212,11 +2252,11 @@ impl PlaybackOptionsPlugin {
     /// update if the plugin cannot render the bit-perfect
     /// path.
     async fn handle_set_exclusive_mode(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetExclusiveModePayload = parse_versioned(req)?;
-        self.settings.exclusive_mode = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").exclusive_mode = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "exclusive_mode",
@@ -2240,7 +2280,7 @@ impl PlaybackOptionsPlugin {
     /// `crossfade <n>` protocol verb on the next subject-update
     /// window.
     async fn handle_set_crossfade_seconds(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetCrossfadeSecondsPayload = parse_versioned(req)?;
@@ -2250,7 +2290,7 @@ impl PlaybackOptionsPlugin {
                 CROSSFADE_SECONDS_MAX, payload.value
             )));
         }
-        self.settings.crossfade_seconds = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").crossfade_seconds = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "crossfade_seconds",
@@ -2271,11 +2311,11 @@ impl PlaybackOptionsPlugin {
     /// pause queue traversal. When `false`, the warden falls
     /// through to MPD's default single-track behaviour.
     async fn handle_set_gapless(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetGaplessPayload = parse_versioned(req)?;
-        self.settings.gapless = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").gapless = payload.value;
         self.persist_settings().await?;
         self.emit_changed("gapless", serde_json::Value::Bool(payload.value))
             .await;
@@ -2294,11 +2334,11 @@ impl PlaybackOptionsPlugin {
     /// unchanged. Operator A/B switch without leaving the EQ
     /// composition mode.
     async fn handle_set_eq_engaged(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetEqEngagedPayload = parse_versioned(req)?;
-        self.settings.eq_engaged = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").eq_engaged = payload.value;
         self.persist_settings().await?;
         self.emit_changed("eq_engaged", serde_json::Value::Bool(payload.value))
             .await;
@@ -2318,7 +2358,7 @@ impl PlaybackOptionsPlugin {
     /// the composition plugin recomputes the biquad coefficients
     /// on the next subject-update window.
     async fn handle_set_eq_band(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetEqBandPayload = parse_versioned(req)?;
@@ -2353,17 +2393,24 @@ impl PlaybackOptionsPlugin {
             gain_db: payload.gain_db,
             q: payload.q,
         };
-        // Defensive resize: the persisted state file might be
-        // older than the current EQ_BAND_COUNT shape. Pad with
-        // defaults to the canonical length before writing.
-        while self.settings.eq_bands.len() < EQ_BAND_COUNT {
-            self.settings.eq_bands.push(EqBand::default());
-        }
-        self.settings.eq_bands[payload.index as usize] = band;
+        let eq_bands_snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            // Defensive resize: the persisted state file might be
+            // older than the current EQ_BAND_COUNT shape. Pad with
+            // defaults to the canonical length before writing.
+            while s.eq_bands.len() < EQ_BAND_COUNT {
+                s.eq_bands.push(EqBand::default());
+            }
+            s.eq_bands[payload.index as usize] = band;
+            s.eq_bands.clone()
+        };
         self.persist_settings().await?;
         self.emit_changed(
             "eq_bands",
-            serde_json::to_value(&self.settings.eq_bands)
+            serde_json::to_value(&eq_bands_snapshot)
                 .map_err(map_json_err)?,
         )
         .await;
@@ -2387,7 +2434,7 @@ impl PlaybackOptionsPlugin {
         parse_versioned::<EmptyPayload>(req)?;
         let body = ListEqPresetsResponse {
             v: PAYLOAD_VERSION,
-            presets: self.settings.eq_presets.clone(),
+            presets: self.settings().eq_presets,
         };
         encode(req, &body)
     }
@@ -2398,7 +2445,7 @@ impl PlaybackOptionsPlugin {
     /// structured Permanent error naming the offending field +
     /// accepted range.
     async fn handle_save_eq_preset(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SaveEqPresetPayload = parse_versioned(req)?;
@@ -2416,31 +2463,36 @@ impl PlaybackOptionsPlugin {
 
         // Overwrite-by-name semantics: scan for existing
         // entry; if absent, enforce library cap before push.
-        if let Some(slot) = self
-            .settings
-            .eq_presets
-            .iter_mut()
-            .find(|p| p.name == payload.name)
-        {
-            slot.bands = payload.bands.clone();
-        } else {
-            if self.settings.eq_presets.len() >= EQ_PRESET_LIBRARY_MAX_COUNT {
-                return Err(PluginError::Permanent(format!(
-                    "eq_preset library cap reached ({} entries); delete \
-                     a preset before saving another",
-                    EQ_PRESET_LIBRARY_MAX_COUNT
-                )));
+        let eq_presets_snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            if let Some(slot) = s
+                .eq_presets
+                .iter_mut()
+                .find(|p| p.name == payload.name)
+            {
+                slot.bands = payload.bands.clone();
+            } else {
+                if s.eq_presets.len() >= EQ_PRESET_LIBRARY_MAX_COUNT {
+                    return Err(PluginError::Permanent(format!(
+                        "eq_preset library cap reached ({} entries); delete \
+                         a preset before saving another",
+                        EQ_PRESET_LIBRARY_MAX_COUNT
+                    )));
+                }
+                s.eq_presets.push(NamedEqPreset {
+                    name: payload.name.clone(),
+                    bands: payload.bands.clone(),
+                });
             }
-            self.settings.eq_presets.push(NamedEqPreset {
-                name: payload.name.clone(),
-                bands: payload.bands.clone(),
-            });
-        }
+            s.eq_presets.clone()
+        };
         self.persist_settings().await?;
         self.emit_changed(
             "eq_presets",
-            serde_json::to_value(&self.settings.eq_presets)
-                .map_err(map_json_err)?,
+            serde_json::to_value(&eq_presets_snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(
@@ -2458,43 +2510,48 @@ impl PlaybackOptionsPlugin {
     /// raison d'être — a recall via the per-band setter would
     /// fire 10 subject updates; this verb fires one.
     async fn handle_recall_eq_preset(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
         validate_preset_name(&payload.name)?;
-        let bands = match self
-            .settings
-            .eq_presets
-            .iter()
-            .find(|p| p.name == payload.name)
-        {
-            Some(p) => p.bands.clone(),
-            None => {
+        let eq_bands_snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            let bands = match s
+                .eq_presets
+                .iter()
+                .find(|p| p.name == payload.name)
+            {
+                Some(p) => p.bands.clone(),
+                None => {
+                    return Err(PluginError::Permanent(format!(
+                        "eq_preset {:?} not found in the library; \
+                         call list_eq_presets to enumerate",
+                        payload.name
+                    )));
+                }
+            };
+            if bands.len() != EQ_BAND_COUNT {
                 return Err(PluginError::Permanent(format!(
-                    "eq_preset {:?} not found in the library; \
-                     call list_eq_presets to enumerate",
-                    payload.name
+                    "eq_preset {:?} carries {} bands; expected {} \
+                     (persisted-state shape drift)",
+                    payload.name,
+                    bands.len(),
+                    EQ_BAND_COUNT
                 )));
             }
+            s.eq_bands = bands;
+            s.eq_bands.clone()
         };
-        if bands.len() != EQ_BAND_COUNT {
-            return Err(PluginError::Permanent(format!(
-                "eq_preset {:?} carries {} bands; expected {} \
-                 (persisted-state shape drift)",
-                payload.name,
-                bands.len(),
-                EQ_BAND_COUNT
-            )));
-        }
-        self.settings.eq_bands = bands;
         self.persist_settings().await?;
         // Single subject update for the full band-set replace —
         // operators see one happening, not ten.
         self.emit_changed(
             "eq_bands",
-            serde_json::to_value(&self.settings.eq_bands)
-                .map_err(map_json_err)?,
+            serde_json::to_value(&eq_bands_snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(
@@ -2509,25 +2566,31 @@ impl PlaybackOptionsPlugin {
     /// Remove a named preset from the library. Refuses on an
     /// unknown name with a structured Permanent error.
     async fn handle_delete_eq_preset(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: NameOnlyEqPresetPayload = parse_versioned(req)?;
         validate_preset_name(&payload.name)?;
-        let before = self.settings.eq_presets.len();
-        self.settings.eq_presets.retain(|p| p.name != payload.name);
-        if self.settings.eq_presets.len() == before {
-            return Err(PluginError::Permanent(format!(
-                "eq_preset {:?} not found in the library; \
-                 call list_eq_presets to enumerate",
-                payload.name
-            )));
-        }
+        let eq_presets_snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            let before = s.eq_presets.len();
+            s.eq_presets.retain(|p| p.name != payload.name);
+            if s.eq_presets.len() == before {
+                return Err(PluginError::Permanent(format!(
+                    "eq_preset {:?} not found in the library; \
+                     call list_eq_presets to enumerate",
+                    payload.name
+                )));
+            }
+            s.eq_presets.clone()
+        };
         self.persist_settings().await?;
         self.emit_changed(
             "eq_presets",
-            serde_json::to_value(&self.settings.eq_presets)
-                .map_err(map_json_err)?,
+            serde_json::to_value(&eq_presets_snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(
@@ -2540,7 +2603,7 @@ impl PlaybackOptionsPlugin {
     }
 
     async fn handle_set_mixer_device(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetMixerDevicePayload = parse_versioned(req)?;
@@ -2555,7 +2618,7 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.mixer_device = payload.value.clone();
+        self.settings.write().expect("settings RwLock poisoned").mixer_device = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "mixer_device",
@@ -2572,7 +2635,7 @@ impl PlaybackOptionsPlugin {
     }
 
     async fn handle_set_mixer_control(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetMixerControlPayload = parse_versioned(req)?;
@@ -2583,7 +2646,7 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.mixer_control = payload.value.clone();
+        self.settings.write().expect("settings RwLock poisoned").mixer_control = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "mixer_control",
@@ -2600,7 +2663,7 @@ impl PlaybackOptionsPlugin {
     }
 
     async fn handle_set_output_device(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetOutputDevicePayload = parse_versioned(req)?;
@@ -2614,7 +2677,7 @@ impl PlaybackOptionsPlugin {
                     .to_string(),
             ));
         }
-        self.settings.output_device = payload.value.clone();
+        self.settings.write().expect("settings RwLock poisoned").output_device = payload.value.clone();
         self.persist_settings().await?;
         self.emit_changed(
             "output_device",
@@ -2631,11 +2694,11 @@ impl PlaybackOptionsPlugin {
     }
 
     async fn handle_set_volume_normalization(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumeNormalizationPayload = parse_versioned(req)?;
-        self.settings.volume_normalization = payload.value;
+        self.settings.write().expect("settings RwLock poisoned").volume_normalization = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_normalization",
@@ -2659,7 +2722,7 @@ impl PlaybackOptionsPlugin {
     /// refuses with an operator-readable error rather than
     /// silently truncating.
     async fn handle_set_startup_volume(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumePercentPayload = parse_versioned(req)?;
@@ -2669,14 +2732,20 @@ impl PlaybackOptionsPlugin {
                 payload.value
             )));
         }
-        if payload.value > self.settings.max_volume_percent {
-            return Err(PluginError::Permanent(format!(
-                "startup_volume_percent {} cannot exceed max_volume_percent {}; \
-                 raise the ceiling first",
-                payload.value, self.settings.max_volume_percent
-            )));
+        {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            if payload.value > s.max_volume_percent {
+                return Err(PluginError::Permanent(format!(
+                    "startup_volume_percent {} cannot exceed max_volume_percent {}; \
+                     raise the ceiling first",
+                    payload.value, s.max_volume_percent
+                )));
+            }
+            s.startup_volume_percent = payload.value;
         }
-        self.settings.startup_volume_percent = payload.value;
         self.persist_settings().await?;
         self.emit_changed(
             "startup_volume_percent",
@@ -2702,7 +2771,7 @@ impl PlaybackOptionsPlugin {
     /// happening so subject-stream consumers observe both
     /// fields' new values.
     async fn handle_set_max_volume(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumePercentPayload = parse_versioned(req)?;
@@ -2712,12 +2781,18 @@ impl PlaybackOptionsPlugin {
                 payload.value
             )));
         }
-        self.settings.max_volume_percent = payload.value;
-        let startup_clamped =
-            self.settings.startup_volume_percent > payload.value;
-        if startup_clamped {
-            self.settings.startup_volume_percent = payload.value;
-        }
+        let startup_clamped = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            s.max_volume_percent = payload.value;
+            let clamped = s.startup_volume_percent > payload.value;
+            if clamped {
+                s.startup_volume_percent = payload.value;
+            }
+            clamped
+        };
         self.persist_settings().await?;
         self.emit_changed(
             "max_volume_percent",
@@ -2747,13 +2822,13 @@ impl PlaybackOptionsPlugin {
     /// warden's volume-curve binding, future audiophile UI
     /// affordances) react.
     async fn handle_set_volume_curve(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumeCurvePayload = parse_versioned(req)?;
         let curve = VolumeCurve::from_wire_str(&payload.value)
             .map_err(PluginError::Permanent)?;
-        self.settings.volume_curve = curve;
+        self.settings.write().expect("settings RwLock poisoned").volume_curve = curve;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_curve",
@@ -2787,12 +2862,19 @@ impl PlaybackOptionsPlugin {
     /// surfaces) observe the rollback the same way they
     /// observe any other operator change.
     async fn handle_restore_last_known_good(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
         let restored = self.restore_from_last_known_good().await?;
-        self.settings = restored;
+        let snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            *s = restored;
+            s.clone()
+        };
         // We do NOT call self.persist_settings() here: the
         // restore_from_last_known_good already atomic-wrote
         // the live state.toml in place; a subsequent persist
@@ -2801,7 +2883,7 @@ impl PlaybackOptionsPlugin {
         // as part of its normal persist path.
         self.emit_changed(
             "restore_last_known_good",
-            serde_json::to_value(&self.settings).map_err(map_json_err)?,
+            serde_json::to_value(&snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(
@@ -2823,15 +2905,22 @@ impl PlaybackOptionsPlugin {
     /// `restore_last_known_good` to undo the reset if it was
     /// accidental.
     async fn handle_reset_to_defaults(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
-        self.settings = Settings::default();
+        let snapshot = {
+            let mut s = self
+                .settings
+                .write()
+                .expect("settings RwLock poisoned");
+            *s = Settings::default();
+            s.clone()
+        };
         self.persist_settings().await?;
         self.emit_changed(
             "reset_to_defaults",
-            serde_json::to_value(&self.settings).map_err(map_json_err)?,
+            serde_json::to_value(&snapshot).map_err(map_json_err)?,
         )
         .await;
         encode(

@@ -4422,7 +4422,7 @@ impl Plugin for NetworkPlugin {
 
 impl Respondent for NetworkPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
