@@ -333,7 +333,34 @@ pub(crate) struct BrowseLibraryPayload {
     pub(crate) source_id: String,
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Zero-indexed page. Callers that omit `page` and
+    /// `page_size` receive the first
+    /// [`BROWSE_HARD_CAP`]-truncated slice — the honest
+    /// large-library default (envelope carries `truncated:
+    /// true` so operators know more is available).
+    #[serde(default)]
+    pub(crate) page: Option<usize>,
+    /// Page size in entries. Bounded by [`BROWSE_HARD_CAP`]
+    /// server-side; requesting more is silently clamped
+    /// down (with `truncated: true` on the envelope). When
+    /// absent the endpoint returns up to
+    /// [`BROWSE_HARD_CAP`] entries.
+    #[serde(default)]
+    pub(crate) page_size: Option<usize>,
 }
+
+/// Server-side hard cap on a single browse response's entry
+/// count. Aligns library browse with the queue's cap-500
+/// pattern but at a higher default (4x) — 2000 entries is
+/// enough to render one screen of a large-library scroll
+/// window without paginating, but small enough that a rogue
+/// caller cannot demand a 100k-entry response.
+///
+/// Callers who need more supply `page_size` explicitly
+/// (still capped) plus `page` for successive slices; the
+/// response envelope carries `truncated: true` +
+/// `next_page` when there is more.
+pub(crate) const BROWSE_HARD_CAP: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SearchLibraryPayload {
@@ -742,6 +769,18 @@ pub(crate) async fn handle_browse_library(
             }
         })?;
     let path = payload.path.clone().unwrap_or_default();
+
+    // Resolve pagination. Both fields optional; when absent
+    // the endpoint returns the first BROWSE_HARD_CAP entries
+    // with `truncated: true` if the underlying listing
+    // exceeds the cap. `page_size` is clamped to
+    // BROWSE_HARD_CAP silently — an operator asking for more
+    // still gets a page, just at the hard-cap size.
+    let page = payload.page.unwrap_or(0);
+    let requested_size = payload.page_size.unwrap_or(BROWSE_HARD_CAP);
+    let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
+    let range_start = page.saturating_mul(page_size);
+
     // Serve from cache on Offline; refresh on Online/Degraded.
     if matches!(
         record.state,
@@ -752,14 +791,22 @@ pub(crate) async fn handle_browse_library(
             .get(&(payload.source_id.clone(), path.clone()))
             .cloned();
         drop(cache);
-        let entries = cached.map(|c| c.entries).unwrap_or_default();
+        let full_entries: Vec<serde_json::Value> =
+            cached.map(|c| c.entries).unwrap_or_default();
+        let (page_entries, next_page, truncated) =
+            paginate(&full_entries, range_start, page_size);
         return Ok(json!({
             "v":            LIBRARY_PAYLOAD_VERSION,
             "source_id":    payload.source_id,
             "path":         path,
-            "entries":      entries,
+            "entries":      page_entries,
             "stale":        true,
             "source_state": record.state,
+            "page":         page,
+            "page_size":    page_size,
+            "total":        full_entries.len(),
+            "truncated":    truncated,
+            "next_page":    next_page,
         }));
     }
     // Online / Degraded / Probing: read from MPD.
@@ -796,7 +843,9 @@ pub(crate) async fn handle_browse_library(
     })?;
     let rendered: Vec<serde_json::Value> =
         entries.iter().map(render_library_entry).collect();
-    // Cache the fresh listing.
+    // Cache the fresh listing (full, unpaginated — the cache is
+    // the source of truth for subsequent page requests without
+    // re-issuing lsinfo).
     {
         let mut cache = ctx.browse_cache.lock().await;
         cache.insert(
@@ -807,14 +856,51 @@ pub(crate) async fn handle_browse_library(
             },
         );
     }
+    let (page_entries, next_page, truncated) =
+        paginate(&rendered, range_start, page_size);
     Ok(json!({
         "v":            LIBRARY_PAYLOAD_VERSION,
         "source_id":    payload.source_id,
         "path":         path,
-        "entries":      rendered,
+        "entries":      page_entries,
         "stale":        false,
         "source_state": record.state,
+        "page":         page,
+        "page_size":    page_size,
+        "total":        rendered.len(),
+        "truncated":    truncated,
+        "next_page":    next_page,
     }))
+}
+
+/// Slice a full entry list into the requested page.
+///
+/// Returns `(page_entries, next_page, truncated)`:
+///
+/// - `page_entries` — the slice for the requested `page` /
+///   `page_size`. Empty when `page` is past the end.
+/// - `next_page` — `Some(page+1)` when there are more
+///   entries after this slice, else `None`.
+/// - `truncated` — `true` iff `next_page.is_some()`. Set on
+///   the envelope so the operator UI knows more is
+///   available without doing the arithmetic itself.
+fn paginate(
+    full: &[serde_json::Value],
+    range_start: usize,
+    page_size: usize,
+) -> (Vec<serde_json::Value>, Option<usize>, bool) {
+    if range_start >= full.len() {
+        return (Vec::new(), None, false);
+    }
+    let range_end = range_start.saturating_add(page_size).min(full.len());
+    let slice = full[range_start..range_end].to_vec();
+    let more = range_end < full.len();
+    let next_page = if more {
+        Some(range_start / page_size + 1)
+    } else {
+        None
+    };
+    (slice, next_page, more)
 }
 
 /// Compute the **database-relative path** MPD's `lsinfo` expects.
@@ -1646,5 +1732,78 @@ mod tests {
             matches!(err, VerbError::SourceOutsideMusicDirectory { .. }),
             "expected SourceOutsideMusicDirectory, got {err:?}"
         );
+    }
+
+    // ---------------------------------------------------------
+    // browse pagination
+    // ---------------------------------------------------------
+
+    fn stub_entries(n: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(
+                |i| serde_json::json!({"kind": "file", "uri": format!("t{i}")}),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn paginate_empty_source_returns_empty_page_and_no_next() {
+        let (page, next, trunc) = paginate(&[], 0, 500);
+        assert!(page.is_empty());
+        assert!(next.is_none());
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn paginate_exact_fit_returns_all_with_no_next_page() {
+        let full = stub_entries(500);
+        let (page, next, trunc) = paginate(&full, 0, 500);
+        assert_eq!(page.len(), 500);
+        assert!(next.is_none());
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn paginate_slice_boundary_sets_next_page_correctly() {
+        // 3000 entries, page_size 500 → page 0 sees 0..500,
+        // truncated=true, next_page=1.
+        let full = stub_entries(3000);
+        let (page, next, trunc) = paginate(&full, 0, 500);
+        assert_eq!(page.len(), 500);
+        assert_eq!(next, Some(1));
+        assert!(trunc);
+        // page 5 sees the last slice (2500..3000), no next.
+        let (page5, next5, trunc5) = paginate(&full, 5 * 500, 500);
+        assert_eq!(page5.len(), 500);
+        assert!(next5.is_none());
+        assert!(!trunc5);
+    }
+
+    #[test]
+    fn paginate_past_end_returns_empty_no_next() {
+        let full = stub_entries(300);
+        let (page, next, trunc) = paginate(&full, 500, 500);
+        assert!(page.is_empty());
+        assert!(next.is_none());
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn paginate_partial_last_page_no_next() {
+        // 1050 entries, page_size 500 → pages 0,1 full;
+        // page 2 has 50, no next.
+        let full = stub_entries(1050);
+        let (page2, next, trunc) = paginate(&full, 2 * 500, 500);
+        assert_eq!(page2.len(), 50);
+        assert!(next.is_none());
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn browse_hard_cap_is_the_documented_ceiling() {
+        // The hard cap is contract, not convenience — if it
+        // changes, the doc must change too. Pins the value
+        // so a future contributor can't silently loosen it.
+        assert_eq!(BROWSE_HARD_CAP, 2_000);
     }
 }
