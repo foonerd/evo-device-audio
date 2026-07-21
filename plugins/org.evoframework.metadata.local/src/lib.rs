@@ -78,7 +78,7 @@ fn plugin_crate_version() -> semver::Version {
 pub struct MetadataLocalPlugin {
     loaded: bool,
     config: PluginConfig,
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
 }
 
 impl MetadataLocalPlugin {
@@ -87,13 +87,13 @@ impl MetadataLocalPlugin {
         Self {
             loaded: false,
             config: PluginConfig::defaults(),
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Count of [`Respondent::handle_request`] invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -205,7 +205,7 @@ impl Respondent for MetadataLocalPlugin {
                 ));
             }
             if req.request_type != REQUEST_METADATA_QUERY {
-                self.requests_handled += 1;
+                self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
@@ -213,7 +213,7 @@ impl Respondent for MetadataLocalPlugin {
                 )));
             }
 
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 request_type = %req.request_type,

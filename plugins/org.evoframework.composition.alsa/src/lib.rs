@@ -192,14 +192,16 @@ impl Default for EqRuntimeState {
 /// ALSA composition plugin.
 pub struct AlsaCompositionPlugin {
     loaded: bool,
-    /// Active composition mode token. Reset to
-    /// [`MODE_PASSTHROUGH`] at every successful load.
-    current_mode: String,
     /// Watch channel publishing the active mode token to the
-    /// byte-flow substrate. The substrate's pump loop
-    /// observes mode changes inline and branches between
-    /// passthrough and eq_only processing without restarting
-    /// the substrate lifecycle.
+    /// byte-flow substrate. `mode_tx` is the single source of
+    /// truth for the active mode — `handle_request` reads the
+    /// current mode via `mode_tx.borrow()` and updates via
+    /// `mode_tx.send_replace()`, both of which use interior
+    /// mutability so the receiver stays `&self` under the
+    /// framework's concurrent-dispatch contract. The substrate's
+    /// pump loop observes mode changes inline and branches
+    /// between passthrough and eq_only processing without
+    /// restarting the substrate lifecycle.
     mode_tx: watch::Sender<String>,
     /// Watch channel publishing the operator's EQ runtime
     /// state (engaged flag + 10 band parameters). Seeded with
@@ -214,7 +216,7 @@ pub struct AlsaCompositionPlugin {
     /// Cumulative `composition.select_mode` requests
     /// served, including refused ones. Surfaced for
     /// diagnostics; not part of the wire contract.
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
     /// Route-change reactor handle. `Some` after a
     /// successful `Plugin::load`; `None` before first load,
     /// after `Plugin::unload`, and after a test path that
@@ -292,11 +294,10 @@ impl AlsaCompositionPlugin {
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
             loaded: false,
-            current_mode: MODE_PASSTHROUGH.to_string(),
             mode_tx,
             eq_state_tx,
             audio_routing: None,
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
             reactor: None,
             worker: None,
         }
@@ -329,12 +330,14 @@ impl AlsaCompositionPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Currently active composition mode.
-    pub fn current_mode(&self) -> &str {
-        &self.current_mode
+    /// Currently active composition mode. Reads through `mode_tx`
+    /// which is the single source of truth. Returns an owned
+    /// `String` because a `watch::Ref` cannot outlive `&self`.
+    pub fn current_mode(&self) -> String {
+        self.mode_tx.borrow().clone()
     }
 
     /// Load contract isolated to its testable inputs. The
@@ -359,7 +362,7 @@ impl AlsaCompositionPlugin {
             )
         })?;
         self.audio_routing = Some(routing);
-        self.current_mode = MODE_PASSTHROUGH.to_string();
+        self.mode_tx.send_replace(MODE_PASSTHROUGH.to_string());
         self.loaded = true;
         Ok(())
     }
@@ -1159,7 +1162,7 @@ impl Respondent for AlsaCompositionPlugin {
                 )));
             }
 
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let payload =
                 match serde_json::from_slice::<SelectModeRequest>(&req.payload)
@@ -1231,7 +1234,7 @@ impl Respondent for AlsaCompositionPlugin {
                 }
             }
 
-            self.current_mode = mode.to_string();
+            let new_mode = mode.to_string();
             // Publish the new mode to the byte-flow substrate.
             // The substrate's pump loop observes mode changes
             // inline and branches between passthrough and
@@ -1239,12 +1242,12 @@ impl Respondent for AlsaCompositionPlugin {
             // substrate lifecycle. send_replace ignores the
             // empty-receiver case (no worker yet) — the next
             // worker spawn reads the current value on
-            // subscribe.
-            self.mode_tx.send_replace(self.current_mode.clone());
-            encode_response(
-                req,
-                SelectModeResponse::ok(self.current_mode.clone()),
-            )
+            // subscribe. `mode_tx` is the single source of
+            // truth for the active mode — its send_replace uses
+            // interior mutability so `handle_request` stays
+            // `&self` under the concurrent-dispatch contract.
+            self.mode_tx.send_replace(new_mode.clone());
+            encode_response(req, SelectModeResponse::ok(new_mode))
         }
     }
 }
@@ -1423,13 +1426,16 @@ mod tests {
 
     #[tokio::test]
     async fn install_routing_accepts_handle_and_resets_mode() {
-        let mut p = AlsaCompositionPlugin::new();
-        p.current_mode = "stale_value".to_string();
+        let p = AlsaCompositionPlugin::new();
+        // Simulate a stale mode via the mode_tx (now the single
+        // source of truth) before install_routing runs.
+        p.mode_tx.send_replace("stale_value".to_string());
         let routing: Arc<dyn AudioRouting> = Arc::new(StubAudioRouting::new());
+        let mut p = p;
         p.install_routing(Some(Arc::clone(&routing)))
             .expect("install_routing must accept a Some handle");
         assert!(p.loaded);
-        assert_eq!(p.current_mode, MODE_PASSTHROUGH);
+        assert_eq!(p.current_mode(), MODE_PASSTHROUGH);
         assert!(p.audio_routing.is_some());
     }
 

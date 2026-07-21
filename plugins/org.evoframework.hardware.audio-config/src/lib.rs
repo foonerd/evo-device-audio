@@ -235,7 +235,7 @@ pub struct HardwareAudioConfigPlugin {
     pending_reboot: Arc<RwLock<PendingRebootState>>,
     happening_emitter: Option<Arc<dyn HappeningEmitter>>,
     subject_announcer: Option<Arc<dyn SubjectAnnouncer>>,
-    requests_handled: u64,
+    requests_handled: std::sync::atomic::AtomicU64,
     /// Modder surface state — distribution-tier config flag.
     /// Showcase distributions default to Enabled; vendor
     /// distributions override to Disabled via the plugin's
@@ -288,7 +288,7 @@ impl HardwareAudioConfigPlugin {
             ),
             happening_emitter: None,
             subject_announcer: None,
-            requests_handled: 0,
+            requests_handled: std::sync::atomic::AtomicU64::new(0),
             modder_state: ModderSurfaceState::default(),
             modder_allowlist: Arc::new(RwLock::new(None)),
             modder_overlays: Arc::new(RwLock::new(Vec::new())),
@@ -297,7 +297,7 @@ impl HardwareAudioConfigPlugin {
 
     /// Cumulative `handle_request` invocations.
     pub fn requests_handled(&self) -> u64 {
-        self.requests_handled
+        self.requests_handled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Resolved board profile (e.g. `Raspberry PI`). `Unknown`
@@ -900,7 +900,7 @@ impl Plugin for HardwareAudioConfigPlugin {
         async move {
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                requests_handled = self.requests_handled,
+                requests_handled = self.requests_handled(),
                 "plugin unload"
             );
             self.happening_emitter = None;
@@ -949,7 +949,7 @@ impl Respondent for HardwareAudioConfigPlugin {
                     req.request_type, REQUEST_TYPES
                 )));
             }
-            self.requests_handled += 1;
+            self.requests_handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match req.request_type.as_str() {
                 "hardware.audio.list_dac_catalogue" => {
                     self.handle_list_dac_catalogue(req).await
@@ -1015,7 +1015,7 @@ impl HardwareAudioConfigPlugin {
     }
 
     async fn handle_select_dac(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SelectDacPayload = parse_versioned(req)?;
@@ -1070,7 +1070,7 @@ impl HardwareAudioConfigPlugin {
     }
 
     async fn handle_clear_dac(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         parse_versioned::<EmptyPayload>(req)?;
@@ -1211,7 +1211,7 @@ impl HardwareAudioConfigPlugin {
     }
 
     async fn handle_dsp_set_control(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: DspSetControlPayload = parse_versioned(req)?;
@@ -1329,7 +1329,7 @@ impl HardwareAudioConfigPlugin {
     }
 
     async fn handle_modder_register_overlay(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: RegisterOverlayPayload = parse_versioned(req)?;
@@ -1443,7 +1443,7 @@ impl HardwareAudioConfigPlugin {
     }
 
     async fn handle_modder_remove_overlay(
-        &mut self,
+        &self,
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: RemoveOverlayPayload = parse_versioned(req)?;
