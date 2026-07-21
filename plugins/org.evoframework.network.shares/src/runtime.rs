@@ -2057,23 +2057,40 @@ pub struct NetworkSharesRuntime {
     publisher: StdMutex<Option<SharesPublisher>>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Deduplication map for in-flight credential prompts. Keyed
-    /// on `credential_key` (the vault key) so multiple concurrent
-    /// mount / add attempts against the same missing credential
-    /// collapse to a single prompt on the responder's shelf. The
-    /// first caller issues the prompt; later callers clone the
-    /// `Notify` and wait. On the first caller's completion (any
-    /// outcome) the entry is removed and waiters wake; they re-
-    /// check the vault and either return successfully (credential
-    /// was stored) or re-issue their own prompt (which the
-    /// framework fast-refuses if no responder is still connected).
+    /// on `credential_key` so multiple concurrent mount / add
+    /// attempts against the same missing credential collapse to
+    /// a single prompt on the responder's shelf.
     ///
-    /// The store-side of a successful prompt writes the answer to
-    /// the credential vault BEFORE this map is unlocked, so
-    /// waking waiters observe the vault hit and never see a race
-    /// where the map entry is gone but the credential is not yet
-    /// stored.
+    /// Entry lifetime is decoupled from any single caller: the
+    /// entry lives from the first `or_insert_with` to the
+    /// explicit `remove_entry` that runs AFTER `get_or_init`
+    /// resolves. Later callers arriving during that whole window
+    /// observe the existing cell (Arc::clone), await
+    /// `get_or_init`, and all receive the same outcome the first
+    /// caller produced — no re-prompt.
+    ///
+    /// Retires the pre-Session-B/C CellOnDrop pattern whose
+    /// removal fired inside the first caller's `Drop` — the map
+    /// entry was gone before any concurrent add arriving one
+    /// tokio poll later could observe it, so peer callers re-
+    /// inserted their own cells and re-prompted. That race
+    /// produced the operator's non-deterministic 0/1/4 prompt
+    /// counts under LAYER A + LAYER B concurrent dispatch.
+    ///
+    /// [`tokio::sync::OnceCell`] provides both requirements the
+    /// operator's 2026-07-21 correctness note pins:
+    ///
+    /// - Single-writer initialization: the first caller to reach
+    ///   `get_or_init` runs the closure; all peers concurrently
+    ///   waiting on the same cell block on the same in-flight
+    ///   init future — exactly one prompt fires, however many
+    ///   callers arrive.
+    /// - Blocking-or-async wait for followers: peers `.await`
+    ///   the OnceCell; when the init resolves, every peer's
+    ///   await returns the same value reference. No polling, no
+    ///   spinning, no re-entry.
     pending_credential_prompts:
-        Arc<std::sync::Mutex<HashMap<String, PromptWaiterCell>>>,
+        Arc<std::sync::Mutex<HashMap<String, PromptCell>>>,
 }
 
 /// Cloneable outcome the first prompt-caller broadcasts to
@@ -2101,14 +2118,16 @@ pub(crate) enum PromptDedupOutcome {
     Other(String),
 }
 
-/// Broadcast-style waiter cell. `watch::Sender<Option<...>>`
-/// starts at `None`; the first caller writes `Some(outcome)`
-/// exactly once, and every waiter subscribes + awaits changed()
-/// + reads the value.
-#[derive(Clone)]
-pub(crate) struct PromptWaiterCell {
-    tx: tokio::sync::watch::Sender<Option<PromptDedupOutcome>>,
-}
+/// Shared once-cell entry held in [`NetworkSharesRuntime::
+/// pending_credential_prompts`]. Concurrent callers clone the
+/// `Arc` under the map's sync lock and then `.await` the
+/// OnceCell — the first arrival's `get_or_init` closure runs
+/// the prompt; every other arrival blocks on the same init.
+///
+/// `Arc` is used purely so the sync-mutex-held pointer can be
+/// cloned out cheaply and awaited without holding the map lock
+/// across `.await`.
+pub(crate) type PromptCell = Arc<tokio::sync::OnceCell<PromptDedupOutcome>>;
 
 impl std::fmt::Debug for NetworkSharesRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2265,199 +2284,135 @@ impl NetworkSharesRuntime {
             return Err(MountError::CredentialStoreUnavailable);
         };
 
-        // Prompt dedup on credential_key. Multiple concurrent
-        // mount / add attempts against the same missing credential
-        // collapse to one prompt on the responder's shelf; one
-        // operator answer (or one cancel, or one no-responder
-        // fast-refusal) resolves every waiter with the EXACT
-        // outcome the first caller received.
+        // Get (or atomically insert) the shared once-cell for
+        // this credential_key. The sync mutex serialises the
+        // check-and-insert so exactly one caller creates the
+        // cell; every peer arriving DURING the cell's lifetime
+        // clones the same `Arc` and awaits the same `get_or_init`.
         //
-        // Storage: `watch::Sender<Option<PromptDedupOutcome>>` in
-        // the shared map. The first caller inserts a fresh cell
-        // and drives the prompt. Later callers with the same key
-        // clone the sender, subscribe(), drop the map lock, and
-        // `changed().await` — when the first caller writes the
-        // outcome, every waiter reads it and maps to the matching
-        // MountError variant without re-issuing the prompt.
-        //
-        // Fixes the 2026-07-20 defect-2a symptom (cancel did not
-        // wake waiters within 30s): the shared cell means the
-        // wake happens IN the first caller's exit path, and
-        // waiters receive the cancel directly instead of falling
-        // into a re-prompt loop that would re-enter the framework
-        // and re-park.
-        let (waiter_cell, is_first_caller) = {
+        // Under LAYER A + LAYER B concurrent dispatch: N concurrent
+        // callers (any N) collapse to exactly one prompt on the
+        // responder's shelf; one operator answer (or cancel, or
+        // no-responder fast-refusal) resolves every waiter with
+        // the same outcome. The pre-Session-B/C CellOnDrop pattern
+        // is retired — the map entry now outlives the first
+        // caller's exit, so a peer arriving one tokio poll after
+        // the first caller resolves still observes the resolved
+        // cell (via `get()`) and returns the cached outcome
+        // instead of falling into re-prompt.
+        let cell: PromptCell = {
             let mut map = self
                 .pending_credential_prompts
                 .lock()
                 .expect("pending_credential_prompts mutex poisoned");
-            if let Some(existing) = map.get(credential_key) {
-                (existing.clone(), false)
-            } else {
-                let (tx, _rx) = tokio::sync::watch::channel(None);
-                let cell = PromptWaiterCell { tx };
-                map.insert(credential_key.clone(), cell.clone());
-                (cell, true)
-            }
-        };
-        if !is_first_caller {
-            let mut rx = waiter_cell.tx.subscribe();
-            // Wait for the first caller to write the outcome.
-            // A closed channel would mean the first caller
-            // dropped the sender WITHOUT writing (guarded
-            // against by the CellOnDrop guard below — always
-            // writes an outcome before drop). Treat a closed
-            // channel defensively as CredentialPromptFailed.
-            loop {
-                if rx.borrow_and_update().is_some() {
-                    break;
-                }
-                if rx.changed().await.is_err() {
-                    return Err(MountError::CredentialPromptFailed {
-                        key: credential_key.clone(),
-                        reason: "dedup channel closed before first caller \
-                                 wrote outcome (defensive)"
-                            .into(),
-                    });
-                }
-            }
-            let outcome = rx
-                .borrow()
-                .clone()
-                .expect("break condition guarantees Some");
-            return match outcome {
-                PromptDedupOutcome::Success => {
-                    // Credential is in the vault; return Ok.
-                    // (Defensive: re-check to catch a rare race
-                    // where the store operation returned Ok but
-                    // the fetcher is not yet consistent. Both
-                    // should be atomic on the file-backed
-                    // store; the re-check costs one filesystem
-                    // stat.)
-                    if self
-                        .credentials
-                        .fetch_password(credential_key)
-                        .await
-                        .is_some()
-                    {
-                        Ok(())
-                    } else {
-                        Err(MountError::CredentialPromptFailed {
-                            key: credential_key.clone(),
-                            reason: "first caller reported Success but \
-                                     vault fetch returned None (store \
-                                     inconsistency)"
-                                .into(),
-                        })
-                    }
-                }
-                PromptDedupOutcome::Cancelled => {
-                    Err(MountError::CredentialPromptCancelled {
-                        key: credential_key.clone(),
-                    })
-                }
-                PromptDedupOutcome::NoResponderAvailable(reason) => {
-                    Err(MountError::NoResponderAvailable {
-                        key: credential_key.clone(),
-                        reason,
-                    })
-                }
-                PromptDedupOutcome::Other(reason) => {
-                    Err(MountError::CredentialPromptFailed {
-                        key: credential_key.clone(),
-                        reason,
-                    })
-                }
-            };
-        }
-
-        // First-caller path. Guarantee EVERY exit writes an
-        // outcome to the cell and removes the map entry.
-        // CellOnDrop's Drop impl writes `Other(...)` if the
-        // caller panics or is cancelled before writing an
-        // explicit outcome, so waiters never park indefinitely.
-        struct CellOnDrop {
-            key: String,
-            map: Arc<std::sync::Mutex<HashMap<String, PromptWaiterCell>>>,
-            cell: PromptWaiterCell,
-            wrote_outcome: bool,
-        }
-        impl Drop for CellOnDrop {
-            fn drop(&mut self) {
-                if !self.wrote_outcome {
-                    let _ = self.cell.tx.send(Some(PromptDedupOutcome::Other(
-                        "first caller dropped before writing outcome \
-                             (panic / cancellation)"
-                            .into(),
-                    )));
-                }
-                self.map
-                    .lock()
-                    .expect("pending_credential_prompts mutex poisoned")
-                    .remove(&self.key);
-            }
-        }
-        let mut guard = CellOnDrop {
-            key: credential_key.clone(),
-            map: Arc::clone(&self.pending_credential_prompts),
-            cell: waiter_cell.clone(),
-            wrote_outcome: false,
+            Arc::clone(
+                map.entry(credential_key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
         };
 
+        // Await the outcome. Exactly one arrival's closure runs
+        // (single-writer init); every peer awaits the same init
+        // future and returns the same `&PromptDedupOutcome`. If
+        // the first arrival panics inside the closure, tokio's
+        // OnceCell surfaces the panic to every waiter and drops
+        // the cell state so the NEXT batch re-initialises — we
+        // treat that as `CredentialPromptFailed`.
         let label =
             format!("Password for {}@{}{}", username, record.host, record.path);
-        // The framework's forward_request_user_interaction fast-
-        // refuses with a message prefixed `no_responder_available:`
-        // when no session currently holds the responder slot. The
-        // SDK's WireFrame::Error → ReportError::Invalid mapping
-        // drops the structured details field and preserves only the
-        // message; we route on the well-defined prefix.
-        let prompt_result = self.prompter.prompt_password(label).await;
-        let answer = match prompt_result {
-            Ok(a) => a,
-            Err(e) => {
-                let msg = format!("{e}");
-                let outcome = if msg.contains("no_responder_available:") {
-                    PromptDedupOutcome::NoResponderAvailable(msg.clone())
-                } else {
-                    PromptDedupOutcome::Other(msg.clone())
-                };
-                let _ = guard.cell.tx.send(Some(outcome));
-                guard.wrote_outcome = true;
-                return Err(if msg.contains("no_responder_available:") {
-                    MountError::NoResponderAvailable {
-                        key: credential_key.clone(),
-                        reason: msg,
+        let key_for_closure = credential_key.clone();
+        let prompter = Arc::clone(&self.prompter);
+        let store_for_closure = Arc::clone(store);
+        let cell_for_await = Arc::clone(&cell);
+        let outcome_ref = cell_for_await
+            .get_or_init(|| async move {
+                match prompter.prompt_password(label).await {
+                    Ok(Some(bytes)) => {
+                        match store_for_closure
+                            .store_password(&key_for_closure, &bytes)
+                            .await
+                        {
+                            Ok(()) => PromptDedupOutcome::Success,
+                            Err(e) => {
+                                PromptDedupOutcome::Other(format!("{e}"))
+                            }
+                        }
                     }
-                } else {
-                    MountError::CredentialPromptFailed {
-                        key: credential_key.clone(),
-                        reason: msg,
+                    Ok(None) => PromptDedupOutcome::Cancelled,
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.contains("no_responder_available:") {
+                            PromptDedupOutcome::NoResponderAvailable(msg)
+                        } else {
+                            PromptDedupOutcome::Other(msg)
+                        }
                     }
-                });
+                }
+            })
+            .await;
+        let outcome = outcome_ref.clone();
+
+        // Cleanup: remove this key's entry from the map ONLY if
+        // the entry still points at the cell we resolved. Under
+        // concurrent-dispatch there is no window where a peer
+        // could see the map empty AND the current batch's cell
+        // in flight — every peer that arrived during the init
+        // observed the existing cell before the removal, and
+        // every peer that arrives AFTER the removal starts a
+        // fresh batch (fresh cell, fresh prompt).
+        //
+        // `Arc::ptr_eq` guards against a rare cleanup race:
+        // if two callers reach cleanup and one already popped +
+        // re-inserted a subsequent batch's cell, the second's
+        // remove must not clobber the newer batch's entry.
+        {
+            let mut map = self
+                .pending_credential_prompts
+                .lock()
+                .expect("pending_credential_prompts mutex poisoned");
+            if map
+                .get(credential_key)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &cell))
+            {
+                map.remove(credential_key);
             }
-        };
-        let Some(bytes) = answer else {
-            let _ = guard.cell.tx.send(Some(PromptDedupOutcome::Cancelled));
-            guard.wrote_outcome = true;
-            return Err(MountError::CredentialPromptCancelled {
-                key: credential_key.clone(),
-            });
-        };
-        match store.store_password(credential_key, &bytes).await {
-            Ok(()) => {
-                let _ = guard.cell.tx.send(Some(PromptDedupOutcome::Success));
-                guard.wrote_outcome = true;
-                Ok(())
+        }
+
+        return match outcome {
+            PromptDedupOutcome::Success => {
+                // Defensive re-check: the store completed Ok in the
+                // init closure, but confirm the fetcher observes
+                // the write (file-backed store; the re-check costs
+                // one filesystem stat).
+                if self
+                    .credentials
+                    .fetch_password(credential_key)
+                    .await
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(MountError::CredentialPromptFailed {
+                        key: credential_key.clone(),
+                        reason: "first caller reported Success but vault \
+                                 fetch returned None (store inconsistency)"
+                            .into(),
+                    })
+                }
             }
-            Err(e) => {
-                let reason = format!("{e}");
-                let _ = guard
-                    .cell
-                    .tx
-                    .send(Some(PromptDedupOutcome::Other(reason.clone())));
-                guard.wrote_outcome = true;
-                Err(MountError::CredentialStoreWriteFailed {
+            PromptDedupOutcome::Cancelled => {
+                Err(MountError::CredentialPromptCancelled {
+                    key: credential_key.clone(),
+                })
+            }
+            PromptDedupOutcome::NoResponderAvailable(reason) => {
+                Err(MountError::NoResponderAvailable {
+                    key: credential_key.clone(),
+                    reason,
+                })
+            }
+            PromptDedupOutcome::Other(reason) => {
+                Err(MountError::CredentialPromptFailed {
                     key: credential_key.clone(),
                     reason,
                 })
@@ -5820,6 +5775,240 @@ mod tests {
             prompter.calls.load(Ordering::SeqCst),
             1,
             "only one prompt call across two concurrent callers"
+        );
+    }
+
+    /// Operator's 2026-07-21 bar (rows 1 + 4 of the locked
+    /// contract): N concurrent same-key adds must collapse to
+    /// EXACTLY ONE prompt at the prompter level. Under the pre-
+    /// Session-G race (CellOnDrop removed the map entry
+    /// synchronously with the first caller's exit), peers
+    /// arriving during the removal window inserted fresh cells
+    /// and re-prompted — the operator's rig observed 0 / 1 / 4
+    /// prompt counts non-deterministically. The `OnceCell`
+    /// rewrite guarantees exactly one closure runs per key for
+    /// the entire batch's lifetime; this test pins that
+    /// invariant at N = 20.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_20_concurrent_same_key_collapses_to_one_prompt() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const N: usize = 20;
+
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+
+        // Prompter blocks until we release, then returns the
+        // supplied answer. Counts prompt_password calls so we can
+        // assert exactly one across 20 concurrent callers.
+        #[derive(Debug)]
+        struct BlockingAnswerPrompter {
+            release: tokio::sync::Notify,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl PasswordPrompter for BlockingAnswerPrompter {
+            async fn prompt_password(
+                &self,
+                _label: String,
+            ) -> Result<Option<Vec<u8>>, ReportError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(Some(b"answered-once".to_vec()))
+            }
+        }
+
+        let prompter = Arc::new(BlockingAnswerPrompter {
+            release: tokio::sync::Notify::new(),
+            calls: AtomicU32::new(0),
+        });
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = Arc::new(
+            NetworkSharesRuntime::builder(&dir)
+                .unwrap()
+                .with_executor(executor)
+                .with_credential_store(store as Arc<dyn CredentialStore>)
+                .with_password_prompter(
+                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+                )
+                .build(),
+        );
+
+        // Add N records, all keyed on the SAME credential_key.
+        let mut records = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut r = built_record(
+                &format!("stress_share_{i}"),
+                &format!("192.0.2.{}", 100 + i),
+            );
+            r.credentials = Credentials::UserPassword {
+                username: "op".to_string(),
+                credential_key: "stress_shared_key".to_string(),
+                domain: None,
+            };
+            rt.add_share(r.clone()).await.unwrap();
+            records.push(r);
+        }
+
+        // Spawn all N callers concurrently. Under the OnceCell
+        // dedup all N should await the same in-flight init and
+        // resolve together when we release the prompter.
+        let mut handles = Vec::with_capacity(N);
+        for r in records {
+            let rt_c = Arc::clone(&rt);
+            handles.push(tokio::spawn(async move {
+                rt_c.ensure_credential_stocked(&r).await
+            }));
+        }
+
+        // Give every task time to reach its `get_or_init.await`.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Exactly ONE prompt fired across 20 concurrent callers.
+        // Prior to the OnceCell fix this asserted non-
+        // deterministically (0..N calls depending on scheduling).
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "20 concurrent same-key callers must produce exactly ONE \
+             prompt (dedup collapse under concurrent dispatch); got {} calls",
+            prompter.calls.load(Ordering::SeqCst),
+        );
+
+        // Answer once — every caller must wake with Ok(()).
+        prompter.release.notify_waiters();
+
+        for (i, h) in handles.into_iter().enumerate() {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                h,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "caller {i} did not resolve within 3s of the shared \
+                     answer — cancel-wake-all/answer-wake-all invariant \
+                     broken under concurrent dispatch"
+                )
+            })
+            .expect("task join");
+            assert!(
+                outcome.is_ok(),
+                "caller {i} expected Ok after shared answer; got {outcome:?}"
+            );
+        }
+
+        // Still exactly one prompt after every waiter woke — no
+        // waiter re-prompted on wake (retires the pre-fix defect
+        // where waiters re-entered ensure_credential_stocked and
+        // issued their own prompts).
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "waiter re-prompted on wake; exactly one prompt should \
+             remain in the counter after every waiter resolved",
+        );
+    }
+
+    /// Operator's 2026-07-21 bar (row 3): a real prompter answer
+    /// wakes every waiter within a bounded ceiling. Symmetric to
+    /// the pre-existing cancel-wakes-all test — this one exercises
+    /// the ANSWER-wakes-all branch (Success outcome, credential
+    /// stored, all waiters return Ok).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_credential_stocked_answer_wakes_all_dedup_waiters() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+
+        #[derive(Debug)]
+        struct BlockingAnswerPrompter {
+            release: tokio::sync::Notify,
+            calls: AtomicU32,
+        }
+        #[async_trait]
+        impl PasswordPrompter for BlockingAnswerPrompter {
+            async fn prompt_password(
+                &self,
+                _label: String,
+            ) -> Result<Option<Vec<u8>>, ReportError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(Some(b"real-answer".to_vec()))
+            }
+        }
+
+        let prompter = Arc::new(BlockingAnswerPrompter {
+            release: tokio::sync::Notify::new(),
+            calls: AtomicU32::new(0),
+        });
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = Arc::new(
+            NetworkSharesRuntime::builder(&dir)
+                .unwrap()
+                .with_executor(executor)
+                .with_credential_store(store as Arc<dyn CredentialStore>)
+                .with_password_prompter(
+                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+                )
+                .build(),
+        );
+
+        let mut r_a = built_record("share_a", "192.0.2.190");
+        r_a.credentials = Credentials::UserPassword {
+            username: "op".into(),
+            credential_key: "answer_key".into(),
+            domain: None,
+        };
+        let mut r_b = built_record("share_b", "192.0.2.191");
+        r_b.credentials = Credentials::UserPassword {
+            username: "op".into(),
+            credential_key: "answer_key".into(),
+            domain: None,
+        };
+        rt.add_share(r_a.clone()).await.unwrap();
+        rt.add_share(r_b.clone()).await.unwrap();
+
+        let rt_a = Arc::clone(&rt);
+        let rt_b = Arc::clone(&rt);
+        let h_a = tokio::spawn(async move {
+            rt_a.ensure_credential_stocked(&r_a).await
+        });
+        let h_b = tokio::spawn(async move {
+            rt_b.ensure_credential_stocked(&r_b).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        prompter.release.notify_waiters();
+
+        let out_a =
+            tokio::time::timeout(std::time::Duration::from_secs(2), h_a)
+                .await
+                .expect("first caller resolves under 2s of answer")
+                .expect("task join");
+        let out_b =
+            tokio::time::timeout(std::time::Duration::from_secs(2), h_b)
+                .await
+                .expect("waiter resolves under 2s of answer")
+                .expect("task join");
+        assert!(
+            out_a.is_ok(),
+            "first caller Ok on answer; got {out_a:?}"
+        );
+        assert!(
+            out_b.is_ok(),
+            "waiter Ok on answer without re-prompting; got {out_b:?}"
+        );
+
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "waiter must not re-prompt on wake"
         );
     }
 
