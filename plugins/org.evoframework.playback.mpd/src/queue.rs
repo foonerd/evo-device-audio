@@ -264,9 +264,10 @@ pub(crate) async fn build_envelope(
             "album":           item.album,
             "duration_ms":     item.duration.map(|d| d.as_millis() as u64),
             "available":       available,
-            "artwork_url":     evo_device_audio_shared::artwork_target_url(
-                "mpd-path",
+            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track(
                 &item.file_path,
+                item.artist.as_deref(),
+                item.album.as_deref(),
             ),
             "composer":        item.classical.composer,
             "composer_sort":   item.classical.composer_sort,

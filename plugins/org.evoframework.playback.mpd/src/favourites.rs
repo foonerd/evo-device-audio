@@ -208,9 +208,10 @@ pub(crate) async fn refresh_favourites(
             // favourites-persisted-as-system-managed-playlist
             // refuses a parallel store; null is honest.
             "added_at_ms":     serde_json::Value::Null,
-            "artwork_url":     evo_device_audio_shared::artwork_target_url(
-                "mpd-path",
+            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track(
                 &entry.file_path,
+                entry.artist.as_deref(),
+                entry.album.as_deref(),
             ),
             "composer":        entry.classical.composer,
             "composer_sort":   entry.classical.composer_sort,

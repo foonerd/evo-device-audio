@@ -202,6 +202,56 @@ pub fn artwork_target_url(scheme: &str, value: &str) -> String {
     )
 }
 
+/// Cover-identity-picking `artwork_target_url` for track rows.
+///
+/// Picks the resolve scheme based on tag availability so list
+/// surfaces (library, queue, favourites, playlists) can collapse
+/// N tracks in one album to ONE resolve key at the framework's
+/// artwork endpoint:
+///
+/// - When both `artist` and `album` are present and non-empty
+///   (after trim), returns an `mpd-album` URL with the
+///   canonical `"{artist}|{album}"` value. Every track in the
+///   same album emits the same URL — the framework's resolve
+///   coalescer collapses concurrent same-key requests to one
+///   upstream dispatch, and the UI can rely on identical URLs
+///   sharing browser + service-worker cache entries.
+/// - Otherwise falls back to the per-track `mpd-path` URL
+///   using the file path. Tracks without album context (loose
+///   files, sidecar-only libraries, custom covers per track)
+///   keep the per-track fidelity path.
+///
+/// Empty / whitespace-only artist or album is treated as
+/// absent — an `Artist|<empty>` mpd-album would not resolve at
+/// the provider, so the fallback to `mpd-path` is honest.
+///
+/// The now-playing subject emits its own URL directly via
+/// `artwork_target_url("mpd-path", ...)` — the hero surface
+/// keeps per-track identity regardless of tag state; this
+/// helper is for list surfaces where the album is the operator-
+/// visible identity anyway.
+pub fn artwork_target_url_for_track(
+    file_path: &str,
+    artist: Option<&str>,
+    album: Option<&str>,
+) -> String {
+    let artist_ok = artist
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let album_ok = album
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    match (artist_ok, album_ok) {
+        (Some(a), Some(al)) => {
+            let value = format!("{a}|{al}");
+            artwork_target_url("mpd-album", &value)
+        }
+        _ => artwork_target_url("mpd-path", file_path),
+    }
+}
+
 /// Percent-encode a string for use as a URL query-component
 /// value. Conservative: encodes everything except the
 /// RFC 3986 "unreserved" set (alphanumerics + `-`, `_`, `.`,
@@ -280,6 +330,87 @@ mod artwork_url_tests {
         // unreserved so it must be percent-encoded.
         let url = artwork_target_url("mpd-album", "Beatles|Revolver");
         assert!(url.contains("%7C")); // |
+    }
+
+    #[test]
+    fn for_track_with_full_tags_uses_mpd_album_key() {
+        // Both artist and album present → mpd-album URL. N
+        // tracks in the same album will emit the same URL and
+        // collapse to one resolve key at the framework
+        // endpoint.
+        let a = artwork_target_url_for_track(
+            "Beatles/Revolver/01.flac",
+            Some("The Beatles"),
+            Some("Revolver"),
+        );
+        let b = artwork_target_url_for_track(
+            "Beatles/Revolver/02.flac",
+            Some("The Beatles"),
+            Some("Revolver"),
+        );
+        let c = artwork_target_url_for_track(
+            "Beatles/Revolver/03.flac",
+            Some("The Beatles"),
+            Some("Revolver"),
+        );
+        assert_eq!(a, b, "same album must emit same URL for track 1 vs 2");
+        assert_eq!(a, c, "same album must emit same URL for track 1 vs 3");
+        assert!(a.contains("scheme=mpd-album"));
+        assert!(a.contains("The%20Beatles%7CRevolver"));
+    }
+
+    #[test]
+    fn for_track_missing_artist_falls_back_to_mpd_path() {
+        let url = artwork_target_url_for_track(
+            "Loose/01.flac",
+            None,
+            Some("Revolver"),
+        );
+        assert!(url.contains("scheme=mpd-path"));
+        assert!(url.contains("Loose%2F01.flac"));
+    }
+
+    #[test]
+    fn for_track_missing_album_falls_back_to_mpd_path() {
+        let url = artwork_target_url_for_track(
+            "Beatles/Loose/01.flac",
+            Some("The Beatles"),
+            None,
+        );
+        assert!(url.contains("scheme=mpd-path"));
+        assert!(url.contains("Beatles%2FLoose%2F01.flac"));
+    }
+
+    #[test]
+    fn for_track_empty_or_whitespace_tags_fall_back_to_mpd_path() {
+        // Whitespace-only artist / album are treated as absent
+        // — an `Artist|<empty>` mpd-album would not resolve at
+        // the provider, so per-track path is the honest choice.
+        let url = artwork_target_url_for_track(
+            "unknown/01.flac",
+            Some("   "),
+            Some(""),
+        );
+        assert!(url.contains("scheme=mpd-path"));
+    }
+
+    #[test]
+    fn for_track_different_albums_by_same_artist_emit_different_urls() {
+        let revolver = artwork_target_url_for_track(
+            "Beatles/Revolver/01.flac",
+            Some("The Beatles"),
+            Some("Revolver"),
+        );
+        let abbey = artwork_target_url_for_track(
+            "Beatles/Abbey Road/01.flac",
+            Some("The Beatles"),
+            Some("Abbey Road"),
+        );
+        assert_ne!(
+            revolver, abbey,
+            "different album names by the same artist must emit \
+             distinct URLs so the resolver can pick the right cover"
+        );
     }
 }
 
