@@ -2925,8 +2925,8 @@ impl MpdPlaybackPlugin {
     ///    that granularity.
     ///
     /// The framework does not clamp or round volumes on the
-    /// framework side. The `77 → 79` observation the 2026-07-20
-    /// footnote memo names is DAC step-rounding, not framework
+    /// framework side. Deltas such as `77 → 79` between requested
+    /// and effective volume are DAC step-rounding, not framework
     /// or MPD-level distortion — documented here so the
     /// operator surface can render "requested vs achieved" if
     /// UI wants to expose the delta, and so a future audit does
@@ -5989,11 +5989,10 @@ mod tests {
         assert_eq!(sv.effective(), 22);
     }
 
-    /// Regression per the 2026-07-20 defect memo: the applier
-    /// receives the operator's configured startup value from
-    /// the subject state (not from MPD's statefile). The
-    /// effective volume it computes is the value the wire
-    /// setter would apply — parser + clamp is the whole
+    /// Regression: the applier receives the operator's configured
+    /// startup value from the subject state (not from MPD's
+    /// statefile). The effective volume it computes is the value
+    /// the wire setter would apply — parser + clamp is the whole
     /// framework-side computation before the MPD `setvol`.
     #[test]
     fn startup_volume_regression_boot_with_statefile_volume_x_configured_startup_y_effective_is_y(

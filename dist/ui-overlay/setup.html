@@ -358,9 +358,9 @@
         // Password set — call set_kiosk_password. This wire op is
         // guarded by the kiosk UID allowlist on the Unix socket;
         // over WSS it will refuse UNLESS the framework has been
-        // extended to accept it from a paired-device bearer. For
-        // the walk we rely on the framework accepting the paired
-        // bearer's plugins_admin scope (the setup path).
+        // extended to accept it from a paired-device bearer. This
+        // setup path relies on the framework accepting the paired
+        // bearer's plugins_admin scope.
         document.getElementById("password-submit").addEventListener(
           "click",
           async function () {

@@ -10,10 +10,8 @@ install script.
 
 Single-file inline CSS + JS demonstration of the bootstrap-preseed
 pair + first-run set-password flow. The wire calls it makes match
-the framework's live wire surface (rig-verified by the Python
-walk driver at `evo-internal walk-logs/walk_wss_critical_path.py`)
-but the browser-side page itself has never completed a pairing
-end-to-end.
+the framework's live wire surface, but the browser-side page
+itself has never completed a pairing end-to-end.
 
 Known limitations that make this UNSUITABLE as the canonical
 reference:
@@ -30,23 +28,19 @@ reference:
 
 ## Canonical reference for wire-op integration
 
-Use the Python walk drivers as the canonical reference for wire
-shape, frame envelope, error subclasses, and cookie / step-up
-token handling:
+The canonical reference for wire shape, frame envelope, error
+subclasses, and cookie / step-up token handling is the framework
+wire surface itself, exercised through either transport:
 
-- `evo-internal walk-logs/walk_headless_ethernet.py` — Unix
-  socket transport (kiosk shell / evo-plugin-tool class).
-- `evo-internal walk-logs/walk_wss_critical_path.py` — WSS
-  transport (browser-equivalent). Wraps every op in the
+- Unix-socket transport (kiosk shell / evo-plugin-tool class).
+- WSS transport (browser-equivalent). Every op is wrapped in the
   framework's `{frame_type: "request", request_id, op, payload}`
-  envelope; negotiates the bearer via
-  `Sec-WebSocket-Protocol: evo.bearer.<encoded-token>`
-  subprotocol.
+  envelope; the bearer is negotiated via
+  `Sec-WebSocket-Protocol: evo.bearer.<encoded-token>`.
 
-The walk-log files (`.log`) show the exact wire responses each
-driver observed on the rig — the ground truth for what the
-framework returns and what subclass strings surface for each
-refusal.
+The framework's own integration tests and the wire-op reference
+documentation are the ground truth for what the framework returns
+and what subclass strings surface for each refusal.
 
 ## The framework primitives back both paths
 
@@ -54,7 +48,7 @@ Whether an operator app reaches the framework through a browser
 (WSS via `Sec-WebSocket-Protocol` bearer) or through the kiosk
 shell (Unix socket via `mint_local_kiosk_session`), the framework
 side is identical. This overlay is a demonstration of one path;
-the walk drivers are the reference.
+the framework wire surface is the reference.
 
 ## The overlay is distribution-scoped
 

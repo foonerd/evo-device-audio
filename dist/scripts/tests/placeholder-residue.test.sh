@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # placeholder-residue.test.sh — regression test for the
-# substitute-then-grep invariant added to bootstrap.sh after
-# the 2026-05-21 parallel-truth-path regression. The
-# distribution shipped `/etc/asound.conf` carrying the literal
-# `@EVO_AUDIO_CARD@` token because the installer's
-# install_asound_conf primitive byte-copied the template
-# without running sed. The residue check is the institutional
+# substitute-then-grep invariant in bootstrap.sh. Guards a
+# regression class where a template file is byte-copied into
+# `/etc/` without running sed, leaving literal `@TOKEN@`
+# placeholders (e.g. `@EVO_AUDIO_CARD@` in `/etc/asound.conf`)
+# in the deployed file. The residue check is the institutional
 # catch: any rendered template that still carries a
 # `@SOMETHING@` token after substitution fails the install
 # with a clear pointer.
@@ -76,8 +75,9 @@ assert_no_residue() {
     fi
 }
 
-# Fixture: dist/alsa/asound.conf — the original 2026-05-21
-# defect. The template carries @EVO_AUDIO_CARD@.
+# Fixture: dist/alsa/asound.conf. The template carries
+# @EVO_AUDIO_CARD@ and MUST be caught by the residue regex
+# before substitution.
 ASOUND_TEMPLATE="$DIST_DIR/alsa/asound.conf"
 if [[ -f "$ASOUND_TEMPLATE" ]]; then
     assert_residue_detected \

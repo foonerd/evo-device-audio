@@ -2,17 +2,15 @@
 # card-detection.test.sh — regression test for the audio-card
 # auto-detection in dist/scripts/lib/detect-audio-card.sh.
 #
-# The 2026-05-21 bootstrap shipped /etc/asound.conf with
-# `card "Loopback"` on every rig where snd-aloop was loaded,
-# because the detection skipped `vc4hdmi` / `HDMI` but not
-# `Loopback`. That regression class is the focus of this
-# suite: each fixture below is the actual `aplay -l` output
-# captured from one of the project's validation targets (or
-# the source-role variant), and the test asserts the detector
-# picks the correct non-virtual hardware card.
+# Guards against a regression class where the detector selects
+# a virtual card (e.g. `Loopback` under snd-aloop, or `vc4hdmi`
+# / `HDMI` on Pi variants) instead of the real hardware card.
+# Each fixture below is a representative `aplay -l` output
+# shape; the test asserts the detector picks the correct
+# non-virtual hardware card.
 #
-# Add a new fixture function whenever a new validation rig is
-# added — the test failing on a known fixture is the catch
+# Add a new fixture whenever a distinct card shape needs to be
+# covered — the test failing on a known fixture is the catch
 # that prevents this class of regression from returning.
 
 set -euo pipefail

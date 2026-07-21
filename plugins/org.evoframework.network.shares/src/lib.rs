@@ -356,12 +356,11 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
             PluginError::Permanent(e.to_string())
         }
         // NoResponderAvailable: carry the distinct subclass end-
-        // to-end through the plugin error chain (per 2026-07-20
-        // defect-1 memo). Message is the plugin's clean
-        // operator-authoritative text — the framework's
-        // plugin_error_to_wire_error will surface it unwrapped,
-        // no nested "transient error: verb execution failed
-        // (mount):" prefix stack.
+        // to-end through the plugin error chain. Message is the
+        // plugin's clean operator-authoritative text — the
+        // framework's plugin_error_to_wire_error will surface it
+        // unwrapped, no nested "transient error: verb execution
+        // failed (mount):" prefix stack.
         VerbDispatchError::Mount(MountError::NoResponderAvailable {
             key,
             reason: _,

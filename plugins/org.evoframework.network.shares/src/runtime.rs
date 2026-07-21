@@ -2069,16 +2069,16 @@ pub struct NetworkSharesRuntime {
     /// `get_or_init`, and all receive the same outcome the first
     /// caller produced — no re-prompt.
     ///
-    /// Retires the pre-Session-B/C CellOnDrop pattern whose
-    /// removal fired inside the first caller's `Drop` — the map
-    /// entry was gone before any concurrent add arriving one
-    /// tokio poll later could observe it, so peer callers re-
-    /// inserted their own cells and re-prompted. That race
-    /// produced the operator's non-deterministic 0/1/4 prompt
-    /// counts under LAYER A + LAYER B concurrent dispatch.
+    /// Retires an earlier CellOnDrop pattern whose removal fired
+    /// inside the first caller's `Drop` — the map entry was gone
+    /// before any concurrent add arriving one tokio poll later
+    /// could observe it, so peer callers re-inserted their own
+    /// cells and re-prompted. That race produced non-deterministic
+    /// prompt counts under concurrent dispatch on the same
+    /// credential key.
     ///
     /// [`tokio::sync::OnceCell`] provides both requirements the
-    /// operator's 2026-07-21 correctness note pins:
+    /// dedup contract pins:
     ///
     /// - Single-writer initialization: the first caller to reach
     ///   `get_or_init` runs the closure; all peers concurrently
@@ -2290,16 +2290,15 @@ impl NetworkSharesRuntime {
         // cell; every peer arriving DURING the cell's lifetime
         // clones the same `Arc` and awaits the same `get_or_init`.
         //
-        // Under LAYER A + LAYER B concurrent dispatch: N concurrent
-        // callers (any N) collapse to exactly one prompt on the
-        // responder's shelf; one operator answer (or cancel, or
-        // no-responder fast-refusal) resolves every waiter with
-        // the same outcome. The pre-Session-B/C CellOnDrop pattern
-        // is retired — the map entry now outlives the first
-        // caller's exit, so a peer arriving one tokio poll after
-        // the first caller resolves still observes the resolved
-        // cell (via `get()`) and returns the cached outcome
-        // instead of falling into re-prompt.
+        // Under concurrent dispatch: N concurrent callers (any N)
+        // collapse to exactly one prompt on the responder's
+        // shelf; one operator answer (or cancel, or no-responder
+        // fast-refusal) resolves every waiter with the same
+        // outcome. The map entry outlives the first caller's
+        // exit, so a peer arriving one tokio poll after the
+        // first caller resolves still observes the resolved cell
+        // (via `get()`) and returns the cached outcome instead of
+        // falling into re-prompt.
         let cell: PromptCell = {
             let mut map = self
                 .pending_credential_prompts
@@ -2428,8 +2427,8 @@ impl NetworkSharesRuntime {
 /// manual update cycles the state; this is a convenience trigger,
 /// not a durability guarantee. Called from `remove_share` so a
 /// removed share's entries are pruned from MPD's database in the
-/// same operation, closing the "dead share kept appearing in the
-/// library" defect the 2026-07-20 audit named.
+/// same operation, keeping a removed share from lingering in the
+/// library view.
 fn trigger_mpd_update_best_effort(mount_root: &std::path::Path) {
     if mount_root.as_os_str().is_empty() {
         return;
@@ -2858,9 +2857,9 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // Without this, dead share entries linger in MPD's
         // database until something else (a mount / restart /
         // manual mpc update) forces a rescan — the operator
-        // sees a "dead share kept appearing in the library"
-        // condition the 2026-07-20 audit named. Best-effort:
-        // failure here does not fail the remove call.
+        // then sees the removed share still surfacing in the
+        // library view. Best-effort: failure here does not fail
+        // the remove call.
         trigger_mpd_update_best_effort(mount_root);
 
         self.schedule_republish_configured(configured_envelope);
@@ -4683,10 +4682,10 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_remove_deletes_empty_mount_root_directory() {
-        // Regression per the 2026-07-20 audit item 8: dead mount-
-        // root directories left behind after remove_share appear
-        // as browsable garbage in the operator's library. Fix:
-        // remove deletes the directory when empty.
+        // Regression: dead mount-root directories left behind
+        // after remove_share appear as browsable garbage in the
+        // operator's library. Fix: remove deletes the directory
+        // when empty.
         let dir = tempdir();
         let rt = NetworkSharesRuntime::open(&dir).unwrap();
         let mount_root = dir.join("music").join("NAS").join("ShareToRemove");
@@ -5527,11 +5526,10 @@ mod tests {
         );
     }
 
-    /// Regression per operator wire-verification 2026-07-20
-    /// defect 2a: cancelling the collapsed prompt must wake ALL
+    /// Regression: cancelling the collapsed prompt must wake ALL
     /// waiters with the exact CredentialPromptCancelled outcome
     /// (not fall into a re-prompt loop that leaves waiters
-    /// parked). The prior Notify-based dedup allowed this
+    /// parked). An earlier Notify-based dedup allowed this
     /// symptom because waiters re-entered ensure_credential_stocked
     /// on wake and issued their own prompts instead of receiving
     /// the first caller's outcome.
@@ -5631,7 +5629,7 @@ mod tests {
         let b_result =
             tokio::time::timeout(std::time::Duration::from_secs(2), handle_b)
                 .await
-                .expect("dedup waiter must resolve fast (defect-2a regression)")
+                .expect("dedup waiter must resolve fast (cancel-wakes-all regression)")
                 .expect("task join");
 
         assert!(
@@ -5658,12 +5656,11 @@ mod tests {
         assert_eq!(
             prompter.calls.load(Ordering::SeqCst),
             1,
-            "waiter must NOT re-prompt on wake (defect-2a regression)"
+            "waiter must NOT re-prompt on wake (cancel-wakes-all regression)"
         );
     }
 
-    /// Regression per operator wire-verification 2026-07-20
-    /// defect 1: NoResponderAvailable must propagate through
+    /// Regression: NoResponderAvailable must propagate through
     /// the dedup path so both first-caller AND dedup-waiter
     /// receive the specific MountError variant (not a generic
     /// CredentialPromptFailed).
@@ -5778,17 +5775,15 @@ mod tests {
         );
     }
 
-    /// Operator's 2026-07-21 bar (rows 1 + 4 of the locked
-    /// contract): N concurrent same-key adds must collapse to
-    /// EXACTLY ONE prompt at the prompter level. Under the pre-
-    /// Session-G race (CellOnDrop removed the map entry
-    /// synchronously with the first caller's exit), peers
+    /// Contract: N concurrent same-key adds must collapse to
+    /// EXACTLY ONE prompt at the prompter level. Under an
+    /// earlier CellOnDrop pattern that removed the map entry
+    /// synchronously with the first caller's exit, peers
     /// arriving during the removal window inserted fresh cells
-    /// and re-prompted — the operator's rig observed 0 / 1 / 4
-    /// prompt counts non-deterministically. The `OnceCell`
-    /// rewrite guarantees exactly one closure runs per key for
-    /// the entire batch's lifetime; this test pins that
-    /// invariant at N = 20.
+    /// and re-prompted — the rig observed non-deterministic
+    /// prompt counts. The `OnceCell` guarantees exactly one
+    /// closure runs per key for the entire batch's lifetime;
+    /// this test pins that invariant at N = 20.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stress_20_concurrent_same_key_collapses_to_one_prompt() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -5911,11 +5906,10 @@ mod tests {
         );
     }
 
-    /// Operator's 2026-07-21 bar (row 3): a real prompter answer
-    /// wakes every waiter within a bounded ceiling. Symmetric to
-    /// the pre-existing cancel-wakes-all test — this one exercises
-    /// the ANSWER-wakes-all branch (Success outcome, credential
-    /// stored, all waiters return Ok).
+    /// Contract: a real prompter answer wakes every waiter within
+    /// a bounded ceiling. Symmetric to the cancel-wakes-all test —
+    /// this one exercises the ANSWER-wakes-all branch (Success
+    /// outcome, credential stored, all waiters return Ok).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ensure_credential_stocked_answer_wakes_all_dedup_waiters() {
         use std::sync::atomic::{AtomicU32, Ordering};

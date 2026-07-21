@@ -265,7 +265,7 @@ pub(crate) fn process_needs_sudo() -> bool {
 ///
 /// 1. The framework-resolved [`CapabilityResolution`] for the
 ///    `mpd_systemctl_restart` intent, if the resolution map
-///    is populated (Phase A P2.5 onwards).
+///    is populated.
 /// 2. EUID detection (volumio-evo's `/proc/self/status` shape)
 ///    when the map is empty or the resolution doesn't carry a
 ///    strategy hint.
