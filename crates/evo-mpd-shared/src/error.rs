@@ -20,7 +20,7 @@ use std::time::Duration;
 
 /// Top-level error type for MPD connection operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MpdError {
+pub enum MpdError {
     /// Underlying transport failure.
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
@@ -62,7 +62,7 @@ pub(crate) enum MpdError {
 
 /// Transport-level errors (I/O on the underlying socket).
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TransportError {
+pub enum TransportError {
     /// Generic I/O error on an established stream.
     #[error("I/O error: {source}")]
     Io {
@@ -106,7 +106,7 @@ impl From<io::Error> for TransportError {
 /// Protocol-level errors: the server responded but not in a shape the
 /// MPD protocol defines.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ProtocolError {
+pub enum ProtocolError {
     /// The welcome banner did not start with the expected `OK MPD `
     /// prefix.
     #[error("expected welcome banner starting with 'OK MPD ', got: {0:?}")]
@@ -187,7 +187,7 @@ pub(crate) enum ProtocolError {
 
 /// Configuration errors (caught before any I/O is attempted).
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     /// TCP endpoint was supplied with an empty or whitespace-only host.
     #[error("empty host in TCP endpoint")]
     EmptyHost,

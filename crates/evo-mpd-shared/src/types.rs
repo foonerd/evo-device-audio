@@ -6,7 +6,7 @@
 //! are not distribution-shaped; they are MPD-domain facts the warden will
 //! later project into whatever the steward's contract requires.
 //!
-//! All types are `pub(crate)` because they are implementation detail
+//! All types are `pub` because they are implementation detail
 //! of the plugin; the admission surface in `lib.rs` does not expose
 //! them.
 
@@ -33,40 +33,40 @@ use std::time::Duration;
 /// output (see queue / favourites / playlist / library / playback
 /// modules).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct ClassicalTags {
+pub struct ClassicalTags {
     /// MPD `Composer` tag — name of the composition's composer.
-    pub(crate) composer: Option<String>,
+    pub composer: Option<String>,
     /// MPD `ComposerSort` tag — sort-form of composer name
     /// (e.g. "Beethoven, Ludwig van" for sorting under "B").
-    pub(crate) composer_sort: Option<String>,
+    pub composer_sort: Option<String>,
     /// MPD `Conductor` tag — conductor of the recording.
-    pub(crate) conductor: Option<String>,
+    pub conductor: Option<String>,
     /// MPD `Ensemble` tag — orchestra / chamber group / quartet.
-    pub(crate) ensemble: Option<String>,
+    pub ensemble: Option<String>,
     /// MPD `Performer` tag — soloist or featured performer.
-    pub(crate) performer: Option<String>,
+    pub performer: Option<String>,
     /// MPD `Work` tag — canonical composition name
     /// (e.g. "Symphony No. 5 in C minor, Op. 67").
-    pub(crate) work: Option<String>,
+    pub work: Option<String>,
     /// MPD `WorkSort` tag — sort-form of work name.
-    pub(crate) work_sort: Option<String>,
+    pub work_sort: Option<String>,
     /// MPD `Movement` tag — movement name within the work
     /// (e.g. "Allegro con brio").
-    pub(crate) movement: Option<String>,
+    pub movement: Option<String>,
     /// MPD `MovementNumber` tag — movement number (1, 2, 3, ...).
     /// Parsed as u32; non-numeric values surface as `None`.
-    pub(crate) movement_number: Option<u32>,
+    pub movement_number: Option<u32>,
     /// MPD `OriginalDate` tag — year the recording was made.
     /// The audiophile-relevant year, distinct from `Date`
     /// which is the issue / release year.
-    pub(crate) original_date: Option<String>,
+    pub original_date: Option<String>,
     /// MPD `Date` tag — year of release / issue.
-    pub(crate) recording_date: Option<String>,
+    pub recording_date: Option<String>,
     /// MPD `Label` tag — record label (DG / EMI / Sony / etc.).
-    pub(crate) label: Option<String>,
+    pub label: Option<String>,
     /// MPD `Media` tag — physical or distribution medium
     /// (e.g. "CD", "SACD", "Vinyl", "Streaming").
-    pub(crate) medium: Option<String>,
+    pub medium: Option<String>,
 }
 
 impl ClassicalTags {
@@ -80,7 +80,7 @@ impl ClassicalTags {
     /// truth-or-null invariant — MPD's wire occasionally emits
     /// a tag line with an empty value, and the wire MUST NOT
     /// surface that as a known-empty string.
-    pub(crate) fn try_apply(&mut self, key: &str, value: &str) -> bool {
+    pub fn try_apply(&mut self, key: &str, value: &str) -> bool {
         match key {
             "Composer" => {
                 self.composer = some_if_non_empty(value);
@@ -146,7 +146,7 @@ impl ClassicalTags {
 /// whitespace-only strings become `None`. Used by
 /// [`ClassicalTags::try_apply`] and any other parser path that
 /// surfaces MPD-tag values to the wire.
-pub(crate) fn some_if_non_empty(v: &str) -> Option<String> {
+pub fn some_if_non_empty(v: &str) -> Option<String> {
     if v.trim().is_empty() {
         None
     } else {
@@ -157,7 +157,7 @@ pub(crate) fn some_if_non_empty(v: &str) -> Option<String> {
 /// MPD playback state, as reported by the `status` command's
 /// `state:` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PlayState {
+pub enum PlayState {
     /// Actively playing a song.
     Playing,
     /// Paused mid-song.
@@ -173,18 +173,18 @@ pub(crate) enum PlayState {
 /// minimum protocol versions (for example, `partition` support arrived
 /// in 0.22, `readpicture` in 0.22, `albumart` in 0.21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct MpdVersion {
+pub struct MpdVersion {
     /// Major version number.
-    pub(crate) major: u32,
+    pub major: u32,
     /// Minor version number.
-    pub(crate) minor: u32,
+    pub minor: u32,
     /// Patch version number.
-    pub(crate) patch: u32,
+    pub patch: u32,
 }
 
 impl MpdVersion {
     /// Construct a version with the three components.
-    pub(crate) fn new(major: u32, minor: u32, patch: u32) -> Self {
+    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
             minor,
@@ -206,49 +206,49 @@ impl std::fmt::Display for MpdVersion {
 /// rather than surfaced: the connection layer's surface grows by
 /// explicit opt-in, not by accumulating every tag MPD emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdStatus {
+pub struct MpdStatus {
     /// Playback state (always present in MPD responses).
-    pub(crate) state: PlayState,
+    pub state: PlayState,
     /// Zero-based position of the current song within the queue.
     /// `None` when the queue is empty or nothing is selected.
-    pub(crate) song_position: Option<u32>,
+    pub song_position: Option<u32>,
     /// Elapsed time within the current song. `None` when the player
     /// is stopped, or when MPD does not report it (some sources omit
     /// elapsed on initial response; this is treated as unknown, not
     /// zero).
-    pub(crate) elapsed: Option<Duration>,
+    pub elapsed: Option<Duration>,
     /// Total duration of the current song. `None` when MPD does not
     /// report it (streams, some CD rips).
-    pub(crate) duration: Option<Duration>,
+    pub duration: Option<Duration>,
     /// Volume level, 0-100. `None` when MPD reports -1 (no mixer
     /// configured) or when the field is absent.
-    pub(crate) volume: Option<u8>,
+    pub volume: Option<u8>,
     /// `repeat` mode: when set, MPD restarts the queue from
     /// position 0 after the last song ends. `false` when MPD
     /// omits the field. Captured by the `emit_test_tone`
     /// diagnostic so the operator's prior value is restored
     /// after the tone completes.
-    pub(crate) repeat: bool,
+    pub repeat: bool,
     /// `random` mode: when set, MPD plays queue entries in
     /// random order. `false` when MPD omits the field.
     /// Captured then restored by `emit_test_tone` for the
     /// same reason as [`Self::repeat`].
-    pub(crate) random: bool,
+    pub random: bool,
     /// `single` mode: when set, MPD stops after the current
     /// song instead of advancing. `false` when MPD omits the
     /// field. Captured then restored by `emit_test_tone` for
     /// the same reason as [`Self::repeat`].
-    pub(crate) single: bool,
+    pub single: bool,
     /// `consume` mode: when set, MPD removes each song from
     /// the queue after it plays. `false` when MPD omits the
     /// field. Captured then restored by `emit_test_tone` for
     /// the same reason as [`Self::repeat`].
-    pub(crate) consume: bool,
+    pub consume: bool,
     /// Inter-song crossfade in seconds; `0` disables. `0`
     /// when MPD omits the field. Captured then restored by
     /// `emit_test_tone` for the same reason as
     /// [`Self::repeat`].
-    pub(crate) crossfade_seconds: u32,
+    pub crossfade_seconds: u32,
 }
 
 /// Narrow view of MPD's `stats` response.
@@ -261,21 +261,21 @@ pub(crate) struct MpdStatus {
 /// surfaced for diagnostics + cross-shelf consumers but not
 /// every consumer needs every field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct MpdStats {
+pub struct MpdStats {
     /// Number of unique artists in the database. `0` when MPD
     /// omits the field.
-    pub(crate) artists: u32,
+    pub artists: u32,
     /// Number of unique albums in the database. `0` when MPD
     /// omits the field.
-    pub(crate) albums: u32,
+    pub albums: u32,
     /// Number of songs in the database. `0` when MPD omits the
     /// field. Drives library-state `total_tracks`.
-    pub(crate) songs: u32,
+    pub songs: u32,
     /// Unix timestamp (seconds) of MPD's last database update.
     /// `None` when the field is absent (fresh MPD with no
     /// completed scan). Drives library-state
     /// `last_full_scan_at_ms` (multiplied by 1000).
-    pub(crate) db_update_unix_s: Option<u64>,
+    pub db_update_unix_s: Option<u64>,
 }
 
 /// Narrow view of MPD's `currentsong` response.
@@ -284,25 +284,25 @@ pub(crate) struct MpdStats {
 /// (composer, date, track number, disc number, etc.) extends this
 /// when the consuming subject assertion demands it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdSong {
+pub struct MpdSong {
     /// MPD-relative file path (e.g. `INTERNAL/Artist/Album/track.flac`).
     /// Always present when `currentsong` returns a non-empty response.
-    pub(crate) file_path: String,
+    pub file_path: String,
     /// Track title tag, if present.
-    pub(crate) title: Option<String>,
+    pub title: Option<String>,
     /// Artist tag, if present (prefers Artist over AlbumArtist; the
     /// warden's subject-assertion logic may walk both).
-    pub(crate) artist: Option<String>,
+    pub artist: Option<String>,
     /// Album tag, if present.
-    pub(crate) album: Option<String>,
+    pub album: Option<String>,
     /// Track duration from the `duration:` field (MPD 0.21+) or
     /// `Time:` (older).
-    pub(crate) duration: Option<Duration>,
+    pub duration: Option<Duration>,
     /// Classical-music metadata tags. Carried alongside the
     /// always-on title / artist / album triplet so every
     /// track-bearing envelope can project the same fields without
     /// extra round-trips. See [`ClassicalTags`].
-    pub(crate) classical: ClassicalTags,
+    pub classical: ClassicalTags,
     /// Source codec name derived from the file path's extension at
     /// parse time, lowercased and normalised to the canonical token
     /// the audio.playback.v1 wire contract uses (see
@@ -316,7 +316,7 @@ pub(crate) struct MpdSong {
     /// per-song surface. Stream URLs without an extension are
     /// reported as `None` rather than guessing from MIME or URL
     /// path heuristics.
-    pub(crate) codec_name: Option<String>,
+    pub codec_name: Option<String>,
 }
 
 /// Derive a canonical source-codec name from a file path's
@@ -341,7 +341,7 @@ pub(crate) struct MpdSong {
 /// honest UI contract. A future enhancement can sharpen the
 /// signal by reading the file's magic bytes; until that lands,
 /// the extension is the load-bearing signal.
-pub(crate) fn derive_source_codec_name(path: &str) -> Option<String> {
+pub fn derive_source_codec_name(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
@@ -402,7 +402,7 @@ pub(crate) fn derive_source_codec_name(path: &str) -> Option<String> {
 /// under its protocol name and ignored if the warden does not yet
 /// recognise it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum IdleSubsystem {
+pub enum IdleSubsystem {
     /// The song database.
     Database,
     /// A database update has started or finished.
@@ -439,7 +439,7 @@ pub(crate) enum IdleSubsystem {
 
 impl IdleSubsystem {
     /// The MPD protocol wire name for this subsystem.
-    pub(crate) fn as_protocol_str(&self) -> &str {
+    pub fn as_protocol_str(&self) -> &str {
         match self {
             Self::Database => "database",
             Self::Update => "update",
@@ -464,7 +464,7 @@ impl IdleSubsystem {
     /// Unknown names return `IdleSubsystem::Other(s.to_string())`
     /// rather than erroring: the protocol can gain subsystems
     /// without our crate having to handle every one explicitly.
-    pub(crate) fn from_protocol_str(s: &str) -> Self {
+    pub fn from_protocol_str(s: &str) -> Self {
         match s {
             "database" => Self::Database,
             "update" => Self::Update,
@@ -500,36 +500,36 @@ impl IdleSubsystem {
 /// of the per-song `evo:available` sticker as the wire's
 /// `available` flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdQueueItem {
+pub struct MpdQueueItem {
     /// MPD songid (`Id:`); stable across queue reorderings within
     /// MPD's current lifetime, but NOT durable across MPD restart.
-    pub(crate) id: u32,
+    pub id: u32,
     /// Zero-based queue position (`Pos:`); mutates when items move.
-    pub(crate) position: u32,
+    pub position: u32,
     /// MPD-relative file path (or external URI for streams).
-    pub(crate) file_path: String,
+    pub file_path: String,
     /// Track title tag, if present.
-    pub(crate) title: Option<String>,
+    pub title: Option<String>,
     /// Artist tag, if present.
-    pub(crate) artist: Option<String>,
+    pub artist: Option<String>,
     /// Album tag, if present.
-    pub(crate) album: Option<String>,
+    pub album: Option<String>,
     /// Track duration; from `duration:` (0.21+) or `Time:` (older).
-    pub(crate) duration: Option<Duration>,
+    pub duration: Option<Duration>,
     /// Classical-music metadata tags; see [`ClassicalTags`].
-    pub(crate) classical: ClassicalTags,
+    pub classical: ClassicalTags,
 }
 
 /// Summary of one stored playlist. Projected from `listplaylists`'s
 /// response: each entry is a `playlist:` line + optional
 /// `Last-Modified:` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdPlaylistSummary {
+pub struct MpdPlaylistSummary {
     /// Playlist name (operator-facing identifier).
-    pub(crate) name: String,
+    pub name: String,
     /// MPD's `Last-Modified:` field as an ISO-8601 string when
     /// reported by MPD; absent for very old MPD versions.
-    pub(crate) last_modified: Option<String>,
+    pub last_modified: Option<String>,
 }
 
 /// One entry in a stored playlist's listing. Projected from
@@ -538,22 +538,22 @@ pub(crate) struct MpdPlaylistSummary {
 /// `Pos` fields. The playlist module assigns positions by parse
 /// order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdPlaylistEntry {
+pub struct MpdPlaylistEntry {
     /// Zero-based position within the playlist (assigned by parse
     /// order; not reported by MPD).
-    pub(crate) position: u32,
+    pub position: u32,
     /// MPD-relative file path (or external URI).
-    pub(crate) file_path: String,
+    pub file_path: String,
     /// Track title tag, if present.
-    pub(crate) title: Option<String>,
+    pub title: Option<String>,
     /// Artist tag, if present.
-    pub(crate) artist: Option<String>,
+    pub artist: Option<String>,
     /// Album tag, if present.
-    pub(crate) album: Option<String>,
+    pub album: Option<String>,
     /// Track duration; from `duration:` (0.21+) or `Time:` (older).
-    pub(crate) duration: Option<Duration>,
+    pub duration: Option<Duration>,
     /// Classical-music metadata tags; see [`ClassicalTags`].
-    pub(crate) classical: ClassicalTags,
+    pub classical: ClassicalTags,
 }
 
 /// One sticker key/value pair. Projected from `sticker get`,
@@ -561,23 +561,23 @@ pub(crate) struct MpdPlaylistEntry {
 /// subsystem attaches durable per-song key/value pairs that
 /// survive MPD restart, database update, and mount-unmount.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdSticker {
+pub struct MpdSticker {
     /// Sticker name (the framework uses `evo:available` for the
     /// per-song availability flag).
-    pub(crate) name: String,
+    pub name: String,
     /// Sticker value (opaque string; framework convention is `0`
     /// / `1` for boolean stickers).
-    pub(crate) value: String,
+    pub value: String,
 }
 
 /// One entry returned by `sticker find`. Projected from the
 /// per-match repeated `file:` + `sticker:` lines MPD emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdStickerMatch {
+pub struct MpdStickerMatch {
     /// MPD-relative file path the sticker is attached to.
-    pub(crate) file_path: String,
+    pub file_path: String,
     /// The matching sticker.
-    pub(crate) sticker: MpdSticker,
+    pub sticker: MpdSticker,
 }
 
 /// One entry in MPD's library tree listing, projected from
@@ -597,7 +597,7 @@ pub(crate) struct MpdStickerMatch {
 /// projection types.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MpdLibraryEntry {
+pub enum MpdLibraryEntry {
     /// A subdirectory under the queried path.
     Directory {
         /// Path relative to MPD's music_directory.
@@ -637,14 +637,14 @@ pub(crate) enum MpdLibraryEntry {
 /// webdav storage plugins) accessible under a named alias that
 /// scopes the resulting songs in MPD's database.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdMount {
+pub struct MpdMount {
     /// The mount alias name. MPD `lsinfo "NAME"` lists songs
     /// from this mount; the path scope for `update NAME` and
     /// `unmount NAME` is the mount alias.
-    pub(crate) name: String,
+    pub name: String,
     /// The storage URI MPD has mounted. Empty for the root
     /// (un-aliased) storage; non-empty for explicit mounts.
-    pub(crate) storage: String,
+    pub storage: String,
 }
 
 /// One MPD storage neighbour, projected from `listneighbors`.
@@ -653,13 +653,13 @@ pub(crate) struct MpdMount {
 /// operator can subsequently issue `mount NAME URI` to mount
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MpdNeighbor {
+pub struct MpdNeighbor {
     /// The storage URI the neighbour offers (e.g.
     /// `smb://server/share`, `upnp://uuid:abc.../`).
-    pub(crate) uri: String,
+    pub uri: String,
     /// Operator-facing display name MPD reports (server name,
     /// share name, etc.). May be empty.
-    pub(crate) name: String,
+    pub name: String,
 }
 
 /// Search field MPD's `find` / `search` commands accept as the
@@ -668,7 +668,7 @@ pub(crate) struct MpdNeighbor {
 /// operator-facing library shelf so a contributor cannot
 /// accidentally surface every internal MPD tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MpdSearchField {
+pub enum MpdSearchField {
     /// `any` — matches against every tag MPD indexes.
     Any,
     /// `artist`.
@@ -692,7 +692,7 @@ pub(crate) enum MpdSearchField {
 
 impl MpdSearchField {
     /// Wire token the MPD protocol expects.
-    pub(crate) fn as_protocol_str(&self) -> &'static str {
+    pub fn as_protocol_str(&self) -> &'static str {
         match self {
             Self::Any => "any",
             Self::Artist => "artist",

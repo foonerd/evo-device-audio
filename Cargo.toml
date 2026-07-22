@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/evo-device-audio-shared",
     "crates/evo-device-audio-distribution",
+    "crates/evo-mpd-shared",
     "crates/evo-multiroom",
     "crates/evo-online-providers",
     "crates/evo-parity-harness",

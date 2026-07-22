@@ -1,0 +1,16 @@
+[package]
+name = "evo-mpd-shared"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared MPD wire-protocol client for the evo audio reference distribution. Single implementation consumed by every plugin that needs MPD access — playback.mpd (the primary user, owns the operational surface) and metadata.online (uses list operations for browse_by_recording_type). No third-party MPD crate dependency; owns the wire protocol end-to-end."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

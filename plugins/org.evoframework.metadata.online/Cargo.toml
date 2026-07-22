@@ -18,6 +18,7 @@ path = "src/bin/metadata-online-wire.rs"
 anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { workspace = true }
+evo-mpd-shared = { path = "../../crates/evo-mpd-shared" }
 evo-online-providers = { path = "../../crates/evo-online-providers" }
 semver = { workspace = true }
 serde = { workspace = true }

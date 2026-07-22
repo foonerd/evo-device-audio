@@ -1536,6 +1536,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-mpd-shared"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evo-multiroom"
 version = "0.1.0"
 dependencies = [
@@ -3687,6 +3696,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "evo-device-audio-shared",
+ "evo-mpd-shared",
  "evo-online-providers",
  "evo-plugin-sdk",
  "semver",
@@ -3791,6 +3801,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "evo-device-audio-shared",
+ "evo-mpd-shared",
  "evo-plugin-sdk",
  "hex",
  "semver",

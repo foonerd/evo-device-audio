@@ -86,7 +86,6 @@
 mod browse_recording_type;
 mod cache;
 mod config;
-mod mpd_client;
 mod reconcile;
 
 use std::future::Future;

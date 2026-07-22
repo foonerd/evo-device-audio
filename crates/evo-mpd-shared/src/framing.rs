@@ -31,7 +31,7 @@ use super::protocol::LINE_MAX;
 /// The reader and writer halves are typed so the caller can pass a
 /// split socket (`TcpStream::into_split()` returns owned halves) or
 /// an in-memory duplex pair.
-pub(crate) struct Framing<R, W>
+pub struct Framing<R, W>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -50,7 +50,7 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     /// Wrap a reader/writer pair.
-    pub(crate) fn new(reader: R, writer: W) -> Self {
+    pub fn new(reader: R, writer: W) -> Self {
         Self {
             reader: BufReader::new(reader),
             writer,
@@ -71,7 +71,7 @@ where
     /// - Non-UTF-8 bytes: `ProtocolError::NonUtf8`.
     /// - Deadline exceeded: `MpdError::Timeout`.
     /// - Other I/O errors: `TransportError::Io`.
-    pub(crate) async fn read_line_with_timeout(
+    pub async fn read_line_with_timeout(
         &mut self,
         budget: Duration,
         operation: &'static str,
@@ -117,7 +117,7 @@ where
 
     /// Write the given bytes to the stream and flush, enforcing a
     /// hard deadline on the combined operation.
-    pub(crate) async fn write_all_with_timeout(
+    pub async fn write_all_with_timeout(
         &mut self,
         bytes: &[u8],
         budget: Duration,

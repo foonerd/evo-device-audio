@@ -12,27 +12,35 @@
 //! (artist / album / genre / year) live on the shelf's
 //! co-tenant playback.mpd and read MPD directly. That plugin
 //! doesn't have cross-plugin dispatch across the OOP boundary
-//! yet, so this one enumerates MPD with its own minimal
-//! client and reconciles via the same code path
-//! `metadata.reconcile_release` uses.
+//! yet (see `evo-internal/RISKS.md` R-029), so this handler
+//! enumerates MPD via the shared [`evo_mpd_shared::MpdConnection`]
+//! client — the SAME implementation playback.mpd uses — and
+//! reconciles via the same code path `metadata.reconcile_release`
+//! uses.
 //!
 //! Flow:
 //!
 //! 1. Validate request shape (`v == 1`, non-empty
 //!    `recording_type`).
 //! 2. Enumerate every `(albumartist, album)` pair via
-//!    [`MinimalMpd::enumerate_albums`].
+//!    the shared `MpdConnection::list_tag` +
+//!    `list_tag_filtered`.
 //! 3. For each pair, reconcile via [`crate::reconcile::reconcile`]
 //!    (which consults the persistent cache first, cold-cache
 //!    hits MB at the shared 1 req/sec rate limit).
 //! 4. Filter by requested recording_type; paginate the matches.
 //! 5. Return the standard envelope with progress counters.
 
+use evo_mpd_shared::{MpdConnection, MpdEndpoint};
 use evo_online_providers::MusicBrainzClient;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ReconcileCache;
-use crate::mpd_client::{MinimalMpd, DEFAULT_MPD_ADDR};
+
+/// Default MPD host + port. Matches the standard MPD config
+/// that ships with the audio reference distribution.
+const DEFAULT_MPD_HOST: &str = "127.0.0.1";
+const DEFAULT_MPD_PORT: u16 = 6600;
 
 /// Wire request shape.
 #[derive(Debug, Deserialize)]
@@ -132,14 +140,37 @@ pub(crate) async fn browse_by_recording_type(
     let requested_size = req.page_size.unwrap_or(BROWSE_HARD_CAP);
     let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
 
-    // Enumerate the library.
-    let mut mpd = MinimalMpd::connect(DEFAULT_MPD_ADDR)
+    // Enumerate the library via the shared MPD client. Same
+    // implementation playback.mpd uses — no parallel truth.
+    let endpoint = MpdEndpoint::tcp(DEFAULT_MPD_HOST, DEFAULT_MPD_PORT)
+        .map_err(|e| {
+            format!(
+                "MPD endpoint construction failed for \
+                 {DEFAULT_MPD_HOST}:{DEFAULT_MPD_PORT}: {e}"
+            )
+        })?;
+    let mut mpd = MpdConnection::connect(endpoint)
         .await
         .map_err(|e| format!("MPD connect failed: {e}"))?;
-    let pairs = mpd
-        .enumerate_albums()
+    let artists = mpd
+        .list_tag("albumartist")
         .await
-        .map_err(|e| format!("MPD album enumeration failed: {e}"))?;
+        .map_err(|e| format!("MPD list albumartist failed: {e}"))?;
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(artists.len());
+    for artist in &artists {
+        let albums = mpd
+            .list_tag_filtered("album", "albumartist", artist)
+            .await
+            .map_err(|e| format!("MPD list album for {artist}: {e}"))?;
+        for album in albums {
+            let trimmed = album.trim();
+            if !trimmed.is_empty() {
+                pairs.push((artist.clone(), trimmed.to_string()));
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
     let library_album_count = pairs.len();
 
     // Reconcile each pair. Positive + negative results memoise

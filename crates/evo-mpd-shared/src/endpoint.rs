@@ -13,7 +13,7 @@ use super::error::ConfigError;
 
 /// Where to reach the MPD daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MpdEndpoint {
+pub enum MpdEndpoint {
     /// Reach MPD over TCP.
     Tcp {
         /// Hostname or IP literal. Must be non-empty after trimming.
@@ -34,7 +34,7 @@ impl MpdEndpoint {
     /// Empty or whitespace-only hosts are refused: a silent default
     /// would let configuration mistakes reach the network stack and
     /// produce confusing failure modes.
-    pub(crate) fn tcp(
+    pub fn tcp(
         host: impl Into<String>,
         port: u16,
     ) -> Result<Self, ConfigError> {
@@ -49,7 +49,7 @@ impl MpdEndpoint {
     ///
     /// Empty paths are refused. The file's existence is NOT checked
     /// here; that is a run-time concern handled at connect time.
-    pub(crate) fn unix(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+    pub fn unix(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let path = path.into();
         if path.as_os_str().is_empty() {
             return Err(ConfigError::EmptyPath);

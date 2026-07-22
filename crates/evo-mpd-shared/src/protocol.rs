@@ -31,11 +31,11 @@ use super::types::MpdVersion;
 /// the server. MPD's own historical default is 65536; matching that
 /// keeps our behaviour predictable against real deployments while
 /// still bounding memory use per line.
-pub(crate) const LINE_MAX: usize = 64 * 1024;
+pub const LINE_MAX: usize = 64 * 1024;
 
 /// Classification of a response line after parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClassifiedLine {
+pub enum ClassifiedLine {
     /// The response-ending `OK` terminator.
     Ok,
     /// The per-command terminator emitted by MPD inside a
@@ -63,14 +63,14 @@ pub(crate) enum ClassifiedLine {
 
 /// A parsed key/value field from a response line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Field {
+pub struct Field {
     /// Field name as emitted by MPD (case preserved; MPD uses mixed
     /// case: `Title`, `Artist`, `volume`, `state`, etc.).
-    pub(crate) key: String,
+    pub key: String,
     /// Field value, trimmed of the `: ` separator but otherwise
     /// preserved verbatim (including any internal colons, spaces,
     /// or unicode).
-    pub(crate) value: String,
+    pub value: String,
 }
 
 /// Serialise a command with its arguments into a single wire frame.
@@ -79,7 +79,7 @@ pub(crate) struct Field {
 /// every argument is validated to reject `\n`, `\r`, and NUL (none
 /// can be represented on the wire). Arguments are uniformly quoted
 /// to avoid a "does this one need quoting" dance at the call site.
-pub(crate) fn serialise_command(
+pub fn serialise_command(
     command: &str,
     args: &[&str],
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -131,7 +131,7 @@ fn encode_argument(arg: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
 ///
 /// `line` must already have its trailing newline stripped by the
 /// framing layer. Expected shape: `OK MPD <major>.<minor>.<patch>`.
-pub(crate) fn parse_welcome(line: &str) -> Result<MpdVersion, ProtocolError> {
+pub fn parse_welcome(line: &str) -> Result<MpdVersion, ProtocolError> {
     let rest = line
         .strip_prefix("OK MPD ")
         .ok_or_else(|| ProtocolError::BadWelcome(line.to_string()))?;
@@ -161,9 +161,7 @@ fn parse_version_triple(s: &str) -> Result<MpdVersion, ProtocolError> {
 /// `line` must already have its trailing newline stripped. The return
 /// value tells the caller whether the response body continues
 /// (`Field`) or has ended (`Ok` or `Ack`).
-pub(crate) fn classify_line(
-    line: &str,
-) -> Result<ClassifiedLine, ProtocolError> {
+pub fn classify_line(line: &str) -> Result<ClassifiedLine, ProtocolError> {
     if line == "OK" {
         return Ok(ClassifiedLine::Ok);
     }

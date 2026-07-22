@@ -38,15 +38,15 @@ use super::types::{
 /// stall the warden. All values overridable via the configuration
 /// layer.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ConnectTimeouts {
+pub struct ConnectTimeouts {
     /// Budget for completing the TCP or Unix connect syscall.
-    pub(crate) connect: Duration,
+    pub connect: Duration,
     /// Budget for reading the welcome banner after the transport is
     /// up.
-    pub(crate) welcome: Duration,
+    pub welcome: Duration,
     /// Budget for a single command dispatch (write + read until OK
     /// or ACK).
-    pub(crate) command: Duration,
+    pub command: Duration,
 }
 
 impl Default for ConnectTimeouts {
@@ -66,7 +66,7 @@ impl Default for ConnectTimeouts {
 /// protocol violation), the caller should drop this connection and
 /// construct a new one. The supervisor wraps this connection
 /// type to do the reconnection automatically.
-pub(crate) struct MpdConnection {
+pub struct MpdConnection {
     framing: Framing<
         Box<dyn AsyncRead + Send + Unpin>,
         Box<dyn AsyncWrite + Send + Unpin>,
@@ -91,9 +91,7 @@ impl std::fmt::Debug for MpdConnection {
 impl MpdConnection {
     /// Connect to `endpoint` with the default timeout budget, read
     /// the welcome banner, and return the live connection.
-    pub(crate) async fn connect(
-        endpoint: MpdEndpoint,
-    ) -> Result<Self, MpdError> {
+    pub async fn connect(endpoint: MpdEndpoint) -> Result<Self, MpdError> {
         Self::connect_with_timeouts(endpoint, ConnectTimeouts::default()).await
     }
 
@@ -101,7 +99,7 @@ impl MpdConnection {
     ///
     /// Used by tests and by the configuration layer where the
     /// operator can override the defaults.
-    pub(crate) async fn connect_with_timeouts(
+    pub async fn connect_with_timeouts(
         endpoint: MpdEndpoint,
         timeouts: ConnectTimeouts,
     ) -> Result<Self, MpdError> {
@@ -111,25 +109,25 @@ impl MpdConnection {
     }
 
     /// The MPD protocol version negotiated at connect.
-    pub(crate) fn version(&self) -> MpdVersion {
+    pub fn version(&self) -> MpdVersion {
         self.version
     }
 
     /// The endpoint this connection points at. Useful for log
     /// context and for future reconnection logic.
-    pub(crate) fn endpoint(&self) -> &MpdEndpoint {
+    pub fn endpoint(&self) -> &MpdEndpoint {
         &self.endpoint
     }
 
     /// When this connection completed its handshake.
-    pub(crate) fn connected_at(&self) -> Instant {
+    pub fn connected_at(&self) -> Instant {
         self.connected_at
     }
 
     // ----- read-only queries -----
 
     /// Dispatch `status` and project the response into [`MpdStatus`].
-    pub(crate) async fn status(&mut self) -> Result<MpdStatus, MpdError> {
+    pub async fn status(&mut self) -> Result<MpdStatus, MpdError> {
         let fields = self.dispatch("status", &[]).await?;
         parse_status(&fields)
     }
@@ -137,9 +135,7 @@ impl MpdConnection {
     /// Dispatch `currentsong` and project the response into
     /// `Option<MpdSong>`. Returns `None` when MPD's response is
     /// empty (no current song; queue empty or player stopped).
-    pub(crate) async fn current_song(
-        &mut self,
-    ) -> Result<Option<MpdSong>, MpdError> {
+    pub async fn current_song(&mut self) -> Result<Option<MpdSong>, MpdError> {
         let fields = self.dispatch("currentsong", &[]).await?;
         parse_current_song(&fields)
     }
@@ -147,7 +143,7 @@ impl MpdConnection {
     /// Dispatch `ping`. A zero-argument no-op useful for liveness
     /// probes; the supervisor uses it to verify a dormant
     /// connection is still alive.
-    pub(crate) async fn ping(&mut self) -> Result<(), MpdError> {
+    pub async fn ping(&mut self) -> Result<(), MpdError> {
         self.dispatch("ping", &[]).await?;
         Ok(())
     }
@@ -158,7 +154,7 @@ impl MpdConnection {
     /// `total_tracks` field comes from [`MpdStats::songs`];
     /// `last_full_scan_at_ms` derives from
     /// [`MpdStats::db_update_unix_s`].
-    pub(crate) async fn stats(&mut self) -> Result<MpdStats, MpdError> {
+    pub async fn stats(&mut self) -> Result<MpdStats, MpdError> {
         let fields = self.dispatch("stats", &[]).await?;
         parse_stats(&fields)
     }
@@ -169,7 +165,7 @@ impl MpdConnection {
     ///
     /// Wire form: `play\n`. If the queue is empty MPD may ACK; the
     /// error surfaces as [`MpdError::Ack`].
-    pub(crate) async fn play(&mut self) -> Result<(), MpdError> {
+    pub async fn play(&mut self) -> Result<(), MpdError> {
         self.dispatch("play", &[]).await?;
         Ok(())
     }
@@ -177,10 +173,7 @@ impl MpdConnection {
     /// Start playback at a specific queue position.
     ///
     /// Wire form: `play "<pos>"\n`. Out-of-range positions ACK.
-    pub(crate) async fn play_position(
-        &mut self,
-        pos: u32,
-    ) -> Result<(), MpdError> {
+    pub async fn play_position(&mut self, pos: u32) -> Result<(), MpdError> {
         let arg = pos.to_string();
         self.dispatch("play", &[arg.as_str()]).await?;
         Ok(())
@@ -191,7 +184,7 @@ impl MpdConnection {
     /// Wire form: `pause "1"\n` or `pause "0"\n`. MPD's pause
     /// command is idempotent; sending the same state twice is not
     /// an error.
-    pub(crate) async fn pause(&mut self, paused: bool) -> Result<(), MpdError> {
+    pub async fn pause(&mut self, paused: bool) -> Result<(), MpdError> {
         let arg = if paused { "1" } else { "0" };
         self.dispatch("pause", &[arg]).await?;
         Ok(())
@@ -201,7 +194,7 @@ impl MpdConnection {
     /// `play` starts from the beginning of the queue.
     ///
     /// Wire form: `stop\n`.
-    pub(crate) async fn stop(&mut self) -> Result<(), MpdError> {
+    pub async fn stop(&mut self) -> Result<(), MpdError> {
         self.dispatch("stop", &[]).await?;
         Ok(())
     }
@@ -213,7 +206,7 @@ impl MpdConnection {
     /// playing).
     ///
     /// Wire form: `clear\n`.
-    pub(crate) async fn clear(&mut self) -> Result<(), MpdError> {
+    pub async fn clear(&mut self) -> Result<(), MpdError> {
         self.dispatch("clear", &[]).await?;
         Ok(())
     }
@@ -227,7 +220,7 @@ impl MpdConnection {
     /// to replace the queue with a single URI.
     ///
     /// Wire form: `add "<path>"\n`.
-    pub(crate) async fn add(&mut self, path: &str) -> Result<(), MpdError> {
+    pub async fn add(&mut self, path: &str) -> Result<(), MpdError> {
         self.dispatch("add", &[path]).await?;
         Ok(())
     }
@@ -237,7 +230,7 @@ impl MpdConnection {
     /// Wire form: `next\n`. If the queue has no next song MPD may
     /// ACK or silently wrap depending on repeat mode; the caller
     /// reads `status` to know what happened.
-    pub(crate) async fn next(&mut self) -> Result<(), MpdError> {
+    pub async fn next(&mut self) -> Result<(), MpdError> {
         self.dispatch("next", &[]).await?;
         Ok(())
     }
@@ -245,7 +238,7 @@ impl MpdConnection {
     /// Skip to the previous song in the queue.
     ///
     /// Wire form: `previous\n`.
-    pub(crate) async fn previous(&mut self) -> Result<(), MpdError> {
+    pub async fn previous(&mut self) -> Result<(), MpdError> {
         self.dispatch("previous", &[]).await?;
         Ok(())
     }
@@ -257,7 +250,7 @@ impl MpdConnection {
     /// (seek within current song) rather than `seek` (seek by
     /// position and song), because the warden's course-correct
     /// primitive is "move the playhead" rather than "switch song".
-    pub(crate) async fn seek(&mut self, pos: Duration) -> Result<(), MpdError> {
+    pub async fn seek(&mut self, pos: Duration) -> Result<(), MpdError> {
         let arg = format!("{:.3}", pos.as_secs_f64());
         self.dispatch("seekcur", &[arg.as_str()]).await?;
         Ok(())
@@ -271,7 +264,7 @@ impl MpdConnection {
     /// as a delta from the current position; the resulting absolute
     /// position is clamped by MPD to the track's bounds. A delta of
     /// 0 ms is a no-op (still issued, MPD ACKs cleanly).
-    pub(crate) async fn seek_relative(
+    pub async fn seek_relative(
         &mut self,
         delta_ms: i64,
     ) -> Result<(), MpdError> {
@@ -289,10 +282,7 @@ impl MpdConnection {
     /// Wire form: `setvol "<volume>"\n`. MPD accepts 0-100; values
     /// above 100 (legal as `u8` but out of MPD's range) surface as
     /// [`MpdError::Ack`] rather than being silently clamped.
-    pub(crate) async fn set_volume(
-        &mut self,
-        volume: u8,
-    ) -> Result<(), MpdError> {
+    pub async fn set_volume(&mut self, volume: u8) -> Result<(), MpdError> {
         let arg = volume.to_string();
         self.dispatch("setvol", &[arg.as_str()]).await?;
         Ok(())
@@ -306,7 +296,7 @@ impl MpdConnection {
     /// the wire arg never exceeds MPD's accepted range; values
     /// MPD rejects surface as [`MpdError::Ack`] (no silent
     /// clamping).
-    pub(crate) async fn set_crossfade(
+    pub async fn set_crossfade(
         &mut self,
         seconds: u32,
     ) -> Result<(), MpdError> {
@@ -327,10 +317,7 @@ impl MpdConnection {
     /// playback between same-format tracks is decided at the
     /// audio-output layer, not by this command; this verb is the
     /// queue-traversal lever the operator actually cares about.
-    pub(crate) async fn set_single(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), MpdError> {
+    pub async fn set_single(&mut self, enabled: bool) -> Result<(), MpdError> {
         let arg = if enabled { "1" } else { "0" };
         self.dispatch("single", &[arg]).await?;
         Ok(())
@@ -344,10 +331,7 @@ impl MpdConnection {
     /// behaviour the `emit_test_tone` diagnostic must neutralise
     /// before play and restore on completion so the operator's
     /// normal music-listening state survives the diagnostic.
-    pub(crate) async fn set_repeat(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), MpdError> {
+    pub async fn set_repeat(&mut self, enabled: bool) -> Result<(), MpdError> {
         let arg = if enabled { "1" } else { "0" };
         self.dispatch("repeat", &[arg]).await?;
         Ok(())
@@ -360,10 +344,7 @@ impl MpdConnection {
     /// neutralises this before play so the queue's lone test
     /// WAV is the song MPD plays, then restores the operator's
     /// prior value.
-    pub(crate) async fn set_random(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), MpdError> {
+    pub async fn set_random(&mut self, enabled: bool) -> Result<(), MpdError> {
         let arg = if enabled { "1" } else { "0" };
         self.dispatch("random", &[arg]).await?;
         Ok(())
@@ -377,10 +358,7 @@ impl MpdConnection {
     /// (the diagnostic owns the queue and clears it cleanly on
     /// its own terms), then restores the operator's prior
     /// value.
-    pub(crate) async fn set_consume(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), MpdError> {
+    pub async fn set_consume(&mut self, enabled: bool) -> Result<(), MpdError> {
         let arg = if enabled { "1" } else { "0" };
         self.dispatch("consume", &[arg]).await?;
         Ok(())
@@ -394,10 +372,7 @@ impl MpdConnection {
     ///
     /// Wire form: `disableoutput "<index>"\n`. Idempotent against
     /// already-disabled outputs.
-    pub(crate) async fn disable_output(
-        &mut self,
-        index: u32,
-    ) -> Result<(), MpdError> {
+    pub async fn disable_output(&mut self, index: u32) -> Result<(), MpdError> {
         let arg = index.to_string();
         self.dispatch("disableoutput", &[arg.as_str()]).await?;
         Ok(())
@@ -411,10 +386,7 @@ impl MpdConnection {
     ///
     /// Wire form: `enableoutput "<index>"\n`. Idempotent against
     /// already-enabled outputs.
-    pub(crate) async fn enable_output(
-        &mut self,
-        index: u32,
-    ) -> Result<(), MpdError> {
+    pub async fn enable_output(&mut self, index: u32) -> Result<(), MpdError> {
         let arg = index.to_string();
         self.dispatch("enableoutput", &[arg.as_str()]).await?;
         Ok(())
@@ -445,7 +417,7 @@ impl MpdConnection {
     /// extra command, treat it as `noidle` intent, and may respond
     /// in ways this layer does not handle. The supervisor enforces
     /// separation by holding idle on a dedicated connection.
-    pub(crate) async fn idle(
+    pub async fn idle(
         &mut self,
         subsystems: &[IdleSubsystem],
         budget: Duration,
@@ -457,7 +429,7 @@ impl MpdConnection {
         let bytes = protocol::serialise_command("idle", &args)?;
 
         tracing::debug!(
-            plugin = crate::PLUGIN_NAME,
+            plugin = "evo-mpd-shared",
             endpoint = %self.endpoint,
             subsystem_count = subsystems.len(),
             budget_ms = budget.as_millis() as u64,
@@ -548,7 +520,7 @@ impl MpdConnection {
         let bytes = protocol::serialise_command(command, args)?;
 
         tracing::debug!(
-            plugin = crate::PLUGIN_NAME,
+            plugin = "evo-mpd-shared",
             endpoint = %self.endpoint,
             command,
             "mpd command dispatch"
@@ -600,7 +572,7 @@ impl MpdConnection {
     /// Wire form: `playlistinfo\n`. MPD returns one repeated
     /// block per queue item, each starting with `file:` and
     /// containing the per-song metadata + `Pos:` + `Id:`.
-    pub(crate) async fn playlistinfo(
+    pub async fn playlistinfo(
         &mut self,
     ) -> Result<Vec<MpdQueueItem>, MpdError> {
         let fields = self.dispatch("playlistinfo", &[]).await?;
@@ -615,7 +587,7 @@ impl MpdConnection {
     ///
     /// Wire form: `addid "<uri>" "<pos>"\n` (when position
     /// non-null) or `addid "<uri>"\n` (when null).
-    pub(crate) async fn addid(
+    pub async fn addid(
         &mut self,
         uri: &str,
         position: Option<u32>,
@@ -642,7 +614,7 @@ impl MpdConnection {
     /// Remove a queue item by songid.
     ///
     /// Wire form: `deleteid "<id>"\n`.
-    pub(crate) async fn deleteid(&mut self, id: u32) -> Result<(), MpdError> {
+    pub async fn deleteid(&mut self, id: u32) -> Result<(), MpdError> {
         let arg = id.to_string();
         self.dispatch("deleteid", &[arg.as_str()]).await?;
         Ok(())
@@ -651,7 +623,7 @@ impl MpdConnection {
     /// Move a queue item to a new position by songid.
     ///
     /// Wire form: `moveid "<id>" "<to_position>"\n`.
-    pub(crate) async fn moveid(
+    pub async fn moveid(
         &mut self,
         id: u32,
         to_position: u32,
@@ -670,7 +642,7 @@ impl MpdConnection {
     /// Wire form: `listplaylists\n`. MPD returns one repeated
     /// block per playlist with `playlist:` and optional
     /// `Last-Modified:`.
-    pub(crate) async fn listplaylists(
+    pub async fn listplaylists(
         &mut self,
     ) -> Result<Vec<MpdPlaylistSummary>, MpdError> {
         let fields = self.dispatch("listplaylists", &[]).await?;
@@ -701,7 +673,7 @@ impl MpdConnection {
     /// Used by the audio.playlist warden's index rehydration to
     /// populate `audio_playlist_index.items[].item_count` with
     /// MPD truth in O(1) round-trips instead of O(N).
-    pub(crate) async fn playlist_file_counts(
+    pub async fn playlist_file_counts(
         &mut self,
         names: &[&str],
     ) -> Result<Vec<Option<u32>>, MpdError> {
@@ -728,7 +700,7 @@ impl MpdConnection {
     /// Read one stored playlist's contents.
     ///
     /// Wire form: `listplaylistinfo "<name>"\n`.
-    pub(crate) async fn listplaylistinfo(
+    pub async fn listplaylistinfo(
         &mut self,
         name: &str,
     ) -> Result<Vec<MpdPlaylistEntry>, MpdError> {
@@ -739,10 +711,7 @@ impl MpdConnection {
     /// Load a stored playlist's contents to the queue, appending.
     ///
     /// Wire form: `load "<name>"\n`.
-    pub(crate) async fn load_playlist(
-        &mut self,
-        name: &str,
-    ) -> Result<(), MpdError> {
+    pub async fn load_playlist(&mut self, name: &str) -> Result<(), MpdError> {
         self.dispatch("load", &[name]).await?;
         Ok(())
     }
@@ -751,10 +720,7 @@ impl MpdConnection {
     ///
     /// Wire form: `save "<name>"\n`. MPD refuses with ACK 56
     /// (exists) when the playlist already exists.
-    pub(crate) async fn save_playlist(
-        &mut self,
-        name: &str,
-    ) -> Result<(), MpdError> {
+    pub async fn save_playlist(&mut self, name: &str) -> Result<(), MpdError> {
         self.dispatch("save", &[name]).await?;
         Ok(())
     }
@@ -762,7 +728,7 @@ impl MpdConnection {
     /// Append a URI to a stored playlist.
     ///
     /// Wire form: `playlistadd "<name>" "<uri>"\n`.
-    pub(crate) async fn playlistadd(
+    pub async fn playlistadd(
         &mut self,
         name: &str,
         uri: &str,
@@ -774,7 +740,7 @@ impl MpdConnection {
     /// Remove an entry from a stored playlist by position.
     ///
     /// Wire form: `playlistdelete "<name>" "<position>"\n`.
-    pub(crate) async fn playlistdelete(
+    pub async fn playlistdelete(
         &mut self,
         name: &str,
         position: u32,
@@ -788,10 +754,7 @@ impl MpdConnection {
     /// Empty a stored playlist (without removing it).
     ///
     /// Wire form: `playlistclear "<name>"\n`.
-    pub(crate) async fn playlistclear(
-        &mut self,
-        name: &str,
-    ) -> Result<(), MpdError> {
+    pub async fn playlistclear(&mut self, name: &str) -> Result<(), MpdError> {
         self.dispatch("playlistclear", &[name]).await?;
         Ok(())
     }
@@ -799,7 +762,7 @@ impl MpdConnection {
     /// Move an entry within a stored playlist.
     ///
     /// Wire form: `playlistmove "<name>" "<from>" "<to>"\n`.
-    pub(crate) async fn playlistmove(
+    pub async fn playlistmove(
         &mut self,
         name: &str,
         from_position: u32,
@@ -815,7 +778,7 @@ impl MpdConnection {
     /// Rename a stored playlist.
     ///
     /// Wire form: `rename "<from>" "<to>"\n`.
-    pub(crate) async fn rename_playlist(
+    pub async fn rename_playlist(
         &mut self,
         from_name: &str,
         to_name: &str,
@@ -827,10 +790,7 @@ impl MpdConnection {
     /// Delete a stored playlist.
     ///
     /// Wire form: `rm "<name>"\n`.
-    pub(crate) async fn rm_playlist(
-        &mut self,
-        name: &str,
-    ) -> Result<(), MpdError> {
+    pub async fn rm_playlist(&mut self, name: &str) -> Result<(), MpdError> {
         self.dispatch("rm", &[name]).await?;
         Ok(())
     }
@@ -848,7 +808,7 @@ impl MpdConnection {
     /// Returns `None` when the sticker is not set (MPD ACKs with
     /// code 50; the method translates that to `Ok(None)` for the
     /// caller's ergonomic).
-    pub(crate) async fn sticker_get(
+    pub async fn sticker_get(
         &mut self,
         uri: &str,
         name: &str,
@@ -874,7 +834,7 @@ impl MpdConnection {
     /// when one is already set.
     ///
     /// Wire form: `sticker set song "<uri>" "<name>" "<value>"\n`.
-    pub(crate) async fn sticker_set(
+    pub async fn sticker_set(
         &mut self,
         uri: &str,
         name: &str,
@@ -890,7 +850,7 @@ impl MpdConnection {
     /// Wire form: `sticker delete song "<uri>" "<name>"\n`. MPD
     /// ACKs with code 50 when the sticker is not set; the method
     /// translates that to `Ok(())` for idempotency.
-    pub(crate) async fn sticker_delete(
+    pub async fn sticker_delete(
         &mut self,
         uri: &str,
         name: &str,
@@ -908,7 +868,7 @@ impl MpdConnection {
     /// List every sticker on a song.
     ///
     /// Wire form: `sticker list song "<uri>"\n`.
-    pub(crate) async fn sticker_list(
+    pub async fn sticker_list(
         &mut self,
         uri: &str,
     ) -> Result<Vec<MpdSticker>, MpdError> {
@@ -922,7 +882,7 @@ impl MpdConnection {
     ///
     /// Wire form: `sticker find song "<base>" "<name>"\n` or
     /// `sticker find song "<base>" "<name>" = "<value>"\n`.
-    pub(crate) async fn sticker_find(
+    pub async fn sticker_find(
         &mut self,
         base: &str,
         name: &str,
@@ -949,7 +909,7 @@ impl MpdConnection {
     /// List the contents of a directory in MPD's library.
     ///
     /// Wire form: `lsinfo "<path>"\n`. Empty path lists the root.
-    pub(crate) async fn lsinfo(
+    pub async fn lsinfo(
         &mut self,
         path: &str,
     ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
@@ -979,7 +939,7 @@ impl MpdConnection {
     /// entry, so the aggregation consumer sees Work / Composer
     /// / Conductor / Ensemble / etc. through the same
     /// `ClassicalTags` projection the per-track envelopes use.
-    pub(crate) async fn listallinfo(
+    pub async fn listallinfo(
         &mut self,
         path: &str,
     ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
@@ -995,7 +955,7 @@ impl MpdConnection {
     ///
     /// Wire form: `find "<field>" "<query>"\n`. Case-sensitive
     /// exact match; for substring search use [`Self::search`].
-    pub(crate) async fn find(
+    pub async fn find(
         &mut self,
         field: MpdSearchField,
         query: &str,
@@ -1009,7 +969,7 @@ impl MpdConnection {
     /// Case-insensitive substring search across MPD's library.
     ///
     /// Wire form: `search "<field>" "<query>"\n`.
-    pub(crate) async fn search(
+    pub async fn search(
         &mut self,
         field: MpdSearchField,
         query: &str,
@@ -1041,11 +1001,43 @@ impl MpdConnection {
     /// filtered out before return — a browse-by-artist facet
     /// shouldn't include a blank entry that operator UI has
     /// no useful label for.
-    pub(crate) async fn list_tag(
+    pub async fn list_tag(
         &mut self,
         tag: &str,
     ) -> Result<Vec<String>, MpdError> {
         let fields = self.dispatch("list", &[tag]).await?;
+        Ok(fields
+            .into_iter()
+            .filter_map(|f| {
+                let trimmed = f.value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect())
+    }
+
+    /// List distinct values of `tag` filtered to `<filter_tag>
+    /// = <filter_value>`.
+    ///
+    /// Wire form: `list "<tag>" "<filter_tag>" "<filter_value>"\n`
+    /// — MPD's shape for the filtered form of `list`. Used to
+    /// enumerate distinct albums for a specific album-artist,
+    /// distinct tracks for a specific album, etc.
+    ///
+    /// Empty values are filtered out at the connection layer,
+    /// mirroring [`Self::list_tag`]'s discipline.
+    pub async fn list_tag_filtered(
+        &mut self,
+        tag: &str,
+        filter_tag: &str,
+        filter_value: &str,
+    ) -> Result<Vec<String>, MpdError> {
+        let fields = self
+            .dispatch("list", &[tag, filter_tag, filter_value])
+            .await?;
         Ok(fields
             .into_iter()
             .filter_map(|f| {
@@ -1065,10 +1057,7 @@ impl MpdConnection {
     /// `update\n`. MPD reads files whose mtime changed since the
     /// last scan; for a force-rescan that re-reads every file see
     /// [`Self::rescan`].
-    pub(crate) async fn update(
-        &mut self,
-        path: Option<&str>,
-    ) -> Result<(), MpdError> {
+    pub async fn update(&mut self, path: Option<&str>) -> Result<(), MpdError> {
         match path {
             Some(p) => {
                 self.dispatch("update", &[p]).await?;
@@ -1084,10 +1073,7 @@ impl MpdConnection {
     ///
     /// Wire form: `rescan "<path>"\n` or `rescan\n`. Re-reads
     /// every file's metadata regardless of mtime.
-    pub(crate) async fn rescan(
-        &mut self,
-        path: Option<&str>,
-    ) -> Result<(), MpdError> {
+    pub async fn rescan(&mut self, path: Option<&str>) -> Result<(), MpdError> {
         match path {
             Some(p) => {
                 self.dispatch("rescan", &[p]).await?;
@@ -1102,9 +1088,7 @@ impl MpdConnection {
     /// List MPD's current mounts.
     ///
     /// Wire form: `listmounts\n`.
-    pub(crate) async fn listmounts(
-        &mut self,
-    ) -> Result<Vec<MpdMount>, MpdError> {
+    pub async fn listmounts(&mut self) -> Result<Vec<MpdMount>, MpdError> {
         let fields = self.dispatch("listmounts", &[]).await?;
         Ok(parse_mounts(&fields))
     }
@@ -1113,7 +1097,7 @@ impl MpdConnection {
     ///
     /// Wire form: `mount "<name>" "<storage>"\n`. MPD ACKs when
     /// the storage URI scheme is not supported.
-    pub(crate) async fn mount_storage(
+    pub async fn mount_storage(
         &mut self,
         name: &str,
         storage: &str,
@@ -1125,7 +1109,7 @@ impl MpdConnection {
     /// Unmount a storage by alias.
     ///
     /// Wire form: `unmount "<name>"\n`.
-    pub(crate) async fn unmount_storage(
+    pub async fn unmount_storage(
         &mut self,
         name: &str,
     ) -> Result<(), MpdError> {
@@ -1136,7 +1120,7 @@ impl MpdConnection {
     /// List discovered storage neighbours.
     ///
     /// Wire form: `listneighbors\n`.
-    pub(crate) async fn listneighbors(
+    pub async fn listneighbors(
         &mut self,
     ) -> Result<Vec<MpdNeighbor>, MpdError> {
         let fields = self.dispatch("listneighbors", &[]).await?;
@@ -1159,7 +1143,7 @@ impl MpdConnection {
     /// Each entry is `(command, args)`; arguments are quoted
     /// per the existing dispatch path. Empty batch is a no-op
     /// (no command_list issued).
-    pub(crate) async fn command_list(
+    pub async fn command_list(
         &mut self,
         commands: &[(&str, Vec<String>)],
     ) -> Result<(), MpdError> {
@@ -1186,7 +1170,7 @@ impl MpdConnection {
         payload.extend_from_slice(b"command_list_end\n");
 
         tracing::debug!(
-            plugin = crate::PLUGIN_NAME,
+            plugin = "evo-mpd-shared",
             endpoint = %self.endpoint,
             command_count = commands.len(),
             payload_bytes = payload.len(),
@@ -1251,7 +1235,7 @@ impl MpdConnection {
     /// fails) aborts the whole dispatch — no partial results
     /// are returned. The caller can split the batch and retry
     /// per-command if that semantic matters.
-    pub(crate) async fn command_list_ok(
+    pub async fn command_list_ok(
         &mut self,
         commands: &[(&str, Vec<String>)],
     ) -> Result<Vec<Vec<Field>>, MpdError> {
@@ -1276,7 +1260,7 @@ impl MpdConnection {
         payload.extend_from_slice(b"command_list_end\n");
 
         tracing::debug!(
-            plugin = crate::PLUGIN_NAME,
+            plugin = "evo-mpd-shared",
             endpoint = %self.endpoint,
             command_count = commands.len(),
             payload_bytes = payload.len(),
@@ -1366,7 +1350,7 @@ async fn open_streams(
             // commands; coalescing adds latency without throughput gain.
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!(
-                    plugin = crate::PLUGIN_NAME,
+                    plugin = "evo-mpd-shared",
                     error = %e,
                     "failed to set TCP_NODELAY; continuing"
                 );
@@ -1411,7 +1395,7 @@ async fn handshake(
     let version = protocol::parse_welcome(&welcome)?;
 
     tracing::info!(
-        plugin = crate::PLUGIN_NAME,
+        plugin = "evo-mpd-shared",
         endpoint = %endpoint,
         mpd_version = %version,
         "mpd connection established"
@@ -1564,7 +1548,7 @@ fn parse_current_song(fields: &[Field]) -> Result<Option<MpdSong>, MpdError> {
         return Ok(None);
     };
 
-    let codec_name = super::derive_source_codec_name(&file_path);
+    let codec_name = crate::types::derive_source_codec_name(&file_path);
 
     Ok(Some(MpdSong {
         file_path,
