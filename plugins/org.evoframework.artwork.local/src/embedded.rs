@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use lofty::file::TaggedFileExt;
 use lofty::picture::PictureType;
 use lofty::read_from_path;
-use lofty::tag::Tag;
+use lofty::tag::{Accessor, Tag};
 
 /// Picked from tags; `mime` is a best-effort `image/*` string.
 pub(crate) struct EmbeddedImage {
@@ -88,6 +88,70 @@ pub(crate) fn read_embedded_cover(path: &Path) -> Option<EmbeddedImage> {
         }
     }
     None
+}
+
+/// Read the `(artist, album)` identity from a supported audio
+/// `path`. Returns `Some((artist, album))` when BOTH fields are
+/// present and non-empty after trimming; returns `None` when the
+/// file has no tags, lofty cannot parse the format, or either
+/// field is absent.
+///
+/// Used by the mpd-path resolve path in `resolve_cover_for_audio_file`
+/// on the local-NotFound branch: the identity rides along on the
+/// response so the framework endpoint can synthesise an mpd-album
+/// target for the online tier. A now-playing surface with no
+/// embedded / sidecar art still cascades to online instead of
+/// dead-ending at 404.
+///
+/// Both artist and album MUST be present — the online cascade is
+/// keyed on the compound identity. A file with an album tag but no
+/// artist (or vice versa) returns `None` here so the endpoint
+/// short-circuits online rather than fabricating a half-identity
+/// lookup that could match unrelated releases at the CAA / iTunes
+/// tier.
+pub(crate) fn read_identity(path: &Path) -> Option<(String, String)> {
+    let tagged = read_from_path(path).ok()?;
+    // Consult the primary tag first (the format's canonical tag —
+    // ID3v2 on MP3, Vorbis comments on FLAC/Ogg, iTunes on MP4);
+    // fall through to any secondary tag if the primary is missing
+    // one field. This mirrors `read_embedded_cover`'s fall-through
+    // discipline so cover + identity resolve consistently for the
+    // same file.
+    let mut artist: Option<String> = None;
+    let mut album: Option<String> = None;
+    if let Some(t) = tagged.primary_tag() {
+        artist = t
+            .artist()
+            .map(|c| c.trim().to_string())
+            .filter(|s| !s.is_empty());
+        album = t
+            .album()
+            .map(|c| c.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if artist.is_none() || album.is_none() {
+        for t in tagged.tags() {
+            if artist.is_none() {
+                artist = t
+                    .artist()
+                    .map(|c| c.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+            if album.is_none() {
+                album = t
+                    .album()
+                    .map(|c| c.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+            if artist.is_some() && album.is_some() {
+                break;
+            }
+        }
+    }
+    match (artist, album) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
 }
 
 fn extension_for_mime(mime: &str) -> &str {

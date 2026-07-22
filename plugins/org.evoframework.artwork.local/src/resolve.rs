@@ -152,6 +152,41 @@ pub(crate) struct ArtworkResolveResponse {
     /// which cascade branch delivered each cover.
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
+    /// Identity — the `(artist, album)` pair the online cascade
+    /// needs to key its lookup. Populated on:
+    ///
+    /// - `mpd-album` responses (Ok and NotFound): identity is the
+    ///   parsed value.
+    /// - `mpd-path` NotFound responses: identity is read from the
+    ///   file's tags via `embedded::read_identity`.
+    ///
+    /// Absent when the file has no `(artist, album)` tags (or lofty
+    /// cannot parse the format), and on `BadRequest` responses.
+    ///
+    /// The framework endpoint uses this to synthesise an
+    /// mpd-album target for the online tier when the local cascade
+    /// misses — so a now-playing surface with no embedded / sidecar
+    /// art still falls through to the online provider chain.
+    /// Without this field, the endpoint would forward the
+    /// mpd-path target verbatim and artwork.online would refuse
+    /// (its cascade is keyed on (artist, album), not on file
+    /// paths); the operator memo of 2026-07-22 pinned this as the
+    /// defect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<Identity>,
+}
+
+/// `(artist, album)` pair carried on the resolve response so the
+/// endpoint can synthesise an mpd-album target for the online
+/// cascade even when the original request came in as mpd-path.
+///
+/// Symmetric with the `artist|album` compound the MPD warden
+/// emits — the endpoint reconstructs the pipe-joined value from
+/// this struct's fields.
+#[derive(Debug, Serialize)]
+pub(crate) struct Identity {
+    pub(crate) artist: String,
+    pub(crate) album: String,
 }
 
 /// Outcome of a resolve attempt.
@@ -333,6 +368,7 @@ pub(crate) fn resolve_artwork(
                 mime: None,
                 size: None,
                 provider_id: None,
+                identity: None,
                 detail: Some("empty payload".to_string()),
             },
             cache_payload: None,
@@ -350,6 +386,7 @@ pub(crate) fn resolve_artwork(
                     content_hash: None,
                     size: None,
                     provider_id: None,
+                    identity: None,
                     mime: None,
                     detail: Some(format!("payload is not UTF-8: {e}")),
                 },
@@ -369,6 +406,7 @@ pub(crate) fn resolve_artwork(
                     content_hash: None,
                     size: None,
                     provider_id: None,
+                    identity: None,
                     mime: None,
                     detail: Some(format!("invalid JSON: {e}")),
                 },
@@ -386,6 +424,7 @@ pub(crate) fn resolve_artwork(
                 mime: None,
                 size: None,
                 provider_id: None,
+                identity: None,
                 detail: Some(format!("unsupported request v: {}", req.v)),
             },
             cache_payload: None,
@@ -408,6 +447,7 @@ pub(crate) fn resolve_artwork(
                     mime: None,
                     size: None,
                     provider_id: None,
+                    identity: None,
                     detail: Some(format!(
                         "unknown size: {size_str} (expected small | medium | large | original; `tiny` accepted as alias for `small`)"
                     )),
@@ -432,6 +472,7 @@ pub(crate) fn resolve_artwork(
             mime: None,
             size: None,
             provider_id: None,
+            identity: None,
             detail: Some(format!("unknown target.scheme: {other}")),
         },
     };
@@ -534,6 +575,7 @@ fn resolve_mpd_album(
                 content_hash: None,
                 size: None,
                 provider_id: None,
+                identity: None,
                 mime: None,
                 detail: Some(
                     "invalid mpd-album value: expected \"artist|album\" (see \
@@ -581,6 +623,7 @@ fn resolve_mpd_album(
                 content_hash: None,
                 size: None,
                 provider_id: None,
+                identity: Some(Identity { artist: artist.clone(), album: album.clone() }),
                 mime: None,
                 detail: Some(format!(
                     "mpd_album: tag-walk scan limit ({} files) reached under [library] roots",
@@ -596,6 +639,10 @@ fn resolve_mpd_album(
                 content_hash: None,
                 size: None,
                 provider_id: None,
+                identity: Some(Identity {
+                    artist: artist.clone(),
+                    album: album.clone(),
+                }),
                 mime: None,
                 detail: Some(m),
             });
@@ -624,6 +671,10 @@ fn resolve_mpd_album(
                         mime: None,
                         size: None,
                         provider_id: None,
+                        identity: Some(Identity {
+                            artist: artist.clone(),
+                            album: album.clone(),
+                        }),
                         detail: Some(
                             "mpd_album: no file under [library] roots \
                              with matching tags AND no directory whose \
@@ -640,6 +691,7 @@ fn resolve_mpd_album(
                         content_hash: None,
                         size: None,
                         provider_id: None,
+                        identity: Some(Identity { artist: artist.clone(), album: album.clone() }),
                         mime: None,
                         detail: Some(format!(
                             "mpd_album: folder-name scan limit ({} directories) reached",
@@ -655,6 +707,10 @@ fn resolve_mpd_album(
                         content_hash: None,
                         size: None,
                         provider_id: None,
+                        identity: Some(Identity {
+                            artist: artist.clone(),
+                            album: album.clone(),
+                        }),
                         mime: None,
                         detail: Some(m),
                     });
@@ -662,13 +718,36 @@ fn resolve_mpd_album(
             }
         }
     };
-    resolve_cover_for_audio_file(state_dir, &track_path)
+    resolve_cover_for_audio_file(
+        state_dir,
+        &track_path,
+        Some(Identity {
+            artist: artist.clone(),
+            album: album.clone(),
+        }),
+    )
 }
 
 /// Sidecar and embedded art for a resolved on-disk track path.
+///
+/// `known_identity` is the caller-supplied `(artist, album)` when
+/// the request scheme already carries that pair — mpd-album's
+/// parsed value. Passed through verbatim to the NotFound
+/// response so the endpoint's online-cascade synth uses the
+/// user's original intent rather than whatever tags the file
+/// happens to carry (which may drift from the mpd-album value
+/// when the operator has re-tagged tracks or when the file
+/// matched via folder-name fallback).
+///
+/// When `None`, the mpd-path caller path applies: on NotFound,
+/// identity is read from the file's own tags via
+/// `embedded::read_identity`. Absent when the file has no
+/// `(artist, album)` tags or lofty can't parse the format —
+/// endpoint short-circuits online in that case.
 fn resolve_cover_for_audio_file(
     state_dir: Option<&Path>,
     track_path: &Path,
+    known_identity: Option<Identity>,
 ) -> Result<ArtworkResolveResponse, String> {
     if let Some(cover) = find_cover_beside_audio_file(track_path) {
         // Sidecar cover: cover.jpg / folder.jpg / etc. living in
@@ -686,6 +765,10 @@ fn resolve_cover_for_audio_file(
                 content_hash: None,
                 size: None,
                 provider_id: None,
+                identity: identity_or_read_from_file(
+                    known_identity,
+                    track_path,
+                ),
                 mime: None,
                 detail: Some(
                     "embedded cover in tags but no state_dir to write cache; cannot expose path"
@@ -707,9 +790,26 @@ fn resolve_cover_for_audio_file(
         content_hash: None,
         size: None,
         provider_id: None,
+        identity: identity_or_read_from_file(known_identity, track_path),
         mime: None,
         detail: Some("no sidecar or embedded cover for this track".to_string()),
     })
+}
+
+/// Return the caller-supplied identity when present; otherwise
+/// read `(artist, album)` from the file's tags. Returns `None`
+/// when both are absent — the endpoint short-circuits online
+/// in that case (structured 404 rather than a half-identity
+/// online lookup that could match unrelated releases).
+fn identity_or_read_from_file(
+    known_identity: Option<Identity>,
+    track_path: &Path,
+) -> Option<Identity> {
+    if known_identity.is_some() {
+        return known_identity;
+    }
+    embedded::read_identity(track_path)
+        .map(|(artist, album)| Identity { artist, album })
 }
 
 /// Stable identifier for the local sidecar cascade leaf. Surfaced
@@ -740,6 +840,7 @@ fn ok_from_path(
         size: None,
         provider_id: Some(provider_id.to_string()),
         detail: None,
+        identity: None,
     })
 }
 
@@ -757,6 +858,7 @@ fn resolve_mpd_path(
             mime: None,
             size: None,
             provider_id: None,
+            identity: None,
             detail: Some("empty mpd-path value".to_string()),
         });
     }
@@ -770,11 +872,12 @@ fn resolve_mpd_path(
             mime: None,
             size: None,
             provider_id: None,
+            identity: None,
             detail: Some("audio file not found for mpd_path".to_string()),
         });
     };
 
-    resolve_cover_for_audio_file(state_dir, &track_path)
+    resolve_cover_for_audio_file(state_dir, &track_path, None)
 }
 
 #[cfg(test)]
