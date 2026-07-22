@@ -35,9 +35,17 @@
 //! flow through the [`musicbrainz`] client.
 
 pub mod http;
+pub mod lastfm;
+pub mod lrclib;
 pub mod musicbrainz;
 pub mod rate_limit;
 
 pub use http::build_http_client;
+pub use lastfm::{
+    is_notfound_code as lastfm_is_notfound_code,
+    AlbumNotesHit as LastfmAlbumNotesHit, BioHit as LastfmBioHit, LastfmClient,
+    LastfmError,
+};
+pub use lrclib::{LrclibClient, LrclibError, LyricsHit};
 pub use musicbrainz::{MusicBrainzClient, MusicBrainzError};
 pub use rate_limit::RateLimiter;

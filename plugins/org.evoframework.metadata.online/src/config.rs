@@ -33,6 +33,14 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// unmatched target should not re-hammer MB across days.
 const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Last.fm API policy: 5 requests per second per key.
+const DEFAULT_LASTFM_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
+/// LRCLIB — no documented per-second policy but explicit
+/// respectful use called out. Default 200 ms (5 req/sec) matches
+/// Last.fm's cadence.
+const DEFAULT_LRCLIB_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Effective, in-memory plugin configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginConfig {
@@ -40,6 +48,19 @@ pub(crate) struct PluginConfig {
     pub(crate) musicbrainz_user_agent: String,
     pub(crate) musicbrainz_min_interval: Duration,
     pub(crate) negative_ttl: Duration,
+    /// Last.fm API key. `None` disables the Last.fm provider —
+    /// the bio + album-notes verbs return structured
+    /// `not_configured` rather than fabricating a result. This
+    /// is the pin the operator specified: "honest-empty on
+    /// tracks with no lyrics/bio rather than a fabricated
+    /// result." When the operator drops the key at the path
+    /// pointed to by `lastfm.api_key_path`, the plugin arms
+    /// the provider on next restart.
+    pub(crate) lastfm_api_key: Option<String>,
+    pub(crate) lastfm_min_interval: Duration,
+    /// LRCLIB rate-limit cadence. Overridable per operator
+    /// policy; default 200 ms (5 req/sec) matches Last.fm's.
+    pub(crate) lrclib_min_interval: Duration,
 }
 
 impl PluginConfig {
@@ -49,6 +70,9 @@ impl PluginConfig {
             musicbrainz_user_agent: DEFAULT_MUSICBRAINZ_USER_AGENT.to_string(),
             musicbrainz_min_interval: DEFAULT_MUSICBRAINZ_MIN_INTERVAL,
             negative_ttl: DEFAULT_NEGATIVE_TTL,
+            lastfm_api_key: None,
+            lastfm_min_interval: DEFAULT_LASTFM_MIN_INTERVAL,
+            lrclib_min_interval: DEFAULT_LRCLIB_MIN_INTERVAL,
         }
     }
 
@@ -97,6 +121,52 @@ impl PluginConfig {
             }
             out.negative_ttl = Duration::from_secs(hours * 60 * 60);
         }
+        if let Some(lastfm) = cfg.lastfm {
+            if let Some(path) = lastfm.api_key_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    match std::fs::read_to_string(trimmed) {
+                        Ok(contents) => {
+                            let key = contents.trim().to_string();
+                            if !key.is_empty() {
+                                out.lastfm_api_key = Some(key);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %trimmed,
+                                error = %e,
+                                "lastfm.api_key_path unreadable; provider stays disabled"
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(key) = lastfm.api_key {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() {
+                    out.lastfm_api_key = Some(trimmed.to_string());
+                }
+            }
+            if let Some(millis) = lastfm.min_interval_ms {
+                if !(0..=60_000).contains(&millis) {
+                    return Err(format!(
+                        "lastfm.min_interval_ms must be 0..=60000; got {millis}"
+                    ));
+                }
+                out.lastfm_min_interval = Duration::from_millis(millis);
+            }
+        }
+        if let Some(lrclib) = cfg.lrclib {
+            if let Some(millis) = lrclib.min_interval_ms {
+                if !(0..=60_000).contains(&millis) {
+                    return Err(format!(
+                        "lrclib.min_interval_ms must be 0..=60000; got {millis}"
+                    ));
+                }
+                out.lrclib_min_interval = Duration::from_millis(millis);
+            }
+        }
         Ok(out)
     }
 }
@@ -109,6 +179,32 @@ struct RawConfig {
     musicbrainz: Option<RawMusicBrainz>,
     #[serde(default)]
     negative_ttl_hours: Option<u64>,
+    #[serde(default)]
+    lastfm: Option<RawLastfm>,
+    #[serde(default)]
+    lrclib: Option<RawLrclib>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLastfm {
+    /// Path to a file whose contents are the API key. Preferred
+    /// over inline `api_key` so the key doesn't sit in plaintext
+    /// in a shared config file.
+    #[serde(default)]
+    api_key_path: Option<String>,
+    /// Inline API key. Overrides `api_key_path` when both are
+    /// set. Present so tests / dev setups can supply a key
+    /// without a filesystem indirection.
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    min_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLrclib {
+    #[serde(default)]
+    min_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -86,12 +86,17 @@
 mod browse_recording_type;
 mod cache;
 mod config;
+mod enrichment;
+mod enrichment_cache;
 mod reconcile;
 
 use std::future::Future;
 use std::sync::Arc;
 
-use evo_online_providers::{build_http_client, MusicBrainzClient, RateLimiter};
+use evo_online_providers::{
+    build_http_client, LastfmClient, LrclibClient, MusicBrainzClient,
+    RateLimiter,
+};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -116,6 +121,14 @@ const REQUEST_METADATA_RECONCILE_RELEASE: &str = "metadata.reconcile_release";
 const REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE: &str =
     "library.browse_by_recording_type";
 
+/// Piece 6 enrichment verbs. LRCLIB lyrics is keyless. Bio +
+/// album-notes provider is Last.fm; when the operator has not
+/// supplied an API key the verbs return structured
+/// `not_configured` responses rather than fabricated data.
+const REQUEST_METADATA_QUERY_LYRICS: &str = "metadata.query_lyrics";
+const REQUEST_METADATA_QUERY_ARTIST_BIO: &str = "metadata.query_artist_bio";
+const REQUEST_METADATA_QUERY_ALBUM_NOTES: &str = "metadata.query_album_notes";
+
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML).expect(
@@ -133,7 +146,12 @@ pub struct MetadataOnlinePlugin {
     loaded: bool,
     config: PluginConfig,
     mb_client: Option<MusicBrainzClient>,
+    lastfm_client: Option<LastfmClient>,
+    lrclib_client: Option<LrclibClient>,
     reconcile_cache: Option<cache::ReconcileCache>,
+    lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
+    bio_cache: Option<enrichment_cache::EnrichmentCache>,
+    notes_cache: Option<enrichment_cache::EnrichmentCache>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -144,7 +162,12 @@ impl MetadataOnlinePlugin {
             loaded: false,
             config: PluginConfig::defaults(),
             mb_client: None,
+            lastfm_client: None,
+            lrclib_client: None,
             reconcile_cache: None,
+            lyrics_cache: None,
+            bio_cache: None,
+            notes_cache: None,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -175,6 +198,9 @@ impl Plugin for MetadataOnlinePlugin {
                     request_types: vec![
                         REQUEST_METADATA_RECONCILE_RELEASE.to_string(),
                         REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE.to_string(),
+                        REQUEST_METADATA_QUERY_LYRICS.to_string(),
+                        REQUEST_METADATA_QUERY_ARTIST_BIO.to_string(),
+                        REQUEST_METADATA_QUERY_ALBUM_NOTES.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -206,17 +232,53 @@ impl Plugin for MetadataOnlinePlugin {
                         "invalid plugin config: {e}"
                     ))
                 })?;
+            // Shared HTTPS client — single connection pool +
+            // DNS cache across every online provider in this
+            // plugin.
             let http = build_http_client(self.config.request_timeout);
-            let rate = Arc::new(RateLimiter::new(
+            let mb_rate = Arc::new(RateLimiter::new(
                 self.config.musicbrainz_min_interval,
             ));
             self.mb_client = Some(MusicBrainzClient::new(
-                http,
-                rate,
+                http.clone(),
+                mb_rate,
                 self.config.musicbrainz_user_agent.clone(),
             ));
+            let lrclib_rate =
+                Arc::new(RateLimiter::new(self.config.lrclib_min_interval));
+            self.lrclib_client = Some(LrclibClient::new(
+                http.clone(),
+                lrclib_rate,
+                self.config.musicbrainz_user_agent.clone(),
+            ));
+            self.lastfm_client = if let Some(key) =
+                self.config.lastfm_api_key.clone()
+            {
+                let lastfm_rate =
+                    Arc::new(RateLimiter::new(self.config.lastfm_min_interval));
+                Some(LastfmClient::new(
+                    http.clone(),
+                    lastfm_rate,
+                    self.config.musicbrainz_user_agent.clone(),
+                    key,
+                ))
+            } else {
+                None
+            };
             self.reconcile_cache = Some(cache::ReconcileCache::new(
                 ctx.state_dir.join("reconcile_cache"),
+                self.config.negative_ttl,
+            ));
+            self.lyrics_cache = Some(enrichment_cache::EnrichmentCache::new(
+                ctx.state_dir.join("lyrics_cache"),
+                self.config.negative_ttl,
+            ));
+            self.bio_cache = Some(enrichment_cache::EnrichmentCache::new(
+                ctx.state_dir.join("bio_cache"),
+                self.config.negative_ttl,
+            ));
+            self.notes_cache = Some(enrichment_cache::EnrichmentCache::new(
+                ctx.state_dir.join("album_notes_cache"),
                 self.config.negative_ttl,
             ));
             tracing::info!(
@@ -224,6 +286,8 @@ impl Plugin for MetadataOnlinePlugin {
                 cache_wired = self.reconcile_cache.is_some(),
                 musicbrainz_ua = %self.config.musicbrainz_user_agent,
                 mb_min_interval_ms = self.config.musicbrainz_min_interval.as_millis() as u64,
+                lastfm_configured = self.lastfm_client.is_some(),
+                lrclib_wired = self.lrclib_client.is_some(),
                 "load complete"
             );
             self.loaded = true;
@@ -238,7 +302,12 @@ impl Plugin for MetadataOnlinePlugin {
             self.loaded = false;
             self.config = PluginConfig::defaults();
             self.mb_client = None;
+            self.lastfm_client = None;
+            self.lrclib_client = None;
             self.reconcile_cache = None;
+            self.lyrics_cache = None;
+            self.bio_cache = None;
+            self.notes_cache = None;
             Ok(())
         }
     }
@@ -273,6 +342,9 @@ impl Respondent for MetadataOnlinePlugin {
             let known = [
                 REQUEST_METADATA_RECONCILE_RELEASE,
                 REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE,
+                REQUEST_METADATA_QUERY_LYRICS,
+                REQUEST_METADATA_QUERY_ARTIST_BIO,
+                REQUEST_METADATA_QUERY_ALBUM_NOTES,
             ];
             if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
@@ -297,37 +369,111 @@ impl Respondent for MetadataOnlinePlugin {
                 .mb_client
                 .clone()
                 .expect("mb client present after load");
-            let cache = self.reconcile_cache.clone();
+            let lrclib = self
+                .lrclib_client
+                .clone()
+                .expect("lrclib client present after load");
+            let lastfm = self.lastfm_client.clone();
+            let reconcile_cache = self.reconcile_cache.clone();
+            let lyrics_cache = self.lyrics_cache.clone();
+            let bio_cache = self.bio_cache.clone();
+            let notes_cache = self.notes_cache.clone();
             let payload = req.payload.clone();
-            let body = if req.request_type == REQUEST_METADATA_RECONCILE_RELEASE
-            {
-                let response =
-                    reconcile::reconcile(&payload, &mb, cache.as_ref())
+            let body = match req.request_type.as_str() {
+                REQUEST_METADATA_RECONCILE_RELEASE => {
+                    let response = reconcile::reconcile(
+                        &payload,
+                        &mb,
+                        reconcile_cache.as_ref(),
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.reconcile_release response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE => {
+                    let cache_ref =
+                        reconcile_cache.as_ref().ok_or_else(|| {
+                            PluginError::Permanent(
+                            "reconcile cache not wired at load — cannot serve \
+                             library.browse_by_recording_type"
+                                .to_string(),
+                        )
+                        })?;
+                    let response =
+                        browse_recording_type::browse_by_recording_type(
+                            &payload, &mb, cache_ref,
+                        )
                         .await
                         .map_err(PluginError::Permanent)?;
-                response.json_bytes().map_err(|e| {
-                    PluginError::Permanent(format!(
-                        "metadata.reconcile_release response JSON: {e}"
-                    ))
-                })?
-            } else {
-                let cache_ref = cache.as_ref().ok_or_else(|| {
-                    PluginError::Permanent(
-                        "reconcile cache not wired at load — cannot serve \
-                         library.browse_by_recording_type"
-                            .to_string(),
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "library.browse_by_recording_type response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_METADATA_QUERY_LYRICS => {
+                    let cache_ref = lyrics_cache.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "lyrics cache not wired at load".to_string(),
+                        )
+                    })?;
+                    let response =
+                        enrichment::query_lyrics(&payload, &lrclib, cache_ref)
+                            .await
+                            .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_lyrics response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_METADATA_QUERY_ARTIST_BIO => {
+                    let cache_ref = bio_cache.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "bio cache not wired at load".to_string(),
+                        )
+                    })?;
+                    let response = enrichment::query_artist_bio(
+                        &payload,
+                        lastfm.as_ref(),
+                        cache_ref,
                     )
-                })?;
-                let response = browse_recording_type::browse_by_recording_type(
-                    &payload, &mb, cache_ref,
-                )
-                .await
-                .map_err(PluginError::Permanent)?;
-                response.json_bytes().map_err(|e| {
-                    PluginError::Permanent(format!(
-                        "library.browse_by_recording_type response JSON: {e}"
-                    ))
-                })?
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_artist_bio response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_METADATA_QUERY_ALBUM_NOTES => {
+                    let cache_ref = notes_cache.as_ref().ok_or_else(|| {
+                        PluginError::Permanent(
+                            "notes cache not wired at load".to_string(),
+                        )
+                    })?;
+                    let response = enrichment::query_album_notes(
+                        &payload,
+                        lastfm.as_ref(),
+                        cache_ref,
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_album_notes response JSON: {e}"
+                        ))
+                    })?
+                }
+                other => {
+                    return Err(PluginError::Permanent(format!(
+                        "unknown request type (defensive): {other}"
+                    )));
+                }
             };
             Ok(Response::for_request(req, body))
         }

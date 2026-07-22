@@ -14,6 +14,9 @@ shape = 1
 role = "respondent"
 request_types = [
     "metadata.reconcile_release",
+    "metadata.query_lyrics",
+    "metadata.query_artist_bio",
+    "metadata.query_album_notes",
 ]
 
 [[stockings]]
@@ -54,6 +57,9 @@ restart_budget = 5
 [capabilities.respondent]
 request_types = [
     "metadata.reconcile_release",
+    "metadata.query_lyrics",
+    "metadata.query_artist_bio",
+    "metadata.query_album_notes",
     "library.browse_by_recording_type",
 ]
 response_budget_ms = 120000
