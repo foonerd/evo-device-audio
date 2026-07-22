@@ -59,16 +59,58 @@ impl PluginConfig {
                 );
             }
         }
-        let library_roots = match table.get("library") {
-            None => Vec::new(),
-            Some(toml::Value::Table(t)) => parse_library_roots(t)?,
+        let mut library_roots: Vec<PathBuf> = Vec::new();
+        // Auto-derive from MPD's canonical config first — same
+        // discipline as artwork.local. Absent an operator
+        // [library] section, we still resolve mpd-path values
+        // that are library-relative against MPD's
+        // music_directory. Logging surfaces the outcome so
+        // operators see exactly which path the plugin walks.
+        match evo_device_audio_shared::load_music_directory_from_mpd_conf(
+            std::path::Path::new(
+                evo_device_audio_shared::DEFAULT_MPD_CONF_PATH,
+            ),
+        ) {
+            Some(p) if p.is_absolute() => {
+                tracing::info!(
+                    plugin = crate::PLUGIN_NAME,
+                    music_directory = %p.display(),
+                    "auto-derived MPD music_directory from /etc/mpd.conf"
+                );
+                library_roots.push(p);
+            }
+            Some(p) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    value = %p.display(),
+                    "MPD music_directory is not absolute; skipping auto-derived root"
+                );
+            }
+            None => {
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    "MPD music_directory not found at canonical path; \
+                     relying on operator [library] roots config"
+                );
+            }
+        }
+        // Operator [library] section extends (does not replace)
+        // the auto-derived roots. This matches the artwork.local
+        // pattern: the auto-derived value is the primary truth
+        // path; the operator config is additive.
+        match table.get("library") {
+            None => {}
+            Some(toml::Value::Table(t)) => {
+                let mut operator_roots = parse_library_roots(t)?;
+                library_roots.append(&mut operator_roots);
+            }
             other => {
                 return Err(ConfigError {
                     key: "library".into(),
                     message: format!("expected a table, got {other:?}"),
                 });
             }
-        };
+        }
         let metadata_profile = match table.get("metadata") {
             None => MetadataProfile::default(),
             Some(toml::Value::Table(t)) => parse_metadata_profile(t)?,
