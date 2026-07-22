@@ -96,6 +96,22 @@ pub(crate) struct ShelfBundle {
     pub(crate) idle_observer: Option<IdleObserverHandle>,
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
+    /// Cross-plugin shelf dispatcher, threaded from
+    /// [`LoadContext::shelf_request_dispatcher`]. `None` on
+    /// OOP admission today — the framework's plugin-subprocess
+    /// wire protocol does not yet propagate the dispatcher
+    /// handle across the boundary. Held on the bundle so a
+    /// future in-process composition path can consume it
+    /// without further threading. Currently unused;
+    /// `library.browse_by_recording_type` lives on the shelf's
+    /// metadata.online co-tenant instead of dispatching from
+    /// here.
+    #[allow(dead_code)]
+    pub(crate) shelf_dispatcher: Option<
+        Arc<
+            dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+        >,
+    >,
 }
 
 impl ShelfBundle {
@@ -111,6 +127,11 @@ impl ShelfBundle {
         subjects: Arc<dyn SubjectAnnouncer>,
         endpoint: MpdEndpoint,
         timeouts: ConnectTimeouts,
+        shelf_dispatcher: Option<
+            Arc<
+                dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+            >,
+        >,
     ) -> Self {
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
@@ -292,6 +313,7 @@ impl ShelfBundle {
             idle_observer,
             endpoint,
             timeouts,
+            shelf_dispatcher,
         }
     }
 

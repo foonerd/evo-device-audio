@@ -28,6 +28,22 @@ request_types = [
     "metadata.reconcile_release",
 ]
 
+# Co-tenant of the audio.library shelf alongside
+# playback.mpd. This plugin owns the reconciliation-derived
+# facet verb (`library.browse_by_recording_type`) — it composes
+# MPD-side album enumeration with MB-side reconciliation
+# identity to filter albums by canonical recording type
+# (Studio / Live / Compilation / Soundtrack). Verb partition
+# is enforced by the Stocking primitive; playback.mpd retains
+# the other library verbs.
+[[stockings]]
+shelf = "audio.library"
+shape = 1
+role = "respondent"
+request_types = [
+    "library.browse_by_recording_type",
+]
+
 [kind]
 instance = "singleton"
 interaction = "respondent"
@@ -55,5 +71,8 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["metadata.reconcile_release"]
-response_budget_ms = 15000
+request_types = [
+    "metadata.reconcile_release",
+    "library.browse_by_recording_type",
+]
+response_budget_ms = 120000

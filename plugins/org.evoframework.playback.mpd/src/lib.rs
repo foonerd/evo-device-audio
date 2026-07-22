@@ -2411,6 +2411,7 @@ impl Plugin for MpdPlaybackPlugin {
                 Arc::clone(&ctx.subject_announcer) as Arc<dyn SubjectAnnouncer>,
                 self.endpoint.clone(),
                 self.timeouts,
+                ctx.shelf_request_dispatcher.clone(),
             )
             .await;
             self.shelves = Some(shelves);

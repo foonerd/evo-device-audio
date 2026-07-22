@@ -16,6 +16,14 @@ request_types = [
     "metadata.reconcile_release",
 ]
 
+[[stockings]]
+shelf = "audio.library"
+shape = 1
+role = "respondent"
+request_types = [
+    "library.browse_by_recording_type",
+]
+
 [kind]
 instance = "singleton"
 interaction = "respondent"
@@ -44,5 +52,8 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["metadata.reconcile_release"]
-response_budget_ms = 15000
+request_types = [
+    "metadata.reconcile_release",
+    "library.browse_by_recording_type",
+]
+response_budget_ms = 120000

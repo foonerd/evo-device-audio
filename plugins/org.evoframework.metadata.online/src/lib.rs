@@ -83,8 +83,10 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+mod browse_recording_type;
 mod cache;
 mod config;
+mod mpd_client;
 mod reconcile;
 
 use std::future::Future;
@@ -106,8 +108,14 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Plugin reverse-DNS name; shared with the manifest and tests.
 pub const PLUGIN_NAME: &str = "org.evoframework.metadata.online";
 
-/// Sole request type handled by this plugin.
+/// The reconciliation verb — cornerstone of piece 3.
 const REQUEST_METADATA_RECONCILE_RELEASE: &str = "metadata.reconcile_release";
+
+/// The recording-type facet browse verb — piece 5. Composes
+/// MPD-side enumeration with the reconciliation identity to
+/// filter albums by their canonical recording type.
+const REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE: &str =
+    "library.browse_by_recording_type";
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -166,7 +174,8 @@ impl Plugin for MetadataOnlinePlugin {
                 },
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec![
-                        REQUEST_METADATA_RECONCILE_RELEASE.to_string()
+                        REQUEST_METADATA_RECONCILE_RELEASE.to_string(),
+                        REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -262,13 +271,16 @@ impl Respondent for MetadataOnlinePlugin {
                     "request deadline already expired".to_string(),
                 ));
             }
-            if req.request_type != REQUEST_METADATA_RECONCILE_RELEASE {
+            let known = [
+                REQUEST_METADATA_RECONCILE_RELEASE,
+                REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE,
+            ];
+            if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
-                    req.request_type,
-                    [REQUEST_METADATA_RECONCILE_RELEASE]
+                    req.request_type, known
                 )));
             }
             self.requests_handled
@@ -279,7 +291,7 @@ impl Respondent for MetadataOnlinePlugin {
                 request_type = %req.request_type,
                 cid = req.correlation_id,
                 payload_len = req.payload.len(),
-                "metadata.reconcile_release"
+                "handling request"
             );
 
             let mb = self
@@ -288,14 +300,36 @@ impl Respondent for MetadataOnlinePlugin {
                 .expect("mb client present after load");
             let cache = self.reconcile_cache.clone();
             let payload = req.payload.clone();
-            let response = reconcile::reconcile(&payload, &mb, cache.as_ref())
+            let body = if req.request_type == REQUEST_METADATA_RECONCILE_RELEASE
+            {
+                let response =
+                    reconcile::reconcile(&payload, &mb, cache.as_ref())
+                        .await
+                        .map_err(PluginError::Permanent)?;
+                response.json_bytes().map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "metadata.reconcile_release response JSON: {e}"
+                    ))
+                })?
+            } else {
+                let cache_ref = cache.as_ref().ok_or_else(|| {
+                    PluginError::Permanent(
+                        "reconcile cache not wired at load — cannot serve \
+                         library.browse_by_recording_type"
+                            .to_string(),
+                    )
+                })?;
+                let response = browse_recording_type::browse_by_recording_type(
+                    &payload, &mb, cache_ref,
+                )
                 .await
                 .map_err(PluginError::Permanent)?;
-            let body = response.json_bytes().map_err(|e| {
-                PluginError::Permanent(format!(
-                    "metadata.reconcile_release response JSON: {e}"
-                ))
-            })?;
+                response.json_bytes().map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "library.browse_by_recording_type response JSON: {e}"
+                    ))
+                })?
+            };
             Ok(Response::for_request(req, body))
         }
     }
