@@ -84,9 +84,18 @@ impl ArtworkSize {
     /// Parse the wire-shape `size` string. Returns `None` on
     /// unrecognised input so callers can surface a structured
     /// `bad_request` rather than silently coercing.
+    ///
+    /// Canonical taxonomy is `small | medium | large |
+    /// original`; `tiny` is retained as a backward-compat
+    /// alias for `small` so pre-existing wire callers don't
+    /// break. This matches the framework's resolve endpoint
+    /// (`crates/evo-runtime-http/src/artwork_resolve_endpoint.rs`)
+    /// which canonicalises `tiny → small` at the boundary; the
+    /// plugin accepts both so the endpoint can also pass the
+    /// canonical name through directly.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "tiny" => Some(Self::Tiny),
+            "small" | "tiny" => Some(Self::Tiny),
             "medium" => Some(Self::Medium),
             "large" => Some(Self::Large),
             "original" => Some(Self::Original),
@@ -95,10 +104,11 @@ impl ArtworkSize {
     }
 
     /// Wire-shape string for the variant. Round-trips with
-    /// `parse`.
+    /// `parse` on the canonical name (`small`, not `tiny` —
+    /// `tiny` is a legacy alias accepted on input only).
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Tiny => "tiny",
+            Self::Tiny => "small",
             Self::Medium => "medium",
             Self::Large => "large",
             Self::Original => "original",
@@ -260,14 +270,32 @@ mod tests {
     }
 
     #[test]
-    fn size_parse_round_trip() {
-        for s in ["tiny", "medium", "large", "original"] {
+    fn size_parse_round_trip_on_canonical_names() {
+        // Canonical wire names round-trip parse→as_str.
+        for s in ["small", "medium", "large", "original"] {
             let parsed = ArtworkSize::parse(s).unwrap();
             assert_eq!(parsed.as_str(), s);
         }
         assert!(ArtworkSize::parse("xl").is_none());
         assert!(ArtworkSize::parse("").is_none());
-        assert!(ArtworkSize::parse("TINY").is_none()); // case-sensitive
+        assert!(ArtworkSize::parse("SMALL").is_none()); // case-sensitive
+    }
+
+    #[test]
+    fn size_parse_accepts_tiny_as_alias_for_small() {
+        // `tiny` is the pre-2026-07-21 wire name for what the
+        // canonical taxonomy now calls `small`. Accept on
+        // input; canonicalise to `small` on output so the
+        // wire response carries the current-canonical name.
+        let parsed = ArtworkSize::parse("tiny").unwrap();
+        assert_eq!(parsed, ArtworkSize::Tiny);
+        assert_eq!(
+            parsed.as_str(),
+            "small",
+            "as_str MUST return the canonical name, not the legacy alias"
+        );
+        // Round-trip via canonical.
+        assert_eq!(ArtworkSize::parse("small").unwrap(), ArtworkSize::Tiny);
     }
 
     #[test]

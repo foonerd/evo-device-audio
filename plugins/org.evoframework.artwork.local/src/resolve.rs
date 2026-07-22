@@ -386,7 +386,7 @@ pub(crate) fn resolve_artwork(
                     mime: None,
                     size: None,
                     detail: Some(format!(
-                        "unknown size: {size_str} (expected tiny | medium | large | original)"
+                        "unknown size: {size_str} (expected small | medium | large | original; `tiny` accepted as alias for `small`)"
                     )),
                 },
                 cache_payload: None,

@@ -36,7 +36,7 @@
 //! {
 //!   "v": 1,
 //!   "target": { "scheme": "mpd-album", "value": "{artist}|{album}" },
-//!   "size": "tiny" | "medium" | "large" | "original"
+//!   "size": "small" | "medium" | "large" | "original" (`tiny` accepted as alias for `small`)
 //! }
 //! ```
 //!
@@ -51,7 +51,7 @@
 //!   "status": "ok" | "not_found" | "unsupported" | "bad_request",
 //!   "content_hash": "<sha256 hex>" | null,
 //!   "mime": "image/webp" | "image/jpeg" | null,
-//!   "size": "tiny" | "medium" | "large" | "original" | null,
+//!   "size": "small" | "medium" | "large" | "original" (`tiny` accepted as alias for `small`) | null,
 //!   "provider_id": "cover_art_archive" | "lastfm" | "itunes" | "volumio_meta" | null,
 //!   "detail": "<operator-readable detail>" | null
 //! }
