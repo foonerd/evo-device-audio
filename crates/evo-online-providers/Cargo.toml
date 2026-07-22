@@ -1,0 +1,25 @@
+[package]
+name = "evo-online-providers"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared HTTPS client, per-provider rate limiting, and MusicBrainz API access primitives for online-metadata plugins in the evo audio reference distribution (artwork.online + metadata.online)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Outbound HTTPS: rustls backend matches the framework's TLS
+# posture (no system OpenSSL dependency on cross-build targets).
+# Same shape artwork.online already carries — this crate is the
+# single point at which the audio distribution builds its HTTPS
+# client so every online-provider plugin shares one connection
+# pool, DNS cache, and User-Agent posture.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

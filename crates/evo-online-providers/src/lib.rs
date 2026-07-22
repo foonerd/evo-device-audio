@@ -1,0 +1,43 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared HTTPS client, per-provider rate limiting, and
+//! MusicBrainz API access primitives for online-metadata plugins
+//! in the evo audio reference distribution.
+//!
+//! This crate is the single point at which the audio
+//! distribution builds its outbound HTTPS client + throttles
+//! per-provider request rates. Both `artwork.online` (cover
+//! bytes) and `metadata.online` (bio, notes, lyrics, MusicBrainz
+//! reconciliation) consume it — one connection pool, one DNS
+//! cache, one shared token bucket per provider. Without this
+//! sharing, two plugins hitting MusicBrainz independently would
+//! bust the 1 req/sec API policy under any browse burst.
+//!
+//! ## Contents
+//!
+//! - [`build_http_client`] — reqwest client factory with the
+//!   distribution's canonical TLS + timeout + redirect posture.
+//! - [`RateLimiter`] — single-provider token bucket. Refill rate
+//!   is per-second; burst capacity is 1 (strict rate limiting,
+//!   no bursty compensation). Multiple in-flight callers await
+//!   sequentially.
+//! - [`musicbrainz`] — MusicBrainz JSON API client (search
+//!   releases, look up release+release-group). Governs the API's
+//!   1 req/sec cap via a shared `RateLimiter`, threads the
+//!   distribution's User-Agent, parses the salient response
+//!   fields into strongly-typed structs.
+//!
+//! Cover Art Archive (CAA) is deliberately NOT rate-limited
+//! here: it's a static-file service (imagedelivery from the
+//! MetaBrainz CDN, not `musicbrainz.org`) and has no
+//! per-second policy. Only calls to `musicbrainz.org/ws/2/…`
+//! flow through the [`musicbrainz`] client.
+
+pub mod http;
+pub mod musicbrainz;
+pub mod rate_limit;
+
+pub use http::build_http_client;
+pub use musicbrainz::{MusicBrainzClient, MusicBrainzError};
+pub use rate_limit::RateLimiter;

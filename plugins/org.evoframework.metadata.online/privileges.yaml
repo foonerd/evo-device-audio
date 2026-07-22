@@ -1,0 +1,30 @@
+schema_version: "1.0"
+plugin: org.evoframework.metadata.online
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.metadata.online/`. This
+# plugin reconciles local library metadata to authoritative
+# release identity via the MusicBrainz JSON API. Every
+# outbound request is throttled to MusicBrainz's 1 req/sec
+# policy through a shared token bucket in the
+# `evo-online-providers` crate.
+
+capability_intent:
+  - id: outbound_https
+    need: reconcile local (artist, album) pairs against the MusicBrainz release catalogue to derive canonical artist/album/release_group MBIDs, first-release year, recording_type (Studio / Live / Compilation / Soundtrack), and track count. All requests over HTTPS to musicbrainz.org/ws/2/ within the API's 1 req/sec policy governed by a shared per-provider token bucket.
+    access_path: network/outbound_https
+    failure_mode: respond with structured not_found on empty MB search or lookup; propagate transient HTTPS errors verbatim so the operator sees why a reconciliation failed; never panic.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+host_provisioning: {}

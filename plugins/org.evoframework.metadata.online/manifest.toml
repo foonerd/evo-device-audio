@@ -1,0 +1,59 @@
+# In-process manifest for org.evoframework.metadata.online.
+#
+# Sole responsibility: reconcile a `(artist, album)` pair against
+# the MusicBrainz catalogue and return the canonical release
+# identity — MBID, release-group MBID, artist MBID, canonical
+# artist/album strings, first-release year, recording_type
+# (Studio / Live / Compilation / Soundtrack), track count. The
+# downstream browse-by-recording-type verb (piece 5) and the
+# authoritative-artwork lookup (via CAA MBID) both depend on
+# this identity.
+#
+# Co-occupies the metadata.providers shelf with
+# org.evoframework.metadata.local: the two plugins partition the
+# shelf's verb set (this plugin owns `metadata.reconcile_release`,
+# the local plugin owns `metadata.query`). The framework's
+# Stocking primitive enforces the partition.
+
+[plugin]
+name = "org.evoframework.metadata.online"
+version = "0.1.0"
+contract = 1
+
+[[stockings]]
+shelf = "metadata.providers"
+shape = 1
+role = "respondent"
+request_types = [
+    "metadata.reconcile_release",
+]
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.13-dev"
+os_family = "linux"
+filesystem_scopes = []
+outbound_network = true
+
+[resources]
+max_memory_mb = 24
+max_cpu_percent = 5
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["metadata.reconcile_release"]
+response_budget_ms = 15000

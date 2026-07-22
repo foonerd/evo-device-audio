@@ -1,0 +1,48 @@
+# Out-of-process manifest for org.evoframework.metadata.online.
+#
+# Production bundle source; the publish pipeline renames this
+# file to `manifest.toml` inside the staged bundle.
+
+[plugin]
+name = "org.evoframework.metadata.online"
+version = "0.1.0"
+contract = 1
+
+[[stockings]]
+shelf = "metadata.providers"
+shape = 1
+role = "respondent"
+request_types = [
+    "metadata.reconcile_release",
+]
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.13-dev"
+os_family = "linux"
+filesystem_scopes = []
+outbound_network = true
+
+[resources]
+max_memory_mb = 24
+max_cpu_percent = 5
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["metadata.reconcile_release"]
+response_budget_ms = 15000

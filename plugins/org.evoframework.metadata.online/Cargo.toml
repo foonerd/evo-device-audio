@@ -1,0 +1,32 @@
+[package]
+name = "org-evoframework-metadata-online"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Online metadata respondent: MusicBrainz reconciliation (canonical artist/album/release/year/recording_type) with 1 req/sec rate limiting and persistent cache. Co-tenant of the metadata.providers shelf alongside metadata.local."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "metadata-online-wire"
+path = "src/bin/metadata-online-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+evo-device-audio-shared = { workspace = true }
+evo-online-providers = { path = "../../crates/evo-online-providers" }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

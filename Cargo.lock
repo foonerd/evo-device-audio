@@ -1570,6 +1570,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-online-providers"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evo-os-clock"
 version = "0.1.13-dev"
 dependencies = [
@@ -3556,6 +3568,7 @@ dependencies = [
  "anyhow",
  "base64",
  "evo-device-audio-shared",
+ "evo-online-providers",
  "evo-plugin-sdk",
  "hex",
  "image",
@@ -3657,6 +3670,25 @@ dependencies = [
  "evo-device-audio-shared",
  "evo-plugin-sdk",
  "lofty",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "org-evoframework-metadata-online"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evo-device-audio-shared",
+ "evo-online-providers",
+ "evo-plugin-sdk",
  "semver",
  "serde",
  "serde_json",

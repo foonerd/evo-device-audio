@@ -31,9 +31,15 @@
 //! returned to the caller as not-found.
 
 use reqwest::Client;
-use std::time::Duration;
 
 use crate::config::PluginConfig;
+
+// Reuse the shared distribution client factory. artwork.online +
+// metadata.online share connection pool + DNS cache + TLS
+// posture. Local `build_http_client` re-exported so existing
+// call sites in this crate compile without churn — but the
+// implementation is the shared crate's.
+pub(crate) use evo_online_providers::build_http_client;
 
 /// One successful provider hit.
 pub(crate) struct ProviderHit {
@@ -47,22 +53,6 @@ pub(crate) struct ProviderHit {
     /// Round-trips on the wire-shape response so the operator UI
     /// can show "from MusicBrainz" / "from iTunes" etc.
     pub(crate) provider_id: &'static str,
-}
-
-/// Build the shared HTTP client. One per plugin load —
-/// connection pooling + DNS cache reuse across cascade calls.
-pub(crate) fn build_http_client(timeout: Duration) -> Client {
-    Client::builder()
-        .timeout(timeout)
-        // Generous redirect limit covers CAA's 307 redirect
-        // chain to the actual image URL.
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        // Build failures here are framework-level configuration
-        // errors (TLS init, threadpool spawn); refusing to admit
-        // is the right shape. Construction error surfaces to
-        // the plugin's load() return.
-        .expect("reqwest client builder")
 }
 
 /// Cascade walker.
