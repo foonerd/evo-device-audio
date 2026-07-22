@@ -1020,6 +1020,45 @@ impl MpdConnection {
         Ok(parse_library_entries(&fields))
     }
 
+    /// List distinct values of a single MPD tag across the
+    /// library.
+    ///
+    /// Wire form: `list "<tag>"\n` — MPD returns lines like
+    /// `Artist: <name>` or `Album: <title>` (the key mirrors the
+    /// TYPE argument). This method extracts the value strings
+    /// (after the `<key>: ` prefix), preserving MPD's own
+    /// ordering — for tags that MPD indexes, that ordering is
+    /// stable across calls so pagination is deterministic
+    /// without a sort pass here.
+    ///
+    /// `tag` accepts any MPD tag name string: `artist`,
+    /// `album`, `genre`, `date`, `albumartist`, etc. Callers
+    /// pass the canonical protocol-level string; the browse
+    /// verbs hardcode the four the operator surface exposes.
+    ///
+    /// Empty values (MPD emits `Artist: ` on tag-less files
+    /// when it wants to represent the tag-absent bucket) are
+    /// filtered out before return — a browse-by-artist facet
+    /// shouldn't include a blank entry that operator UI has
+    /// no useful label for.
+    pub(crate) async fn list_tag(
+        &mut self,
+        tag: &str,
+    ) -> Result<Vec<String>, MpdError> {
+        let fields = self.dispatch("list", &[tag]).await?;
+        Ok(fields
+            .into_iter()
+            .filter_map(|f| {
+                let trimmed = f.value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect())
+    }
+
     /// Trigger an incremental library scan.
     ///
     /// Wire form: `update "<path>"\n` (when path non-empty) or

@@ -561,6 +561,46 @@ impl ShelfBundle {
             "library.get_work_recordings" => {
                 Ok(Some(self.dispatch_library_get_work_recordings(req).await?))
             }
+            "library.browse_by_artist" => Ok(Some(
+                self.dispatch_library_browse_by_tag(
+                    req,
+                    "library.browse_by_artist",
+                    "artist",
+                    "artist",
+                    library::identity_post_process,
+                )
+                .await?,
+            )),
+            "library.browse_by_album" => Ok(Some(
+                self.dispatch_library_browse_by_tag(
+                    req,
+                    "library.browse_by_album",
+                    "album",
+                    "album",
+                    library::identity_post_process,
+                )
+                .await?,
+            )),
+            "library.browse_by_genre" => Ok(Some(
+                self.dispatch_library_browse_by_tag(
+                    req,
+                    "library.browse_by_genre",
+                    "genre",
+                    "genre",
+                    library::identity_post_process,
+                )
+                .await?,
+            )),
+            "library.browse_by_year" => Ok(Some(
+                self.dispatch_library_browse_by_tag(
+                    req,
+                    "library.browse_by_year",
+                    "date",
+                    "year",
+                    library::year_from_mpd_date,
+                )
+                .await?,
+            )),
             _ => Ok(None),
         }
     }
@@ -957,6 +997,35 @@ impl ShelfBundle {
             library::handle_search_library(&self.library, &mut conn, payload)
                 .await
                 .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+
+    /// Common dispatcher for the four facet-browse verbs
+    /// (`library.browse_by_{artist,album,genre,year}`). Each
+    /// verb calls this with its own `(verb_name, tag,
+    /// facet_key, post_process)` — the underlying flow
+    /// (parse-payload → open-connection → run MPD `list <tag>`
+    /// → paginate) is identical.
+    async fn dispatch_library_browse_by_tag(
+        &self,
+        req: &Request,
+        verb_name: &'static str,
+        tag: &'static str,
+        facet_key: &'static str,
+        post_process: fn(String) -> Option<String>,
+    ) -> Result<Response, PluginError> {
+        let payload: library::BrowseByTagPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let env = library::handle_browse_by_tag(
+            &mut conn,
+            payload,
+            verb_name,
+            tag,
+            facet_key,
+            post_process,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
         encode_json_response(req, &env)
     }
 

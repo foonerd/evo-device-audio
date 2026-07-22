@@ -270,6 +270,10 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.search_library",
     "library.list_works",
     "library.get_work_recordings",
+    "library.browse_by_artist",
+    "library.browse_by_album",
+    "library.browse_by_genre",
+    "library.browse_by_year",
 ];
 
 /// Wire-protocol payload version every source-verb request

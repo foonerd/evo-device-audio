@@ -873,6 +873,111 @@ pub(crate) async fn handle_browse_library(
     }))
 }
 
+/// Payload for the four facet-browse verbs
+/// (`library.browse_by_artist`, `_album`, `_genre`, `_year`).
+///
+/// Pagination shape mirrors [`BrowseLibraryPayload`]: `page` +
+/// `page_size` both optional; response envelope carries
+/// `next_page` + `truncated` + `total` so the operator UI can
+/// scroll a long facet list without fetching everything at
+/// once.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BrowseByTagPayload {
+    pub(crate) v: u32,
+    #[serde(default)]
+    pub(crate) page: Option<usize>,
+    #[serde(default)]
+    pub(crate) page_size: Option<usize>,
+}
+
+/// Return the paged distinct values for a single MPD tag.
+///
+/// Common core for all four facet-browse verbs — the caller
+/// supplies the tag protocol string (`artist`, `album`,
+/// `genre`, `date`) and the verb name for error attribution;
+/// this function issues the MPD `list <tag>` command, applies
+/// optional value post-processing (e.g. year extraction from
+/// `date` which MPD stores as YYYY or YYYY-MM-DD), sorts case-
+/// insensitively for a stable operator-visible ordering, and
+/// paginates. Returns the standard envelope shape.
+pub(crate) async fn handle_browse_by_tag(
+    conn: &mut MpdConnection,
+    payload: BrowseByTagPayload,
+    verb_name: &'static str,
+    tag: &'static str,
+    facet_key: &'static str,
+    post_process: fn(String) -> Option<String>,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, verb_name)?;
+    let page = payload.page.unwrap_or(0);
+    let requested_size = payload.page_size.unwrap_or(BROWSE_HARD_CAP);
+    let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
+    let range_start = page.saturating_mul(page_size);
+
+    let raw_values = conn.list_tag(tag).await.map_err(|e| VerbError::Mpd {
+        verb: verb_name.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    // Post-process + deduplicate.
+    //
+    // Some tags need normalisation before the facet list is
+    // useful (year extraction from MPD's `date` field). After
+    // that, distinct values may collapse — e.g. `1997` and
+    // `1997-06-16` both yield `1997`. Deduplication happens here
+    // (rather than at MPD's list layer) because MPD's list is
+    // already-distinct for the RAW tag value, not the processed
+    // form.
+    let mut seen = std::collections::HashSet::new();
+    let mut processed: Vec<String> = raw_values
+        .into_iter()
+        .filter_map(post_process)
+        .filter(|v| seen.insert(v.clone()))
+        .collect();
+    // Case-insensitive lexicographic sort for a stable
+    // operator-visible ordering — MPD returns tags in an
+    // internal order that is stable across calls but not
+    // alphabetical.
+    processed.sort_by_key(|a| a.to_lowercase());
+
+    let rendered: Vec<serde_json::Value> =
+        processed.iter().map(|v| json!({ facet_key: v })).collect();
+    let (page_entries, next_page, truncated) =
+        paginate(&rendered, range_start, page_size);
+    Ok(json!({
+        "v":         LIBRARY_PAYLOAD_VERSION,
+        "facet":     facet_key,
+        "entries":   page_entries,
+        "page":      page,
+        "page_size": page_size,
+        "total":     rendered.len(),
+        "truncated": truncated,
+        "next_page": next_page,
+    }))
+}
+
+/// Extract the four-character year from MPD's `date` tag,
+/// tolerating any of the shapes MPD emits (`YYYY`, `YYYY-MM`,
+/// `YYYY-MM-DD`). Returns `None` when the tag doesn't start
+/// with four ASCII digits — the entry is dropped from the
+/// facet list rather than surfaced as a garbage bucket.
+pub(crate) fn year_from_mpd_date(raw: String) -> Option<String> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let candidate: String = raw.chars().take(4).collect();
+    if candidate.chars().all(|c| c.is_ascii_digit()) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Identity post-process for tags that don't need transforming.
+pub(crate) fn identity_post_process(raw: String) -> Option<String> {
+    Some(raw)
+}
+
 /// Slice a full entry list into the requested page.
 ///
 /// Returns `(page_entries, next_page, truncated)`:
