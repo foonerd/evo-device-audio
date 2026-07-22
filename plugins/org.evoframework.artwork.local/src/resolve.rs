@@ -134,6 +134,24 @@ pub(crate) struct ArtworkResolveResponse {
     /// Extra context for operators and UIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// Which leaf source in the local cascade produced the
+    /// resolved bytes. Stable identifiers:
+    ///
+    /// - `local_sidecar` — cover / folder / front / album image
+    ///   file living beside the audio file (or, via the
+    ///   folder-name fallback, in the album-named folder).
+    /// - `local_embedded` — cover extracted from the audio
+    ///   file's own tags (lofty-readable formats only).
+    ///
+    /// Absent on structured refusals (`NotFound`, `BadRequest`)
+    /// and on the pre-2026-07-22 build (older clients tolerate
+    /// the missing field via `serde(skip_serializing_if)`).
+    ///
+    /// The endpoint surfaces this via `X-Artwork-Provider` on
+    /// the resolve response so operators (and the UI probe) see
+    /// which cascade branch delivered each cover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
 }
 
 /// Outcome of a resolve attempt.
@@ -314,6 +332,7 @@ pub(crate) fn resolve_artwork(
                 content_hash: None,
                 mime: None,
                 size: None,
+                provider_id: None,
                 detail: Some("empty payload".to_string()),
             },
             cache_payload: None,
@@ -330,6 +349,7 @@ pub(crate) fn resolve_artwork(
                     path: None,
                     content_hash: None,
                     size: None,
+                    provider_id: None,
                     mime: None,
                     detail: Some(format!("payload is not UTF-8: {e}")),
                 },
@@ -348,6 +368,7 @@ pub(crate) fn resolve_artwork(
                     path: None,
                     content_hash: None,
                     size: None,
+                    provider_id: None,
                     mime: None,
                     detail: Some(format!("invalid JSON: {e}")),
                 },
@@ -364,6 +385,7 @@ pub(crate) fn resolve_artwork(
                 content_hash: None,
                 mime: None,
                 size: None,
+                provider_id: None,
                 detail: Some(format!("unsupported request v: {}", req.v)),
             },
             cache_payload: None,
@@ -385,6 +407,7 @@ pub(crate) fn resolve_artwork(
                     content_hash: None,
                     mime: None,
                     size: None,
+                    provider_id: None,
                     detail: Some(format!(
                         "unknown size: {size_str} (expected small | medium | large | original; `tiny` accepted as alias for `small`)"
                     )),
@@ -408,6 +431,7 @@ pub(crate) fn resolve_artwork(
             content_hash: None,
             mime: None,
             size: None,
+            provider_id: None,
             detail: Some(format!("unknown target.scheme: {other}")),
         },
     };
@@ -509,6 +533,7 @@ fn resolve_mpd_album(
                 path: None,
                 content_hash: None,
                 size: None,
+                provider_id: None,
                 mime: None,
                 detail: Some(
                     "invalid mpd-album value: expected \"artist|album\" (see \
@@ -555,6 +580,7 @@ fn resolve_mpd_album(
                 path: None,
                 content_hash: None,
                 size: None,
+                provider_id: None,
                 mime: None,
                 detail: Some(format!(
                     "mpd_album: tag-walk scan limit ({} files) reached under [library] roots",
@@ -569,6 +595,7 @@ fn resolve_mpd_album(
                 path: None,
                 content_hash: None,
                 size: None,
+                provider_id: None,
                 mime: None,
                 detail: Some(m),
             });
@@ -596,6 +623,7 @@ fn resolve_mpd_album(
                         content_hash: None,
                         mime: None,
                         size: None,
+                        provider_id: None,
                         detail: Some(
                             "mpd_album: no file under [library] roots \
                              with matching tags AND no directory whose \
@@ -611,6 +639,7 @@ fn resolve_mpd_album(
                         path: None,
                         content_hash: None,
                         size: None,
+                        provider_id: None,
                         mime: None,
                         detail: Some(format!(
                             "mpd_album: folder-name scan limit ({} directories) reached",
@@ -625,6 +654,7 @@ fn resolve_mpd_album(
                         path: None,
                         content_hash: None,
                         size: None,
+                        provider_id: None,
                         mime: None,
                         detail: Some(m),
                     });
@@ -641,7 +671,10 @@ fn resolve_cover_for_audio_file(
     track_path: &Path,
 ) -> Result<ArtworkResolveResponse, String> {
     if let Some(cover) = find_cover_beside_audio_file(track_path) {
-        return ok_from_path(cover);
+        // Sidecar cover: cover.jpg / folder.jpg / etc. living in
+        // the audio file's parent directory (or, via the folder-
+        // name fallback, in the album-named folder).
+        return ok_from_path(cover, PROVIDER_LOCAL_SIDECAR);
     }
 
     if let Some(img) = embedded::read_embedded_cover(track_path) {
@@ -652,6 +685,7 @@ fn resolve_cover_for_audio_file(
                 path: None,
                 content_hash: None,
                 size: None,
+                provider_id: None,
                 mime: None,
                 detail: Some(
                     "embedded cover in tags but no state_dir to write cache; cannot expose path"
@@ -660,7 +694,10 @@ fn resolve_cover_for_audio_file(
             });
         };
         let cached = embedded::write_embedded_to_cache(dir, track_path, &img)?;
-        return ok_from_path(cached);
+        // Embedded cover: bytes extracted from the file's ID3 /
+        // Vorbis / FLAC / MP4 tags via lofty and cached beside
+        // the audio file.
+        return ok_from_path(cached, PROVIDER_LOCAL_EMBEDDED);
     }
 
     Ok(ArtworkResolveResponse {
@@ -669,12 +706,26 @@ fn resolve_cover_for_audio_file(
         path: None,
         content_hash: None,
         size: None,
+        provider_id: None,
         mime: None,
         detail: Some("no sidecar or embedded cover for this track".to_string()),
     })
 }
 
-fn ok_from_path(cover: PathBuf) -> Result<ArtworkResolveResponse, String> {
+/// Stable identifier for the local sidecar cascade leaf. Surfaced
+/// via `X-Artwork-Provider` on the endpoint's resolve response so
+/// operators (and rig probes) can distinguish "cover came from
+/// folder.jpg beside the audio file" from "cover came from the
+/// audio file's own tags".
+const PROVIDER_LOCAL_SIDECAR: &str = "local_sidecar";
+
+/// Stable identifier for the local embedded-cover cascade leaf.
+const PROVIDER_LOCAL_EMBEDDED: &str = "local_embedded";
+
+fn ok_from_path(
+    cover: PathBuf,
+    provider_id: &'static str,
+) -> Result<ArtworkResolveResponse, String> {
     let mime = mime_for_path(&cover).map(str::to_string);
     let path = cover
         .to_str()
@@ -687,6 +738,7 @@ fn ok_from_path(cover: PathBuf) -> Result<ArtworkResolveResponse, String> {
         content_hash: None,
         mime,
         size: None,
+        provider_id: Some(provider_id.to_string()),
         detail: None,
     })
 }
@@ -704,6 +756,7 @@ fn resolve_mpd_path(
             content_hash: None,
             mime: None,
             size: None,
+            provider_id: None,
             detail: Some("empty mpd-path value".to_string()),
         });
     }
@@ -716,6 +769,7 @@ fn resolve_mpd_path(
             content_hash: None,
             mime: None,
             size: None,
+            provider_id: None,
             detail: Some("audio file not found for mpd_path".to_string()),
         });
     };
