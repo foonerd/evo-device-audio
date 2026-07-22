@@ -50,7 +50,7 @@ pub const MAX_MPD_ALBUM_SCAN_CANDIDATES: u32 = 100_000;
 pub const MAX_ALBUM_FOLDER_SCAN_DIRECTORIES: u32 = 20_000;
 
 /// Find the first file inside a directory whose basename
-/// (normalised: lower-case, alphanumeric-only) contains the
+/// (normalised: lower-case, alphanumeric-only) matches the
 /// normalised `album` value. Used as the folder-name-fallback
 /// step in the artwork.local mpd-album resolver's cascade —
 /// invoked when the tag-walk returns None (typical for DSD
@@ -70,28 +70,90 @@ pub const MAX_ALBUM_FOLDER_SCAN_DIRECTORIES: u32 = 20_000;
 /// `Ok(None)` on cap without erroring so the resolver can
 /// still emit a structured NotFound.
 ///
-/// Deterministic: entries within a directory are sorted by
-/// UTF-8 name before recursion, matching the tag-walk's
-/// determinism contract.
+/// Deterministic ranking (smaller wins on every key):
+///   1. **Tier**  — `0` when the normalised basename contains
+///      BOTH the normalised artist AND the normalised album;
+///      `1` when only the album is present. `artist == UNKNOWN_ARTIST`
+///      (case-insensitive) or empty artist collapses every
+///      match into tier 1 — no false artist bonus from mpd-album's
+///      unknown-artist marker.
+///   2. **Quality** — `0` exact-match (basename == want_album),
+///      `1` starts-with, `2` ends-with, `3` substring. Tightens
+///      the fit when two folders both contain the album value.
+///   3. **norm_len** — shorter normalised basename wins. Given
+///      equal tier+quality, `"Signature Solo"` beats
+///      `"Signature Solo Vol 2"` — the extra suffix is a wider,
+///      less-specific fit.
+///   4. **path** — lexicographic path tie-break so the resolver
+///      returns the same folder across calls even when the
+///      first three keys are indistinguishable.
+///
+/// The scoring covers the two named-fallback risks:
+///   - two folder names overlap on album substring →
+///     tier + quality + length pick the tighter fit; if all
+///     three are equal, path lexicography stays deterministic.
+///   - artist context is carried but the caller cannot know
+///     which of several album-substring folders belongs to the
+///     right artist → tier-0 (artist AND album) always beats
+///     tier-1 (album only) regardless of quality/length.
 pub fn first_file_in_album_named_folder(
     library_roots: &[PathBuf],
+    artist: &str,
     album: &str,
 ) -> Result<Option<PathBuf>, MatchError> {
-    let want = normalise_for_folder_match(album);
-    if want.is_empty() {
+    let want_album = normalise_for_folder_match(album);
+    if want_album.is_empty() {
         return Ok(None);
     }
+    // Artist tier only applies when the caller supplied a real
+    // artist. mpd-album's warden encodes missing artist as the
+    // literal `UNKNOWN_ARTIST`; treat that (and case variants)
+    // as artist-absent so the tier system doesn't spuriously
+    // reward a folder just because its normalised basename
+    // happens to contain the substring `unknown`.
+    let want_artist_norm = normalise_for_folder_match(artist);
+    let want_artist: Option<&str> = if want_artist_norm.is_empty()
+        || artist.eq_ignore_ascii_case(UNKNOWN_ARTIST)
+    {
+        None
+    } else {
+        Some(want_artist_norm.as_str())
+    };
+
     let mut examined: u32 = 0;
     let mut visited: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+    let mut candidates: Vec<FolderCandidate> = Vec::new();
+
     for root in library_roots {
-        if let Some(hit) =
-            walk_for_matching_folder(root, &want, &mut examined, &mut visited)?
-        {
-            return Ok(Some(hit));
+        collect_matching_folders(
+            root,
+            want_artist,
+            &want_album,
+            &mut examined,
+            &mut visited,
+            &mut candidates,
+        )?;
+    }
+
+    candidates.sort_by(|a, b| {
+        (a.tier, a.quality, a.norm_len, &a.path)
+            .cmp(&(b.tier, b.quality, b.norm_len, &b.path))
+    });
+
+    for c in &candidates {
+        if let Some(f) = first_file_in_directory(&c.path) {
+            return Ok(Some(f));
         }
     }
     Ok(None)
+}
+
+struct FolderCandidate {
+    tier: u8,
+    quality: u8,
+    norm_len: usize,
+    path: PathBuf,
 }
 
 /// Normalise a folder / album name for the folder-name match.
@@ -109,26 +171,28 @@ fn normalise_for_folder_match(s: &str) -> String {
         .collect()
 }
 
-fn walk_for_matching_folder(
+fn collect_matching_folders(
     dir: &Path,
-    want: &str,
+    want_artist: Option<&str>,
+    want_album: &str,
     examined: &mut u32,
     visited: &mut std::collections::HashSet<PathBuf>,
-) -> Result<Option<PathBuf>, MatchError> {
+    candidates: &mut Vec<FolderCandidate>,
+) -> Result<(), MatchError> {
     if *examined >= MAX_ALBUM_FOLDER_SCAN_DIRECTORIES {
-        return Ok(None);
+        return Ok(());
     }
     let canonical = match dir.canonicalize() {
         Ok(p) => p,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(()),
     };
     if !visited.insert(canonical) {
-        return Ok(None);
+        return Ok(());
     }
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
+            return Ok(());
         }
         Err(e) => return Err(MatchError::Io(e.to_string())),
     };
@@ -138,7 +202,7 @@ fn walk_for_matching_folder(
     for path in &entries {
         *examined += 1;
         if *examined >= MAX_ALBUM_FOLDER_SCAN_DIRECTORIES {
-            return Ok(None);
+            return Ok(());
         }
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -152,24 +216,55 @@ fn walk_for_matching_folder(
         if !meta.is_dir() {
             continue;
         }
-        // Match check on this directory's basename.
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let normalised = normalise_for_folder_match(name);
-        if !normalised.is_empty() && normalised.contains(want) {
-            if let Some(f) = first_file_in_directory(path) {
-                return Ok(Some(f));
+        if !normalised.is_empty() {
+            if let Some(cand) =
+                score_folder(path, &normalised, want_artist, want_album)
+            {
+                candidates.push(cand);
             }
-            // Directory name matches but has no direct files;
-            // fall through to recurse in case a subdir has
-            // them.
         }
-        if let Some(hit) =
-            walk_for_matching_folder(path, want, examined, visited)?
-        {
-            return Ok(Some(hit));
-        }
+        collect_matching_folders(
+            path,
+            want_artist,
+            want_album,
+            examined,
+            visited,
+            candidates,
+        )?;
     }
-    Ok(None)
+    Ok(())
+}
+
+fn score_folder(
+    path: &Path,
+    normalised: &str,
+    want_artist: Option<&str>,
+    want_album: &str,
+) -> Option<FolderCandidate> {
+    if !normalised.contains(want_album) {
+        return None;
+    }
+    let quality: u8 = if normalised == want_album {
+        0
+    } else if normalised.starts_with(want_album) {
+        1
+    } else if normalised.ends_with(want_album) {
+        2
+    } else {
+        3
+    };
+    let tier: u8 = match want_artist {
+        Some(a) if normalised.contains(a) => 0,
+        _ => 1,
+    };
+    Some(FolderCandidate {
+        tier,
+        quality,
+        norm_len: normalised.chars().count(),
+        path: path.to_path_buf(),
+    })
 }
 
 fn first_file_in_directory(dir: &Path) -> Option<PathBuf> {
@@ -888,6 +983,7 @@ mod tests {
 
         let found = first_file_in_album_named_folder(
             &[dir.path().to_path_buf()],
+            "Fiona Joy",
             "Signature - Solo",
         )
         .unwrap();
@@ -907,6 +1003,7 @@ mod tests {
         .unwrap();
         let found = first_file_in_album_named_folder(
             &[dir.path().to_path_buf()],
+            "Fiona Joy",
             "Signature - Solo",
         )
         .unwrap();
@@ -923,9 +1020,12 @@ mod tests {
         // Empty album value must not match every folder — the
         // fallback should refuse to consider a search with no
         // signal.
-        let found =
-            first_file_in_album_named_folder(&[dir.path().to_path_buf()], "")
-                .unwrap();
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "Fiona Joy",
+            "",
+        )
+        .unwrap();
         assert_eq!(found, None);
     }
 
@@ -941,6 +1041,7 @@ mod tests {
         std::fs::write(sub.join("m_middle.txt"), b"m").unwrap();
         let found = first_file_in_album_named_folder(
             &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
             "The Album",
         )
         .unwrap();
@@ -961,12 +1062,188 @@ mod tests {
         std::fs::write(sub.join("cover.jpg"), b"jpg").unwrap();
         let found = first_file_in_album_named_folder(
             &[dir.path().to_path_buf()],
+            "Sigur Rós",
             "ágætis byrjun",
         )
         .unwrap();
         assert!(
             found.is_some(),
             "unicode folder + unicode album value must match via lowercase-normalise"
+        );
+    }
+
+    // ---------------------------------------------------------
+    // Determinism-hardening regression tests. These pin the
+    // scoring contract that keeps the folder-name fallback
+    // from serving a wrong-album cover when two folder names
+    // overlap on the album substring. Ranking (smaller wins):
+    //   1. tier: (artist AND album) < (album only)
+    //   2. quality: exact < starts-with < ends-with < substring
+    //   3. normalised basename length: shorter wins
+    //   4. path lexicography: final tie-break
+    // ---------------------------------------------------------
+
+    #[test]
+    fn folder_ranking_prefers_artist_and_album_over_album_only() {
+        // Two folders both contain the normalised album name.
+        // Folder A carries the artist too (tier 0); Folder B is
+        // just the album (tier 1). Tier 0 wins even when Folder
+        // B has strictly better quality — the whole point of
+        // the tier system.
+        let dir = tempfile::tempdir().unwrap();
+        let with_artist = dir.path().join("[DSD64] Fiona Joy - Signature Solo");
+        std::fs::create_dir_all(&with_artist).unwrap();
+        std::fs::write(with_artist.join("hit.jpg"), b"hit").unwrap();
+        let album_only = dir.path().join("Signature - Solo");
+        std::fs::create_dir_all(&album_only).unwrap();
+        std::fs::write(album_only.join("miss.jpg"), b"miss").unwrap();
+
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "Fiona Joy",
+            "Signature - Solo",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(with_artist.join("hit.jpg")),
+            "artist+album tier must beat album-only tier even when the \
+             album-only folder is an exact-quality match"
+        );
+    }
+
+    #[test]
+    fn folder_ranking_prefers_exact_match_over_substring_when_no_artist() {
+        // Artist is UNKNOWN → every candidate collapses to
+        // tier 1. Within tier 1, exact-quality (basename ==
+        // normalised album) beats substring quality.
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("The Album");
+        std::fs::create_dir_all(&exact).unwrap();
+        std::fs::write(exact.join("hit.jpg"), b"hit").unwrap();
+        let extended = dir.path().join("The Album Remastered");
+        std::fs::create_dir_all(&extended).unwrap();
+        std::fs::write(extended.join("miss.jpg"), b"miss").unwrap();
+
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "The Album",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(exact.join("hit.jpg")),
+            "exact-quality match must beat starts-with quality within \
+             the same tier"
+        );
+    }
+
+    #[test]
+    fn folder_ranking_prefers_shorter_basename_within_same_quality() {
+        // Two folders both starts-with the album value and
+        // have no artist context. Tighter fit (shorter
+        // normalised basename) wins so the wider-scoped
+        // folder cannot capture the request.
+        let dir = tempfile::tempdir().unwrap();
+        let tight = dir.path().join("Signature Solo Live");
+        std::fs::create_dir_all(&tight).unwrap();
+        std::fs::write(tight.join("hit.jpg"), b"hit").unwrap();
+        let wide = dir.path().join("Signature Solo Compilation Anthology");
+        std::fs::create_dir_all(&wide).unwrap();
+        std::fs::write(wide.join("miss.jpg"), b"miss").unwrap();
+
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "Signature Solo",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(tight.join("hit.jpg")),
+            "shorter normalised basename wins within the same tier + \
+             quality — the tighter fit is the more-specific match"
+        );
+    }
+
+    #[test]
+    fn folder_ranking_alphabetic_tie_break_is_deterministic() {
+        // Same tier, same quality (exact-match), same
+        // normalised length. Path lexicography must produce
+        // a stable result — otherwise the resolver would
+        // return different covers across calls.
+        let dir = tempfile::tempdir().unwrap();
+        // Both folders normalise to "thealbum".
+        let ab = dir.path().join("The Album (AA)");
+        std::fs::create_dir_all(&ab).unwrap();
+        std::fs::write(ab.join("aa.jpg"), b"aa").unwrap();
+        let ba = dir.path().join("The Album (BB)");
+        std::fs::create_dir_all(&ba).unwrap();
+        std::fs::write(ba.join("bb.jpg"), b"bb").unwrap();
+
+        // Both call twice — same result both times.
+        let a = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "The Album AA",
+        )
+        .unwrap();
+        let b = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "The Album AA",
+        )
+        .unwrap();
+        assert_eq!(
+            a, b,
+            "identical inputs must return identical output across calls"
+        );
+        // And when both would be tier 1 quality 3 (album =
+        // "The Album" is starts-with for both after
+        // normalisation), the lexicographically-earlier path
+        // wins.
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "The Album",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(ab.join("aa.jpg")),
+            "lexicographic path tie-break: `The Album (AA)` sorts \
+             before `The Album (BB)`"
+        );
+    }
+
+    #[test]
+    fn folder_ranking_unknown_artist_marker_does_not_reward_folder_named_unknown(
+    ) {
+        // Regression: `artist == UNKNOWN_ARTIST` must NOT be
+        // treated as a real artist substring — otherwise a
+        // folder called `Unknown - The Album` would win over
+        // `The Album` on tier alone despite carrying no
+        // artist context.
+        let dir = tempfile::tempdir().unwrap();
+        let unknown_named = dir.path().join("Unknown - The Album");
+        std::fs::create_dir_all(&unknown_named).unwrap();
+        std::fs::write(unknown_named.join("miss.jpg"), b"miss").unwrap();
+        let clean = dir.path().join("The Album");
+        std::fs::create_dir_all(&clean).unwrap();
+        std::fs::write(clean.join("hit.jpg"), b"hit").unwrap();
+
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            UNKNOWN_ARTIST,
+            "The Album",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(clean.join("hit.jpg")),
+            "UNKNOWN_ARTIST must NOT be scored as a real artist substring; \
+             tier-collapse means the exact-quality match wins on quality"
         );
     }
 

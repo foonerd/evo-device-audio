@@ -584,6 +584,7 @@ fn resolve_mpd_album(
             // sidecar / embedded from there.
             match evo_device_audio_shared::first_file_in_album_named_folder(
                 library_roots,
+                &artist,
                 &album,
             ) {
                 Ok(Some(p)) => p,
