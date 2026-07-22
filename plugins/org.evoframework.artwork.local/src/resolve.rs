@@ -518,12 +518,36 @@ fn resolve_mpd_album(
             });
             }
         };
-    let found = match evo_device_audio_shared::first_matching_audio_path(
+    // Cascade — the operator memo mandates that a 404 is
+    // legitimate ONLY when every strategy on every source
+    // genuinely has nothing:
+    //
+    //   1. tag-walk match: walk library_roots looking for a
+    //      file whose lofty-readable tags match (artist,
+    //      album). Works for MP3/FLAC/M4A/OGG/etc.; fails
+    //      for formats lofty can't parse (DSD DSF/DFF today)
+    //      and for files without artist/album tags.
+    //   2. folder-name match (fallback): walk library_roots
+    //      looking for a directory whose basename contains the
+    //      normalised album name; return ANY file inside such
+    //      a directory so the cascade below reaches folder-
+    //      sidecar (folder.jpg/cover.jpg) art without needing
+    //      readable tags.
+    //   3. cascade the found path through
+    //      `resolve_cover_for_audio_file` → sidecar → embedded
+    //      → NotFound.
+    //
+    // Step 2 covers DSD folders (lofty can't tag-read DSF today)
+    // and every other format where tag reads fail but the
+    // folder still carries operator-visible cover art.
+    let tag_walk_result = evo_device_audio_shared::first_matching_audio_path(
         library_roots,
         &artist,
         &album,
-    ) {
-        Ok(p) => p,
+    );
+    let found = match tag_walk_result {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
         Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
             return Ok(ArtworkResolveResponse {
                 v: 1,
@@ -533,7 +557,7 @@ fn resolve_mpd_album(
                 size: None,
                 mime: None,
                 detail: Some(format!(
-                    "mpd_album: scan limit ({} files) reached under [library] roots",
+                    "mpd_album: tag-walk scan limit ({} files) reached under [library] roots",
                     evo_device_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES
                 )),
             });
@@ -550,20 +574,62 @@ fn resolve_mpd_album(
             });
         }
     };
-    let Some(track_path) = found else {
-        return Ok(ArtworkResolveResponse {
-            v: 1,
-            status: ResponseStatus::NotFound,
-            path: None,
-            content_hash: None,
-            mime: None,
-            size: None,
-            detail: Some(
-                "mpd_album: no file under [library] roots with matching track artist and album \
-                 tags"
-                    .to_string(),
-            ),
-        });
+    let track_path = match found {
+        Some(p) => p,
+        None => {
+            // tag-walk missed — fall through to folder-name
+            // match. This is the cascade step that covers DSD
+            // + tag-less libraries. Returns ANY file inside a
+            // matching folder; the cascade below picks up the
+            // sidecar / embedded from there.
+            match evo_device_audio_shared::first_file_in_album_named_folder(
+                library_roots,
+                &album,
+            ) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Ok(ArtworkResolveResponse {
+                        v: 1,
+                        status: ResponseStatus::NotFound,
+                        path: None,
+                        content_hash: None,
+                        mime: None,
+                        size: None,
+                        detail: Some(
+                            "mpd_album: no file under [library] roots \
+                             with matching tags AND no directory whose \
+                             name matches the album value"
+                                .to_string(),
+                        ),
+                    });
+                }
+                Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
+                    return Ok(ArtworkResolveResponse {
+                        v: 1,
+                        status: ResponseStatus::NotFound,
+                        path: None,
+                        content_hash: None,
+                        size: None,
+                        mime: None,
+                        detail: Some(format!(
+                            "mpd_album: folder-name scan limit ({} directories) reached",
+                            evo_device_audio_shared::MAX_ALBUM_FOLDER_SCAN_DIRECTORIES
+                        )),
+                    });
+                }
+                Err(evo_device_audio_shared::MatchError::Io(m)) => {
+                    return Ok(ArtworkResolveResponse {
+                        v: 1,
+                        status: ResponseStatus::NotFound,
+                        path: None,
+                        content_hash: None,
+                        size: None,
+                        mime: None,
+                        detail: Some(m),
+                    });
+                }
+            }
+        }
     };
     resolve_cover_for_audio_file(state_dir, &track_path)
 }
@@ -832,5 +898,63 @@ mod tests {
         assert_eq!(r.response.status, ResponseStatus::Ok);
         assert!(r.response.path.as_ref().unwrap().ends_with("folder.jpg"));
         assert_eq!(r.response.mime.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn resolve_mpd_album_cascades_to_folder_name_when_tag_walk_finds_nothing() {
+        // Pins the operator's Gap 1 regression verbatim: a DSD
+        // album (lofty can't tag-parse .dsf today) whose folder
+        // has folder.jpg beside it MUST resolve via the
+        // folder-name-fallback cascade — not 404 because tags
+        // couldn't be read.
+        //
+        // Fixture shape mirrors the actual DSD library on the
+        // rigs (`INTERNAL/[DSD64] Fiona Joy - Signature Solo/`
+        // + folder.jpg + one .dsf file) so the test proves the
+        // cascade closes the exact defect the memo names.
+        let dir = tempfile::tempdir().unwrap();
+        let album_dir = dir.path().join("[DSD64] Fiona Joy - Signature Solo");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(
+            album_dir.join("01. Ceremony.dsf"),
+            b"not-a-real-dsf-just-bytes-lofty-cant-parse",
+        )
+        .unwrap();
+        std::fs::write(album_dir.join("folder.jpg"), b"jpg").unwrap();
+
+        // mpd-album value the emitter would emit for this album.
+        let body = r##"{"v":1,"target":{"scheme":"mpd-album","value":"Fiona Joy|Signature - Solo"}}"##;
+        let r =
+            resolve_artwork(&[dir.path().to_path_buf()], None, body.as_bytes())
+                .expect("resolve_artwork must not error");
+        assert_eq!(
+            r.response.status,
+            ResponseStatus::Ok,
+            "cascade MUST return Ok — DSD folder with folder.jpg cannot 404"
+        );
+        assert!(
+            r.response.path.as_ref().unwrap().ends_with("folder.jpg"),
+            "cascade must land on folder.jpg via
+             folder-name-match → resolve_cover_for_audio_file → sidecar"
+        );
+    }
+
+    #[test]
+    fn resolve_mpd_album_returns_not_found_when_no_strategy_hits() {
+        // With no matching tags AND no folder name that
+        // contains the album value, the resolver honestly
+        // returns NotFound — this is the only legitimate 404
+        // per the memo's "A 404 is legitimate ONLY when every
+        // strategy on every source genuinely has nothing".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Different").join("Album"))
+            .unwrap();
+        // The one folder has no folder.jpg, no matching name,
+        // no audio file with matching tags.
+        let body = r##"{"v":1,"target":{"scheme":"mpd-album","value":"Absent|Album"}}"##;
+        let r =
+            resolve_artwork(&[dir.path().to_path_buf()], None, body.as_bytes())
+                .expect("resolve_artwork must not error");
+        assert_eq!(r.response.status, ResponseStatus::NotFound);
     }
 }

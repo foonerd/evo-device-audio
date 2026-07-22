@@ -39,6 +39,149 @@ pub const UNKNOWN_ARTIST: &str = "unknown";
 /// At most this many local audio files are read for tag match per request.
 pub const MAX_MPD_ALBUM_SCAN_CANDIDATES: u32 = 100_000;
 
+/// At most this many directories are examined per folder-name
+/// fallback pass. The fallback is invoked when the tag-walk
+/// returns None (formats lofty can't parse — DSD, edge cases —
+/// or files without artist/album tags); it walks library_roots
+/// looking for a directory whose basename contains the
+/// normalised album name, and returns the first file inside a
+/// matching directory. Bounded so a pathological deep tree
+/// can't stall the request.
+pub const MAX_ALBUM_FOLDER_SCAN_DIRECTORIES: u32 = 20_000;
+
+/// Find the first file inside a directory whose basename
+/// (normalised: lower-case, alphanumeric-only) contains the
+/// normalised `album` value. Used as the folder-name-fallback
+/// step in the artwork.local mpd-album resolver's cascade —
+/// invoked when the tag-walk returns None (typical for DSD
+/// files where lofty can't read tags, or files without an
+/// album tag but with a folder-name that names the album).
+///
+/// Return value: `Some(any_file_path)` inside a matching
+/// folder. The caller then cascades the returned path through
+/// `resolve_cover_for_audio_file` (or equivalent) which walks
+/// the file's parent directory for cover.jpg / folder.jpg /
+/// embedded-tag art. Returning ANY file (not just an audio
+/// file) is intentional: even if the folder contains only
+/// unreadable-tag DSD tracks and a folder.jpg, the sidecar
+/// cascade will find the cover.
+///
+/// Bounded by [`MAX_ALBUM_FOLDER_SCAN_DIRECTORIES`]; returns
+/// `Ok(None)` on cap without erroring so the resolver can
+/// still emit a structured NotFound.
+///
+/// Deterministic: entries within a directory are sorted by
+/// UTF-8 name before recursion, matching the tag-walk's
+/// determinism contract.
+pub fn first_file_in_album_named_folder(
+    library_roots: &[PathBuf],
+    album: &str,
+) -> Result<Option<PathBuf>, MatchError> {
+    let want = normalise_for_folder_match(album);
+    if want.is_empty() {
+        return Ok(None);
+    }
+    let mut examined: u32 = 0;
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    for root in library_roots {
+        if let Some(hit) =
+            walk_for_matching_folder(root, &want, &mut examined, &mut visited)?
+        {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
+}
+
+/// Normalise a folder / album name for the folder-name match.
+/// Lower-cases and strips everything that isn't an ASCII
+/// alphanumeric so `"[DSD64] Fiona Joy - Signature Solo"` and
+/// `"Signature - Solo"` (album value from mpd-album) both
+/// collapse to something matchable via substring. Non-ASCII
+/// characters (`Sigur Rós`, `Ágætis byrjun`) survive by
+/// lower-casing + keeping code-points; the substring rule
+/// works on the raw char sequence.
+fn normalise_for_folder_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn walk_for_matching_folder(
+    dir: &Path,
+    want: &str,
+    examined: &mut u32,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<Option<PathBuf>, MatchError> {
+    if *examined >= MAX_ALBUM_FOLDER_SCAN_DIRECTORIES {
+        return Ok(None);
+    }
+    let canonical = match dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if !visited.insert(canonical) {
+        return Ok(None);
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => return Err(MatchError::Io(e.to_string())),
+    };
+    let mut entries: Vec<PathBuf> =
+        read.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    entries.sort();
+    for path in &entries {
+        *examined += 1;
+        if *examined >= MAX_ALBUM_FOLDER_SCAN_DIRECTORIES {
+            return Ok(None);
+        }
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            // Skip symlinks — matches first_matching_audio_path's
+            // symlink discipline (never follow, never chase).
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        // Match check on this directory's basename.
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let normalised = normalise_for_folder_match(name);
+        if !normalised.is_empty() && normalised.contains(want) {
+            if let Some(f) = first_file_in_directory(path) {
+                return Ok(Some(f));
+            }
+            // Directory name matches but has no direct files;
+            // fall through to recurse in case a subdir has
+            // them.
+        }
+        if let Some(hit) =
+            walk_for_matching_folder(path, want, examined, visited)?
+        {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
+}
+
+fn first_file_in_directory(dir: &Path) -> Option<PathBuf> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut files: Vec<PathBuf> = read
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    files.into_iter().next()
+}
+
 /// Read `/etc/mpd.conf` (or alternate path) and return the parsed
 /// `music_directory` value. `None` when the file cannot be read,
 /// when the directive is absent, or when the value is empty.
@@ -415,8 +558,19 @@ mod artwork_url_tests {
 }
 
 const AUDIO_EXTS: &[&str] = &[
-    "flac", "mp3", "m4a", "mp4", "m4b", "aac", "ogg", "oga", "opus", "wma",
-    "wav", "aif", "aiff", "wv", "ape", "mpc", "mka", "webm", "3gp", "aax",
+    // Lossy / compressed containers.
+    "mp3", "aac", "m4a", "mp4", "m4b", "ogg", "oga", "opus", "wma", "webm",
+    "3gp", "aax", "mka", // Lossless PCM containers.
+    "flac", "wav", "aif", "aiff", "wv", "ape", "mpc",
+    // DSD stream containers — DSF (Sony) + DFF (Philips DSD-IFF).
+    // Missing pre-2026-07-22 meant the mpd-album tag-walk (and
+    // any other AUDIO_EXTS-gated scan) filtered DSD files out
+    // before lofty saw them; DSD albums returned 404 from the
+    // mpd-album path even when their folder carried folder.jpg
+    // or embedded art. Adding them here lets the scanner enter
+    // the file; the artwork.local cascade (tag match → folder
+    // sidecar → embedded → online) picks up from there.
+    "dsf", "dff",
 ];
 
 /// `mpd-album` value could not be parsed.
@@ -710,6 +864,110 @@ mod tests {
             first_matching_audio_path(&[dir.path().to_path_buf()], &a, &al)
                 .unwrap();
         assert_eq!(found, Some(mp3));
+    }
+
+    // ---------------------------------------------------------
+    // Folder-name-fallback tests (mpd-album cascade step 2).
+    // These pin the "album by folder name" invariant that
+    // covers formats lofty can't tag-parse (DSF/DFF today) or
+    // libraries with missing artist/album tags.
+    // ---------------------------------------------------------
+
+    #[test]
+    fn folder_by_album_name_finds_normalised_substring_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // Folder name contains the album name plus extra text
+        // (case + special chars + brackets), and the folder
+        // contains a DSF file lofty can't tag-parse plus a
+        // folder.jpg the cascade would use.
+        let sub = dir.path().join("[DSD64] Fiona Joy - Signature Solo");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("01. Ceremony.dsf"), b"dsf-fake-bytes")
+            .unwrap();
+        std::fs::write(sub.join("folder.jpg"), b"fake-jpg-bytes").unwrap();
+
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "Signature - Solo",
+        )
+        .unwrap();
+        assert!(
+            found.is_some(),
+            "folder-name match MUST find the album folder even when its \
+             basename has bracketed prefix + case + dashes"
+        );
+    }
+
+    #[test]
+    fn folder_by_album_name_returns_none_when_no_folder_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            dir.path().join("Other Artist").join("Other Album"),
+        )
+        .unwrap();
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "Signature - Solo",
+        )
+        .unwrap();
+        assert_eq!(
+            found, None,
+            "no folder whose basename contains 'signaturesolo' → None, \
+             not a false positive"
+        );
+    }
+
+    #[test]
+    fn folder_by_album_name_handles_empty_album() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty album value must not match every folder — the
+        // fallback should refuse to consider a search with no
+        // signal.
+        let found =
+            first_file_in_album_named_folder(&[dir.path().to_path_buf()], "")
+                .unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn folder_by_album_name_prefers_deterministic_first_file() {
+        // Ensure a folder with multiple files returns the same
+        // one across calls (sorted order).
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("The Album");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("z_last.txt"), b"z").unwrap();
+        std::fs::write(sub.join("a_first.txt"), b"a").unwrap();
+        std::fs::write(sub.join("m_middle.txt"), b"m").unwrap();
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "The Album",
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(sub.join("a_first.txt")),
+            "sorted-first file wins so subsequent calls return the \
+             same path (deterministic)"
+        );
+    }
+
+    #[test]
+    fn folder_by_album_name_normalisation_handles_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unicode-cased folder + album value.
+        let sub = dir.path().join("Sigur Rós - Ágætis byrjun");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("cover.jpg"), b"jpg").unwrap();
+        let found = first_file_in_album_named_folder(
+            &[dir.path().to_path_buf()],
+            "ágætis byrjun",
+        )
+        .unwrap();
+        assert!(
+            found.is_some(),
+            "unicode folder + unicode album value must match via lowercase-normalise"
+        );
     }
 
     // ---------------------------------------------------------
