@@ -41,6 +41,8 @@ pub mod lastfm;
 pub mod lrclib;
 pub mod musicbrainz;
 pub mod rate_limit;
+pub mod wikidata;
+pub mod wikipedia;
 
 pub use discogs::{
     ArtistProfileHit, DiscogsClient, DiscogsError, ReleaseDetailHit,
@@ -55,5 +57,10 @@ pub use lastfm::{
     LastfmError,
 };
 pub use lrclib::{LrclibClient, LrclibError, LyricsHit};
-pub use musicbrainz::{MusicBrainzClient, MusicBrainzError};
+pub use musicbrainz::{
+    ArtistLookup, ArtistSearchHit, MusicBrainzClient, MusicBrainzError,
+    ReleaseCreditsLookup, TrackCredits, WorkLookup, WorkSearchHit,
+};
 pub use rate_limit::RateLimiter;
+pub use wikidata::{WikidataClient, WikidataEntityHit, WikidataError};
+pub use wikipedia::{WikipediaClient, WikipediaError, WikipediaSummaryHit};
