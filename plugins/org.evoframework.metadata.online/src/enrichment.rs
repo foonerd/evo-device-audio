@@ -1772,3 +1772,320 @@ fn enhancement_hint_for_album_notes_missing(
         None
     }
 }
+
+// -----------------------------------------------------------------
+// KEYLESS-FIRST CASCADE — classical work notes via MusicBrainz
+// work lookup → url-rels → Wikipedia work-page summary.
+// Wikidata offers structured facts as a secondary anonymous
+// fallback when the work has a Wikidata entity but no
+// Wikipedia article.
+//
+// No identity-bearing enhancement: Wikipedia + Wikidata are
+// the authoritative sources for classical works; no keyed
+// provider currently improves on their coverage or fidelity.
+// -----------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkNotesCascadeRequest {
+    #[serde(default)]
+    v: u8,
+    /// Work title (composer's original or MB-canonical form).
+    /// The cascade prefers `work_mbid` when supplied and
+    /// short-circuits the search step.
+    #[serde(default)]
+    work_name: Option<String>,
+    /// Optional MB work MBID. Companion to the release-credits
+    /// cascade's per-track `work_mbid` — a caller with the
+    /// release-credits response in hand can pass it verbatim.
+    #[serde(default)]
+    work_mbid: Option<String>,
+    /// Optional composer hint used to disambiguate a `search_work`
+    /// candidate list when the title alone is generic (e.g. many
+    /// composers wrote pieces titled `"Symphony No. 5"`).
+    #[serde(default)]
+    composer: Option<String>,
+}
+
+/// MB confidence floor for a `search_work` hit to be adopted as
+/// the work's canonical MBID.
+const WORK_SEARCH_CONFIDENCE_FLOOR: u32 = 85;
+
+pub(crate) async fn query_work_notes_cascade(
+    payload: &[u8],
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+) -> Result<CascadeResponse, String> {
+    if payload.is_empty() {
+        return Ok(CascadeResponse::bad_request("empty payload"));
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
+    let req: WorkNotesCascadeRequest =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    if req.v != 1 {
+        return Ok(CascadeResponse::bad_request(format!(
+            "unsupported v: {}",
+            req.v
+        )));
+    }
+    let work_name = req
+        .work_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let has_mbid = req
+        .work_mbid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if work_name.is_none() && !has_mbid {
+        return Ok(CascadeResponse::bad_request(
+            "at least one of `work_name` or `work_mbid` is required",
+        ));
+    }
+
+    let want_mb = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::MusicBrainz)
+        && catalogue.musicbrainz.is_some();
+    let want_wp = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikipedia)
+        && catalogue.wikipedia.is_some();
+    let want_wd = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikidata)
+        && catalogue.wikidata.is_some();
+
+    if !(want_mb || want_wp || want_wd) {
+        return Ok(CascadeResponse::not_configured(
+            "every work-notes provider is disabled or unavailable on this \
+             device; enable at least one under Settings → Metadata → Sources",
+        ));
+    }
+
+    let mut last_provider: Option<ProviderId> = None;
+
+    // Anonymous baseline: MusicBrainz work lookup. Yields the
+    // Wikipedia + Wikidata URLs the downstream providers consume
+    // directly. When the caller supplied `work_mbid` the search
+    // step is skipped.
+    let mut wikipedia_url: Option<String> = None;
+    let mut wikidata_url: Option<String> = None;
+    let mut canonical_title: Option<String> = None;
+    let mut work_type: Option<String> = None;
+    let mut resolved_work_mbid: Option<String> = req
+        .work_mbid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if want_mb {
+        if let Some(mb) = catalogue.musicbrainz.as_ref() {
+            last_provider = Some(ProviderId::MusicBrainz);
+            if resolved_work_mbid.is_none() {
+                if let Some(name) = work_name.as_deref() {
+                    let composer_hint = req
+                        .composer
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    match mb.search_work(name, composer_hint).await {
+                        Ok(Some(hit))
+                            if hit.confidence_percent
+                                >= WORK_SEARCH_CONFIDENCE_FLOOR =>
+                        {
+                            resolved_work_mbid = Some(hit.work_mbid);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = crate::PLUGIN_NAME,
+                                provider = "musicbrainz",
+                                work = %name,
+                                error = %e,
+                                "MB work search transient; skipping"
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(work_mbid) = resolved_work_mbid.as_ref() {
+                match mb.lookup_work(work_mbid).await {
+                    Ok(wl) => {
+                        wikipedia_url = wl.wikipedia_url;
+                        wikidata_url = wl.wikidata_url;
+                        canonical_title = Some(wl.canonical_title);
+                        work_type = wl.work_type;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "musicbrainz",
+                            work_mbid,
+                            error = %e,
+                            "MB work lookup transient; skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Wikipedia work-page summary — primary anonymous content.
+    if want_wp {
+        if let Some(wp) = catalogue.wikipedia.as_ref() {
+            last_provider = Some(ProviderId::Wikipedia);
+            let cache_name = canonical_title
+                .clone()
+                .or_else(|| work_name.clone())
+                .unwrap_or_default();
+            let key = EnrichmentCache::key_for(&[
+                "work_notes",
+                "work",
+                &normalise(&cache_name),
+                ProviderId::Wikipedia.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Wikipedia,
+                            None,
+                        ));
+                    }
+                }
+            }
+            let hit = match &wikipedia_url {
+                Some(url) => wp.get_summary_from_url(url).await,
+                None => match &canonical_title {
+                    Some(title) => wp.get_summary_en(title).await,
+                    None => match &work_name {
+                        Some(name) => wp.get_summary_en(name).await,
+                        None => Ok(None),
+                    },
+                },
+            };
+            match hit {
+                Ok(Some(summary)) => {
+                    let payload = serde_json::json!({
+                        "title": summary.title,
+                        "summary": summary.extract,
+                        "language": summary.language,
+                        "work_mbid": resolved_work_mbid,
+                        "work_type": work_type,
+                        "source_url": summary.page_url,
+                    });
+                    let _ =
+                        cache.put_positive(&key, payload.clone(), "wikipedia");
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Wikipedia.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::Anonymous.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Wikipedia".into(),
+                            source_url: Some(summary.page_url),
+                            license: "CC BY-SA".into(),
+                        }),
+                        enhancement: None,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        work = %cache_name,
+                        error = %e,
+                        "Wikipedia work-summary transient / not-usable; \
+                         skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    // Wikidata — structured work facts (composer, inception,
+    // genre) as a secondary anonymous fallback when Wikipedia
+    // has no summary but MB routed a wikidata_url.
+    if want_wd {
+        if let Some(wd) = catalogue.wikidata.as_ref() {
+            last_provider = Some(ProviderId::Wikidata);
+            let hit = match &wikidata_url {
+                Some(url) => wd.get_entity_from_url(url).await,
+                None => Ok(None),
+            };
+            if let Ok(Some(entity_hit)) = hit {
+                let payload = serde_json::json!({
+                    "label": entity_hit.label_en,
+                    "description": entity_hit.description_en,
+                    "inception": entity_hit.inception,
+                    "genre_ids": entity_hit.genre_ids,
+                    "work_mbid": resolved_work_mbid,
+                    "work_type": work_type,
+                    "source_url": entity_hit.entity_url,
+                });
+                let cache_name = canonical_title
+                    .clone()
+                    .or_else(|| work_name.clone())
+                    .unwrap_or_default();
+                let key = EnrichmentCache::key_for(&[
+                    "work_notes",
+                    "work",
+                    &normalise(&cache_name),
+                    ProviderId::Wikidata.as_str(),
+                ]);
+                let _ = cache.put_positive(&key, payload.clone(), "wikidata");
+                return Ok(CascadeResponse {
+                    v: 1,
+                    status: CascadeStatus::Ok,
+                    provider_id: Some(
+                        ProviderId::Wikidata.as_str().to_string(),
+                    ),
+                    privacy_class: Some(
+                        PrivacyClass::Anonymous.as_str().to_string(),
+                    ),
+                    payload: Some(payload),
+                    detail: None,
+                    attribution: Some(Attribution {
+                        source_name: "Wikidata".into(),
+                        source_url: Some(entity_hit.entity_url),
+                        license: "CC0".into(),
+                    }),
+                    enhancement: None,
+                });
+            }
+        }
+    }
+
+    let detail = format!(
+        "no work notes found for {} across enabled providers",
+        canonical_title
+            .clone()
+            .or_else(|| work_name.clone())
+            .unwrap_or_else(|| "the requested work".to_string())
+    );
+    Ok(CascadeResponse {
+        v: 1,
+        status: CascadeStatus::NotFound,
+        provider_id: last_provider.map(|p| p.as_str().to_string()),
+        privacy_class: last_provider
+            .map(|p| p.privacy_class().as_str().to_string()),
+        payload: None,
+        detail: Some(detail),
+        attribution: None,
+        // No identity-bearing enhancement for work notes.
+        enhancement: None,
+    })
+}

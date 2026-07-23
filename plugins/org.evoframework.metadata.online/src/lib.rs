@@ -137,6 +137,11 @@ const REQUEST_METADATA_QUERY_RELEASE_CREDITS: &str =
 /// enrichment verb.
 const REQUEST_METADATA_QUERY_TRACK_ANNOTATION: &str =
     "metadata.query_track_annotation";
+/// Classical work notes — MusicBrainz work lookup → url-rels →
+/// Wikipedia summary of the work. Anonymous-only; Wikipedia is
+/// the authoritative source for classical works and no
+/// identity-bearing provider currently improves on it.
+const REQUEST_METADATA_QUERY_WORK_NOTES: &str = "metadata.query_work_notes";
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -168,6 +173,7 @@ pub struct MetadataOnlinePlugin {
     notes_cache: Option<enrichment_cache::EnrichmentCache>,
     credits_cache: Option<enrichment_cache::EnrichmentCache>,
     annotation_cache: Option<enrichment_cache::EnrichmentCache>,
+    work_notes_cache: Option<enrichment_cache::EnrichmentCache>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -191,6 +197,7 @@ impl MetadataOnlinePlugin {
             notes_cache: None,
             credits_cache: None,
             annotation_cache: None,
+            work_notes_cache: None,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -226,6 +233,7 @@ impl Plugin for MetadataOnlinePlugin {
                         REQUEST_METADATA_QUERY_ALBUM_NOTES.to_string(),
                         REQUEST_METADATA_QUERY_RELEASE_CREDITS.to_string(),
                         REQUEST_METADATA_QUERY_TRACK_ANNOTATION.to_string(),
+                        REQUEST_METADATA_QUERY_WORK_NOTES.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -344,6 +352,11 @@ impl Plugin for MetadataOnlinePlugin {
                     ctx.state_dir.join("track_annotation_cache"),
                     self.config.negative_ttl,
                 ));
+            self.work_notes_cache =
+                Some(enrichment_cache::EnrichmentCache::new(
+                    ctx.state_dir.join("work_notes_cache"),
+                    self.config.negative_ttl,
+                ));
             // Discogs client — resolves via credential vault under
             // stable key `discogs_personal_access_token`.
             let discogs_token = resolve_credential_from_vault(
@@ -403,10 +416,18 @@ impl Plugin for MetadataOnlinePlugin {
             self.mb_client = None;
             self.lastfm_client = None;
             self.lrclib_client = None;
+            self.discogs_client = None;
+            self.genius_client = None;
+            self.wikipedia_client = None;
+            self.wikidata_client = None;
+            self.provider_config = cascade::ProviderConfig::defaults();
             self.reconcile_cache = None;
             self.lyrics_cache = None;
             self.bio_cache = None;
             self.notes_cache = None;
+            self.credits_cache = None;
+            self.annotation_cache = None;
+            self.work_notes_cache = None;
             Ok(())
         }
     }
@@ -446,6 +467,7 @@ impl Respondent for MetadataOnlinePlugin {
                 REQUEST_METADATA_QUERY_ALBUM_NOTES,
                 REQUEST_METADATA_QUERY_RELEASE_CREDITS,
                 REQUEST_METADATA_QUERY_TRACK_ANNOTATION,
+                REQUEST_METADATA_QUERY_WORK_NOTES,
             ];
             if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
@@ -486,6 +508,7 @@ impl Respondent for MetadataOnlinePlugin {
             let notes_cache = self.notes_cache.clone();
             let credits_cache = self.credits_cache.clone();
             let annotation_cache = self.annotation_cache.clone();
+            let work_notes_cache = self.work_notes_cache.clone();
             let payload = req.payload.clone();
             let body = match req.request_type.as_str() {
                 REQUEST_METADATA_RECONCILE_RELEASE => {
@@ -647,6 +670,35 @@ impl Respondent for MetadataOnlinePlugin {
                     response.json_bytes().map_err(|e| {
                         PluginError::Permanent(format!(
                             "metadata.query_track_annotation response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_METADATA_QUERY_WORK_NOTES => {
+                    let cache_ref =
+                        work_notes_cache.as_ref().ok_or_else(|| {
+                            PluginError::Permanent(
+                                "work-notes cache not wired at load"
+                                    .to_string(),
+                            )
+                        })?;
+                    let catalogue = cascade::ProviderCatalogue {
+                        musicbrainz: Some(Arc::new(mb.clone())),
+                        wikipedia: wikipedia.clone().map(Arc::new),
+                        wikidata: wikidata.clone().map(Arc::new),
+                        lrclib: Some(Arc::new(lrclib.clone())),
+                        lastfm: lastfm.clone().map(Arc::new),
+                        discogs: discogs.clone().map(Arc::new),
+                        genius: genius.clone().map(Arc::new),
+                        config: provider_config.clone(),
+                    };
+                    let response = enrichment::query_work_notes_cascade(
+                        &payload, &catalogue, cache_ref,
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_work_notes response JSON: {e}"
                         ))
                     })?
                 }
