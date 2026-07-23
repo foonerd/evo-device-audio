@@ -30,6 +30,10 @@ use evo_online_providers::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cascade::{
+    Attribution, CascadeResponse, CascadeStatus, EnhancementHint, EntityRef,
+    EntityType, PrivacyClass, ProviderCatalogue, ProviderId,
+};
 use crate::enrichment_cache::EnrichmentCache;
 
 // ---------------------------------------------------------------
@@ -239,109 +243,9 @@ pub(crate) async fn query_lyrics(
 }
 
 // ---------------------------------------------------------------
-// Artist bio — Last.fm
+// Artist bio — retired 2026-07-23 in favour of the entity-typed
+// keyless-first cascade `query_entity_bio` below.
 // ---------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct BioRequest {
-    #[serde(default)]
-    v: u8,
-    #[serde(default)]
-    artist: Option<String>,
-    #[serde(default)]
-    artist_mbid: Option<String>,
-}
-
-pub(crate) async fn query_artist_bio(
-    payload: &[u8],
-    lastfm: Option<&LastfmClient>,
-    cache: &EnrichmentCache,
-) -> Result<EnrichmentResponse, String> {
-    if payload.is_empty() {
-        return Ok(bad_request("empty payload"));
-    }
-    let text = std::str::from_utf8(payload)
-        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
-    let req: BioRequest =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
-    if req.v != 1 {
-        return Ok(bad_request(&format!("unsupported v: {}", req.v)));
-    }
-    let artist = req
-        .artist
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let artist = match artist {
-        Some(a) => a.to_string(),
-        None => {
-            return Ok(bad_request("artist is required and must be non-empty"));
-        }
-    };
-    let Some(lastfm) = lastfm else {
-        return Ok(not_configured(
-            "Last.fm API key not configured on this device; bio provider disabled",
-        ));
-    };
-    let key = EnrichmentCache::key_for(&["bio", &normalise(&artist)]);
-    if let Some(entry) = cache.get(&key) {
-        if entry.status == "ok" {
-            if let Some(p) = entry.payload {
-                return Ok(from_cache_ok(p, entry.provider_id));
-            }
-        }
-        return Ok(from_cache_negative(entry.detail));
-    }
-    let hit_result = lastfm
-        .get_artist_bio(&artist, req.artist_mbid.as_deref())
-        .await;
-    match hit_result {
-        Ok(None) => {
-            let detail = "Last.fm has no bio for this artist".to_string();
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("lastfm".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Ok(Some(h)) => {
-            let payload = serde_json::json!({
-                "summary": h.summary,
-                "content": h.content,
-                "source_url": h.source_url,
-            });
-            let _ = cache.put_positive(&key, payload.clone(), "lastfm");
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::Ok,
-                provider_id: Some("lastfm".to_string()),
-                payload: Some(payload),
-                detail: None,
-            })
-        }
-        Err(LastfmError::Application { code, message })
-            if evo_online_providers::lastfm_is_notfound_code(code) =>
-        {
-            // Not-found application code — cache negatively.
-            let detail = format!("Last.fm code {code}: {message}");
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("lastfm".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Err(e) => {
-            // Transient error — do NOT cache.
-            Err(format!("Last.fm error: {e}"))
-        }
-    }
-}
 
 // ---------------------------------------------------------------
 // Album notes — Last.fm
@@ -715,5 +619,471 @@ fn genius_error_message(e: &GeniusError) -> String {
             format!("genius status {status}: {body}")
         }
         GeniusError::Decode(m) => format!("genius decode: {m}"),
+    }
+}
+
+// -----------------------------------------------------------------
+// KEYLESS-FIRST CASCADE — entity-typed bio via MB → Wikipedia
+// → Wikidata → Last.fm (identity-bearing enhancement)
+// -----------------------------------------------------------------
+
+/// Entity-typed bio request: enrich an artist / composer / work /
+/// performer / conductor / ensemble via the anonymous-first
+/// cascade. Falls back to identity-bearing providers as opt-in
+/// enhancement.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EntityBioRequest {
+    #[serde(default)]
+    pub(crate) v: u8,
+    /// Entity to enrich. New shape.
+    #[serde(default)]
+    pub(crate) entity: Option<EntityRef>,
+    /// Backward-compat: legacy `{artist, artist_mbid}` shape from
+    /// the pre-cascade query_artist_bio request. When `entity` is
+    /// absent and these are present, the cascade treats them as
+    /// an `EntityType::Artist` request.
+    #[serde(default)]
+    pub(crate) artist: Option<String>,
+    #[serde(default)]
+    pub(crate) artist_mbid: Option<String>,
+}
+
+pub(crate) async fn query_entity_bio(
+    payload: &[u8],
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+) -> Result<CascadeResponse, String> {
+    if payload.is_empty() {
+        return Ok(CascadeResponse::bad_request("empty payload"));
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
+    let req: EntityBioRequest =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    if req.v != 1 {
+        return Ok(CascadeResponse::bad_request(format!(
+            "unsupported v: {}",
+            req.v
+        )));
+    }
+    // Resolve entity from the new-shape `entity` field, else
+    // the legacy `{artist, artist_mbid}` fields.
+    let entity: EntityRef = match req.entity {
+        Some(e) => e,
+        None => match req.artist {
+            Some(a) if !a.trim().is_empty() => EntityRef {
+                entity_type: EntityType::Artist,
+                name: a.trim().to_string(),
+                mbid: req.artist_mbid,
+            },
+            _ => {
+                return Ok(CascadeResponse::bad_request(
+                    "either `entity` (new shape) or `artist` (legacy shape) \
+                     is required and must be non-empty",
+                ));
+            }
+        },
+    };
+    if entity.name.trim().is_empty() {
+        return Ok(CascadeResponse::bad_request(
+            "entity.name is required and must be non-empty",
+        ));
+    }
+
+    // Anonymous baseline: try MusicBrainz artist search + url-rels
+    // to discover Wikipedia / Wikidata URLs, then Wikipedia
+    // summary, then Wikidata facts. Every step is gated on
+    // per-provider enable + privacy-mode.
+    let mut last_provider: Option<ProviderId> = None;
+
+    // Positive cache pre-check per provider so an operator
+    // disabling a provider does not suppress cached positives
+    // from a still-enabled provider.
+    // Anonymous first: Wikipedia (bio prose is our primary
+    // enrichment surface).
+    let want_mb = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::MusicBrainz);
+    let want_wp = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikipedia);
+    let want_wd = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikidata);
+    let want_lastfm =
+        catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+            && catalogue.lastfm.is_some();
+
+    if !(want_mb || want_wp || want_wd || want_lastfm) {
+        return Ok(CascadeResponse::not_configured(
+            "every bio provider is disabled or unavailable on this device; \
+             enable at least one under Settings → Metadata → Sources",
+        ));
+    }
+
+    // Resolve entity URLs via MusicBrainz artist lookup when
+    // enabled. This yields Wikipedia + Wikidata URLs that the
+    // downstream providers consume directly — no fuzzy search.
+    let mut wikipedia_url: Option<String> = None;
+    let mut wikidata_url: Option<String> = None;
+    if want_mb {
+        if let Some(mb) = catalogue.musicbrainz.as_ref() {
+            last_provider = Some(ProviderId::MusicBrainz);
+            let mbid = match &entity.mbid {
+                Some(m) if !m.trim().is_empty() => Some(m.clone()),
+                _ => match mb.search_artist(&entity.name).await {
+                    Ok(Some(hit)) if hit.confidence_percent >= 85 => {
+                        Some(hit.artist_mbid)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        // MB transient — do not cache; skip MB.
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "musicbrainz",
+                            entity = %entity.name,
+                            error = %e,
+                            "MB artist search transient; skipping"
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some(mbid) = mbid {
+                match mb.lookup_artist(&mbid).await {
+                    Ok(al) => {
+                        wikipedia_url = al.wikipedia_url;
+                        wikidata_url = al.wikidata_url;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "musicbrainz",
+                            mbid,
+                            error = %e,
+                            "MB artist lookup transient; skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Wikipedia summary — the primary anonymous bio content.
+    if want_wp {
+        if let Some(wp) = catalogue.wikipedia.as_ref() {
+            last_provider = Some(ProviderId::Wikipedia);
+            let key = EnrichmentCache::key_for(&[
+                "entity_bio",
+                entity.entity_type.as_str(),
+                &normalise(&entity.name),
+                ProviderId::Wikipedia.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache(
+                            p,
+                            ProviderId::Wikipedia,
+                            entry.provider_id,
+                        ));
+                    }
+                }
+            }
+            let hit = match &wikipedia_url {
+                Some(url) => wp.get_summary_from_url(url).await,
+                None => wp.get_summary_en(&entity.name).await,
+            };
+            match hit {
+                Ok(Some(summary)) => {
+                    let payload = serde_json::json!({
+                        "title": summary.title,
+                        "summary": summary.extract,
+                        "language": summary.language,
+                    });
+                    let _ =
+                        cache.put_positive(&key, payload.clone(), "wikipedia");
+                    let enhancement = enhancement_hint_for_bio(
+                        catalogue,
+                        ProviderId::Wikipedia,
+                    );
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Wikipedia.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::Anonymous.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Wikipedia".into(),
+                            source_url: Some(summary.page_url),
+                            license: "CC BY-SA".into(),
+                        }),
+                        enhancement,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        entity = %entity.name,
+                        error = %e,
+                        "Wikipedia summary transient / not-usable; skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    // Wikidata — structured biographical facts. Fallback bio
+    // surface when Wikipedia has no summary.
+    if want_wd {
+        if let Some(wd) = catalogue.wikidata.as_ref() {
+            last_provider = Some(ProviderId::Wikidata);
+            let hit = match &wikidata_url {
+                Some(url) => wd.get_entity_from_url(url).await,
+                None => Ok(None),
+            };
+            if let Ok(Some(entity_hit)) = hit {
+                let payload = serde_json::json!({
+                    "label": entity_hit.label_en,
+                    "description": entity_hit.description_en,
+                    "date_of_birth": entity_hit.date_of_birth,
+                    "date_of_death": entity_hit.date_of_death,
+                    "inception": entity_hit.inception,
+                    "dissolution": entity_hit.dissolution,
+                });
+                let key = EnrichmentCache::key_for(&[
+                    "entity_bio",
+                    entity.entity_type.as_str(),
+                    &normalise(&entity.name),
+                    ProviderId::Wikidata.as_str(),
+                ]);
+                let _ = cache.put_positive(&key, payload.clone(), "wikidata");
+                let enhancement =
+                    enhancement_hint_for_bio(catalogue, ProviderId::Wikidata);
+                return Ok(CascadeResponse {
+                    v: 1,
+                    status: CascadeStatus::Ok,
+                    provider_id: Some(
+                        ProviderId::Wikidata.as_str().to_string(),
+                    ),
+                    privacy_class: Some(
+                        PrivacyClass::Anonymous.as_str().to_string(),
+                    ),
+                    payload: Some(payload),
+                    detail: None,
+                    attribution: Some(Attribution {
+                        source_name: "Wikidata".into(),
+                        source_url: Some(entity_hit.entity_url),
+                        license: "CC0".into(),
+                    }),
+                    enhancement,
+                });
+            }
+        }
+    }
+
+    // Identity-bearing enhancement: Last.fm — richer editorial
+    // bio when the operator has enabled it AND provided a key.
+    // Only fired for artist-type entities; Last.fm has poor
+    // classical (composer / work / performer) coverage.
+    if want_lastfm && matches!(entity.entity_type, EntityType::Artist) {
+        if let Some(lastfm) = catalogue.lastfm.as_ref() {
+            last_provider = Some(ProviderId::Lastfm);
+            match lastfm
+                .get_artist_bio(&entity.name, entity.mbid.as_deref())
+                .await
+            {
+                Ok(Some(h)) => {
+                    let payload = serde_json::json!({
+                        "summary": h.summary,
+                        "content": h.content,
+                        "source_url": h.source_url,
+                    });
+                    let key = EnrichmentCache::key_for(&[
+                        "entity_bio",
+                        entity.entity_type.as_str(),
+                        &normalise(&entity.name),
+                        ProviderId::Lastfm.as_str(),
+                    ]);
+                    let _ = cache.put_positive(&key, payload.clone(), "lastfm");
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Lastfm.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::IdentityBearing.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Last.fm".into(),
+                            source_url: h.source_url.clone(),
+                            license: "Last.fm terms of use".into(),
+                        }),
+                        enhancement: None,
+                    });
+                }
+                Ok(None) => {}
+                Err(LastfmError::Application { code, message })
+                    if evo_online_providers::lastfm_is_notfound_code(code) =>
+                {
+                    tracing::debug!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "lastfm",
+                        code,
+                        message,
+                        "Last.fm clean miss"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "lastfm",
+                        entity = %entity.name,
+                        error = %e,
+                        "Last.fm transient; skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    // All enabled providers structurally missed. Return
+    // not_found with an enhancement hint pointing at the
+    // best identity-bearing provider the operator could enable
+    // next.
+    let detail = format!(
+        "no bio found for {}={} across enabled providers",
+        entity.entity_type.as_str(),
+        entity.name
+    );
+    let enhancement = enhancement_hint_for_bio_missing(catalogue);
+    Ok(CascadeResponse {
+        v: 1,
+        status: CascadeStatus::NotFound,
+        provider_id: last_provider.map(|p| p.as_str().to_string()),
+        privacy_class: last_provider
+            .map(|p| p.privacy_class().as_str().to_string()),
+        payload: None,
+        detail: Some(detail),
+        attribution: None,
+        enhancement,
+    })
+}
+
+fn cascade_ok_from_cache(
+    payload: serde_json::Value,
+    provider: ProviderId,
+    _origin_provider_id: Option<String>,
+) -> CascadeResponse {
+    CascadeResponse {
+        v: 1,
+        status: CascadeStatus::Ok,
+        provider_id: Some(provider.as_str().to_string()),
+        privacy_class: Some(provider.privacy_class().as_str().to_string()),
+        payload: Some(payload),
+        detail: None,
+        attribution: Some(match provider {
+            ProviderId::Wikipedia => Attribution {
+                source_name: "Wikipedia".into(),
+                source_url: None,
+                license: "CC BY-SA".into(),
+            },
+            ProviderId::Wikidata => Attribution {
+                source_name: "Wikidata".into(),
+                source_url: None,
+                license: "CC0".into(),
+            },
+            ProviderId::MusicBrainz => Attribution {
+                source_name: "MusicBrainz".into(),
+                source_url: None,
+                license: "CC0".into(),
+            },
+            ProviderId::Lrclib => Attribution {
+                source_name: "LRCLIB".into(),
+                source_url: None,
+                license: "Public domain".into(),
+            },
+            ProviderId::Lastfm => Attribution {
+                source_name: "Last.fm".into(),
+                source_url: None,
+                license: "Last.fm terms of use".into(),
+            },
+            ProviderId::Discogs => Attribution {
+                source_name: "Discogs".into(),
+                source_url: None,
+                license: "Discogs terms of use".into(),
+            },
+            ProviderId::Genius => Attribution {
+                source_name: "Genius".into(),
+                source_url: None,
+                license: "Genius terms of use".into(),
+            },
+        }),
+        enhancement: None,
+    }
+}
+
+fn enhancement_hint_for_bio(
+    catalogue: &ProviderCatalogue,
+    won: ProviderId,
+) -> Option<EnhancementHint> {
+    // Suggest Last.fm as bio enhancement only for artist requests
+    // where the anonymous baseline won and Last.fm is either
+    // disabled or unavailable.
+    if won == ProviderId::Lastfm {
+        return None;
+    }
+    if catalogue.lastfm.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Last.fm API key for richer editorial bios".into(),
+        })
+    } else if !catalogue.config.is_effectively_enabled(ProviderId::Lastfm) {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Last.fm under Settings → Metadata → Sources \
+                     for richer editorial bios"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
+fn enhancement_hint_for_bio_missing(
+    catalogue: &ProviderCatalogue,
+) -> Option<EnhancementHint> {
+    // On a full miss with Last.fm available but disabled,
+    // suggest enabling it. Otherwise silent.
+    if catalogue.lastfm.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Last.fm under Settings → Metadata → Sources \
+                     to try one more source"
+                .into(),
+        })
+    } else if catalogue.lastfm.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Last.fm API key to try one more source".into(),
+        })
+    } else {
+        None
     }
 }

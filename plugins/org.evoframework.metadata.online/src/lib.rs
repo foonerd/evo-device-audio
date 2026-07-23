@@ -85,6 +85,7 @@
 
 mod browse_recording_type;
 mod cache;
+mod cascade;
 mod config;
 mod enrichment;
 mod enrichment_cache;
@@ -95,7 +96,7 @@ use std::sync::Arc;
 
 use evo_online_providers::{
     build_http_client, DiscogsClient, GeniusClient, LastfmClient, LrclibClient,
-    MusicBrainzClient, RateLimiter,
+    MusicBrainzClient, RateLimiter, WikidataClient, WikipediaClient,
 };
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
@@ -158,6 +159,9 @@ pub struct MetadataOnlinePlugin {
     lrclib_client: Option<LrclibClient>,
     discogs_client: Option<DiscogsClient>,
     genius_client: Option<GeniusClient>,
+    wikipedia_client: Option<WikipediaClient>,
+    wikidata_client: Option<WikidataClient>,
+    provider_config: cascade::ProviderConfig,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -178,6 +182,9 @@ impl MetadataOnlinePlugin {
             lrclib_client: None,
             discogs_client: None,
             genius_client: None,
+            wikipedia_client: None,
+            wikidata_client: None,
+            provider_config: cascade::ProviderConfig::defaults(),
             reconcile_cache: None,
             lyrics_cache: None,
             bio_cache: None,
@@ -267,6 +274,24 @@ impl Plugin for MetadataOnlinePlugin {
             self.lrclib_client = Some(LrclibClient::new(
                 http.clone(),
                 lrclib_rate,
+                self.config.musicbrainz_user_agent.clone(),
+            ));
+            // Wikipedia + Wikidata anonymous baseline for the
+            // keyless-first metadata enrichment cascade. Both
+            // share the MusicBrainz rate limiter's 1-req/sec
+            // cadence — Wikimedia asks for the same discipline
+            // (descriptive UA, no burst).
+            let wikimedia_rate = Arc::new(RateLimiter::new(
+                self.config.musicbrainz_min_interval,
+            ));
+            self.wikipedia_client = Some(WikipediaClient::new(
+                http.clone(),
+                Arc::clone(&wikimedia_rate),
+                self.config.musicbrainz_user_agent.clone(),
+            ));
+            self.wikidata_client = Some(WikidataClient::new(
+                http.clone(),
+                wikimedia_rate,
                 self.config.musicbrainz_user_agent.clone(),
             ));
             // Resolve the Last.fm API key. Precedence:
@@ -452,6 +477,9 @@ impl Respondent for MetadataOnlinePlugin {
             let lastfm = self.lastfm_client.clone();
             let discogs = self.discogs_client.clone();
             let genius = self.genius_client.clone();
+            let wikipedia = self.wikipedia_client.clone();
+            let wikidata = self.wikidata_client.clone();
+            let provider_config = self.provider_config.clone();
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -517,10 +545,18 @@ impl Respondent for MetadataOnlinePlugin {
                             "bio cache not wired at load".to_string(),
                         )
                     })?;
-                    let response = enrichment::query_artist_bio(
-                        &payload,
-                        lastfm.as_ref(),
-                        cache_ref,
+                    let catalogue = cascade::ProviderCatalogue {
+                        musicbrainz: Some(Arc::new(mb.clone())),
+                        wikipedia: wikipedia.clone().map(Arc::new),
+                        wikidata: wikidata.clone().map(Arc::new),
+                        lrclib: Some(Arc::new(lrclib.clone())),
+                        lastfm: lastfm.clone().map(Arc::new),
+                        discogs: discogs.clone().map(Arc::new),
+                        genius: genius.clone().map(Arc::new),
+                        config: provider_config.clone(),
+                    };
+                    let response = enrichment::query_entity_bio(
+                        &payload, &catalogue, cache_ref,
                     )
                     .await
                     .map_err(PluginError::Permanent)?;
