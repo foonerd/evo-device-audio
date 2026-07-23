@@ -19,6 +19,7 @@ request_types = [
     "metadata.query_album_notes",
     "metadata.query_release_credits",
     "metadata.query_track_annotation",
+    "metadata.query_work_notes",
 ]
 
 [[stockings]]
@@ -64,6 +65,7 @@ request_types = [
     "metadata.query_album_notes",
     "metadata.query_release_credits",
     "metadata.query_track_annotation",
+    "metadata.query_work_notes",
     "library.browse_by_recording_type",
 ]
 response_budget_ms = 120000

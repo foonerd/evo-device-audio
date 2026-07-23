@@ -123,6 +123,7 @@ OOP_PLUGINS=(
     "org.evoframework.artwork.online:org-evoframework-artwork-online:artwork-online-wire:"
     "org.evoframework.network:org-evoframework-network:network-wire:"
     "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
+    "org.evoframework.metadata.online:org-evoframework-metadata-online:metadata-online-wire:"
     "org.evoframework.hardware.audio-config:org-evoframework-hardware-audio-config:hardware-audio-config-wire:"
     "org.evoframework.playback.options:org-evoframework-playback-options:playback-options-wire:"
     "org.evoframework.composition.alsa:org-evoframework-composition-alsa:composition-alsa-wire:alsa-substrate"
