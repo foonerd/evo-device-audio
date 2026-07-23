@@ -621,10 +621,18 @@ impl Respondent for MetadataOnlinePlugin {
                                     .to_string(),
                             )
                         })?;
-                    let response = enrichment::query_track_annotation(
-                        &payload,
-                        genius.as_ref(),
-                        cache_ref,
+                    let catalogue = cascade::ProviderCatalogue {
+                        musicbrainz: Some(Arc::new(mb.clone())),
+                        wikipedia: wikipedia.clone().map(Arc::new),
+                        wikidata: wikidata.clone().map(Arc::new),
+                        lrclib: Some(Arc::new(lrclib.clone())),
+                        lastfm: lastfm.clone().map(Arc::new),
+                        discogs: discogs.clone().map(Arc::new),
+                        genius: genius.clone().map(Arc::new),
+                        config: provider_config.clone(),
+                    };
+                    let response = enrichment::query_track_annotation_cascade(
+                        &payload, &catalogue, cache_ref,
                     )
                     .await
                     .map_err(PluginError::Permanent)?;

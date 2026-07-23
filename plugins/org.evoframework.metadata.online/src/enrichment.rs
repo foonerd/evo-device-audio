@@ -25,8 +25,7 @@
 //!    moment).
 
 use evo_online_providers::{
-    lastfm::LastfmError, DiscogsError, GeniusClient, GeniusError, LastfmClient,
-    LrclibClient,
+    lastfm::LastfmError, DiscogsError, GeniusError, LastfmClient, LrclibClient,
 };
 use serde::{Deserialize, Serialize};
 
@@ -387,113 +386,8 @@ fn discogs_error_message(e: &DiscogsError) -> String {
     }
 }
 
-// -----------------------------------------------------------------
-// query_track_annotation — Genius song description + lyrics URL
-// -----------------------------------------------------------------
-//
-// Request:
-//   { "v": 1, "artist": "...", "track": "..." }
-//
-// Response payload on hit:
-//   {
-//     "song_id": <u64>,
-//     "description": "...",
-//     "source_url": "https://genius.com/..."
-//   }
-//
-// The Genius API does NOT return lyrics text; this verb surfaces
-// only what the API returns as text (annotation description) plus
-// the URL of Genius's web page for the song. The operator UI
-// renders the URL as an outbound "View lyrics on Genius" link.
-
-#[derive(Debug, Deserialize)]
-struct TrackAnnotationRequest {
-    v: u8,
-    artist: Option<String>,
-    track: Option<String>,
-}
-
-pub(crate) async fn query_track_annotation(
-    payload: &[u8],
-    genius: Option<&GeniusClient>,
-    cache: &EnrichmentCache,
-) -> Result<EnrichmentResponse, String> {
-    if payload.is_empty() {
-        return Ok(bad_request("empty payload"));
-    }
-    let text = std::str::from_utf8(payload)
-        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
-    let req: TrackAnnotationRequest =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
-    if req.v != 1 {
-        return Ok(bad_request(&format!("unsupported v: {}", req.v)));
-    }
-    let artist = req
-        .artist
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let track = req
-        .track
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let (Some(artist), Some(track)) = (artist, track) else {
-        return Ok(bad_request(
-            "artist and track are required and must be non-empty",
-        ));
-    };
-    let Some(genius) = genius else {
-        return Ok(not_configured(
-            "Genius client access token not configured on this device; \
-             track-annotation provider disabled",
-        ));
-    };
-    let key = EnrichmentCache::key_for(&[
-        "track_annotation",
-        &normalise(&artist),
-        &normalise(&track),
-    ]);
-    if let Some(entry) = cache.get(&key) {
-        if entry.status == "ok" {
-            if let Some(p) = entry.payload {
-                return Ok(from_cache_ok(p, entry.provider_id));
-            }
-        }
-        return Ok(from_cache_negative(entry.detail));
-    }
-    match genius.get_track_annotation(&artist, &track).await {
-        Ok(None) => {
-            let detail = "Genius has no hit for this track".to_string();
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("genius".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Ok(Some(h)) => {
-            let payload = serde_json::json!({
-                "song_id": h.song_id,
-                "description": h.description,
-                "source_url": h.source_url,
-            });
-            let _ = cache.put_positive(&key, payload.clone(), "genius");
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::Ok,
-                provider_id: Some("genius".to_string()),
-                payload: Some(payload),
-                detail: None,
-            })
-        }
-        Err(e) => Err(genius_error_message(&e)),
-    }
-}
+// Genius error surfacing helper — shared with the
+// track-annotation cascade below.
 
 fn genius_error_message(e: &GeniusError) -> String {
     match e {
@@ -1378,5 +1272,315 @@ fn cascade_ok_from_cache_generic(
             license: license.into(),
         }),
         enhancement: None,
+    }
+}
+
+// -----------------------------------------------------------------
+// KEYLESS-FIRST CASCADE — track-annotation via Wikipedia song
+// page (anonymous baseline, best-effort) → Genius description
+// (identity-bearing enhancement).
+// -----------------------------------------------------------------
+//
+// The Genius API does NOT return lyrics text; this verb only
+// surfaces its `description` field plus the URL of Genius's web
+// page for the song. Consumers render the URL as an outbound
+// "View lyrics on Genius" affordance. The plugin never fetches
+// Genius's HTML lyrics page.
+
+/// Cascade request for track-annotation. The optional
+/// `recording_mbid` short-circuits the Wikipedia title-search
+/// step when the caller can supply it (from the release-credits
+/// cascade payload's `tracks[].work_mbid` is a companion path
+/// but not the recording-mbid; MB does not expose recording url-
+/// rels through the current shipped client, so this field is
+/// wire-compatible today and consumed once that client method
+/// lands).
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrackAnnotationCascadeRequest {
+    #[serde(default)]
+    v: u8,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    track: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    recording_mbid: Option<String>,
+}
+
+pub(crate) async fn query_track_annotation_cascade(
+    payload: &[u8],
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+) -> Result<CascadeResponse, String> {
+    if payload.is_empty() {
+        return Ok(CascadeResponse::bad_request("empty payload"));
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
+    let req: TrackAnnotationCascadeRequest =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    if req.v != 1 {
+        return Ok(CascadeResponse::bad_request(format!(
+            "unsupported v: {}",
+            req.v
+        )));
+    }
+    let artist = req
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let track = req
+        .track
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let (Some(artist), Some(track)) = (artist, track) else {
+        return Ok(CascadeResponse::bad_request(
+            "artist and track are required and must be non-empty",
+        ));
+    };
+
+    let want_wp = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikipedia)
+        && catalogue.wikipedia.is_some();
+    let want_genius =
+        catalogue.config.is_effectively_enabled(ProviderId::Genius)
+            && catalogue.genius.is_some();
+
+    if !(want_wp || want_genius) {
+        return Ok(CascadeResponse::not_configured(
+            "every track-annotation provider is disabled or unavailable on \
+             this device; enable at least one under Settings → Metadata → \
+             Sources",
+        ));
+    }
+
+    let mut last_provider: Option<ProviderId> = None;
+
+    // Anonymous baseline: Wikipedia song page. Songs rarely
+    // carry their own Wikipedia article — the try-set below
+    // exhausts the disambiguated forms `"{Track} ({Artist} song)"`
+    // and `"{Track} (song)"` before falling back to the bare
+    // title (which lands on the correct page for songs whose
+    // title is unambiguous in Wikipedia's namespace).
+    if want_wp {
+        if let Some(wp) = catalogue.wikipedia.as_ref() {
+            last_provider = Some(ProviderId::Wikipedia);
+            let key = EnrichmentCache::key_for(&[
+                "track_annotation",
+                "song",
+                &normalise(&artist),
+                &normalise(&track),
+                ProviderId::Wikipedia.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Wikipedia,
+                            None,
+                        ));
+                    }
+                }
+            }
+            let candidate_titles = [
+                format!("{track} ({artist} song)"),
+                format!("{track} (song)"),
+                track.clone(),
+            ];
+            let mut wp_hit = None;
+            for candidate in &candidate_titles {
+                match wp.get_summary_en(candidate).await {
+                    Ok(Some(summary)) => {
+                        wp_hit = Some(summary);
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikipedia",
+                            title = %candidate,
+                            error = %e,
+                            "Wikipedia song-title lookup transient / \
+                             not-usable; trying next form"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if let Some(summary) = wp_hit {
+                let payload = serde_json::json!({
+                    "title": summary.title,
+                    "summary": summary.extract,
+                    "language": summary.language,
+                    "source_url": summary.page_url,
+                });
+                let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+                let enhancement = enhancement_hint_for_track_annotation(
+                    catalogue,
+                    ProviderId::Wikipedia,
+                );
+                return Ok(CascadeResponse {
+                    v: 1,
+                    status: CascadeStatus::Ok,
+                    provider_id: Some(
+                        ProviderId::Wikipedia.as_str().to_string(),
+                    ),
+                    privacy_class: Some(
+                        PrivacyClass::Anonymous.as_str().to_string(),
+                    ),
+                    payload: Some(payload),
+                    detail: None,
+                    attribution: Some(Attribution {
+                        source_name: "Wikipedia".into(),
+                        source_url: Some(summary.page_url),
+                        license: "CC BY-SA".into(),
+                    }),
+                    enhancement,
+                });
+            }
+        }
+    }
+
+    // Identity-bearing enhancement: Genius description.
+    if want_genius {
+        if let Some(genius) = catalogue.genius.as_ref() {
+            last_provider = Some(ProviderId::Genius);
+            let key = EnrichmentCache::key_for(&[
+                "track_annotation",
+                "song",
+                &normalise(&artist),
+                &normalise(&track),
+                ProviderId::Genius.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Genius,
+                            None,
+                        ));
+                    }
+                }
+            }
+            match genius.get_track_annotation(&artist, &track).await {
+                Ok(Some(h)) => {
+                    let payload = serde_json::json!({
+                        "song_id": h.song_id,
+                        "description": h.description,
+                        "source_url": h.source_url,
+                    });
+                    let _ = cache.put_positive(&key, payload.clone(), "genius");
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Genius.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::IdentityBearing.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Genius".into(),
+                            source_url: h.source_url.clone(),
+                            license: "Genius terms of use".into(),
+                        }),
+                        enhancement: enhancement_hint_for_track_annotation(
+                            catalogue,
+                            ProviderId::Genius,
+                        ),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "genius",
+                        artist,
+                        track,
+                        error = %genius_error_message(&e),
+                        "Genius track annotation transient; skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    let detail = format!(
+        "no track annotation found for {artist} — {track} across \
+         enabled providers"
+    );
+    let enhancement = enhancement_hint_for_track_annotation_missing(catalogue);
+    Ok(CascadeResponse {
+        v: 1,
+        status: CascadeStatus::NotFound,
+        provider_id: last_provider.map(|p| p.as_str().to_string()),
+        privacy_class: last_provider
+            .map(|p| p.privacy_class().as_str().to_string()),
+        payload: None,
+        detail: Some(detail),
+        attribution: None,
+        enhancement,
+    })
+}
+
+fn enhancement_hint_for_track_annotation(
+    catalogue: &ProviderCatalogue,
+    won: ProviderId,
+) -> Option<EnhancementHint> {
+    if won == ProviderId::Genius {
+        return None;
+    }
+    if catalogue.genius.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Genius.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Genius API access token for song annotations".into(),
+        })
+    } else if !catalogue.config.is_effectively_enabled(ProviderId::Genius) {
+        Some(EnhancementHint {
+            provider: ProviderId::Genius.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Genius under Settings → Metadata → Sources for \
+                     song annotations"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
+fn enhancement_hint_for_track_annotation_missing(
+    catalogue: &ProviderCatalogue,
+) -> Option<EnhancementHint> {
+    if catalogue.genius.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
+    {
+        Some(EnhancementHint {
+            provider: ProviderId::Genius.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Genius under Settings → Metadata → Sources to \
+                     try one more source"
+                .into(),
+        })
+    } else if catalogue.genius.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Genius.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Genius API access token to try one more source"
+                .into(),
+        })
+    } else {
+        None
     }
 }
