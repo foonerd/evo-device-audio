@@ -25,8 +25,8 @@
 //!    moment).
 
 use evo_online_providers::{
-    lastfm::LastfmError, DiscogsClient, DiscogsError, GeniusClient,
-    GeniusError, LastfmClient, LrclibClient,
+    lastfm::LastfmError, DiscogsError, GeniusClient, GeniusError, LastfmClient,
+    LrclibClient,
 };
 use serde::{Deserialize, Serialize};
 
@@ -374,125 +374,8 @@ mod tests {
     }
 }
 
-// -----------------------------------------------------------------
-// query_release_credits — Discogs release detail
-// -----------------------------------------------------------------
-//
-// Request:
-//   { "v": 1, "artist": "...", "album": "..." }
-//
-// Response payload on hit:
-//   {
-//     "release_id": <u64>,
-//     "label": "...",
-//     "catalog_number": "...",
-//     "year": <u32>,
-//     "country": "...",
-//     "format": "...",
-//     "notes": "...",
-//     "source_url": "https://www.discogs.com/release/..."
-//   }
-//
-// No-key / no-configuration → status=not_configured, provider_id=None.
-
-#[derive(Debug, Deserialize)]
-struct ReleaseCreditsRequest {
-    v: u8,
-    artist: Option<String>,
-    album: Option<String>,
-}
-
-pub(crate) async fn query_release_credits(
-    payload: &[u8],
-    discogs: Option<&DiscogsClient>,
-    cache: &EnrichmentCache,
-) -> Result<EnrichmentResponse, String> {
-    if payload.is_empty() {
-        return Ok(bad_request("empty payload"));
-    }
-    let text = std::str::from_utf8(payload)
-        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
-    let req: ReleaseCreditsRequest =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
-    if req.v != 1 {
-        return Ok(bad_request(&format!("unsupported v: {}", req.v)));
-    }
-    let artist = req
-        .artist
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let album = req
-        .album
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let (Some(artist), Some(album)) = (artist, album) else {
-        return Ok(bad_request(
-            "artist and album are required and must be non-empty",
-        ));
-    };
-    let Some(discogs) = discogs else {
-        return Ok(not_configured(
-            "Discogs Personal Access Token not configured on this device; \
-             release-credits provider disabled",
-        ));
-    };
-    let key = EnrichmentCache::key_for(&[
-        "release_credits",
-        &normalise(&artist),
-        &normalise(&album),
-    ]);
-    if let Some(entry) = cache.get(&key) {
-        if entry.status == "ok" {
-            if let Some(p) = entry.payload {
-                return Ok(from_cache_ok(p, entry.provider_id));
-            }
-        }
-        return Ok(from_cache_negative(entry.detail));
-    }
-    match discogs.get_release_detail(&artist, &album).await {
-        Ok(None) => {
-            let detail =
-                "Discogs has no release matching this pair".to_string();
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("discogs".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Ok(Some(h)) => {
-            let payload = serde_json::json!({
-                "release_id": h.release_id,
-                "label": h.label,
-                "catalog_number": h.catalog_number,
-                "year": h.year,
-                "country": h.country,
-                "format": h.format,
-                "notes": h.notes,
-                "source_url": h.source_url,
-            });
-            let _ = cache.put_positive(&key, payload.clone(), "discogs");
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::Ok,
-                provider_id: Some("discogs".to_string()),
-                payload: Some(payload),
-                detail: None,
-            })
-        }
-        Err(e) => {
-            // Transient — never cache. Same shape the transient-not-
-            // cached fix locked in for artwork.online.
-            Err(discogs_error_message(&e))
-        }
-    }
-}
+// Discogs error surfacing helper — shared with the
+// release-credits cascade below.
 
 fn discogs_error_message(e: &DiscogsError) -> String {
     match e {
@@ -1085,5 +968,415 @@ fn enhancement_hint_for_bio_missing(
         })
     } else {
         None
+    }
+}
+
+// -----------------------------------------------------------------
+// KEYLESS-FIRST CASCADE — release-credits via MusicBrainz
+// full-release lookup (anonymous baseline) → Discogs release
+// detail (identity-bearing enhancement).
+// -----------------------------------------------------------------
+
+/// Cascade request for release-credits. `release_mbid` short-
+/// circuits the `search_release` step when the caller already
+/// has one; otherwise the cascade reconciles `(artist, album)`
+/// against MusicBrainz first.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReleaseCreditsCascadeRequest {
+    #[serde(default)]
+    v: u8,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    release_mbid: Option<String>,
+}
+
+/// MB confidence floor for accepting a `search_release` hit as
+/// the release's canonical MBID. Matches the reconciliation
+/// module's threshold.
+const RELEASE_SEARCH_CONFIDENCE_FLOOR: u32 = 85;
+
+pub(crate) async fn query_release_credits_cascade(
+    payload: &[u8],
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+) -> Result<CascadeResponse, String> {
+    if payload.is_empty() {
+        return Ok(CascadeResponse::bad_request("empty payload"));
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
+    let req: ReleaseCreditsCascadeRequest =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    if req.v != 1 {
+        return Ok(CascadeResponse::bad_request(format!(
+            "unsupported v: {}",
+            req.v
+        )));
+    }
+    let artist = req
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let album = req
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let (Some(artist), Some(album)) = (artist, album) else {
+        return Ok(CascadeResponse::bad_request(
+            "artist and album are required and must be non-empty",
+        ));
+    };
+
+    let want_mb = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::MusicBrainz)
+        && catalogue.musicbrainz.is_some();
+    let want_discogs =
+        catalogue.config.is_effectively_enabled(ProviderId::Discogs)
+            && catalogue.discogs.is_some();
+
+    if !(want_mb || want_discogs) {
+        return Ok(CascadeResponse::not_configured(
+            "every release-credits provider is disabled or unavailable on \
+             this device; enable at least one under Settings → Metadata → \
+             Sources",
+        ));
+    }
+
+    let mut last_provider: Option<ProviderId> = None;
+
+    // Anonymous baseline: MusicBrainz. Resolves the release MBID
+    // (via caller-supplied hint or `search_release`), then a full
+    // release lookup delivers artist credits, labels + catalog #,
+    // recording-level performer / conductor / composer relations,
+    // and per-track work MBIDs. This is the canonical shape that
+    // populates classical personnel — a Discogs-only response
+    // cannot match this fidelity.
+    if want_mb {
+        if let Some(mb) = catalogue.musicbrainz.as_ref() {
+            last_provider = Some(ProviderId::MusicBrainz);
+            let key = EnrichmentCache::key_for(&[
+                "release_credits",
+                "release",
+                &normalise(&artist),
+                &normalise(&album),
+                ProviderId::MusicBrainz.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        // Cached payload already carries the
+                        // canonical `source_url` set on the fresh
+                        // path — the generic helper recovers it.
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::MusicBrainz,
+                            None,
+                        ));
+                    }
+                }
+            }
+            let release_mbid: Option<String> = match &req.release_mbid {
+                Some(m) if !m.trim().is_empty() => Some(m.trim().to_string()),
+                _ => match mb.search_release(&artist, &album).await {
+                    Ok(Some(hit))
+                        if hit.confidence_percent
+                            >= RELEASE_SEARCH_CONFIDENCE_FLOOR =>
+                    {
+                        Some(hit.release_mbid)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "musicbrainz",
+                            artist,
+                            album,
+                            error = %e,
+                            "MB release search transient; skipping"
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some(release_mbid) = release_mbid {
+                match mb.lookup_release_full(&release_mbid).await {
+                    Ok(rc) => {
+                        let payload = release_credits_payload(&rc);
+                        let _ = cache.put_positive(
+                            &key,
+                            payload.clone(),
+                            "musicbrainz",
+                        );
+                        let attribution = Attribution {
+                            source_name: "MusicBrainz".into(),
+                            source_url: Some(format!(
+                                "https://musicbrainz.org/release/{}",
+                                rc.release_mbid
+                            )),
+                            license: "CC0".into(),
+                        };
+                        let enhancement = enhancement_hint_for_release_credits(
+                            catalogue,
+                            ProviderId::MusicBrainz,
+                        );
+                        return Ok(CascadeResponse {
+                            v: 1,
+                            status: CascadeStatus::Ok,
+                            provider_id: Some(
+                                ProviderId::MusicBrainz.as_str().to_string(),
+                            ),
+                            privacy_class: Some(
+                                PrivacyClass::Anonymous.as_str().to_string(),
+                            ),
+                            payload: Some(payload),
+                            detail: None,
+                            attribution: Some(attribution),
+                            enhancement,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "musicbrainz",
+                            release_mbid,
+                            error = %e,
+                            "MB full-release lookup transient; skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Identity-bearing enhancement: Discogs release detail.
+    // Delivers pressing + label + catalog + notes at higher
+    // fidelity than MB when the operator has enabled Discogs and
+    // provided a token. Cache is keyed separately so a disabled
+    // Discogs never suppresses a cached MB result and vice versa.
+    if want_discogs {
+        if let Some(discogs) = catalogue.discogs.as_ref() {
+            last_provider = Some(ProviderId::Discogs);
+            let key = EnrichmentCache::key_for(&[
+                "release_credits",
+                "release",
+                &normalise(&artist),
+                &normalise(&album),
+                ProviderId::Discogs.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Discogs,
+                            None,
+                        ));
+                    }
+                }
+            }
+            match discogs.get_release_detail(&artist, &album).await {
+                Ok(Some(h)) => {
+                    let payload = serde_json::json!({
+                        "release_id": h.release_id,
+                        "label": h.label,
+                        "catalog_number": h.catalog_number,
+                        "year": h.year,
+                        "country": h.country,
+                        "format": h.format,
+                        "notes": h.notes,
+                        "source_url": h.source_url,
+                    });
+                    let _ =
+                        cache.put_positive(&key, payload.clone(), "discogs");
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Discogs.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::IdentityBearing.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Discogs".into(),
+                            source_url: h.source_url.clone(),
+                            license: "Discogs terms of use".into(),
+                        }),
+                        enhancement: enhancement_hint_for_release_credits(
+                            catalogue,
+                            ProviderId::Discogs,
+                        ),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Transient — never cache; skip Discogs.
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "discogs",
+                        artist,
+                        album,
+                        error = %discogs_error_message(&e),
+                        "Discogs release detail transient; skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    // Every enabled provider structurally missed.
+    let detail = format!("no release-credits found for {artist} — {album}");
+    let enhancement = enhancement_hint_for_release_credits_missing(catalogue);
+    Ok(CascadeResponse {
+        v: 1,
+        status: CascadeStatus::NotFound,
+        provider_id: last_provider.map(|p| p.as_str().to_string()),
+        privacy_class: last_provider
+            .map(|p| p.privacy_class().as_str().to_string()),
+        payload: None,
+        detail: Some(detail),
+        attribution: None,
+        enhancement,
+    })
+}
+
+fn release_credits_payload(
+    rc: &evo_online_providers::musicbrainz::ReleaseCreditsLookup,
+) -> serde_json::Value {
+    let tracks: Vec<serde_json::Value> = rc
+        .tracks
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "position": t.position,
+                "title": t.title,
+                "length_ms": t.length_ms,
+                "track_artist": t.track_artist,
+                "composer": t.composer,
+                "conductor": t.conductor,
+                "performer": t.performer,
+                "work_mbid": t.work_mbid,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "release_mbid": rc.release_mbid,
+        "first_release_year": rc.first_release_year,
+        "recording_type": rc.recording_type,
+        "label_name": rc.label_name,
+        "catalog_number": rc.catalog_number,
+        "album_artist": rc.album_artist,
+        "country": rc.country,
+        "tracks": tracks,
+        "source_url": format!(
+            "https://musicbrainz.org/release/{}",
+            rc.release_mbid
+        ),
+    })
+}
+
+fn enhancement_hint_for_release_credits(
+    catalogue: &ProviderCatalogue,
+    won: ProviderId,
+) -> Option<EnhancementHint> {
+    if won == ProviderId::Discogs {
+        return None;
+    }
+    // MB won — suggest Discogs when it could enrich further.
+    if catalogue.discogs.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Discogs.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Discogs Personal Access Token for pressing + \
+                     personnel depth"
+                .into(),
+        })
+    } else if !catalogue.config.is_effectively_enabled(ProviderId::Discogs) {
+        Some(EnhancementHint {
+            provider: ProviderId::Discogs.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Discogs under Settings → Metadata → Sources for \
+                     pressing + personnel depth"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
+fn enhancement_hint_for_release_credits_missing(
+    catalogue: &ProviderCatalogue,
+) -> Option<EnhancementHint> {
+    if catalogue.discogs.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
+    {
+        Some(EnhancementHint {
+            provider: ProviderId::Discogs.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Discogs under Settings → Metadata → Sources to \
+                     try one more source"
+                .into(),
+        })
+    } else if catalogue.discogs.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Discogs.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Discogs Personal Access Token to try one more \
+                     source"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Shared cache-hit helper for cascade verbs that don't have a
+/// per-provider attribution rebuild path. Rehydrates the winning
+/// provider's attribution using the cascade's stable licence map
+/// plus an optional resource URL the caller can recover from the
+/// cached payload.
+fn cascade_ok_from_cache_generic(
+    payload: serde_json::Value,
+    provider: ProviderId,
+    source_url_override: Option<String>,
+) -> CascadeResponse {
+    let (source_name, license) = match provider {
+        ProviderId::MusicBrainz => ("MusicBrainz", "CC0"),
+        ProviderId::Wikipedia => ("Wikipedia", "CC BY-SA"),
+        ProviderId::Wikidata => ("Wikidata", "CC0"),
+        ProviderId::Lrclib => ("LRCLIB", "Public domain"),
+        ProviderId::Lastfm => ("Last.fm", "Last.fm terms of use"),
+        ProviderId::Discogs => ("Discogs", "Discogs terms of use"),
+        ProviderId::Genius => ("Genius", "Genius terms of use"),
+    };
+    let source_url = source_url_override.or_else(|| {
+        payload
+            .get("source_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    CascadeResponse {
+        v: 1,
+        status: CascadeStatus::Ok,
+        provider_id: Some(provider.as_str().to_string()),
+        privacy_class: Some(provider.privacy_class().as_str().to_string()),
+        payload: Some(payload),
+        detail: None,
+        attribution: Some(Attribution {
+            source_name: source_name.into(),
+            source_url,
+            license: license.into(),
+        }),
+        enhancement: None,
     }
 }
