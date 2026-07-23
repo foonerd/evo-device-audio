@@ -29,6 +29,8 @@ request_types = [
     "metadata.query_lyrics",
     "metadata.query_artist_bio",
     "metadata.query_album_notes",
+    "metadata.query_release_credits",
+    "metadata.query_track_annotation",
 ]
 
 # Co-tenant of the audio.library shelf alongside

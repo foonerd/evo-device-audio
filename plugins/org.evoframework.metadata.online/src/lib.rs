@@ -94,8 +94,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use evo_online_providers::{
-    build_http_client, LastfmClient, LrclibClient, MusicBrainzClient,
-    RateLimiter,
+    build_http_client, DiscogsClient, GeniusClient, LastfmClient, LrclibClient,
+    MusicBrainzClient, RateLimiter,
 };
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
@@ -128,6 +128,14 @@ const REQUEST_LIBRARY_BROWSE_BY_RECORDING_TYPE: &str =
 const REQUEST_METADATA_QUERY_LYRICS: &str = "metadata.query_lyrics";
 const REQUEST_METADATA_QUERY_ARTIST_BIO: &str = "metadata.query_artist_bio";
 const REQUEST_METADATA_QUERY_ALBUM_NOTES: &str = "metadata.query_album_notes";
+/// Discogs release-detail (label / catalog# / year / country /
+/// format / notes) enrichment verb.
+const REQUEST_METADATA_QUERY_RELEASE_CREDITS: &str =
+    "metadata.query_release_credits";
+/// Genius track-annotation (song description + lyrics URL)
+/// enrichment verb.
+const REQUEST_METADATA_QUERY_TRACK_ANNOTATION: &str =
+    "metadata.query_track_annotation";
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -148,10 +156,14 @@ pub struct MetadataOnlinePlugin {
     mb_client: Option<MusicBrainzClient>,
     lastfm_client: Option<LastfmClient>,
     lrclib_client: Option<LrclibClient>,
+    discogs_client: Option<DiscogsClient>,
+    genius_client: Option<GeniusClient>,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
     notes_cache: Option<enrichment_cache::EnrichmentCache>,
+    credits_cache: Option<enrichment_cache::EnrichmentCache>,
+    annotation_cache: Option<enrichment_cache::EnrichmentCache>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -164,10 +176,14 @@ impl MetadataOnlinePlugin {
             mb_client: None,
             lastfm_client: None,
             lrclib_client: None,
+            discogs_client: None,
+            genius_client: None,
             reconcile_cache: None,
             lyrics_cache: None,
             bio_cache: None,
             notes_cache: None,
+            credits_cache: None,
+            annotation_cache: None,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -201,6 +217,8 @@ impl Plugin for MetadataOnlinePlugin {
                         REQUEST_METADATA_QUERY_LYRICS.to_string(),
                         REQUEST_METADATA_QUERY_ARTIST_BIO.to_string(),
                         REQUEST_METADATA_QUERY_ALBUM_NOTES.to_string(),
+                        REQUEST_METADATA_QUERY_RELEASE_CREDITS.to_string(),
+                        REQUEST_METADATA_QUERY_TRACK_ANNOTATION.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -292,6 +310,51 @@ impl Plugin for MetadataOnlinePlugin {
                 ctx.state_dir.join("album_notes_cache"),
                 self.config.negative_ttl,
             ));
+            self.credits_cache = Some(enrichment_cache::EnrichmentCache::new(
+                ctx.state_dir.join("release_credits_cache"),
+                self.config.negative_ttl,
+            ));
+            self.annotation_cache =
+                Some(enrichment_cache::EnrichmentCache::new(
+                    ctx.state_dir.join("track_annotation_cache"),
+                    self.config.negative_ttl,
+                ));
+            // Discogs client — resolves via credential vault under
+            // stable key `discogs_personal_access_token`.
+            let discogs_token = resolve_credential_from_vault(
+                ctx.credential_vault.as_ref(),
+                DISCOGS_VAULT_KEY,
+            )
+            .await;
+            self.discogs_client = discogs_token.and_then(|token| {
+                let rate = Arc::new(RateLimiter::new(
+                    std::time::Duration::from_millis(1000),
+                ));
+                DiscogsClient::new(
+                    http.clone(),
+                    rate,
+                    self.config.musicbrainz_user_agent.clone(),
+                    token,
+                )
+            });
+            // Genius client — resolves via credential vault under
+            // stable key `genius_client_access_token`.
+            let genius_token = resolve_credential_from_vault(
+                ctx.credential_vault.as_ref(),
+                GENIUS_VAULT_KEY,
+            )
+            .await;
+            self.genius_client = genius_token.and_then(|token| {
+                let rate = Arc::new(RateLimiter::new(
+                    std::time::Duration::from_millis(250),
+                ));
+                GeniusClient::new(
+                    http.clone(),
+                    rate,
+                    self.config.musicbrainz_user_agent.clone(),
+                    token,
+                )
+            });
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 cache_wired = self.reconcile_cache.is_some(),
@@ -356,6 +419,8 @@ impl Respondent for MetadataOnlinePlugin {
                 REQUEST_METADATA_QUERY_LYRICS,
                 REQUEST_METADATA_QUERY_ARTIST_BIO,
                 REQUEST_METADATA_QUERY_ALBUM_NOTES,
+                REQUEST_METADATA_QUERY_RELEASE_CREDITS,
+                REQUEST_METADATA_QUERY_TRACK_ANNOTATION,
             ];
             if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
@@ -385,10 +450,14 @@ impl Respondent for MetadataOnlinePlugin {
                 .clone()
                 .expect("lrclib client present after load");
             let lastfm = self.lastfm_client.clone();
+            let discogs = self.discogs_client.clone();
+            let genius = self.genius_client.clone();
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
             let notes_cache = self.notes_cache.clone();
+            let credits_cache = self.credits_cache.clone();
+            let annotation_cache = self.annotation_cache.clone();
             let payload = req.payload.clone();
             let body = match req.request_type.as_str() {
                 REQUEST_METADATA_RECONCILE_RELEASE => {
@@ -480,6 +549,47 @@ impl Respondent for MetadataOnlinePlugin {
                         ))
                     })?
                 }
+                REQUEST_METADATA_QUERY_RELEASE_CREDITS => {
+                    let cache_ref =
+                        credits_cache.as_ref().ok_or_else(|| {
+                            PluginError::Permanent(
+                                "credits cache not wired at load".to_string(),
+                            )
+                        })?;
+                    let response = enrichment::query_release_credits(
+                        &payload,
+                        discogs.as_ref(),
+                        cache_ref,
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_release_credits response JSON: {e}"
+                        ))
+                    })?
+                }
+                REQUEST_METADATA_QUERY_TRACK_ANNOTATION => {
+                    let cache_ref =
+                        annotation_cache.as_ref().ok_or_else(|| {
+                            PluginError::Permanent(
+                                "annotation cache not wired at load"
+                                    .to_string(),
+                            )
+                        })?;
+                    let response = enrichment::query_track_annotation(
+                        &payload,
+                        genius.as_ref(),
+                        cache_ref,
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
+                    response.json_bytes().map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "metadata.query_track_annotation response JSON: {e}"
+                        ))
+                    })?
+                }
                 other => {
                     return Err(PluginError::Permanent(format!(
                         "unknown request type (defensive): {other}"
@@ -495,11 +605,34 @@ impl Respondent for MetadataOnlinePlugin {
 const LASTFM_VAULT_KEY: &str = "lastfm_api_key";
 /// Stable credential-vault key for the Discogs Personal Access
 /// Token.
-#[allow(dead_code)]
 const DISCOGS_VAULT_KEY: &str = "discogs_personal_access_token";
 /// Stable credential-vault key for the Genius client access token.
-#[allow(dead_code)]
 const GENIUS_VAULT_KEY: &str = "genius_client_access_token";
+
+/// Fetch an operator-supplied credential from the framework vault
+/// under `key`. Returns `None` when the vault is not wired, when
+/// no row exists, or when the stored bytes are not valid UTF-8.
+async fn resolve_credential_from_vault(
+    vault: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
+    key: &str,
+) -> Option<String> {
+    let handle = vault?;
+    match handle.fetch(key.to_string()).await {
+        Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                key = key,
+                error = %e,
+                "credential vault fetch failed"
+            );
+            None
+        }
+    }
+}
 
 /// Fetch the Last.fm API key. Precedence:
 ///   1. Framework credential vault under `LASTFM_VAULT_KEY`.
