@@ -23,9 +23,9 @@ concurrency:
 
 jobs:
   preflight:
-    # Schemas-repo foot-lock (R-009): every shipped plugin
-    # manifest must declare a `[target].shelf` + `[target].shape`
-    # pair backed by a schema file in the canonical
+    # Schemas-repo foot-lock: every shipped plugin manifest must
+    # declare a `[target].shelf` + `[target].shape` pair backed
+    # by a schema file in the canonical
     # `foonerd/evo-catalogue-schemas` repository. The preflight
     # script reads the schemas-repo checkout via the
     # EVO_CATALOGUE_SCHEMAS_DIR env var.
@@ -40,7 +40,7 @@ jobs:
         with:
           repository: foonerd/evo-catalogue-schemas
           path: evo-catalogue-schemas
-      - name: Schemas-repo foot-lock alignment (R-009)
+      - name: Schemas-repo foot-lock alignment
         working-directory: evo-device-audio
         env:
           EVO_CATALOGUE_SCHEMAS_DIR: ${{ github.workspace }}/evo-catalogue-schemas

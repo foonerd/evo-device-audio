@@ -10,13 +10,12 @@
 //!
 //! This is the fifth facet-browse verb — the other four
 //! (artist / album / genre / year) live on the shelf's
-//! co-tenant playback.mpd and read MPD directly. That plugin
-//! doesn't have cross-plugin dispatch across the OOP boundary
-//! yet (see `evo-internal/RISKS.md` R-029), so this handler
-//! enumerates MPD via the shared [`evo_mpd_shared::MpdConnection`]
-//! client — the SAME implementation playback.mpd uses — and
-//! reconciles via the same code path `metadata.reconcile_release`
-//! uses.
+//! co-tenant playback.mpd and read MPD directly. Cross-plugin
+//! dispatch across the OOP boundary is not yet available on the
+//! wire protocol, so this handler enumerates MPD via the shared
+//! [`evo_mpd_shared::MpdConnection`] client — the SAME
+//! implementation playback.mpd uses — and reconciles via the
+//! same code path `metadata.reconcile_release` uses.
 //!
 //! Flow:
 //!
