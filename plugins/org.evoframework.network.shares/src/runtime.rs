@@ -1045,7 +1045,7 @@ impl FileCredentialStore {
         Self { root }
     }
 
-    fn validate_key(key: &str) -> Result<(), CredentialStoreError> {
+    pub(crate) fn validate_key(key: &str) -> Result<(), CredentialStoreError> {
         if key.is_empty() {
             return Err(CredentialStoreError::InvalidKey(
                 "credential_key is empty".into(),
@@ -1152,6 +1152,205 @@ impl CredentialStore for FileCredentialStore {
         })??;
         Ok(())
     }
+}
+
+/// Framework credential-vault-backed [`CredentialStore`].
+///
+/// Bridges the plugin's local `CredentialStore` trait to the
+/// framework primitive delivered on
+/// `LoadContext::credential_vault`. The plugin's mount code
+/// continues to see the same trait; the storage boundary shifts
+/// from per-plugin plaintext files to the framework's per-plugin-
+/// scoped vault under one shared substrate.
+pub struct VaultCredentialStore {
+    handle: Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+}
+
+impl std::fmt::Debug for VaultCredentialStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultCredentialStore")
+            .field("handle", &"<dyn CredentialVaultHandle>")
+            .finish()
+    }
+}
+
+impl VaultCredentialStore {
+    /// Wrap a per-plugin-scoped framework credential vault handle
+    /// under the plugin's local `CredentialStore` trait.
+    pub fn new(
+        handle: Arc<
+            dyn evo_plugin_sdk::contract::context::CredentialVaultHandle,
+        >,
+    ) -> Self {
+        Self { handle }
+    }
+
+    fn map_error(
+        e: evo_plugin_sdk::contract::context::CredentialVaultError,
+    ) -> CredentialStoreError {
+        CredentialStoreError::Io(io::Error::other(format!("vault: {e}")))
+    }
+}
+
+#[async_trait]
+impl CredentialFetcher for VaultCredentialStore {
+    async fn fetch_password(&self, credential_key: &str) -> Option<Vec<u8>> {
+        self.handle
+            .fetch(credential_key.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+#[async_trait]
+impl CredentialStore for VaultCredentialStore {
+    async fn store_password(
+        &self,
+        credential_key: &str,
+        value: &[u8],
+    ) -> Result<(), CredentialStoreError> {
+        let metadata = evo_plugin_sdk::contract::context::CredentialMetadata {
+            display_name: Some(format!(
+                "network.shares SMB credential — {credential_key}"
+            )),
+            expires_at_ms: None,
+            uninstall_policy:
+                evo_plugin_sdk::contract::context::UninstallPolicy::PreserveForReinstall,
+        };
+        self.handle
+            .store(credential_key.to_string(), value.to_vec(), metadata)
+            .await
+            .map_err(Self::map_error)
+    }
+
+    async fn delete_password(
+        &self,
+        credential_key: &str,
+    ) -> Result<(), CredentialStoreError> {
+        self.handle
+            .delete(credential_key.to_string())
+            .await
+            .map_err(Self::map_error)
+    }
+}
+
+/// One-shot migration: read every plaintext credential file under
+/// `credentials_dir` (pre-substrate `FileCredentialStore` shape),
+/// upsert each into the framework vault, then remove the original
+/// file. Idempotent — a second boot finds no files and returns
+/// zero-migrated.
+///
+/// Called at plugin load once, before the runtime opens against
+/// the vault-backed store. Failure of the migration for a specific
+/// file is logged and does not abort the boot — the plugin will
+/// simply prompt the operator to re-enter the affected credential.
+pub async fn migrate_plaintext_credentials_into_vault(
+    credentials_dir: &std::path::Path,
+    handle: Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+) -> Result<usize, io::Error> {
+    let dir = credentials_dir.to_path_buf();
+    let entries = match tokio::task::spawn_blocking(
+        move || -> Result<Vec<std::path::PathBuf>, io::Error> {
+            let mut out = Vec::new();
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(out);
+                }
+                Err(e) => return Err(e),
+            };
+            for entry in rd {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    out.push(entry.path());
+                }
+            }
+            Ok(out)
+        },
+    )
+    .await
+    {
+        Ok(inner) => inner?,
+        Err(e) => return Err(io::Error::other(format!("scan task: {e}"))),
+    };
+
+    let mut migrated = 0usize;
+    for path in entries {
+        let key = match path.file_name().and_then(|n| n.to_str()) {
+            Some(k) => k.to_string(),
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "migration skipping non-utf8 credential file name"
+                );
+                continue;
+            }
+        };
+        // Only migrate keys the FileCredentialStore itself would
+        // have accepted; anything else was not the plugin's file.
+        if FileCredentialStore::validate_key(&key).is_err() {
+            continue;
+        }
+        let value = match tokio::task::spawn_blocking({
+            let p = path.clone();
+            move || std::fs::read(p)
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "migration read failed; skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "migration read task panicked; skipping"
+                );
+                continue;
+            }
+        };
+        let metadata = evo_plugin_sdk::contract::context::CredentialMetadata {
+            display_name: Some(format!(
+                "network.shares SMB credential — {key} (migrated from disk)"
+            )),
+            expires_at_ms: None,
+            uninstall_policy:
+                evo_plugin_sdk::contract::context::UninstallPolicy::PreserveForReinstall,
+        };
+        if let Err(e) = handle.store(key.clone(), value.clone(), metadata).await
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "migration vault store failed; leaving file in place"
+            );
+            continue;
+        }
+        // Vault write succeeded — remove the original file.
+        if let Err(e) = tokio::task::spawn_blocking({
+            let p = path.clone();
+            move || std::fs::remove_file(p)
+        })
+        .await
+        .map(|r| r.map_err(io::Error::other))
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "migration succeeded but failed to remove original file; \
+                 will re-migrate idempotently on next boot"
+            );
+        }
+        migrated += 1;
+    }
+    Ok(migrated)
 }
 
 /// Adapter over the framework's [`UserInteractionRequester`]

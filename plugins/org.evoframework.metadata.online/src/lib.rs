@@ -251,20 +251,31 @@ impl Plugin for MetadataOnlinePlugin {
                 lrclib_rate,
                 self.config.musicbrainz_user_agent.clone(),
             ));
-            self.lastfm_client = if let Some(key) =
-                self.config.lastfm_api_key.clone()
-            {
+            // Resolve the Last.fm API key. Precedence:
+            //   1. Framework credential vault (single-substrate
+            //      source — operator UI writes here via the
+            //      credential_put wire op).
+            //   2. Legacy config file (lastfm.api_key_path /
+            //      lastfm.api_key) with one-shot migration into
+            //      the vault. The migration keeps the config-file
+            //      path working across the substrate transition;
+            //      subsequent boots find no config-file key and
+            //      read from the vault.
+            let lastfm_key = resolve_lastfm_api_key(
+                ctx.credential_vault.as_ref(),
+                self.config.lastfm_api_key.clone(),
+            )
+            .await;
+            self.lastfm_client = lastfm_key.map(|key| {
                 let lastfm_rate =
                     Arc::new(RateLimiter::new(self.config.lastfm_min_interval));
-                Some(LastfmClient::new(
+                LastfmClient::new(
                     http.clone(),
                     lastfm_rate,
                     self.config.musicbrainz_user_agent.clone(),
                     key,
-                ))
-            } else {
-                None
-            };
+                )
+            });
             self.reconcile_cache = Some(cache::ReconcileCache::new(
                 ctx.state_dir.join("reconcile_cache"),
                 self.config.negative_ttl,
@@ -478,4 +489,77 @@ impl Respondent for MetadataOnlinePlugin {
             Ok(Response::for_request(req, body))
         }
     }
+}
+
+/// Stable credential-vault key for the Last.fm API key.
+const LASTFM_VAULT_KEY: &str = "lastfm_api_key";
+/// Stable credential-vault key for the Discogs Personal Access
+/// Token.
+#[allow(dead_code)]
+const DISCOGS_VAULT_KEY: &str = "discogs_personal_access_token";
+/// Stable credential-vault key for the Genius client access token.
+#[allow(dead_code)]
+const GENIUS_VAULT_KEY: &str = "genius_client_access_token";
+
+/// Fetch the Last.fm API key. Precedence:
+///   1. Framework credential vault under `LASTFM_VAULT_KEY`.
+///   2. Legacy config file key (pre-substrate `lastfm.api_key_path`
+///      / `lastfm.api_key`). When the legacy value is present and
+///      the vault is populated, upsert the legacy value into the
+///      vault under `LASTFM_VAULT_KEY` and return it — one-shot
+///      migration.
+///   3. Absent — Last.fm-gated verbs return `not_configured`.
+async fn resolve_lastfm_api_key(
+    vault: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
+    legacy_config_key: Option<String>,
+) -> Option<String> {
+    if let Some(handle) = vault {
+        match handle.fetch(LASTFM_VAULT_KEY.to_string()).await {
+            Ok(Some(bytes)) => {
+                if let Ok(s) = String::from_utf8(bytes) {
+                    return Some(s);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "credential vault lastfm fetch failed"
+                );
+            }
+        }
+    }
+    if let Some(legacy) = legacy_config_key {
+        if let Some(handle) = vault {
+            let metadata =
+                evo_plugin_sdk::contract::context::CredentialMetadata {
+                    display_name: Some(
+                        "Last.fm API key (migrated from plugin config)"
+                            .to_string(),
+                    ),
+                    expires_at_ms: None,
+                    uninstall_policy:
+                        evo_plugin_sdk::contract::context::UninstallPolicy::PreserveForReinstall,
+                };
+            if let Err(e) = handle
+                .store(
+                    LASTFM_VAULT_KEY.to_string(),
+                    legacy.as_bytes().to_vec(),
+                    metadata,
+                )
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "credential vault lastfm migration store failed"
+                );
+            }
+        }
+        return Some(legacy);
+    }
+    None
 }

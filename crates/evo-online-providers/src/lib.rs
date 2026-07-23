@@ -34,12 +34,20 @@
 //! per-second policy. Only calls to `musicbrainz.org/ws/2/…`
 //! flow through the [`musicbrainz`] client.
 
+pub mod discogs;
+pub mod genius;
 pub mod http;
 pub mod lastfm;
 pub mod lrclib;
 pub mod musicbrainz;
 pub mod rate_limit;
 
+pub use discogs::{
+    ArtistProfileHit, DiscogsClient, DiscogsError, ReleaseDetailHit,
+};
+pub use genius::{
+    ArtistDescriptionHit, GeniusClient, GeniusError, TrackAnnotationHit,
+};
 pub use http::build_http_client;
 pub use lastfm::{
     is_notfound_code as lastfm_is_notfound_code,

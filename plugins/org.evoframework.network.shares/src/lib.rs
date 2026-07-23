@@ -177,16 +177,44 @@ impl Plugin for NetworkSharesPlugin {
             // per-verb failure_mode.
 
             // Open the runtime against the plugin's state_dir
-            // via the builder so we can wire the file-backed
-            // credential store (against the framework-provisioned
-            // `credentials_dir`) and the framework's user-
-            // interaction responder for the prompt-on-mount
-            // flow. Guest shares never need either handle;
-            // UserPassword shares need both.
-            let credential_store =
-                Arc::new(crate::runtime::FileCredentialStore::new(
-                    ctx.credentials_dir.clone(),
-                ));
+            // via the builder so we can wire the credential store
+            // and the framework's user-interaction responder for
+            // the prompt-on-mount flow. Guest shares never need
+            // either handle; UserPassword shares need both.
+            //
+            // Credential-store binding: prefer the framework
+            // credential vault via LoadContext when populated (single
+            // credential substrate across every plugin), else fall
+            // back to the file-backed store (compatibility path for
+            // stewards that predate the vault wiring). A one-shot
+            // migration re-writes any pre-substrate plaintext files
+            // sitting under `credentials_dir` into the vault before
+            // the runtime opens so no share loses its stored
+            // password across the substrate transition.
+            let credential_store: Arc<dyn crate::runtime::CredentialStore> =
+                if let Some(vault) = ctx.credential_vault.as_ref() {
+                    if let Err(e) =
+                        crate::runtime::migrate_plaintext_credentials_into_vault(
+                            &ctx.credentials_dir,
+                            Arc::clone(vault),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            error = %e,
+                            "credential migration into vault failed; \
+                             continuing with vault-only store"
+                        );
+                    }
+                    Arc::new(crate::runtime::VaultCredentialStore::new(
+                        Arc::clone(vault),
+                    ))
+                } else {
+                    Arc::new(crate::runtime::FileCredentialStore::new(
+                        ctx.credentials_dir.clone(),
+                    ))
+                };
             let prompter =
                 Arc::new(crate::runtime::FrameworkPasswordPrompter::new(
                     Arc::clone(&ctx.user_interaction_requester),
