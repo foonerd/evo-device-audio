@@ -265,6 +265,13 @@ impl Plugin for MetadataOnlinePlugin {
                         "invalid plugin config: {e}"
                     ))
                 })?;
+            // Apply the operator's provider selection + privacy
+            // preset from the config. The cascade orchestrator
+            // reads through self.provider_config on every verb
+            // dispatch; a `provider_config.privacy_mode = Offline`
+            // config makes every network provider a structural
+            // miss without any wire-op sequencing.
+            self.provider_config = self.config.provider_config.clone();
             // Shared HTTPS client — single connection pool +
             // DNS cache across every online provider in this
             // plugin.

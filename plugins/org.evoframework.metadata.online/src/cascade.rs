@@ -389,14 +389,39 @@ impl ProviderConfig {
     }
 
     pub(crate) fn flags(&self, provider: ProviderId) -> ProviderFlags {
+        *self.flags_ref(provider)
+    }
+
+    /// Read-only reference to a provider's flags. Config parsing
+    /// uses this to fetch the framework default before applying
+    /// operator overrides.
+    pub(crate) fn flags_ref(&self, provider: ProviderId) -> &ProviderFlags {
         match provider {
-            ProviderId::MusicBrainz => self.musicbrainz,
-            ProviderId::Wikipedia => self.wikipedia,
-            ProviderId::Wikidata => self.wikidata,
-            ProviderId::Lrclib => self.lrclib,
-            ProviderId::Lastfm => self.lastfm,
-            ProviderId::Discogs => self.discogs,
-            ProviderId::Genius => self.genius,
+            ProviderId::MusicBrainz => &self.musicbrainz,
+            ProviderId::Wikipedia => &self.wikipedia,
+            ProviderId::Wikidata => &self.wikidata,
+            ProviderId::Lrclib => &self.lrclib,
+            ProviderId::Lastfm => &self.lastfm,
+            ProviderId::Discogs => &self.discogs,
+            ProviderId::Genius => &self.genius,
+        }
+    }
+
+    /// Overwrite a provider's flags block. Config parsing uses
+    /// this to apply operator overrides.
+    pub(crate) fn set_flags(
+        &mut self,
+        provider: ProviderId,
+        flags: ProviderFlags,
+    ) {
+        match provider {
+            ProviderId::MusicBrainz => self.musicbrainz = flags,
+            ProviderId::Wikipedia => self.wikipedia = flags,
+            ProviderId::Wikidata => self.wikidata = flags,
+            ProviderId::Lrclib => self.lrclib = flags,
+            ProviderId::Lastfm => self.lastfm = flags,
+            ProviderId::Discogs => self.discogs = flags,
+            ProviderId::Genius => self.genius = flags,
         }
     }
 }

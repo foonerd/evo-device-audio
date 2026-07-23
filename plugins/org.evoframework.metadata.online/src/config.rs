@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::cascade::{PrivacyMode, ProviderConfig, ProviderId};
+
 /// Canonical User-Agent used against MusicBrainz. Includes
 /// product name, version, and contact URL per MB's Terms of
 /// Use. Operators may override via `musicbrainz.user_agent`.
@@ -61,6 +63,13 @@ pub(crate) struct PluginConfig {
     /// LRCLIB rate-limit cadence. Overridable per operator
     /// policy; default 200 ms (5 req/sec) matches Last.fm's.
     pub(crate) lrclib_min_interval: Duration,
+    /// Provider cascade configuration — per-provider enable +
+    /// priority pairs plus the `privacy_mode` preset. The
+    /// operator's `[providers.<id>]` and `privacy_mode`
+    /// entries in the plugin config file feed this. The plugin
+    /// copies it into its `self.provider_config` at load; every
+    /// verb dispatch reads through it via the ProviderCatalogue.
+    pub(crate) provider_config: ProviderConfig,
 }
 
 impl PluginConfig {
@@ -73,6 +82,7 @@ impl PluginConfig {
             lastfm_api_key: None,
             lastfm_min_interval: DEFAULT_LASTFM_MIN_INTERVAL,
             lrclib_min_interval: DEFAULT_LRCLIB_MIN_INTERVAL,
+            provider_config: ProviderConfig::defaults(),
         }
     }
 
@@ -167,7 +177,52 @@ impl PluginConfig {
                 out.lrclib_min_interval = Duration::from_millis(millis);
             }
         }
+        if let Some(mode) = cfg.privacy_mode {
+            out.provider_config.privacy_mode =
+                match mode.to_ascii_lowercase().as_str() {
+                    "enhanced" => PrivacyMode::Enhanced,
+                    "anonymous_only" => PrivacyMode::AnonymousOnly,
+                    "offline" => PrivacyMode::Offline,
+                    other => {
+                        return Err(format!(
+                            "privacy_mode must be one of \
+                         \"enhanced\" | \"anonymous_only\" | \"offline\"; \
+                         got {other:?}"
+                        ));
+                    }
+                };
+        }
+        if let Some(providers) = cfg.providers {
+            for (id_raw, flags_raw) in providers {
+                let id = parse_provider_id(&id_raw)?;
+                let mut flags = *out.provider_config.flags_ref(id);
+                if let Some(enabled) = flags_raw.enabled {
+                    flags.enabled = enabled;
+                }
+                if let Some(priority) = flags_raw.priority {
+                    flags.priority = priority;
+                }
+                out.provider_config.set_flags(id, flags);
+            }
+        }
         Ok(out)
+    }
+}
+
+fn parse_provider_id(raw: &str) -> Result<ProviderId, String> {
+    match raw {
+        "musicbrainz" => Ok(ProviderId::MusicBrainz),
+        "wikipedia" => Ok(ProviderId::Wikipedia),
+        "wikidata" => Ok(ProviderId::Wikidata),
+        "lrclib" => Ok(ProviderId::Lrclib),
+        "lastfm" => Ok(ProviderId::Lastfm),
+        "discogs" => Ok(ProviderId::Discogs),
+        "genius" => Ok(ProviderId::Genius),
+        other => Err(format!(
+            "unknown provider id under [providers]: {other:?}; \
+             expected one of musicbrainz / wikipedia / wikidata / \
+             lrclib / lastfm / discogs / genius"
+        )),
     }
 }
 
@@ -183,6 +238,28 @@ struct RawConfig {
     lastfm: Option<RawLastfm>,
     #[serde(default)]
     lrclib: Option<RawLrclib>,
+    /// Optional privacy-mode preset — layered non-bypassably on
+    /// top of the per-provider flags. Accepted values:
+    /// `"enhanced"` (default, per-provider selection stands),
+    /// `"anonymous_only"` (every identity-bearing provider is
+    /// disabled en masse), `"offline"` (every network provider
+    /// disabled).
+    #[serde(default)]
+    privacy_mode: Option<String>,
+    /// Optional per-provider `[providers.<id>]` sub-tables
+    /// letting the operator flip `enabled` and re-order
+    /// `priority` per provider. Providers omitted keep their
+    /// framework defaults.
+    #[serde(default)]
+    providers: Option<std::collections::BTreeMap<String, RawProviderFlags>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProviderFlags {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    priority: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,5 +341,152 @@ mod tests {
         .unwrap();
         let cfg = PluginConfig::from_toml_table(&raw).unwrap();
         assert_eq!(cfg.musicbrainz_min_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn privacy_mode_defaults_to_enhanced() {
+        let raw: toml::value::Table = toml::from_str("").unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert_eq!(cfg.provider_config.privacy_mode, PrivacyMode::Enhanced);
+    }
+
+    #[test]
+    fn privacy_mode_anonymous_only_parses() {
+        let raw: toml::value::Table =
+            toml::from_str(r#"privacy_mode = "anonymous_only""#).unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert_eq!(
+            cfg.provider_config.privacy_mode,
+            PrivacyMode::AnonymousOnly
+        );
+    }
+
+    #[test]
+    fn privacy_mode_offline_parses() {
+        let raw: toml::value::Table =
+            toml::from_str(r#"privacy_mode = "offline""#).unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert_eq!(cfg.provider_config.privacy_mode, PrivacyMode::Offline);
+    }
+
+    #[test]
+    fn privacy_mode_unknown_rejected() {
+        let raw: toml::value::Table =
+            toml::from_str(r#"privacy_mode = "silent""#).unwrap();
+        assert!(PluginConfig::from_toml_table(&raw).is_err());
+    }
+
+    #[test]
+    fn privacy_mode_offline_disables_every_provider() {
+        let raw: toml::value::Table =
+            toml::from_str(r#"privacy_mode = "offline""#).unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        for p in [
+            ProviderId::MusicBrainz,
+            ProviderId::Wikipedia,
+            ProviderId::Wikidata,
+            ProviderId::Lrclib,
+            ProviderId::Lastfm,
+            ProviderId::Discogs,
+            ProviderId::Genius,
+        ] {
+            assert!(
+                !cfg.provider_config.is_effectively_enabled(p),
+                "provider {:?} must be effectively disabled under offline",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_mode_anonymous_only_disables_identity_bearing() {
+        let raw: toml::value::Table =
+            toml::from_str(r#"privacy_mode = "anonymous_only""#).unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        // Anonymous providers remain enabled.
+        for p in [
+            ProviderId::MusicBrainz,
+            ProviderId::Wikipedia,
+            ProviderId::Wikidata,
+            ProviderId::Lrclib,
+        ] {
+            assert!(
+                cfg.provider_config.is_effectively_enabled(p),
+                "anonymous provider {:?} must remain effectively enabled",
+                p
+            );
+        }
+        // Identity-bearing providers are disabled en masse.
+        for p in [ProviderId::Lastfm, ProviderId::Discogs, ProviderId::Genius] {
+            assert!(
+                !cfg.provider_config.is_effectively_enabled(p),
+                "identity-bearing provider {:?} must be effectively \
+                 disabled under anonymous_only",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn per_provider_disable_applies() {
+        let raw: toml::value::Table = toml::from_str(
+            r#"
+            [providers.wikipedia]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert!(!cfg
+            .provider_config
+            .is_effectively_enabled(ProviderId::Wikipedia));
+        assert!(cfg
+            .provider_config
+            .is_effectively_enabled(ProviderId::MusicBrainz));
+    }
+
+    #[test]
+    fn per_provider_priority_override_applies() {
+        let raw: toml::value::Table = toml::from_str(
+            r#"
+            [providers.lastfm]
+            priority = 5
+            "#,
+        )
+        .unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert_eq!(cfg.provider_config.flags(ProviderId::Lastfm).priority, 5);
+    }
+
+    #[test]
+    fn unknown_provider_id_rejected() {
+        let raw: toml::value::Table = toml::from_str(
+            r#"
+            [providers.spotify]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(PluginConfig::from_toml_table(&raw).is_err());
+    }
+
+    #[test]
+    fn privacy_mode_wins_over_per_provider_enable_for_identity_bearing() {
+        let raw: toml::value::Table = toml::from_str(
+            r#"
+            privacy_mode = "anonymous_only"
+
+            [providers.lastfm]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        // Even though the operator explicitly enabled Last.fm,
+        // anonymous_only overrides it — the preset is
+        // non-bypassable.
+        assert!(!cfg
+            .provider_config
+            .is_effectively_enabled(ProviderId::Lastfm));
     }
 }
