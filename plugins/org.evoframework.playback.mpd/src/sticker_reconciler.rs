@@ -83,8 +83,13 @@ pub(crate) struct StickerReconcilerHandle {
 
 impl StickerReconcilerHandle {
     /// Signal shutdown + await task completion. Idempotent.
+    ///
+    /// `notify_one()` stores the shutdown permit if the task
+    /// hasn't yet parked at `.notified().await`; the next poll
+    /// consumes it immediately. `notify_waiters()` would drop
+    /// the notification and hang the task.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }
@@ -489,15 +494,6 @@ mod tests {
             last_scan_at_ms: None,
         }
     }
-
-    // (No spawn() lifecycle test here: spawn() returns immediately
-    // and stop() races with the task entering its select loop;
-    // `Notify::notify_waiters()` doesn't queue past notifications
-    // for late-arriving waiters, so the test path can hang
-    // pathologically without a synchronisation point that the
-    // production-path doesn't need. The lifecycle is exercised
-    // end-to-end at the plugin level when the supervisor's
-    // tear-down path drives stop() after live event flow.)
 
     fn _unused_local_record_pin(_: SourceRecord) {}
 }

@@ -77,8 +77,12 @@ pub(crate) struct AsoundWatcherHandle {
 }
 
 impl AsoundWatcherHandle {
+    /// Signal shutdown and await task exit. `notify_one()` (not
+    /// `notify_waiters()`) so the shutdown permit is stored if
+    /// the task hasn't yet parked at `.notified().await` — a
+    /// `stop()` fired immediately after `spawn()` is race-safe.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }

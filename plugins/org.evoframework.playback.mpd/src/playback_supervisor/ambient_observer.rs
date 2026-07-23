@@ -84,8 +84,12 @@ impl AmbientObserverHandle {
     /// Notify the task to shut down and await its exit. Idempotent
     /// — calling twice is safe; the second call's await returns
     /// immediately on the already-completed task.
+    ///
+    /// See the note on [`super::startup_volume`]: `notify_one`
+    /// is race-safe against a `stop()` fired before the task
+    /// parks at `.notified().await`; `notify_waiters` is not.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }

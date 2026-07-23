@@ -105,8 +105,16 @@ pub(crate) struct StartupVolumeApplierHandle {
 impl StartupVolumeApplierHandle {
     /// Notify the task to shut down and await its exit.
     /// Idempotent — calling twice is safe.
+    ///
+    /// Uses `notify_one()` rather than `notify_waiters()`: the
+    /// former stores a permit if the task hasn't yet parked at
+    /// `.notified().await`, so a `stop()` fired immediately after
+    /// `spawn()` is race-free. `notify_waiters()` only wakes
+    /// currently-registered waiters and drops the notification
+    /// otherwise — the task would then block forever on its
+    /// first select-arm.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }

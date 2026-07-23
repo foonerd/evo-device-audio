@@ -117,8 +117,13 @@ pub(crate) struct IdleObserverHandle {
 
 impl IdleObserverHandle {
     /// Signal shutdown + await task completion.
+    ///
+    /// `notify_one()` (not `notify_waiters()`) so a `stop()`
+    /// fired before the task parks at `.notified().await` still
+    /// wakes it — the permit is stored and consumed by the next
+    /// `.notified()` poll.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }

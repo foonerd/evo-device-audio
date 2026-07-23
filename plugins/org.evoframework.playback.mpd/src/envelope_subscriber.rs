@@ -53,8 +53,14 @@ pub(crate) struct EnvelopeSubscriberHandle {
 
 impl EnvelopeSubscriberHandle {
     /// Signal shutdown and wait for the task to finish.
+    ///
+    /// `notify_one()` stores the shutdown permit if the task
+    /// hasn't yet reached `.notified().await` — a `stop()`
+    /// fired immediately after `spawn()` is race-safe.
+    /// `notify_waiters()` drops the notification when no
+    /// waiter is registered.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         let _ = self.task.await;
     }
 }
