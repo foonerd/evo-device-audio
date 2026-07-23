@@ -25,7 +25,7 @@
 //!    moment).
 
 use evo_online_providers::{
-    lastfm::LastfmError, DiscogsError, GeniusError, LastfmClient, LrclibClient,
+    lastfm::LastfmError, DiscogsError, GeniusError, LrclibClient,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,6 @@ impl EnrichmentResponse {
 enum ResponseStatus {
     Ok,
     NotFound,
-    NotConfigured,
     BadRequest,
 }
 
@@ -70,16 +69,6 @@ fn bad_request(detail: &str) -> EnrichmentResponse {
     EnrichmentResponse {
         v: 1,
         status: ResponseStatus::BadRequest,
-        provider_id: None,
-        payload: None,
-        detail: Some(detail.to_string()),
-    }
-}
-
-fn not_configured(detail: &str) -> EnrichmentResponse {
-    EnrichmentResponse {
-        v: 1,
-        status: ResponseStatus::NotConfigured,
         provider_id: None,
         payload: None,
         detail: Some(detail.to_string()),
@@ -249,117 +238,6 @@ pub(crate) async fn query_lyrics(
 // ---------------------------------------------------------------
 // Album notes — Last.fm
 // ---------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct NotesRequest {
-    #[serde(default)]
-    v: u8,
-    #[serde(default)]
-    artist: Option<String>,
-    #[serde(default)]
-    album: Option<String>,
-    #[serde(default)]
-    release_mbid: Option<String>,
-}
-
-pub(crate) async fn query_album_notes(
-    payload: &[u8],
-    lastfm: Option<&LastfmClient>,
-    cache: &EnrichmentCache,
-) -> Result<EnrichmentResponse, String> {
-    if payload.is_empty() {
-        return Ok(bad_request("empty payload"));
-    }
-    let text = std::str::from_utf8(payload)
-        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
-    let req: NotesRequest =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
-    if req.v != 1 {
-        return Ok(bad_request(&format!("unsupported v: {}", req.v)));
-    }
-    let artist = req
-        .artist
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let album = req
-        .album
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let (artist, album) = match (artist, album) {
-        (Some(a), Some(b)) => (a.to_string(), b.to_string()),
-        _ => {
-            return Ok(bad_request(
-                "artist and album are required and must be non-empty",
-            ));
-        }
-    };
-    let Some(lastfm) = lastfm else {
-        return Ok(not_configured(
-            "Last.fm API key not configured on this device; album-notes provider disabled",
-        ));
-    };
-    let key = EnrichmentCache::key_for(&[
-        "notes",
-        &normalise(&artist),
-        &normalise(&album),
-    ]);
-    if let Some(entry) = cache.get(&key) {
-        if entry.status == "ok" {
-            if let Some(p) = entry.payload {
-                return Ok(from_cache_ok(p, entry.provider_id));
-            }
-        }
-        return Ok(from_cache_negative(entry.detail));
-    }
-    let hit_result = lastfm
-        .get_album_notes(&artist, &album, req.release_mbid.as_deref())
-        .await;
-    match hit_result {
-        Ok(None) => {
-            let detail =
-                "Last.fm has no album notes for this album".to_string();
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("lastfm".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Ok(Some(h)) => {
-            let payload = serde_json::json!({
-                "summary": h.summary,
-                "content": h.content,
-                "source_url": h.source_url,
-            });
-            let _ = cache.put_positive(&key, payload.clone(), "lastfm");
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::Ok,
-                provider_id: Some("lastfm".to_string()),
-                payload: Some(payload),
-                detail: None,
-            })
-        }
-        Err(LastfmError::Application { code, message })
-            if evo_online_providers::lastfm_is_notfound_code(code) =>
-        {
-            let detail = format!("Last.fm code {code}: {message}");
-            let _ = cache.put_negative(&key, detail.clone());
-            Ok(EnrichmentResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                provider_id: Some("lastfm".to_string()),
-                payload: None,
-                detail: Some(detail),
-            })
-        }
-        Err(e) => Err(format!("Last.fm error: {e}")),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1579,6 +1457,316 @@ fn enhancement_hint_for_track_annotation_missing(
             requires_key: true,
             reason: "Add a Genius API access token to try one more source"
                 .into(),
+        })
+    } else {
+        None
+    }
+}
+
+// -----------------------------------------------------------------
+// KEYLESS-FIRST CASCADE — album-notes via Wikipedia album page
+// (anonymous baseline, title-search variants) → Last.fm album
+// (identity-bearing enhancement).
+// -----------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AlbumNotesCascadeRequest {
+    #[serde(default)]
+    v: u8,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+    /// Optional MB release MBID. When supplied, the Last.fm
+    /// enhancement branch uses it to refine the lookup; the
+    /// Wikipedia baseline still runs title-search variants
+    /// (Wikipedia does not resolve on MBID).
+    #[serde(default)]
+    release_mbid: Option<String>,
+}
+
+pub(crate) async fn query_album_notes_cascade(
+    payload: &[u8],
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+) -> Result<CascadeResponse, String> {
+    if payload.is_empty() {
+        return Ok(CascadeResponse::bad_request("empty payload"));
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| format!("payload is not UTF-8: {e}"))?;
+    let req: AlbumNotesCascadeRequest =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    if req.v != 1 {
+        return Ok(CascadeResponse::bad_request(format!(
+            "unsupported v: {}",
+            req.v
+        )));
+    }
+    let artist = req
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let album = req
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let (Some(artist), Some(album)) = (artist, album) else {
+        return Ok(CascadeResponse::bad_request(
+            "artist and album are required and must be non-empty",
+        ));
+    };
+
+    let want_wp = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::Wikipedia)
+        && catalogue.wikipedia.is_some();
+    let want_lastfm =
+        catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+            && catalogue.lastfm.is_some();
+
+    if !(want_wp || want_lastfm) {
+        return Ok(CascadeResponse::not_configured(
+            "every album-notes provider is disabled or unavailable on this \
+             device; enable at least one under Settings → Metadata → \
+             Sources",
+        ));
+    }
+
+    let mut last_provider: Option<ProviderId> = None;
+
+    // Anonymous baseline: Wikipedia album page via title-search
+    // variants. Wikipedia's page naming convention for album
+    // articles is `"{Album} ({Artist} album)"` or
+    // `"{Album} (album)"` for disambiguation, then the bare
+    // title for unambiguous titles. Exhaust all three in order.
+    if want_wp {
+        if let Some(wp) = catalogue.wikipedia.as_ref() {
+            last_provider = Some(ProviderId::Wikipedia);
+            let key = EnrichmentCache::key_for(&[
+                "album_notes",
+                "album",
+                &normalise(&artist),
+                &normalise(&album),
+                ProviderId::Wikipedia.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Wikipedia,
+                            None,
+                        ));
+                    }
+                }
+            }
+            let candidate_titles = [
+                format!("{album} ({artist} album)"),
+                format!("{album} (album)"),
+                album.clone(),
+            ];
+            let mut wp_hit = None;
+            for candidate in &candidate_titles {
+                match wp.get_summary_en(candidate).await {
+                    Ok(Some(summary)) => {
+                        wp_hit = Some(summary);
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikipedia",
+                            title = %candidate,
+                            error = %e,
+                            "Wikipedia album-title lookup transient / \
+                             not-usable; trying next form"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if let Some(summary) = wp_hit {
+                let payload = serde_json::json!({
+                    "title": summary.title,
+                    "summary": summary.extract,
+                    "language": summary.language,
+                    "source_url": summary.page_url,
+                });
+                let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+                let enhancement = enhancement_hint_for_album_notes(
+                    catalogue,
+                    ProviderId::Wikipedia,
+                );
+                return Ok(CascadeResponse {
+                    v: 1,
+                    status: CascadeStatus::Ok,
+                    provider_id: Some(
+                        ProviderId::Wikipedia.as_str().to_string(),
+                    ),
+                    privacy_class: Some(
+                        PrivacyClass::Anonymous.as_str().to_string(),
+                    ),
+                    payload: Some(payload),
+                    detail: None,
+                    attribution: Some(Attribution {
+                        source_name: "Wikipedia".into(),
+                        source_url: Some(summary.page_url),
+                        license: "CC BY-SA".into(),
+                    }),
+                    enhancement,
+                });
+            }
+        }
+    }
+
+    // Identity-bearing enhancement: Last.fm album.getinfo wiki.
+    if want_lastfm {
+        if let Some(lastfm) = catalogue.lastfm.as_ref() {
+            last_provider = Some(ProviderId::Lastfm);
+            let key = EnrichmentCache::key_for(&[
+                "album_notes",
+                "album",
+                &normalise(&artist),
+                &normalise(&album),
+                ProviderId::Lastfm.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache_generic(
+                            p,
+                            ProviderId::Lastfm,
+                            None,
+                        ));
+                    }
+                }
+            }
+            match lastfm
+                .get_album_notes(&artist, &album, req.release_mbid.as_deref())
+                .await
+            {
+                Ok(Some(h)) => {
+                    let payload = serde_json::json!({
+                        "summary": h.summary,
+                        "content": h.content,
+                        "source_url": h.source_url,
+                    });
+                    let _ = cache.put_positive(&key, payload.clone(), "lastfm");
+                    return Ok(CascadeResponse {
+                        v: 1,
+                        status: CascadeStatus::Ok,
+                        provider_id: Some(
+                            ProviderId::Lastfm.as_str().to_string(),
+                        ),
+                        privacy_class: Some(
+                            PrivacyClass::IdentityBearing.as_str().to_string(),
+                        ),
+                        payload: Some(payload),
+                        detail: None,
+                        attribution: Some(Attribution {
+                            source_name: "Last.fm".into(),
+                            source_url: h.source_url.clone(),
+                            license: "Last.fm terms of use".into(),
+                        }),
+                        enhancement: enhancement_hint_for_album_notes(
+                            catalogue,
+                            ProviderId::Lastfm,
+                        ),
+                    });
+                }
+                Ok(None) => {}
+                Err(LastfmError::Application { code, message })
+                    if evo_online_providers::lastfm_is_notfound_code(code) =>
+                {
+                    tracing::debug!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "lastfm",
+                        code,
+                        message,
+                        "Last.fm album clean miss"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "lastfm",
+                        artist,
+                        album,
+                        error = %e,
+                        "Last.fm album transient; skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    let detail = format!(
+        "no album notes found for {artist} — {album} across enabled providers"
+    );
+    let enhancement = enhancement_hint_for_album_notes_missing(catalogue);
+    Ok(CascadeResponse {
+        v: 1,
+        status: CascadeStatus::NotFound,
+        provider_id: last_provider.map(|p| p.as_str().to_string()),
+        privacy_class: last_provider
+            .map(|p| p.privacy_class().as_str().to_string()),
+        payload: None,
+        detail: Some(detail),
+        attribution: None,
+        enhancement,
+    })
+}
+
+fn enhancement_hint_for_album_notes(
+    catalogue: &ProviderCatalogue,
+    won: ProviderId,
+) -> Option<EnhancementHint> {
+    if won == ProviderId::Lastfm {
+        return None;
+    }
+    if catalogue.lastfm.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Last.fm API key for richer album notes".into(),
+        })
+    } else if !catalogue.config.is_effectively_enabled(ProviderId::Lastfm) {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Last.fm under Settings → Metadata → Sources for \
+                     richer album notes"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
+fn enhancement_hint_for_album_notes_missing(
+    catalogue: &ProviderCatalogue,
+) -> Option<EnhancementHint> {
+    if catalogue.lastfm.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: false,
+            reason: "Enable Last.fm under Settings → Metadata → Sources to \
+                     try one more source"
+                .into(),
+        })
+    } else if catalogue.lastfm.is_none() {
+        Some(EnhancementHint {
+            provider: ProviderId::Lastfm.as_str().to_string(),
+            requires_key: true,
+            reason: "Add a Last.fm API key to try one more source".into(),
         })
     } else {
         None
