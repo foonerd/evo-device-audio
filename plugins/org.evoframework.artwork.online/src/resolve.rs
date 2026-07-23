@@ -72,7 +72,15 @@ pub(crate) struct ResolveOnlineResponse {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResponseStatus {
     Ok,
+    /// Every attempted provider gave a clean "no such release"
+    /// answer. Framework MAY cache negatively.
     NotFound,
+    /// At least one provider was reachable-but-transient
+    /// (rate-limit, HTTP 5xx, timeout, transcode failure) and
+    /// no provider hit. Distinct from `not_found` — the caller
+    /// (framework negative-cache) MUST NOT memoise this as
+    /// definitive absence.
+    Unavailable,
     Unsupported,
     BadRequest,
 }
@@ -161,22 +169,49 @@ pub(crate) async fn resolve_artwork(
             }
         };
     // Run the cascade.
-    let hit = providers::run_cascade(&artist, &album, client, config).await;
-    let Some(hit) = hit else {
-        return Ok(ResolveOutput {
-            response: ResolveOnlineResponse {
-                v: 1,
-                status: ResponseStatus::NotFound,
-                content_hash: None,
-                mime: None,
-                size: None,
-                provider_id: None,
-                detail: Some(format!(
-                    "no provider returned artwork for artist={artist:?} album={album:?}"
-                )),
-            },
-            cache_payload: None,
-        });
+    let hit = match providers::run_cascade(&artist, &album, client, config)
+        .await
+    {
+        providers::CascadeResult::Hit(h) => h,
+        providers::CascadeResult::GenuinelyEmpty => {
+            return Ok(ResolveOutput {
+                response: ResolveOnlineResponse {
+                    v: 1,
+                    status: ResponseStatus::NotFound,
+                    content_hash: None,
+                    mime: None,
+                    size: None,
+                    provider_id: None,
+                    detail: Some(format!(
+                        "every provider gave a clean miss for artist={artist:?} album={album:?}"
+                    )),
+                },
+                cache_payload: None,
+            });
+        }
+        providers::CascadeResult::Unavailable(reason) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                artist,
+                album,
+                reason = %reason,
+                "online cascade returned unavailable; framework must not cache negatively"
+            );
+            return Ok(ResolveOutput {
+                response: ResolveOnlineResponse {
+                    v: 1,
+                    status: ResponseStatus::Unavailable,
+                    content_hash: None,
+                    mime: None,
+                    size: None,
+                    provider_id: None,
+                    detail: Some(format!(
+                        "online providers unavailable for artist={artist:?} album={album:?}: {reason}"
+                    )),
+                },
+                cache_payload: None,
+            });
+        }
     };
     let source_mime = hit.mime.clone().unwrap_or_else(|| {
         // Sniff defaults to image/octet-stream which the
@@ -196,23 +231,29 @@ pub(crate) async fn resolve_artwork(
     } = match transcode(hit.bytes, &source_mime, size) {
         Ok(t) => t,
         Err(e) => {
+            // Transcode failure is a transient shape defect —
+            // upstream returned bytes we could not decode / resize.
+            // The bytes might be a broken CDN response, a rare
+            // upstream-format mismatch, or a resize-pipeline
+            // fault. NEVER cache this as "no such release": that
+            // would suppress the actual artwork on next retry.
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
                 provider = %hit.provider_id,
                 error = %e,
-                "transcode failed; degrading to not_found"
+                "transcode failed; surfacing as unavailable (not cacheable)"
             );
             return Ok(ResolveOutput {
                 response: ResolveOnlineResponse {
                     v: 1,
-                    status: ResponseStatus::NotFound,
+                    status: ResponseStatus::Unavailable,
                     content_hash: None,
                     mime: None,
                     size: None,
-                    provider_id: None,
+                    provider_id: Some(hit.provider_id.to_string()),
                     detail: Some(format!(
-                        "transcode of {} bytes from {} failed",
-                        source_mime, hit.provider_id
+                        "transcode of {} bytes from {} failed: {}",
+                        source_mime, hit.provider_id, e
                     )),
                 },
                 cache_payload: None,
