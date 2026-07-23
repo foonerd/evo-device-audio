@@ -45,6 +45,7 @@
 #![warn(missing_docs)]
 #![allow(clippy::manual_async_fn)]
 
+mod asf;
 mod config;
 mod embedded;
 mod resolve;

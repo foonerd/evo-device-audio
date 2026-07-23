@@ -75,19 +75,44 @@ fn sniff_image_mime(data: &[u8]) -> String {
 }
 
 /// Read the best embedded image from a supported audio `path`.
+///
+/// Primary path is `lofty` (ID3, Vorbis, MP4, RIFF, etc.). ASF /
+/// WMA files are not implemented by lofty 0.22, so a targeted
+/// fallback in [`crate::asf`] reads the `WM/Picture` extended-
+/// content descriptor for those files. The fallback is invoked
+/// only when lofty declines the file entirely — for every other
+/// format lofty's decoder is authoritative.
 pub(crate) fn read_embedded_cover(path: &Path) -> Option<EmbeddedImage> {
-    let tagged = read_from_path(path).ok()?;
-    if let Some(t) = tagged.primary_tag() {
-        if let Some(i) = pick_picture(t) {
-            return Some(i);
+    match read_from_path(path) {
+        Ok(tagged) => {
+            if let Some(t) = tagged.primary_tag() {
+                if let Some(i) = pick_picture(t) {
+                    return Some(i);
+                }
+            }
+            for t in tagged.tags() {
+                if let Some(i) = pick_picture(t) {
+                    return Some(i);
+                }
+            }
+            None
         }
+        Err(_) => crate::asf::read_embedded_picture(path).and_then(|p| {
+            // Sniff MIME from magic bytes when the WM/Picture
+            // descriptor did not carry one that starts with
+            // `image/` — mirrors the discipline of the lofty
+            // path so downstream transcode + cache sees a
+            // consistent MIME shape.
+            let mut mime = p.mime;
+            if !mime.starts_with("image/") {
+                mime = sniff_image_mime(&p.data);
+            }
+            if !mime.starts_with("image/") {
+                return None;
+            }
+            Some(EmbeddedImage { data: p.data, mime })
+        }),
     }
-    for t in tagged.tags() {
-        if let Some(i) = pick_picture(t) {
-            return Some(i);
-        }
-    }
-    None
 }
 
 /// Read the `(artist, album)` identity from a supported audio
@@ -110,47 +135,55 @@ pub(crate) fn read_embedded_cover(path: &Path) -> Option<EmbeddedImage> {
 /// lookup that could match unrelated releases at the CAA / iTunes
 /// tier.
 pub(crate) fn read_identity(path: &Path) -> Option<(String, String)> {
-    let tagged = read_from_path(path).ok()?;
-    // Consult the primary tag first (the format's canonical tag —
-    // ID3v2 on MP3, Vorbis comments on FLAC/Ogg, iTunes on MP4);
-    // fall through to any secondary tag if the primary is missing
-    // one field. This mirrors `read_embedded_cover`'s fall-through
-    // discipline so cover + identity resolve consistently for the
-    // same file.
-    let mut artist: Option<String> = None;
-    let mut album: Option<String> = None;
-    if let Some(t) = tagged.primary_tag() {
-        artist = t
-            .artist()
-            .map(|c| c.trim().to_string())
-            .filter(|s| !s.is_empty());
-        album = t
-            .album()
-            .map(|c| c.trim().to_string())
-            .filter(|s| !s.is_empty());
-    }
-    if artist.is_none() || album.is_none() {
-        for t in tagged.tags() {
-            if artist.is_none() {
+    // ASF/WMA: not implemented by lofty 0.22. Route to the
+    // targeted parser BEFORE lofty declines the file — same
+    // discipline as embedded-cover extraction.
+    match read_from_path(path) {
+        Ok(tagged) => {
+            // Consult the primary tag first (the format's canonical
+            // tag — ID3v2 on MP3, Vorbis comments on FLAC/Ogg,
+            // iTunes on MP4); fall through to any secondary tag if
+            // the primary is missing one field. This mirrors
+            // `read_embedded_cover`'s fall-through discipline so
+            // cover + identity resolve consistently for the same
+            // file.
+            let mut artist: Option<String> = None;
+            let mut album: Option<String> = None;
+            if let Some(t) = tagged.primary_tag() {
                 artist = t
                     .artist()
                     .map(|c| c.trim().to_string())
                     .filter(|s| !s.is_empty());
-            }
-            if album.is_none() {
                 album = t
                     .album()
                     .map(|c| c.trim().to_string())
                     .filter(|s| !s.is_empty());
             }
-            if artist.is_some() && album.is_some() {
-                break;
+            if artist.is_none() || album.is_none() {
+                for t in tagged.tags() {
+                    if artist.is_none() {
+                        artist = t
+                            .artist()
+                            .map(|c| c.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                    }
+                    if album.is_none() {
+                        album = t
+                            .album()
+                            .map(|c| c.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                    }
+                    if artist.is_some() && album.is_some() {
+                        break;
+                    }
+                }
+            }
+            match (artist, album) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
             }
         }
-    }
-    match (artist, album) {
-        (Some(a), Some(b)) => Some((a, b)),
-        _ => None,
+        Err(_) => crate::asf::read_identity(path),
     }
 }
 
