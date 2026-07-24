@@ -45,12 +45,15 @@
 #                     armv7-unknown-linux-gnueabihf  (32-bit ARM)
 #
 # Exit codes:
-#   0 — build + deploy + restart succeeded; service active.
+#   0 — build + deploy + restart + smoke succeeded; service active.
 #   1 — operator error (wrong invocation, ssh refused, missing
 #       prerequisite on target).
 #   2 — build error (cross build failed; previous deploy untouched).
 #   3 — deploy error (scp / install failed; previous binary remains).
 #   4 — verify error (service did not become active within budget).
+#   5 — track_detail smoke gate refused the deploy; `.prev` binary
+#       has been restored on the target and evo restarted so no
+#       half-landed protocol work sits on a listening device.
 
 set -euo pipefail
 
@@ -723,7 +726,37 @@ for entry in "${OOP_PLUGINS[@]}"; do
     fi
 done
 
+# ----------------------------------------------------------
+# Deploy gate: track_detail full-source smoke. Refuses to
+# declare the deploy complete unless every gated source on
+# the composite track_detail endpoint returns non-error.
+# Catches the exact regression class UI has already paid for
+# (half-landed wire codec drops payload_b64; metadata plugins
+# return status=error; every dependent source falls silent).
+# On FAIL: automatically restore `.prev` on this rig +
+# exit 5. No half-landed protocol work reaches a listening
+# device.
+# ----------------------------------------------------------
 echo
+echo "[7.5/7] track_detail full-source smoke (deploy gate) ..."
+SMOKE_SCRIPT="${REPO_ROOT}/scripts/preflight/track-detail-smoke.py"
+if [[ ! -x "${SMOKE_SCRIPT}" ]]; then
+    echo "FAIL: track_detail smoke script missing / not executable at ${SMOKE_SCRIPT}" >&2
+    exit 5
+fi
+if ! python3 "${SMOKE_SCRIPT}" "${TARGET_HOST}" "${TARGET_USER}"; then
+    echo
+    echo "FAIL: track_detail smoke refused the deploy — restoring \`.prev\` on ${TARGET_HOST}" >&2
+    ssh "${SSH_TARGET}" "
+        set -e
+        sudo -n systemctl stop evo
+        sudo -n cp ${TARGET_BIN_PREV} ${TARGET_BIN_PATH}
+        sudo -n systemctl start evo
+    " || echo "WARN: rollback to .prev on ${TARGET_HOST} also failed — operator intervention required" >&2
+    exit 5
+fi
+echo
+
 echo "=== deploy-distribution.sh complete ==="
 echo "Steward binary deployed to ${SSH_TARGET}:${TARGET_BIN_PATH}"
 echo "Previous steward binary preserved at ${SSH_TARGET}:${TARGET_BIN_PREV}"
