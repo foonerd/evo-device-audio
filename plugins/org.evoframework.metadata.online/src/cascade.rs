@@ -201,14 +201,37 @@ pub(crate) struct EnhancementHint {
     pub(crate) reason: String,
 }
 
-/// The cascade's per-verb response shape. Replaces the older
-/// `EnrichmentResponse` for verbs that flow through the cascade.
+/// One provider's contribution to a cascade response.
 ///
-/// `not_configured` is no longer a terminal status for verbs
-/// with an enabled anonymous provider — the anonymous baseline
-/// answer sits in `payload` + `provider_id` + `attribution`
-/// while any relevant identity-bearing provider that could
-/// enrich the answer surfaces as an `enhancement` hint.
+/// Every provider that returned non-empty content for a query is
+/// represented as one `SourceEntry` in the response's `sources`
+/// array. The UI renders the operator-selected entry's payload +
+/// attribution; the operator can switch between entries via the
+/// per-source selection surface (ADR-0153 §3, UI-side).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct SourceEntry {
+    /// Provider id string (`"wikipedia"`, `"lastfm"`,
+    /// `"theaudiodb"`, etc.).
+    pub(crate) provider_id: String,
+    /// Provider's privacy class at the time of the fetch.
+    pub(crate) privacy_class: String,
+    /// The provider's content payload. Shape is verb-specific;
+    /// each verb's contract documents its own payload shape.
+    pub(crate) payload: serde_json::Value,
+    /// Attribution the operator UI MUST render alongside this
+    /// entry's payload.
+    pub(crate) attribution: Attribution,
+}
+
+/// The cascade's per-verb response shape.
+///
+/// Every provider that returned non-empty content is represented
+/// in `sources`, ordered by the operator's per-source priority
+/// (highest priority first). Top-level `provider_id` / `payload`
+/// / `attribution` mirror `sources[0]` for back-compat with UIs
+/// that render a single default. The operator's per-source
+/// selection surface (ADR-0153 §3) reads `sources` directly and
+/// lets the operator switch between contributing entries.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CascadeResponse {
     pub(crate) v: u8,
@@ -218,29 +241,79 @@ pub(crate) struct CascadeResponse {
     /// (or the verb has no anonymous provider); `"bad_request"`
     /// on caller-input errors.
     pub(crate) status: CascadeStatus,
-    /// Winning provider id when the status is `"ok"`. Otherwise
-    /// the last-tried provider so the UI can label an honest
-    /// "we asked X and nothing was there" surface.
+    /// Mirrors `sources[0].provider_id` when `sources` is
+    /// non-empty. On non-`ok` statuses, the last-tried provider
+    /// so the UI can label an honest "we asked X and nothing was
+    /// there" surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) provider_id: Option<String>,
-    /// Winning provider's privacy class. Absent when the status
-    /// is `"not_configured"` (no provider was tried).
+    /// Mirrors `sources[0].privacy_class` when `sources` is
+    /// non-empty. Absent when the status is `"not_configured"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) privacy_class: Option<String>,
-    /// The resolved content payload. Shape per verb.
+    /// Mirrors `sources[0].payload` when `sources` is non-empty.
+    /// Kept for back-compat; new consumers read `sources`
+    /// directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) payload: Option<serde_json::Value>,
     /// Operator-readable explanation on any non-`ok` status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
-    /// Attribution the operator UI MUST render alongside a
-    /// non-empty payload.
+    /// Mirrors `sources[0].attribution` when `sources` is
+    /// non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attribution: Option<Attribution>,
     /// Optional hint pointing at a provider the operator could
-    /// enable / configure to enrich the answer further.
+    /// enable / configure to enrich the answer further. Will
+    /// retire once ADR-0153 §3 per-source enable/disable ships.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) enhancement: Option<EnhancementHint>,
+    /// Every provider that returned non-empty content, ordered by
+    /// the operator's per-source priority (highest first). Empty
+    /// when `status` is not `"ok"`. This is the source of truth
+    /// for the response's content; the top-level `provider_id` /
+    /// `payload` / `attribution` mirror `sources[0]` for
+    /// back-compat.
+    #[serde(default)]
+    pub(crate) sources: Vec<SourceEntry>,
+}
+
+impl CascadeResponse {
+    /// Build a `CascadeResponse` from an ordered vector of
+    /// `SourceEntry` (highest-priority first). The top-level
+    /// fields mirror `sources[0]` when the vector is non-empty.
+    ///
+    /// `status` is `Ok` iff `sources` is non-empty. Callers that
+    /// need `not_found` / `not_configured` / `bad_request` use
+    /// the existing `bad_request` / `not_configured` constructors.
+    pub(crate) fn from_sources(
+        sources: Vec<SourceEntry>,
+        enhancement: Option<EnhancementHint>,
+    ) -> Self {
+        let (status, provider_id, privacy_class, payload, attribution) =
+            if let Some(primary) = sources.first() {
+                (
+                    CascadeStatus::Ok,
+                    Some(primary.provider_id.clone()),
+                    Some(primary.privacy_class.clone()),
+                    Some(primary.payload.clone()),
+                    Some(primary.attribution.clone()),
+                )
+            } else {
+                (CascadeStatus::NotFound, None, None, None, None)
+            };
+        Self {
+            v: 1,
+            status,
+            provider_id,
+            privacy_class,
+            payload,
+            detail: None,
+            attribution,
+            enhancement,
+            sources,
+        }
+    }
 }
 
 /// Wire-serialised status for the cascade response.
@@ -268,6 +341,7 @@ impl CascadeResponse {
             detail: Some(detail.into()),
             attribution: None,
             enhancement: None,
+            sources: Vec::new(),
         }
     }
 
@@ -281,6 +355,7 @@ impl CascadeResponse {
             detail: Some(detail.into()),
             attribution: None,
             enhancement: None,
+            sources: Vec::new(),
         }
     }
 }

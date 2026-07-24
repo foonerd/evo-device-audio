@@ -696,6 +696,7 @@ pub(crate) async fn query_entity_bio(
                             license: "CC BY-SA".into(),
                         }),
                         enhancement,
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -809,6 +810,7 @@ pub(crate) async fn query_entity_bio(
                                         license: "CC BY-SA".into(),
                                     }),
                                     enhancement,
+                                    sources: Vec::new(),
                                 });
                             }
                             Ok(None) => {}
@@ -862,6 +864,7 @@ pub(crate) async fn query_entity_bio(
                         license: "CC0".into(),
                     }),
                     enhancement,
+                    sources: Vec::new(),
                 });
             }
         }
@@ -908,6 +911,7 @@ pub(crate) async fn query_entity_bio(
                             license: "Last.fm terms of use".into(),
                         }),
                         enhancement: None,
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -955,6 +959,7 @@ pub(crate) async fn query_entity_bio(
         detail: Some(detail),
         attribution: None,
         enhancement,
+        sources: Vec::new(),
     })
 }
 
@@ -1010,6 +1015,7 @@ fn cascade_ok_from_cache(
             license: license.into(),
         }),
         enhancement,
+        sources: Vec::new(),
     }
 }
 
@@ -1243,6 +1249,7 @@ pub(crate) async fn query_release_credits_cascade(
                             detail: None,
                             attribution: Some(attribution),
                             enhancement,
+                            sources: Vec::new(),
                         });
                     }
                     Err(e) => {
@@ -1323,6 +1330,7 @@ pub(crate) async fn query_release_credits_cascade(
                             catalogue,
                             ProviderId::Discogs,
                         ),
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -1354,6 +1362,7 @@ pub(crate) async fn query_release_credits_cascade(
         detail: Some(detail),
         attribution: None,
         enhancement,
+        sources: Vec::new(),
     })
 }
 
@@ -1620,6 +1629,7 @@ pub(crate) async fn query_track_annotation_cascade(
                         license: "CC BY-SA".into(),
                     }),
                     enhancement,
+                    sources: Vec::new(),
                 });
             }
         }
@@ -1679,6 +1689,7 @@ pub(crate) async fn query_track_annotation_cascade(
                             catalogue,
                             ProviderId::Genius,
                         ),
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -1711,6 +1722,7 @@ pub(crate) async fn query_track_annotation_cascade(
         detail: Some(detail),
         attribution: None,
         enhancement,
+        sources: Vec::new(),
     })
 }
 
@@ -1919,6 +1931,7 @@ pub(crate) async fn query_album_notes_cascade(
                         license: "CC BY-SA".into(),
                     }),
                     enhancement,
+                    sources: Vec::new(),
                 });
             }
         }
@@ -1981,6 +1994,7 @@ pub(crate) async fn query_album_notes_cascade(
                             catalogue,
                             ProviderId::Lastfm,
                         ),
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -2023,6 +2037,7 @@ pub(crate) async fn query_album_notes_cascade(
         detail: Some(detail),
         attribution: None,
         enhancement,
+        sources: Vec::new(),
     })
 }
 
@@ -2299,6 +2314,7 @@ pub(crate) async fn query_work_notes_cascade(
                             license: "CC BY-SA".into(),
                         }),
                         enhancement: None,
+                        sources: Vec::new(),
                     });
                 }
                 Ok(None) => {}
@@ -2364,6 +2380,7 @@ pub(crate) async fn query_work_notes_cascade(
                         license: "CC0".into(),
                     }),
                     enhancement: None,
+                    sources: Vec::new(),
                 });
             }
         }
@@ -2387,5 +2404,6 @@ pub(crate) async fn query_work_notes_cascade(
         attribution: None,
         // No identity-bearing enhancement for work notes.
         enhancement: None,
+        sources: Vec::new(),
     })
 }
