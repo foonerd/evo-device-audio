@@ -34,6 +34,7 @@
 //! per-second policy. Only calls to `musicbrainz.org/ws/2/…`
 //! flow through the [`musicbrainz`] client.
 
+pub mod deezer;
 pub mod discogs;
 pub mod genius;
 pub mod http;
@@ -45,6 +46,9 @@ pub mod theaudiodb;
 pub mod wikidata;
 pub mod wikipedia;
 
+pub use deezer::{
+    ArtistImageHit as DeezerArtistImageHit, DeezerClient, DeezerError,
+};
 pub use discogs::{
     ArtistProfileHit, DiscogsClient, DiscogsError, ReleaseDetailHit,
 };
