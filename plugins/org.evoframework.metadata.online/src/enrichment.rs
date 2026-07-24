@@ -440,7 +440,11 @@ pub(crate) async fn query_entity_bio(
                         return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Wikipedia,
-                            entry.provider_id,
+                            None,
+                            enhancement_hint_for_bio(
+                                catalogue,
+                                ProviderId::Wikipedia,
+                            ),
                         ));
                     }
                 }
@@ -451,10 +455,17 @@ pub(crate) async fn query_entity_bio(
             };
             match hit {
                 Ok(Some(summary)) => {
+                    // Include source_url in the cached payload so
+                    // the cache-hit rebuilder can recover Wikipedia's
+                    // canonical page URL. CC BY-SA requires the
+                    // attribution link on every rendered payload,
+                    // including cached ones — dropping the URL is
+                    // a licence violation, not a cosmetic gap.
                     let payload = serde_json::json!({
                         "title": summary.title,
                         "summary": summary.extract,
                         "language": summary.language,
+                        "source_url": summary.page_url,
                     });
                     let _ =
                         cache.put_positive(&key, payload.clone(), "wikipedia");
@@ -500,11 +511,35 @@ pub(crate) async fn query_entity_bio(
     if want_wd {
         if let Some(wd) = catalogue.wikidata.as_ref() {
             last_provider = Some(ProviderId::Wikidata);
+            let key = EnrichmentCache::key_for(&[
+                "entity_bio",
+                entity.entity_type.as_str(),
+                &normalise(&entity.name),
+                ProviderId::Wikidata.as_str(),
+            ]);
+            if let Some(entry) = cache.get(&key) {
+                if entry.status == "ok" {
+                    if let Some(p) = entry.payload {
+                        return Ok(cascade_ok_from_cache(
+                            p,
+                            ProviderId::Wikidata,
+                            None,
+                            enhancement_hint_for_bio(
+                                catalogue,
+                                ProviderId::Wikidata,
+                            ),
+                        ));
+                    }
+                }
+            }
             let hit = match &wikidata_url {
                 Some(url) => wd.get_entity_from_url(url).await,
                 None => Ok(None),
             };
             if let Ok(Some(entity_hit)) = hit {
+                // Include source_url so the cache-hit rebuilder can
+                // recover Wikidata's canonical entity URL alongside
+                // the biographical facts.
                 let payload = serde_json::json!({
                     "label": entity_hit.label_en,
                     "description": entity_hit.description_en,
@@ -512,13 +547,8 @@ pub(crate) async fn query_entity_bio(
                     "date_of_death": entity_hit.date_of_death,
                     "inception": entity_hit.inception,
                     "dissolution": entity_hit.dissolution,
+                    "source_url": entity_hit.entity_url,
                 });
-                let key = EnrichmentCache::key_for(&[
-                    "entity_bio",
-                    entity.entity_type.as_str(),
-                    &normalise(&entity.name),
-                    ProviderId::Wikidata.as_str(),
-                ]);
                 let _ = cache.put_positive(&key, payload.clone(), "wikidata");
                 let enhancement =
                     enhancement_hint_for_bio(catalogue, ProviderId::Wikidata);
@@ -635,11 +665,45 @@ pub(crate) async fn query_entity_bio(
     })
 }
 
+/// Rebuild a cascade response from a cached payload. Cache-hit
+/// responses MUST be indistinguishable from fresh-hit responses on
+/// every field UI renders — provider_id, privacy_class,
+/// attribution (including source_url), and enhancement. Two
+/// invariants this helper enforces:
+///
+/// 1. **source_url is recovered from the cached payload**, not
+///    hardcoded `None`. CC BY-SA requires the attribution link on
+///    every rendered payload; the fresh path persists it into the
+///    cached payload, and this rebuilder pulls it back. The
+///    caller may override via `source_url_override` when the
+///    canonical URL is derivable from other cached fields (e.g.
+///    MB release URL from the cached `release_mbid`).
+/// 2. **enhancement is recomputed via the verb-specific hint
+///    closure**, not dropped. The hint depends on the current
+///    catalogue state (which providers are enabled, which have
+///    credentials in the vault), so it MUST be computed at
+///    dispatch time, not baked into the cached bytes.
 fn cascade_ok_from_cache(
     payload: serde_json::Value,
     provider: ProviderId,
-    _origin_provider_id: Option<String>,
+    source_url_override: Option<String>,
+    enhancement: Option<EnhancementHint>,
 ) -> CascadeResponse {
+    let source_url = source_url_override.or_else(|| {
+        payload
+            .get("source_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    let (source_name, license) = match provider {
+        ProviderId::MusicBrainz => ("MusicBrainz", "CC0"),
+        ProviderId::Wikipedia => ("Wikipedia", "CC BY-SA"),
+        ProviderId::Wikidata => ("Wikidata", "CC0"),
+        ProviderId::Lrclib => ("LRCLIB", "Public domain"),
+        ProviderId::Lastfm => ("Last.fm", "Last.fm terms of use"),
+        ProviderId::Discogs => ("Discogs", "Discogs terms of use"),
+        ProviderId::Genius => ("Genius", "Genius terms of use"),
+    };
     CascadeResponse {
         v: 1,
         status: CascadeStatus::Ok,
@@ -647,44 +711,12 @@ fn cascade_ok_from_cache(
         privacy_class: Some(provider.privacy_class().as_str().to_string()),
         payload: Some(payload),
         detail: None,
-        attribution: Some(match provider {
-            ProviderId::Wikipedia => Attribution {
-                source_name: "Wikipedia".into(),
-                source_url: None,
-                license: "CC BY-SA".into(),
-            },
-            ProviderId::Wikidata => Attribution {
-                source_name: "Wikidata".into(),
-                source_url: None,
-                license: "CC0".into(),
-            },
-            ProviderId::MusicBrainz => Attribution {
-                source_name: "MusicBrainz".into(),
-                source_url: None,
-                license: "CC0".into(),
-            },
-            ProviderId::Lrclib => Attribution {
-                source_name: "LRCLIB".into(),
-                source_url: None,
-                license: "Public domain".into(),
-            },
-            ProviderId::Lastfm => Attribution {
-                source_name: "Last.fm".into(),
-                source_url: None,
-                license: "Last.fm terms of use".into(),
-            },
-            ProviderId::Discogs => Attribution {
-                source_name: "Discogs".into(),
-                source_url: None,
-                license: "Discogs terms of use".into(),
-            },
-            ProviderId::Genius => Attribution {
-                source_name: "Genius".into(),
-                source_url: None,
-                license: "Genius terms of use".into(),
-            },
+        attribution: Some(Attribution {
+            source_name: source_name.into(),
+            source_url,
+            license: license.into(),
         }),
-        enhancement: None,
+        enhancement,
     }
 }
 
@@ -846,11 +878,18 @@ pub(crate) async fn query_release_credits_cascade(
                     if let Some(p) = entry.payload {
                         // Cached payload already carries the
                         // canonical `source_url` set on the fresh
-                        // path — the generic helper recovers it.
-                        return Ok(cascade_ok_from_cache_generic(
+                        // path; cascade_ok_from_cache recovers it.
+                        // Enhancement hint is recomputed via the
+                        // catalogue so a cached MB hit still
+                        // surfaces the Discogs uplift.
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::MusicBrainz,
                             None,
+                            enhancement_hint_for_release_credits(
+                                catalogue,
+                                ProviderId::MusicBrainz,
+                            ),
                         ));
                     }
                 }
@@ -946,10 +985,14 @@ pub(crate) async fn query_release_credits_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Discogs,
                             None,
+                            enhancement_hint_for_release_credits(
+                                catalogue,
+                                ProviderId::Discogs,
+                            ),
                         ));
                     }
                 }
@@ -1112,46 +1155,11 @@ fn enhancement_hint_for_release_credits_missing(
     }
 }
 
-/// Shared cache-hit helper for cascade verbs that don't have a
-/// per-provider attribution rebuild path. Rehydrates the winning
-/// provider's attribution using the cascade's stable licence map
-/// plus an optional resource URL the caller can recover from the
-/// cached payload.
-fn cascade_ok_from_cache_generic(
-    payload: serde_json::Value,
-    provider: ProviderId,
-    source_url_override: Option<String>,
-) -> CascadeResponse {
-    let (source_name, license) = match provider {
-        ProviderId::MusicBrainz => ("MusicBrainz", "CC0"),
-        ProviderId::Wikipedia => ("Wikipedia", "CC BY-SA"),
-        ProviderId::Wikidata => ("Wikidata", "CC0"),
-        ProviderId::Lrclib => ("LRCLIB", "Public domain"),
-        ProviderId::Lastfm => ("Last.fm", "Last.fm terms of use"),
-        ProviderId::Discogs => ("Discogs", "Discogs terms of use"),
-        ProviderId::Genius => ("Genius", "Genius terms of use"),
-    };
-    let source_url = source_url_override.or_else(|| {
-        payload
-            .get("source_url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
-    CascadeResponse {
-        v: 1,
-        status: CascadeStatus::Ok,
-        provider_id: Some(provider.as_str().to_string()),
-        privacy_class: Some(provider.privacy_class().as_str().to_string()),
-        payload: Some(payload),
-        detail: None,
-        attribution: Some(Attribution {
-            source_name: source_name.into(),
-            source_url,
-            license: license.into(),
-        }),
-        enhancement: None,
-    }
-}
+// cascade_ok_from_cache_generic retired — folded into the sole
+// cascade_ok_from_cache helper above, which now takes the same
+// source-url-override + enhancement params for every verb. One
+// rebuilder means one place to enforce "cache hit == fresh hit"
+// on the fields UI renders.
 
 // -----------------------------------------------------------------
 // KEYLESS-FIRST CASCADE — track-annotation via Wikipedia song
@@ -1259,10 +1267,14 @@ pub(crate) async fn query_track_annotation_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Wikipedia,
                             None,
+                            enhancement_hint_for_track_annotation(
+                                catalogue,
+                                ProviderId::Wikipedia,
+                            ),
                         ));
                     }
                 }
@@ -1341,10 +1353,14 @@ pub(crate) async fn query_track_annotation_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Genius,
                             None,
+                            enhancement_hint_for_track_annotation(
+                                catalogue,
+                                ProviderId::Genius,
+                            ),
                         ));
                     }
                 }
@@ -1557,10 +1573,14 @@ pub(crate) async fn query_album_notes_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Wikipedia,
                             None,
+                            enhancement_hint_for_album_notes(
+                                catalogue,
+                                ProviderId::Wikipedia,
+                            ),
                         ));
                     }
                 }
@@ -1639,10 +1659,14 @@ pub(crate) async fn query_album_notes_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Lastfm,
                             None,
+                            enhancement_hint_for_album_notes(
+                                catalogue,
+                                ProviderId::Lastfm,
+                            ),
                         ));
                     }
                 }
@@ -1952,9 +1976,14 @@ pub(crate) async fn query_work_notes_cascade(
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache_generic(
+                        // work_notes has no identity-bearing
+                        // enhancement — Wikipedia is authoritative
+                        // for classical works. Explicit `None` so
+                        // the intent is on the wire.
+                        return Ok(cascade_ok_from_cache(
                             p,
                             ProviderId::Wikipedia,
+                            None,
                             None,
                         ));
                     }
