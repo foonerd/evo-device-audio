@@ -101,6 +101,48 @@ fn from_cache_negative(detail: Option<String>) -> EnrichmentResponse {
     }
 }
 
+/// Build the cache key for an entity-bio response. Two
+/// namespaces:
+///
+/// - **`mbid/<mbid>`** when the cascade resolved (or the caller
+///   supplied) a canonical MusicBrainz MBID for the entity. This
+///   is the correct case for every track whose reconciliation
+///   completes.
+/// - **`name/<normalised-name>`** when no MBID is available. This
+///   namespace is deliberately at risk of same-name collisions
+///   for artist-type entities (Passenger the musician vs the
+///   transport noun) — the bare-name Wikipedia fallback is
+///   refused for artist-type entities elsewhere in this cascade
+///   so name-only positive entries are only ever written by
+///   non-artist entity types.
+///
+/// The namespaces are segregated: a poisoned `name/passenger`
+/// entry cannot leak into a subsequent `mbid/<mbid>` lookup, and
+/// vice versa. Two callers with the same name but different
+/// resolved MBIDs live in different cache entries.
+fn bio_cache_key(
+    entity: &EntityRef,
+    resolved_mbid: Option<&str>,
+    provider: ProviderId,
+) -> String {
+    match resolved_mbid {
+        Some(mbid) => EnrichmentCache::key_for(&[
+            "entity_bio",
+            entity.entity_type.as_str(),
+            "mbid",
+            mbid,
+            provider.as_str(),
+        ]),
+        None => EnrichmentCache::key_for(&[
+            "entity_bio",
+            entity.entity_type.as_str(),
+            "name",
+            &normalise(&entity.name),
+            provider.as_str(),
+        ]),
+    }
+}
+
 /// Normalise a string for cache keying: lower-case + collapse
 /// internal whitespace + trim.
 fn normalise(s: &str) -> String {
@@ -249,6 +291,93 @@ mod tests {
         assert_eq!(normalise("OK  Computer"), "ok computer");
         assert_eq!(normalise(""), "");
     }
+
+    #[test]
+    fn bio_cache_key_partitions_mbid_from_name_namespace() {
+        // Two entities with the same normalised name but
+        // different MBIDs MUST live in different cache entries
+        // — the common-noun-trap fix depends on this.
+        let ent_passenger_musician = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Passenger".to_string(),
+            mbid: Some("186e216a-2f8a-41a1-935f-8e30c018a8fe".to_string()),
+        };
+        let ent_passenger_disambig_only = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Passenger".to_string(),
+            mbid: None,
+        };
+        let k_musician = bio_cache_key(
+            &ent_passenger_musician,
+            ent_passenger_musician.mbid.as_deref(),
+            ProviderId::Wikipedia,
+        );
+        let k_disambig = bio_cache_key(
+            &ent_passenger_disambig_only,
+            None,
+            ProviderId::Wikipedia,
+        );
+        assert_ne!(
+            k_musician, k_disambig,
+            "MBID-resolved and name-only cache keys must \
+                    be distinct even for the same normalised name"
+        );
+    }
+
+    #[test]
+    fn bio_cache_key_same_mbid_different_names_collide() {
+        // If two callers arrive at the same MBID via different
+        // display-name spellings, they SHOULD hit the same cache
+        // entry. The MBID is the canonical identity.
+        let mbid = "186e216a-2f8a-41a1-935f-8e30c018a8fe";
+        let a = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Passenger".to_string(),
+            mbid: Some(mbid.to_string()),
+        };
+        let b = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Mike Rosenberg".to_string(),
+            mbid: Some(mbid.to_string()),
+        };
+        let ka = bio_cache_key(&a, Some(mbid), ProviderId::Wikipedia);
+        let kb = bio_cache_key(&b, Some(mbid), ProviderId::Wikipedia);
+        assert_eq!(ka, kb, "MBID-keyed cache entries must ignore display name");
+    }
+
+    #[test]
+    fn bio_cache_key_different_mbids_never_collide() {
+        // Passenger the musician vs some other artist that also
+        // reconciles to a different MBID: never share cache.
+        let a = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Passenger".to_string(),
+            mbid: Some("186e216a-2f8a-41a1-935f-8e30c018a8fe".to_string()),
+        };
+        let b = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Passenger".to_string(),
+            mbid: Some("00000000-0000-0000-0000-000000000000".to_string()),
+        };
+        let ka = bio_cache_key(&a, a.mbid.as_deref(), ProviderId::Wikipedia);
+        let kb = bio_cache_key(&b, b.mbid.as_deref(), ProviderId::Wikipedia);
+        assert_ne!(ka, kb, "different MBIDs must never share a cache key");
+    }
+
+    #[test]
+    fn bio_cache_key_provider_scoped() {
+        // Wikipedia and Wikidata payloads for the same entity
+        // live in their own cache entries so a disabled provider
+        // never returns another provider's cached content.
+        let e = EntityRef {
+            entity_type: EntityType::Artist,
+            name: "Radiohead".to_string(),
+            mbid: Some("a74b1b7f-71a5-4011-9441-d0b5e4122711".to_string()),
+        };
+        let k_wp = bio_cache_key(&e, e.mbid.as_deref(), ProviderId::Wikipedia);
+        let k_wd = bio_cache_key(&e, e.mbid.as_deref(), ProviderId::Wikidata);
+        assert_ne!(k_wp, k_wd);
+    }
 }
 
 // Discogs error surfacing helper — shared with the
@@ -379,18 +508,32 @@ pub(crate) async fn query_entity_bio(
     // Resolve entity URLs via MusicBrainz artist lookup when
     // enabled. This yields Wikipedia + Wikidata URLs that the
     // downstream providers consume directly — no fuzzy search.
+    //
+    // resolved_mbid tracks the canonical MBID we ended up with —
+    // either caller-supplied or MB-resolved. It's hoisted to outer
+    // scope so the Wikipedia + Wikidata cache-key namespacing below
+    // can partition MBID-resolved lookups from name-only ones. A
+    // name-only cache entry cannot poison an MBID-keyed lookup and
+    // vice versa (the fix for the Passenger/common-noun trap: same
+    // name string across two different real artists must not
+    // collide in the cache).
+    let mut resolved_mbid: Option<String> = entity
+        .mbid
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let mut wikipedia_url: Option<String> = None;
     let mut wikidata_url: Option<String> = None;
     if want_mb {
         if let Some(mb) = catalogue.musicbrainz.as_ref() {
             last_provider = Some(ProviderId::MusicBrainz);
-            let mbid = match &entity.mbid {
-                Some(m) if !m.trim().is_empty() => Some(m.clone()),
-                _ => match mb.search_artist(&entity.name).await {
+            if resolved_mbid.is_none() {
+                match mb.search_artist(&entity.name).await {
                     Ok(Some(hit)) if hit.confidence_percent >= 85 => {
-                        Some(hit.artist_mbid)
+                        resolved_mbid = Some(hit.artist_mbid);
                     }
-                    Ok(_) => None,
+                    Ok(_) => {}
                     Err(e) => {
                         // MB transient — do not cache; skip MB.
                         tracing::warn!(
@@ -400,12 +543,11 @@ pub(crate) async fn query_entity_bio(
                             error = %e,
                             "MB artist search transient; skipping"
                         );
-                        None
                     }
-                },
-            };
-            if let Some(mbid) = mbid {
-                match mb.lookup_artist(&mbid).await {
+                }
+            }
+            if let Some(mbid) = resolved_mbid.as_ref() {
+                match mb.lookup_artist(mbid).await {
                     Ok(al) => {
                         wikipedia_url = al.wikipedia_url;
                         wikidata_url = al.wikidata_url;
@@ -414,7 +556,7 @@ pub(crate) async fn query_entity_bio(
                         tracing::warn!(
                             plugin = crate::PLUGIN_NAME,
                             provider = "musicbrainz",
-                            mbid,
+                            mbid = mbid.as_str(),
                             error = %e,
                             "MB artist lookup transient; skipping"
                         );
@@ -428,12 +570,17 @@ pub(crate) async fn query_entity_bio(
     if want_wp {
         if let Some(wp) = catalogue.wikipedia.as_ref() {
             last_provider = Some(ProviderId::Wikipedia);
-            let key = EnrichmentCache::key_for(&[
-                "entity_bio",
-                entity.entity_type.as_str(),
-                &normalise(&entity.name),
-                ProviderId::Wikipedia.as_str(),
-            ]);
+            // Cache key is namespaced by (mbid | name): MBID-
+            // resolved bios live in a separate namespace from
+            // name-only bios so a name collision (Passenger the
+            // musician vs the transport noun) cannot leak between
+            // them. This is the load-bearing invariant against
+            // the common-noun trap.
+            let key = bio_cache_key(
+                &entity,
+                resolved_mbid.as_deref(),
+                ProviderId::Wikipedia,
+            );
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {
@@ -451,7 +598,35 @@ pub(crate) async fn query_entity_bio(
             }
             let hit = match &wikipedia_url {
                 Some(url) => wp.get_summary_from_url(url).await,
-                None => wp.get_summary_en(&entity.name).await,
+                None => {
+                    // Artist-type entities MUST NOT fall back to
+                    // a bare-name Wikipedia title search when MB
+                    // did not route a `wikipedia` url-rel — the
+                    // plain title search hits common-noun articles
+                    // for artists whose names collide with English
+                    // words (Passenger the musician vs the
+                    // transport noun, Bush the band vs the shrub,
+                    // Cake / Air / Live / Yes / Blur / …). Prefer
+                    // honest empty over a confidently-wrong
+                    // common-noun article. Non-artist entity
+                    // types (composer / work / performer /
+                    // conductor / ensemble) retain the bare-name
+                    // fallback pending an equivalent collision
+                    // audit; work_notes has its own cascade path.
+                    if matches!(entity.entity_type, EntityType::Artist) {
+                        tracing::debug!(
+                            plugin = crate::PLUGIN_NAME,
+                            entity = %entity.name,
+                            "artist-type entity with no MB-routed \
+                             Wikipedia URL; refusing bare-name \
+                             Wikipedia fallback (common-noun \
+                             disambiguation trap)"
+                        );
+                        Ok(None)
+                    } else {
+                        wp.get_summary_en(&entity.name).await
+                    }
+                }
             };
             match hit {
                 Ok(Some(summary)) => {
@@ -511,12 +686,11 @@ pub(crate) async fn query_entity_bio(
     if want_wd {
         if let Some(wd) = catalogue.wikidata.as_ref() {
             last_provider = Some(ProviderId::Wikidata);
-            let key = EnrichmentCache::key_for(&[
-                "entity_bio",
-                entity.entity_type.as_str(),
-                &normalise(&entity.name),
-                ProviderId::Wikidata.as_str(),
-            ]);
+            let key = bio_cache_key(
+                &entity,
+                resolved_mbid.as_deref(),
+                ProviderId::Wikidata,
+            );
             if let Some(entry) = cache.get(&key) {
                 if entry.status == "ok" {
                     if let Some(p) = entry.payload {

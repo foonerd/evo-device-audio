@@ -436,6 +436,38 @@ done
 echo
 
 # ----------------------------------------------------------
+# Cache purge for the metadata.online plugin's entity_bio
+# cache. The bio cache-key format was namespaced from
+# `<name>` to `<mbid|name>/<...>` to prevent same-name
+# collisions (Passenger the musician vs the transport common
+# noun, and the whole class of artists whose names collide
+# with English words). Old-format `<name>`-keyed entries
+# under state/bio_cache/ can be orphaned poisoned entries
+# from before the fix — they are no longer read by the new
+# code, but a pruning pass on deploy makes the migration
+# explicit and prevents disk bloat.
+#
+# Applied ONLY to org.evoframework.metadata.online. Other
+# plugins' state dirs are untouched.
+# ----------------------------------------------------------
+if ssh "${SSH_TARGET}" \
+        "test -d /var/lib/evo/plugins/org.evoframework.metadata.online/state/bio_cache" \
+        >/dev/null 2>&1; then
+    echo "cache purge: metadata.online bio_cache — orphan old-format entries ..."
+    if ! ssh "${SSH_TARGET}" "
+        set -e
+        sudo -n rm -rf /var/lib/evo/plugins/org.evoframework.metadata.online/state/bio_cache/*
+    "; then
+        echo "WARN: bio_cache purge failed on target — the plugin will still function; \
+              old-format entries will simply never be read. Refusing to fail the deploy \
+              on cache hygiene." >&2
+    else
+        echo "  ok"
+    fi
+fi
+echo
+
+# ----------------------------------------------------------
 # [4/7] Install catalogue. Composes the same way bootstrap.sh
 # does (prepend `schema_version = 1` to dist/catalogue/
 # audio-rack.toml) and atomically installs at the canonical
