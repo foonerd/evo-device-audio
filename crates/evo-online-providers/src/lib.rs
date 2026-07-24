@@ -62,5 +62,9 @@ pub use musicbrainz::{
     ReleaseCreditsLookup, TrackCredits, WorkLookup, WorkSearchHit,
 };
 pub use rate_limit::RateLimiter;
+/// Re-export of the concrete HTTPS client type
+/// [`build_http_client`] returns, so callers can name the type in
+/// helper signatures without taking a direct `reqwest` dep.
+pub use reqwest::Client as HttpClient;
 pub use wikidata::{WikidataClient, WikidataEntityHit, WikidataError};
 pub use wikipedia::{WikipediaClient, WikipediaError, WikipediaSummaryHit};

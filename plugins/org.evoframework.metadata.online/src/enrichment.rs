@@ -1019,17 +1019,26 @@ fn enhancement_hint_for_bio(
 ) -> Option<EnhancementHint> {
     // Suggest Last.fm as bio enhancement only for artist requests
     // where the anonymous baseline won and Last.fm is either
-    // disabled or unavailable.
+    // disabled or unavailable. Suppression rule: never surface
+    // an "add a key" hint for a provider whose key the framework
+    // vault already reports stored — the device must not prompt
+    // for a credential it already holds. Enable-hint (no key
+    // required) is unaffected.
     if won == ProviderId::Lastfm {
         return None;
     }
-    if catalogue.lastfm.is_none() {
+    let lastfm_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::lastfm_vault_key_hash());
+    if catalogue.lastfm.is_none() && !lastfm_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: true,
             reason: "Add a Last.fm API key for richer editorial bios".into(),
         })
-    } else if !catalogue.config.is_effectively_enabled(ProviderId::Lastfm) {
+    } else if catalogue.lastfm.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: false,
@@ -1046,7 +1055,12 @@ fn enhancement_hint_for_bio_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
     // On a full miss with Last.fm available but disabled,
-    // suggest enabling it. Otherwise silent.
+    // suggest enabling it. Otherwise silent. Suppression rule
+    // matches `enhancement_hint_for_bio` — no "add a key" hint
+    // when the vault already holds the key.
+    let lastfm_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::lastfm_vault_key_hash());
     if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
@@ -1057,7 +1071,7 @@ fn enhancement_hint_for_bio_missing(
                      to try one more source"
                 .into(),
         })
-    } else if catalogue.lastfm.is_none() {
+    } else if catalogue.lastfm.is_none() && !lastfm_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: true,
@@ -1401,7 +1415,12 @@ fn enhancement_hint_for_release_credits(
         return None;
     }
     // MB won — suggest Discogs when it could enrich further.
-    if catalogue.discogs.is_none() {
+    // Suppression rule: never surface "add a key" for a provider
+    // whose key the vault already reports stored.
+    let discogs_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::discogs_vault_key_hash());
+    if catalogue.discogs.is_none() && !discogs_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Discogs.as_str().to_string(),
             requires_key: true,
@@ -1409,7 +1428,9 @@ fn enhancement_hint_for_release_credits(
                      personnel depth"
                 .into(),
         })
-    } else if !catalogue.config.is_effectively_enabled(ProviderId::Discogs) {
+    } else if catalogue.discogs.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
+    {
         Some(EnhancementHint {
             provider: ProviderId::Discogs.as_str().to_string(),
             requires_key: false,
@@ -1425,6 +1446,9 @@ fn enhancement_hint_for_release_credits(
 fn enhancement_hint_for_release_credits_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
+    let discogs_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::discogs_vault_key_hash());
     if catalogue.discogs.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
     {
@@ -1435,7 +1459,7 @@ fn enhancement_hint_for_release_credits_missing(
                      try one more source"
                 .into(),
         })
-    } else if catalogue.discogs.is_none() {
+    } else if catalogue.discogs.is_none() && !discogs_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Discogs.as_str().to_string(),
             requires_key: true,
@@ -1728,13 +1752,18 @@ fn enhancement_hint_for_track_annotation(
     if won == ProviderId::Genius {
         return None;
     }
-    if catalogue.genius.is_none() {
+    let genius_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::genius_vault_key_hash());
+    if catalogue.genius.is_none() && !genius_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Genius.as_str().to_string(),
             requires_key: true,
             reason: "Add a Genius API access token for song annotations".into(),
         })
-    } else if !catalogue.config.is_effectively_enabled(ProviderId::Genius) {
+    } else if catalogue.genius.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
+    {
         Some(EnhancementHint {
             provider: ProviderId::Genius.as_str().to_string(),
             requires_key: false,
@@ -1750,6 +1779,9 @@ fn enhancement_hint_for_track_annotation(
 fn enhancement_hint_for_track_annotation_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
+    let genius_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::genius_vault_key_hash());
     if catalogue.genius.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
     {
@@ -1760,7 +1792,7 @@ fn enhancement_hint_for_track_annotation_missing(
                      try one more source"
                 .into(),
         })
-    } else if catalogue.genius.is_none() {
+    } else if catalogue.genius.is_none() && !genius_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Genius.as_str().to_string(),
             requires_key: true,
@@ -2047,13 +2079,18 @@ fn enhancement_hint_for_album_notes(
     if won == ProviderId::Lastfm {
         return None;
     }
-    if catalogue.lastfm.is_none() {
+    let lastfm_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::lastfm_vault_key_hash());
+    if catalogue.lastfm.is_none() && !lastfm_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: true,
             reason: "Add a Last.fm API key for richer album notes".into(),
         })
-    } else if !catalogue.config.is_effectively_enabled(ProviderId::Lastfm) {
+    } else if catalogue.lastfm.is_some()
+        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: false,
@@ -2069,6 +2106,9 @@ fn enhancement_hint_for_album_notes(
 fn enhancement_hint_for_album_notes_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
+    let lastfm_key_stored = catalogue
+        .stored_key_hashes
+        .contains(crate::lastfm_vault_key_hash());
     if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
@@ -2079,7 +2119,7 @@ fn enhancement_hint_for_album_notes_missing(
                      try one more source"
                 .into(),
         })
-    } else if catalogue.lastfm.is_none() {
+    } else if catalogue.lastfm.is_none() && !lastfm_key_stored {
         Some(EnhancementHint {
             provider: ProviderId::Lastfm.as_str().to_string(),
             requires_key: true,

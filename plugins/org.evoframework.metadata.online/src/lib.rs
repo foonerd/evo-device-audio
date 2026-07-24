@@ -91,8 +91,14 @@ mod enrichment;
 mod enrichment_cache;
 mod reconcile;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use evo_online_providers::{
     build_http_client, DiscogsClient, GeniusClient, LastfmClient, LrclibClient,
@@ -106,6 +112,18 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 
 use crate::config::PluginConfig;
+
+/// SHA-256 hex of a plaintext credential key. Used to check
+/// `CredentialVaultHandle::list_keys` output — the vault only
+/// returns hashes, not plaintext keys, so the plugin computes
+/// the hash of its own keys and looks them up in the returned
+/// set. Matches the framework's key-hash discipline
+/// (`crate::credentials::key_hash_hex` on the framework side).
+fn key_hash_hex(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 /// Embedded manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -160,10 +178,18 @@ pub struct MetadataOnlinePlugin {
     loaded: bool,
     config: PluginConfig,
     mb_client: Option<MusicBrainzClient>,
-    lastfm_client: Option<LastfmClient>,
+    /// Last.fm / Discogs / Genius credential-bearing clients are
+    /// wrapped in `Arc<RwLock<Option<Client>>>` so the reactor
+    /// task spawned at load time can swap them in place when the
+    /// framework publishes a `CredentialSetChanged` event —
+    /// without a plugin restart. `handle_request` clones the
+    /// current value out under a read guard once per dispatch;
+    /// the reactor takes a write guard only when a credential
+    /// mutation lands, so reads never contend with themselves.
+    lastfm_client: Arc<RwLock<Option<LastfmClient>>>,
     lrclib_client: Option<LrclibClient>,
-    discogs_client: Option<DiscogsClient>,
-    genius_client: Option<GeniusClient>,
+    discogs_client: Arc<RwLock<Option<DiscogsClient>>>,
+    genius_client: Arc<RwLock<Option<GeniusClient>>>,
     wikipedia_client: Option<WikipediaClient>,
     wikidata_client: Option<WikidataClient>,
     provider_config: cascade::ProviderConfig,
@@ -174,6 +200,21 @@ pub struct MetadataOnlinePlugin {
     credits_cache: Option<enrichment_cache::EnrichmentCache>,
     annotation_cache: Option<enrichment_cache::EnrichmentCache>,
     work_notes_cache: Option<enrichment_cache::EnrichmentCache>,
+    /// Cached credential-vault handle from the load-time
+    /// `LoadContext`. `handle_request` consults it to populate
+    /// `ProviderCatalogue.stored_key_hashes` for hint
+    /// suppression. `None` when the steward booted without a
+    /// vault (test harnesses, degraded boot).
+    credential_vault: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
+    /// Background reactor spawned at load time. Awaits
+    /// `CredentialSetChanged` events on the framework's central
+    /// change bus (via the SDK's `subscribe_changes` receiver)
+    /// and re-resolves affected clients in place. Aborted on
+    /// unload so a re-load cycle spawns a fresh reactor rather
+    /// than leaking the old subscription.
+    reactor_task: Option<JoinHandle<()>>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -184,10 +225,10 @@ impl MetadataOnlinePlugin {
             loaded: false,
             config: PluginConfig::defaults(),
             mb_client: None,
-            lastfm_client: None,
+            lastfm_client: Arc::new(RwLock::new(None)),
             lrclib_client: None,
-            discogs_client: None,
-            genius_client: None,
+            discogs_client: Arc::new(RwLock::new(None)),
+            genius_client: Arc::new(RwLock::new(None)),
             wikipedia_client: None,
             wikidata_client: None,
             provider_config: cascade::ProviderConfig::defaults(),
@@ -198,6 +239,8 @@ impl MetadataOnlinePlugin {
             credits_cache: None,
             annotation_cache: None,
             work_notes_cache: None,
+            credential_vault: None,
+            reactor_task: None,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -324,16 +367,8 @@ impl Plugin for MetadataOnlinePlugin {
                 self.config.lastfm_api_key.clone(),
             )
             .await;
-            self.lastfm_client = lastfm_key.map(|key| {
-                let lastfm_rate =
-                    Arc::new(RateLimiter::new(self.config.lastfm_min_interval));
-                LastfmClient::new(
-                    http.clone(),
-                    lastfm_rate,
-                    self.config.musicbrainz_user_agent.clone(),
-                    key,
-                )
-            });
+            *self.lastfm_client.write().await = lastfm_key
+                .map(|key| build_lastfm_client(&http, &self.config, key));
             self.reconcile_cache = Some(cache::ReconcileCache::new(
                 ctx.state_dir.join("reconcile_cache"),
                 self.config.negative_ttl,
@@ -371,17 +406,10 @@ impl Plugin for MetadataOnlinePlugin {
                 DISCOGS_VAULT_KEY,
             )
             .await;
-            self.discogs_client = discogs_token.and_then(|token| {
-                let rate = Arc::new(RateLimiter::new(
-                    std::time::Duration::from_millis(1000),
-                ));
-                DiscogsClient::new(
-                    http.clone(),
-                    rate,
-                    self.config.musicbrainz_user_agent.clone(),
-                    token,
-                )
-            });
+            *self.discogs_client.write().await =
+                discogs_token.and_then(|token| {
+                    build_discogs_client(&http, &self.config, token)
+                });
             // Genius client — resolves via credential vault under
             // stable key `genius_client_access_token`.
             let genius_token = resolve_credential_from_vault(
@@ -389,26 +417,53 @@ impl Plugin for MetadataOnlinePlugin {
                 GENIUS_VAULT_KEY,
             )
             .await;
-            self.genius_client = genius_token.and_then(|token| {
-                let rate = Arc::new(RateLimiter::new(
-                    std::time::Duration::from_millis(250),
-                ));
-                GeniusClient::new(
-                    http.clone(),
-                    rate,
-                    self.config.musicbrainz_user_agent.clone(),
-                    token,
-                )
-            });
+            *self.genius_client.write().await =
+                genius_token.and_then(|token| {
+                    build_genius_client(&http, &self.config, token)
+                });
+            let lastfm_configured = self.lastfm_client.read().await.is_some();
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 cache_wired = self.reconcile_cache.is_some(),
                 musicbrainz_ua = %self.config.musicbrainz_user_agent,
                 mb_min_interval_ms = self.config.musicbrainz_min_interval.as_millis() as u64,
-                lastfm_configured = self.lastfm_client.is_some(),
+                lastfm_configured = lastfm_configured,
                 lrclib_wired = self.lrclib_client.is_some(),
                 "load complete"
             );
+            // Stash the credential-vault handle so `handle_request`
+            // can consult `list_keys` at request start and hint
+            // builders can suppress "add a key" for any provider
+            // whose key is already stored.
+            self.credential_vault = ctx.credential_vault.clone();
+            // Spawn the credential-change reactor. On every
+            // `CredentialSetChanged` event that touches one of
+            // this plugin's vault keys (`lastfm_api_key` /
+            // `discogs_personal_access_token` /
+            // `genius_client_access_token`), re-fetch the value
+            // and atomically swap the affected provider client
+            // in place — no plugin restart, no lifecycle
+            // teardown. Aborted on unload so a subsequent
+            // re-load spawns a fresh reactor rather than
+            // leaking the old subscription.
+            if let Some(vault) = ctx.credential_vault.as_ref() {
+                let rx = vault.subscribe_changes();
+                let vault_for_task = Arc::clone(vault);
+                let lastfm_slot = Arc::clone(&self.lastfm_client);
+                let discogs_slot = Arc::clone(&self.discogs_client);
+                let genius_slot = Arc::clone(&self.genius_client);
+                let http_for_task = http.clone();
+                let config_for_task = self.config.clone();
+                self.reactor_task = Some(tokio::spawn(credential_reactor(
+                    rx,
+                    vault_for_task,
+                    lastfm_slot,
+                    discogs_slot,
+                    genius_slot,
+                    http_for_task,
+                    config_for_task,
+                )));
+            }
             self.loaded = true;
             Ok(())
         }
@@ -421,10 +476,18 @@ impl Plugin for MetadataOnlinePlugin {
             self.loaded = false;
             self.config = PluginConfig::defaults();
             self.mb_client = None;
-            self.lastfm_client = None;
+            // Abort the credential reactor so a subsequent
+            // re-load spawns a fresh subscription. The task
+            // may already be exiting via `RecvError::Closed`
+            // if the framework tore down the change bus.
+            if let Some(task) = self.reactor_task.take() {
+                task.abort();
+            }
+            self.credential_vault = None;
+            *self.lastfm_client.write().await = None;
             self.lrclib_client = None;
-            self.discogs_client = None;
-            self.genius_client = None;
+            *self.discogs_client.write().await = None;
+            *self.genius_client.write().await = None;
             self.wikipedia_client = None;
             self.wikidata_client = None;
             self.provider_config = cascade::ProviderConfig::defaults();
@@ -503,12 +566,21 @@ impl Respondent for MetadataOnlinePlugin {
                 .lrclib_client
                 .clone()
                 .expect("lrclib client present after load");
-            let lastfm = self.lastfm_client.clone();
-            let discogs = self.discogs_client.clone();
-            let genius = self.genius_client.clone();
+            let lastfm = self.lastfm_client.read().await.clone();
+            let discogs = self.discogs_client.read().await.clone();
+            let genius = self.genius_client.read().await.clone();
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
             let provider_config = self.provider_config.clone();
+            // Consult the credential vault once per dispatch to
+            // build the set of stored key hashes the hint
+            // builders check for suppression. Populated as an
+            // empty set when the vault is not wired or the
+            // `list_keys` call fails — the historical
+            // fallback (`catalogue.<provider>.is_none()`)
+            // takes over in that case.
+            let stored_key_hashes =
+                fetch_stored_key_hashes(self.credential_vault.as_ref()).await;
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -588,6 +660,7 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
+                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_entity_bio(
                         &payload, &catalogue, cache_ref,
@@ -615,6 +688,7 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
+                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_album_notes_cascade(
                         &payload, &catalogue, cache_ref,
@@ -643,6 +717,7 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
+                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_release_credits_cascade(
                         &payload, &catalogue, cache_ref,
@@ -672,6 +747,7 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
+                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_track_annotation_cascade(
                         &payload, &catalogue, cache_ref,
@@ -701,6 +777,7 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
+                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_work_notes_cascade(
                         &payload, &catalogue, cache_ref,
@@ -818,4 +895,240 @@ async fn resolve_lastfm_api_key(
         return Some(legacy);
     }
     None
+}
+
+// -----------------------------------------------------------------
+// Provider-client builders. Shared between load-time construction
+// and the credential-change reactor so both paths produce clients
+// with matching rate-limit + user-agent + HTTPS settings.
+// -----------------------------------------------------------------
+
+/// Construct a fresh Last.fm client from an operator-supplied key.
+fn build_lastfm_client(
+    http: &evo_online_providers::HttpClient,
+    config: &PluginConfig,
+    key: String,
+) -> LastfmClient {
+    let rate = Arc::new(RateLimiter::new(config.lastfm_min_interval));
+    LastfmClient::new(
+        http.clone(),
+        rate,
+        config.musicbrainz_user_agent.clone(),
+        key,
+    )
+}
+
+/// Construct a fresh Discogs client from an operator-supplied
+/// personal access token. Returns `None` when the token is
+/// rejected by the client constructor (empty / malformed).
+fn build_discogs_client(
+    http: &evo_online_providers::HttpClient,
+    config: &PluginConfig,
+    token: String,
+) -> Option<DiscogsClient> {
+    let rate = Arc::new(RateLimiter::new(Duration::from_millis(1000)));
+    DiscogsClient::new(
+        http.clone(),
+        rate,
+        config.musicbrainz_user_agent.clone(),
+        token,
+    )
+}
+
+/// Construct a fresh Genius client from an operator-supplied
+/// client access token. Returns `None` when the token is
+/// rejected by the client constructor.
+fn build_genius_client(
+    http: &evo_online_providers::HttpClient,
+    config: &PluginConfig,
+    token: String,
+) -> Option<GeniusClient> {
+    let rate = Arc::new(RateLimiter::new(Duration::from_millis(250)));
+    GeniusClient::new(
+        http.clone(),
+        rate,
+        config.musicbrainz_user_agent.clone(),
+        token,
+    )
+}
+
+// -----------------------------------------------------------------
+// Credential-change reactor.
+// -----------------------------------------------------------------
+
+/// Background task spawned at load time. Awaits
+/// `CredentialSetChanged` events on the framework's central
+/// per-plugin change bus (via the SDK's `subscribe_changes`
+/// receiver) and re-resolves affected provider clients in place
+/// — no plugin restart. Terminates on:
+///
+/// - `RecvError::Closed` — the framework's sender dropped
+///   (steward teardown or plugin uninstall).
+/// - `JoinHandle::abort` from the plugin's `unload` path.
+///
+/// `RecvError::Lagged` never terminates: the reactor logs the
+/// dropped-event count and continues so a burst of operator
+/// gestures does not stall the substrate.
+#[allow(clippy::too_many_arguments)]
+async fn credential_reactor(
+    mut rx: tokio::sync::broadcast::Receiver<
+        evo_plugin_sdk::contract::context::CredentialChangeEvent,
+    >,
+    vault: Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    lastfm_slot: Arc<RwLock<Option<LastfmClient>>>,
+    discogs_slot: Arc<RwLock<Option<DiscogsClient>>>,
+    genius_slot: Arc<RwLock<Option<GeniusClient>>>,
+    http: evo_online_providers::HttpClient,
+    config: PluginConfig,
+) {
+    use evo_plugin_sdk::contract::context::CredentialChangeKind;
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                for key in &event.changed_keys {
+                    match key.as_str() {
+                        LASTFM_VAULT_KEY => {
+                            let new_client =
+                                match event.kind {
+                                    CredentialChangeKind::Delete => None,
+                                    CredentialChangeKind::Put => {
+                                        resolve_credential_from_vault(
+                                            Some(&vault),
+                                            LASTFM_VAULT_KEY,
+                                        )
+                                        .await
+                                        .map(|k| {
+                                            build_lastfm_client(
+                                                &http, &config, k,
+                                            )
+                                        })
+                                    }
+                                };
+                            *lastfm_slot.write().await = new_client;
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                key = LASTFM_VAULT_KEY,
+                                kind = ?event.kind,
+                                "reactor: re-resolved Last.fm client"
+                            );
+                        }
+                        DISCOGS_VAULT_KEY => {
+                            let new_client = match event.kind {
+                                CredentialChangeKind::Delete => None,
+                                CredentialChangeKind::Put => {
+                                    resolve_credential_from_vault(
+                                        Some(&vault),
+                                        DISCOGS_VAULT_KEY,
+                                    )
+                                    .await
+                                    .and_then(|t| {
+                                        build_discogs_client(&http, &config, t)
+                                    })
+                                }
+                            };
+                            *discogs_slot.write().await = new_client;
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                key = DISCOGS_VAULT_KEY,
+                                kind = ?event.kind,
+                                "reactor: re-resolved Discogs client"
+                            );
+                        }
+                        GENIUS_VAULT_KEY => {
+                            let new_client = match event.kind {
+                                CredentialChangeKind::Delete => None,
+                                CredentialChangeKind::Put => {
+                                    resolve_credential_from_vault(
+                                        Some(&vault),
+                                        GENIUS_VAULT_KEY,
+                                    )
+                                    .await
+                                    .and_then(|t| {
+                                        build_genius_client(&http, &config, t)
+                                    })
+                                }
+                            };
+                            *genius_slot.write().await = new_client;
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                key = GENIUS_VAULT_KEY,
+                                kind = ?event.kind,
+                                "reactor: re-resolved Genius client"
+                            );
+                        }
+                        _other => {
+                            // Event touched a key this plugin does
+                            // not consume (future-provider slot).
+                            // Silently ignore.
+                        }
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "credential-change reactor: sender closed, exiting"
+                );
+                return;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    skipped = n,
+                    "credential-change reactor lagged; dropped events"
+                );
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Hint suppression — list_keys.
+// -----------------------------------------------------------------
+
+/// Fetch the set of stored key hashes for the plugin's own vault.
+/// Called once per `handle_request` and passed to the
+/// `ProviderCatalogue` so the hint builders can suppress the
+/// "add a key" hint for any provider whose key is already
+/// stored. Returns an empty set when the vault is not wired or
+/// the `list_keys` call fails — the historical fallback path
+/// (`catalogue.<provider>.is_none()`) takes over in that case,
+/// preserving pre-substrate behaviour under degraded boot.
+async fn fetch_stored_key_hashes(
+    vault: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
+) -> HashSet<String> {
+    let Some(handle) = vault else {
+        return HashSet::new();
+    };
+    match handle.list_keys().await {
+        Ok(listings) => listings.into_iter().map(|l| l.key_hash).collect(),
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "credential vault list_keys failed; hint suppression \
+                 falls back to catalogue.<provider>.is_none()"
+            );
+            HashSet::new()
+        }
+    }
+}
+
+/// Vault key hashes the hint builders check against the request-
+/// time `stored_key_hashes` set. Computed on first call and
+/// memoised via a once-cell so subsequent hint checks are
+/// hash-map lookups, not SHA-256 evaluations.
+pub(crate) fn lastfm_vault_key_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| key_hash_hex(LASTFM_VAULT_KEY))
+}
+pub(crate) fn discogs_vault_key_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| key_hash_hex(DISCOGS_VAULT_KEY))
+}
+pub(crate) fn genius_vault_key_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| key_hash_hex(GENIUS_VAULT_KEY))
 }
