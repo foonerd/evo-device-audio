@@ -104,6 +104,13 @@ pub struct WikidataEntityHit {
     pub occupation_ids: Vec<String>,
     /// Genres (P136) as Q-ids.
     pub genre_ids: Vec<String>,
+    /// English-Wikipedia article title from the entity's
+    /// `sitelinks.enwiki.site` block, when present. Cascade
+    /// callers use this to fetch actual Wikipedia prose via
+    /// `WikipediaClient::get_summary_en` and attribute the
+    /// result to Wikipedia (CC BY-SA) rather than falling back
+    /// to Wikidata's one-line description as bio content.
+    pub enwiki_title: Option<String>,
     /// Canonical Wikidata entity page URL (attribution).
     pub entity_url: String,
 }
@@ -222,6 +229,19 @@ struct EntityBody {
     descriptions: std::collections::HashMap<String, LangValue>,
     #[serde(default)]
     claims: std::collections::HashMap<String, Vec<Statement>>,
+    #[serde(default)]
+    sitelinks: std::collections::HashMap<String, SitelinkEntry>,
+}
+
+/// One sitelinks entry — the Wikidata API returns
+/// `{ site: "enwiki", title: "…" , badges: […], url?: "…" }`
+/// keyed by the site id. The cascade only consumes
+/// `enwiki` currently; other language editions land in the
+/// same shape when the callers need them.
+#[derive(Debug, Deserialize)]
+struct SitelinkEntry {
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +286,11 @@ fn entity_hit_from_response(
     let country_of_origin_id = first_entity_id(&body.claims, "P495");
     let occupation_ids = all_entity_ids(&body.claims, "P106");
     let genre_ids = all_entity_ids(&body.claims, "P136");
+    let enwiki_title = body
+        .sitelinks
+        .get("enwiki")
+        .and_then(|entry| entry.title.clone())
+        .filter(|s| !s.trim().is_empty());
     WikidataEntityHit {
         entity_id: entity_id.to_string(),
         label_en,
@@ -279,6 +304,7 @@ fn entity_hit_from_response(
         country_of_origin_id,
         occupation_ids,
         genre_ids,
+        enwiki_title,
         entity_url: format!("https://www.wikidata.org/wiki/{entity_id}"),
     }
 }

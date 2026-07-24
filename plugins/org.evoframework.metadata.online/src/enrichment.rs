@@ -742,9 +742,97 @@ pub(crate) async fn query_entity_bio(
                 None => Ok(None),
             };
             if let Ok(Some(entity_hit)) = hit {
-                // Include source_url so the cache-hit rebuilder can
-                // recover Wikidata's canonical entity URL alongside
-                // the biographical facts.
+                // Prefer Wikipedia prose via the entity's
+                // enwiki sitelink over Wikidata's one-line
+                // description. Wikidata's `description` is
+                // designed to disambiguate on the entity list
+                // ("English rock band" / "German composer") and
+                // is not a bio — the UI needs actual prose.
+                // The enwiki sitelink is the canonical way to
+                // walk from a Wikidata entity to its Wikipedia
+                // article regardless of whether MB routed a
+                // `wikipedia` url-rel (which is the case that
+                // pushed us into this Wikidata branch in the
+                // first place).
+                if let (Some(title), Some(wp)) = (
+                    entity_hit.enwiki_title.as_ref(),
+                    catalogue.wikipedia.as_ref(),
+                ) {
+                    if catalogue
+                        .config
+                        .is_effectively_enabled(ProviderId::Wikipedia)
+                    {
+                        match wp.get_summary_en(title).await {
+                            Ok(Some(summary)) => {
+                                let payload = serde_json::json!({
+                                    "title": summary.title,
+                                    "summary": summary.extract,
+                                    "language": summary.language,
+                                    "source_url": summary.page_url,
+                                });
+                                // Cache under the Wikipedia
+                                // namespace so a repeat request
+                                // whose Wikipedia branch runs
+                                // first finds this on cache.
+                                let wp_key = bio_cache_key(
+                                    &entity,
+                                    resolved_mbid.as_deref(),
+                                    ProviderId::Wikipedia,
+                                );
+                                let _ = cache.put_positive(
+                                    &wp_key,
+                                    payload.clone(),
+                                    "wikipedia",
+                                );
+                                let enhancement = enhancement_hint_for_bio(
+                                    catalogue,
+                                    ProviderId::Wikipedia,
+                                );
+                                return Ok(CascadeResponse {
+                                    v: 1,
+                                    status: CascadeStatus::Ok,
+                                    provider_id: Some(
+                                        ProviderId::Wikipedia
+                                            .as_str()
+                                            .to_string(),
+                                    ),
+                                    privacy_class: Some(
+                                        PrivacyClass::Anonymous
+                                            .as_str()
+                                            .to_string(),
+                                    ),
+                                    payload: Some(payload),
+                                    detail: None,
+                                    attribution: Some(Attribution {
+                                        source_name: "Wikipedia".into(),
+                                        source_url: Some(summary.page_url),
+                                        license: "CC BY-SA".into(),
+                                    }),
+                                    enhancement,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = crate::PLUGIN_NAME,
+                                    provider = "wikipedia",
+                                    entity = %entity.name,
+                                    enwiki_title = %title,
+                                    error = %e,
+                                    "Wikipedia summary via Wikidata \
+                                     enwiki sitelink transient / \
+                                     not-usable; falling back to \
+                                     Wikidata description"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Fallback: no enwiki sitelink, Wikipedia is
+                // disabled, or the Wikipedia fetch failed —
+                // return Wikidata's one-line description as
+                // honest what-we-have content with CC0
+                // attribution.
                 let payload = serde_json::json!({
                     "label": entity_hit.label_en,
                     "description": entity_hit.description_en,
