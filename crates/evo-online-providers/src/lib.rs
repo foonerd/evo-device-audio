@@ -36,6 +36,7 @@
 
 pub mod deezer;
 pub mod discogs;
+pub mod fanart;
 pub mod genius;
 pub mod http;
 pub mod lastfm;
@@ -51,6 +52,9 @@ pub use deezer::{
 };
 pub use discogs::{
     ArtistProfileHit, DiscogsClient, DiscogsError, ReleaseDetailHit,
+};
+pub use fanart::{
+    ArtistImagesHit as FanartArtistImagesHit, FanartClient, FanartError,
 };
 pub use genius::{
     ArtistDescriptionHit, GeniusClient, GeniusError, TrackAnnotationHit,
