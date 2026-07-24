@@ -41,6 +41,7 @@ pub mod lastfm;
 pub mod lrclib;
 pub mod musicbrainz;
 pub mod rate_limit;
+pub mod theaudiodb;
 pub mod wikidata;
 pub mod wikipedia;
 
@@ -66,5 +67,10 @@ pub use rate_limit::RateLimiter;
 /// [`build_http_client`] returns, so callers can name the type in
 /// helper signatures without taking a direct `reqwest` dep.
 pub use reqwest::Client as HttpClient;
+pub use theaudiodb::{
+    AlbumNotesHit as TheAudioDbAlbumNotesHit,
+    ArtistBioHit as TheAudioDbArtistBioHit, TheAudioDbClient, TheAudioDbError,
+    THEAUDIODB_KEYLESS_API_KEY,
+};
 pub use wikidata::{WikidataClient, WikidataEntityHit, WikidataError};
 pub use wikipedia::{WikipediaClient, WikipediaError, WikipediaSummaryHit};
