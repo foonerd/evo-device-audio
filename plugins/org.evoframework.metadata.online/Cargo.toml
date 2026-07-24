@@ -20,6 +20,7 @@ evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { workspace = true }
 evo-mpd-shared = { path = "../../crates/evo-mpd-shared" }
 evo-online-providers = { path = "../../crates/evo-online-providers" }
+futures = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

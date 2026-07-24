@@ -30,8 +30,8 @@ use evo_online_providers::{
 use serde::{Deserialize, Serialize};
 
 use crate::cascade::{
-    Attribution, CascadeResponse, CascadeStatus, EnhancementHint, EntityRef,
-    EntityType, PrivacyClass, ProviderCatalogue, ProviderId,
+    self, Attribution, CascadeResponse, CascadeStatus, EntityRef, EntityType,
+    PrivacyClass, ProviderCatalogue, ProviderId, SourceEntry,
 };
 use crate::enrichment_cache::EnrichmentCache;
 
@@ -505,17 +505,17 @@ pub(crate) async fn query_entity_bio(
         ));
     }
 
-    // Anonymous baseline: try MusicBrainz artist search + url-rels
-    // to discover Wikipedia / Wikidata URLs, then Wikipedia
-    // summary, then Wikidata facts. Every step is gated on
-    // per-provider enable + privacy-mode.
-    let mut last_provider: Option<ProviderId> = None;
-
-    // Positive cache pre-check per provider so an operator
-    // disabling a provider does not suppress cached positives
-    // from a still-enabled provider.
-    // Anonymous first: Wikipedia (bio prose is our primary
-    // enrichment surface).
+    // Aggregate cascade: every enabled+available provider
+    // fetches in parallel; every non-empty result is folded into
+    // `sources: Vec<SourceEntry>`, sorted by operator priority.
+    // The top-level payload is the field-level first-non-empty
+    // merge across sources — a keyed provider's content is never
+    // shadowed by a peer that hit first.
+    //
+    // MusicBrainz stays SEQUENTIAL because its output routes URLs
+    // for Wikipedia + Wikidata; those two only dispatch after MB
+    // resolves. MB itself is not a bio content source in this
+    // verb — it is identity resolution.
     let want_mb = catalogue
         .config
         .is_effectively_enabled(ProviderId::MusicBrainz);
@@ -528,8 +528,12 @@ pub(crate) async fn query_entity_bio(
     let want_lastfm =
         catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
             && catalogue.lastfm.is_some();
+    let want_theaudiodb = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::TheAudioDb)
+        && catalogue.theaudiodb.is_some();
 
-    if !(want_mb || want_wp || want_wd || want_lastfm) {
+    if !(want_mb || want_wp || want_wd || want_lastfm || want_theaudiodb) {
         return Ok(CascadeResponse::not_configured(
             "every bio provider is disabled or unavailable on this device; \
              enable at least one under Settings → Metadata → Sources",
@@ -541,13 +545,13 @@ pub(crate) async fn query_entity_bio(
     // downstream providers consume directly — no fuzzy search.
     //
     // resolved_mbid tracks the canonical MBID we ended up with —
-    // either caller-supplied or MB-resolved. It's hoisted to outer
-    // scope so the Wikipedia + Wikidata cache-key namespacing below
-    // can partition MBID-resolved lookups from name-only ones. A
-    // name-only cache entry cannot poison an MBID-keyed lookup and
-    // vice versa (the fix for the Passenger/common-noun trap: same
-    // name string across two different real artists must not
-    // collide in the cache).
+    // either caller-supplied or MB-resolved. It's used by the
+    // Wikipedia + Wikidata cache-key namespacing below to
+    // partition MBID-resolved lookups from name-only ones. A
+    // name-only cache entry cannot poison an MBID-keyed lookup
+    // and vice versa (the fix for the Passenger/common-noun
+    // trap: same name string across two different real artists
+    // must not collide in the cache).
     let mut resolved_mbid: Option<String> = entity
         .mbid
         .as_ref()
@@ -558,7 +562,6 @@ pub(crate) async fn query_entity_bio(
     let mut wikidata_url: Option<String> = None;
     if want_mb {
         if let Some(mb) = catalogue.musicbrainz.as_ref() {
-            last_provider = Some(ProviderId::MusicBrainz);
             if resolved_mbid.is_none() {
                 match mb.search_artist(&entity.name).await {
                     Ok(Some(hit)) if hit.confidence_percent >= 85 => {
@@ -566,7 +569,6 @@ pub(crate) async fn query_entity_bio(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        // MB transient — do not cache; skip MB.
                         tracing::warn!(
                             plugin = crate::PLUGIN_NAME,
                             provider = "musicbrainz",
@@ -597,108 +599,183 @@ pub(crate) async fn query_entity_bio(
         }
     }
 
-    // Wikipedia summary — the primary anonymous bio content.
-    if want_wp {
-        if let Some(wp) = catalogue.wikipedia.as_ref() {
-            last_provider = Some(ProviderId::Wikipedia);
-            // Cache key is namespaced by (mbid | name): MBID-
-            // resolved bios live in a separate namespace from
-            // name-only bios so a name collision (Passenger the
-            // musician vs the transport noun) cannot leak between
-            // them. This is the load-bearing invariant against
-            // the common-noun trap.
-            let key = bio_cache_key(
-                &entity,
-                resolved_mbid.as_deref(),
-                ProviderId::Wikipedia,
-            );
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Wikipedia,
-                            None,
-                            enhancement_hint_for_bio(
-                                catalogue,
-                                ProviderId::Wikipedia,
-                            ),
-                        ));
+    // Parallel content-fetch across every enabled provider.
+    // Each helper returns `Option<SourceEntry>`; `None` on
+    // disabled / unavailable / structural miss / cache negative /
+    // transient error. `tokio::join!` polls all four
+    // concurrently; wall-clock is the slowest single provider.
+    let (wp_src, wd_src, lastfm_src, tadb_src) = tokio::join!(
+        fetch_wikipedia_bio(
+            &entity,
+            resolved_mbid.as_deref(),
+            wikipedia_url.as_deref(),
+            wikidata_url.as_deref(),
+            catalogue,
+            cache,
+            want_wp,
+            want_wd,
+        ),
+        fetch_wikidata_bio(
+            &entity,
+            resolved_mbid.as_deref(),
+            wikidata_url.as_deref(),
+            catalogue,
+            cache,
+            want_wd,
+        ),
+        fetch_lastfm_bio(&entity, catalogue, cache, want_lastfm),
+        fetch_theaudiodb_bio(&entity, catalogue, cache, want_theaudiodb),
+    );
+
+    let mut sources: Vec<SourceEntry> = [wp_src, wd_src, lastfm_src, tadb_src]
+        .into_iter()
+        .flatten()
+        .collect();
+    cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
+
+    if sources.is_empty() {
+        return Ok(CascadeResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            detail: Some(format!(
+                "no bio found for {}={} across enabled providers",
+                entity.entity_type.as_str(),
+                entity.name
+            )),
+            attribution: None,
+            enhancement: None,
+            sources: Vec::new(),
+        });
+    }
+    Ok(CascadeResponse::from_sources(sources, None))
+}
+
+// ---------------------------------------------------------------
+// Per-provider bio-fetch helpers — one `Option<SourceEntry>` per
+// provider, folded into the parallel-dispatch `tokio::join!` in
+// `query_entity_bio` above. Each helper OWNS its own cache
+// check, network fetch, cache-write, and payload construction —
+// so a per-provider enable / priority change lands the moment
+// the online_provider_config store publishes it, without any
+// coordination on the orchestrator's side.
+// ---------------------------------------------------------------
+
+// 8 args reflect the parallel-dispatch shape: each helper is a
+// self-contained leaf that runs inside `tokio::join!` and must
+// carry everything it needs (identity resolution outputs +
+// per-provider enable flags + the shared catalogue / cache) as
+// direct arguments. Wrapping in a struct would move the args
+// without reducing them.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_wikipedia_bio(
+    entity: &EntityRef,
+    resolved_mbid: Option<&str>,
+    wikipedia_url: Option<&str>,
+    wikidata_url: Option<&str>,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    wp_enabled: bool,
+    wd_enabled: bool,
+) -> Option<SourceEntry> {
+    if !wp_enabled {
+        return None;
+    }
+    let wp = catalogue.wikipedia.as_ref()?;
+    let key = bio_cache_key(entity, resolved_mbid, ProviderId::Wikipedia);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikipedia_source_from_cached_payload(p));
+            }
+        }
+    }
+    // Path 1 — MB-routed Wikipedia URL is authoritative.
+    let mut hit = None;
+    if let Some(url) = wikipedia_url {
+        match wp.get_summary_from_url(url).await {
+            Ok(Some(s)) => hit = Some(s),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "wikipedia",
+                    entity = %entity.name,
+                    error = %e,
+                    "Wikipedia summary from MB-routed URL transient; \
+                     trying fallbacks"
+                );
+            }
+        }
+    }
+    // Path 2 — Wikidata enwiki-sitelink hop. Works for artist-
+    // type entities where MB did not route a Wikipedia URL but
+    // Wikidata knows the enwiki title. Sequential inline call —
+    // the parallel-dispatched Wikidata fetch runs for facts only.
+    if hit.is_none() {
+        if let (Some(wd), Some(wd_url)) =
+            (catalogue.wikidata.as_ref(), wikidata_url)
+        {
+            if wd_enabled {
+                match wd.get_entity_from_url(wd_url).await {
+                    Ok(Some(wd_entity)) => {
+                        if let Some(title) = wd_entity.enwiki_title.as_deref() {
+                            match wp.get_summary_en(title).await {
+                                Ok(Some(s)) => hit = Some(s),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        plugin = crate::PLUGIN_NAME,
+                                        provider = "wikipedia",
+                                        entity = %entity.name,
+                                        enwiki_title = %title,
+                                        error = %e,
+                                        "Wikipedia summary via Wikidata \
+                                         enwiki sitelink transient; \
+                                         trying next fallback"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikidata",
+                            entity = %entity.name,
+                            error = %e,
+                            "Wikidata enwiki-sitelink hop transient; \
+                             trying next fallback"
+                        );
                     }
                 }
             }
-            let hit = match &wikipedia_url {
-                Some(url) => wp.get_summary_from_url(url).await,
-                None => {
-                    // Artist-type entities MUST NOT fall back to
-                    // a bare-name Wikipedia title search when MB
-                    // did not route a `wikipedia` url-rel — the
-                    // plain title search hits common-noun articles
-                    // for artists whose names collide with English
-                    // words (Passenger the musician vs the
-                    // transport noun, Bush the band vs the shrub,
-                    // Cake / Air / Live / Yes / Blur / …). Prefer
-                    // honest empty over a confidently-wrong
-                    // common-noun article. Non-artist entity
-                    // types (composer / work / performer /
-                    // conductor / ensemble) retain the bare-name
-                    // fallback pending an equivalent collision
-                    // audit; work_notes has its own cascade path.
-                    if matches!(entity.entity_type, EntityType::Artist) {
-                        tracing::debug!(
-                            plugin = crate::PLUGIN_NAME,
-                            entity = %entity.name,
-                            "artist-type entity with no MB-routed \
-                             Wikipedia URL; refusing bare-name \
-                             Wikipedia fallback (common-noun \
-                             disambiguation trap)"
-                        );
-                        Ok(None)
-                    } else {
-                        wp.get_summary_en(&entity.name).await
-                    }
-                }
-            };
-            match hit {
-                Ok(Some(summary)) => {
-                    // Include source_url in the cached payload so
-                    // the cache-hit rebuilder can recover Wikipedia's
-                    // canonical page URL. CC BY-SA requires the
-                    // attribution link on every rendered payload,
-                    // including cached ones — dropping the URL is
-                    // a licence violation, not a cosmetic gap.
-                    let payload = serde_json::json!({
-                        "title": summary.title,
-                        "summary": summary.extract,
-                        "language": summary.language,
-                        "source_url": summary.page_url,
-                    });
-                    let _ =
-                        cache.put_positive(&key, payload.clone(), "wikipedia");
-                    let enhancement = enhancement_hint_for_bio(
-                        catalogue,
-                        ProviderId::Wikipedia,
-                    );
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Wikipedia.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::Anonymous.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Wikipedia".into(),
-                            source_url: Some(summary.page_url),
-                            license: "CC BY-SA".into(),
-                        }),
-                        enhancement,
-                        sources: Vec::new(),
-                    });
-                }
+        }
+    }
+    // Path 3 — bare-name search. Non-artist entity types only.
+    // Artist-type + no MB URL + no Wikidata enwiki hop must stay
+    // an honest empty: the plain title search hits common-noun
+    // articles for artists whose names collide with English
+    // words (Passenger the musician vs the transport noun, Bush
+    // the band vs the shrub, Cake / Air / Live / Yes / Blur).
+    // Non-artist types (composer / work / performer / conductor
+    // / ensemble) retain the bare-name fallback pending an
+    // equivalent collision audit.
+    if hit.is_none() {
+        if matches!(entity.entity_type, EntityType::Artist) {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                entity = %entity.name,
+                "artist-type entity with no MB-routed or Wikidata-enwiki \
+                 Wikipedia URL; refusing bare-name Wikipedia fallback \
+                 (common-noun disambiguation trap)"
+            );
+        } else {
+            match wp.get_summary_en(&entity.name).await {
+                Ok(Some(s)) => hit = Some(s),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
@@ -706,370 +783,311 @@ pub(crate) async fn query_entity_bio(
                         provider = "wikipedia",
                         entity = %entity.name,
                         error = %e,
-                        "Wikipedia summary transient / not-usable; skipping"
+                        "Wikipedia bare-name summary transient; skipping"
                     );
                 }
             }
         }
     }
-
-    // Wikidata — structured biographical facts. Fallback bio
-    // surface when Wikipedia has no summary.
-    if want_wd {
-        if let Some(wd) = catalogue.wikidata.as_ref() {
-            last_provider = Some(ProviderId::Wikidata);
-            let key = bio_cache_key(
-                &entity,
-                resolved_mbid.as_deref(),
-                ProviderId::Wikidata,
-            );
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Wikidata,
-                            None,
-                            enhancement_hint_for_bio(
-                                catalogue,
-                                ProviderId::Wikidata,
-                            ),
-                        ));
-                    }
-                }
-            }
-            let hit = match &wikidata_url {
-                Some(url) => wd.get_entity_from_url(url).await,
-                None => Ok(None),
-            };
-            if let Ok(Some(entity_hit)) = hit {
-                // Prefer Wikipedia prose via the entity's
-                // enwiki sitelink over Wikidata's one-line
-                // description. Wikidata's `description` is
-                // designed to disambiguate on the entity list
-                // ("English rock band" / "German composer") and
-                // is not a bio — the UI needs actual prose.
-                // The enwiki sitelink is the canonical way to
-                // walk from a Wikidata entity to its Wikipedia
-                // article regardless of whether MB routed a
-                // `wikipedia` url-rel (which is the case that
-                // pushed us into this Wikidata branch in the
-                // first place).
-                if let (Some(title), Some(wp)) = (
-                    entity_hit.enwiki_title.as_ref(),
-                    catalogue.wikipedia.as_ref(),
-                ) {
-                    if catalogue
-                        .config
-                        .is_effectively_enabled(ProviderId::Wikipedia)
-                    {
-                        match wp.get_summary_en(title).await {
-                            Ok(Some(summary)) => {
-                                let payload = serde_json::json!({
-                                    "title": summary.title,
-                                    "summary": summary.extract,
-                                    "language": summary.language,
-                                    "source_url": summary.page_url,
-                                });
-                                // Cache under the Wikipedia
-                                // namespace so a repeat request
-                                // whose Wikipedia branch runs
-                                // first finds this on cache.
-                                let wp_key = bio_cache_key(
-                                    &entity,
-                                    resolved_mbid.as_deref(),
-                                    ProviderId::Wikipedia,
-                                );
-                                let _ = cache.put_positive(
-                                    &wp_key,
-                                    payload.clone(),
-                                    "wikipedia",
-                                );
-                                let enhancement = enhancement_hint_for_bio(
-                                    catalogue,
-                                    ProviderId::Wikipedia,
-                                );
-                                return Ok(CascadeResponse {
-                                    v: 1,
-                                    status: CascadeStatus::Ok,
-                                    provider_id: Some(
-                                        ProviderId::Wikipedia
-                                            .as_str()
-                                            .to_string(),
-                                    ),
-                                    privacy_class: Some(
-                                        PrivacyClass::Anonymous
-                                            .as_str()
-                                            .to_string(),
-                                    ),
-                                    payload: Some(payload),
-                                    detail: None,
-                                    attribution: Some(Attribution {
-                                        source_name: "Wikipedia".into(),
-                                        source_url: Some(summary.page_url),
-                                        license: "CC BY-SA".into(),
-                                    }),
-                                    enhancement,
-                                    sources: Vec::new(),
-                                });
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    plugin = crate::PLUGIN_NAME,
-                                    provider = "wikipedia",
-                                    entity = %entity.name,
-                                    enwiki_title = %title,
-                                    error = %e,
-                                    "Wikipedia summary via Wikidata \
-                                     enwiki sitelink transient / \
-                                     not-usable; falling back to \
-                                     Wikidata description"
-                                );
-                            }
-                        }
-                    }
-                }
-                // Fallback: no enwiki sitelink, Wikipedia is
-                // disabled, or the Wikipedia fetch failed —
-                // return Wikidata's one-line description as
-                // honest what-we-have content with CC0
-                // attribution.
-                let payload = serde_json::json!({
-                    "label": entity_hit.label_en,
-                    "description": entity_hit.description_en,
-                    "date_of_birth": entity_hit.date_of_birth,
-                    "date_of_death": entity_hit.date_of_death,
-                    "inception": entity_hit.inception,
-                    "dissolution": entity_hit.dissolution,
-                    "source_url": entity_hit.entity_url,
-                });
-                let _ = cache.put_positive(&key, payload.clone(), "wikidata");
-                let enhancement =
-                    enhancement_hint_for_bio(catalogue, ProviderId::Wikidata);
-                return Ok(CascadeResponse {
-                    v: 1,
-                    status: CascadeStatus::Ok,
-                    provider_id: Some(
-                        ProviderId::Wikidata.as_str().to_string(),
-                    ),
-                    privacy_class: Some(
-                        PrivacyClass::Anonymous.as_str().to_string(),
-                    ),
-                    payload: Some(payload),
-                    detail: None,
-                    attribution: Some(Attribution {
-                        source_name: "Wikidata".into(),
-                        source_url: Some(entity_hit.entity_url),
-                        license: "CC0".into(),
-                    }),
-                    enhancement,
-                    sources: Vec::new(),
-                });
-            }
-        }
-    }
-
-    // Identity-bearing enhancement: Last.fm — richer editorial
-    // bio when the operator has enabled it AND provided a key.
-    // Only fired for artist-type entities; Last.fm has poor
-    // classical (composer / work / performer) coverage.
-    if want_lastfm && matches!(entity.entity_type, EntityType::Artist) {
-        if let Some(lastfm) = catalogue.lastfm.as_ref() {
-            last_provider = Some(ProviderId::Lastfm);
-            match lastfm
-                .get_artist_bio(&entity.name, entity.mbid.as_deref())
-                .await
-            {
-                Ok(Some(h)) => {
-                    let payload = serde_json::json!({
-                        "summary": h.summary,
-                        "content": h.content,
-                        "source_url": h.source_url,
-                    });
-                    let key = EnrichmentCache::key_for(&[
-                        "entity_bio",
-                        entity.entity_type.as_str(),
-                        &normalise(&entity.name),
-                        ProviderId::Lastfm.as_str(),
-                    ]);
-                    let _ = cache.put_positive(&key, payload.clone(), "lastfm");
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Lastfm.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::IdentityBearing.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Last.fm".into(),
-                            source_url: h.source_url.clone(),
-                            license: "Last.fm terms of use".into(),
-                        }),
-                        enhancement: None,
-                        sources: Vec::new(),
-                    });
-                }
-                Ok(None) => {}
-                Err(LastfmError::Application { code, message })
-                    if evo_online_providers::lastfm_is_notfound_code(code) =>
-                {
-                    tracing::debug!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "lastfm",
-                        code,
-                        message,
-                        "Last.fm clean miss"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "lastfm",
-                        entity = %entity.name,
-                        error = %e,
-                        "Last.fm transient; skipping"
-                    );
-                }
-            }
-        }
-    }
-
-    // All enabled providers structurally missed. Return
-    // not_found with an enhancement hint pointing at the
-    // best identity-bearing provider the operator could enable
-    // next.
-    let detail = format!(
-        "no bio found for {}={} across enabled providers",
-        entity.entity_type.as_str(),
-        entity.name
-    );
-    let enhancement = enhancement_hint_for_bio_missing(catalogue);
-    Ok(CascadeResponse {
-        v: 1,
-        status: CascadeStatus::NotFound,
-        provider_id: last_provider.map(|p| p.as_str().to_string()),
-        privacy_class: last_provider
-            .map(|p| p.privacy_class().as_str().to_string()),
-        payload: None,
-        detail: Some(detail),
-        attribution: None,
-        enhancement,
-        sources: Vec::new(),
+    let summary = hit?;
+    let payload = serde_json::json!({
+        "title": summary.title,
+        "summary": summary.extract,
+        "language": summary.language,
+        "source_url": summary.page_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikipedia.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikipedia".into(),
+            source_url: Some(summary.page_url),
+            license: "CC BY-SA".into(),
+        },
     })
 }
 
-/// Rebuild a cascade response from a cached payload. Cache-hit
-/// responses MUST be indistinguishable from fresh-hit responses on
-/// every field UI renders — provider_id, privacy_class,
-/// attribution (including source_url), and enhancement. Two
-/// invariants this helper enforces:
-///
-/// 1. **source_url is recovered from the cached payload**, not
-///    hardcoded `None`. CC BY-SA requires the attribution link on
-///    every rendered payload; the fresh path persists it into the
-///    cached payload, and this rebuilder pulls it back. The
-///    caller may override via `source_url_override` when the
-///    canonical URL is derivable from other cached fields (e.g.
-///    MB release URL from the cached `release_mbid`).
-/// 2. **enhancement is recomputed via the verb-specific hint
-///    closure**, not dropped. The hint depends on the current
-///    catalogue state (which providers are enabled, which have
-///    credentials in the vault), so it MUST be computed at
-///    dispatch time, not baked into the cached bytes.
-fn cascade_ok_from_cache(
-    payload: serde_json::Value,
-    provider: ProviderId,
-    source_url_override: Option<String>,
-    enhancement: Option<EnhancementHint>,
-) -> CascadeResponse {
-    let source_url = source_url_override.or_else(|| {
-        payload
-            .get("source_url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
-    let (source_name, license) = match provider {
-        ProviderId::MusicBrainz => ("MusicBrainz", "CC0"),
-        ProviderId::Wikipedia => ("Wikipedia", "CC BY-SA"),
-        ProviderId::Wikidata => ("Wikidata", "CC0"),
-        ProviderId::Lrclib => ("LRCLIB", "Public domain"),
-        ProviderId::Lastfm => ("Last.fm", "Last.fm terms of use"),
-        ProviderId::Discogs => ("Discogs", "Discogs terms of use"),
-        ProviderId::Genius => ("Genius", "Genius terms of use"),
-    };
-    CascadeResponse {
-        v: 1,
-        status: CascadeStatus::Ok,
-        provider_id: Some(provider.as_str().to_string()),
-        privacy_class: Some(provider.privacy_class().as_str().to_string()),
-        payload: Some(payload),
-        detail: None,
-        attribution: Some(Attribution {
-            source_name: source_name.into(),
-            source_url,
-            license: license.into(),
-        }),
-        enhancement,
-        sources: Vec::new(),
-    }
-}
-
-fn enhancement_hint_for_bio(
+async fn fetch_wikidata_bio(
+    entity: &EntityRef,
+    resolved_mbid: Option<&str>,
+    wikidata_url: Option<&str>,
     catalogue: &ProviderCatalogue,
-    won: ProviderId,
-) -> Option<EnhancementHint> {
-    // Interim (until ADR-0153 aggregation ships): retire the
-    // "Add a Last.fm API key" prompt entirely. The current
-    // cascade returns on the first anonymous provider that hits,
-    // so a keyed Last.fm never surfaces content — the "add a key"
-    // hint would be a no-op affordance. Engineering-bar rule:
-    // the device must not advertise enrichment the cascade
-    // cannot deliver. The "Enable Last.fm under Settings" branch
-    // (requires_key: false) stays because that's a legitimate
-    // operator-facing enablement hint; it too becomes vestigial
-    // once ADR-0153 §3 lands and per-source enable/disable is
-    // real, at which point the whole enhancement_hint concept
-    // retires in favour of `sources[]`.
-    if won == ProviderId::Lastfm {
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
         return None;
     }
-    if catalogue.lastfm.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    let wd = catalogue.wikidata.as_ref()?;
+    let key = bio_cache_key(entity, resolved_mbid, ProviderId::Wikidata);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikidata_source_from_cached_payload(p));
+            }
+        }
+    }
+    let wd_url = wikidata_url?;
+    let entity_hit = match wd.get_entity_from_url(wd_url).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "wikidata",
+                entity = %entity.name,
+                error = %e,
+                "Wikidata facts transient; skipping"
+            );
+            return None;
+        }
+    };
+    let payload = serde_json::json!({
+        "label": entity_hit.label_en,
+        "description": entity_hit.description_en,
+        "date_of_birth": entity_hit.date_of_birth,
+        "date_of_death": entity_hit.date_of_death,
+        "inception": entity_hit.inception,
+        "dissolution": entity_hit.dissolution,
+        "source_url": entity_hit.entity_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikidata");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikidata.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikidata".into(),
+            source_url: Some(entity_hit.entity_url),
+            license: "CC0".into(),
+        },
+    })
+}
+
+async fn fetch_lastfm_bio(
+    entity: &EntityRef,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    // Last.fm has poor classical (composer / work / performer)
+    // coverage; only dispatch for artist-type entities.
+    if !matches!(entity.entity_type, EntityType::Artist) {
+        return None;
+    }
+    let lastfm = catalogue.lastfm.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "entity_bio",
+        entity.entity_type.as_str(),
+        &normalise(&entity.name),
+        ProviderId::Lastfm.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(lastfm_source_from_cached_payload(p));
+            }
+        }
+    }
+    match lastfm
+        .get_artist_bio(&entity.name, entity.mbid.as_deref())
+        .await
     {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Last.fm under Settings → Metadata → Sources \
-                     for richer editorial bios"
-                .into(),
-        })
-    } else {
-        None
+        Ok(Some(h)) => {
+            let payload = serde_json::json!({
+                "summary": h.summary,
+                "content": h.content,
+                "source_url": h.source_url,
+            });
+            let _ = cache.put_positive(&key, payload.clone(), "lastfm");
+            Some(SourceEntry {
+                provider_id: ProviderId::Lastfm.as_str().to_string(),
+                privacy_class: PrivacyClass::IdentityBearing
+                    .as_str()
+                    .to_string(),
+                payload,
+                attribution: Attribution {
+                    source_name: "Last.fm".into(),
+                    source_url: h.source_url.clone(),
+                    license: "Last.fm terms of use".into(),
+                },
+            })
+        }
+        Ok(None) => None,
+        Err(LastfmError::Application { code, message })
+            if evo_online_providers::lastfm_is_notfound_code(code) =>
+        {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "lastfm",
+                code,
+                message,
+                "Last.fm clean miss"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "lastfm",
+                entity = %entity.name,
+                error = %e,
+                "Last.fm transient; skipping"
+            );
+            None
+        }
     }
 }
 
-fn enhancement_hint_for_bio_missing(
+async fn fetch_theaudiodb_bio(
+    entity: &EntityRef,
     catalogue: &ProviderCatalogue,
-) -> Option<EnhancementHint> {
-    // Interim: "Add a Last.fm API key" retired — see
-    // `enhancement_hint_for_bio` for the rationale.
-    if catalogue.lastfm.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Last.fm under Settings → Metadata → Sources \
-                     to try one more source"
-                .into(),
-        })
-    } else {
-        None
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    // TheAudioDB's bio surface is `strBiographyEN` on the artist
+    // record — an artist-type surface. Composer / work /
+    // performer / conductor / ensemble routes through MB +
+    // Wikipedia + Wikidata; TheAudioDB adds nothing there.
+    if !matches!(entity.entity_type, EntityType::Artist) {
+        return None;
+    }
+    let tadb = catalogue.theaudiodb.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "entity_bio",
+        entity.entity_type.as_str(),
+        &normalise(&entity.name),
+        ProviderId::TheAudioDb.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(theaudiodb_source_from_cached_payload(p));
+            }
+        }
+    }
+    let hit = match tadb.search_artist_bio(&entity.name).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "theaudiodb",
+                entity = %entity.name,
+                error = %e,
+                "TheAudioDB artist bio transient; skipping"
+            );
+            return None;
+        }
+    };
+    // Guard against TheAudioDB records with no bio prose (thin
+    // artist_thumb / genre only). The field-level merge would
+    // dedupe empties across sources, but returning `None` here
+    // keeps `sources` from carrying a placeholder entry with no
+    // renderable content.
+    let bio_prose = hit
+        .bio_en
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if bio_prose.is_none() && hit.genre.is_none() && hit.formed_year.is_none() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "summary": hit.bio_en,
+        "genre": hit.genre,
+        "formed_year": hit.formed_year,
+        "source_url": hit.source_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "theaudiodb");
+    Some(SourceEntry {
+        provider_id: ProviderId::TheAudioDb.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "TheAudioDB".into(),
+            source_url: Some(hit.source_url),
+            license: "TheAudioDB terms of use".into(),
+        },
+    })
+}
+
+fn source_url_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("source_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn wikipedia_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::Wikipedia.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikipedia".into(),
+            source_url,
+            license: "CC BY-SA".into(),
+        },
+    }
+}
+
+fn wikidata_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::Wikidata.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikidata".into(),
+            source_url,
+            license: "CC0".into(),
+        },
+    }
+}
+
+fn lastfm_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::Lastfm.as_str().to_string(),
+        privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Last.fm".into(),
+            source_url,
+            license: "Last.fm terms of use".into(),
+        },
+    }
+}
+
+fn theaudiodb_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::TheAudioDb.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "TheAudioDB".into(),
+            source_url,
+            license: "TheAudioDB terms of use".into(),
+        },
     }
 }
 
@@ -1135,6 +1153,12 @@ pub(crate) async fn query_release_credits_cascade(
             "artist and album are required and must be non-empty",
         ));
     };
+    let release_mbid_hint = req
+        .release_mbid
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let want_mb = catalogue
         .config
@@ -1152,218 +1176,226 @@ pub(crate) async fn query_release_credits_cascade(
         ));
     }
 
-    let mut last_provider: Option<ProviderId> = None;
+    // Both providers are self-contained content sources — MB
+    // owns its own release-mbid resolution, Discogs looks up
+    // by (artist, album) directly. No cross-dependency, so both
+    // dispatch in parallel via `tokio::join!`.
+    let (mb_src, discogs_src) = tokio::join!(
+        fetch_musicbrainz_release_credits(
+            &artist,
+            &album,
+            release_mbid_hint.as_deref(),
+            catalogue,
+            cache,
+            want_mb,
+        ),
+        fetch_discogs_release_credits(
+            &artist,
+            &album,
+            catalogue,
+            cache,
+            want_discogs,
+        ),
+    );
 
-    // Anonymous baseline: MusicBrainz. Resolves the release MBID
-    // (via caller-supplied hint or `search_release`), then a full
-    // release lookup delivers artist credits, labels + catalog #,
-    // recording-level performer / conductor / composer relations,
-    // and per-track work MBIDs. This is the canonical shape that
-    // populates classical personnel — a Discogs-only response
-    // cannot match this fidelity.
-    if want_mb {
-        if let Some(mb) = catalogue.musicbrainz.as_ref() {
-            last_provider = Some(ProviderId::MusicBrainz);
-            let key = EnrichmentCache::key_for(&[
-                "release_credits",
-                "release",
-                &normalise(&artist),
-                &normalise(&album),
-                ProviderId::MusicBrainz.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        // Cached payload already carries the
-                        // canonical `source_url` set on the fresh
-                        // path; cascade_ok_from_cache recovers it.
-                        // Enhancement hint is recomputed via the
-                        // catalogue so a cached MB hit still
-                        // surfaces the Discogs uplift.
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::MusicBrainz,
-                            None,
-                            enhancement_hint_for_release_credits(
-                                catalogue,
-                                ProviderId::MusicBrainz,
-                            ),
-                        ));
-                    }
-                }
-            }
-            let release_mbid: Option<String> = match &req.release_mbid {
-                Some(m) if !m.trim().is_empty() => Some(m.trim().to_string()),
-                _ => match mb.search_release(&artist, &album).await {
-                    Ok(Some(hit))
-                        if hit.confidence_percent
-                            >= RELEASE_SEARCH_CONFIDENCE_FLOOR =>
-                    {
-                        Some(hit.release_mbid)
-                    }
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = crate::PLUGIN_NAME,
-                            provider = "musicbrainz",
-                            artist,
-                            album,
-                            error = %e,
-                            "MB release search transient; skipping"
-                        );
-                        None
-                    }
-                },
-            };
-            if let Some(release_mbid) = release_mbid {
-                match mb.lookup_release_full(&release_mbid).await {
-                    Ok(rc) => {
-                        let payload = release_credits_payload(&rc);
-                        let _ = cache.put_positive(
-                            &key,
-                            payload.clone(),
-                            "musicbrainz",
-                        );
-                        let attribution = Attribution {
-                            source_name: "MusicBrainz".into(),
-                            source_url: Some(format!(
-                                "https://musicbrainz.org/release/{}",
-                                rc.release_mbid
-                            )),
-                            license: "CC0".into(),
-                        };
-                        let enhancement = enhancement_hint_for_release_credits(
-                            catalogue,
-                            ProviderId::MusicBrainz,
-                        );
-                        return Ok(CascadeResponse {
-                            v: 1,
-                            status: CascadeStatus::Ok,
-                            provider_id: Some(
-                                ProviderId::MusicBrainz.as_str().to_string(),
-                            ),
-                            privacy_class: Some(
-                                PrivacyClass::Anonymous.as_str().to_string(),
-                            ),
-                            payload: Some(payload),
-                            detail: None,
-                            attribution: Some(attribution),
-                            enhancement,
-                            sources: Vec::new(),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = crate::PLUGIN_NAME,
-                            provider = "musicbrainz",
-                            release_mbid,
-                            error = %e,
-                            "MB full-release lookup transient; skipping"
-                        );
-                    }
-                }
+    let mut sources: Vec<SourceEntry> =
+        [mb_src, discogs_src].into_iter().flatten().collect();
+    cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
+
+    if sources.is_empty() {
+        return Ok(CascadeResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            detail: Some(format!(
+                "no release-credits found for {artist} — {album}"
+            )),
+            attribution: None,
+            enhancement: None,
+            sources: Vec::new(),
+        });
+    }
+    Ok(CascadeResponse::from_sources(sources, None))
+}
+
+async fn fetch_musicbrainz_release_credits(
+    artist: &str,
+    album: &str,
+    release_mbid_hint: Option<&str>,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let mb = catalogue.musicbrainz.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "release_credits",
+        "release",
+        &normalise(artist),
+        &normalise(album),
+        ProviderId::MusicBrainz.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(mb_release_credits_source_from_cached_payload(p));
             }
         }
     }
-
-    // Identity-bearing enhancement: Discogs release detail.
-    // Delivers pressing + label + catalog + notes at higher
-    // fidelity than MB when the operator has enabled Discogs and
-    // provided a token. Cache is keyed separately so a disabled
-    // Discogs never suppresses a cached MB result and vice versa.
-    if want_discogs {
-        if let Some(discogs) = catalogue.discogs.as_ref() {
-            last_provider = Some(ProviderId::Discogs);
-            let key = EnrichmentCache::key_for(&[
-                "release_credits",
-                "release",
-                &normalise(&artist),
-                &normalise(&album),
-                ProviderId::Discogs.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Discogs,
-                            None,
-                            enhancement_hint_for_release_credits(
-                                catalogue,
-                                ProviderId::Discogs,
-                            ),
-                        ));
-                    }
-                }
+    let release_mbid: Option<String> = match release_mbid_hint {
+        Some(m) => Some(m.to_string()),
+        None => match mb.search_release(artist, album).await {
+            Ok(Some(hit))
+                if hit.confidence_percent
+                    >= RELEASE_SEARCH_CONFIDENCE_FLOOR =>
+            {
+                Some(hit.release_mbid)
             }
-            match discogs.get_release_detail(&artist, &album).await {
-                Ok(Some(h)) => {
-                    let payload = serde_json::json!({
-                        "release_id": h.release_id,
-                        "label": h.label,
-                        "catalog_number": h.catalog_number,
-                        "year": h.year,
-                        "country": h.country,
-                        "format": h.format,
-                        "notes": h.notes,
-                        "source_url": h.source_url,
-                    });
-                    let _ =
-                        cache.put_positive(&key, payload.clone(), "discogs");
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Discogs.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::IdentityBearing.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Discogs".into(),
-                            source_url: h.source_url.clone(),
-                            license: "Discogs terms of use".into(),
-                        }),
-                        enhancement: enhancement_hint_for_release_credits(
-                            catalogue,
-                            ProviderId::Discogs,
-                        ),
-                        sources: Vec::new(),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    // Transient — never cache; skip Discogs.
-                    tracing::warn!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "discogs",
-                        artist,
-                        album,
-                        error = %discogs_error_message(&e),
-                        "Discogs release detail transient; skipping"
-                    );
-                }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "musicbrainz",
+                    artist,
+                    album,
+                    error = %e,
+                    "MB release search transient; skipping"
+                );
+                None
             }
+        },
+    };
+    let release_mbid = release_mbid?;
+    let rc = match mb.lookup_release_full(&release_mbid).await {
+        Ok(rc) => rc,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "musicbrainz",
+                release_mbid,
+                error = %e,
+                "MB full-release lookup transient; skipping"
+            );
+            return None;
         }
-    }
-
-    // Every enabled provider structurally missed.
-    let detail = format!("no release-credits found for {artist} — {album}");
-    let enhancement = enhancement_hint_for_release_credits_missing(catalogue);
-    Ok(CascadeResponse {
-        v: 1,
-        status: CascadeStatus::NotFound,
-        provider_id: last_provider.map(|p| p.as_str().to_string()),
-        privacy_class: last_provider
-            .map(|p| p.privacy_class().as_str().to_string()),
-        payload: None,
-        detail: Some(detail),
-        attribution: None,
-        enhancement,
-        sources: Vec::new(),
+    };
+    let payload = release_credits_payload(&rc);
+    let _ = cache.put_positive(&key, payload.clone(), "musicbrainz");
+    Some(SourceEntry {
+        provider_id: ProviderId::MusicBrainz.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "MusicBrainz".into(),
+            source_url: Some(format!(
+                "https://musicbrainz.org/release/{}",
+                rc.release_mbid
+            )),
+            license: "CC0".into(),
+        },
     })
+}
+
+async fn fetch_discogs_release_credits(
+    artist: &str,
+    album: &str,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let discogs = catalogue.discogs.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "release_credits",
+        "release",
+        &normalise(artist),
+        &normalise(album),
+        ProviderId::Discogs.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(discogs_source_from_cached_payload(p));
+            }
+        }
+    }
+    match discogs.get_release_detail(artist, album).await {
+        Ok(Some(h)) => {
+            let payload = serde_json::json!({
+                "release_id": h.release_id,
+                "label": h.label,
+                "catalog_number": h.catalog_number,
+                "year": h.year,
+                "country": h.country,
+                "format": h.format,
+                "notes": h.notes,
+                "source_url": h.source_url,
+            });
+            let _ = cache.put_positive(&key, payload.clone(), "discogs");
+            Some(SourceEntry {
+                provider_id: ProviderId::Discogs.as_str().to_string(),
+                privacy_class: PrivacyClass::IdentityBearing
+                    .as_str()
+                    .to_string(),
+                payload,
+                attribution: Attribution {
+                    source_name: "Discogs".into(),
+                    source_url: h.source_url.clone(),
+                    license: "Discogs terms of use".into(),
+                },
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                album,
+                error = %discogs_error_message(&e),
+                "Discogs release detail transient; skipping"
+            );
+            None
+        }
+    }
+}
+
+fn mb_release_credits_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::MusicBrainz.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "MusicBrainz".into(),
+            source_url,
+            license: "CC0".into(),
+        },
+    }
+}
+
+fn discogs_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::Discogs.as_str().to_string(),
+        privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Discogs".into(),
+            source_url,
+            license: "Discogs terms of use".into(),
+        },
+    }
 }
 
 fn release_credits_payload(
@@ -1399,55 +1431,6 @@ fn release_credits_payload(
             rc.release_mbid
         ),
     })
-}
-
-fn enhancement_hint_for_release_credits(
-    catalogue: &ProviderCatalogue,
-    won: ProviderId,
-) -> Option<EnhancementHint> {
-    if won == ProviderId::Discogs {
-        return None;
-    }
-    // MB won — suggest Discogs when it could enrich further.
-    // Suppression rule: never surface "add a key" for a provider
-    // whose key the vault already reports stored.
-    // Interim: "Add a Discogs Personal Access Token" retired —
-    // same rationale as `enhancement_hint_for_bio`. The Discogs
-    // branch in `query_release_credits_cascade` is currently
-    // unreachable whenever MusicBrainz hits; advertising the key
-    // would be a no-op affordance.
-    if catalogue.discogs.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Discogs.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Discogs under Settings → Metadata → Sources for \
-                     pressing + personnel depth"
-                .into(),
-        })
-    } else {
-        None
-    }
-}
-
-fn enhancement_hint_for_release_credits_missing(
-    catalogue: &ProviderCatalogue,
-) -> Option<EnhancementHint> {
-    // Interim: "Add a Discogs Personal Access Token" retired.
-    if catalogue.discogs.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Discogs.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Discogs under Settings → Metadata → Sources to \
-                     try one more source"
-                .into(),
-        })
-    } else {
-        None
-    }
 }
 
 // cascade_ok_from_cache_generic retired — folded into the sole
@@ -1541,232 +1524,192 @@ pub(crate) async fn query_track_annotation_cascade(
         ));
     }
 
-    let mut last_provider: Option<ProviderId> = None;
-
-    // Anonymous baseline: Wikipedia song page. Songs rarely
-    // carry their own Wikipedia article — the try-set below
-    // exhausts the disambiguated forms `"{Track} ({Artist} song)"`
-    // and `"{Track} (song)"` before falling back to the bare
-    // title (which lands on the correct page for songs whose
-    // title is unambiguous in Wikipedia's namespace).
-    if want_wp {
-        if let Some(wp) = catalogue.wikipedia.as_ref() {
-            last_provider = Some(ProviderId::Wikipedia);
-            let key = EnrichmentCache::key_for(&[
-                "track_annotation",
-                "song",
-                &normalise(&artist),
-                &normalise(&track),
-                ProviderId::Wikipedia.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Wikipedia,
-                            None,
-                            enhancement_hint_for_track_annotation(
-                                catalogue,
-                                ProviderId::Wikipedia,
-                            ),
-                        ));
-                    }
-                }
-            }
-            let candidate_titles = [
-                format!("{track} ({artist} song)"),
-                format!("{track} (song)"),
-                track.clone(),
-            ];
-            let mut wp_hit = None;
-            for candidate in &candidate_titles {
-                match wp.get_summary_en(candidate).await {
-                    Ok(Some(summary)) => {
-                        wp_hit = Some(summary);
-                        break;
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = crate::PLUGIN_NAME,
-                            provider = "wikipedia",
-                            title = %candidate,
-                            error = %e,
-                            "Wikipedia song-title lookup transient / \
-                             not-usable; trying next form"
-                        );
-                        continue;
-                    }
-                }
-            }
-            if let Some(summary) = wp_hit {
-                let payload = serde_json::json!({
-                    "title": summary.title,
-                    "summary": summary.extract,
-                    "language": summary.language,
-                    "source_url": summary.page_url,
-                });
-                let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
-                let enhancement = enhancement_hint_for_track_annotation(
-                    catalogue,
-                    ProviderId::Wikipedia,
-                );
-                return Ok(CascadeResponse {
-                    v: 1,
-                    status: CascadeStatus::Ok,
-                    provider_id: Some(
-                        ProviderId::Wikipedia.as_str().to_string(),
-                    ),
-                    privacy_class: Some(
-                        PrivacyClass::Anonymous.as_str().to_string(),
-                    ),
-                    payload: Some(payload),
-                    detail: None,
-                    attribution: Some(Attribution {
-                        source_name: "Wikipedia".into(),
-                        source_url: Some(summary.page_url),
-                        license: "CC BY-SA".into(),
-                    }),
-                    enhancement,
-                    sources: Vec::new(),
-                });
-            }
-        }
-    }
-
-    // Identity-bearing enhancement: Genius description.
-    if want_genius {
-        if let Some(genius) = catalogue.genius.as_ref() {
-            last_provider = Some(ProviderId::Genius);
-            let key = EnrichmentCache::key_for(&[
-                "track_annotation",
-                "song",
-                &normalise(&artist),
-                &normalise(&track),
-                ProviderId::Genius.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Genius,
-                            None,
-                            enhancement_hint_for_track_annotation(
-                                catalogue,
-                                ProviderId::Genius,
-                            ),
-                        ));
-                    }
-                }
-            }
-            match genius.get_track_annotation(&artist, &track).await {
-                Ok(Some(h)) => {
-                    let payload = serde_json::json!({
-                        "song_id": h.song_id,
-                        "description": h.description,
-                        "source_url": h.source_url,
-                    });
-                    let _ = cache.put_positive(&key, payload.clone(), "genius");
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Genius.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::IdentityBearing.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Genius".into(),
-                            source_url: h.source_url.clone(),
-                            license: "Genius terms of use".into(),
-                        }),
-                        enhancement: enhancement_hint_for_track_annotation(
-                            catalogue,
-                            ProviderId::Genius,
-                        ),
-                        sources: Vec::new(),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "genius",
-                        artist,
-                        track,
-                        error = %genius_error_message(&e),
-                        "Genius track annotation transient; skipping"
-                    );
-                }
-            }
-        }
-    }
-
-    let detail = format!(
-        "no track annotation found for {artist} — {track} across \
-         enabled providers"
+    let (wp_src, genius_src) = tokio::join!(
+        fetch_wikipedia_track_annotation(
+            &artist, &track, catalogue, cache, want_wp
+        ),
+        fetch_genius_track_annotation(
+            &artist,
+            &track,
+            catalogue,
+            cache,
+            want_genius
+        ),
     );
-    let enhancement = enhancement_hint_for_track_annotation_missing(catalogue);
-    Ok(CascadeResponse {
-        v: 1,
-        status: CascadeStatus::NotFound,
-        provider_id: last_provider.map(|p| p.as_str().to_string()),
-        privacy_class: last_provider
-            .map(|p| p.privacy_class().as_str().to_string()),
-        payload: None,
-        detail: Some(detail),
-        attribution: None,
-        enhancement,
-        sources: Vec::new(),
+
+    let mut sources: Vec<SourceEntry> =
+        [wp_src, genius_src].into_iter().flatten().collect();
+    cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
+
+    if sources.is_empty() {
+        return Ok(CascadeResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            detail: Some(format!(
+                "no track annotation found for {artist} — {track} across \
+                 enabled providers"
+            )),
+            attribution: None,
+            enhancement: None,
+            sources: Vec::new(),
+        });
+    }
+    Ok(CascadeResponse::from_sources(sources, None))
+}
+
+async fn fetch_wikipedia_track_annotation(
+    artist: &str,
+    track: &str,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let wp = catalogue.wikipedia.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "track_annotation",
+        "song",
+        &normalise(artist),
+        &normalise(track),
+        ProviderId::Wikipedia.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikipedia_source_from_cached_payload(p));
+            }
+        }
+    }
+    // Wikipedia's song-article naming pattern: try the two
+    // disambiguated forms first, then bare-title. Songs rarely
+    // have their own article, and the disambiguated forms
+    // (`"{Track} ({Artist} song)"` / `"{Track} (song)"`) are
+    // Wikipedia's own convention.
+    let candidate_titles = [
+        format!("{track} ({artist} song)"),
+        format!("{track} (song)"),
+        track.to_string(),
+    ];
+    let mut wp_hit = None;
+    for candidate in &candidate_titles {
+        match wp.get_summary_en(candidate).await {
+            Ok(Some(summary)) => {
+                wp_hit = Some(summary);
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "wikipedia",
+                    title = %candidate,
+                    error = %e,
+                    "Wikipedia song-title lookup transient / \
+                     not-usable; trying next form"
+                );
+                continue;
+            }
+        }
+    }
+    let summary = wp_hit?;
+    let payload = serde_json::json!({
+        "title": summary.title,
+        "summary": summary.extract,
+        "language": summary.language,
+        "source_url": summary.page_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikipedia.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikipedia".into(),
+            source_url: Some(summary.page_url),
+            license: "CC BY-SA".into(),
+        },
     })
 }
 
-fn enhancement_hint_for_track_annotation(
+async fn fetch_genius_track_annotation(
+    artist: &str,
+    track: &str,
     catalogue: &ProviderCatalogue,
-    won: ProviderId,
-) -> Option<EnhancementHint> {
-    if won == ProviderId::Genius {
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
         return None;
     }
-    // Interim: "Add a Genius API access token" retired — the
-    // Genius branch is currently unreachable when Wikipedia hits;
-    // advertising the key would be a no-op affordance.
-    if catalogue.genius.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Genius.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Genius under Settings → Metadata → Sources for \
-                     song annotations"
-                .into(),
-        })
-    } else {
-        None
+    let genius = catalogue.genius.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "track_annotation",
+        "song",
+        &normalise(artist),
+        &normalise(track),
+        ProviderId::Genius.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(genius_source_from_cached_payload(p));
+            }
+        }
+    }
+    match genius.get_track_annotation(artist, track).await {
+        Ok(Some(h)) => {
+            let payload = serde_json::json!({
+                "song_id": h.song_id,
+                "description": h.description,
+                "source_url": h.source_url,
+            });
+            let _ = cache.put_positive(&key, payload.clone(), "genius");
+            Some(SourceEntry {
+                provider_id: ProviderId::Genius.as_str().to_string(),
+                privacy_class: PrivacyClass::IdentityBearing
+                    .as_str()
+                    .to_string(),
+                payload,
+                attribution: Attribution {
+                    source_name: "Genius".into(),
+                    source_url: h.source_url.clone(),
+                    license: "Genius terms of use".into(),
+                },
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "genius",
+                artist,
+                track,
+                error = %genius_error_message(&e),
+                "Genius track annotation transient; skipping"
+            );
+            None
+        }
     }
 }
 
-fn enhancement_hint_for_track_annotation_missing(
-    catalogue: &ProviderCatalogue,
-) -> Option<EnhancementHint> {
-    // Interim: "Add a Genius API access token" retired.
-    if catalogue.genius.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Genius.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Genius under Settings → Metadata → Sources to \
-                     try one more source"
-                .into(),
-        })
-    } else {
-        None
+fn genius_source_from_cached_payload(
+    payload: serde_json::Value,
+) -> SourceEntry {
+    let source_url = source_url_from_payload(&payload);
+    SourceEntry {
+        provider_id: ProviderId::Genius.as_str().to_string(),
+        privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Genius".into(),
+            source_url,
+            license: "Genius terms of use".into(),
+        },
     }
 }
 
@@ -1827,6 +1770,12 @@ pub(crate) async fn query_album_notes_cascade(
             "artist and album are required and must be non-empty",
         ));
     };
+    let release_mbid_hint = req
+        .release_mbid
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let want_wp = catalogue
         .config
@@ -1835,8 +1784,12 @@ pub(crate) async fn query_album_notes_cascade(
     let want_lastfm =
         catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
             && catalogue.lastfm.is_some();
+    let want_theaudiodb = catalogue
+        .config
+        .is_effectively_enabled(ProviderId::TheAudioDb)
+        && catalogue.theaudiodb.is_some();
 
-    if !(want_wp || want_lastfm) {
+    if !(want_wp || want_lastfm || want_theaudiodb) {
         return Ok(CascadeResponse::not_configured(
             "every album-notes provider is disabled or unavailable on this \
              device; enable at least one under Settings → Metadata → \
@@ -1844,243 +1797,280 @@ pub(crate) async fn query_album_notes_cascade(
         ));
     }
 
-    let mut last_provider: Option<ProviderId> = None;
-
-    // Anonymous baseline: Wikipedia album page via title-search
-    // variants. Wikipedia's page naming convention for album
-    // articles is `"{Album} ({Artist} album)"` or
-    // `"{Album} (album)"` for disambiguation, then the bare
-    // title for unambiguous titles. Exhaust all three in order.
-    if want_wp {
-        if let Some(wp) = catalogue.wikipedia.as_ref() {
-            last_provider = Some(ProviderId::Wikipedia);
-            let key = EnrichmentCache::key_for(&[
-                "album_notes",
-                "album",
-                &normalise(&artist),
-                &normalise(&album),
-                ProviderId::Wikipedia.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Wikipedia,
-                            None,
-                            enhancement_hint_for_album_notes(
-                                catalogue,
-                                ProviderId::Wikipedia,
-                            ),
-                        ));
-                    }
-                }
-            }
-            let candidate_titles = [
-                format!("{album} ({artist} album)"),
-                format!("{album} (album)"),
-                album.clone(),
-            ];
-            let mut wp_hit = None;
-            for candidate in &candidate_titles {
-                match wp.get_summary_en(candidate).await {
-                    Ok(Some(summary)) => {
-                        wp_hit = Some(summary);
-                        break;
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = crate::PLUGIN_NAME,
-                            provider = "wikipedia",
-                            title = %candidate,
-                            error = %e,
-                            "Wikipedia album-title lookup transient / \
-                             not-usable; trying next form"
-                        );
-                        continue;
-                    }
-                }
-            }
-            if let Some(summary) = wp_hit {
-                let payload = serde_json::json!({
-                    "title": summary.title,
-                    "summary": summary.extract,
-                    "language": summary.language,
-                    "source_url": summary.page_url,
-                });
-                let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
-                let enhancement = enhancement_hint_for_album_notes(
-                    catalogue,
-                    ProviderId::Wikipedia,
-                );
-                return Ok(CascadeResponse {
-                    v: 1,
-                    status: CascadeStatus::Ok,
-                    provider_id: Some(
-                        ProviderId::Wikipedia.as_str().to_string(),
-                    ),
-                    privacy_class: Some(
-                        PrivacyClass::Anonymous.as_str().to_string(),
-                    ),
-                    payload: Some(payload),
-                    detail: None,
-                    attribution: Some(Attribution {
-                        source_name: "Wikipedia".into(),
-                        source_url: Some(summary.page_url),
-                        license: "CC BY-SA".into(),
-                    }),
-                    enhancement,
-                    sources: Vec::new(),
-                });
-            }
-        }
-    }
-
-    // Identity-bearing enhancement: Last.fm album.getinfo wiki.
-    if want_lastfm {
-        if let Some(lastfm) = catalogue.lastfm.as_ref() {
-            last_provider = Some(ProviderId::Lastfm);
-            let key = EnrichmentCache::key_for(&[
-                "album_notes",
-                "album",
-                &normalise(&artist),
-                &normalise(&album),
-                ProviderId::Lastfm.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Lastfm,
-                            None,
-                            enhancement_hint_for_album_notes(
-                                catalogue,
-                                ProviderId::Lastfm,
-                            ),
-                        ));
-                    }
-                }
-            }
-            match lastfm
-                .get_album_notes(&artist, &album, req.release_mbid.as_deref())
-                .await
-            {
-                Ok(Some(h)) => {
-                    let payload = serde_json::json!({
-                        "summary": h.summary,
-                        "content": h.content,
-                        "source_url": h.source_url,
-                    });
-                    let _ = cache.put_positive(&key, payload.clone(), "lastfm");
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Lastfm.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::IdentityBearing.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Last.fm".into(),
-                            source_url: h.source_url.clone(),
-                            license: "Last.fm terms of use".into(),
-                        }),
-                        enhancement: enhancement_hint_for_album_notes(
-                            catalogue,
-                            ProviderId::Lastfm,
-                        ),
-                        sources: Vec::new(),
-                    });
-                }
-                Ok(None) => {}
-                Err(LastfmError::Application { code, message })
-                    if evo_online_providers::lastfm_is_notfound_code(code) =>
-                {
-                    tracing::debug!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "lastfm",
-                        code,
-                        message,
-                        "Last.fm album clean miss"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "lastfm",
-                        artist,
-                        album,
-                        error = %e,
-                        "Last.fm album transient; skipping"
-                    );
-                }
-            }
-        }
-    }
-
-    let detail = format!(
-        "no album notes found for {artist} — {album} across enabled providers"
+    let (wp_src, lastfm_src, tadb_src) = tokio::join!(
+        fetch_wikipedia_album_notes(&artist, &album, catalogue, cache, want_wp),
+        fetch_lastfm_album_notes(
+            &artist,
+            &album,
+            release_mbid_hint.as_deref(),
+            catalogue,
+            cache,
+            want_lastfm,
+        ),
+        fetch_theaudiodb_album_notes(
+            &artist,
+            &album,
+            catalogue,
+            cache,
+            want_theaudiodb
+        ),
     );
-    let enhancement = enhancement_hint_for_album_notes_missing(catalogue);
-    Ok(CascadeResponse {
-        v: 1,
-        status: CascadeStatus::NotFound,
-        provider_id: last_provider.map(|p| p.as_str().to_string()),
-        privacy_class: last_provider
-            .map(|p| p.privacy_class().as_str().to_string()),
-        payload: None,
-        detail: Some(detail),
-        attribution: None,
-        enhancement,
-        sources: Vec::new(),
+
+    let mut sources: Vec<SourceEntry> = [wp_src, lastfm_src, tadb_src]
+        .into_iter()
+        .flatten()
+        .collect();
+    cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
+
+    if sources.is_empty() {
+        return Ok(CascadeResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            detail: Some(format!(
+                "no album notes found for {artist} — {album} across enabled \
+                 providers"
+            )),
+            attribution: None,
+            enhancement: None,
+            sources: Vec::new(),
+        });
+    }
+    Ok(CascadeResponse::from_sources(sources, None))
+}
+
+async fn fetch_wikipedia_album_notes(
+    artist: &str,
+    album: &str,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let wp = catalogue.wikipedia.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "album_notes",
+        "album",
+        &normalise(artist),
+        &normalise(album),
+        ProviderId::Wikipedia.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikipedia_source_from_cached_payload(p));
+            }
+        }
+    }
+    // Wikipedia's album-article naming convention: two
+    // disambiguated forms then bare title.
+    let candidate_titles = [
+        format!("{album} ({artist} album)"),
+        format!("{album} (album)"),
+        album.to_string(),
+    ];
+    let mut wp_hit = None;
+    for candidate in &candidate_titles {
+        match wp.get_summary_en(candidate).await {
+            Ok(Some(summary)) => {
+                wp_hit = Some(summary);
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "wikipedia",
+                    title = %candidate,
+                    error = %e,
+                    "Wikipedia album-title lookup transient / \
+                     not-usable; trying next form"
+                );
+                continue;
+            }
+        }
+    }
+    let summary = wp_hit?;
+    let payload = serde_json::json!({
+        "title": summary.title,
+        "summary": summary.extract,
+        "language": summary.language,
+        "source_url": summary.page_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikipedia.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikipedia".into(),
+            source_url: Some(summary.page_url),
+            license: "CC BY-SA".into(),
+        },
     })
 }
 
-fn enhancement_hint_for_album_notes(
+async fn fetch_lastfm_album_notes(
+    artist: &str,
+    album: &str,
+    release_mbid_hint: Option<&str>,
     catalogue: &ProviderCatalogue,
-    won: ProviderId,
-) -> Option<EnhancementHint> {
-    if won == ProviderId::Lastfm {
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
         return None;
     }
-    // Interim: "Add a Last.fm API key" retired.
-    if catalogue.lastfm.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
+    let lastfm = catalogue.lastfm.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "album_notes",
+        "album",
+        &normalise(artist),
+        &normalise(album),
+        ProviderId::Lastfm.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(lastfm_source_from_cached_payload(p));
+            }
+        }
+    }
+    match lastfm
+        .get_album_notes(artist, album, release_mbid_hint)
+        .await
     {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Last.fm under Settings → Metadata → Sources for \
-                     richer album notes"
-                .into(),
-        })
-    } else {
-        None
+        Ok(Some(h)) => {
+            let payload = serde_json::json!({
+                "summary": h.summary,
+                "content": h.content,
+                "source_url": h.source_url,
+            });
+            let _ = cache.put_positive(&key, payload.clone(), "lastfm");
+            Some(SourceEntry {
+                provider_id: ProviderId::Lastfm.as_str().to_string(),
+                privacy_class: PrivacyClass::IdentityBearing
+                    .as_str()
+                    .to_string(),
+                payload,
+                attribution: Attribution {
+                    source_name: "Last.fm".into(),
+                    source_url: h.source_url.clone(),
+                    license: "Last.fm terms of use".into(),
+                },
+            })
+        }
+        Ok(None) => None,
+        Err(LastfmError::Application { code, message })
+            if evo_online_providers::lastfm_is_notfound_code(code) =>
+        {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "lastfm",
+                code,
+                message,
+                "Last.fm album clean miss"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "lastfm",
+                artist,
+                album,
+                error = %e,
+                "Last.fm album transient; skipping"
+            );
+            None
+        }
     }
 }
 
-fn enhancement_hint_for_album_notes_missing(
+async fn fetch_theaudiodb_album_notes(
+    artist: &str,
+    album: &str,
     catalogue: &ProviderCatalogue,
-) -> Option<EnhancementHint> {
-    // Interim: "Add a Last.fm API key" retired.
-    if catalogue.lastfm.is_some()
-        && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
-    {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: false,
-            reason: "Enable Last.fm under Settings → Metadata → Sources to \
-                     try one more source"
-                .into(),
-        })
-    } else {
-        None
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
     }
+    let tadb = catalogue.theaudiodb.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "album_notes",
+        "album",
+        &normalise(artist),
+        &normalise(album),
+        ProviderId::TheAudioDb.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(theaudiodb_source_from_cached_payload(p));
+            }
+        }
+    }
+    let hit = match tadb.search_album_notes(artist, album).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "theaudiodb",
+                artist,
+                album,
+                error = %e,
+                "TheAudioDB album notes transient; skipping"
+            );
+            return None;
+        }
+    };
+    // TheAudioDB's album records sometimes carry only a
+    // release year + label without any prose. Suppress the
+    // entry when there's no renderable text.
+    let desc_present = hit
+        .description_en
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let review_present = hit
+        .review
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !desc_present
+        && !review_present
+        && hit.year.is_none()
+        && hit.label.is_none()
+    {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "summary": hit.description_en,
+        "review": hit.review,
+        "year": hit.year,
+        "label": hit.label,
+        "source_url": hit.source_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "theaudiodb");
+    Some(SourceEntry {
+        provider_id: ProviderId::TheAudioDb.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "TheAudioDB".into(),
+            source_url: Some(hit.source_url),
+            license: "TheAudioDB terms of use".into(),
+        },
+    })
 }
 
 // -----------------------------------------------------------------
@@ -2155,6 +2145,12 @@ pub(crate) async fn query_work_notes_cascade(
             "at least one of `work_name` or `work_mbid` is required",
         ));
     }
+    let composer_hint = req
+        .composer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let want_mb = catalogue
         .config
@@ -2176,12 +2172,11 @@ pub(crate) async fn query_work_notes_cascade(
         ));
     }
 
-    let mut last_provider: Option<ProviderId> = None;
-
-    // Anonymous baseline: MusicBrainz work lookup. Yields the
-    // Wikipedia + Wikidata URLs the downstream providers consume
-    // directly. When the caller supplied `work_mbid` the search
-    // step is skipped.
+    // MB identity-resolve phase — sequential; feeds Wikipedia +
+    // Wikidata URLs and the canonical title we key their caches
+    // by. Skipped when MB is disabled OR the caller supplied
+    // both work_mbid + work_name (nothing MB can add without a
+    // lookup, and MB lookups aren't free).
     let mut wikipedia_url: Option<String> = None;
     let mut wikidata_url: Option<String> = None;
     let mut canonical_title: Option<String> = None;
@@ -2195,15 +2190,9 @@ pub(crate) async fn query_work_notes_cascade(
 
     if want_mb {
         if let Some(mb) = catalogue.musicbrainz.as_ref() {
-            last_provider = Some(ProviderId::MusicBrainz);
             if resolved_work_mbid.is_none() {
                 if let Some(name) = work_name.as_deref() {
-                    let composer_hint = req
-                        .composer
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
-                    match mb.search_work(name, composer_hint).await {
+                    match mb.search_work(name, composer_hint.as_deref()).await {
                         Ok(Some(hit))
                             if hit.confidence_percent
                                 >= WORK_SEARCH_CONFIDENCE_FLOOR =>
@@ -2245,165 +2234,197 @@ pub(crate) async fn query_work_notes_cascade(
         }
     }
 
-    // Wikipedia work-page summary — primary anonymous content.
-    if want_wp {
-        if let Some(wp) = catalogue.wikipedia.as_ref() {
-            last_provider = Some(ProviderId::Wikipedia);
-            let cache_name = canonical_title
-                .clone()
-                .or_else(|| work_name.clone())
-                .unwrap_or_default();
-            let key = EnrichmentCache::key_for(&[
-                "work_notes",
-                "work",
-                &normalise(&cache_name),
-                ProviderId::Wikipedia.as_str(),
-            ]);
-            if let Some(entry) = cache.get(&key) {
-                if entry.status == "ok" {
-                    if let Some(p) = entry.payload {
-                        // work_notes has no identity-bearing
-                        // enhancement — Wikipedia is authoritative
-                        // for classical works. Explicit `None` so
-                        // the intent is on the wire.
-                        return Ok(cascade_ok_from_cache(
-                            p,
-                            ProviderId::Wikipedia,
-                            None,
-                            None,
-                        ));
-                    }
-                }
-            }
-            let hit = match &wikipedia_url {
-                Some(url) => wp.get_summary_from_url(url).await,
-                None => match &canonical_title {
-                    Some(title) => wp.get_summary_en(title).await,
-                    None => match &work_name {
-                        Some(name) => wp.get_summary_en(name).await,
-                        None => Ok(None),
-                    },
-                },
-            };
-            match hit {
-                Ok(Some(summary)) => {
-                    let payload = serde_json::json!({
-                        "title": summary.title,
-                        "summary": summary.extract,
-                        "language": summary.language,
-                        "work_mbid": resolved_work_mbid,
-                        "work_type": work_type,
-                        "source_url": summary.page_url,
-                    });
-                    let _ =
-                        cache.put_positive(&key, payload.clone(), "wikipedia");
-                    return Ok(CascadeResponse {
-                        v: 1,
-                        status: CascadeStatus::Ok,
-                        provider_id: Some(
-                            ProviderId::Wikipedia.as_str().to_string(),
-                        ),
-                        privacy_class: Some(
-                            PrivacyClass::Anonymous.as_str().to_string(),
-                        ),
-                        payload: Some(payload),
-                        detail: None,
-                        attribution: Some(Attribution {
-                            source_name: "Wikipedia".into(),
-                            source_url: Some(summary.page_url),
-                            license: "CC BY-SA".into(),
-                        }),
-                        enhancement: None,
-                        sources: Vec::new(),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = crate::PLUGIN_NAME,
-                        provider = "wikipedia",
-                        work = %cache_name,
-                        error = %e,
-                        "Wikipedia work-summary transient / not-usable; \
-                         skipping"
-                    );
-                }
-            }
-        }
-    }
+    let cache_name = canonical_title
+        .clone()
+        .or_else(|| work_name.clone())
+        .unwrap_or_default();
+    let (wp_src, wd_src) = tokio::join!(
+        fetch_wikipedia_work_notes(
+            &cache_name,
+            work_name.as_deref(),
+            canonical_title.as_deref(),
+            wikipedia_url.as_deref(),
+            resolved_work_mbid.clone(),
+            work_type.clone(),
+            catalogue,
+            cache,
+            want_wp,
+        ),
+        fetch_wikidata_work_notes(
+            &cache_name,
+            wikidata_url.as_deref(),
+            resolved_work_mbid.clone(),
+            work_type.clone(),
+            catalogue,
+            cache,
+            want_wd,
+        ),
+    );
 
-    // Wikidata — structured work facts (composer, inception,
-    // genre) as a secondary anonymous fallback when Wikipedia
-    // has no summary but MB routed a wikidata_url.
-    if want_wd {
-        if let Some(wd) = catalogue.wikidata.as_ref() {
-            last_provider = Some(ProviderId::Wikidata);
-            let hit = match &wikidata_url {
-                Some(url) => wd.get_entity_from_url(url).await,
-                None => Ok(None),
-            };
-            if let Ok(Some(entity_hit)) = hit {
-                let payload = serde_json::json!({
-                    "label": entity_hit.label_en,
-                    "description": entity_hit.description_en,
-                    "inception": entity_hit.inception,
-                    "genre_ids": entity_hit.genre_ids,
-                    "work_mbid": resolved_work_mbid,
-                    "work_type": work_type,
-                    "source_url": entity_hit.entity_url,
-                });
-                let cache_name = canonical_title
+    let mut sources: Vec<SourceEntry> =
+        [wp_src, wd_src].into_iter().flatten().collect();
+    cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
+
+    if sources.is_empty() {
+        return Ok(CascadeResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            detail: Some(format!(
+                "no work notes found for {} across enabled providers",
+                canonical_title
                     .clone()
                     .or_else(|| work_name.clone())
-                    .unwrap_or_default();
-                let key = EnrichmentCache::key_for(&[
-                    "work_notes",
-                    "work",
-                    &normalise(&cache_name),
-                    ProviderId::Wikidata.as_str(),
-                ]);
-                let _ = cache.put_positive(&key, payload.clone(), "wikidata");
-                return Ok(CascadeResponse {
-                    v: 1,
-                    status: CascadeStatus::Ok,
-                    provider_id: Some(
-                        ProviderId::Wikidata.as_str().to_string(),
-                    ),
-                    privacy_class: Some(
-                        PrivacyClass::Anonymous.as_str().to_string(),
-                    ),
-                    payload: Some(payload),
-                    detail: None,
-                    attribution: Some(Attribution {
-                        source_name: "Wikidata".into(),
-                        source_url: Some(entity_hit.entity_url),
-                        license: "CC0".into(),
-                    }),
-                    enhancement: None,
-                    sources: Vec::new(),
-                });
+                    .unwrap_or_else(|| "the requested work".to_string())
+            )),
+            attribution: None,
+            enhancement: None,
+            sources: Vec::new(),
+        });
+    }
+    Ok(CascadeResponse::from_sources(sources, None))
+}
+
+// 9 args reflect the parallel-dispatch shape — the work-notes
+// verb's MB identity-resolve phase produces four downstream
+// signals (wikipedia_url, work_mbid, canonical_title,
+// work_type) that both leaf helpers consume; grouping them
+// into a struct would move the args without reducing them.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_wikipedia_work_notes(
+    cache_name: &str,
+    work_name: Option<&str>,
+    canonical_title: Option<&str>,
+    wikipedia_url: Option<&str>,
+    resolved_work_mbid: Option<String>,
+    work_type: Option<String>,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let wp = catalogue.wikipedia.as_ref()?;
+    let key = EnrichmentCache::key_for(&[
+        "work_notes",
+        "work",
+        &normalise(cache_name),
+        ProviderId::Wikipedia.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikipedia_source_from_cached_payload(p));
             }
         }
     }
+    let hit = match wikipedia_url {
+        Some(url) => wp.get_summary_from_url(url).await,
+        None => match canonical_title {
+            Some(title) => wp.get_summary_en(title).await,
+            None => match work_name {
+                Some(name) => wp.get_summary_en(name).await,
+                None => Ok(None),
+            },
+        },
+    };
+    let summary = match hit {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "wikipedia",
+                work = %cache_name,
+                error = %e,
+                "Wikipedia work-summary transient / not-usable; skipping"
+            );
+            return None;
+        }
+    };
+    let payload = serde_json::json!({
+        "title": summary.title,
+        "summary": summary.extract,
+        "language": summary.language,
+        "work_mbid": resolved_work_mbid,
+        "work_type": work_type,
+        "source_url": summary.page_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikipedia.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikipedia".into(),
+            source_url: Some(summary.page_url),
+            license: "CC BY-SA".into(),
+        },
+    })
+}
 
-    let detail = format!(
-        "no work notes found for {} across enabled providers",
-        canonical_title
-            .clone()
-            .or_else(|| work_name.clone())
-            .unwrap_or_else(|| "the requested work".to_string())
-    );
-    Ok(CascadeResponse {
-        v: 1,
-        status: CascadeStatus::NotFound,
-        provider_id: last_provider.map(|p| p.as_str().to_string()),
-        privacy_class: last_provider
-            .map(|p| p.privacy_class().as_str().to_string()),
-        payload: None,
-        detail: Some(detail),
-        attribution: None,
-        // No identity-bearing enhancement for work notes.
-        enhancement: None,
-        sources: Vec::new(),
+async fn fetch_wikidata_work_notes(
+    cache_name: &str,
+    wikidata_url: Option<&str>,
+    resolved_work_mbid: Option<String>,
+    work_type: Option<String>,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let wd = catalogue.wikidata.as_ref()?;
+    let wd_url = wikidata_url?;
+    let key = EnrichmentCache::key_for(&[
+        "work_notes",
+        "work",
+        &normalise(cache_name),
+        ProviderId::Wikidata.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(wikidata_source_from_cached_payload(p));
+            }
+        }
+    }
+    let entity_hit = match wd.get_entity_from_url(wd_url).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "wikidata",
+                work = %cache_name,
+                error = %e,
+                "Wikidata work-facts transient; skipping"
+            );
+            return None;
+        }
+    };
+    let payload = serde_json::json!({
+        "label": entity_hit.label_en,
+        "description": entity_hit.description_en,
+        "inception": entity_hit.inception,
+        "genre_ids": entity_hit.genre_ids,
+        "work_mbid": resolved_work_mbid,
+        "work_type": work_type,
+        "source_url": entity_hit.entity_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "wikidata");
+    Some(SourceEntry {
+        provider_id: ProviderId::Wikidata.as_str().to_string(),
+        privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Wikidata".into(),
+            source_url: Some(entity_hit.entity_url),
+            license: "CC0".into(),
+        },
     })
 }

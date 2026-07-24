@@ -3699,6 +3699,7 @@ dependencies = [
  "evo-mpd-shared",
  "evo-online-providers",
  "evo-plugin-sdk",
+ "futures",
  "semver",
  "serde",
  "serde_json",

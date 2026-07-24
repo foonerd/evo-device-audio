@@ -119,6 +119,7 @@ pub(crate) enum ProviderId {
     Wikipedia,
     Wikidata,
     Lrclib,
+    TheAudioDb,
     // Identity-bearing — API key required.
     Lastfm,
     Discogs,
@@ -132,9 +133,29 @@ impl ProviderId {
             ProviderId::Wikipedia => "wikipedia",
             ProviderId::Wikidata => "wikidata",
             ProviderId::Lrclib => "lrclib",
+            ProviderId::TheAudioDb => "theaudiodb",
             ProviderId::Lastfm => "lastfm",
             ProviderId::Discogs => "discogs",
             ProviderId::Genius => "genius",
+        }
+    }
+
+    /// Inverse of `as_str`. Used when a wire payload or store
+    /// entry carries a provider id as a string and the cascade
+    /// needs the typed variant. Returns `None` on an unknown id
+    /// so the store never crashes the cascade if a stale row
+    /// names a retired provider.
+    pub(crate) fn from_wire(id: &str) -> Option<Self> {
+        match id {
+            "musicbrainz" => Some(ProviderId::MusicBrainz),
+            "wikipedia" => Some(ProviderId::Wikipedia),
+            "wikidata" => Some(ProviderId::Wikidata),
+            "lrclib" => Some(ProviderId::Lrclib),
+            "theaudiodb" => Some(ProviderId::TheAudioDb),
+            "lastfm" => Some(ProviderId::Lastfm),
+            "discogs" => Some(ProviderId::Discogs),
+            "genius" => Some(ProviderId::Genius),
+            _ => None,
         }
     }
 
@@ -143,7 +164,8 @@ impl ProviderId {
             ProviderId::MusicBrainz
             | ProviderId::Wikipedia
             | ProviderId::Wikidata
-            | ProviderId::Lrclib => PrivacyClass::Anonymous,
+            | ProviderId::Lrclib
+            | ProviderId::TheAudioDb => PrivacyClass::Anonymous,
             ProviderId::Lastfm | ProviderId::Discogs | ProviderId::Genius => {
                 PrivacyClass::IdentityBearing
             }
@@ -206,8 +228,8 @@ pub(crate) struct EnhancementHint {
 /// Every provider that returned non-empty content for a query is
 /// represented as one `SourceEntry` in the response's `sources`
 /// array. The UI renders the operator-selected entry's payload +
-/// attribution; the operator can switch between entries via the
-/// per-source selection surface (ADR-0153 §3, UI-side).
+/// attribution; the operator switches between entries via the
+/// per-source selection surface on the UI side.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct SourceEntry {
     /// Provider id string (`"wikipedia"`, `"lastfm"`,
@@ -230,8 +252,8 @@ pub(crate) struct SourceEntry {
 /// (highest priority first). Top-level `provider_id` / `payload`
 /// / `attribution` mirror `sources[0]` for back-compat with UIs
 /// that render a single default. The operator's per-source
-/// selection surface (ADR-0153 §3) reads `sources` directly and
-/// lets the operator switch between contributing entries.
+/// selection surface reads `sources` directly and lets the
+/// operator switch between contributing entries.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CascadeResponse {
     pub(crate) v: u8,
@@ -264,8 +286,9 @@ pub(crate) struct CascadeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attribution: Option<Attribution>,
     /// Optional hint pointing at a provider the operator could
-    /// enable / configure to enrich the answer further. Will
-    /// retire once ADR-0153 §3 per-source enable/disable ships.
+    /// enable / configure to enrich the answer further. Retires
+    /// once per-source enable/disable ships on the UI side and
+    /// `sources` becomes the sole surface consumers walk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) enhancement: Option<EnhancementHint>,
     /// Every provider that returned non-empty content, ordered by
@@ -280,8 +303,21 @@ pub(crate) struct CascadeResponse {
 
 impl CascadeResponse {
     /// Build a `CascadeResponse` from an ordered vector of
-    /// `SourceEntry` (highest-priority first). The top-level
-    /// fields mirror `sources[0]` when the vector is non-empty.
+    /// `SourceEntry` (highest-priority first).
+    ///
+    /// The top-level `payload` is the **field-level first-non-empty
+    /// merge** across every source in priority order: for each
+    /// top-level JSON key, the value from the highest-priority
+    /// source that has a non-empty value wins. Fields unique to a
+    /// single source come through as-is. This matches the
+    /// Jellyfin / beets displayed-default pattern — the top-level
+    /// object stays useful even when a single source misses a
+    /// field a lower-priority peer covers, while the operator-
+    /// selectable per-source view reads `sources` directly.
+    ///
+    /// Top-level `provider_id` / `privacy_class` / `attribution`
+    /// mirror `sources[0]` — the primary source. UIs that render
+    /// per-field attribution walk `sources`.
     ///
     /// `status` is `Ok` iff `sources` is non-empty. Callers that
     /// need `not_found` / `not_configured` / `bad_request` use
@@ -296,7 +332,7 @@ impl CascadeResponse {
                     CascadeStatus::Ok,
                     Some(primary.provider_id.clone()),
                     Some(primary.privacy_class.clone()),
-                    Some(primary.payload.clone()),
+                    Some(merge_sources_field_level(&sources)),
                     Some(primary.attribution.clone()),
                 )
             } else {
@@ -314,6 +350,68 @@ impl CascadeResponse {
             sources,
         }
     }
+}
+
+/// Field-level first-non-empty merge across an ordered slice of
+/// sources (highest-priority first). Walks the sources in order;
+/// for each top-level key encountered, the first source with a
+/// non-empty value at that key wins.
+///
+/// Non-empty is defined as:
+/// - JSON `null` — absent
+/// - string — non-empty and non-whitespace
+/// - array — non-empty
+/// - object — non-empty
+/// - number / bool — always present
+///
+/// Returns a JSON object even when the input is empty (the
+/// caller of `from_sources` guarantees non-empty input for the
+/// merged branch, but the helper is defensive).
+pub(crate) fn merge_sources_field_level(
+    sources: &[SourceEntry],
+) -> serde_json::Value {
+    let mut merged = serde_json::Map::new();
+    for src in sources {
+        let obj = match src.payload.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        for (k, v) in obj {
+            if merged.contains_key(k) {
+                continue;
+            }
+            if is_json_value_present(v) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+fn is_json_value_present(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+/// Sort a mutable `sources` vector in place by the operator's
+/// per-provider priority (ascending — lower number wins first).
+/// Entries whose `provider_id` does not resolve to a known
+/// `ProviderId` sink to the tail. Ties preserve input order
+/// (stable sort).
+pub(crate) fn sort_sources_by_priority(
+    sources: &mut [SourceEntry],
+    config: &ProviderConfig,
+) {
+    sources.sort_by_key(|s| {
+        ProviderId::from_wire(&s.provider_id)
+            .map(|p| config.flags(p).priority)
+            .unwrap_or(u32::MAX)
+    });
 }
 
 /// Wire-serialised status for the cascade response.
@@ -374,6 +472,8 @@ pub(crate) struct ProviderCatalogue {
     pub(crate) wikidata:
         Option<Arc<evo_online_providers::wikidata::WikidataClient>>,
     pub(crate) lrclib: Option<Arc<evo_online_providers::lrclib::LrclibClient>>,
+    pub(crate) theaudiodb:
+        Option<Arc<evo_online_providers::theaudiodb::TheAudioDbClient>>,
     pub(crate) lastfm: Option<Arc<evo_online_providers::lastfm::LastfmClient>>,
     pub(crate) discogs:
         Option<Arc<evo_online_providers::discogs::DiscogsClient>>,
@@ -397,6 +497,7 @@ pub(crate) struct ProviderConfig {
     pub(crate) wikipedia: ProviderFlags,
     pub(crate) wikidata: ProviderFlags,
     pub(crate) lrclib: ProviderFlags,
+    pub(crate) theaudiodb: ProviderFlags,
     pub(crate) lastfm: ProviderFlags,
     pub(crate) discogs: ProviderFlags,
     pub(crate) genius: ProviderFlags,
@@ -429,6 +530,10 @@ impl ProviderConfig {
             lrclib: ProviderFlags {
                 enabled: true,
                 priority: 40,
+            },
+            theaudiodb: ProviderFlags {
+                enabled: true,
+                priority: 45,
             },
             lastfm: ProviderFlags {
                 enabled: true,
@@ -476,6 +581,7 @@ impl ProviderConfig {
             ProviderId::Wikipedia => &self.wikipedia,
             ProviderId::Wikidata => &self.wikidata,
             ProviderId::Lrclib => &self.lrclib,
+            ProviderId::TheAudioDb => &self.theaudiodb,
             ProviderId::Lastfm => &self.lastfm,
             ProviderId::Discogs => &self.discogs,
             ProviderId::Genius => &self.genius,
@@ -494,10 +600,34 @@ impl ProviderConfig {
             ProviderId::Wikipedia => self.wikipedia = flags,
             ProviderId::Wikidata => self.wikidata = flags,
             ProviderId::Lrclib => self.lrclib = flags,
+            ProviderId::TheAudioDb => self.theaudiodb = flags,
             ProviderId::Lastfm => self.lastfm = flags,
             ProviderId::Discogs => self.discogs = flags,
             ProviderId::Genius => self.genius = flags,
         }
+    }
+
+    /// Merge a runtime operator override on top of the current
+    /// per-provider flag block. Config parsing calls this once
+    /// per operator override; the operator's per-source
+    /// enable/priority store calls it once per store entry at
+    /// request time. Priority-only overrides preserve the existing
+    /// enabled bit; enabled-only overrides preserve the existing
+    /// priority. When both are supplied both are applied.
+    pub(crate) fn merge_override(
+        &mut self,
+        provider: ProviderId,
+        enabled: Option<bool>,
+        priority: Option<u32>,
+    ) {
+        let mut flags = self.flags(provider);
+        if let Some(e) = enabled {
+            flags.enabled = e;
+        }
+        if let Some(p) = priority {
+            flags.priority = p;
+        }
+        self.set_flags(provider, flags);
     }
 }
 
@@ -597,11 +727,175 @@ mod tests {
             ProviderId::Wikipedia,
             ProviderId::Wikidata,
             ProviderId::Lrclib,
+            ProviderId::TheAudioDb,
             ProviderId::Lastfm,
             ProviderId::Discogs,
             ProviderId::Genius,
         ] {
             assert!(!cfg.is_effectively_enabled(p), "{p:?} must be disabled");
         }
+    }
+
+    #[test]
+    fn provider_id_wire_round_trip() {
+        for p in [
+            ProviderId::MusicBrainz,
+            ProviderId::Wikipedia,
+            ProviderId::Wikidata,
+            ProviderId::Lrclib,
+            ProviderId::TheAudioDb,
+            ProviderId::Lastfm,
+            ProviderId::Discogs,
+            ProviderId::Genius,
+        ] {
+            assert_eq!(
+                ProviderId::from_wire(p.as_str()),
+                Some(p),
+                "wire round-trip for {p:?}"
+            );
+        }
+        assert_eq!(ProviderId::from_wire("no-such-provider"), None);
+    }
+
+    #[test]
+    fn merge_override_preserves_untouched_fields() {
+        let mut cfg = ProviderConfig::defaults();
+        let baseline_priority = cfg.flags(ProviderId::Lastfm).priority;
+        cfg.merge_override(ProviderId::Lastfm, Some(false), None);
+        assert!(!cfg.flags(ProviderId::Lastfm).enabled);
+        assert_eq!(cfg.flags(ProviderId::Lastfm).priority, baseline_priority);
+        cfg.merge_override(ProviderId::Lastfm, None, Some(5));
+        assert!(!cfg.flags(ProviderId::Lastfm).enabled);
+        assert_eq!(cfg.flags(ProviderId::Lastfm).priority, 5);
+    }
+
+    fn source_of(provider_id: &str, payload: serde_json::Value) -> SourceEntry {
+        SourceEntry {
+            provider_id: provider_id.to_string(),
+            privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+            payload,
+            attribution: Attribution {
+                source_name: provider_id.to_string(),
+                source_url: None,
+                license: "test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn merge_sources_field_level_takes_first_non_empty() {
+        let sources = vec![
+            source_of(
+                "wikipedia",
+                serde_json::json!({"summary": "wp prose", "language": "en"}),
+            ),
+            source_of(
+                "lastfm",
+                serde_json::json!({
+                    "summary": "lastfm prose",
+                    "listeners": 12345,
+                    "language": "",
+                }),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({
+                    "summary": "tadb prose",
+                    "genre": "rock",
+                }),
+            ),
+        ];
+        let merged = merge_sources_field_level(&sources);
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.get("summary").unwrap(), "wp prose");
+        assert_eq!(obj.get("language").unwrap(), "en");
+        assert_eq!(obj.get("listeners").unwrap().as_u64(), Some(12345));
+        assert_eq!(obj.get("genre").unwrap(), "rock");
+    }
+
+    #[test]
+    fn merge_sources_field_level_skips_empty_and_null_and_whitespace() {
+        let sources = vec![
+            source_of(
+                "wikipedia",
+                serde_json::json!({
+                    "summary": "",
+                    "list": [],
+                    "obj": {},
+                    "null_field": serde_json::Value::Null,
+                    "ws": "   \n\t",
+                }),
+            ),
+            source_of(
+                "lastfm",
+                serde_json::json!({
+                    "summary": "lastfm prose",
+                    "list": ["a"],
+                    "obj": {"k": "v"},
+                    "null_field": "from lastfm",
+                    "ws": "content",
+                }),
+            ),
+        ];
+        let merged = merge_sources_field_level(&sources);
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.get("summary").unwrap(), "lastfm prose");
+        assert_eq!(obj.get("list").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(obj.get("null_field").unwrap(), "from lastfm");
+        assert_eq!(obj.get("ws").unwrap(), "content");
+    }
+
+    #[test]
+    fn sort_sources_by_priority_lower_wins_first() {
+        let cfg = ProviderConfig::defaults();
+        let mut sources = vec![
+            source_of("lastfm", serde_json::json!({})),
+            source_of("musicbrainz", serde_json::json!({})),
+            source_of("wikipedia", serde_json::json!({})),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        assert_eq!(sources[0].provider_id, "musicbrainz");
+        assert_eq!(sources[1].provider_id, "wikipedia");
+        assert_eq!(sources[2].provider_id, "lastfm");
+    }
+
+    #[test]
+    fn sort_sources_by_priority_sinks_unknown() {
+        let cfg = ProviderConfig::defaults();
+        let mut sources = vec![
+            source_of("unknown_provider", serde_json::json!({})),
+            source_of("wikipedia", serde_json::json!({})),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        assert_eq!(sources[0].provider_id, "wikipedia");
+        assert_eq!(sources[1].provider_id, "unknown_provider");
+    }
+
+    #[test]
+    fn from_sources_ok_when_non_empty_notfound_when_empty() {
+        let ok = CascadeResponse::from_sources(
+            vec![source_of("wikipedia", serde_json::json!({"a": "b"}))],
+            None,
+        );
+        assert!(matches!(ok.status, CascadeStatus::Ok));
+        let empty = CascadeResponse::from_sources(vec![], None);
+        assert!(matches!(empty.status, CascadeStatus::NotFound));
+    }
+
+    #[test]
+    fn from_sources_top_level_is_merged_view() {
+        let sources = vec![
+            source_of("wikipedia", serde_json::json!({"summary": "wp"})),
+            source_of(
+                "lastfm",
+                serde_json::json!({"summary": "lfm", "listeners": 7}),
+            ),
+        ];
+        let resp = CascadeResponse::from_sources(sources, None);
+        let payload = resp.payload.unwrap();
+        assert_eq!(payload.get("summary").unwrap(), "wp");
+        assert_eq!(payload.get("listeners").unwrap().as_u64(), Some(7));
+        assert_eq!(resp.provider_id.as_deref(), Some("wikipedia"));
+        assert_eq!(resp.sources.len(), 2);
     }
 }

@@ -99,8 +99,10 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use evo_online_providers::{
-    build_http_client, DiscogsClient, GeniusClient, LastfmClient, LrclibClient,
-    MusicBrainzClient, RateLimiter, WikidataClient, WikipediaClient,
+    build_http_client,
+    theaudiodb::{TheAudioDbClient, THEAUDIODB_KEYLESS_API_KEY},
+    DiscogsClient, GeniusClient, LastfmClient, LrclibClient, MusicBrainzClient,
+    RateLimiter, WikidataClient, WikipediaClient,
 };
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
@@ -178,6 +180,13 @@ pub struct MetadataOnlinePlugin {
     genius_client: Arc<RwLock<Option<GeniusClient>>>,
     wikipedia_client: Option<WikipediaClient>,
     wikidata_client: Option<WikidataClient>,
+    /// TheAudioDB keyless client (bio + album review text). No
+    /// vault key today; the client wraps the community test key
+    /// documented on TheAudioDB's site. If the operator later
+    /// obtains a paid key, this slot upgrades to the same
+    /// `Arc<RwLock<Option<..>>>` pattern as Last.fm / Discogs /
+    /// Genius without touching the cascade.
+    theaudiodb_client: Option<TheAudioDbClient>,
     provider_config: cascade::ProviderConfig,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -217,6 +226,7 @@ impl MetadataOnlinePlugin {
             genius_client: Arc::new(RwLock::new(None)),
             wikipedia_client: None,
             wikidata_client: None,
+            theaudiodb_client: None,
             provider_config: cascade::ProviderConfig::defaults(),
             reconcile_cache: None,
             lyrics_cache: None,
@@ -301,6 +311,64 @@ impl Plugin for MetadataOnlinePlugin {
             // config makes every network provider a structural
             // miss without any wire-op sequencing.
             self.provider_config = self.config.provider_config.clone();
+            // Runtime-store overlay: when the framework exposes an
+            // online-provider config handle, its per-provider
+            // enable + priority overrides layer on top of the
+            // plugin's config-file defaults. Precedence, lowest
+            // to highest:
+            //   1. `ProviderConfig::defaults()` (framework baseline)
+            //   2. plugin config-file `[providers.<id>]` blocks
+            //   3. runtime store rows (operator gestures via wire
+            //      op `online_providers_set_enabled` /
+            //      `online_providers_set_priority`)
+            // Unknown provider ids (from a store row that names a
+            // provider this plugin does not implement) are
+            // skipped with a debug log — the store is a
+            // framework-wide store and other plugins register
+            // their own ids there.
+            if let Some(store) = ctx.online_provider_config.as_ref() {
+                match store.list_all().await {
+                    Ok(rows) => {
+                        for row in rows {
+                            let Some(pid) = cascade::ProviderId::from_wire(
+                                &row.provider_id,
+                            ) else {
+                                tracing::debug!(
+                                    plugin = PLUGIN_NAME,
+                                    provider_id = %row.provider_id,
+                                    "online_provider_config store row names a \
+                                     provider this plugin does not implement; \
+                                     skipping"
+                                );
+                                continue;
+                            };
+                            if row.priority < 0 {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    provider_id = %row.provider_id,
+                                    priority = row.priority,
+                                    "online_provider_config store row carries \
+                                     negative priority; skipping override"
+                                );
+                                continue;
+                            }
+                            self.provider_config.merge_override(
+                                pid,
+                                Some(row.enabled),
+                                Some(row.priority as u32),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "online_provider_config store list_all failed; \
+                             cascade uses plugin config-file defaults"
+                        );
+                    }
+                }
+            }
             // Shared HTTPS client — single connection pool +
             // DNS cache across every online provider in this
             // plugin.
@@ -337,6 +405,20 @@ impl Plugin for MetadataOnlinePlugin {
                 http.clone(),
                 wikimedia_rate,
                 self.config.musicbrainz_user_agent.clone(),
+            ));
+            // TheAudioDB anonymous baseline (keyless test key).
+            // Shares the MusicBrainz rate limiter's 1-req/sec
+            // cadence — TheAudioDB is a small-team database on a
+            // best-effort SLA; hammering it is antisocial and
+            // the test key is a shared community resource.
+            let theaudiodb_rate = Arc::new(RateLimiter::new(
+                self.config.musicbrainz_min_interval,
+            ));
+            self.theaudiodb_client = Some(TheAudioDbClient::new(
+                http.clone(),
+                theaudiodb_rate,
+                self.config.musicbrainz_user_agent.clone(),
+                THEAUDIODB_KEYLESS_API_KEY,
             ));
             // Resolve the Last.fm API key. Precedence:
             //   1. Framework credential vault (single-substrate
@@ -476,6 +558,7 @@ impl Plugin for MetadataOnlinePlugin {
             *self.genius_client.write().await = None;
             self.wikipedia_client = None;
             self.wikidata_client = None;
+            self.theaudiodb_client = None;
             self.provider_config = cascade::ProviderConfig::defaults();
             self.reconcile_cache = None;
             self.lyrics_cache = None;
@@ -557,6 +640,7 @@ impl Respondent for MetadataOnlinePlugin {
             let genius = self.genius_client.read().await.clone();
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
+            let theaudiodb = self.theaudiodb_client.clone();
             let provider_config = self.provider_config.clone();
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
@@ -633,6 +717,7 @@ impl Respondent for MetadataOnlinePlugin {
                         wikipedia: wikipedia.clone().map(Arc::new),
                         wikidata: wikidata.clone().map(Arc::new),
                         lrclib: Some(Arc::new(lrclib.clone())),
+                        theaudiodb: theaudiodb.clone().map(Arc::new),
                         lastfm: lastfm.clone().map(Arc::new),
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
@@ -660,6 +745,7 @@ impl Respondent for MetadataOnlinePlugin {
                         wikipedia: wikipedia.clone().map(Arc::new),
                         wikidata: wikidata.clone().map(Arc::new),
                         lrclib: Some(Arc::new(lrclib.clone())),
+                        theaudiodb: theaudiodb.clone().map(Arc::new),
                         lastfm: lastfm.clone().map(Arc::new),
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
@@ -688,6 +774,7 @@ impl Respondent for MetadataOnlinePlugin {
                         wikipedia: wikipedia.clone().map(Arc::new),
                         wikidata: wikidata.clone().map(Arc::new),
                         lrclib: Some(Arc::new(lrclib.clone())),
+                        theaudiodb: theaudiodb.clone().map(Arc::new),
                         lastfm: lastfm.clone().map(Arc::new),
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
@@ -717,6 +804,7 @@ impl Respondent for MetadataOnlinePlugin {
                         wikipedia: wikipedia.clone().map(Arc::new),
                         wikidata: wikidata.clone().map(Arc::new),
                         lrclib: Some(Arc::new(lrclib.clone())),
+                        theaudiodb: theaudiodb.clone().map(Arc::new),
                         lastfm: lastfm.clone().map(Arc::new),
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
@@ -746,6 +834,7 @@ impl Respondent for MetadataOnlinePlugin {
                         wikipedia: wikipedia.clone().map(Arc::new),
                         wikidata: wikidata.clone().map(Arc::new),
                         lrclib: Some(Arc::new(lrclib.clone())),
+                        theaudiodb: theaudiodb.clone().map(Arc::new),
                         lastfm: lastfm.clone().map(Arc::new),
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
