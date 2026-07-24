@@ -305,17 +305,6 @@ pub(crate) struct ProviderCatalogue {
     pub(crate) genius: Option<Arc<evo_online_providers::genius::GeniusClient>>,
     /// Operator-controlled per-provider enable/order.
     pub(crate) config: ProviderConfig,
-    /// Hex-encoded SHA-256 key hashes the framework's credential
-    /// vault reported present for this plugin at the top of the
-    /// current request. Populated once per `handle_request` from
-    /// `CredentialVaultHandle::list_keys`. The enhancement-hint
-    /// builders consult this set to suppress the "add a key"
-    /// hint for any provider whose key is already stored — the
-    /// device must never prompt for a credential it already
-    /// holds. Empty when the vault is not wired (test harnesses,
-    /// degraded boot); in that case the historical fallback
-    /// (`catalogue.<provider>.is_none()`) drives the hint.
-    pub(crate) stored_key_hashes: std::collections::HashSet<String>,
 }
 
 /// Per-provider enable + priority map — one entry per provider

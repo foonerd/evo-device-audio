@@ -1017,26 +1017,22 @@ fn enhancement_hint_for_bio(
     catalogue: &ProviderCatalogue,
     won: ProviderId,
 ) -> Option<EnhancementHint> {
-    // Suggest Last.fm as bio enhancement only for artist requests
-    // where the anonymous baseline won and Last.fm is either
-    // disabled or unavailable. Suppression rule: never surface
-    // an "add a key" hint for a provider whose key the framework
-    // vault already reports stored — the device must not prompt
-    // for a credential it already holds. Enable-hint (no key
-    // required) is unaffected.
+    // Interim (until ADR-0153 aggregation ships): retire the
+    // "Add a Last.fm API key" prompt entirely. The current
+    // cascade returns on the first anonymous provider that hits,
+    // so a keyed Last.fm never surfaces content — the "add a key"
+    // hint would be a no-op affordance. Engineering-bar rule:
+    // the device must not advertise enrichment the cascade
+    // cannot deliver. The "Enable Last.fm under Settings" branch
+    // (requires_key: false) stays because that's a legitimate
+    // operator-facing enablement hint; it too becomes vestigial
+    // once ADR-0153 §3 lands and per-source enable/disable is
+    // real, at which point the whole enhancement_hint concept
+    // retires in favour of `sources[]`.
     if won == ProviderId::Lastfm {
         return None;
     }
-    let lastfm_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::lastfm_vault_key_hash());
-    if catalogue.lastfm.is_none() && !lastfm_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Last.fm API key for richer editorial bios".into(),
-        })
-    } else if catalogue.lastfm.is_some()
+    if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
         Some(EnhancementHint {
@@ -1054,13 +1050,8 @@ fn enhancement_hint_for_bio(
 fn enhancement_hint_for_bio_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
-    // On a full miss with Last.fm available but disabled,
-    // suggest enabling it. Otherwise silent. Suppression rule
-    // matches `enhancement_hint_for_bio` — no "add a key" hint
-    // when the vault already holds the key.
-    let lastfm_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::lastfm_vault_key_hash());
+    // Interim: "Add a Last.fm API key" retired — see
+    // `enhancement_hint_for_bio` for the rationale.
     if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
@@ -1070,12 +1061,6 @@ fn enhancement_hint_for_bio_missing(
             reason: "Enable Last.fm under Settings → Metadata → Sources \
                      to try one more source"
                 .into(),
-        })
-    } else if catalogue.lastfm.is_none() && !lastfm_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Last.fm API key to try one more source".into(),
         })
     } else {
         None
@@ -1417,18 +1402,12 @@ fn enhancement_hint_for_release_credits(
     // MB won — suggest Discogs when it could enrich further.
     // Suppression rule: never surface "add a key" for a provider
     // whose key the vault already reports stored.
-    let discogs_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::discogs_vault_key_hash());
-    if catalogue.discogs.is_none() && !discogs_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Discogs.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Discogs Personal Access Token for pressing + \
-                     personnel depth"
-                .into(),
-        })
-    } else if catalogue.discogs.is_some()
+    // Interim: "Add a Discogs Personal Access Token" retired —
+    // same rationale as `enhancement_hint_for_bio`. The Discogs
+    // branch in `query_release_credits_cascade` is currently
+    // unreachable whenever MusicBrainz hits; advertising the key
+    // would be a no-op affordance.
+    if catalogue.discogs.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
     {
         Some(EnhancementHint {
@@ -1446,9 +1425,7 @@ fn enhancement_hint_for_release_credits(
 fn enhancement_hint_for_release_credits_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
-    let discogs_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::discogs_vault_key_hash());
+    // Interim: "Add a Discogs Personal Access Token" retired.
     if catalogue.discogs.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Discogs)
     {
@@ -1457,14 +1434,6 @@ fn enhancement_hint_for_release_credits_missing(
             requires_key: false,
             reason: "Enable Discogs under Settings → Metadata → Sources to \
                      try one more source"
-                .into(),
-        })
-    } else if catalogue.discogs.is_none() && !discogs_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Discogs.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Discogs Personal Access Token to try one more \
-                     source"
                 .into(),
         })
     } else {
@@ -1752,16 +1721,10 @@ fn enhancement_hint_for_track_annotation(
     if won == ProviderId::Genius {
         return None;
     }
-    let genius_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::genius_vault_key_hash());
-    if catalogue.genius.is_none() && !genius_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Genius.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Genius API access token for song annotations".into(),
-        })
-    } else if catalogue.genius.is_some()
+    // Interim: "Add a Genius API access token" retired — the
+    // Genius branch is currently unreachable when Wikipedia hits;
+    // advertising the key would be a no-op affordance.
+    if catalogue.genius.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
     {
         Some(EnhancementHint {
@@ -1779,9 +1742,7 @@ fn enhancement_hint_for_track_annotation(
 fn enhancement_hint_for_track_annotation_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
-    let genius_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::genius_vault_key_hash());
+    // Interim: "Add a Genius API access token" retired.
     if catalogue.genius.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Genius)
     {
@@ -1790,13 +1751,6 @@ fn enhancement_hint_for_track_annotation_missing(
             requires_key: false,
             reason: "Enable Genius under Settings → Metadata → Sources to \
                      try one more source"
-                .into(),
-        })
-    } else if catalogue.genius.is_none() && !genius_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Genius.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Genius API access token to try one more source"
                 .into(),
         })
     } else {
@@ -2079,16 +2033,8 @@ fn enhancement_hint_for_album_notes(
     if won == ProviderId::Lastfm {
         return None;
     }
-    let lastfm_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::lastfm_vault_key_hash());
-    if catalogue.lastfm.is_none() && !lastfm_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Last.fm API key for richer album notes".into(),
-        })
-    } else if catalogue.lastfm.is_some()
+    // Interim: "Add a Last.fm API key" retired.
+    if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
         Some(EnhancementHint {
@@ -2106,9 +2052,7 @@ fn enhancement_hint_for_album_notes(
 fn enhancement_hint_for_album_notes_missing(
     catalogue: &ProviderCatalogue,
 ) -> Option<EnhancementHint> {
-    let lastfm_key_stored = catalogue
-        .stored_key_hashes
-        .contains(crate::lastfm_vault_key_hash());
+    // Interim: "Add a Last.fm API key" retired.
     if catalogue.lastfm.is_some()
         && !catalogue.config.is_effectively_enabled(ProviderId::Lastfm)
     {
@@ -2118,12 +2062,6 @@ fn enhancement_hint_for_album_notes_missing(
             reason: "Enable Last.fm under Settings → Metadata → Sources to \
                      try one more source"
                 .into(),
-        })
-    } else if catalogue.lastfm.is_none() && !lastfm_key_stored {
-        Some(EnhancementHint {
-            provider: ProviderId::Lastfm.as_str().to_string(),
-            requires_key: true,
-            reason: "Add a Last.fm API key to try one more source".into(),
         })
     } else {
         None

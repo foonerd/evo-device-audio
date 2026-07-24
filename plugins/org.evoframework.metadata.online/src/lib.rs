@@ -91,12 +91,10 @@ mod enrichment;
 mod enrichment_cache;
 mod reconcile;
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -112,18 +110,6 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 
 use crate::config::PluginConfig;
-
-/// SHA-256 hex of a plaintext credential key. Used to check
-/// `CredentialVaultHandle::list_keys` output — the vault only
-/// returns hashes, not plaintext keys, so the plugin computes
-/// the hash of its own keys and looks them up in the returned
-/// set. Matches the framework's key-hash discipline
-/// (`crate::credentials::key_hash_hex` on the framework side).
-fn key_hash_hex(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
 
 /// Embedded manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -572,15 +558,6 @@ impl Respondent for MetadataOnlinePlugin {
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
             let provider_config = self.provider_config.clone();
-            // Consult the credential vault once per dispatch to
-            // build the set of stored key hashes the hint
-            // builders check for suppression. Populated as an
-            // empty set when the vault is not wired or the
-            // `list_keys` call fails — the historical
-            // fallback (`catalogue.<provider>.is_none()`)
-            // takes over in that case.
-            let stored_key_hashes =
-                fetch_stored_key_hashes(self.credential_vault.as_ref()).await;
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -660,7 +637,6 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
-                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_entity_bio(
                         &payload, &catalogue, cache_ref,
@@ -688,7 +664,6 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
-                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_album_notes_cascade(
                         &payload, &catalogue, cache_ref,
@@ -717,7 +692,6 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
-                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_release_credits_cascade(
                         &payload, &catalogue, cache_ref,
@@ -747,7 +721,6 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
-                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_track_annotation_cascade(
                         &payload, &catalogue, cache_ref,
@@ -777,7 +750,6 @@ impl Respondent for MetadataOnlinePlugin {
                         discogs: discogs.clone().map(Arc::new),
                         genius: genius.clone().map(Arc::new),
                         config: provider_config.clone(),
-                        stored_key_hashes: stored_key_hashes.clone(),
                     };
                     let response = enrichment::query_work_notes_cascade(
                         &payload, &catalogue, cache_ref,
@@ -1080,55 +1052,4 @@ async fn credential_reactor(
             }
         }
     }
-}
-
-// -----------------------------------------------------------------
-// Hint suppression — list_keys.
-// -----------------------------------------------------------------
-
-/// Fetch the set of stored key hashes for the plugin's own vault.
-/// Called once per `handle_request` and passed to the
-/// `ProviderCatalogue` so the hint builders can suppress the
-/// "add a key" hint for any provider whose key is already
-/// stored. Returns an empty set when the vault is not wired or
-/// the `list_keys` call fails — the historical fallback path
-/// (`catalogue.<provider>.is_none()`) takes over in that case,
-/// preserving pre-substrate behaviour under degraded boot.
-async fn fetch_stored_key_hashes(
-    vault: Option<
-        &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
-    >,
-) -> HashSet<String> {
-    let Some(handle) = vault else {
-        return HashSet::new();
-    };
-    match handle.list_keys().await {
-        Ok(listings) => listings.into_iter().map(|l| l.key_hash).collect(),
-        Err(e) => {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                error = %e,
-                "credential vault list_keys failed; hint suppression \
-                 falls back to catalogue.<provider>.is_none()"
-            );
-            HashSet::new()
-        }
-    }
-}
-
-/// Vault key hashes the hint builders check against the request-
-/// time `stored_key_hashes` set. Computed on first call and
-/// memoised via a once-cell so subsequent hint checks are
-/// hash-map lookups, not SHA-256 evaluations.
-pub(crate) fn lastfm_vault_key_hash() -> &'static str {
-    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| key_hash_hex(LASTFM_VAULT_KEY))
-}
-pub(crate) fn discogs_vault_key_hash() -> &'static str {
-    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| key_hash_hex(DISCOGS_VAULT_KEY))
-}
-pub(crate) fn genius_vault_key_hash() -> &'static str {
-    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| key_hash_hex(GENIUS_VAULT_KEY))
 }
