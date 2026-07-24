@@ -559,10 +559,14 @@ impl Respondent for MetadataOnlinePlugin {
                             "lyrics cache not wired at load".to_string(),
                         )
                     })?;
-                    let response =
-                        enrichment::query_lyrics(&payload, &lrclib, cache_ref)
-                            .await
-                            .map_err(PluginError::Permanent)?;
+                    let response = enrichment::query_lyrics(
+                        &payload,
+                        &lrclib,
+                        cache_ref,
+                        &provider_config,
+                    )
+                    .await
+                    .map_err(PluginError::Permanent)?;
                     response.json_bytes().map_err(|e| {
                         PluginError::Permanent(format!(
                             "metadata.query_lyrics response JSON: {e}"

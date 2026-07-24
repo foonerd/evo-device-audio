@@ -62,6 +62,14 @@ impl EnrichmentResponse {
 enum ResponseStatus {
     Ok,
     NotFound,
+    /// LRCLIB (the sole provider on the pre-cascade
+    /// `query_lyrics` verb) is disabled by the operator's
+    /// per-provider selection or by the `privacy_mode`
+    /// preset. Mirrors the cascade verbs' `not_configured`
+    /// status so consumers of the composite `track_detail`
+    /// endpoint see a consistent shape across every verb
+    /// under offline mode.
+    NotConfigured,
     BadRequest,
 }
 
@@ -187,9 +195,32 @@ pub(crate) async fn query_lyrics(
     payload: &[u8],
     lrclib: &LrclibClient,
     cache: &EnrichmentCache,
+    provider_config: &crate::cascade::ProviderConfig,
 ) -> Result<EnrichmentResponse, String> {
     if payload.is_empty() {
         return Ok(bad_request("empty payload"));
+    }
+    // LRCLIB is a network provider — must respect the operator's
+    // `privacy_mode = "offline"` preset (and the per-provider
+    // `[providers.lrclib] enabled = false` toggle). Without this
+    // gate the lyrics path bypasses the privacy guarantee that
+    // the offline mode is meant to enforce: the offline
+    // attestation script explicitly asserts this.
+    if !provider_config
+        .is_effectively_enabled(crate::cascade::ProviderId::Lrclib)
+    {
+        return Ok(EnrichmentResponse {
+            v: 1,
+            status: ResponseStatus::NotConfigured,
+            provider_id: None,
+            payload: None,
+            detail: Some(
+                "LRCLIB is disabled by the operator's privacy \
+                 selection; enable it under Settings → Metadata → \
+                 Sources"
+                    .to_string(),
+            ),
+        });
     }
     let text = std::str::from_utf8(payload)
         .map_err(|e| format!("payload is not UTF-8: {e}"))?;
