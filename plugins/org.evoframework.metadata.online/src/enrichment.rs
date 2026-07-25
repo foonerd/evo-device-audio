@@ -224,8 +224,62 @@ pub(crate) fn normalise_album_query(title: &str) -> String {
     // separators ("Closer: The Best of Sarah McLachlan"), while
     // iTunes / Apple Music tag titles emit " - ".
     cleaned = cleaned.replace(" - ", ": ");
+    // Apply Wikipedia title-case convention: lowercase common
+    // connective words (of, the, in, on, at, to, for, and, or,
+    // a, an, is, but, by, with, from) unless they appear at
+    // the start of the string. Wikipedia's REST summary API is
+    // case-sensitive on titles: the tag "The Best Of Sarah
+    // McLachlan" (capital Of) returns 404, but the canonical
+    // Wikipedia article title uses "the Best of Sarah McLachlan"
+    // (lowercase of). Operator tags in the wild use either
+    // form; this normalisation converges on Wikipedia's.
+    cleaned = lowercase_connective_words(&cleaned);
     cleaned.trim().to_string()
 }
+
+/// Lowercase common connective words that Wikipedia's title-
+/// casing convention keeps lowercase mid-string. The word at
+/// position 0 AND the first word of any subtitle (word
+/// following a token that ended with `:`) stay title-cased —
+/// Wikipedia capitalises the first word of both the main title
+/// and every subtitle regardless of what it is
+/// ("Closer: The Best of Sarah McLachlan" — `The` capitalised
+/// as subtitle first-word, `of` lowercased as mid-subtitle
+/// connective).
+fn lowercase_connective_words(title: &str) -> String {
+    let words: Vec<&str> = title.split(' ').collect();
+    let mut out = String::with_capacity(title.len());
+    let mut prev_ended_colon = false;
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // A word is "subtitle-start" when it follows a token
+        // that ended with `:` (main-title / subtitle boundary).
+        let is_subtitle_start = prev_ended_colon;
+        let w_lower = w.to_ascii_lowercase();
+        let lowercase_it = i > 0
+            && !is_subtitle_start
+            && WIKIPEDIA_CONNECTIVE_WORDS.contains(&w_lower.as_str());
+        if lowercase_it {
+            out.push_str(&w_lower);
+        } else {
+            out.push_str(w);
+        }
+        prev_ended_colon = w.ends_with(':');
+    }
+    out
+}
+
+/// Words Wikipedia's title-casing rule keeps lowercase when they
+/// appear mid-title. Not exhaustive — covers the words most
+/// likely to appear in album titles that operator tags may have
+/// title-cased. Wikipedia's own MoS lists more but these are the
+/// ones the real-track probe has hit.
+const WIKIPEDIA_CONNECTIVE_WORDS: &[&str] = &[
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "is", "of",
+    "on", "or", "the", "to", "with",
+];
 
 /// Trailing edition suffixes stripped by
 /// [`normalise_album_query`]. Case-insensitive matching happens
@@ -466,18 +520,35 @@ mod tests {
     }
 
     #[test]
-    fn normalise_album_query_folds_dash_subtitle_to_colon() {
+    fn normalise_album_query_folds_dash_subtitle_to_colon_and_wp_case() {
         // Wikipedia + MB use colon-space for subtitle separators;
         // iTunes tags emit " - ". The Sarah McLachlan case that
         // motivated this: "Closer - The Best Of Sarah McLachlan
         // (Deluxe Version)" → "Closer: The Best of Sarah McLachlan"
-        // (edition suffix stripped, dash-subtitle normalised).
-        // The "of" → "of" case-preservation stays operator-facing.
+        // (edition suffix stripped, dash-subtitle normalised, and
+        // Wikipedia title-case convention applied — lowercase
+        // "of" mid-title because Wikipedia's REST summary API is
+        // case-sensitive and the article is at
+        // "Closer:_The_Best_of_Sarah_McLachlan").
         assert_eq!(
             normalise_album_query(
                 "Closer - The Best Of Sarah McLachlan (Deluxe Version)"
             ),
-            "Closer: The Best Of Sarah McLachlan"
+            "Closer: The Best of Sarah McLachlan"
+        );
+    }
+
+    #[test]
+    fn normalise_album_query_lowercases_connective_words() {
+        assert_eq!(
+            normalise_album_query("The Dark Side Of The Moon"),
+            "The Dark Side of the Moon"
+        );
+        assert_eq!(normalise_album_query("Band On The Run"), "Band on the Run");
+        // First word stays capitalized regardless of what it is.
+        assert_eq!(
+            normalise_album_query("The Best of Both Worlds"),
+            "The Best of Both Worlds"
         );
     }
 
