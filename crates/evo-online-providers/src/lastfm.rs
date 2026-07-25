@@ -95,9 +95,21 @@ impl LastfmClient {
         }
     }
 
-    /// `artist.getInfo` — fetch the artist bio. Prefers lookup
-    /// by MBID when supplied (more accurate; avoids name-clash
-    /// mismatches like the many bands called "Iron Maiden").
+    /// `artist.getInfo` — fetch the artist bio.
+    ///
+    /// **MBID-first, exclusive.** When `artist_mbid` is supplied,
+    /// this method sends the `mbid=` parameter ONLY and omits the
+    /// `artist=` parameter entirely. Last.fm's `artist.getInfo`
+    /// returns disambiguation stubs ("There are at least six
+    /// artists and bands…") when it receives both `mbid` + `artist`
+    /// and the two don't align on Last.fm's internal index — even
+    /// though the MBID uniquely identifies the artist. Sending
+    /// MBID-alone forces Last.fm to look up the artist by MBID
+    /// directly, which is the whole point of the MBID being on
+    /// the wire. Matches Picard / beets / Roon posture.
+    ///
+    /// Without an MBID this falls back to `artist=` — same shape
+    /// operators without reconciliation get.
     pub async fn get_artist_bio(
         &self,
         artist_name: &str,
@@ -110,17 +122,27 @@ impl LastfmClient {
             ("api_key", self.api_key.clone()),
             ("autocorrect", "1".to_string()),
         ];
-        if let Some(mbid) = artist_mbid {
-            if !mbid.is_empty() {
+        match artist_mbid.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(mbid) => {
+                // MBID-only. Do NOT send artist=; that reintroduces
+                // the disambiguation-stub failure mode.
                 params.push(("mbid", mbid.to_string()));
             }
+            None => {
+                params.push(("artist", artist_name.to_string()));
+            }
         }
-        params.push(("artist", artist_name.to_string()));
         let value: serde_json::Value = self.get_json(&params).await?;
         Ok(parse_artist_bio(&value))
     }
 
     /// `album.getInfo` — fetch the album wiki (notes).
+    ///
+    /// **MBID-first, exclusive.** Same rationale as
+    /// [`Self::get_artist_bio`]: with `release_mbid` present, send
+    /// `mbid=` alone and omit both `artist=` and `album=`, so
+    /// Last.fm resolves the release by MBID directly and cannot
+    /// fall back to name-based disambiguation.
     pub async fn get_album_notes(
         &self,
         artist_name: &str,
@@ -134,13 +156,15 @@ impl LastfmClient {
             ("api_key", self.api_key.clone()),
             ("autocorrect", "1".to_string()),
         ];
-        if let Some(mbid) = release_mbid {
-            if !mbid.is_empty() {
+        match release_mbid.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(mbid) => {
                 params.push(("mbid", mbid.to_string()));
             }
+            None => {
+                params.push(("artist", artist_name.to_string()));
+                params.push(("album", album_name.to_string()));
+            }
         }
-        params.push(("artist", artist_name.to_string()));
-        params.push(("album", album_name.to_string()));
         let value: serde_json::Value = self.get_json(&params).await?;
         Ok(parse_album_notes(&value))
     }

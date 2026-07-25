@@ -157,10 +157,61 @@ impl TheAudioDbClient {
         }
     }
 
+    /// Fetch an artist by MusicBrainz artist MBID via
+    /// `artist-mb.php?i=<mbid>` — TheAudioDB's MBID-indexed
+    /// endpoint. MBID-first per the enrichment flow: when the
+    /// caller has resolved the MB identity for this artist,
+    /// this method returns the same artist TheAudioDB has under
+    /// that MBID without any name-disambiguation risk.
+    ///
+    /// Returns `Ok(None)` when TheAudioDB has no artist record
+    /// keyed on the supplied MBID (a clean miss — the artist
+    /// is not in their catalogue).
+    pub async fn fetch_artist_bio_by_mbid(
+        &self,
+        artist_mbid: &str,
+    ) -> Result<Option<ArtistBioHit>, TheAudioDbError> {
+        let mbid = artist_mbid.trim();
+        if mbid.is_empty() {
+            return Err(TheAudioDbError::Invalid(
+                "artist MBID is empty".into(),
+            ));
+        }
+        self.rate.acquire().await;
+        let url = format!(
+            "https://www.theaudiodb.com/api/v1/json/{}/artist-mb.php",
+            self.api_key
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header("User-Agent", &self.user_agent)
+            .query(&[("i", mbid)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TheAudioDbError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let bytes = resp.bytes().await?;
+        let root: ArtistSearchRoot = serde_json::from_slice(&bytes)
+            .map_err(|e| TheAudioDbError::Decode(e.to_string()))?;
+        Ok(Self::first_artist_to_bio_hit(root))
+    }
+
     /// Search TheAudioDB by artist name, returning the first
     /// hit's bio payload. Returns `Ok(None)` when the response
     /// carries no artist entry — a legitimate miss the cascade
     /// treats as a clean skip.
+    ///
+    /// **Name-last fallback.** Callers with a resolved MB
+    /// identity should call [`Self::fetch_artist_bio_by_mbid`]
+    /// first; this method is the last-resort path for entities
+    /// without a resolved MBID.
     pub async fn search_artist_bio(
         &self,
         artist: &str,
@@ -194,18 +245,23 @@ impl TheAudioDbClient {
         let bytes = resp.bytes().await?;
         let root: ArtistSearchRoot = serde_json::from_slice(&bytes)
             .map_err(|e| TheAudioDbError::Decode(e.to_string()))?;
-        let Some(artist_entry) =
-            root.artists.and_then(|list| list.into_iter().next())
-        else {
-            return Ok(None);
-        };
+        Ok(Self::first_artist_to_bio_hit(root))
+    }
+
+    /// Shared shape extractor: TheAudioDB's `artists` array
+    /// (from both `search.php` and `artist-mb.php`) maps to the
+    /// same `ArtistBioHit` fields. Consolidated here so the
+    /// name-first and MBID-first paths return identical shapes.
+    fn first_artist_to_bio_hit(root: ArtistSearchRoot) -> Option<ArtistBioHit> {
+        let artist_entry =
+            root.artists.and_then(|list| list.into_iter().next())?;
         let artist_id = artist_entry.id_artist.unwrap_or_default();
         let source_url = if artist_id.is_empty() {
             "https://www.theaudiodb.com".to_string()
         } else {
             format!("https://www.theaudiodb.com/artist/{artist_id}")
         };
-        Ok(Some(ArtistBioHit {
+        Some(ArtistBioHit {
             artist_id,
             bio_en: artist_entry.str_biography_en.and_then(nonempty),
             artist_thumb_url: artist_entry.str_artist_thumb.and_then(nonempty),
@@ -215,7 +271,7 @@ impl TheAudioDbClient {
                 .as_deref()
                 .and_then(|s| s.parse().ok()),
             source_url,
-        }))
+        })
     }
 
     /// Search TheAudioDB by (artist, album), returning the first

@@ -903,6 +903,7 @@ pub(crate) async fn query_entity_bio(
         fetch_theaudiodb_bio(
             &entity,
             effective_name,
+            resolved_mbid.as_deref(),
             catalogue,
             cache,
             want_theaudiodb,
@@ -1247,6 +1248,7 @@ async fn fetch_lastfm_bio(
 async fn fetch_theaudiodb_bio(
     entity: &EntityRef,
     effective_name: &str,
+    resolved_mbid: Option<&str>,
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
@@ -1275,20 +1277,62 @@ async fn fetch_theaudiodb_bio(
             }
         }
     }
-    let hit = match tadb.search_artist_bio(effective_name).await {
-        Ok(Some(h)) => h,
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::warn!(
-                plugin = crate::PLUGIN_NAME,
-                provider = "theaudiodb",
-                entity = %entity.name,
-                effective_name,
-                error = %e,
-                "TheAudioDB artist bio transient; skipping"
-            );
-            return None;
-        }
+    // MBID-first per enrichment flow: when the caller has
+    // resolved a MusicBrainz artist MBID, query TheAudioDB's
+    // MBID-indexed endpoint (`artist-mb.php?i=<mbid>`). Name
+    // search is the last-resort fallback for entities without a
+    // resolved MB identity.
+    let hit = match resolved_mbid {
+        Some(mbid) => match tadb.fetch_artist_bio_by_mbid(mbid).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // TheAudioDB does not know this MBID. Fall back
+                // to name-search (last-resort).
+                match tadb.search_artist_bio(effective_name).await {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return None,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "theaudiodb",
+                            entity = %entity.name,
+                            effective_name,
+                            error = %e,
+                            "TheAudioDB artist bio name-fallback \
+                             transient; skipping"
+                        );
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "theaudiodb",
+                    entity = %entity.name,
+                    artist_mbid = mbid,
+                    error = %e,
+                    "TheAudioDB artist bio MBID lookup transient; \
+                     skipping"
+                );
+                return None;
+            }
+        },
+        None => match tadb.search_artist_bio(effective_name).await {
+            Ok(Some(h)) => h,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "theaudiodb",
+                    entity = %entity.name,
+                    effective_name,
+                    error = %e,
+                    "TheAudioDB artist bio transient; skipping"
+                );
+                return None;
+            }
+        },
     };
     // Guard against TheAudioDB records with no bio prose (thin
     // artist_thumb / genre only). The field-level merge would
