@@ -151,6 +151,103 @@ fn bio_cache_key(
     }
 }
 
+/// Normalise an album title for provider queries by stripping
+/// edition suffixes and homogenising punctuation. Applied
+/// before the Wikipedia / Last.fm / TheAudioDB album lookups so
+/// operator-tagged variants match canonical article titles.
+///
+/// Handles these cases surfaced by real library tracks:
+///
+/// - `"Closer - The Best Of Sarah McLachlan (Deluxe Version)"`
+///   → `"Closer: The Best of Sarah McLachlan"` — strip the
+///   parenthetical edition suffix, replace ` - ` with `: ` so
+///   MusicBrainz / Wikipedia article-title conventions match.
+///
+/// Suffix stripping is case-insensitive and covers the
+/// operator-facing edition vocabulary iTunes / Apple Music /
+/// Deezer / Tidal emit into tag metadata: `(Deluxe Version)`,
+/// `(Deluxe Edition)`, `(Deluxe)`, `(Remastered)`, `(Remaster)`,
+/// `(YYYY Remaster)`, `(Expanded Edition)`, `(Special Edition)`,
+/// `(Anniversary Edition)`, `(Bonus Track Version)`. Only
+/// trailing suffixes are removed — a real album title
+/// containing the word "Deluxe" mid-string stays intact.
+///
+/// The output is not lower-cased — providers do case-sensitive
+/// matching on articles like "The" vs "the". Cache keying keeps
+/// its own separate `normalise` for lower-case + whitespace
+/// folding.
+pub(crate) fn normalise_album_query(title: &str) -> String {
+    let mut cleaned = title.trim().to_string();
+    // Strip trailing parenthetical edition suffixes. Loop so
+    // "(Deluxe Version) (Remastered)" gets both stripped, though
+    // real tags rarely stack.
+    loop {
+        let lower = cleaned.to_ascii_lowercase();
+        let matched = TRAILING_EDITION_SUFFIXES.iter().find(|s| {
+            lower.ends_with(&format!("({s})"))
+                || lower.ends_with(&format!("({s} version)"))
+                || lower.ends_with(&format!("({s} edition)"))
+        });
+        match matched {
+            Some(_) => {
+                if let Some(paren_start) = cleaned.rfind('(') {
+                    cleaned = cleaned[..paren_start].trim_end().to_string();
+                } else {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    // Also strip trailing " - Deluxe Version" / " - Remastered"
+    // patterns iTunes emits when the edition isn't in parens.
+    let dash_lower = cleaned.to_ascii_lowercase();
+    for suffix in TRAILING_EDITION_SUFFIXES {
+        let with_dash = format!(" - {suffix}");
+        if dash_lower.ends_with(&with_dash) {
+            cleaned.truncate(cleaned.len() - with_dash.len());
+            break;
+        }
+        let with_dash_edition = format!(" - {suffix} edition");
+        if dash_lower.ends_with(&with_dash_edition) {
+            cleaned.truncate(cleaned.len() - with_dash_edition.len());
+            break;
+        }
+        let with_dash_version = format!(" - {suffix} version");
+        if dash_lower.ends_with(&with_dash_version) {
+            cleaned.truncate(cleaned.len() - with_dash_version.len());
+            break;
+        }
+    }
+    // Normalise " - " to ": " — Wikipedia and MusicBrainz
+    // article titles use the colon-space form for subtitle
+    // separators ("Closer: The Best of Sarah McLachlan"), while
+    // iTunes / Apple Music tag titles emit " - ".
+    cleaned = cleaned.replace(" - ", ": ");
+    cleaned.trim().to_string()
+}
+
+/// Trailing edition suffixes stripped by
+/// [`normalise_album_query`]. Case-insensitive matching happens
+/// against the lower-cased title. Order matters only in the
+/// dash-form loop above (first match wins); the parenthetical
+/// loop reprocesses until stable so order there does not.
+const TRAILING_EDITION_SUFFIXES: &[&str] = &[
+    "deluxe",
+    "deluxe version",
+    "deluxe edition",
+    "expanded edition",
+    "expanded version",
+    "special edition",
+    "anniversary edition",
+    "bonus track version",
+    "bonus track edition",
+    "bonus tracks version",
+    "remastered",
+    "remaster",
+    "remastered version",
+];
+
 /// Normalise a string for cache keying: lower-case + collapse
 /// internal whitespace + trim.
 fn normalise(s: &str) -> String {
@@ -321,6 +418,87 @@ mod tests {
         assert_eq!(normalise("  Radiohead  "), "radiohead");
         assert_eq!(normalise("OK  Computer"), "ok computer");
         assert_eq!(normalise(""), "");
+    }
+
+    #[test]
+    fn normalise_album_query_strips_parenthetical_editions() {
+        assert_eq!(
+            normalise_album_query("Songs of Love (Deluxe Version)"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love (Deluxe Edition)"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love (Deluxe)"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love (Remastered)"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love (Special Edition)"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love (Anniversary Edition)"),
+            "Songs of Love"
+        );
+        // Case-insensitive.
+        assert_eq!(
+            normalise_album_query("Songs of Love (DELUXE VERSION)"),
+            "Songs of Love"
+        );
+    }
+
+    #[test]
+    fn normalise_album_query_strips_dash_editions() {
+        assert_eq!(
+            normalise_album_query("Songs of Love - Deluxe Version"),
+            "Songs of Love"
+        );
+        assert_eq!(
+            normalise_album_query("Songs of Love - Remastered"),
+            "Songs of Love"
+        );
+    }
+
+    #[test]
+    fn normalise_album_query_folds_dash_subtitle_to_colon() {
+        // Wikipedia + MB use colon-space for subtitle separators;
+        // iTunes tags emit " - ". The Sarah McLachlan case that
+        // motivated this: "Closer - The Best Of Sarah McLachlan
+        // (Deluxe Version)" → "Closer: The Best of Sarah McLachlan"
+        // (edition suffix stripped, dash-subtitle normalised).
+        // The "of" → "of" case-preservation stays operator-facing.
+        assert_eq!(
+            normalise_album_query(
+                "Closer - The Best Of Sarah McLachlan (Deluxe Version)"
+            ),
+            "Closer: The Best Of Sarah McLachlan"
+        );
+    }
+
+    #[test]
+    fn normalise_album_query_preserves_mid_string_words() {
+        // A real album whose title contains "Deluxe" mid-string
+        // must not lose it — only trailing edition suffixes are
+        // stripped.
+        assert_eq!(
+            normalise_album_query("Deluxe Recordings"),
+            "Deluxe Recordings"
+        );
+    }
+
+    #[test]
+    fn normalise_album_query_no_suffix_is_identity() {
+        assert_eq!(normalise_album_query("OK Computer"), "OK Computer");
+        assert_eq!(
+            normalise_album_query("The Dark Side of the Moon"),
+            "The Dark Side of the Moon"
+        );
     }
 
     #[test]
@@ -560,12 +738,19 @@ pub(crate) async fn query_entity_bio(
         .map(str::to_string);
     let mut wikipedia_url: Option<String> = None;
     let mut wikidata_url: Option<String> = None;
+    // Canonical entity name from MB — the alias-resolved
+    // authoritative form (e.g. tag "Fiona Joy" → MB canonical
+    // "Fiona Joy Hawkins"). Downstream helpers prefer this
+    // over the tag literal for keyless searches; without it,
+    // aliases surface as "not_found" from every source.
+    let mut canonical_name: Option<String> = None;
     if want_mb {
         if let Some(mb) = catalogue.musicbrainz.as_ref() {
             if resolved_mbid.is_none() {
                 match mb.search_artist(&entity.name).await {
                     Ok(Some(hit)) if hit.confidence_percent >= 85 => {
                         resolved_mbid = Some(hit.artist_mbid);
+                        canonical_name = Some(hit.canonical_name);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -584,6 +769,13 @@ pub(crate) async fn query_entity_bio(
                     Ok(al) => {
                         wikipedia_url = al.wikipedia_url;
                         wikidata_url = al.wikidata_url;
+                        // Lookup returns the canonical name too;
+                        // prefer it over the search result when
+                        // caller supplied MBID directly (search
+                        // may have been skipped).
+                        if canonical_name.is_none() {
+                            canonical_name = Some(al.canonical_name);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -598,6 +790,12 @@ pub(crate) async fn query_entity_bio(
             }
         }
     }
+    // Effective name for downstream searches — MB canonical
+    // when available, tag literal otherwise. `Fiona Joy` (tag)
+    // → `Fiona Joy Hawkins` (canonical) → Wikipedia bare-name
+    // search hits the correct page instead of returning empty.
+    let effective_name =
+        canonical_name.as_deref().unwrap_or(entity.name.as_str());
 
     // Parallel content-fetch across every enabled provider.
     // Each helper returns `Option<SourceEntry>`; `None` on
@@ -607,6 +805,7 @@ pub(crate) async fn query_entity_bio(
     let (wp_src, wd_src, lastfm_src, tadb_src) = tokio::join!(
         fetch_wikipedia_bio(
             &entity,
+            effective_name,
             resolved_mbid.as_deref(),
             wikipedia_url.as_deref(),
             wikidata_url.as_deref(),
@@ -623,8 +822,20 @@ pub(crate) async fn query_entity_bio(
             cache,
             want_wd,
         ),
-        fetch_lastfm_bio(&entity, catalogue, cache, want_lastfm),
-        fetch_theaudiodb_bio(&entity, catalogue, cache, want_theaudiodb),
+        fetch_lastfm_bio(
+            &entity,
+            effective_name,
+            catalogue,
+            cache,
+            want_lastfm
+        ),
+        fetch_theaudiodb_bio(
+            &entity,
+            effective_name,
+            catalogue,
+            cache,
+            want_theaudiodb,
+        ),
     );
 
     let mut sources: Vec<SourceEntry> = [wp_src, wd_src, lastfm_src, tadb_src]
@@ -672,6 +883,7 @@ pub(crate) async fn query_entity_bio(
 #[allow(clippy::too_many_arguments)]
 async fn fetch_wikipedia_bio(
     entity: &EntityRef,
+    effective_name: &str,
     resolved_mbid: Option<&str>,
     wikipedia_url: Option<&str>,
     wikidata_url: Option<&str>,
@@ -755,26 +967,27 @@ async fn fetch_wikipedia_bio(
             }
         }
     }
-    // Path 3 — bare-name search. Non-artist entity types only.
-    // Artist-type + no MB URL + no Wikidata enwiki hop must stay
-    // an honest empty: the plain title search hits common-noun
-    // articles for artists whose names collide with English
-    // words (Passenger the musician vs the transport noun, Bush
-    // the band vs the shrub, Cake / Air / Live / Yes / Blur).
-    // Non-artist types (composer / work / performer / conductor
-    // / ensemble) retain the bare-name fallback pending an
-    // equivalent collision audit.
+    // Path 3 — bare-name search using MB canonical name when
+    // available. Two cases:
+    //   (a) MB resolved the entity and gave us canonical name
+    //       different from the tag literal → search by canonical.
+    //       Canonical is MB's authoritative form; if MB says the
+    //       artist is "Fiona Joy Hawkins", searching Wikipedia
+    //       by that form hits the correct page. The common-noun
+    //       trap does not apply — the operator's tag was a
+    //       shortened alias, MB's canonical is what Wikipedia
+    //       likely titled the page under.
+    //   (b) MB did not resolve OR canonical == tag literal →
+    //       artist-type entities skip bare-name (common-noun
+    //       trap for Passenger / Bush / Cake / etc.); non-
+    //       artist types retain the bare-name fallback.
     if hit.is_none() {
-        if matches!(entity.entity_type, EntityType::Artist) {
-            tracing::debug!(
-                plugin = crate::PLUGIN_NAME,
-                entity = %entity.name,
-                "artist-type entity with no MB-routed or Wikidata-enwiki \
-                 Wikipedia URL; refusing bare-name Wikipedia fallback \
-                 (common-noun disambiguation trap)"
-            );
-        } else {
-            match wp.get_summary_en(&entity.name).await {
+        let mb_gave_useful_canonical =
+            resolved_mbid.is_some() && effective_name != entity.name.as_str();
+        let should_search = mb_gave_useful_canonical
+            || !matches!(entity.entity_type, EntityType::Artist);
+        if should_search {
+            match wp.get_summary_en(effective_name).await {
                 Ok(Some(s)) => hit = Some(s),
                 Ok(None) => {}
                 Err(e) => {
@@ -782,11 +995,21 @@ async fn fetch_wikipedia_bio(
                         plugin = crate::PLUGIN_NAME,
                         provider = "wikipedia",
                         entity = %entity.name,
+                        effective_name,
                         error = %e,
                         "Wikipedia bare-name summary transient; skipping"
                     );
                 }
             }
+        } else {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                entity = %entity.name,
+                "artist-type entity with no MB-routed URL, no Wikidata \
+                 enwiki hop, and no MB canonical-alias resolution; \
+                 refusing bare-name Wikipedia fallback (common-noun \
+                 disambiguation trap)"
+            );
         }
     }
     let summary = hit?;
@@ -868,6 +1091,7 @@ async fn fetch_wikidata_bio(
 
 async fn fetch_lastfm_bio(
     entity: &EntityRef,
+    effective_name: &str,
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
@@ -881,10 +1105,15 @@ async fn fetch_lastfm_bio(
         return None;
     }
     let lastfm = catalogue.lastfm.as_ref()?;
+    // Cache key uses `effective_name` (MB canonical when
+    // available) so alias-resolved tags and canonical hits
+    // share one entry — the tag "Fiona Joy" and canonical
+    // "Fiona Joy Hawkins" both key on the same canonical form
+    // once MB has resolved either.
     let key = EnrichmentCache::key_for(&[
         "entity_bio",
         entity.entity_type.as_str(),
-        &normalise(&entity.name),
+        &normalise(effective_name),
         ProviderId::Lastfm.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -895,7 +1124,7 @@ async fn fetch_lastfm_bio(
         }
     }
     match lastfm
-        .get_artist_bio(&entity.name, entity.mbid.as_deref())
+        .get_artist_bio(effective_name, entity.mbid.as_deref())
         .await
     {
         Ok(Some(h)) => {
@@ -946,6 +1175,7 @@ async fn fetch_lastfm_bio(
 
 async fn fetch_theaudiodb_bio(
     entity: &EntityRef,
+    effective_name: &str,
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
@@ -964,7 +1194,7 @@ async fn fetch_theaudiodb_bio(
     let key = EnrichmentCache::key_for(&[
         "entity_bio",
         entity.entity_type.as_str(),
-        &normalise(&entity.name),
+        &normalise(effective_name),
         ProviderId::TheAudioDb.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -974,7 +1204,7 @@ async fn fetch_theaudiodb_bio(
             }
         }
     }
-    let hit = match tadb.search_artist_bio(&entity.name).await {
+    let hit = match tadb.search_artist_bio(effective_name).await {
         Ok(Some(h)) => h,
         Ok(None) => return None,
         Err(e) => {
@@ -982,6 +1212,7 @@ async fn fetch_theaudiodb_bio(
                 plugin = crate::PLUGIN_NAME,
                 provider = "theaudiodb",
                 entity = %entity.name,
+                effective_name,
                 error = %e,
                 "TheAudioDB artist bio transient; skipping"
             );
@@ -1232,11 +1463,17 @@ async fn fetch_musicbrainz_release_credits(
         return None;
     }
     let mb = catalogue.musicbrainz.as_ref()?;
+    // Normalise album title before MB release search — MB
+    // stores releases under their canonical form (no
+    // "(Deluxe Version)" suffix); operator tags carrying the
+    // edition suffix sink to a clean miss even for well-known
+    // releases.
+    let normalised_album = normalise_album_query(album);
     let key = EnrichmentCache::key_for(&[
         "release_credits",
         "release",
         &normalise(artist),
-        &normalise(album),
+        &normalise(&normalised_album),
         ProviderId::MusicBrainz.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -1248,7 +1485,7 @@ async fn fetch_musicbrainz_release_credits(
     }
     let release_mbid: Option<String> = match release_mbid_hint {
         Some(m) => Some(m.to_string()),
-        None => match mb.search_release(artist, album).await {
+        None => match mb.search_release(artist, &normalised_album).await {
             Ok(Some(hit))
                 if hit.confidence_percent
                     >= RELEASE_SEARCH_CONFIDENCE_FLOOR =>
@@ -1311,11 +1548,14 @@ async fn fetch_discogs_release_credits(
         return None;
     }
     let discogs = catalogue.discogs.as_ref()?;
+    // Normalise album title before Discogs query — Discogs
+    // matches on canonical release titles.
+    let normalised_album = normalise_album_query(album);
     let key = EnrichmentCache::key_for(&[
         "release_credits",
         "release",
         &normalise(artist),
-        &normalise(album),
+        &normalise(&normalised_album),
         ProviderId::Discogs.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -1325,7 +1565,7 @@ async fn fetch_discogs_release_credits(
             }
         }
     }
-    match discogs.get_release_detail(artist, album).await {
+    match discogs.get_release_detail(artist, &normalised_album).await {
         Ok(Some(h)) => {
             let payload = serde_json::json!({
                 "release_id": h.release_id,
@@ -1852,11 +2092,23 @@ async fn fetch_wikipedia_album_notes(
         return None;
     }
     let wp = catalogue.wikipedia.as_ref()?;
+    // Normalise the album tag to Wikipedia's article-title
+    // convention BEFORE cache key + search. Operator tags may
+    // carry `(Deluxe Version)` / ` - Deluxe Edition` /
+    // ` - Remastered` suffixes iTunes and streaming stores emit;
+    // the target Wikipedia article is under the canonical album
+    // title, not the edition-tagged form. Also normalises the
+    // ` - ` subtitle separator to `: ` — Wikipedia article
+    // titles use the colon-space form ("Closer: The Best of
+    // Sarah McLachlan" vs the tag's "Closer - The Best Of
+    // Sarah McLachlan"). Without this, tag variants sink into
+    // clean-miss even when the article plainly exists.
+    let normalised_album = normalise_album_query(album);
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
-        &normalise(album),
+        &normalise(&normalised_album),
         ProviderId::Wikipedia.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -1867,11 +2119,13 @@ async fn fetch_wikipedia_album_notes(
         }
     }
     // Wikipedia's album-article naming convention: two
-    // disambiguated forms then bare title.
+    // disambiguated forms then bare title, on the NORMALISED
+    // album title so `(Deluxe Version)` etc. don't send us to
+    // an inevitable clean miss.
     let candidate_titles = [
-        format!("{album} ({artist} album)"),
-        format!("{album} (album)"),
-        album.to_string(),
+        format!("{normalised_album} ({artist} album)"),
+        format!("{normalised_album} (album)"),
+        normalised_album.clone(),
     ];
     let mut wp_hit = None;
     for candidate in &candidate_titles {
@@ -1926,11 +2180,15 @@ async fn fetch_lastfm_album_notes(
         return None;
     }
     let lastfm = catalogue.lastfm.as_ref()?;
+    // Same normalisation as the Wikipedia helper — Last.fm's
+    // album.getinfo matches on canonical titles, edition
+    // suffixes send the query to a clean miss.
+    let normalised_album = normalise_album_query(album);
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
-        &normalise(album),
+        &normalise(&normalised_album),
         ProviderId::Lastfm.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -1941,7 +2199,7 @@ async fn fetch_lastfm_album_notes(
         }
     }
     match lastfm
-        .get_album_notes(artist, album, release_mbid_hint)
+        .get_album_notes(artist, &normalised_album, release_mbid_hint)
         .await
     {
         Ok(Some(h)) => {
@@ -2002,11 +2260,14 @@ async fn fetch_theaudiodb_album_notes(
         return None;
     }
     let tadb = catalogue.theaudiodb.as_ref()?;
+    // Same normalisation as the other album helpers — TheAudioDB's
+    // search matches on canonical album titles.
+    let normalised_album = normalise_album_query(album);
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
-        &normalise(album),
+        &normalise(&normalised_album),
         ProviderId::TheAudioDb.as_str(),
     ]);
     if let Some(entry) = cache.get(&key) {
@@ -2016,7 +2277,7 @@ async fn fetch_theaudiodb_album_notes(
             }
         }
     }
-    let hit = match tadb.search_album_notes(artist, album).await {
+    let hit = match tadb.search_album_notes(artist, &normalised_album).await {
         Ok(Some(h)) => h,
         Ok(None) => return None,
         Err(e) => {
@@ -2025,6 +2286,7 @@ async fn fetch_theaudiodb_album_notes(
                 provider = "theaudiodb",
                 artist,
                 album,
+                normalised_album,
                 error = %e,
                 "TheAudioDB album notes transient; skipping"
             );

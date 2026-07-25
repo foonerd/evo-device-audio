@@ -305,19 +305,28 @@ impl CascadeResponse {
     /// Build a `CascadeResponse` from an ordered vector of
     /// `SourceEntry` (highest-priority first).
     ///
-    /// The top-level `payload` is the **field-level first-non-empty
-    /// merge** across every source in priority order: for each
-    /// top-level JSON key, the value from the highest-priority
-    /// source that has a non-empty value wins. Fields unique to a
-    /// single source come through as-is. This matches the
-    /// Jellyfin / beets displayed-default pattern — the top-level
-    /// object stays useful even when a single source misses a
-    /// field a lower-priority peer covers, while the operator-
-    /// selectable per-source view reads `sources` directly.
+    /// **Attribution unity, load-bearing licensing invariant.**
+    /// The top-level `payload` is the primary source's payload
+    /// VERBATIM — no field-level merge across sources. The
+    /// top-level `attribution` is the same primary source's
+    /// attribution. Prose + attribution travel as a unit;
+    /// consumers rendering the top-level view see prose whose
+    /// attribution matches the source that supplied it.
     ///
-    /// Top-level `provider_id` / `privacy_class` / `attribution`
-    /// mirror `sources[0]` — the primary source. UIs that render
-    /// per-field attribution walk `sources`.
+    /// The prior "Jellyfin / beets field-level first-non-empty
+    /// merge" shape was a licensing violation: it stitched prose
+    /// from one source into a payload stamped with another
+    /// source's attribution (e.g. Last.fm prose under Wikidata
+    /// CC0). CC BY-SA content mislabeled CC0 is a real license
+    /// violation, not a display convenience.
+    ///
+    /// Consumers that want to render alternative sources walk
+    /// `sources[]` explicitly and read each entry's payload +
+    /// attribution as a unit. Field-level merging is a consumer-
+    /// side choice on a per-field basis, and consumers MUST
+    /// carry attribution alongside every displayed field they
+    /// pull from a given source. This module refuses to make
+    /// that choice on their behalf.
     ///
     /// `status` is `Ok` iff `sources` is non-empty. Callers that
     /// need `not_found` / `not_configured` / `bad_request` use
@@ -332,7 +341,7 @@ impl CascadeResponse {
                     CascadeStatus::Ok,
                     Some(primary.provider_id.clone()),
                     Some(primary.privacy_class.clone()),
-                    Some(merge_sources_field_level(&sources)),
+                    Some(primary.payload.clone()),
                     Some(primary.attribution.clone()),
                 )
             } else {
@@ -349,52 +358,6 @@ impl CascadeResponse {
             enhancement,
             sources,
         }
-    }
-}
-
-/// Field-level first-non-empty merge across an ordered slice of
-/// sources (highest-priority first). Walks the sources in order;
-/// for each top-level key encountered, the first source with a
-/// non-empty value at that key wins.
-///
-/// Non-empty is defined as:
-/// - JSON `null` — absent
-/// - string — non-empty and non-whitespace
-/// - array — non-empty
-/// - object — non-empty
-/// - number / bool — always present
-///
-/// Returns a JSON object even when the input is empty (the
-/// caller of `from_sources` guarantees non-empty input for the
-/// merged branch, but the helper is defensive).
-pub(crate) fn merge_sources_field_level(
-    sources: &[SourceEntry],
-) -> serde_json::Value {
-    let mut merged = serde_json::Map::new();
-    for src in sources {
-        let obj = match src.payload.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        for (k, v) in obj {
-            if merged.contains_key(k) {
-                continue;
-            }
-            if is_json_value_present(v) {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    serde_json::Value::Object(merged)
-}
-
-fn is_json_value_present(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Null => false,
-        serde_json::Value::String(s) => !s.trim().is_empty(),
-        serde_json::Value::Array(a) => !a.is_empty(),
-        serde_json::Value::Object(o) => !o.is_empty(),
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
     }
 }
 
@@ -783,69 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_sources_field_level_takes_first_non_empty() {
-        let sources = vec![
-            source_of(
-                "wikipedia",
-                serde_json::json!({"summary": "wp prose", "language": "en"}),
-            ),
-            source_of(
-                "lastfm",
-                serde_json::json!({
-                    "summary": "lastfm prose",
-                    "listeners": 12345,
-                    "language": "",
-                }),
-            ),
-            source_of(
-                "theaudiodb",
-                serde_json::json!({
-                    "summary": "tadb prose",
-                    "genre": "rock",
-                }),
-            ),
-        ];
-        let merged = merge_sources_field_level(&sources);
-        let obj = merged.as_object().unwrap();
-        assert_eq!(obj.get("summary").unwrap(), "wp prose");
-        assert_eq!(obj.get("language").unwrap(), "en");
-        assert_eq!(obj.get("listeners").unwrap().as_u64(), Some(12345));
-        assert_eq!(obj.get("genre").unwrap(), "rock");
-    }
-
-    #[test]
-    fn merge_sources_field_level_skips_empty_and_null_and_whitespace() {
-        let sources = vec![
-            source_of(
-                "wikipedia",
-                serde_json::json!({
-                    "summary": "",
-                    "list": [],
-                    "obj": {},
-                    "null_field": serde_json::Value::Null,
-                    "ws": "   \n\t",
-                }),
-            ),
-            source_of(
-                "lastfm",
-                serde_json::json!({
-                    "summary": "lastfm prose",
-                    "list": ["a"],
-                    "obj": {"k": "v"},
-                    "null_field": "from lastfm",
-                    "ws": "content",
-                }),
-            ),
-        ];
-        let merged = merge_sources_field_level(&sources);
-        let obj = merged.as_object().unwrap();
-        assert_eq!(obj.get("summary").unwrap(), "lastfm prose");
-        assert_eq!(obj.get("list").unwrap().as_array().unwrap().len(), 1);
-        assert_eq!(obj.get("null_field").unwrap(), "from lastfm");
-        assert_eq!(obj.get("ws").unwrap(), "content");
-    }
-
-    #[test]
     fn sort_sources_by_priority_lower_wins_first() {
         let cfg = ProviderConfig::defaults();
         let mut sources = vec![
@@ -883,19 +783,61 @@ mod tests {
     }
 
     #[test]
-    fn from_sources_top_level_is_merged_view() {
+    fn from_sources_top_level_payload_verbatim_from_primary() {
+        // Load-bearing licensing invariant: the top-level
+        // payload MUST be the primary source's payload verbatim.
+        // No field-level merge across sources — that stitches
+        // prose from source A into a payload the top-level
+        // attribution claims came from source B (CC BY-SA prose
+        // stamped CC0 is a real license violation).
         let sources = vec![
-            source_of("wikipedia", serde_json::json!({"summary": "wp"})),
+            source_of("wikipedia", serde_json::json!({"summary": "wp prose"})),
             source_of(
                 "lastfm",
-                serde_json::json!({"summary": "lfm", "listeners": 7}),
+                serde_json::json!({
+                    "summary": "lfm prose that WOULD get merged in the old shape",
+                    "listeners": 7,
+                }),
             ),
         ];
         let resp = CascadeResponse::from_sources(sources, None);
         let payload = resp.payload.unwrap();
-        assert_eq!(payload.get("summary").unwrap(), "wp");
-        assert_eq!(payload.get("listeners").unwrap().as_u64(), Some(7));
+        // Primary payload, verbatim — no lastfm fields survived.
+        assert_eq!(payload.get("summary").unwrap(), "wp prose");
+        assert!(
+            payload.get("listeners").is_none(),
+            "field-level merge is banned; lastfm.listeners must not \
+                 leak into the wikipedia-attributed top-level payload"
+        );
         assert_eq!(resp.provider_id.as_deref(), Some("wikipedia"));
+        let attr = resp.attribution.as_ref().unwrap();
+        assert_eq!(attr.source_name, "wikipedia");
+        // sources[] still carries every entry so the UI's per-
+        // source selection surface has the alternatives.
         assert_eq!(resp.sources.len(), 2);
+    }
+
+    #[test]
+    fn from_sources_attribution_matches_top_level_prose_source() {
+        // Direct guard for the licensing regression: if payload
+        // came from source X, attribution MUST be source X's.
+        let sources = vec![
+            source_of(
+                "wikidata",
+                serde_json::json!({"summary": "wd disambig prose"}),
+            ),
+            source_of(
+                "lastfm",
+                serde_json::json!({"summary": "lfm disambig prose"}),
+            ),
+        ];
+        let resp = CascadeResponse::from_sources(sources, None);
+        let payload = resp.payload.unwrap();
+        let attr = resp.attribution.as_ref().unwrap();
+        // The prose showing at the top is Wikidata's — the
+        // attribution alongside it must ALSO name Wikidata, not
+        // any other source that happened to also return content.
+        assert_eq!(payload.get("summary").unwrap(), "wd disambig prose");
+        assert_eq!(attr.source_name, "wikidata");
     }
 }

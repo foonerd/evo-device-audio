@@ -319,9 +319,11 @@ impl ArtistArtworkResponse {
     }
 
     /// Build an OK response from an ordered vector of source
-    /// entries. Top-level payload is the field-level first-non-
-    /// empty merge; top-level provider_id / privacy_class /
-    /// attribution mirror sources[0].
+    /// entries. Top-level payload = primary source's payload
+    /// verbatim (no field-level merge). Top-level attribution
+    /// matches. See the text-verb cascade's `from_sources`
+    /// docstring for the licensing rationale — mirroring here
+    /// keeps text and image sources on one attribution contract.
     pub(crate) fn from_sources(sources: Vec<SourceEntry>) -> Self {
         let (status, provider_id, privacy_class, payload, attribution) =
             if let Some(primary) = sources.first() {
@@ -329,7 +331,7 @@ impl ArtistArtworkResponse {
                     CascadeStatus::Ok,
                     Some(primary.provider_id.clone()),
                     Some(primary.privacy_class.clone()),
-                    Some(merge_sources_field_level(&sources)),
+                    Some(primary.payload.clone()),
                     Some(primary.attribution.clone()),
                 )
             } else {
@@ -345,41 +347,6 @@ impl ArtistArtworkResponse {
             attribution,
             sources,
         }
-    }
-}
-
-/// Field-level first-non-empty merge across an ordered slice of
-/// sources (highest-priority first). Matches the text-verb
-/// cascade's helper of the same name; both plugins independently
-/// produce the identical top-level shape.
-pub(crate) fn merge_sources_field_level(
-    sources: &[SourceEntry],
-) -> serde_json::Value {
-    let mut merged = serde_json::Map::new();
-    for src in sources {
-        let obj = match src.payload.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        for (k, v) in obj {
-            if merged.contains_key(k) {
-                continue;
-            }
-            if is_json_value_present(v) {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    serde_json::Value::Object(merged)
-}
-
-fn is_json_value_present(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Null => false,
-        serde_json::Value::String(s) => !s.trim().is_empty(),
-        serde_json::Value::Array(a) => !a.is_empty(),
-        serde_json::Value::Object(o) => !o.is_empty(),
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
     }
 }
 
@@ -844,37 +811,36 @@ mod tests {
     }
 
     #[test]
-    fn merge_sources_field_level_takes_first_non_empty() {
+    fn from_sources_top_level_payload_verbatim_from_primary() {
+        // Attribution unity — see cascade.rs docstring.
+        // Top-level payload MUST be the primary source verbatim.
         let sources = vec![
             source_of(
                 "deezer",
                 serde_json::json!({
                     "picture_xl_url": "https://cdn.deezer.example/xl.jpg",
-                    "source_url": "https://deezer.example/artist/1",
                 }),
             ),
             source_of(
                 "theaudiodb",
                 serde_json::json!({
                     "thumb_url": "https://theaudiodb.example/thumb.jpg",
-                    "source_url": "https://theaudiodb.example/artist/1",
                 }),
             ),
         ];
-        let merged = merge_sources_field_level(&sources);
-        let obj = merged.as_object().unwrap();
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        let payload = resp.payload.unwrap();
         assert_eq!(
-            obj.get("picture_xl_url").unwrap(),
+            payload.get("picture_xl_url").unwrap(),
             "https://cdn.deezer.example/xl.jpg"
         );
-        assert_eq!(
-            obj.get("thumb_url").unwrap(),
-            "https://theaudiodb.example/thumb.jpg"
+        assert!(
+            payload.get("thumb_url").is_none(),
+            "field-level merge is banned; theaudiodb.thumb_url must not \
+             leak into the deezer-attributed top-level payload"
         );
-        assert_eq!(
-            obj.get("source_url").unwrap(),
-            "https://deezer.example/artist/1"
-        );
+        assert_eq!(resp.provider_id.as_deref(), Some("deezer"));
+        assert_eq!(resp.sources.len(), 2);
     }
 
     #[test]
@@ -914,36 +880,6 @@ mod tests {
         assert!(matches!(ok.status, CascadeStatus::Ok));
         let empty = ArtistArtworkResponse::from_sources(vec![]);
         assert!(matches!(empty.status, CascadeStatus::NotFound));
-    }
-
-    #[test]
-    fn field_level_merge_excludes_empty_and_null() {
-        let sources = vec![
-            source_of(
-                "deezer",
-                serde_json::json!({
-                    "picture_xl_url": "",
-                    "picture_big_url": serde_json::Value::Null,
-                }),
-            ),
-            source_of(
-                "theaudiodb",
-                serde_json::json!({
-                    "picture_xl_url": "https://theaudiodb.example/x.jpg",
-                    "picture_big_url": "https://theaudiodb.example/b.jpg",
-                }),
-            ),
-        ];
-        let merged = merge_sources_field_level(&sources);
-        let obj = merged.as_object().unwrap();
-        assert_eq!(
-            obj.get("picture_xl_url").unwrap(),
-            "https://theaudiodb.example/x.jpg"
-        );
-        assert_eq!(
-            obj.get("picture_big_url").unwrap(),
-            "https://theaudiodb.example/b.jpg"
-        );
     }
 
     /// Compile-fence attestation: ArtistImageHit MUST NOT derive

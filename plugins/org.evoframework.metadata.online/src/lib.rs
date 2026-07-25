@@ -357,21 +357,22 @@ impl Plugin for MetadataOnlinePlugin {
                                     );
                                     continue;
                                 };
-                                if row.priority < 0 {
-                                    tracing::warn!(
-                                        plugin = PLUGIN_NAME,
-                                        provider_id = %row.provider_id,
-                                        priority = row.priority,
-                                        "online_provider_config store row \
-                                         carries negative priority; skipping \
-                                         override"
-                                    );
-                                    continue;
-                                }
+                                // Sentinel semantics (migration 042):
+                                // priority < 0 means "operator has NOT
+                                // explicitly set a priority for this
+                                // provider". Keep the plugin's cascade
+                                // default; still apply enabled — the
+                                // operator's toggle is unambiguous even
+                                // when they haven't touched priority.
+                                let priority_override = if row.priority < 0 {
+                                    None
+                                } else {
+                                    Some(row.priority as u32)
+                                };
                                 cfg.merge_override(
                                     pid,
                                     Some(row.enabled),
-                                    Some(row.priority as u32),
+                                    priority_override,
                                 );
                             }
                         }
@@ -1220,22 +1221,21 @@ async fn online_provider_config_reactor(
                     );
                     continue;
                 };
-                if event.priority < 0 {
-                    tracing::warn!(
-                        plugin = PLUGIN_NAME,
-                        provider_id = %event.provider_id,
-                        priority = event.priority,
-                        "reactor: config change carries negative priority; \
-                         skipping override"
-                    );
-                    continue;
-                }
+                // Sentinel: priority < 0 means "operator has not
+                // explicitly set a priority for this provider"
+                // (migration 042). Keep the plugin's cascade
+                // default; still apply enabled.
+                let priority_override = if event.priority < 0 {
+                    None
+                } else {
+                    Some(event.priority as u32)
+                };
                 {
                     let mut cfg = config_slot.write().await;
                     cfg.merge_override(
                         pid,
                         Some(event.enabled),
-                        Some(event.priority as u32),
+                        priority_override,
                     );
                 }
                 tracing::info!(
