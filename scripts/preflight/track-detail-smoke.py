@@ -126,6 +126,50 @@ def pick_fixture_track(target_user, target_host):
     return tracks[0]
 
 
+def pick_known_lyric_track(target_user, target_host):
+    """Return an mpd-path for a track known to have lyrics on
+    LRCLIB, or `None` when the rig's library carries none of
+    the curated candidates.
+
+    The candidates are picked for two properties: universally
+    present on LRCLIB (mainstream singer-songwriter / pop),
+    and typically present in the audio-team's reference
+    libraries. `mpc find` on `(Artist,Title)` matches the
+    tagged fields exactly — narrower than `mpc listall` so the
+    smoke doesn't accidentally land on a live take / cover /
+    karaoke variant that LRCLIB misses.
+    """
+    # (artist_tag, title_substring) — title is a substring
+    # match to tolerate small punctuation / edition differences
+    # in tag data.
+    candidates = [
+        ("Passenger", "Let Her Go"),
+        ("Passenger", "Staring At the Stars"),
+        ("Passenger", "Things That Stop You Dreaming"),
+        ("Ed Sheeran", "Thinking Out Loud"),
+        ("Adele", "Someone Like You"),
+        ("Adele", "Hello"),
+        ("Sarah McLachlan", "Angel"),
+        ("Sarah McLachlan", "Building a Mystery"),
+        ("Sarah McLachlan", "Vox"),
+        ("Coldplay", "Yellow"),
+        ("Radiohead", "Creep"),
+    ]
+    for artist, title_substring in candidates:
+        try:
+            out = ssh(
+                target_user,
+                target_host,
+                f"mpc find artist {json.dumps(artist)} 2>/dev/null",
+            )
+        except subprocess.CalledProcessError:
+            continue
+        for track in out.splitlines():
+            if title_substring.lower() in track.lower():
+                return track
+    return None
+
+
 def bootstrap_preseed(target_user, target_host):
     """Read the pair-preseed code from the rig."""
     try:
@@ -271,6 +315,119 @@ async def main():
                 f"exact regression class UI called out (dropped "
                 f"payload_b64 / half-landed wire codec)"
             )
+
+    # ---- Step 5 — lyrics cache-hit shape parity ------------------
+    #
+    # A prior defect (verified in code): the lyrics cache-hit path
+    # returned `provider_id="cache"` with a wrapped payload
+    # `{cached_from_provider_id, value:{...}}` while the live-hit
+    # path returned flat `{plain_lyrics, ...}` under
+    # `provider_id="lrclib"`. Every UI/consumer reading
+    # `payload.plain_lyrics` at the top level rendered empty on
+    # every refresh after the first play. The fix collapsed the
+    # cache-hit shape to equal the live shape.
+    #
+    # This step gates on that invariant: pick a track known to
+    # carry lyrics on LRCLIB, fetch track_detail twice, assert
+    # the two `lyrics` sub-sources have identical
+    # `(status, provider_id, payload.plain_lyrics non-empty)`
+    # tuples. If the invariant is broken again, this step FAILs
+    # before publish — the "Cluster One" instrumental fixture
+    # gated the surface-level dispatch shape, not the cache
+    # parity, and let the defect ship.
+    #
+    # SKIPPED (not FAILED) when the rig's library carries no
+    # curated known-lyrics fixture — the gate cannot honestly
+    # attest what the library does not carry.
+    print()
+    print("--- lyrics cache-hit shape parity ---")
+    lyric_fixture = pick_known_lyric_track(args.target_user, args.target_host)
+    if lyric_fixture is None:
+        print(
+            "  SKIP — no curated known-lyrics fixture found in the "
+            "rig's library. Cache-hit shape parity not exercised on "
+            "this deploy."
+        )
+    else:
+        print(f"  lyric fixture: mpd-path={lyric_fixture!r}")
+        lyric_path = (
+            f"/api/v1/audio/track_detail?scheme=mpd-path"
+            f"&value={quote(lyric_fixture, safe='')}"
+        )
+        try:
+            first = await http_get_json(bearer, args.target_host, lyric_path)
+            second = await http_get_json(bearer, args.target_host, lyric_path)
+        except Exception as e:
+            print(f"  FAIL (endpoint): lyric parity fetch failed: {e}")
+            fails.append(f"lyrics_cache_parity: fetch failed: {e}")
+        else:
+            first_lyrics = (first.get("sources") or {}).get("lyrics") or {}
+            second_lyrics = (second.get("sources") or {}).get("lyrics") or {}
+            first_status = first_lyrics.get("status")
+            second_status = second_lyrics.get("status")
+            first_pid = first_lyrics.get("provider_id")
+            second_pid = second_lyrics.get("provider_id")
+            first_plain = str(
+                (first_lyrics.get("payload") or {}).get("plain_lyrics") or ""
+            )
+            second_plain = str(
+                (second_lyrics.get("payload") or {}).get("plain_lyrics") or ""
+            )
+            print(
+                f"    first : status={first_status!r} "
+                f"provider_id={first_pid!r} plain_lyrics_len={len(first_plain)}"
+            )
+            print(
+                f"    second: status={second_status!r} "
+                f"provider_id={second_pid!r} plain_lyrics_len={len(second_plain)}"
+            )
+            if first_status != "ok" or second_status != "ok":
+                # Not necessarily a fail — LRCLIB may not have this
+                # track. SKIP with a diagnostic when the FIRST call
+                # already missed; only FAIL when live-hit was OK
+                # but cache-hit disagreed.
+                if first_status != "ok":
+                    print(
+                        "    SKIP — LRCLIB missed on the fixture; "
+                        "cache parity not exercisable this run."
+                    )
+                else:
+                    fails.append(
+                        f"lyrics_cache_parity: first fetch status={first_status!r} "
+                        f"but second fetch status={second_status!r} — "
+                        f"cache-hit downgraded the response"
+                    )
+                    print(
+                        "    FAIL — live-hit ok but cache-hit not ok"
+                    )
+            elif first_pid != second_pid:
+                fails.append(
+                    f"lyrics_cache_parity: provider_id differs — "
+                    f"first={first_pid!r} second={second_pid!r} "
+                    f"(cache-hit must echo live-hit's provider_id, "
+                    f"not a synthetic 'cache' label)"
+                )
+                print("    FAIL — provider_id shape differs between live and cache")
+            elif len(first_plain) == 0 or len(second_plain) == 0:
+                fails.append(
+                    f"lyrics_cache_parity: plain_lyrics empty on one/both "
+                    f"reads (first_len={len(first_plain)} "
+                    f"second_len={len(second_plain)}) — the exact "
+                    f"'lyrics vanish on refresh' regression class"
+                )
+                print("    FAIL — plain_lyrics empty on live and/or cache read")
+            elif first_plain != second_plain:
+                fails.append(
+                    f"lyrics_cache_parity: plain_lyrics text differs "
+                    f"between live and cache reads — cache is returning "
+                    f"different content than the source served"
+                )
+                print("    FAIL — plain_lyrics content differs live vs cache")
+            else:
+                print(
+                    "    GREEN — cache-hit shape equals live-hit shape; "
+                    "plain_lyrics identical across both reads"
+                )
 
     print()
     if fails:

@@ -237,6 +237,17 @@ pub(crate) struct SourceEntry {
     pub(crate) provider_id: String,
     /// Provider's privacy class at the time of the fetch.
     pub(crate) privacy_class: String,
+    /// BCP47 short language tag of the content actually served
+    /// by this provider (`"en"`, `"de"`, `"fr"`, ...). Absent
+    /// when the provider is language-agnostic (e.g. structured
+    /// facts, personnel credits, artwork URLs).     /// every text lookup honours
+    /// the operator locale with a strict fallback chain
+    /// (operator locale → English → first available non-empty);
+    /// this field reports what actually landed so the UI can
+    /// label prose whose language differs from the operator
+    /// locale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
     /// The provider's content payload. Shape is verb-specific;
     /// each verb's contract documents its own payload shape.
     pub(crate) payload: serde_json::Value,
@@ -285,6 +296,14 @@ pub(crate) struct CascadeResponse {
     /// non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attribution: Option<Attribution>,
+    /// Mirrors `sources[0].language` when `sources` is
+    /// non-empty and the primary source served locale-scoped
+    /// prose. Absent for language-agnostic top-level payloads
+    /// (personnel credits, artwork URLs). The UI can
+    /// label the top-level prose with the language actually
+    /// served without re-walking `sources[]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
     /// Optional hint pointing at a provider the operator could
     /// enable / configure to enrich the answer further. Retires
     /// once per-source enable/disable ships on the UI side and
@@ -335,18 +354,25 @@ impl CascadeResponse {
         sources: Vec<SourceEntry>,
         enhancement: Option<EnhancementHint>,
     ) -> Self {
-        let (status, provider_id, privacy_class, payload, attribution) =
-            if let Some(primary) = sources.first() {
-                (
-                    CascadeStatus::Ok,
-                    Some(primary.provider_id.clone()),
-                    Some(primary.privacy_class.clone()),
-                    Some(primary.payload.clone()),
-                    Some(primary.attribution.clone()),
-                )
-            } else {
-                (CascadeStatus::NotFound, None, None, None, None)
-            };
+        let (
+            status,
+            provider_id,
+            privacy_class,
+            payload,
+            attribution,
+            language,
+        ) = if let Some(primary) = sources.first() {
+            (
+                CascadeStatus::Ok,
+                Some(primary.provider_id.clone()),
+                Some(primary.privacy_class.clone()),
+                Some(primary.payload.clone()),
+                Some(primary.attribution.clone()),
+                primary.language.clone(),
+            )
+        } else {
+            (CascadeStatus::NotFound, None, None, None, None, None)
+        };
         Self {
             v: 1,
             status,
@@ -355,6 +381,7 @@ impl CascadeResponse {
             payload,
             detail: None,
             attribution,
+            language,
             enhancement,
             sources,
         }
@@ -401,6 +428,7 @@ impl CascadeResponse {
             payload: None,
             detail: Some(detail.into()),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         }
@@ -415,6 +443,7 @@ impl CascadeResponse {
             payload: None,
             detail: Some(detail.into()),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         }
@@ -473,9 +502,30 @@ pub(crate) struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Framework defaults: anonymous providers enabled, identity-
-    /// bearing providers enabled (they self-skip when their
-    /// credential is absent), privacy_mode = enhanced.
+    /// Framework defaults: anonymous providers enabled (keyless-
+    /// first — the operator gets bio / notes / lyrics /
+    /// artwork with no keys required); identity-bearing providers
+    /// default DISABLED so first-run is honest opt-in and the Q3
+    /// prompt-on-missing path actually runs.
+    ///
+    /// Rationale: the framework's `online_provider_config` bus
+    /// publishes change-events on operator `set_enabled` /
+    /// `set_priority` gestures only — never at boot. If keyed
+    /// providers defaulted `enabled=true`, the enabled-transition
+    /// never happens on a fresh device, the
+    /// `online_provider_config_reactor`'s prompt trigger never
+    /// fires, and the cascade silently drops the provider on every
+    /// dispatch because `catalogue.discogs.is_none()` (no vault
+    /// key). The operator sees no source, no error, no way to be
+    /// asked. Defaulting to `enabled=false` makes enabling a
+    /// keyed provider the operator's explicit gesture — which IS
+    /// the change-event the reactor waits for, and the moment
+    /// `request_from_operator` runs.
+    ///
+    /// Anonymous defaults stay enabled per the keyless-first posture.
+    /// Their `enabled=true` is safe because no credential is
+    /// required to make them useful; the change-event silence at
+    /// boot is not a problem for them.
     pub(crate) fn defaults() -> Self {
         Self {
             musicbrainz: ProviderFlags {
@@ -498,16 +548,22 @@ impl ProviderConfig {
                 enabled: true,
                 priority: 45,
             },
+            // Identity-bearing providers default DISABLED.
+            // Operator toggles on → change-event fires →
+            // reactor calls `request_from_operator` → prompt
+            // renders on the UI's responder → operator enters
+            // key → vault stores → credential_reactor rebuilds
+            // client → cascade uses it on next dispatch.
             lastfm: ProviderFlags {
-                enabled: true,
+                enabled: false,
                 priority: 50,
             },
             discogs: ProviderFlags {
-                enabled: true,
+                enabled: false,
                 priority: 60,
             },
             genius: ProviderFlags {
-                enabled: true,
+                enabled: false,
                 priority: 70,
             },
             privacy_mode: PrivacyMode::Enhanced,
@@ -736,6 +792,7 @@ mod tests {
         SourceEntry {
             provider_id: provider_id.to_string(),
             privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+            language: None,
             payload,
             attribution: Attribution {
                 source_name: provider_id.to_string(),

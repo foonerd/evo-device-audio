@@ -7,10 +7,11 @@
 //!
 //! 1. Validate `v == 1` + required inputs.
 //! 2. Consult the [`EnrichmentCache`] for this verb's namespace.
-//!    - Positive cache hit → return the cached payload with
-//!      `provider_id: "cache"`.
-//!    - Fresh negative → return `not_found` with cache
-//!      provider_id.
+//!    - Positive cache hit → return the cached payload
+//!      VERBATIM with the originating source's `provider_id`.
+//!      Cache-hit wire shape MUST equal live-hit wire shape.
+//!    - Fresh negative → return `not_found` with the
+//!      originating source's `provider_id`.
 //! 3. Cache miss → dispatch the provider chain:
 //!    - Lyrics: LRCLIB.
 //!    - Bio: Last.fm (when configured); no fallback in this
@@ -34,6 +35,7 @@ use crate::cascade::{
     PrivacyClass, ProviderCatalogue, ProviderId, SourceEntry,
 };
 use crate::enrichment_cache::EnrichmentCache;
+use crate::locale;
 
 // ---------------------------------------------------------------
 // Common shape
@@ -83,6 +85,28 @@ fn bad_request(detail: &str) -> EnrichmentResponse {
     }
 }
 
+/// Transparent cache-hit response. Returns the stored payload
+/// VERBATIM with the originating source's `provider_id` — no
+/// `"cache"` label, no `{ cached_from_provider_id, value: {...} }`
+/// wrapper. The wire shape of a cache-hit MUST equal the wire
+/// shape of the live-fetch it echoes; anything else forces
+/// every consumer to branch on `provider_id == "cache"` and
+/// decode a different shape, which the UI does not do (and
+/// cannot reasonably be expected to).
+///
+/// Prior shape (defective): `provider_id="cache"`,
+/// `payload={cached_from_provider_id, value: {plain_lyrics,...}}`.
+/// The lyrics UI reads `payload.plain_lyrics` at the top level;
+/// on cache-hit the lookup landed on the wrapper, `plain_lyrics`
+/// was undefined, and the pane rendered empty. Because
+/// `put_positive` writes an indefinite entry, the first
+/// successful fetch warmed the cache and every subsequent play
+/// returned the empty-shape hit — the "lyrics vanish on
+/// refresh" symptom.
+///
+/// The stored payload is already the flat live shape (see
+/// `query_lyrics` around line 471); no cache migration or wipe
+/// is needed. Existing cache entries repair on deploy.
 fn from_cache_ok(
     payload: serde_json::Value,
     provider_id: Option<String>,
@@ -90,11 +114,11 @@ fn from_cache_ok(
     EnrichmentResponse {
         v: 1,
         status: ResponseStatus::Ok,
-        provider_id: Some("cache".to_string()),
-        payload: Some(serde_json::json!({
-            "cached_from_provider_id": provider_id,
-            "value": payload,
-        })),
+        // Prefer the cached originating provider id; fall back
+        // to the verb's default source when the cache row is
+        // missing that field for whatever reason.
+        provider_id: Some(provider_id.unwrap_or_else(|| "lrclib".to_string())),
+        payload: Some(payload),
         detail: None,
     }
 }
@@ -103,7 +127,12 @@ fn from_cache_negative(detail: Option<String>) -> EnrichmentResponse {
     EnrichmentResponse {
         v: 1,
         status: ResponseStatus::NotFound,
-        provider_id: Some("cache".to_string()),
+        // Same shape parity: negative cache-hits carry the
+        // originating source id (best-effort; falls back to
+        // the verb's default) rather than a bare `"cache"`,
+        // so consumers can attribute the miss to the actual
+        // source they queried.
+        provider_id: Some("lrclib".to_string()),
         payload: None,
         detail,
     }
@@ -128,10 +157,32 @@ fn from_cache_negative(detail: Option<String>) -> EnrichmentResponse {
 /// entry cannot leak into a subsequent `mbid/<mbid>` lookup, and
 /// vice versa. Two callers with the same name but different
 /// resolved MBIDs live in different cache entries.
+///
+/// Locale-less back-compat wrapper used by the partitioning
+/// tests below (they assert namespace segregation invariants
+/// that are orthogonal to the locale dimension). Prod callers
+/// use [`bio_cache_key_with_locale`] directly.
+#[cfg(test)]
 fn bio_cache_key(
     entity: &EntityRef,
     resolved_mbid: Option<&str>,
     provider: ProviderId,
+) -> String {
+    bio_cache_key_with_locale(entity, resolved_mbid, provider, "en")
+}
+
+/// Locale-scoped variant: the cache key incorporates the operator
+/// locale so entries fetched under one language never shadow a
+/// request under another. Without locale in the key, the first
+/// caller's language would freeze into the cache and every
+/// subsequent operator would see prose in the wrong language
+/// regardless of their locale header — an integrity failure the
+/// bare `bio_cache_key` above cannot see.
+fn bio_cache_key_with_locale(
+    entity: &EntityRef,
+    resolved_mbid: Option<&str>,
+    provider: ProviderId,
+    locale: &str,
 ) -> String {
     match resolved_mbid {
         Some(mbid) => EnrichmentCache::key_for(&[
@@ -140,6 +191,8 @@ fn bio_cache_key(
             "mbid",
             mbid,
             provider.as_str(),
+            "loc",
+            locale,
         ]),
         None => EnrichmentCache::key_for(&[
             "entity_bio",
@@ -147,6 +200,8 @@ fn bio_cache_key(
             "name",
             &normalise(&entity.name),
             provider.as_str(),
+            "loc",
+            locale,
         ]),
     }
 }
@@ -340,6 +395,12 @@ struct LyricsRequest {
     album: Option<String>,
     #[serde(default)]
     duration_seconds: Option<f64>,
+    /// Operator UI locale (BCP47 short — `"en"`, `"de"`, ...).
+    /// Absent =
+    /// `"en"` (back-compat with pre-Rule-G callers).
+    #[serde(default)]
+    #[allow(dead_code)]
+    locale: Option<String>,
 }
 
 pub(crate) async fn query_lyrics(
@@ -404,11 +465,27 @@ pub(crate) async fn query_lyrics(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(normalise);
+    // duration_seconds is folded into the cache key so a
+    // negative miss keyed on a wrong / imprecise duration
+    // doesn't shadow a subsequent lookup with the corrected
+    // value for 24h (positive misses are indefinite; negative
+    // misses default 24h). LRCLIB's `get_lyrics` treats
+    // duration as a match-refinement parameter, so
+    // `(artist, track, album, ±1s duration)` may hit vs miss
+    // differently — the cache key must reflect that.
+    // Rounded to integer seconds because sub-second precision
+    // is spurious for lyrics matching (LRCLIB itself matches
+    // within a small tolerance).
+    let duration_key = req
+        .duration_seconds
+        .map(|d| format!("{}", d.round() as i64))
+        .unwrap_or_default();
     let key = EnrichmentCache::key_for(&[
         "lyrics",
         &normalise(&artist),
         &normalise(&track),
         album_norm.as_deref().unwrap_or(""),
+        &duration_key,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -747,6 +824,11 @@ pub(crate) struct EntityBioRequest {
     pub(crate) artist: Option<String>,
     #[serde(default)]
     pub(crate) artist_mbid: Option<String>,
+    /// Operator UI locale (BCP47 short — `"en"`, `"de"`, ...).
+    /// Absent =
+    /// `"en"` (back-compat with pre-Rule-G callers).
+    #[serde(default)]
+    pub(crate) locale: Option<String>,
 }
 
 pub(crate) async fn query_entity_bio(
@@ -905,6 +987,9 @@ pub(crate) async fn query_entity_bio(
     let effective_name =
         canonical_name.as_deref().unwrap_or(entity.name.as_str());
 
+    // Operator locale (the locale-aware fallback). Absent → `"en"` (default).
+    let operator_locale = locale::normalise(req.locale.as_deref());
+
     // Parallel content-fetch across every enabled provider.
     // Each helper returns `Option<SourceEntry>`; `None` on
     // disabled / unavailable / structural miss / cache negative /
@@ -921,6 +1006,7 @@ pub(crate) async fn query_entity_bio(
             cache,
             want_wp,
             want_wd,
+            &operator_locale,
         ),
         fetch_wikidata_bio(
             &entity,
@@ -929,6 +1015,7 @@ pub(crate) async fn query_entity_bio(
             catalogue,
             cache,
             want_wd,
+            &operator_locale,
         ),
         fetch_lastfm_bio(
             &entity,
@@ -944,6 +1031,7 @@ pub(crate) async fn query_entity_bio(
             catalogue,
             cache,
             want_theaudiodb,
+            &operator_locale,
         ),
     );
 
@@ -966,6 +1054,7 @@ pub(crate) async fn query_entity_bio(
                 entity.name
             )),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         });
@@ -1000,12 +1089,23 @@ async fn fetch_wikipedia_bio(
     cache: &EnrichmentCache,
     wp_enabled: bool,
     wd_enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !wp_enabled {
         return None;
     }
     let wp = catalogue.wikipedia.as_ref()?;
-    let key = bio_cache_key(entity, resolved_mbid, ProviderId::Wikipedia);
+    // Cache key includes the operator locale so a `de` operator
+    // and an `en` operator get distinct entries — otherwise the
+    // first fetch (whatever language it happened to land in)
+    // would shadow every subsequent request regardless of the
+    // caller's locale (a locale-integrity failure).
+    let key = bio_cache_key_with_locale(
+        entity,
+        resolved_mbid,
+        ProviderId::Wikipedia,
+        operator_locale,
+    );
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
             if let Some(p) = entry.payload {
@@ -1013,28 +1113,35 @@ async fn fetch_wikipedia_bio(
             }
         }
     }
-    // Path 1 — MB-routed Wikipedia URL is authoritative.
-    let mut hit = None;
-    if let Some(url) = wikipedia_url {
-        match wp.get_summary_from_url(url).await {
-            Ok(Some(s)) => hit = Some(s),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    plugin = crate::PLUGIN_NAME,
-                    provider = "wikipedia",
-                    entity = %entity.name,
-                    error = %e,
-                    "Wikipedia summary from MB-routed URL transient; \
-                     trying fallbacks"
-                );
-            }
-        }
-    }
-    // Path 2 — Wikidata enwiki-sitelink hop. Works for artist-
-    // type entities where MB did not route a Wikipedia URL but
-    // Wikidata knows the enwiki title. Sequential inline call —
-    // the parallel-dispatched Wikidata fetch runs for facts only.
+    // Locale-aware candidate ordering. Every candidate is
+    // `(language_hint, fetch_future)`; iterate in order, use the
+    // first that returns a non-empty summary. The reported
+    // language on the SourceEntry is whichever candidate landed.
+    let mb_url_lang = wikipedia_url
+        .and_then(|url| {
+            evo_online_providers::wikipedia::parse_wikipedia_url(url)
+        })
+        .map(|(lang, _)| lang);
+    // Candidate 1: operator-locale sitelink via Wikidata.
+    //   → operator locale first, correct entity via MBID.
+    // Candidate 2: MB URL when it happens to be operator locale.
+    //   → same, without needing the Wikidata hop.
+    // Candidate 3: enwiki sitelink via Wikidata (skipped if
+    //   operator locale is already English — candidate 1 covered it).
+    //   → English fallback, correct entity via MBID.
+    // Candidate 4: MB URL in any other language.
+    //   → whatever language MB happens to have; still MBID-first.
+    // Candidate 5: bare-name search in operator locale.
+    //   → last-resort, gated (artist-type common-noun trap).
+    // Candidate 6: bare-name search in English (skipped if
+    //   operator locale is already English).
+    let mut hit: Option<evo_online_providers::wikipedia::WikipediaSummaryHit> =
+        None;
+
+    // Candidate 1: Wikidata `{locale}wiki` sitelink.
+    let mut wd_entity_cache: Option<
+        evo_online_providers::wikidata::WikidataEntityHit,
+    > = None;
     if hit.is_none() {
         if let (Some(wd), Some(wd_url)) =
             (catalogue.wikidata.as_ref(), wikidata_url)
@@ -1042,24 +1149,7 @@ async fn fetch_wikipedia_bio(
             if wd_enabled {
                 match wd.get_entity_from_url(wd_url).await {
                     Ok(Some(wd_entity)) => {
-                        if let Some(title) = wd_entity.enwiki_title.as_deref() {
-                            match wp.get_summary_en(title).await {
-                                Ok(Some(s)) => hit = Some(s),
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        plugin = crate::PLUGIN_NAME,
-                                        provider = "wikipedia",
-                                        entity = %entity.name,
-                                        enwiki_title = %title,
-                                        error = %e,
-                                        "Wikipedia summary via Wikidata \
-                                         enwiki sitelink transient; \
-                                         trying next fallback"
-                                    );
-                                }
-                            }
-                        }
+                        wd_entity_cache = Some(wd_entity);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -1068,7 +1158,7 @@ async fn fetch_wikipedia_bio(
                             provider = "wikidata",
                             entity = %entity.name,
                             error = %e,
-                            "Wikidata enwiki-sitelink hop transient; \
+                            "Wikidata sitelink lookup transient; \
                              trying next fallback"
                         );
                     }
@@ -1076,27 +1166,108 @@ async fn fetch_wikipedia_bio(
             }
         }
     }
-    // Path 3 — bare-name search using MB canonical name when
-    // available. Two cases:
-    //   (a) MB resolved the entity and gave us canonical name
-    //       different from the tag literal → search by canonical.
-    //       Canonical is MB's authoritative form; if MB says the
-    //       artist is "Fiona Joy Hawkins", searching Wikipedia
-    //       by that form hits the correct page. The common-noun
-    //       trap does not apply — the operator's tag was a
-    //       shortened alias, MB's canonical is what Wikipedia
-    //       likely titled the page under.
-    //   (b) MB did not resolve OR canonical == tag literal →
-    //       artist-type entities skip bare-name (common-noun
-    //       trap for Passenger / Bush / Cake / etc.); non-
-    //       artist types retain the bare-name fallback.
+    if hit.is_none() {
+        if let Some(wd_entity) = wd_entity_cache.as_ref() {
+            let locale_site = format!("{operator_locale}wiki");
+            if let Some(title) = wd_entity.sitelinks.get(&locale_site) {
+                match wp.get_summary(title, operator_locale).await {
+                    Ok(Some(s)) => hit = Some(s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikipedia",
+                            entity = %entity.name,
+                            title = %title,
+                            language = operator_locale,
+                            error = %e,
+                            "operator-locale Wikipedia summary transient; \
+                             trying next fallback"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Candidate 2: MB URL parses to operator-locale edition.
+    if hit.is_none()
+        && wikipedia_url.is_some()
+        && mb_url_lang.as_deref() == Some(operator_locale)
+    {
+        if let Some(url) = wikipedia_url {
+            match wp.get_summary_from_url(url).await {
+                Ok(Some(s)) => hit = Some(s),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        entity = %entity.name,
+                        url = url,
+                        error = %e,
+                        "Wikipedia summary from MB-routed URL (locale-match) \
+                         transient; trying next fallback"
+                    );
+                }
+            }
+        }
+    }
+    // Candidate 3: Wikidata `enwiki` sitelink (skipped if
+    // operator_locale is en — candidate 1 covered it).
+    if hit.is_none() && operator_locale != "en" {
+        if let Some(wd_entity) = wd_entity_cache.as_ref() {
+            if let Some(title) = wd_entity.sitelinks.get("enwiki") {
+                match wp.get_summary_en(title).await {
+                    Ok(Some(s)) => hit = Some(s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikipedia",
+                            entity = %entity.name,
+                            enwiki_title = %title,
+                            error = %e,
+                            "Wikipedia summary via Wikidata enwiki sitelink \
+                             transient; trying next fallback"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Candidate 4: MB URL in any other language.
+    if hit.is_none()
+        && wikipedia_url.is_some()
+        && mb_url_lang.as_deref() != Some(operator_locale)
+    {
+        if let Some(url) = wikipedia_url {
+            match wp.get_summary_from_url(url).await {
+                Ok(Some(s)) => hit = Some(s),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        entity = %entity.name,
+                        url = url,
+                        error = %e,
+                        "Wikipedia summary from MB-routed URL transient; \
+                         trying next fallback"
+                    );
+                }
+            }
+        }
+    }
+    // Candidates 5-6: bare-name search. Same common-noun-trap
+    // gating as before, applied per language attempt.
     if hit.is_none() {
         let mb_gave_useful_canonical =
             resolved_mbid.is_some() && effective_name != entity.name.as_str();
         let should_search = mb_gave_useful_canonical
             || !matches!(entity.entity_type, EntityType::Artist);
         if should_search {
-            match wp.get_summary_en(effective_name).await {
+            // Candidate 5: operator-locale bare-name.
+            match wp.get_summary(effective_name, operator_locale).await {
                 Ok(Some(s)) => hit = Some(s),
                 Ok(None) => {}
                 Err(e) => {
@@ -1105,9 +1276,29 @@ async fn fetch_wikipedia_bio(
                         provider = "wikipedia",
                         entity = %entity.name,
                         effective_name,
+                        language = operator_locale,
                         error = %e,
-                        "Wikipedia bare-name summary transient; skipping"
+                        "operator-locale bare-name Wikipedia summary \
+                         transient; trying next fallback"
                     );
+                }
+            }
+            // Candidate 6: English bare-name (skipped if operator_locale is en).
+            if hit.is_none() && operator_locale != "en" {
+                match wp.get_summary_en(effective_name).await {
+                    Ok(Some(s)) => hit = Some(s),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = crate::PLUGIN_NAME,
+                            provider = "wikipedia",
+                            entity = %entity.name,
+                            effective_name,
+                            error = %e,
+                            "English bare-name Wikipedia summary \
+                             transient; skipping"
+                        );
+                    }
                 }
             }
         } else {
@@ -1115,23 +1306,25 @@ async fn fetch_wikipedia_bio(
                 plugin = crate::PLUGIN_NAME,
                 entity = %entity.name,
                 "artist-type entity with no MB-routed URL, no Wikidata \
-                 enwiki hop, and no MB canonical-alias resolution; \
+                 sitelink, and no MB canonical-alias resolution; \
                  refusing bare-name Wikipedia fallback (common-noun \
                  disambiguation trap)"
             );
         }
     }
     let summary = hit?;
+    let served_language = summary.language.clone();
     let payload = serde_json::json!({
         "title": summary.title,
         "summary": summary.extract,
-        "language": summary.language,
+        "language": served_language,
         "source_url": summary.page_url,
     });
     let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
     Some(SourceEntry {
         provider_id: ProviderId::Wikipedia.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: Some(served_language),
         payload,
         attribution: Attribution {
             source_name: "Wikipedia".into(),
@@ -1148,12 +1341,20 @@ async fn fetch_wikidata_bio(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
     }
     let wd = catalogue.wikidata.as_ref()?;
-    let key = bio_cache_key(entity, resolved_mbid, ProviderId::Wikidata);
+    // Cache key includes locale so a `de` request never
+    // returns the cached `en` description under the wrong label.
+    let key = bio_cache_key_with_locale(
+        entity,
+        resolved_mbid,
+        ProviderId::Wikidata,
+        operator_locale,
+    );
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
             if let Some(p) = entry.payload {
@@ -1176,9 +1377,22 @@ async fn fetch_wikidata_bio(
             return None;
         }
     };
+    // Pick the operator-locale label + description with
+    // the operator → English → any fallback chain. `label_for`
+    // and `description_for` return `(text, lang_actually_served)`.
+    let label_pick = entity_hit.label_for(operator_locale);
+    let description_pick = entity_hit.description_for(operator_locale);
+    // Report the label/description language on the SourceEntry —
+    // when they diverge, prefer the description's language
+    // because that's the prose the operator actually reads.
+    let served_language = description_pick
+        .as_ref()
+        .map(|(_, l)| l.clone())
+        .or_else(|| label_pick.as_ref().map(|(_, l)| l.clone()));
     let payload = serde_json::json!({
-        "label": entity_hit.label_en,
-        "description": entity_hit.description_en,
+        "label": label_pick.as_ref().map(|(t, _)| t),
+        "description": description_pick.as_ref().map(|(t, _)| t),
+        "language": served_language,
         "date_of_birth": entity_hit.date_of_birth,
         "date_of_death": entity_hit.date_of_death,
         "inception": entity_hit.inception,
@@ -1189,6 +1403,7 @@ async fn fetch_wikidata_bio(
     Some(SourceEntry {
         provider_id: ProviderId::Wikidata.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: served_language,
         payload,
         attribution: Attribution {
             source_name: "Wikidata".into(),
@@ -1280,6 +1495,7 @@ async fn fetch_lastfm_bio(
                 privacy_class: PrivacyClass::IdentityBearing
                     .as_str()
                     .to_string(),
+                language: None,
                 payload,
                 attribution: Attribution {
                     source_name: "Last.fm".into(),
@@ -1339,23 +1555,30 @@ async fn fetch_theaudiodb_bio(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
     }
-    // TheAudioDB's bio surface is `strBiographyEN` on the artist
-    // record — an artist-type surface. Composer / work /
-    // performer / conductor / ensemble routes through MB +
-    // Wikipedia + Wikidata; TheAudioDB adds nothing there.
+    // TheAudioDB's bio surface is the strBiography{lang} field
+    // family on the artist record — an artist-type surface.
+    // Composer / work / performer / conductor / ensemble routes
+    // through MB + Wikipedia + Wikidata; TheAudioDB adds nothing
+    // there.
     if !matches!(entity.entity_type, EntityType::Artist) {
         return None;
     }
     let tadb = catalogue.theaudiodb.as_ref()?;
+    // Locale-aware: locale in the cache key so a `de` request and an
+    // `en` request never poison each other. Distinct locales
+    // land in distinct cached payloads.
     let key = EnrichmentCache::key_for(&[
         "entity_bio",
         entity.entity_type.as_str(),
         &normalise(effective_name),
         ProviderId::TheAudioDb.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -1421,21 +1644,21 @@ async fn fetch_theaudiodb_bio(
             }
         },
     };
-    // Guard against TheAudioDB records with no bio prose (thin
-    // artist_thumb / genre only). The field-level merge would
-    // dedupe empties across sources, but returning `None` here
-    // keeps `sources` from carrying a placeholder entry with no
-    // renderable content.
-    let bio_prose = hit
-        .bio_en
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if bio_prose.is_none() && hit.genre.is_none() && hit.formed_year.is_none() {
+    // Locale-aware pick: operator locale → English → any
+    // non-empty. Reports the language actually served on the
+    // SourceEntry so the UI can label prose whose language
+    // differs from the operator locale.
+    let bio_pick = hit.bio_for_locale(operator_locale);
+    if bio_pick.is_none() && hit.genre.is_none() && hit.formed_year.is_none() {
         return None;
     }
+    let (bio_text, served_language) = match bio_pick.as_ref() {
+        Some((t, l)) => (Some(t.clone()), Some(l.clone())),
+        None => (None, None),
+    };
     let payload = serde_json::json!({
-        "summary": hit.bio_en,
+        "summary": bio_text,
+        "language": served_language,
         "genre": hit.genre,
         "formed_year": hit.formed_year,
         "source_url": hit.source_url,
@@ -1444,6 +1667,7 @@ async fn fetch_theaudiodb_bio(
     Some(SourceEntry {
         provider_id: ProviderId::TheAudioDb.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: served_language,
         payload,
         attribution: Attribution {
             source_name: "TheAudioDB".into(),
@@ -1460,13 +1684,27 @@ fn source_url_from_payload(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the reported language from a cached payload's
+/// `language` field. Locale-aware: caches store the language served
+/// alongside the prose so a cache-hit `SourceEntry` reports
+/// what was originally served, not `None`.
+fn language_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("language")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
 fn wikipedia_source_from_cached_payload(
     payload: serde_json::Value,
 ) -> SourceEntry {
     let source_url = source_url_from_payload(&payload);
+    let language = language_from_payload(&payload);
     SourceEntry {
         provider_id: ProviderId::Wikipedia.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language,
         payload,
         attribution: Attribution {
             source_name: "Wikipedia".into(),
@@ -1480,9 +1718,11 @@ fn wikidata_source_from_cached_payload(
     payload: serde_json::Value,
 ) -> SourceEntry {
     let source_url = source_url_from_payload(&payload);
+    let language = language_from_payload(&payload);
     SourceEntry {
         provider_id: ProviderId::Wikidata.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language,
         payload,
         attribution: Attribution {
             source_name: "Wikidata".into(),
@@ -1496,9 +1736,11 @@ fn lastfm_source_from_cached_payload(
     payload: serde_json::Value,
 ) -> SourceEntry {
     let source_url = source_url_from_payload(&payload);
+    let language = language_from_payload(&payload);
     SourceEntry {
         provider_id: ProviderId::Lastfm.as_str().to_string(),
         privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        language,
         payload,
         attribution: Attribution {
             source_name: "Last.fm".into(),
@@ -1512,9 +1754,11 @@ fn theaudiodb_source_from_cached_payload(
     payload: serde_json::Value,
 ) -> SourceEntry {
     let source_url = source_url_from_payload(&payload);
+    let language = language_from_payload(&payload);
     SourceEntry {
         provider_id: ProviderId::TheAudioDb.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language,
         payload,
         attribution: Attribution {
             source_name: "TheAudioDB".into(),
@@ -1544,6 +1788,13 @@ pub(crate) struct ReleaseCreditsCascadeRequest {
     album: Option<String>,
     #[serde(default)]
     release_mbid: Option<String>,
+    /// Operator UI locale (BCP47 short). the locale-aware fallback. Personnel /
+    /// credits are largely language-agnostic (names + roles),
+    /// but Discogs' release notes text honours the locale when
+    /// present. Absent = `"en"`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    locale: Option<String>,
 }
 
 /// MB confidence floor for accepting a `search_release` hit as
@@ -1646,6 +1897,7 @@ pub(crate) async fn query_release_credits_cascade(
                 "no release-credits found for {artist} — {album}"
             )),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         });
@@ -1727,6 +1979,7 @@ async fn fetch_musicbrainz_release_credits(
     Some(SourceEntry {
         provider_id: ProviderId::MusicBrainz.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: None,
         payload,
         attribution: Attribution {
             source_name: "MusicBrainz".into(),
@@ -1785,6 +2038,7 @@ async fn fetch_discogs_release_credits(
                 privacy_class: PrivacyClass::IdentityBearing
                     .as_str()
                     .to_string(),
+                language: None,
                 payload,
                 attribution: Attribution {
                     source_name: "Discogs".into(),
@@ -1815,6 +2069,7 @@ fn mb_release_credits_source_from_cached_payload(
     SourceEntry {
         provider_id: ProviderId::MusicBrainz.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: None,
         payload,
         attribution: Attribution {
             source_name: "MusicBrainz".into(),
@@ -1831,6 +2086,7 @@ fn discogs_source_from_cached_payload(
     SourceEntry {
         provider_id: ProviderId::Discogs.as_str().to_string(),
         privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        language: None,
         payload,
         attribution: Attribution {
             source_name: "Discogs".into(),
@@ -1912,6 +2168,11 @@ pub(crate) struct TrackAnnotationCascadeRequest {
     #[serde(default)]
     #[allow(dead_code)]
     recording_mbid: Option<String>,
+    /// Operator UI locale (BCP47 short). the locale-aware fallback. Wikipedia
+    /// track annotations honour the locale by editing edition;
+    /// Genius text falls through as English. Absent = `"en"`.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 pub(crate) async fn query_track_annotation_cascade(
@@ -1966,9 +2227,15 @@ pub(crate) async fn query_track_annotation_cascade(
         ));
     }
 
+    let operator_locale = locale::normalise(req.locale.as_deref());
     let (wp_src, genius_src) = tokio::join!(
         fetch_wikipedia_track_annotation(
-            &artist, &track, catalogue, cache, want_wp
+            &artist,
+            &track,
+            catalogue,
+            cache,
+            want_wp,
+            &operator_locale,
         ),
         fetch_genius_track_annotation(
             &artist,
@@ -1995,6 +2262,7 @@ pub(crate) async fn query_track_annotation_cascade(
                  enabled providers"
             )),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         });
@@ -2008,6 +2276,7 @@ async fn fetch_wikipedia_track_annotation(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
@@ -2019,6 +2288,8 @@ async fn fetch_wikipedia_track_annotation(
         &normalise(artist),
         &normalise(track),
         ProviderId::Wikipedia.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -2031,44 +2302,54 @@ async fn fetch_wikipedia_track_annotation(
     // disambiguated forms first, then bare-title. Songs rarely
     // have their own article, and the disambiguated forms
     // (`"{Track} ({Artist} song)"` / `"{Track} (song)"`) are
-    // Wikipedia's own convention.
+    // Wikipedia's own convention. Exhaust all title
+    // forms in the operator-locale edition BEFORE falling back
+    // to English.
     let candidate_titles = [
         format!("{track} ({artist} song)"),
         format!("{track} (song)"),
         track.to_string(),
     ];
     let mut wp_hit = None;
-    for candidate in &candidate_titles {
-        match wp.get_summary_en(candidate).await {
-            Ok(Some(summary)) => {
-                wp_hit = Some(summary);
-                break;
+    for lang in fallback_langs(operator_locale) {
+        for candidate in &candidate_titles {
+            match wp.get_summary(candidate, lang).await {
+                Ok(Some(summary)) => {
+                    wp_hit = Some(summary);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        title = %candidate,
+                        language = lang,
+                        error = %e,
+                        "Wikipedia song-title lookup transient / \
+                         not-usable; trying next form"
+                    );
+                    continue;
+                }
             }
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    plugin = crate::PLUGIN_NAME,
-                    provider = "wikipedia",
-                    title = %candidate,
-                    error = %e,
-                    "Wikipedia song-title lookup transient / \
-                     not-usable; trying next form"
-                );
-                continue;
-            }
+        }
+        if wp_hit.is_some() {
+            break;
         }
     }
     let summary = wp_hit?;
+    let served_language = summary.language.clone();
     let payload = serde_json::json!({
         "title": summary.title,
         "summary": summary.extract,
-        "language": summary.language,
+        "language": served_language,
         "source_url": summary.page_url,
     });
     let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
     Some(SourceEntry {
         provider_id: ProviderId::Wikipedia.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: Some(served_language),
         payload,
         attribution: Attribution {
             source_name: "Wikipedia".into(),
@@ -2116,6 +2397,7 @@ async fn fetch_genius_track_annotation(
                 privacy_class: PrivacyClass::IdentityBearing
                     .as_str()
                     .to_string(),
+                language: None,
                 payload,
                 attribution: Attribution {
                     source_name: "Genius".into(),
@@ -2146,6 +2428,7 @@ fn genius_source_from_cached_payload(
     SourceEntry {
         provider_id: ProviderId::Genius.as_str().to_string(),
         privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        language: None,
         payload,
         attribution: Attribution {
             source_name: "Genius".into(),
@@ -2175,6 +2458,13 @@ pub(crate) struct AlbumNotesCascadeRequest {
     /// (Wikipedia does not resolve on MBID).
     #[serde(default)]
     release_mbid: Option<String>,
+    /// Operator UI locale (BCP47 short). the locale-aware fallback. Wikipedia
+    /// resolves against the operator-locale edition;
+    /// TheAudioDB selects `strDescription<CC>`; Last.fm
+    /// stays English (its API is locale-agnostic). Absent =
+    /// `"en"`.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 pub(crate) async fn query_album_notes_cascade(
@@ -2230,8 +2520,11 @@ pub(crate) async fn query_album_notes_cascade(
         .config
         .is_effectively_enabled(ProviderId::TheAudioDb)
         && catalogue.theaudiodb.is_some();
+    let want_discogs =
+        catalogue.config.is_effectively_enabled(ProviderId::Discogs)
+            && catalogue.discogs.is_some();
 
-    if !(want_wp || want_lastfm || want_theaudiodb) {
+    if !(want_wp || want_lastfm || want_theaudiodb || want_discogs) {
         return Ok(CascadeResponse::not_configured(
             "every album-notes provider is disabled or unavailable on this \
              device; enable at least one under Settings → Metadata → \
@@ -2239,8 +2532,16 @@ pub(crate) async fn query_album_notes_cascade(
         ));
     }
 
-    let (wp_src, lastfm_src, tadb_src) = tokio::join!(
-        fetch_wikipedia_album_notes(&artist, &album, catalogue, cache, want_wp),
+    let operator_locale = locale::normalise(req.locale.as_deref());
+    let (wp_src, lastfm_src, tadb_src, discogs_src) = tokio::join!(
+        fetch_wikipedia_album_notes(
+            &artist,
+            &album,
+            catalogue,
+            cache,
+            want_wp,
+            &operator_locale,
+        ),
         fetch_lastfm_album_notes(
             &artist,
             &album,
@@ -2254,14 +2555,24 @@ pub(crate) async fn query_album_notes_cascade(
             &album,
             catalogue,
             cache,
-            want_theaudiodb
+            want_theaudiodb,
+            &operator_locale,
+        ),
+        fetch_discogs_album_notes(
+            &artist,
+            &album,
+            release_mbid_hint.as_deref(),
+            catalogue,
+            cache,
+            want_discogs,
         ),
     );
 
-    let mut sources: Vec<SourceEntry> = [wp_src, lastfm_src, tadb_src]
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut sources: Vec<SourceEntry> =
+        [wp_src, lastfm_src, tadb_src, discogs_src]
+            .into_iter()
+            .flatten()
+            .collect();
     cascade::sort_sources_by_priority(&mut sources, &catalogue.config);
 
     if sources.is_empty() {
@@ -2276,6 +2587,7 @@ pub(crate) async fn query_album_notes_cascade(
                  providers"
             )),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         });
@@ -2289,6 +2601,7 @@ async fn fetch_wikipedia_album_notes(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
@@ -2306,12 +2619,16 @@ async fn fetch_wikipedia_album_notes(
     // Sarah McLachlan"). Without this, tag variants sink into
     // clean-miss even when the article plainly exists.
     let normalised_album = normalise_album_query(album);
+    // Locale-scoped cache key so each language edition
+    // gets its own entry.
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
         &normalise(&normalised_album),
         ProviderId::Wikipedia.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -2329,38 +2646,52 @@ async fn fetch_wikipedia_album_notes(
         format!("{normalised_album} (album)"),
         normalised_album.clone(),
     ];
+    // Try each title in the operator-locale edition
+    // first; only after ALL titles miss in operator locale do
+    // we fall back to English. (The inverse — full title
+    // sequence in en first — would surface English content
+    // even when the operator locale has the article, defeating
+    // the locale-aware selector.)
     let mut wp_hit = None;
-    for candidate in &candidate_titles {
-        match wp.get_summary_en(candidate).await {
-            Ok(Some(summary)) => {
-                wp_hit = Some(summary);
-                break;
+    for lang in fallback_langs(operator_locale) {
+        for candidate in &candidate_titles {
+            match wp.get_summary(candidate, lang).await {
+                Ok(Some(summary)) => {
+                    wp_hit = Some(summary);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "wikipedia",
+                        title = %candidate,
+                        language = lang,
+                        error = %e,
+                        "Wikipedia album-title lookup transient / \
+                         not-usable; trying next form"
+                    );
+                    continue;
+                }
             }
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    plugin = crate::PLUGIN_NAME,
-                    provider = "wikipedia",
-                    title = %candidate,
-                    error = %e,
-                    "Wikipedia album-title lookup transient / \
-                     not-usable; trying next form"
-                );
-                continue;
-            }
+        }
+        if wp_hit.is_some() {
+            break;
         }
     }
     let summary = wp_hit?;
+    let served_language = summary.language.clone();
     let payload = serde_json::json!({
         "title": summary.title,
         "summary": summary.extract,
-        "language": summary.language,
+        "language": served_language,
         "source_url": summary.page_url,
     });
     let _ = cache.put_positive(&key, payload.clone(), "wikipedia");
     Some(SourceEntry {
         provider_id: ProviderId::Wikipedia.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: Some(served_language),
         payload,
         attribution: Attribution {
             source_name: "Wikipedia".into(),
@@ -2368,6 +2699,19 @@ async fn fetch_wikipedia_album_notes(
             license: "CC BY-SA".into(),
         },
     })
+}
+
+/// Language fallback chain: operator locale, then
+/// English (unless operator locale is already English). Used by
+/// bare-title-search helpers (Wikipedia album / work / track
+/// annotation) that don't have a Wikidata sitelink hop
+/// available.
+fn fallback_langs(operator_locale: &str) -> Vec<&str> {
+    if operator_locale == "en" {
+        vec!["en"]
+    } else {
+        vec![operator_locale, "en"]
+    }
 }
 
 async fn fetch_lastfm_album_notes(
@@ -2416,6 +2760,7 @@ async fn fetch_lastfm_album_notes(
                 privacy_class: PrivacyClass::IdentityBearing
                     .as_str()
                     .to_string(),
+                language: None,
                 payload,
                 attribution: Attribution {
                     source_name: "Last.fm".into(),
@@ -2457,6 +2802,7 @@ async fn fetch_theaudiodb_album_notes(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
@@ -2465,12 +2811,15 @@ async fn fetch_theaudiodb_album_notes(
     // Same normalisation as the other album helpers — TheAudioDB's
     // search matches on canonical album titles.
     let normalised_album = normalise_album_query(album);
+    // Locale-scoped cache key.
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
         &normalise(&normalised_album),
         ProviderId::TheAudioDb.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -2495,21 +2844,18 @@ async fn fetch_theaudiodb_album_notes(
             return None;
         }
     };
-    // TheAudioDB's album records sometimes carry only a
-    // release year + label without any prose. Suppress the
-    // entry when there's no renderable text.
-    let desc_present = hit
-        .description_en
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some();
+    // Locale-aware pick for the album description.
+    let desc_pick = hit.description_for_locale(operator_locale);
+    let desc_present = desc_pick.is_some();
     let review_present = hit
         .review
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .is_some();
+    // TheAudioDB's album records sometimes carry only a
+    // release year + label without any prose. Suppress the
+    // entry when there's no renderable text.
     if !desc_present
         && !review_present
         && hit.year.is_none()
@@ -2517,8 +2863,13 @@ async fn fetch_theaudiodb_album_notes(
     {
         return None;
     }
+    let (desc_text, served_language) = match desc_pick.as_ref() {
+        Some((t, l)) => (Some(t.clone()), Some(l.clone())),
+        None => (None, None),
+    };
     let payload = serde_json::json!({
-        "summary": hit.description_en,
+        "summary": desc_text,
+        "language": served_language,
         "review": hit.review,
         "year": hit.year,
         "label": hit.label,
@@ -2528,11 +2879,184 @@ async fn fetch_theaudiodb_album_notes(
     Some(SourceEntry {
         provider_id: ProviderId::TheAudioDb.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: served_language,
         payload,
         attribution: Attribution {
             source_name: "TheAudioDB".into(),
             source_url: Some(hit.source_url),
             license: "TheAudioDB terms of use".into(),
+        },
+    })
+}
+
+/// Discogs album-notes helper. MBID-first per the enrichment flow: the
+/// MusicBrainz release lookup surfaces the `discogs` url-rel
+/// (when MB carries one), the plugin parses the release id from
+/// that URL and hits Discogs's `/releases/{id}` endpoint
+/// directly. Name-search is the last-resort fallback for
+/// releases MB has not yet linked to Discogs.
+///
+/// Discogs is THE primary album-notes source for this device's
+/// niche / audiophile / SACD / DSD catalogue. Wikipedia +
+/// Last.fm + TheAudioDB miss on labels like Blue Coast Records,
+/// Tiny Island Music, and countless small-run audiophile
+/// pressings. The `release.notes` field on Discogs carries the
+/// album's liner text; label / catno / format land alongside so
+/// the operator UI can surface all four as one Discogs entry.
+async fn fetch_discogs_album_notes(
+    artist: &str,
+    album: &str,
+    release_mbid_hint: Option<&str>,
+    catalogue: &ProviderCatalogue,
+    cache: &EnrichmentCache,
+    enabled: bool,
+) -> Option<SourceEntry> {
+    if !enabled {
+        return None;
+    }
+    let discogs = catalogue.discogs.as_ref()?;
+    let normalised_album = normalise_album_query(album);
+    // Cache key mirrors the other album-notes helpers'
+    // (artist, normalised_album, provider) partition. Discogs
+    // album notes are language-agnostic (the wiki text
+    // contributors write in whatever language they picked),
+    // so no locale scope is needed here.
+    let key = EnrichmentCache::key_for(&[
+        "album_notes",
+        "album",
+        &normalise(artist),
+        &normalise(&normalised_album),
+        ProviderId::Discogs.as_str(),
+    ]);
+    if let Some(entry) = cache.get(&key) {
+        if entry.status == "ok" {
+            if let Some(p) = entry.payload {
+                return Some(discogs_source_from_cached_payload(p));
+            }
+        }
+    }
+
+    // Path 1 — MBID-first per the enrichment flow. When the caller passed a
+    // release MBID, MB's release lookup surfaces `discogs`
+    // url-rel; we parse the id and hit Discogs directly. This
+    // sidesteps Discogs's fuzzy `(artist, album)` search
+    // entirely for MB-linked releases.
+    let mut hit = None;
+    if let (Some(mb), Some(mbid)) =
+        (catalogue.musicbrainz.as_ref(), release_mbid_hint)
+    {
+        match mb.lookup_release(mbid).await {
+            Ok(release_lookup) => {
+                if let Some(discogs_url) = release_lookup.discogs_url.as_deref()
+                {
+                    match evo_online_providers::discogs::parse_discogs_release_id(
+                        discogs_url,
+                    ) {
+                        Some(release_id) => {
+                            match discogs.get_release_by_id(release_id).await {
+                                Ok(Some(h)) => hit = Some(h),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        plugin = crate::PLUGIN_NAME,
+                                        provider = "discogs",
+                                        release_id,
+                                        error = %discogs_error_message(&e),
+                                        "Discogs release-by-id transient; \
+                                         trying name-search fallback"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::debug!(
+                                plugin = crate::PLUGIN_NAME,
+                                provider = "discogs",
+                                url = discogs_url,
+                                "MB `discogs` url-rel did not parse to a \
+                                 release id (may be a master/label link); \
+                                 falling back to name search"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "musicbrainz",
+                    release_mbid = mbid,
+                    error = %e,
+                    "MB release lookup transient for Discogs url-rel; \
+                     falling back to name search"
+                );
+            }
+        }
+    }
+
+    // Path 2 — name-search fallback. Uses the normalised album
+    // title so `(Deluxe Version)` etc. don't sink the lookup.
+    if hit.is_none() {
+        match discogs.get_release_detail(artist, &normalised_album).await {
+            Ok(Some(h)) => hit = Some(h),
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "discogs",
+                    artist,
+                    album,
+                    normalised_album,
+                    error = %discogs_error_message(&e),
+                    "Discogs release-search transient; skipping"
+                );
+                return None;
+            }
+        }
+    }
+
+    let hit = hit?;
+    // Discogs releases sometimes carry only structured facts
+    // (label / format / catno) without any prose notes.
+    // Suppress the entry when there's no renderable text AND
+    // no useful structured facts — a fully-empty entry helps
+    // no one.
+    let notes = hit
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if notes.is_none()
+        && hit.label.is_none()
+        && hit.format.is_none()
+        && hit.year.is_none()
+    {
+        return None;
+    }
+
+    let source_url = hit.source_url.clone().unwrap_or_else(|| {
+        format!("https://www.discogs.com/release/{}", hit.release_id)
+    });
+    let payload = serde_json::json!({
+        "summary": notes,
+        "label": hit.label,
+        "catalog_number": hit.catalog_number,
+        "format": hit.format,
+        "year": hit.year,
+        "country": hit.country,
+        "release_id": hit.release_id,
+        "source_url": source_url,
+    });
+    let _ = cache.put_positive(&key, payload.clone(), "discogs");
+    Some(SourceEntry {
+        provider_id: ProviderId::Discogs.as_str().to_string(),
+        privacy_class: PrivacyClass::IdentityBearing.as_str().to_string(),
+        language: None,
+        payload,
+        attribution: Attribution {
+            source_name: "Discogs".into(),
+            source_url: Some(source_url),
+            license: "Discogs terms of use".into(),
         },
     })
 }
@@ -2568,6 +3092,11 @@ pub(crate) struct WorkNotesCascadeRequest {
     /// composers wrote pieces titled `"Symphony No. 5"`).
     #[serde(default)]
     composer: Option<String>,
+    /// Operator UI locale (BCP47 short). the locale-aware fallback. Wikipedia
+    /// work page honours the locale; Wikidata description
+    /// selects the operator-locale label. Absent = `"en"`.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 /// MB confidence floor for a `search_work` hit to be adopted as
@@ -2702,6 +3231,7 @@ pub(crate) async fn query_work_notes_cascade(
         .clone()
         .or_else(|| work_name.clone())
         .unwrap_or_default();
+    let operator_locale = locale::normalise(req.locale.as_deref());
     let (wp_src, wd_src) = tokio::join!(
         fetch_wikipedia_work_notes(
             &cache_name,
@@ -2713,6 +3243,7 @@ pub(crate) async fn query_work_notes_cascade(
             catalogue,
             cache,
             want_wp,
+            &operator_locale,
         ),
         fetch_wikidata_work_notes(
             &cache_name,
@@ -2722,6 +3253,7 @@ pub(crate) async fn query_work_notes_cascade(
             catalogue,
             cache,
             want_wd,
+            &operator_locale,
         ),
     );
 
@@ -2744,6 +3276,7 @@ pub(crate) async fn query_work_notes_cascade(
                     .unwrap_or_else(|| "the requested work".to_string())
             )),
             attribution: None,
+            language: None,
             enhancement: None,
             sources: Vec::new(),
         });
@@ -2751,7 +3284,7 @@ pub(crate) async fn query_work_notes_cascade(
     Ok(CascadeResponse::from_sources(sources, None))
 }
 
-// 9 args reflect the parallel-dispatch shape — the work-notes
+// 10 args reflect the parallel-dispatch shape — the work-notes
 // verb's MB identity-resolve phase produces four downstream
 // signals (wikipedia_url, work_mbid, canonical_title,
 // work_type) that both leaf helpers consume; grouping them
@@ -2767,6 +3300,7 @@ async fn fetch_wikipedia_work_notes(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
@@ -2777,6 +3311,8 @@ async fn fetch_wikipedia_work_notes(
         "work",
         &normalise(cache_name),
         ProviderId::Wikipedia.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -2785,15 +3321,33 @@ async fn fetch_wikipedia_work_notes(
             }
         }
     }
+    // If MB gave us a URL, honour it (the URL is MBID-
+    // authoritative for THIS work; its language is what MB
+    // knows about). Otherwise search canonical_title, then
+    // work_name, each in operator locale → English.
     let hit = match wikipedia_url {
         Some(url) => wp.get_summary_from_url(url).await,
-        None => match canonical_title {
-            Some(title) => wp.get_summary_en(title).await,
-            None => match work_name {
-                Some(name) => wp.get_summary_en(name).await,
-                None => Ok(None),
-            },
-        },
+        None => {
+            let mut fetched = Ok(None);
+            'outer: for lang in fallback_langs(operator_locale) {
+                for candidate in canonical_title.into_iter().chain(work_name) {
+                    match wp.get_summary(candidate, lang).await {
+                        Ok(Some(s)) => {
+                            fetched = Ok(Some(s));
+                            break 'outer;
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            fetched = Err(e);
+                            // Try next language / candidate rather
+                            // than aborting — a transient on one
+                            // form still lets the fallback land.
+                        }
+                    }
+                }
+            }
+            fetched
+        }
     };
     let summary = match hit {
         Ok(Some(s)) => s,
@@ -2809,10 +3363,11 @@ async fn fetch_wikipedia_work_notes(
             return None;
         }
     };
+    let served_language = summary.language.clone();
     let payload = serde_json::json!({
         "title": summary.title,
         "summary": summary.extract,
-        "language": summary.language,
+        "language": served_language,
         "work_mbid": resolved_work_mbid,
         "work_type": work_type,
         "source_url": summary.page_url,
@@ -2821,6 +3376,7 @@ async fn fetch_wikipedia_work_notes(
     Some(SourceEntry {
         provider_id: ProviderId::Wikipedia.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: Some(served_language),
         payload,
         attribution: Attribution {
             source_name: "Wikipedia".into(),
@@ -2830,6 +3386,7 @@ async fn fetch_wikipedia_work_notes(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_wikidata_work_notes(
     cache_name: &str,
     wikidata_url: Option<&str>,
@@ -2838,6 +3395,7 @@ async fn fetch_wikidata_work_notes(
     catalogue: &ProviderCatalogue,
     cache: &EnrichmentCache,
     enabled: bool,
+    operator_locale: &str,
 ) -> Option<SourceEntry> {
     if !enabled {
         return None;
@@ -2849,6 +3407,8 @@ async fn fetch_wikidata_work_notes(
         "work",
         &normalise(cache_name),
         ProviderId::Wikidata.as_str(),
+        "loc",
+        operator_locale,
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
@@ -2871,9 +3431,16 @@ async fn fetch_wikidata_work_notes(
             return None;
         }
     };
+    let label_pick = entity_hit.label_for(operator_locale);
+    let description_pick = entity_hit.description_for(operator_locale);
+    let served_language = description_pick
+        .as_ref()
+        .map(|(_, l)| l.clone())
+        .or_else(|| label_pick.as_ref().map(|(_, l)| l.clone()));
     let payload = serde_json::json!({
-        "label": entity_hit.label_en,
-        "description": entity_hit.description_en,
+        "label": label_pick.as_ref().map(|(t, _)| t),
+        "description": description_pick.as_ref().map(|(t, _)| t),
+        "language": served_language,
         "inception": entity_hit.inception,
         "genre_ids": entity_hit.genre_ids,
         "work_mbid": resolved_work_mbid,
@@ -2884,6 +3451,7 @@ async fn fetch_wikidata_work_notes(
     Some(SourceEntry {
         provider_id: ProviderId::Wikidata.as_str().to_string(),
         privacy_class: PrivacyClass::Anonymous.as_str().to_string(),
+        language: served_language,
         payload,
         attribution: Attribution {
             source_name: "Wikidata".into(),

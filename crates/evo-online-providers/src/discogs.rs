@@ -149,6 +149,12 @@ impl DiscogsClient {
     /// pair. Returns `Err` on transport / decode failure or when
     /// the fetch succeeds but the detail JSON is missing every
     /// interesting field.
+    ///
+    /// **Name-last fallback.** Callers with a MusicBrainz release
+    /// MBID should first walk MB's `discogs` url-rel and call
+    /// [`Self::get_release_by_id`] on the resulting id — that's
+    /// the MBID-first path. This method is the last-resort
+    /// surface for releases without a MB→Discogs link.
     pub async fn get_release_detail(
         &self,
         artist: &str,
@@ -163,7 +169,20 @@ impl DiscogsClient {
         let Some(first) = search.results.into_iter().next() else {
             return Ok(None);
         };
-        let detail_url = format!("{DISCOGS_API_BASE}/releases/{}", first.id);
+        self.get_release_by_id(first.id).await
+    }
+
+    /// Fetch release detail by Discogs release id — the MBID-
+    /// first path. Callers resolve the id from a
+    /// MusicBrainz release's `discogs` url-rel
+    /// (parseable with [`parse_discogs_release_id`]) and then
+    /// hit this endpoint directly, bypassing Discogs's fuzzy
+    /// `(artist, album)` search.
+    pub async fn get_release_by_id(
+        &self,
+        release_id: u64,
+    ) -> Result<Option<ReleaseDetailHit>, DiscogsError> {
+        let detail_url = format!("{DISCOGS_API_BASE}/releases/{release_id}");
         let detail: ReleaseDetail = self.get_json(detail_url).await?;
         let label = detail
             .labels
@@ -181,7 +200,7 @@ impl DiscogsClient {
             .and_then(|v| v.first())
             .and_then(|f| f.name.clone());
         Ok(Some(ReleaseDetailHit {
-            release_id: first.id,
+            release_id,
             label,
             catalog_number,
             year: detail.year,
@@ -189,8 +208,7 @@ impl DiscogsClient {
             format,
             notes: detail.notes,
             source_url: Some(format!(
-                "https://www.discogs.com/release/{}",
-                first.id
+                "https://www.discogs.com/release/{release_id}"
             )),
         }))
     }
@@ -270,6 +288,41 @@ struct ArtistSearchResponse {
 struct ArtistDetail {
     #[serde(default)]
     profile: Option<String>,
+}
+
+/// Extract the numeric Discogs release id from a MusicBrainz
+/// `discogs` url-rel resource string.
+///
+/// MB stores discogs URLs in one of these shapes:
+///
+///   `https://www.discogs.com/release/17279182`
+///   `https://www.discogs.com/release/17279182-Fiona-Joy-Signature-Solo`
+///   `http://www.discogs.com/release/17279182-...`
+///
+/// Returns `None` for URLs that don't match — a Discogs
+/// URL pointing at a MASTER (`/master/<id>`) rather than a
+/// release, or a non-Discogs URL. Callers treat the None as a
+/// clean miss and fall through to the name-search path.
+pub fn parse_discogs_release_id(url: &str) -> Option<u64> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = after_scheme.split_once('/')?;
+    if host != "www.discogs.com" && host != "discogs.com" {
+        return None;
+    }
+    let after_release = path.strip_prefix("release/")?;
+    // The id is the leading digits; everything after `-` /
+    // `?` / `#` is slug or query.
+    let id_str: String = after_release
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if id_str.is_empty() {
+        None
+    } else {
+        id_str.parse::<u64>().ok()
+    }
 }
 
 fn urlencode(s: &str) -> String {

@@ -74,18 +74,26 @@ pub enum TheAudioDbError {
 /// Artist-bio hit surfaced by [`TheAudioDbClient::search_artist_bio`].
 ///
 /// Every field is `Option` because TheAudioDB's response fields
-/// are individually populated per artist. A response with just
-/// `bio_en` present is common and usable; the caller decides
-/// how to render partial hits.
+/// are individually populated per artist.
+///
+/// Locale-aware selection note: TheAudioDB carries per-locale biographies on
+/// `strBiography` (English base) + `strBiography<CC>` (DE / FR /
+/// ES / IT / JP / RU / CN / PT / NL / PL / HU / IL / SE / NO).
+/// The caller reaches for [`Self::bio_for_locale`] which picks
+/// operator locale → English → any-non-empty and reports the
+/// language actually served — never a "false empty" for a
+/// locale the API happens not to carry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtistBioHit {
     /// TheAudioDB internal artist id, used to construct the
     /// attribution URL back to the artist's page.
     pub artist_id: String,
-    /// The `strBiographyEN` field — English-language biography
-    /// prose. This is the primary bio content the cascade
-    /// consumes.
-    pub bio_en: Option<String>,
+    /// The per-locale bio map — key is a BCP47 short language
+    /// tag (`"en"`, `"de"`, ...), value is the non-empty prose
+    /// the API returned for that locale. operator-locale → English → any-non-empty
+    /// fallback chain runs over this map, not over one
+    /// specific field.
+    pub bios_by_locale: std::collections::HashMap<String, String>,
     /// The `strArtistThumb` field — canonical URL to a
     /// thumbnail image of the artist. Consumers that render
     /// artist artwork can use it; not persisted by the plugin.
@@ -99,14 +107,39 @@ pub struct ArtistBioHit {
     pub source_url: String,
 }
 
+impl ArtistBioHit {
+    /// Fallback pick: try the operator locale, then
+    /// English, then any non-empty entry the response carries.
+    /// Returns `(bio_text, language_actually_served)`. Callers
+    /// report `language_actually_served` on `SourceEntry.language`.
+    pub fn bio_for_locale(&self, locale: &str) -> Option<(String, String)> {
+        if let Some(b) = self.bios_by_locale.get(locale) {
+            return Some((b.clone(), locale.to_string()));
+        }
+        if locale != "en" {
+            if let Some(b) = self.bios_by_locale.get("en") {
+                return Some((b.clone(), "en".to_string()));
+            }
+        }
+        self.bios_by_locale
+            .iter()
+            .next()
+            .map(|(l, b)| (b.clone(), l.clone()))
+    }
+}
+
 /// Album-notes hit surfaced by [`TheAudioDbClient::search_album_notes`].
+///
+/// Same shape as [`ArtistBioHit`]: `strDescription`
+/// (English base) + `strDescription<CC>` per locale, accessed
+/// via [`Self::description_for_locale`] with the
+/// operator → English → any-non-empty fallback chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlbumNotesHit {
     /// TheAudioDB internal album id.
     pub album_id: String,
-    /// The `strDescriptionEN` field — English-language album
-    /// description. Primary album-notes content.
-    pub description_en: Option<String>,
+    /// Per-locale description map.
+    pub descriptions_by_locale: std::collections::HashMap<String, String>,
     /// The `strReview` field — editorial review text (when
     /// TheAudioDB has one for the album).
     pub review: Option<String>,
@@ -117,6 +150,28 @@ pub struct AlbumNotesHit {
     pub label: Option<String>,
     /// Canonical URL back to the album's TheAudioDB page.
     pub source_url: String,
+}
+
+impl AlbumNotesHit {
+    /// Fallback pick for album descriptions. Same
+    /// contract as [`ArtistBioHit::bio_for_locale`].
+    pub fn description_for_locale(
+        &self,
+        locale: &str,
+    ) -> Option<(String, String)> {
+        if let Some(d) = self.descriptions_by_locale.get(locale) {
+            return Some((d.clone(), locale.to_string()));
+        }
+        if locale != "en" {
+            if let Some(d) = self.descriptions_by_locale.get("en") {
+                return Some((d.clone(), "en".to_string()));
+            }
+        }
+        self.descriptions_by_locale
+            .iter()
+            .next()
+            .map(|(l, d)| (d.clone(), l.clone()))
+    }
 }
 
 /// TheAudioDB JSON client.
@@ -263,7 +318,7 @@ impl TheAudioDbClient {
         };
         Some(ArtistBioHit {
             artist_id,
-            bio_en: artist_entry.str_biography_en.and_then(nonempty),
+            bios_by_locale: collect_bios_by_locale(&artist_entry.extra),
             artist_thumb_url: artist_entry.str_artist_thumb.and_then(nonempty),
             genre: artist_entry.str_genre.and_then(nonempty),
             formed_year: artist_entry
@@ -327,7 +382,9 @@ impl TheAudioDbClient {
         };
         Ok(Some(AlbumNotesHit {
             album_id,
-            description_en: album_entry.str_description_en.and_then(nonempty),
+            descriptions_by_locale: collect_descriptions_by_locale(
+                &album_entry.extra,
+            ),
             review: album_entry.str_review.and_then(nonempty),
             year: album_entry
                 .int_year_released
@@ -336,6 +393,76 @@ impl TheAudioDbClient {
             label: album_entry.str_label.and_then(nonempty),
             source_url,
         }))
+    }
+}
+
+/// Extract every `strBiography<CC>` (and the base `strBiography`
+/// = English) into a `{lang_short: text}` map. Empty / whitespace
+/// values are dropped so the fallback chain doesn't hit a
+/// spuriously-populated locale.
+fn collect_bios_by_locale(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> std::collections::HashMap<String, String> {
+    collect_locale_map(extra, "strBiography")
+}
+
+/// Same shape as [`collect_bios_by_locale`] but for
+/// `strDescription<CC>` on the album endpoint.
+fn collect_descriptions_by_locale(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> std::collections::HashMap<String, String> {
+    collect_locale_map(extra, "strDescription")
+}
+
+fn collect_locale_map(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+    prefix: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for (key, value) in extra {
+        let Some(suffix) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `strBiography` (no suffix) is TheAudioDB's English base.
+        let lang = if suffix.is_empty() {
+            "en".to_string()
+        } else {
+            country_code_to_lang(suffix).to_string()
+        };
+        out.insert(lang, trimmed.to_string());
+    }
+    out
+}
+
+/// Map TheAudioDB's country-coded suffix back to a BCP47 short
+/// language tag. Inverse of
+/// `crate::locale::theaudiodb_country_code`. Unknown suffixes
+/// pass through lower-cased — the caller may still match them
+/// against a locale from the same family.
+fn country_code_to_lang(cc: &str) -> String {
+    match cc {
+        "DE" => "de".into(),
+        "FR" => "fr".into(),
+        "ES" => "es".into(),
+        "IT" => "it".into(),
+        "JP" => "ja".into(),
+        "RU" => "ru".into(),
+        "CN" => "zh".into(),
+        "PT" => "pt".into(),
+        "NL" => "nl".into(),
+        "PL" => "pl".into(),
+        "HU" => "hu".into(),
+        "IL" => "he".into(),
+        "SE" => "sv".into(),
+        "NO" => "no".into(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
@@ -364,14 +491,21 @@ struct ArtistSearchRoot {
 struct ArtistEntry {
     #[serde(rename = "idArtist")]
     id_artist: Option<String>,
-    #[serde(rename = "strBiographyEN")]
-    str_biography_en: Option<String>,
     #[serde(rename = "strArtistThumb")]
     str_artist_thumb: Option<String>,
     #[serde(rename = "strGenre")]
     str_genre: Option<String>,
     #[serde(rename = "intFormedYear")]
     int_formed_year: Option<String>,
+    /// TheAudioDB emits `strBiography` (English base)
+    /// plus `strBiography<CC>` per locale. The full response
+    /// carries ~40 other fields we don't consume — the caller
+    /// only reads the biography set, so a `flatten` capture
+    /// keeps every locale variant available for
+    /// [`ArtistBioHit::bio_for_locale`] without a per-locale
+    /// field explosion here.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,14 +518,17 @@ struct AlbumSearchRoot {
 struct AlbumEntry {
     #[serde(rename = "idAlbum")]
     id_album: Option<String>,
-    #[serde(rename = "strDescriptionEN")]
-    str_description_en: Option<String>,
     #[serde(rename = "strReview")]
     str_review: Option<String>,
     #[serde(rename = "intYearReleased")]
     int_year_released: Option<String>,
     #[serde(rename = "strLabel")]
     str_label: Option<String>,
+    /// `strDescription` (English base) + per-locale
+    /// `strDescription<CC>` — same shape as the artist bio
+    /// response.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -438,13 +575,17 @@ mod tests {
 
     #[test]
     fn artist_search_root_decodes_populated_response() {
-        // Minimal shape of TheAudioDB's real response — one artist
-        // with the fields the cascade consumes.
+        // TheAudioDB has NO `strBiographyEN`; the
+        // English base lives on `strBiography` and per-locale
+        // variants land on `strBiography<CC>`. The flattened
+        // `extra` map captures every prose-carrying field so
+        // `bio_for_locale` can pick the operator locale.
         let body = r#"{
             "artists": [{
                 "idArtist": "111239",
                 "strArtist": "Radiohead",
-                "strBiographyEN": "Radiohead are an English rock band...",
+                "strBiography": "Radiohead are an English rock band...",
+                "strBiographyDE": "Radiohead ist eine britische Rockband...",
                 "strArtistThumb": "https://example.com/thumb.jpg",
                 "strGenre": "Alternative Rock",
                 "intFormedYear": "1985"
@@ -458,11 +599,80 @@ mod tests {
             .next()
             .expect("first entry present");
         assert_eq!(entry.id_artist.as_deref(), Some("111239"));
-        assert!(entry
-            .str_biography_en
-            .as_ref()
-            .is_some_and(|s| s.starts_with("Radiohead are")));
         assert_eq!(entry.int_formed_year.as_deref(), Some("1985"));
+        // English base + DE variant both land in `extra`.
+        assert!(entry
+            .extra
+            .get("strBiography")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("Radiohead are")));
+        assert!(entry
+            .extra
+            .get("strBiographyDE")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("Radiohead ist")));
+    }
+
+    #[test]
+    fn bio_for_locale_picks_operator_locale_then_english_then_any() {
+        // Positive: operator locale populated → served in that
+        // locale.
+        let hit_full = TheAudioDbClient::first_artist_to_bio_hit(
+            serde_json::from_str(
+                r#"{"artists":[{
+                    "idArtist":"1",
+                    "strBiography":"english base",
+                    "strBiographyDE":"deutsche version"
+                }]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (text, lang) = hit_full.bio_for_locale("de").unwrap();
+        assert_eq!(lang, "de");
+        assert_eq!(text, "deutsche version");
+
+        // Fallback 1: operator locale absent, English present.
+        let hit_no_de = TheAudioDbClient::first_artist_to_bio_hit(
+            serde_json::from_str(
+                r#"{"artists":[{
+                    "idArtist":"1",
+                    "strBiography":"english base"
+                }]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (text, lang) = hit_no_de.bio_for_locale("de").unwrap();
+        assert_eq!(lang, "en", "German absent → English fallback");
+        assert_eq!(text, "english base");
+
+        // Fallback 2: operator locale AND English absent, but
+        // some other locale present — serve that, honestly
+        // labelled.
+        let hit_only_fr = TheAudioDbClient::first_artist_to_bio_hit(
+            serde_json::from_str(
+                r#"{"artists":[{
+                    "idArtist":"1",
+                    "strBiographyFR":"version française"
+                }]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (text, lang) = hit_only_fr.bio_for_locale("de").unwrap();
+        assert_eq!(
+            lang, "fr",
+            "German + English absent → any-non-empty (fr), labelled fr"
+        );
+        assert_eq!(text, "version française");
+
+        // Nothing at all: honest None (empty bio pane in the UI).
+        let hit_empty = TheAudioDbClient::first_artist_to_bio_hit(
+            serde_json::from_str(r#"{"artists":[{"idArtist":"1"}]}"#).unwrap(),
+        )
+        .unwrap();
+        assert!(hit_empty.bio_for_locale("de").is_none());
     }
 
     #[test]
@@ -476,11 +686,15 @@ mod tests {
 
     #[test]
     fn album_search_root_decodes_populated_response() {
+        // Same shape as bio: `strDescription` (English base) +
+        // `strDescription<CC>` per locale, both captured via
+        // the flattened `extra` map.
         let body = r#"{
             "album": [{
                 "idAlbum": "2109547",
                 "strAlbum": "OK Computer",
-                "strDescriptionEN": "OK Computer is a landmark...",
+                "strDescription": "OK Computer is a landmark...",
+                "strDescriptionDE": "OK Computer ist ein Meilenstein...",
                 "strReview": "A widely acclaimed album...",
                 "intYearReleased": "1997",
                 "strLabel": "Parlophone"
@@ -489,12 +703,18 @@ mod tests {
         let root: AlbumSearchRoot = serde_json::from_str(body).unwrap();
         let entry = root.album.unwrap().into_iter().next().unwrap();
         assert_eq!(entry.id_album.as_deref(), Some("2109547"));
-        assert!(entry
-            .str_description_en
-            .as_ref()
-            .is_some_and(|s| s.starts_with("OK Computer")));
         assert_eq!(entry.int_year_released.as_deref(), Some("1997"));
         assert_eq!(entry.str_label.as_deref(), Some("Parlophone"));
+        assert!(entry
+            .extra
+            .get("strDescription")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("OK Computer")));
+        assert!(entry
+            .extra
+            .get("strDescriptionDE")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("OK Computer ist")));
     }
 
     #[test]

@@ -111,8 +111,83 @@ pub struct WikidataEntityHit {
     /// result to Wikipedia (CC BY-SA) rather than falling back
     /// to Wikidata's one-line description as bio content.
     pub enwiki_title: Option<String>,
+    /// Per-site sitelinks map keyed by Wikidata site id
+    /// (`"enwiki"`, `"dewiki"`, `"frwiki"`, ...). Values are
+    /// the page titles on that site. Cascade callers
+    /// pick `{operator_lang}wiki` first, fall back to
+    /// `enwiki`, then any remaining sitelink so a non-English
+    /// operator locale still lands on a real article.
+    pub sitelinks: std::collections::HashMap<String, String>,
+    /// Per-language label map (Wikidata calls these "labels").
+    /// Pick the operator-locale label if present, else
+    /// English, else any.
+    pub labels: std::collections::HashMap<String, String>,
+    /// Per-language description map. Wikidata descriptions are
+    /// one-line and language-scoped; callers pick the
+    /// operator-locale variant.
+    pub descriptions: std::collections::HashMap<String, String>,
     /// Canonical Wikidata entity page URL (attribution).
     pub entity_url: String,
+}
+
+impl WikidataEntityHit {
+    /// Return the sitelink title for the operator-preferred
+    /// language edition (`"de"` → `"dewiki"`), applying the operator-locale
+    /// fallback chain: operator locale → English → any. The
+    /// returned tuple is `(wiki_site_id, article_title)` so
+    /// callers can construct the operator-locale summary URL
+    /// via `{site_without_wiki}.wikipedia.org/...`.
+    pub fn sitelink_for(&self, lang: &str) -> Option<(String, String)> {
+        let candidate = format!("{lang}wiki");
+        if let Some(title) = self.sitelinks.get(&candidate) {
+            return Some((candidate, title.clone()));
+        }
+        if lang != "en" {
+            if let Some(title) = self.sitelinks.get("enwiki") {
+                return Some(("enwiki".into(), title.clone()));
+            }
+        }
+        self.sitelinks
+            .iter()
+            .next()
+            .map(|(site, title)| (site.clone(), title.clone()))
+    }
+
+    /// Return `(text, language_actually_served)` for this
+    /// entity's description, applying the operator-locale fallback chain.
+    /// `language_actually_served` is the BCP47 short tag the
+    /// caller reports on `SourceEntry.language`.
+    pub fn description_for(&self, lang: &str) -> Option<(String, String)> {
+        if let Some(v) = self.descriptions.get(lang) {
+            return Some((v.clone(), lang.to_string()));
+        }
+        if lang != "en" {
+            if let Some(v) = self.descriptions.get("en") {
+                return Some((v.clone(), "en".to_string()));
+            }
+        }
+        self.descriptions
+            .iter()
+            .next()
+            .map(|(l, v)| (v.clone(), l.clone()))
+    }
+
+    /// Return `(text, language_actually_served)` for this
+    /// entity's label, applying the operator-locale fallback chain.
+    pub fn label_for(&self, lang: &str) -> Option<(String, String)> {
+        if let Some(v) = self.labels.get(lang) {
+            return Some((v.clone(), lang.to_string()));
+        }
+        if lang != "en" {
+            if let Some(v) = self.labels.get("en") {
+                return Some((v.clone(), "en".to_string()));
+            }
+        }
+        self.labels
+            .iter()
+            .next()
+            .map(|(l, v)| (v.clone(), l.clone()))
+    }
 }
 
 /// Wikidata entity client. Anonymous, rate-limited via the
@@ -274,9 +349,40 @@ fn entity_hit_from_response(
     entity_id: &str,
     body: &EntityBody,
 ) -> WikidataEntityHit {
-    let label_en = body.labels.get("en").and_then(|l| l.value.clone());
-    let description_en =
-        body.descriptions.get("en").and_then(|d| d.value.clone());
+    let labels: std::collections::HashMap<String, String> = body
+        .labels
+        .iter()
+        .filter_map(|(lang, lv)| {
+            lv.value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .map(|v| (lang.clone(), v))
+        })
+        .collect();
+    let descriptions: std::collections::HashMap<String, String> = body
+        .descriptions
+        .iter()
+        .filter_map(|(lang, lv)| {
+            lv.value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .map(|v| (lang.clone(), v))
+        })
+        .collect();
+    let sitelinks: std::collections::HashMap<String, String> = body
+        .sitelinks
+        .iter()
+        .filter_map(|(site, entry)| {
+            entry
+                .title
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .map(|t| (site.clone(), t))
+        })
+        .collect();
+    let label_en = labels.get("en").cloned();
+    let description_en = descriptions.get("en").cloned();
+    let enwiki_title = sitelinks.get("enwiki").cloned();
     let date_of_birth = first_time_value(&body.claims, "P569");
     let date_of_death = first_time_value(&body.claims, "P570");
     let inception = first_time_value(&body.claims, "P571");
@@ -286,11 +392,6 @@ fn entity_hit_from_response(
     let country_of_origin_id = first_entity_id(&body.claims, "P495");
     let occupation_ids = all_entity_ids(&body.claims, "P106");
     let genre_ids = all_entity_ids(&body.claims, "P136");
-    let enwiki_title = body
-        .sitelinks
-        .get("enwiki")
-        .and_then(|entry| entry.title.clone())
-        .filter(|s| !s.trim().is_empty());
     WikidataEntityHit {
         entity_id: entity_id.to_string(),
         label_en,
@@ -305,6 +406,9 @@ fn entity_hit_from_response(
         occupation_ids,
         genre_ids,
         enwiki_title,
+        sitelinks,
+        labels,
+        descriptions,
         entity_url: format!("https://www.wikidata.org/wiki/{entity_id}"),
     }
 }

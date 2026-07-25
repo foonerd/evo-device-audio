@@ -89,6 +89,7 @@ mod cascade;
 mod config;
 mod enrichment;
 mod enrichment_cache;
+mod locale;
 mod reconcile;
 
 use std::future::Future;
@@ -564,8 +565,13 @@ impl Plugin for MetadataOnlinePlugin {
             if let Some(store) = ctx.online_provider_config.as_ref() {
                 let rx = store.subscribe_changes();
                 let config_slot = Arc::clone(&self.provider_config);
+                let vault_for_reactor = ctx.credential_vault.clone();
                 self.reactor_tasks.push(tokio::spawn(
-                    online_provider_config_reactor(rx, config_slot),
+                    online_provider_config_reactor(
+                        rx,
+                        config_slot,
+                        vault_for_reactor,
+                    ),
                 ));
             }
             self.loaded = true;
@@ -908,6 +914,55 @@ const DISCOGS_VAULT_KEY: &str = "discogs_personal_access_token";
 /// Stable credential-vault key for the Genius client access token.
 const GENIUS_VAULT_KEY: &str = "genius_client_access_token";
 
+/// Per-identity-bearing-provider prompt shape used by the
+/// online-provider-config reactor when the operator enables a
+/// keyed provider that has no stored credential yet.
+///
+/// on `enabled=true` for a
+/// keyed provider, the reactor calls
+/// `CredentialVaultHandle::request_from_operator` with the
+/// provider's stable vault key + a human-readable prompt.
+/// The vault helper handles the fetch-first / prompt-on-miss /
+/// store / return-bytes flow atomically; on operator answer,
+/// the vault's change bus fires and this plugin's
+/// `credential_reactor` rebuilds the affected client without
+/// a plugin restart.
+///
+/// Returns `None` for anonymous providers (nothing to prompt
+/// for) and unknown providers (defensive; the reactor logs +
+/// skips).
+fn identity_bearing_prompt(
+    pid: cascade::ProviderId,
+) -> Option<(&'static str, &'static str)> {
+    match pid {
+        cascade::ProviderId::Lastfm => Some((
+            LASTFM_VAULT_KEY,
+            "Enter your Last.fm API key. Register at \
+             https://www.last.fm/api/account/create to obtain \
+             one; it is stored securely in the device's \
+             credential vault and never shown back in the UI.",
+        )),
+        cascade::ProviderId::Discogs => Some((
+            DISCOGS_VAULT_KEY,
+            "Enter your Discogs personal-access-token. Generate \
+             one at https://www.discogs.com/settings/developers \
+             (free with a Discogs account); it is stored securely \
+             in the device's credential vault and never shown \
+             back in the UI. Required for the primary album-notes \
+             source on niche / audiophile releases.",
+        )),
+        cascade::ProviderId::Genius => Some((
+            GENIUS_VAULT_KEY,
+            "Enter your Genius API client access token. Generate \
+             one at https://genius.com/api-clients; it is stored \
+             securely in the device's credential vault. This \
+             plugin uses only Genius's description / URL fields \
+             — it never scrapes lyrics text (Genius ToS).",
+        )),
+        _ => None,
+    }
+}
+
 /// Fetch an operator-supplied credential from the framework vault
 /// under `key`. Returns `None` when the vault is not wired, when
 /// no row exists, or when the stored bytes are not valid UTF-8.
@@ -1206,6 +1261,9 @@ async fn online_provider_config_reactor(
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
     >,
     config_slot: Arc<RwLock<cascade::ProviderConfig>>,
+    vault: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
 ) {
     loop {
         match rx.recv().await {
@@ -1245,6 +1303,62 @@ async fn online_provider_config_reactor(
                     priority = event.priority,
                     "reactor: applied online_provider_config change"
                 );
+
+                // on `enabled=true` for an
+                // identity-bearing provider, ask the framework
+                // vault for the credential; the vault helper
+                // handles fetch-first / prompt-on-miss / store /
+                // return-bytes atomically. On operator answer,
+                // the credential-vault change bus fires and the
+                // credential_reactor rebuilds the client — no
+                // further wiring here. Spawn a detached task so
+                // the reactor's event loop is never blocked on
+                // an operator response (prompts can park for up
+                // to 60s by SDK default).
+                if event.enabled {
+                    if let (Some(vault), Some((vault_key, prompt_text))) =
+                        (vault.as_ref(), identity_bearing_prompt(pid))
+                    {
+                        let vault = Arc::clone(vault);
+                        tokio::spawn(async move {
+                            use evo_plugin_sdk::contract::context::CredentialMetadata;
+                            let metadata = CredentialMetadata::default();
+                            match vault
+                                .request_from_operator(
+                                    vault_key.to_string(),
+                                    prompt_text.to_string(),
+                                    metadata,
+                                )
+                                .await
+                            {
+                                Ok(_bytes) => {
+                                    tracing::info!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = pid.as_str(),
+                                        vault_key,
+                                        "reactor: credential resolved for \
+                                         enabled keyed provider (via vault \
+                                         hit or operator prompt); \
+                                         credential_reactor will rebuild \
+                                         the client"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = pid.as_str(),
+                                        vault_key,
+                                        error = %e,
+                                        "reactor: credential prompt failed \
+                                         (operator declined / timed out / \
+                                         framework refused); provider stays \
+                                         unusable until next operator gesture"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(

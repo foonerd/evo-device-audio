@@ -119,6 +119,23 @@ pub struct ReleaseLookup {
     pub recording_type: String,
     /// Track count.
     pub track_count: Option<u32>,
+    /// Discogs release URL from the release's `discogs` url-rel
+    /// (when MB carries one). Cascade callers parse the trailing
+    /// release-id and hit Discogs's `/releases/{id}` endpoint
+    /// directly — that's the MBID-first path for the
+    /// album-notes cascade's Discogs branch, which sidesteps
+    /// Discogs's fuzzy `(artist, album)` search.
+    pub discogs_url: Option<String>,
+    /// Wikipedia release URL from the `wikipedia` url-rel, when
+    /// MB carries one. Rarely populated for individual releases
+    /// (Wikipedia articles land on release-groups), but present
+    /// on notable pressings.
+    pub wikipedia_url: Option<String>,
+    /// Wikidata entity URL from the `wikidata` url-rel, when MB
+    /// carries one. Cascade callers use this to hop to the
+    /// operator-locale Wikipedia edition via the Wikidata
+    /// sitelink map.
+    pub wikidata_url: Option<String>,
 }
 
 /// Artist / composer / performer / conductor / ensemble search
@@ -349,7 +366,12 @@ impl MusicBrainzClient {
 
     /// Look up a release by MBID, inlining the release-group so
     /// the caller can determine `recording_type` + first-release
-    /// year without a second round trip.
+    /// year without a second round trip. The `url-rels` include
+    /// surfaces `discogs` / `wikipedia` / `wikidata` URLs on the
+    /// returned [`ReleaseLookup`] — cascade callers use those
+    /// for the MBID-first Discogs album-notes path and the
+    /// operator-locale Wikipedia hop via the Wikidata sitelink
+    /// map.
     pub async fn lookup_release(
         &self,
         release_mbid: &str,
@@ -361,7 +383,7 @@ impl MusicBrainzClient {
             .get(&url)
             .header(reqwest::header::USER_AGENT, &self.user_agent)
             .header(reqwest::header::ACCEPT, "application/json")
-            .query(&[("inc", "release-groups media"), ("fmt", "json")])
+            .query(&[("inc", "release-groups media url-rels"), ("fmt", "json")])
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -637,6 +659,12 @@ struct LookupResponse {
     date: Option<String>,
     #[serde(default)]
     media: Vec<LookupMedium>,
+    /// MB's `url-rels` include: `[{type, url:{resource}}, ...]`.
+    /// The MBID-first Discogs album-notes path reads
+    /// `type == "discogs"`; the operator-locale Wikipedia hop
+    /// reads `type == "wikipedia"` / `"wikidata"`.
+    #[serde(default)]
+    relations: Vec<UrlRelation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,10 +701,16 @@ fn lookup_from_release(r: LookupResponse) -> ReleaseLookup {
     } else {
         None
     };
+    let discogs_url = extract_url_for_type(&r.relations, "discogs");
+    let wikipedia_url = extract_url_for_type(&r.relations, "wikipedia");
+    let wikidata_url = extract_url_for_type(&r.relations, "wikidata");
     ReleaseLookup {
         first_release_year,
         recording_type,
         track_count,
+        discogs_url,
+        wikipedia_url,
+        wikidata_url,
     }
 }
 
