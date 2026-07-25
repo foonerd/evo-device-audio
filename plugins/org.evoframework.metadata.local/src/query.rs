@@ -758,22 +758,211 @@ pub(crate) fn response_from_tag(
     r
 }
 
+/// Derive the MPD-relative form of an absolute file path by
+/// stripping whichever library root the path lives under.
+/// Returns `None` when the path is not inside any configured
+/// root — in that case the MPD lsinfo fallback would refuse
+/// anyway (MPD only knows library-relative paths).
+fn mpd_relative_from_absolute(
+    library_roots: &[PathBuf],
+    abs_path: &Path,
+) -> Option<String> {
+    for root in library_roots {
+        if let Ok(rel) = abs_path.strip_prefix(root) {
+            return rel.to_str().map(str::to_string);
+        }
+    }
+    None
+}
+
 /// Read tags and duration with lofty, then apply [`MetadataProfile`].
+///
+/// When lofty refuses the file (formats it doesn't decode — DSF /
+/// DFF / a corrupt-container edge case) AND `mpd_relative` names
+/// the file's MPD-relative path, falls back to
+/// [`read_from_mpd_lsinfo`] which pulls the tags MPD has already
+/// indexed for its own library database. The MPD fallback path
+/// covers DSD files whose tags MPD parses natively but lofty
+/// doesn't recognise as a supported container. Duration + audio-
+/// properties on the MPD fallback path come from the tag record
+/// where MPD surfaced them; container-level file properties
+/// remain absent because MPD's lsinfo does not carry the
+/// underlying container's sample rate / bit depth / channels.
 fn read_file_metadata(
     path: &Path,
+    mpd_relative: Option<&str>,
     profile: MetadataProfile,
 ) -> Result<MetadataQueryResponse, String> {
-    let tagged =
-        read_from_path(path).map_err(|e| format!("read audio file: {e}"))?;
-    let props: &FileProperties = tagged.properties();
-    if let Some(t) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        let mut r = ok_response(t, props, None);
-        apply_metadata_profile(&mut r, profile);
-        return Ok(r);
+    match read_from_path(path) {
+        Ok(tagged) => {
+            let props: &FileProperties = tagged.properties();
+            if let Some(t) = tagged.primary_tag().or_else(|| tagged.first_tag())
+            {
+                let mut r = ok_response(t, props, None);
+                apply_metadata_profile(&mut r, profile);
+                return Ok(r);
+            }
+            let mut m = ok_from_properties_only(props);
+            apply_metadata_profile(&mut m, profile);
+            Ok(m)
+        }
+        Err(lofty_err) => {
+            // Lofty could not decode the container. Fall back to
+            // MPD's tag cache when we know the MPD-relative form.
+            if let Some(mpd_path) = mpd_relative {
+                match read_from_mpd_lsinfo(mpd_path) {
+                    Ok(mut r) => {
+                        r.detail = Some(format!(
+                            "tags via MPD lsinfo fallback (lofty could \
+                             not decode container: {lofty_err})"
+                        ));
+                        apply_metadata_profile(&mut r, profile);
+                        return Ok(r);
+                    }
+                    Err(mpd_err) => {
+                        tracing::debug!(
+                            plugin = crate::PLUGIN_NAME,
+                            path = %path.display(),
+                            mpd_path,
+                            lofty_error = %lofty_err,
+                            mpd_error = %mpd_err,
+                            "MPD lsinfo fallback also failed"
+                        );
+                    }
+                }
+            }
+            Err(format!("read audio file: {lofty_err}"))
+        }
     }
-    let mut m = ok_from_properties_only(props);
-    apply_metadata_profile(&mut m, profile);
-    Ok(m)
+}
+
+/// Read tags for one library-relative path from MPD's tag cache
+/// via the MPD text protocol (localhost:6600 by default, or
+/// `MPD_HOST` / `MPD_PORT` when the operator has overridden).
+///
+/// Synchronous by design: metadata_local's `query_metadata` is
+/// synchronous end-to-end and this fallback is on a rare error
+/// path. A short connect + I/O timeout keeps the plugin
+/// unresponsive-window bounded; MPD's tag cache is always in-
+/// process and returns within milliseconds.
+///
+/// Wire form: `lsinfo "<path>"\n`. MPD's response is a
+/// newline-terminated key: value stream followed by `OK\n` (or
+/// `ACK\n` on failure). We parse Artist / Album / Title /
+/// AlbumArtist / Track / Time / Duration into a
+/// [`MetadataQueryResponse`].
+fn read_from_mpd_lsinfo(
+    mpd_relative: &str,
+) -> Result<MetadataQueryResponse, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration as StdDuration;
+
+    let host =
+        std::env::var("MPD_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port = std::env::var("MPD_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(6600);
+    let addr = format!("{host}:{port}");
+
+    let mut stream = TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|e| format!("bad MPD addr {addr}: {e}"))?,
+        StdDuration::from_millis(500),
+    )
+    .map_err(|e| format!("MPD connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(StdDuration::from_millis(1500)))
+        .map_err(|e| format!("MPD set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(StdDuration::from_millis(500)))
+        .map_err(|e| format!("MPD set write timeout: {e}"))?;
+
+    // Consume the MPD greeting line ("OK MPD <version>\n").
+    let mut reader = BufReader::new(
+        stream.try_clone().map_err(|e| format!("MPD clone: {e}"))?,
+    );
+    let mut greeting = String::new();
+    reader
+        .read_line(&mut greeting)
+        .map_err(|e| format!("MPD greeting: {e}"))?;
+    if !greeting.starts_with("OK MPD") {
+        return Err(format!("MPD greeting unexpected: {greeting:?}"));
+    }
+
+    // Send lsinfo. Path is quoted for MPD's command parser;
+    // internal double-quotes are escaped by backslash.
+    let escaped = mpd_relative.replace('\\', "\\\\").replace('"', "\\\"");
+    let cmd = format!("lsinfo \"{escaped}\"\n");
+    stream
+        .write_all(cmd.as_bytes())
+        .map_err(|e| format!("MPD write: {e}"))?;
+
+    // Collect Artist / Album / Title / AlbumArtist / Track /
+    // Time into a HashMap. MPD's response ends on `OK\n` or
+    // `ACK\n`.
+    let mut fields: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("MPD read: {e}"))?;
+        if n == 0 {
+            return Err("MPD stream closed mid-response".to_string());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "OK" {
+            break;
+        }
+        if trimmed.starts_with("ACK") {
+            return Err(format!("MPD lsinfo refused: {trimmed}"));
+        }
+        if let Some((k, v)) = trimmed.split_once(": ") {
+            // MPD may repeat tag keys (e.g. multiple Artist).
+            // First-wins matches the operator UI conventions;
+            // additional values collapse.
+            fields.entry(k.to_string()).or_insert_with(|| v.to_string());
+        }
+    }
+
+    let artist = fields.get("Artist").cloned();
+    let album = fields.get("Album").cloned();
+    let title = fields.get("Title").cloned();
+    let album_artist = fields.get("AlbumArtist").cloned();
+    let track = fields
+        .get("Track")
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let duration_ms = fields
+        .get("duration")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| (f * 1000.0) as u64)
+        .or_else(|| {
+            fields
+                .get("Time")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|s| s * 1000)
+        });
+
+    if artist.is_none() && album.is_none() && title.is_none() {
+        return Err(format!(
+            "MPD lsinfo returned no tags for path {mpd_relative:?}"
+        ));
+    }
+
+    let mut r = MetadataQueryResponse::v1_error(ResponseStatus::Ok, None);
+    r.status = ResponseStatus::Ok;
+    r.title = title;
+    r.artist = artist;
+    r.album = album;
+    r.album_artist = album_artist;
+    r.track = track;
+    r.duration_ms = duration_ms;
+    Ok(r)
 }
 
 /// Strips fields not present in the operator’s [`MetadataProfile`]. For `ok` responses, sets
@@ -893,8 +1082,13 @@ pub(crate) fn query_metadata(
                     ),
                 ));
             };
-            let mut r =
-                read_file_metadata(&path, profile).unwrap_or_else(|e| {
+            // Derive the MPD-relative form (strip whichever
+            // library root this path lives under) so the MPD
+            // lsinfo fallback in read_file_metadata can query
+            // MPD's tag cache when lofty refuses the container.
+            let mpd_rel = mpd_relative_from_absolute(library_roots, &path);
+            let mut r = read_file_metadata(&path, mpd_rel.as_deref(), profile)
+                .unwrap_or_else(|e| {
                     MetadataQueryResponse::v1_error(
                         ResponseStatus::NotFound,
                         Some(e),
@@ -923,7 +1117,16 @@ pub(crate) fn query_metadata(
                     Some("audio file not found for mpd_path".to_string()),
                 ));
             };
-            let r = read_file_metadata(&path, profile).unwrap_or_else(|e| {
+            // req.target.value is the mpd-relative path by the
+            // scheme's contract; pass it through so the MPD
+            // lsinfo fallback can query MPD's tag cache when
+            // lofty refuses the container.
+            let r = read_file_metadata(
+                &path,
+                Some(req.target.value.as_str()),
+                profile,
+            )
+            .unwrap_or_else(|e| {
                 MetadataQueryResponse::v1_error(
                     ResponseStatus::NotFound,
                     Some(e),
