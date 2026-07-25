@@ -15,6 +15,7 @@ shape = 1
 role = "respondent"
 request_types = [
     "artwork.resolve_online",
+    "artwork.resolve_artist_artwork",
 ]
 
 [kind]
@@ -45,5 +46,8 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["artwork.resolve_online"]
+request_types = [
+    "artwork.resolve_online",
+    "artwork.resolve_artist_artwork",
+]
 response_budget_ms = 15000

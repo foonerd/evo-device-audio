@@ -18,6 +18,7 @@ shape = 1
 role = "respondent"
 request_types = [
     "artwork.resolve_online",
+    "artwork.resolve_artist_artwork",
 ]
 
 [kind]
@@ -60,7 +61,10 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["artwork.resolve_online"]
+request_types = [
+    "artwork.resolve_online",
+    "artwork.resolve_artist_artwork",
+]
 # Online providers respond within ~2-3s under good network
 # conditions; the budget allows for one slow upstream + the
 # transcode + asset-cache put.
