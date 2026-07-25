@@ -573,6 +573,43 @@ mod tests {
     }
 
     #[test]
+    fn lastfm_disambiguation_stubs_are_detected() {
+        // Real Last.fm response for Passenger's singer MBID —
+        // routes to the disambiguation page bio.
+        let passenger = "There are at least six artists and bands who \
+                         have performed with the name \"Passenger\". \
+                         The following order is loosely based on the \
+                         last.fm statistics.\n1. A Brighton (UK) based \
+                         alternative folk band";
+        assert!(is_lastfm_disambiguation_stub(passenger));
+        // Case-insensitive.
+        assert!(is_lastfm_disambiguation_stub(
+            "THERE ARE AT LEAST five bands calling themselves Bush."
+        ));
+        // Variant phrasing Last.fm uses.
+        assert!(is_lastfm_disambiguation_stub(
+            "There are several artists with this name."
+        ));
+    }
+
+    #[test]
+    fn lastfm_real_bios_not_flagged_as_disambiguation() {
+        // A real Passenger-the-singer bio wouldn't contain the
+        // stub phrases.
+        let real_bio = "Michael David Rosenberg, better known by his \
+                        stage name Passenger, is an English indie folk \
+                        singer, songwriter and musician.";
+        assert!(!is_lastfm_disambiguation_stub(real_bio));
+        // A short bio.
+        assert!(!is_lastfm_disambiguation_stub(
+            "Sarah McLachlan is a \
+                                                Canadian singer."
+        ));
+        // Empty prose.
+        assert!(!is_lastfm_disambiguation_stub(""));
+    }
+
+    #[test]
     fn bio_cache_key_partitions_mbid_from_name_namespace() {
         // Two entities with the same normalised name but
         // different MBIDs MUST live in different cache entries
@@ -1200,6 +1237,38 @@ async fn fetch_lastfm_bio(
         .await
     {
         Ok(Some(h)) => {
+            // Content-correctness: Last.fm serves user-editable
+            // "wiki" bios and its own disambiguation stubs. Even
+            // an MBID-only query can land the operator on a
+            // disambiguation page when Last.fm's internal MBID
+            // mapping routes to their disambig page (a data-
+            // quality issue on Last.fm's side, not something the
+            // API surface exposes). Passenger's singer MBID
+            // (186e216a-...) maps to Last.fm's "Passenger"
+            // disambiguation page: "There are at least six
+            // artists and bands who have performed with the name
+            // 'Passenger'". Rendering this under Last.fm's
+            // attribution surfaces content-shaped garbage to the
+            // operator. Drop the entry as a clean miss so
+            // `sources[]` never carries a disambiguation stub.
+            let combined_prose = format!(
+                "{}\n{}",
+                h.summary.as_deref().unwrap_or(""),
+                h.content.as_deref().unwrap_or("")
+            );
+            if is_lastfm_disambiguation_stub(&combined_prose) {
+                tracing::info!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "lastfm",
+                    entity = %entity.name,
+                    "Last.fm returned a disambiguation-stub bio for \
+                     this MBID (Last.fm-side MBID mapping issue); \
+                     suppressing the entry so the operator never \
+                     sees disambiguation content attributed to \
+                     Last.fm"
+                );
+                return None;
+            }
             let payload = serde_json::json!({
                 "summary": h.summary,
                 "content": h.content,
@@ -1243,6 +1312,24 @@ async fn fetch_lastfm_bio(
             None
         }
     }
+}
+
+/// Detect Last.fm's stable disambiguation-stub bio patterns.
+/// Last.fm's user-editable wiki adopts a formulaic shape when
+/// multiple artists share a name; the stub is content-shaped
+/// (paragraphs, prose) but names no single artist. Rendering it
+/// under a specific-artist attribution mislabels the source.
+///
+/// The pattern is stable and case-insensitive; both English
+/// forms observed on real .24 rig data ("There are at least N
+/// artists" / "The following order is loosely based on Last.fm
+/// statistics") flag the entry as disambiguation.
+fn is_lastfm_disambiguation_stub(prose: &str) -> bool {
+    let lower = prose.to_ascii_lowercase();
+    lower.contains("there are at least")
+        || lower.contains("there are several artists")
+        || lower.contains("there are multiple artists")
+        || lower.contains("the following order is loosely based")
 }
 
 async fn fetch_theaudiodb_bio(
