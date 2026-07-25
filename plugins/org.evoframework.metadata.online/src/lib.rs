@@ -187,7 +187,16 @@ pub struct MetadataOnlinePlugin {
     /// `Arc<RwLock<Option<..>>>` pattern as Last.fm / Discogs /
     /// Genius without touching the cascade.
     theaudiodb_client: Option<TheAudioDbClient>,
-    provider_config: cascade::ProviderConfig,
+    /// Per-provider enable + priority for the text-verb cascade.
+    /// Wrapped in `Arc<RwLock<..>>` so the store-change reactor
+    /// spawned at load time can swap it in place when the
+    /// framework's `online_provider_config` bus publishes a
+    /// change — without a plugin restart. `handle_request`
+    /// clones the current value out under a read guard once per
+    /// dispatch; the reactor takes a write guard only when an
+    /// operator gesture lands, so reads never contend with
+    /// themselves.
+    provider_config: Arc<RwLock<cascade::ProviderConfig>>,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -203,13 +212,13 @@ pub struct MetadataOnlinePlugin {
     credential_vault: Option<
         Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
     >,
-    /// Background reactor spawned at load time. Awaits
-    /// `CredentialSetChanged` events on the framework's central
-    /// change bus (via the SDK's `subscribe_changes` receiver)
-    /// and re-resolves affected clients in place. Aborted on
-    /// unload so a re-load cycle spawns a fresh reactor rather
-    /// than leaking the old subscription.
-    reactor_task: Option<JoinHandle<()>>,
+    /// Background reactors spawned at load time. Each subscribes
+    /// to a framework change bus (credential vault + online-
+    /// provider config store) and re-resolves affected state in
+    /// place — no plugin restart. All handles abort on unload so
+    /// a re-load cycle spawns fresh reactors rather than leaking
+    /// old subscriptions.
+    reactor_tasks: Vec<JoinHandle<()>>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -227,7 +236,9 @@ impl MetadataOnlinePlugin {
             wikipedia_client: None,
             wikidata_client: None,
             theaudiodb_client: None,
-            provider_config: cascade::ProviderConfig::defaults(),
+            provider_config: Arc::new(RwLock::new(
+                cascade::ProviderConfig::defaults(),
+            )),
             reconcile_cache: None,
             lyrics_cache: None,
             bio_cache: None,
@@ -236,7 +247,7 @@ impl MetadataOnlinePlugin {
             annotation_cache: None,
             work_notes_cache: None,
             credential_vault: None,
-            reactor_task: None,
+            reactor_tasks: Vec::new(),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -310,62 +321,69 @@ impl Plugin for MetadataOnlinePlugin {
             // dispatch; a `provider_config.privacy_mode = Offline`
             // config makes every network provider a structural
             // miss without any wire-op sequencing.
-            self.provider_config = self.config.provider_config.clone();
-            // Runtime-store overlay: when the framework exposes an
-            // online-provider config handle, its per-provider
-            // enable + priority overrides layer on top of the
-            // plugin's config-file defaults. Precedence, lowest
-            // to highest:
+            //
+            // Load-time layering (lowest → highest precedence):
             //   1. `ProviderConfig::defaults()` (framework baseline)
             //   2. plugin config-file `[providers.<id>]` blocks
             //   3. runtime store rows (operator gestures via wire
             //      op `online_providers_set_enabled` /
             //      `online_providers_set_priority`)
-            // Unknown provider ids (from a store row that names a
-            // provider this plugin does not implement) are
-            // skipped with a debug log — the store is a
-            // framework-wide store and other plugins register
-            // their own ids there.
-            if let Some(store) = ctx.online_provider_config.as_ref() {
-                match store.list_all().await {
-                    Ok(rows) => {
-                        for row in rows {
-                            let Some(pid) = cascade::ProviderId::from_wire(
-                                &row.provider_id,
-                            ) else {
-                                tracing::debug!(
-                                    plugin = PLUGIN_NAME,
-                                    provider_id = %row.provider_id,
-                                    "online_provider_config store row names a \
-                                     provider this plugin does not implement; \
-                                     skipping"
+            //
+            // The reactor task spawned below extends layer 3 into
+            // the live-run: each new store event applies the same
+            // `merge_override` on top of the current config, so
+            // `set_enabled(false)` removes the source on the next
+            // dispatch with no restart. Unknown provider ids
+            // (from a store row that names a provider this plugin
+            // does not implement) are skipped with a debug log —
+            // the store is framework-wide and other plugins
+            // register their own ids there.
+            {
+                let mut cfg = self.provider_config.write().await;
+                *cfg = self.config.provider_config.clone();
+                if let Some(store) = ctx.online_provider_config.as_ref() {
+                    match store.list_all().await {
+                        Ok(rows) => {
+                            for row in rows {
+                                let Some(pid) = cascade::ProviderId::from_wire(
+                                    &row.provider_id,
+                                ) else {
+                                    tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = %row.provider_id,
+                                        "online_provider_config store row \
+                                         names a provider this plugin does \
+                                         not implement; skipping"
+                                    );
+                                    continue;
+                                };
+                                if row.priority < 0 {
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = %row.provider_id,
+                                        priority = row.priority,
+                                        "online_provider_config store row \
+                                         carries negative priority; skipping \
+                                         override"
+                                    );
+                                    continue;
+                                }
+                                cfg.merge_override(
+                                    pid,
+                                    Some(row.enabled),
+                                    Some(row.priority as u32),
                                 );
-                                continue;
-                            };
-                            if row.priority < 0 {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    provider_id = %row.provider_id,
-                                    priority = row.priority,
-                                    "online_provider_config store row carries \
-                                     negative priority; skipping override"
-                                );
-                                continue;
                             }
-                            self.provider_config.merge_override(
-                                pid,
-                                Some(row.enabled),
-                                Some(row.priority as u32),
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "online_provider_config store list_all \
+                                 failed; cascade uses plugin config-file \
+                                 defaults"
                             );
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = PLUGIN_NAME,
-                            error = %e,
-                            "online_provider_config store list_all failed; \
-                             cascade uses plugin config-file defaults"
-                        );
                     }
                 }
             }
@@ -522,7 +540,7 @@ impl Plugin for MetadataOnlinePlugin {
                 let genius_slot = Arc::clone(&self.genius_client);
                 let http_for_task = http.clone();
                 let config_for_task = self.config.clone();
-                self.reactor_task = Some(tokio::spawn(credential_reactor(
+                self.reactor_tasks.push(tokio::spawn(credential_reactor(
                     rx,
                     vault_for_task,
                     lastfm_slot,
@@ -531,6 +549,23 @@ impl Plugin for MetadataOnlinePlugin {
                     http_for_task,
                     config_for_task,
                 )));
+            }
+            // Spawn the online-provider-config reactor. On every
+            // operator gesture published by the framework's
+            // `online_provider_config` bus, apply the mutation to
+            // the plugin's local ProviderConfig in place so the
+            // next verb dispatch sees the new enable / priority
+            // without a plugin restart. Aborted on unload.
+            //
+            // This is the live-apply pipe the T3 gate acceptance
+            // depends on: `set_enabled(false)` removes the source
+            // from the cascade's next query, not on the next boot.
+            if let Some(store) = ctx.online_provider_config.as_ref() {
+                let rx = store.subscribe_changes();
+                let config_slot = Arc::clone(&self.provider_config);
+                self.reactor_tasks.push(tokio::spawn(
+                    online_provider_config_reactor(rx, config_slot),
+                ));
             }
             self.loaded = true;
             Ok(())
@@ -544,11 +579,12 @@ impl Plugin for MetadataOnlinePlugin {
             self.loaded = false;
             self.config = PluginConfig::defaults();
             self.mb_client = None;
-            // Abort the credential reactor so a subsequent
-            // re-load spawns a fresh subscription. The task
-            // may already be exiting via `RecvError::Closed`
-            // if the framework tore down the change bus.
-            if let Some(task) = self.reactor_task.take() {
+            // Abort every background reactor (credential vault +
+            // online-provider config) so a subsequent re-load
+            // spawns fresh subscriptions. Tasks may already be
+            // exiting via `RecvError::Closed` if the framework
+            // tore down the relevant change bus.
+            for task in self.reactor_tasks.drain(..) {
                 task.abort();
             }
             self.credential_vault = None;
@@ -559,7 +595,8 @@ impl Plugin for MetadataOnlinePlugin {
             self.wikipedia_client = None;
             self.wikidata_client = None;
             self.theaudiodb_client = None;
-            self.provider_config = cascade::ProviderConfig::defaults();
+            *self.provider_config.write().await =
+                cascade::ProviderConfig::defaults();
             self.reconcile_cache = None;
             self.lyrics_cache = None;
             self.bio_cache = None;
@@ -641,7 +678,7 @@ impl Respondent for MetadataOnlinePlugin {
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
             let theaudiodb = self.theaudiodb_client.clone();
-            let provider_config = self.provider_config.clone();
+            let provider_config = self.provider_config.read().await.clone();
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -1138,6 +1175,91 @@ async fn credential_reactor(
                     skipped = n,
                     "credential-change reactor lagged; dropped events"
                 );
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Online-provider-config reactor.
+// -----------------------------------------------------------------
+
+/// Background task spawned at load time. Awaits change events on
+/// the framework's `online_provider_config` bus and applies each
+/// operator gesture to the plugin's local `provider_config` in
+/// place — no plugin restart. The next verb dispatch sees the
+/// new enable / priority and behaves accordingly (a disabled
+/// source stops appearing in `sources[]`; a re-ordered source
+/// changes which entry mirrors as the top-level default).
+///
+/// Terminates on:
+/// - `RecvError::Closed` — the framework's sender dropped
+///   (steward teardown or plugin uninstall).
+/// - `JoinHandle::abort` from the plugin's `unload` path.
+///
+/// `RecvError::Lagged` never terminates: the reactor logs the
+/// dropped-event count and continues so a burst of operator
+/// gestures does not stall the substrate.
+async fn online_provider_config_reactor(
+    mut rx: tokio::sync::broadcast::Receiver<
+        evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
+    >,
+    config_slot: Arc<RwLock<cascade::ProviderConfig>>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let Some(pid) =
+                    cascade::ProviderId::from_wire(&event.provider_id)
+                else {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        provider_id = %event.provider_id,
+                        "reactor: config change names a provider this plugin \
+                         does not implement; skipping"
+                    );
+                    continue;
+                };
+                if event.priority < 0 {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        provider_id = %event.provider_id,
+                        priority = event.priority,
+                        "reactor: config change carries negative priority; \
+                         skipping override"
+                    );
+                    continue;
+                }
+                {
+                    let mut cfg = config_slot.write().await;
+                    cfg.merge_override(
+                        pid,
+                        Some(event.enabled),
+                        Some(event.priority as u32),
+                    );
+                }
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    provider_id = %event.provider_id,
+                    enabled = event.enabled,
+                    priority = event.priority,
+                    "reactor: applied online_provider_config change"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    dropped = n,
+                    "reactor: online_provider_config bus lagged; \
+                     continuing (next event will re-sync)"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "reactor: online_provider_config bus closed; exiting"
+                );
+                return;
             }
         }
     }

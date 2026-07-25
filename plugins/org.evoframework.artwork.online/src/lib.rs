@@ -149,13 +149,23 @@ pub struct ArtworkOnlinePlugin {
     /// Per-provider enable + priority for the artist-artwork
     /// cascade. Framework defaults, layered with runtime
     /// overrides from the `online_provider_config` store at
-    /// load time.
-    artist_provider_config: artist_cascade::ArtistProviderConfig,
+    /// load time. Wrapped in `Arc<RwLock<..>>` so the store-
+    /// change reactor can apply operator gestures in place —
+    /// the next verb dispatch sees the new enable / priority
+    /// without a plugin restart.
+    artist_provider_config:
+        Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
     /// Volumio meta variant string (`community` / `commercial`)
     /// piggy-backed from the album-artwork provider config.
     /// Artist-artwork uses the same base endpoint under
     /// `mode=artistArt`.
     volumio_meta_variant: String,
+    /// Background reactor task spawned at load. Subscribes to
+    /// the framework's `online_provider_config` bus and applies
+    /// operator gestures to `artist_provider_config` in place.
+    /// Aborted on unload so a re-load cycle spawns a fresh
+    /// subscription rather than leaking the old one.
+    reactor_tasks: Vec<tokio::task::JoinHandle<()>>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -170,9 +180,11 @@ impl ArtworkOnlinePlugin {
             theaudiodb_client: None,
             deezer_client: None,
             fanart_client: None,
-            artist_provider_config:
+            artist_provider_config: Arc::new(tokio::sync::RwLock::new(
                 artist_cascade::ArtistProviderConfig::defaults(),
+            )),
             volumio_meta_variant: "community".to_string(),
+            reactor_tasks: Vec::new(),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -311,51 +323,69 @@ impl Plugin for ArtworkOnlinePlugin {
             // cascade's per-provider enable / priority. Same
             // shape as metadata.online's overlay: framework
             // defaults, then the store rows layered on top.
-            // Unknown provider ids skip with a debug log.
-            if let Some(store) = ctx.online_provider_config.as_ref() {
-                match store.list_all().await {
-                    Ok(rows) => {
-                        for row in rows {
-                            let Some(pid) =
-                                artist_cascade::ArtistProviderId::from_wire(
-                                    &row.provider_id,
-                                )
-                            else {
-                                tracing::debug!(
-                                    plugin = PLUGIN_NAME,
-                                    provider_id = %row.provider_id,
-                                    "online_provider_config store row names a \
-                                     provider this plugin's artist-artwork \
-                                     cascade does not implement; skipping"
+            // Unknown provider ids skip with a debug log. The
+            // reactor spawned below extends this into the
+            // live-run so `set_enabled(false)` removes the
+            // source on the next query, no restart.
+            {
+                let mut cfg = self.artist_provider_config.write().await;
+                if let Some(store) = ctx.online_provider_config.as_ref() {
+                    match store.list_all().await {
+                        Ok(rows) => {
+                            for row in rows {
+                                let Some(pid) =
+                                    artist_cascade::ArtistProviderId::from_wire(
+                                        &row.provider_id,
+                                    )
+                                else {
+                                    tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = %row.provider_id,
+                                        "online_provider_config store row \
+                                         names a provider this plugin's \
+                                         artist-artwork cascade does not \
+                                         implement; skipping"
+                                    );
+                                    continue;
+                                };
+                                if row.priority < 0 {
+                                    tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = %row.provider_id,
+                                        priority = row.priority,
+                                        "online_provider_config store row \
+                                         carries negative priority; skipping \
+                                         override"
+                                    );
+                                    continue;
+                                }
+                                cfg.merge_override(
+                                    pid,
+                                    Some(row.enabled),
+                                    Some(row.priority as u32),
                                 );
-                                continue;
-                            };
-                            if row.priority < 0 {
-                                tracing::warn!(
-                                    plugin = PLUGIN_NAME,
-                                    provider_id = %row.provider_id,
-                                    priority = row.priority,
-                                    "online_provider_config store row carries \
-                                     negative priority; skipping override"
-                                );
-                                continue;
                             }
-                            self.artist_provider_config.merge_override(
-                                pid,
-                                Some(row.enabled),
-                                Some(row.priority as u32),
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "online_provider_config store list_all \
+                                 failed; artist-artwork cascade uses \
+                                 framework defaults"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = PLUGIN_NAME,
-                            error = %e,
-                            "online_provider_config store list_all failed; \
-                             artist-artwork cascade uses framework defaults"
-                        );
-                    }
                 }
+            }
+            // Spawn the store-change reactor so live operator
+            // gestures re-resolve the cascade in place.
+            if let Some(store) = ctx.online_provider_config.as_ref() {
+                let rx = store.subscribe_changes();
+                let config_slot = Arc::clone(&self.artist_provider_config);
+                self.reactor_tasks.push(tokio::spawn(
+                    online_provider_config_reactor(rx, config_slot),
+                ));
             }
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -384,7 +414,12 @@ impl Plugin for ArtworkOnlinePlugin {
             self.theaudiodb_client = None;
             self.deezer_client = None;
             self.fanart_client = None;
-            self.artist_provider_config =
+            // Abort every background reactor so a subsequent
+            // re-load spawns fresh subscriptions.
+            for task in self.reactor_tasks.drain(..) {
+                task.abort();
+            }
+            *self.artist_provider_config.write().await =
                 artist_cascade::ArtistProviderConfig::defaults();
             self.volumio_meta_variant = "community".to_string();
             Ok(())
@@ -492,13 +527,15 @@ impl Respondent for ArtworkOnlinePlugin {
                         .http_client
                         .clone()
                         .expect("http client present after load");
+                    let config_snapshot =
+                        self.artist_provider_config.read().await.clone();
                     let catalogue = artist_cascade::ArtistCatalogue {
                         volumio_meta_http: Arc::new(http),
                         volumio_meta_variant: self.volumio_meta_variant.clone(),
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
-                        config: self.artist_provider_config.clone(),
+                        config: config_snapshot,
                     };
                     let response = artist_cascade::query_artist_artwork(
                         &req.payload,
@@ -516,6 +553,88 @@ impl Respondent for ArtworkOnlinePlugin {
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type (defensive): {other}"
                 ))),
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Online-provider-config reactor.
+// -----------------------------------------------------------------
+
+/// Background task spawned at load time. Awaits change events
+/// on the framework's `online_provider_config` bus and applies
+/// each operator gesture to `artist_provider_config` in place
+/// — no plugin restart. The next verb dispatch sees the new
+/// enable / priority and behaves accordingly.
+///
+/// Terminates on `RecvError::Closed` (framework sender dropped)
+/// or `JoinHandle::abort` (unload). `RecvError::Lagged` never
+/// terminates: the reactor logs the dropped-event count and
+/// continues so a burst of operator gestures does not stall
+/// the substrate.
+async fn online_provider_config_reactor(
+    mut rx: tokio::sync::broadcast::Receiver<
+        evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
+    >,
+    config_slot: Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let Some(pid) = artist_cascade::ArtistProviderId::from_wire(
+                    &event.provider_id,
+                ) else {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        provider_id = %event.provider_id,
+                        "reactor: config change names a provider this \
+                         plugin's artist-artwork cascade does not implement; \
+                         skipping"
+                    );
+                    continue;
+                };
+                if event.priority < 0 {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        provider_id = %event.provider_id,
+                        priority = event.priority,
+                        "reactor: config change carries negative priority; \
+                         skipping override"
+                    );
+                    continue;
+                }
+                {
+                    let mut cfg = config_slot.write().await;
+                    cfg.merge_override(
+                        pid,
+                        Some(event.enabled),
+                        Some(event.priority as u32),
+                    );
+                }
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    provider_id = %event.provider_id,
+                    enabled = event.enabled,
+                    priority = event.priority,
+                    "reactor: applied online_provider_config change to \
+                     artist-artwork cascade"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    dropped = n,
+                    "reactor: online_provider_config bus lagged; \
+                     continuing (next event will re-sync)"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    "reactor: online_provider_config bus closed; exiting"
+                );
+                return;
             }
         }
     }
