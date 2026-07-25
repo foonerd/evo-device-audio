@@ -855,7 +855,7 @@ fn read_from_mpd_lsinfo(
     mpd_relative: &str,
 ) -> Result<MetadataQueryResponse, String> {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration as StdDuration;
 
     let host =
@@ -866,13 +866,20 @@ fn read_from_mpd_lsinfo(
         .unwrap_or(6600);
     let addr = format!("{host}:{port}");
 
-    let mut stream = TcpStream::connect_timeout(
-        &addr
-            .parse()
-            .map_err(|e| format!("bad MPD addr {addr}: {e}"))?,
-        StdDuration::from_millis(500),
-    )
-    .map_err(|e| format!("MPD connect {addr}: {e}"))?;
+    // `TcpStream::connect_timeout` takes a `SocketAddr` (IP
+    // literal), not a hostname — `"localhost:6600".parse()`
+    // fails. Resolve `host:port` through `ToSocketAddrs` first.
+    // MPD is single-socket per install; the first resolved
+    // address is authoritative.
+    let sock = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("MPD resolve {addr}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("MPD resolve {addr}: no addresses"))?;
+
+    let mut stream =
+        TcpStream::connect_timeout(&sock, StdDuration::from_millis(500))
+            .map_err(|e| format!("MPD connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(StdDuration::from_millis(1500)))
         .map_err(|e| format!("MPD set read timeout: {e}"))?;
