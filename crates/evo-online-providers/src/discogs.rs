@@ -129,6 +129,22 @@ impl DiscogsClient {
             .get(&url)
             .header(reqwest::header::USER_AGENT, self.user_agent.clone())
             .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            // Ask Discogs for the plaintext-annotated dialect so the
+            // response carries `notes_plaintext` / `profile_plaintext`
+            // fields alongside the raw `notes` / `profile`. Without
+            // this the default v2 dialect returns bracketed reference
+            // codes verbatim (`[l333658]` = label id, `[r=571297]` =
+            // release id) that no downstream consumer resolves,
+            // rendering "All songs owned by [l333658]" to the
+            // operator. With this dialect Discogs resolves the codes
+            // server-side into human-readable text and hands us the
+            // resolved form on the `_plaintext` twin. No extra
+            // per-id round trips; the resolution counts against the
+            // same rate-limit bucket as the original request.
+            .header(
+                reqwest::header::ACCEPT,
+                "application/vnd.discogs.v2.plaintext+json",
+            )
             .send()
             .await?;
         let status = resp.status();
@@ -199,6 +215,12 @@ impl DiscogsClient {
             .as_ref()
             .and_then(|v| v.first())
             .and_then(|f| f.name.clone());
+        // Prefer the plaintext-annotated twin; fall back to the raw
+        // `notes` only when the plaintext field is absent (Discogs
+        // API versioning / edge cases). Empty strings collapse to
+        // `None` at the same time so a blank plaintext field never
+        // shadows a populated raw fallback.
+        let notes = plaintext_or_raw(detail.notes_plaintext, detail.notes);
         Ok(Some(ReleaseDetailHit {
             release_id,
             label,
@@ -206,7 +228,7 @@ impl DiscogsClient {
             year: detail.year,
             country: detail.country,
             format,
-            notes: detail.notes,
+            notes,
             source_url: Some(format!(
                 "https://www.discogs.com/release/{release_id}"
             )),
@@ -229,14 +251,38 @@ impl DiscogsClient {
         };
         let detail_url = format!("{DISCOGS_API_BASE}/artists/{}", first.id);
         let detail: ArtistDetail = self.get_json(detail_url).await?;
+        // Same plaintext-preference as release notes above: the
+        // artist profile field also carries `[a=NNN]`-style
+        // reference codes on the raw form, resolved by Discogs on
+        // the plaintext twin.
+        let profile =
+            plaintext_or_raw(detail.profile_plaintext, detail.profile);
         Ok(Some(ArtistProfileHit {
-            profile: detail.profile.filter(|s| !s.trim().is_empty()),
+            profile,
             source_url: Some(format!(
                 "https://www.discogs.com/artist/{}",
                 first.id
             )),
         }))
     }
+}
+
+/// Prefer the plaintext-annotated field, fall back to the raw
+/// field, and treat empty / whitespace-only strings as absent so
+/// a blank plaintext value doesn't shadow a populated raw one.
+fn plaintext_or_raw(
+    plaintext: Option<String>,
+    raw: Option<String>,
+) -> Option<String> {
+    let clean = |s: String| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    plaintext.and_then(clean).or_else(|| raw.and_then(clean))
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,8 +302,21 @@ struct ReleaseDetail {
     year: Option<u32>,
     #[serde(default)]
     country: Option<String>,
+    /// The raw notes field — carries Discogs' bracketed reference
+    /// codes verbatim (`[l333658]`, `[r=571297]`). Kept as a
+    /// fallback for the pathological case where the plaintext
+    /// dialect returns the raw form on `notes` and no
+    /// `notes_plaintext` twin.
     #[serde(default)]
     notes: Option<String>,
+    /// The plaintext-annotated dialect's resolved twin of `notes`,
+    /// populated when the request carried
+    /// `Accept: application/vnd.discogs.v2.plaintext+json`.
+    /// Discogs resolves `[l...]` / `[r=...]` reference codes into
+    /// human text server-side and surfaces the resolved form here;
+    /// callers prefer this over `notes`.
+    #[serde(default)]
+    notes_plaintext: Option<String>,
     #[serde(default)]
     labels: Option<Vec<LabelEntry>>,
     #[serde(default)]
@@ -286,8 +345,15 @@ struct ArtistSearchResponse {
 
 #[derive(Debug, Deserialize)]
 struct ArtistDetail {
+    /// Raw profile field — same bracketed-reference caveat as
+    /// `ReleaseDetail::notes`; kept as a fallback.
     #[serde(default)]
     profile: Option<String>,
+    /// Plaintext-annotated twin of `profile`, populated when the
+    /// request carried the plaintext-dialect Accept header.
+    /// Callers prefer this over `profile`.
+    #[serde(default)]
+    profile_plaintext: Option<String>,
 }
 
 /// Extract the numeric Discogs release id from a MusicBrainz
@@ -342,4 +408,129 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contains_bracket_reference(text: &str) -> bool {
+        // Matches Discogs' bracketed reference codes:
+        //   [lNNN]  — label / company id
+        //   [r=NNN] — release id
+        //   [a=NNN] — artist id
+        //   [m=NNN] — master id
+        // Any of these leaked into rendered text is the exact
+        // "All songs owned by [l333658]" symptom this fixture
+        // gates against.
+        let text = text.to_ascii_lowercase();
+        for prefix in ["[l", "[r=", "[a=", "[m="] {
+            if let Some(idx) = text.find(prefix) {
+                let after = &text[idx + prefix.len()..];
+                if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn contains_bracket_reference_detects_all_variants() {
+        // Sanity check on the matcher used by the release-notes /
+        // profile fixtures below.
+        assert!(contains_bracket_reference("All songs owned by [l333658]"));
+        assert!(contains_bracket_reference("See also [r=571297]"));
+        assert!(contains_bracket_reference("Member of [a=1234]"));
+        assert!(contains_bracket_reference("From [m=999]"));
+        assert!(!contains_bracket_reference(
+            "Older release; catalogue notes clean."
+        ));
+    }
+
+    #[test]
+    fn release_detail_prefers_notes_plaintext_over_raw_notes() {
+        // Fixture mirrors the shape Discogs returns under
+        // `Accept: application/vnd.discogs.v2.plaintext+json`:
+        // BOTH the raw and plaintext fields are present, and the
+        // plaintext form has already resolved `[l...]` / `[r=...]`
+        // reference codes. The extractor MUST prefer the
+        // plaintext form so no bracket markup reaches the
+        // operator UI.
+        let body = r#"{
+            "year": 2015,
+            "country": "US",
+            "notes": "All songs owned by [l333658]. See also [r=571297].",
+            "notes_plaintext": "All songs owned by Blue Coast Records. See also Older.",
+            "labels": [{"name": "Blue Coast Records", "catno": "BCR-001"}],
+            "formats": [{"name": "SACD, Hybrid"}]
+        }"#;
+        let detail: ReleaseDetail = serde_json::from_str(body).unwrap();
+        let notes = plaintext_or_raw(
+            detail.notes_plaintext.clone(),
+            detail.notes.clone(),
+        )
+        .expect("notes present on both fields");
+        assert!(
+            !contains_bracket_reference(&notes),
+            "extracted notes must not carry bracket markup; got {notes:?}"
+        );
+        assert!(notes.contains("Blue Coast Records"));
+        assert!(notes.contains("Older"));
+    }
+
+    #[test]
+    fn release_detail_falls_back_to_raw_notes_when_plaintext_absent() {
+        // Defence-in-depth: if a future Discogs response omits the
+        // plaintext twin entirely (older release detail, API
+        // regression), the extractor still returns the raw notes
+        // rather than dropping the field.
+        let body = r#"{
+            "year": 2015,
+            "notes": "All songs owned by [l333658]."
+        }"#;
+        let detail: ReleaseDetail = serde_json::from_str(body).unwrap();
+        let notes = plaintext_or_raw(detail.notes_plaintext, detail.notes)
+            .expect("raw notes present, plaintext absent");
+        // The raw form still carries brackets here — the extractor
+        // does not strip; it only prefers plaintext when available.
+        // The UI-side defence-in-depth strip is a separate follow-on.
+        assert!(notes.contains("[l333658]"));
+    }
+
+    #[test]
+    fn release_detail_treats_empty_plaintext_as_absent() {
+        // Discogs occasionally returns an empty-string plaintext
+        // twin. The extractor must treat that as absent and fall
+        // through to the raw form rather than emitting empty text.
+        let body = r#"{
+            "notes": "All songs owned by [l333658].",
+            "notes_plaintext": "   "
+        }"#;
+        let detail: ReleaseDetail = serde_json::from_str(body).unwrap();
+        let notes = plaintext_or_raw(detail.notes_plaintext, detail.notes)
+            .expect("raw fallback when plaintext is whitespace only");
+        assert!(notes.contains("[l333658]"));
+    }
+
+    #[test]
+    fn artist_detail_prefers_profile_plaintext_over_raw_profile() {
+        // Same pair-of-fields shape on `/artists/{id}` responses;
+        // extractor must prefer the plaintext twin.
+        let body = r#"{
+            "profile": "Founded [a=1234] in 1962.",
+            "profile_plaintext": "Founded The Rolling Stones in 1962."
+        }"#;
+        let detail: ArtistDetail = serde_json::from_str(body).unwrap();
+        let profile = plaintext_or_raw(
+            detail.profile_plaintext.clone(),
+            detail.profile.clone(),
+        )
+        .expect("profile present on both fields");
+        assert!(
+            !contains_bracket_reference(&profile),
+            "extracted profile must not carry bracket markup; got {profile:?}"
+        );
+        assert!(profile.contains("The Rolling Stones"));
+    }
 }

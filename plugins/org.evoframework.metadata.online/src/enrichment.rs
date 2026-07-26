@@ -2921,12 +2921,24 @@ async fn fetch_discogs_album_notes(
     // album notes are language-agnostic (the wiki text
     // contributors write in whatever language they picked),
     // so no locale scope is needed here.
+    //
+    // The trailing "v2" tag partitions entries fetched under the
+    // plaintext-annotated Accept dialect from earlier entries
+    // that landed pre-fix and cached raw bracketed references
+    // (`[l333658]` = label id, `[r=571297]` = release id) as
+    // rendered summary text. Positive cache is indefinite, so
+    // without this partition the operator would keep seeing
+    // "[l333658]" in the summary on every replay of already-cached
+    // releases even after the client fix ships. Bumping the tag
+    // whenever the extractor's output shape changes at a
+    // per-provider level is the standard escape hatch.
     let key = EnrichmentCache::key_for(&[
         "album_notes",
         "album",
         &normalise(artist),
         &normalise(&normalised_album),
         ProviderId::Discogs.as_str(),
+        "v2",
     ]);
     if let Some(entry) = cache.get(&key) {
         if entry.status == "ok" {
