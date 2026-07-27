@@ -30,6 +30,12 @@ hex = { workspace = true }
 # downstream; declare here so the shared crate can log
 # resize / encode outcomes consistently.
 tracing = { workspace = true }
+# Unicode NFD decomposition for the artist fold-key + display
+# form. Same crate + version playback.mpd already uses; moved
+# here so both playback.mpd (facet dedupe) and artwork.online
+# (reconcile cache key) share one implementation of "same
+# artist" across tag drift. Small (~40 KB), no transitive deps.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

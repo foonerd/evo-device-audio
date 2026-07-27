@@ -1033,15 +1033,28 @@ pub(crate) async fn handle_browse_by_tag(
                 // Break ties by longest form so
                 // "Céline Dion" wins over "Celine Dion" — the
                 // diacritic-carrying form is closer to the
-                // artist's canonical presentation.
-                forms
+                // artist's canonical presentation. Then run
+                // `artist_display_form` on the winner so tag-
+                // editor watermarks and `Last, First` sort-
+                // form drop out before the tile is rendered.
+                // Cleaning preserves fold-key equivalence
+                // (proven in the shared crate's tests), so
+                // the drill path still matches every raw form
+                // that belongs to the group.
+                let raw_winner = forms
                     .into_iter()
                     .max_by(|a, b| {
                         a.1.cmp(&b.1).then_with(|| {
                             a.0.chars().count().cmp(&b.0.chars().count())
                         })
                     })
-                    .map(|(display, _)| display)
+                    .map(|(display, _)| display)?;
+                let cleaned = artist_display_form(&raw_winner);
+                Some(if cleaned.is_empty() {
+                    raw_winner
+                } else {
+                    cleaned
+                })
             })
             .collect()
     } else {
@@ -1488,100 +1501,9 @@ pub(crate) fn identity_post_process(raw: String) -> Option<String> {
     Some(raw)
 }
 
-/// Fold an artist tag value into a dedupe key.
-///
-/// MPD's raw tag store carries per-file drift that surfaces the
-/// same real artist as multiple facet tiles:
-///
-/// - Diacritic form: `Céline Dion` vs `Celine Dion`.
-/// - Punctuation drift: `Jean-Michel Jarre` vs `Jean Michel Jarre`.
-/// - Sort-form reversal: `Cohen, Leonard` vs `Leonard Cohen`.
-/// - Tag-editor droppings: `Bruno Mars | www.RNBxBeatz.com`.
-///
-/// Fold rules, applied in order:
-///
-/// 1. Trim; empty → empty key (caller drops).
-/// 2. Strip trailing `| <suffix>` (tag-editor watermarks). The
-///    `|` is a rare literal in artist names — dropping the
-///    suffix removes the watermark while preserving anything
-///    before it verbatim.
-/// 3. Split on `,`; if the head is a plausible last name (single
-///    token) and the tail is a plausible first-name run, reorder
-///    to `<tail> <head>`. Handles `Cohen, Leonard` → `Leonard
-///    Cohen` but leaves `Nick Cave, Kylie Minogue` (duet credit)
-///    unchanged because the head has multiple tokens.
-/// 4. NFD-decompose, drop combining marks (U+0300..=U+036F —
-///    Latin diacritics), lowercase, replace every non-alnum
-///    run with a single space, trim.
-///
-/// The resulting key is not human-readable — it is only a
-/// group discriminator. The caller keeps the raw form for
-/// display.
-pub(crate) fn artist_fold_key(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    // Strip trailing `| ...` watermark. The pipe is
-    // exceptionally rare in real artist names; anything after
-    // it is more likely to be a tagger's URL / tag-editor
-    // signature than part of the credit.
-    let without_watermark = match trimmed.split_once('|') {
-        Some((head, _)) => head.trim(),
-        None => trimmed,
-    };
-    // "Last, First" → "First Last" when the head is a single
-    // token. Multiple commas / multi-token heads look like duet
-    // credits and stay as-is.
-    let reordered: String =
-        if let Some((head, tail)) = without_watermark.split_once(',') {
-            let head_trim = head.trim();
-            let tail_trim = tail.trim();
-            let head_is_single_token = !head_trim.contains(char::is_whitespace);
-            let tail_has_no_comma = !tail_trim.contains(',');
-            if head_is_single_token
-                && tail_has_no_comma
-                && !head_trim.is_empty()
-                && !tail_trim.is_empty()
-            {
-                format!("{tail_trim} {head_trim}")
-            } else {
-                without_watermark.to_string()
-            }
-        } else {
-            without_watermark.to_string()
-        };
-    // NFD, drop combining marks, lowercase.
-    use unicode_normalization::UnicodeNormalization;
-    let mut folded = String::with_capacity(reordered.len());
-    let mut last_was_space = true;
-    for ch in reordered.nfd() {
-        if is_combining_mark(ch) {
-            continue;
-        }
-        if ch.is_alphanumeric() {
-            for lc in ch.to_lowercase() {
-                folded.push(lc);
-                last_was_space = false;
-            }
-        } else if !last_was_space {
-            folded.push(' ');
-            last_was_space = true;
-        }
-    }
-    if folded.ends_with(' ') {
-        folded.pop();
-    }
-    folded
-}
-
-/// Test whether a char is a Unicode combining mark used for
-/// diacritics on Latin script. Covers the primary Combining
-/// Diacritical Marks block (U+0300..=U+036F); adequate for the
-/// Latin-script fold the artist facet needs.
-fn is_combining_mark(ch: char) -> bool {
-    matches!(ch as u32, 0x0300..=0x036F)
-}
+pub(crate) use evo_device_audio_shared::artist_name::{
+    artist_display_form, artist_fold_key,
+};
 
 /// Slice a full entry list into the requested page.
 ///
@@ -2517,58 +2439,9 @@ mod tests {
         assert_eq!(BROWSE_HARD_CAP, 2_000);
     }
 
-    #[test]
-    fn artist_fold_key_collapses_diacritic_forms() {
-        assert_eq!(
-            artist_fold_key("Céline Dion"),
-            artist_fold_key("Celine Dion")
-        );
-        assert_eq!(
-            artist_fold_key("Sinéad O'Connor"),
-            artist_fold_key("Sinead O'Connor")
-        );
-    }
-
-    #[test]
-    fn artist_fold_key_reorders_sort_form() {
-        assert_eq!(
-            artist_fold_key("Cohen, Leonard"),
-            artist_fold_key("Leonard Cohen")
-        );
-    }
-
-    #[test]
-    fn artist_fold_key_strips_pipe_watermark() {
-        assert_eq!(
-            artist_fold_key("Bruno Mars | www.RNBxBeatz.com"),
-            artist_fold_key("Bruno Mars")
-        );
-    }
-
-    #[test]
-    fn artist_fold_key_collapses_hyphen_variants() {
-        // Jean-Michel Jarre vs Jean Michel Jarre — hyphenation
-        // drift is normalized into a single fold-key because
-        // non-alnum runs become one space in the key.
-        assert_eq!(
-            artist_fold_key("Jean-Michel Jarre"),
-            artist_fold_key("Jean Michel Jarre")
-        );
-    }
-
-    #[test]
-    fn artist_fold_key_leaves_multi_artist_credits_alone() {
-        // "Nick Cave, Kylie Minogue" is a duet credit, not a
-        // sort-form. Head is multi-token → no reorder.
-        let a = artist_fold_key("Nick Cave, Kylie Minogue");
-        let b = artist_fold_key("Kylie Minogue Nick Cave");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn artist_fold_key_empty_when_blank() {
-        assert!(artist_fold_key("").is_empty());
-        assert!(artist_fold_key("   ").is_empty());
-        assert!(artist_fold_key("|").is_empty());
-    }
+    // `artist_fold_key` unit tests live in the shared crate
+    // (`evo_device_audio_shared::artist_name`) — the crate is
+    // the canonical owner of the fold rules. The tests here
+    // exercise the browse-facet integration, not the fold
+    // function itself.
 }

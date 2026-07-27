@@ -18,6 +18,7 @@ use lofty::file::TaggedFileExt;
 use lofty::read_from_path;
 use lofty::tag::Accessor;
 
+pub mod artist_name;
 pub mod audio_ui_pack;
 pub mod terminus_loopback;
 pub mod transcode;

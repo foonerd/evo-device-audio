@@ -56,11 +56,6 @@ toml = "0.8"
 # Wire-binary stderr logging. Matches the artwork-local-wire +
 # network-wire + metadata-local-wire sibling plugins.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Unicode NFD decomposition for the artist-facet fold-key.
-# Used to reduce "Céline Dion" / "Celine Dion" to one entry
-# on browse_by_artist — MPD's raw tag values carry per-file
-# diacritic drift. Small (~40 KB), no transitive deps.
-unicode-normalization = "0.1"
 
 [dev-dependencies]
 # Extra tokio features only needed by tests (duplex streams, test-util utilities).
