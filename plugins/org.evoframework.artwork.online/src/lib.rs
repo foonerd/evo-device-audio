@@ -62,6 +62,7 @@
 #![allow(clippy::manual_async_fn)]
 
 mod artist_cascade;
+mod artwork_caches;
 mod config;
 mod providers;
 mod resolve;
@@ -191,6 +192,14 @@ pub struct ArtworkOnlinePlugin {
     /// Aborted on unload so a re-load cycle spawns a fresh
     /// subscription rather than leaking the old one.
     reactor_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Per-plugin caches for the artist-artwork cascade —
+    /// memoises the MB reconcile outcome and the non-Deezer
+    /// provider results so repeat browse of the same artist
+    /// set does not re-hammer upstream. LRU-capped, TTL-bound,
+    /// dropped on unload. Deezer results never enter these
+    /// caches (live-fetch invariant enforced by
+    /// `ArtistImageHit`'s missing `Serialize`).
+    artwork_caches: Arc<artwork_caches::ArtworkCaches>,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -211,6 +220,7 @@ impl ArtworkOnlinePlugin {
             )),
             volumio_meta_variant: "community".to_string(),
             reactor_tasks: Vec::new(),
+            artwork_caches: Arc::new(artwork_caches::ArtworkCaches::new()),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -464,6 +474,11 @@ impl Plugin for ArtworkOnlinePlugin {
             self.deezer_client = None;
             self.fanart_client = None;
             self.mb_client = None;
+            // Drop the cache state and replace with a fresh
+            // empty pair so a subsequent load() starts with
+            // no memoised reconcile / provider entries.
+            self.artwork_caches =
+                Arc::new(artwork_caches::ArtworkCaches::new());
             // Abort every background reactor so a subsequent
             // re-load spawns fresh subscriptions.
             for task in self.reactor_tasks.drain(..) {
@@ -586,6 +601,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
                         mb: self.mb_client.clone(),
+                        caches: Arc::clone(&self.artwork_caches),
                         config: config_snapshot,
                     };
                     let response = artist_cascade::query_artist_artwork(

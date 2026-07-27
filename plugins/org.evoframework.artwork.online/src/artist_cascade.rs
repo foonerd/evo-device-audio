@@ -236,7 +236,15 @@ impl ArtistProviderConfig {
 }
 
 /// Provenance carried on every source entry.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// `Deserialize` is derived so the result-cache can serialise
+/// `SourceEntry` into `serde_json::Value` at insert time and
+/// round-trip it back at lookup — the cache lives on the same
+/// side of the plugin as `Serialize`, so no data ever crosses
+/// the ToS boundary that `ArtistImageHit`'s missing
+/// `Serialize` enforces (Deezer results are excluded from the
+/// cache by construction, not by the trait).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Attribution {
     pub(crate) source_name: String,
     pub(crate) source_url: Option<String>,
@@ -248,7 +256,7 @@ pub(crate) struct Attribution {
 /// Wire shape MUST match the text-verb cascade's `SourceEntry`
 /// so the operator UI's per-source selection surface renders
 /// text and image sources through one code path.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SourceEntry {
     pub(crate) provider_id: String,
     pub(crate) privacy_class: String,
@@ -528,6 +536,11 @@ pub(crate) struct ArtistCatalogue {
     /// operator has not set one); `Option` remains for the
     /// pre-load state.
     pub(crate) mb: Option<Arc<MusicBrainzClient>>,
+    /// Per-fold-key caches for the reconcile step and the
+    /// non-Deezer provider results. Shared across all in-
+    /// flight cascade calls so a browse of the same artist
+    /// set warm-caches from the second visit onwards.
+    pub(crate) caches: Arc<crate::artwork_caches::ArtworkCaches>,
     pub(crate) config: ArtistProviderConfig,
 }
 
@@ -571,12 +584,22 @@ pub(crate) async fn query_artist_artwork(
             "artist is required and must be non-empty",
         ));
     };
+    // Cache key: fold(input artist) — stable across display
+    // cleaning so a browse tile rendered from a cleaned form
+    // hits the same cache slot as the raw MPD tag it came
+    // from. Empty fold-key means the input trims to nothing
+    // (already caught above, but re-check for safety).
+    let fold_key =
+        evo_device_audio_shared::artist_name::artist_fold_key(&artist);
+    let can_cache = !fold_key.is_empty();
+
     // MBID reconciliation is mandatory for identity-bearing
     // providers. Prefer any MBID the caller supplied (already
-    // reconciled upstream); otherwise ask MusicBrainz for a
-    // name → MBID match, gated on confidence. Missing / weak
-    // reconciliation is not an error — the fallback path is
-    // "no source", which becomes `not_found` at the envelope.
+    // reconciled upstream); otherwise consult the reconcile
+    // cache; on cache miss, hit MusicBrainz for a name → MBID
+    // match, gated on confidence. Missing / weak reconciliation
+    // is not an error — the fallback path is "no source",
+    // which becomes `not_found` at the envelope.
     let caller_supplied_mbid = req
         .artist_mbid
         .as_deref()
@@ -607,6 +630,38 @@ pub(crate) async fn query_artist_artwork(
                 }
             },
             None => Some(bare_lookup_from_mbid(&mbid, &artist)),
+        }
+    } else if can_cache {
+        // Cache-first name reconciliation. A fresh hit / miss
+        // entry short-circuits the two MB round trips (search +
+        // URL-rels lookup); an expired or absent entry falls
+        // through to live reconcile and updates the cache with
+        // the outcome. Negatives are always TTL-bounded (never
+        // eternal) so an operator tag correction or a later MB
+        // submission surfaces on the next cache expiry.
+        use crate::artwork_caches::{MissReason, ReconcileEntry};
+        match catalogue.caches.get_reconcile(&fold_key) {
+            Some(ReconcileEntry::Hit { lookup, .. }) => Some(*lookup),
+            Some(ReconcileEntry::Miss { .. }) => None,
+            None => {
+                let outcome =
+                    reconcile_artist_mbid(&artist, catalogue.mb.as_deref())
+                        .await;
+                match &outcome {
+                    Some(lookup) => catalogue
+                        .caches
+                        .put_reconcile_hit(fold_key.clone(), lookup.clone()),
+                    None => catalogue.caches.put_reconcile_miss(
+                        fold_key.clone(),
+                        if catalogue.mb.is_none() {
+                            MissReason::NoClient
+                        } else {
+                            MissReason::NoConfidentMatch
+                        },
+                    ),
+                }
+                outcome
+            }
         }
     } else {
         reconcile_artist_mbid(&artist, catalogue.mb.as_deref()).await
@@ -683,27 +738,85 @@ pub(crate) async fn query_artist_artwork(
         .and_then(|l| l.deezer_artist_url.as_deref())
         .and_then(parse_deezer_artist_id);
 
-    let (volumio_src, tadb_src, deezer_src, fanart_src) = tokio::join!(
-        fetch_volumio_meta_artist(
-            &artist,
-            &catalogue.volumio_meta_http,
-            &catalogue.volumio_meta_variant,
-            want_volumio,
-        ),
-        fetch_theaudiodb_artist(
-            effective_mbid,
-            &artist,
-            catalogue,
-            want_theaudiodb,
-        ),
-        fetch_deezer_artist_by_id(
-            deezer_artist_id,
-            &artist,
-            catalogue,
-            want_deezer,
-        ),
-        fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
-    );
+    // Non-Deezer provider result cache. Volumio meta,
+    // TheAudioDB, and fanart.tv return stable URLs per artist;
+    // memoising the `SourceEntry` snapshot lets a browse of the
+    // same artist set after the first cascade skip every non-
+    // Deezer network round. Deezer is deliberately excluded —
+    // its live-fetch invariant remains structurally enforced by
+    // `ArtistImageHit`'s missing `Serialize`, and every request
+    // still fires `deezer.get_artist_image_by_id(id)` fresh
+    // (using the id memoised via the reconcile cache).
+    let cached_non_deezer: Option<Vec<SourceEntry>> = if can_cache {
+        catalogue
+            .caches
+            .get_provider(&fold_key)
+            .map(|entry| deserialize_provider_entries(&entry.sources))
+    } else {
+        None
+    };
+    let (volumio_src, tadb_src, fanart_src) = if let Some(sources) =
+        cached_non_deezer.as_ref()
+    {
+        // Warm cache — re-use the memoised entries per
+        // provider. Every source in the cache was created
+        // by a prior successful fetch, so the vector is
+        // already sort-order agnostic.
+        let mut v = None;
+        let mut t = None;
+        let mut f = None;
+        for src in sources {
+            match src.provider_id.as_str() {
+                "volumio_meta" => v = Some(src.clone()),
+                "theaudiodb" => t = Some(src.clone()),
+                "fanart_tv" => f = Some(src.clone()),
+                _ => {}
+            }
+        }
+        (v, t, f)
+    } else {
+        // Cold cache — hit every enabled non-Deezer
+        // provider and cache the successful entries.
+        let (volumio_src, tadb_src, fanart_src) = tokio::join!(
+            fetch_volumio_meta_artist(
+                &artist,
+                &catalogue.volumio_meta_http,
+                &catalogue.volumio_meta_variant,
+                want_volumio,
+            ),
+            fetch_theaudiodb_artist(
+                effective_mbid,
+                &artist,
+                catalogue,
+                want_theaudiodb,
+            ),
+            fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
+        );
+        if can_cache {
+            let snapshot: Vec<serde_json::Value> =
+                [volumio_src.as_ref(), tadb_src.as_ref(), fanart_src.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serialize_source_entry)
+                    .collect();
+            catalogue.caches.put_provider(
+                fold_key.clone(),
+                crate::artwork_caches::ProviderEntry::new(snapshot),
+            );
+        }
+        (volumio_src, tadb_src, fanart_src)
+    };
+
+    // Deezer always fires live — the by-id fetch is cheap
+    // (single HTTPS round on a known id) and the URL is under
+    // the live-fetch invariant.
+    let deezer_src = fetch_deezer_artist_by_id(
+        deezer_artist_id,
+        &artist,
+        catalogue,
+        want_deezer,
+    )
+    .await;
 
     let mut sources: Vec<SourceEntry> =
         [volumio_src, tadb_src, deezer_src, fanart_src]
@@ -1154,6 +1267,53 @@ fn mb_error_display(e: &MusicBrainzError) -> String {
         }
         MusicBrainzError::Decode(msg) => format!("decode: {msg}"),
     }
+}
+
+/// Snapshot a `SourceEntry` into the cache's `serde_json::Value`
+/// storage shape. Returns `None` when serialisation fails (in
+/// practice never; `Serialize` is derived on both structs and
+/// their fields).
+fn serialize_source_entry(entry: &SourceEntry) -> Option<serde_json::Value> {
+    match serde_json::to_value(entry) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider_id = %entry.provider_id,
+                error = %e,
+                "failed to snapshot artist-artwork source entry for cache; \
+                 skipping the entry (fresh fetch on next request)"
+            );
+            None
+        }
+    }
+}
+
+/// Restore a slice of cached `serde_json::Value`s into a
+/// `Vec<SourceEntry>`. Entries that fail to deserialise
+/// (should be impossible; only present so a schema drift in a
+/// running plugin cannot panic the request handler) are
+/// silently dropped and re-fetched on the next request.
+fn deserialize_provider_entries(
+    stored: &[serde_json::Value],
+) -> Vec<SourceEntry> {
+    stored
+        .iter()
+        .filter_map(|v| {
+            match serde_json::from_value::<SourceEntry>(v.clone()) {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        error = %e,
+                        "cached artist-artwork source entry failed to \
+                         deserialise; dropping (fresh fetch on next request)"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

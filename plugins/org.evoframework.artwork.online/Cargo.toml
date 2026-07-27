@@ -39,6 +39,11 @@ base64 = { workspace = true }
 # as artwork.local, so the size taxonomy round-trip is shared.
 image = { workspace = true }
 webp = { workspace = true }
+# Fixed-capacity LRU for the artist-artwork reconcile + result
+# caches. Bounds the working set (~5000 keys) so a large
+# library cannot exhaust the plugin's memory, and evicts the
+# oldest entry on insert. Small (~15 KB), zero transitive deps.
+lru = "0.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }
