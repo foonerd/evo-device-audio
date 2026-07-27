@@ -966,6 +966,34 @@ impl MpdConnection {
         Ok(parse_library_entries(&fields))
     }
 
+    /// Multi-field case-sensitive exact match — MPD accepts
+    /// paired `TYPE VALUE` arguments and ANDs the constraints
+    /// together.
+    ///
+    /// Wire form: `find "<field1>" "<query1>" "<field2>" "<query2>"…`.
+    ///
+    /// The browse-by facet drill uses this when a parent
+    /// context is present: selecting album "Older" scoped to
+    /// artist "George Michael" issues
+    /// `find album "Older" albumartist "George Michael"`,
+    /// dropping every "Older" pressing under a different
+    /// credited artist that would surface on a single-field
+    /// find.
+    pub async fn find_multi(
+        &mut self,
+        pairs: &[(MpdSearchField, &str)],
+    ) -> Result<Vec<MpdLibraryEntry>, MpdError> {
+        // Materialise the borrowed pairs into a flat &[&str]
+        // list the dispatch layer expects.
+        let mut args: Vec<&str> = Vec::with_capacity(pairs.len() * 2);
+        for (field, value) in pairs {
+            args.push(field.as_protocol_str());
+            args.push(*value);
+        }
+        let fields = self.dispatch("find", &args).await?;
+        Ok(parse_library_entries(&fields))
+    }
+
     /// Case-insensitive substring search across MPD's library.
     ///
     /// Wire form: `search "<field>" "<query>"\n`.
@@ -1017,6 +1045,89 @@ impl MpdConnection {
                 }
             })
             .collect())
+    }
+
+    /// List distinct values of `tag` grouped by `group_by`.
+    ///
+    /// Wire form: `list "<tag>" group "<group_by>"\n` — MPD
+    /// returns interleaved pairs
+    /// (`GroupBy: <group_value>\n<Tag>: <tag_value>\n…`)
+    /// emitting the group header once and then every distinct
+    /// `tag` value under it.
+    ///
+    /// Returns `(tag_value, group_value)` pairs. Empty group
+    /// headers (MPD's tag-absent bucket) are mapped to empty
+    /// strings on the group side; callers decide whether the
+    /// blank group is operator-visible.
+    ///
+    /// One roundtrip for the entire library — replaces
+    /// `list <tag>` + N × `list <group> filter <tag>=<val>` on
+    /// the album-enumeration path.
+    pub async fn list_tag_grouped(
+        &mut self,
+        tag: &str,
+        group_by: &str,
+    ) -> Result<Vec<(String, String)>, MpdError> {
+        let fields = self.dispatch("list", &[tag, "group", group_by]).await?;
+        // The response is interleaved: one Group line, then the
+        // Tag lines under it, then next Group line, then its
+        // tags, etc. Walk the field list once and pair each
+        // Tag value with the most-recent Group value.
+        let mut current_group = String::new();
+        let tag_lower = tag.to_ascii_lowercase();
+        let group_lower = group_by.to_ascii_lowercase();
+        let mut out: Vec<(String, String)> = Vec::new();
+        for field in fields {
+            let key_lower = field.key.to_ascii_lowercase();
+            if key_lower == group_lower {
+                current_group = field.value.trim().to_string();
+            } else if key_lower == tag_lower {
+                let value = field.value.trim().to_string();
+                if !value.is_empty() {
+                    out.push((value, current_group.clone()));
+                }
+            }
+            // Silently ignore other keys — MPD may prefix the
+            // response with an OK/status line depending on the
+            // dispatch layer.
+        }
+        Ok(out)
+    }
+
+    /// Per-value song counts for `tag`, grouped in one MPD
+    /// roundtrip.
+    ///
+    /// Wire form: `count group "<tag>"\n` — MPD emits, for
+    /// every distinct value of `tag`, a `TagName: <value>\n`
+    /// header followed by `songs: <n>\n` and `playtime: <s>\n`.
+    /// This method walks the response once and returns a
+    /// `{tag_value: song_count}` map.
+    ///
+    /// Playtime is dropped — the browse envelope's shipped
+    /// shape is track counts only.
+    pub async fn count_grouped_by_tag(
+        &mut self,
+        tag: &str,
+    ) -> Result<std::collections::HashMap<String, u64>, MpdError> {
+        let fields = self.dispatch("count", &["group", tag]).await?;
+        let mut current_value: Option<String> = None;
+        let tag_lower = tag.to_ascii_lowercase();
+        let mut out = std::collections::HashMap::new();
+        for field in fields {
+            let key_lower = field.key.to_ascii_lowercase();
+            if key_lower == tag_lower {
+                current_value = Some(field.value.trim().to_string());
+            } else if key_lower == "songs" {
+                if let Some(v) = current_value.as_ref() {
+                    if !v.is_empty() {
+                        if let Ok(n) = field.value.trim().parse::<u64>() {
+                            out.insert(v.clone(), n);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// List distinct values of `tag` filtered to `<filter_tag>
@@ -3350,6 +3461,7 @@ mod tests {
             (MpdSearchField::Composer, "composer"),
             (MpdSearchField::File, "file"),
             (MpdSearchField::Base, "base"),
+            (MpdSearchField::Date, "date"),
         ];
         for (f, token) in pairs {
             assert_eq!(f.as_protocol_str(), token);

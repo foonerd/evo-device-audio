@@ -688,6 +688,12 @@ pub enum MpdSearchField {
     /// `base` — anchor the search at a directory prefix; MPD
     /// 0.20+ accepts this as a filter against the file path.
     Base,
+    /// `date` — the release-date tag; MPD stores whatever the
+    /// file was tagged with (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
+    /// A `search date <YYYY>` substring-matches every file
+    /// whose date starts with the given year, which is exactly
+    /// what a facet-drill on the year bucket wants.
+    Date,
 }
 
 impl MpdSearchField {
@@ -703,6 +709,7 @@ impl MpdSearchField {
             Self::Composer => "composer",
             Self::File => "file",
             Self::Base => "base",
+            Self::Date => "date",
         }
     }
 }
