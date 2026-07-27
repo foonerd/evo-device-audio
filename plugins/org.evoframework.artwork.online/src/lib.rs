@@ -73,6 +73,7 @@ use std::time::Duration;
 use evo_online_providers::{
     deezer::DeezerClient,
     fanart::FanartClient,
+    musicbrainz::MusicBrainzClient,
     rate_limit::RateLimiter,
     theaudiodb::{TheAudioDbClient, THEAUDIODB_KEYLESS_API_KEY},
 };
@@ -121,6 +122,20 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
+/// Fabricate a MusicBrainz-TOS-compliant User-Agent when the
+/// operator has not configured one. MB TOS says a client MUST
+/// send a UA that identifies "software, version, and contact
+/// info"; the default identifies this plugin's crate name +
+/// version and points at the plugin repository as the
+/// operator-visible contact for any provider-facing question
+/// about the traffic pattern.
+fn default_musicbrainz_user_agent() -> String {
+    format!(
+        "{PLUGIN_NAME}/{} (+https://github.com/foonerd/evo-device-audio)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 /// Online artwork respondent.
 pub struct ArtworkOnlinePlugin {
     loaded: bool,
@@ -146,6 +161,16 @@ pub struct ArtworkOnlinePlugin {
     /// cascade treats the fanart source as disabled in that
     /// case.
     fanart_client: Option<Arc<FanartClient>>,
+    /// MusicBrainz client used by the artist-artwork cascade to
+    /// resolve a canonical MBID from an artist name (`ws/2/artist
+    /// ?query=`) plus URL relationships (`ws/2/artist/<mbid>
+    /// ?inc=url-rels`) that carry the artist's Deezer link.
+    /// Always constructed once the plugin has loaded: uses the
+    /// operator-supplied `musicbrainz_user_agent` when set, or a
+    /// spec-compliant default identifying this plugin's crate
+    /// version + a public contact link. `Option` remains to
+    /// keep the pre-load state (`None`) representable.
+    mb_client: Option<Arc<MusicBrainzClient>>,
     /// Per-provider enable + priority for the artist-artwork
     /// cascade. Framework defaults, layered with runtime
     /// overrides from the `online_provider_config` store at
@@ -180,6 +205,7 @@ impl ArtworkOnlinePlugin {
             theaudiodb_client: None,
             deezer_client: None,
             fanart_client: None,
+            mb_client: None,
             artist_provider_config: Arc::new(tokio::sync::RwLock::new(
                 artist_cascade::ArtistProviderConfig::defaults(),
             )),
@@ -278,6 +304,30 @@ impl Plugin for ArtworkOnlinePlugin {
                 http.clone(),
                 one_req_per_sec(),
                 ua.clone(),
+            )));
+            // MusicBrainz client — used by the artist-artwork
+            // cascade to reconcile artist name → MBID → URL-rels
+            // (Deezer artist id / other databases). MB's TOS
+            // requires 1 req/sec and an identifying UA; the
+            // shared `one_req_per_sec()` limiter honours the
+            // former, and the UA is always set — operator
+            // override under `musicbrainz_user_agent` when
+            // present, or a spec-compliant default identifying
+            // this plugin + crate version + a public contact
+            // link. That way a fresh install has a working
+            // artist-artwork cascade without an operator
+            // configuration step, and MB's TOS is honoured
+            // either way (a distribution-scoped UA is more
+            // informative than a naked `curl` one).
+            let mb_ua = self
+                .config
+                .musicbrainz_user_agent
+                .clone()
+                .unwrap_or_else(default_musicbrainz_user_agent);
+            self.mb_client = Some(Arc::new(MusicBrainzClient::new(
+                http.clone(),
+                one_req_per_sec(),
+                mb_ua,
             )));
             // fanart.tv: fetch personal API key from the framework
             // credential vault. Absent key → client is None →
@@ -413,6 +463,7 @@ impl Plugin for ArtworkOnlinePlugin {
             self.theaudiodb_client = None;
             self.deezer_client = None;
             self.fanart_client = None;
+            self.mb_client = None;
             // Abort every background reactor so a subsequent
             // re-load spawns fresh subscriptions.
             for task in self.reactor_tasks.drain(..) {
@@ -534,6 +585,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
+                        mb: self.mb_client.clone(),
                         config: config_snapshot,
                     };
                     let response = artist_cascade::query_artist_artwork(

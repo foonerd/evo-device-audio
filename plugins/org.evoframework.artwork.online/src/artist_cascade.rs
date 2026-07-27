@@ -75,7 +75,12 @@
 use std::sync::Arc;
 
 use evo_online_providers::{
-    deezer::DeezerClient, fanart::FanartClient, theaudiodb::TheAudioDbClient,
+    deezer::DeezerClient,
+    fanart::FanartClient,
+    musicbrainz::{
+        parse_deezer_artist_id, MusicBrainzClient, MusicBrainzError,
+    },
+    theaudiodb::TheAudioDbClient,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -342,6 +347,20 @@ impl ArtistArtworkResponse {
     /// docstring for the licensing rationale — mirroring here
     /// keeps text and image sources on one attribution contract.
     pub(crate) fn from_sources(sources: Vec<SourceEntry>) -> Self {
+        // The `sources` list is already sorted by operator
+        // priority. Walk it and pick the first source whose
+        // payload produces a real image URL — a source whose
+        // payload picker returns `None` (e.g. a provider
+        // that returned a URL shape but with an empty entity
+        // slug) is skipped so a downstream fallback source can
+        // still deliver the image. Only when every source
+        // fails the picker do we surface NotFound: an "ok"
+        // response with no usable URL is worse than an honest
+        // "not_found" that the caller can render as a
+        // placeholder.
+        let usable = sources.iter().enumerate().find_map(|(idx, s)| {
+            pick_canonical_image_url(&s.payload).map(|url| (idx, url))
+        });
         let (
             status,
             provider_id,
@@ -349,17 +368,19 @@ impl ArtistArtworkResponse {
             payload,
             image_url,
             attribution,
-        ) = if let Some(primary) = sources.first() {
-            (
-                CascadeStatus::Ok,
-                Some(primary.provider_id.clone()),
-                Some(primary.privacy_class.clone()),
-                Some(primary.payload.clone()),
-                pick_canonical_image_url(&primary.payload),
-                Some(primary.attribution.clone()),
-            )
-        } else {
-            (CascadeStatus::NotFound, None, None, None, None, None)
+        ) = match usable {
+            Some((idx, url)) => {
+                let s = &sources[idx];
+                (
+                    CascadeStatus::Ok,
+                    Some(s.provider_id.clone()),
+                    Some(s.privacy_class.clone()),
+                    Some(s.payload.clone()),
+                    Some(url),
+                    Some(s.attribution.clone()),
+                )
+            }
+            None => (CascadeStatus::NotFound, None, None, None, None, None),
         };
         Self {
             v: 1,
@@ -410,6 +431,7 @@ fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|s| is_real_image_url(s))
             .map(str::to_string)
         {
             return Some(url);
@@ -426,15 +448,39 @@ fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
         if let Some(url) = obj
             .get(*key)
             .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.iter().find_map(serde_json::Value::as_str))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .find(|s| !s.is_empty() && is_real_image_url(s))
+            })
             .map(str::to_string)
         {
             return Some(url);
         }
     }
     None
+}
+
+/// Reject URLs that are structurally shaped like a valid image
+/// URL but carry no entity identifier — the wire-observed
+/// failure mode where Deezer returns
+/// `https://cdn-images.dzcdn.net/images/artist//1000x1000-…`
+/// (empty artist hash between the `artist/` and size segments)
+/// for entities the provider did not resolve. Absent this
+/// guard the picker returns the placeholder URL and callers
+/// see a status=ok with a URL that renders as a broken image.
+///
+/// The rule: any `//` inside the path portion of the URL that
+/// is not the scheme separator disqualifies the URL. Covers
+/// the observed Deezer shape and every equivalent shape in
+/// which a provider CDN elides an entity segment.
+fn is_real_image_url(url: &str) -> bool {
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map(|(_, p)| p).unwrap_or(""),
+        None => url,
+    };
+    !path.contains("//")
 }
 
 /// Sort a `sources` slice in place by operator priority
@@ -475,8 +521,26 @@ pub(crate) struct ArtistCatalogue {
     pub(crate) theaudiodb: Option<Arc<TheAudioDbClient>>,
     pub(crate) deezer: Option<Arc<DeezerClient>>,
     pub(crate) fanart: Option<Arc<FanartClient>>,
+    /// MusicBrainz client used to reconcile the artist's
+    /// canonical MBID before dispatching identity-bearing
+    /// providers. Always present when the plugin has loaded
+    /// (a spec-compliant default UA is fabricated when the
+    /// operator has not set one); `Option` remains for the
+    /// pre-load state.
+    pub(crate) mb: Option<Arc<MusicBrainzClient>>,
     pub(crate) config: ArtistProviderConfig,
 }
+
+/// Minimum MusicBrainz search score required to accept an
+/// artist-name → MBID reconciliation as authoritative.
+/// MB's Lucene score model returns `100` for exact-match on
+/// name; the next tier down (`90`+) is normally a phonetic
+/// / punctuation variant of the same entity. Below 90 the
+/// match confidence is not sufficient to key provider
+/// lookups on — the cascade emits `not_found` so the UI
+/// falls back to its local thumbnail rather than surface a
+/// wrong-entity image.
+const MB_MIN_CONFIDENCE_PERCENT: u32 = 90;
 
 /// Entry point invoked by the plugin's request handler.
 pub(crate) async fn query_artist_artwork(
@@ -507,32 +571,117 @@ pub(crate) async fn query_artist_artwork(
             "artist is required and must be non-empty",
         ));
     };
-    let artist_mbid = req
+    // MBID reconciliation is mandatory for identity-bearing
+    // providers. Prefer any MBID the caller supplied (already
+    // reconciled upstream); otherwise ask MusicBrainz for a
+    // name → MBID match, gated on confidence. Missing / weak
+    // reconciliation is not an error — the fallback path is
+    // "no source", which becomes `not_found` at the envelope.
+    let caller_supplied_mbid = req
         .artist_mbid
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let reconciled = if let Some(mbid) = caller_supplied_mbid.clone() {
+        // The caller passed an MBID they already trust; skip
+        // MusicBrainz search, but still fetch URL-rels so the
+        // Deezer path can key on the recorded Deezer link.
+        match &catalogue.mb {
+            Some(mb) => match mb.lookup_artist(&mbid).await {
+                Ok(lookup) => Some(lookup),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "musicbrainz",
+                        artist = %artist,
+                        mbid = %mbid,
+                        error = %mb_error_display(&e),
+                        "MB lookup for caller-supplied MBID failed; \
+                         proceeding with MBID only"
+                    );
+                    // Fabricate a URL-rel-less lookup so the
+                    // downstream providers still use the MBID
+                    // where they can (fanart.tv, TheAudioDB).
+                    Some(bare_lookup_from_mbid(&mbid, &artist))
+                }
+            },
+            None => Some(bare_lookup_from_mbid(&mbid, &artist)),
+        }
+    } else {
+        reconcile_artist_mbid(&artist, catalogue.mb.as_deref()).await
+    };
 
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
     let want_theaudiodb =
         catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some();
+            && catalogue.theaudiodb.is_some()
+            && reconciled.is_some();
     let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
-        && catalogue.deezer.is_some();
+        && catalogue.deezer.is_some()
+        && reconciled
+            .as_ref()
+            .and_then(|l| l.deezer_artist_url.as_deref())
+            .is_some();
     let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
         && catalogue.fanart.is_some()
-        && artist_mbid.is_some();
+        && reconciled.is_some();
+    // volumio_meta remains a name-only source; it takes no MBID
+    // and no way to validate against a canonical identity. Keep
+    // it enabled only when MBID reconciliation confirmed the
+    // artist exists — that gate blocks the compilation-artist
+    // wire failure mode (raw tag "Al Di Meola and John
+    // McLaughlin and Paco De Lucía" resolves to no MB entity,
+    // so volumio_meta doesn't fire, so no false-ok URL surfaces).
+    let want_volumio =
+        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
+            && reconciled.is_some();
 
     if !(want_volumio || want_theaudiodb || want_deezer || want_fanart) {
-        return Ok(ArtistArtworkResponse::not_configured(
-            "every artist-artwork provider is disabled or unavailable on this \
-             device; enable at least one under Settings → Metadata → Sources \
-             (fanart.tv also requires the artist_mbid + a fanart.tv \
-             personal API key)",
-        ));
+        // Two shapes of "cascade would not fire":
+        //   - Every provider disabled / unavailable → not_configured
+        //     (operator gesture would help).
+        //   - Providers configured but MBID did not reconcile
+        //     → not_found (no configuration change would help;
+        //     the artist is not in MusicBrainz at confidence).
+        let any_configured =
+            catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
+                || (catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+                    && catalogue.theaudiodb.is_some())
+                || (catalogue.config.is_enabled(ArtistProviderId::Deezer)
+                    && catalogue.deezer.is_some())
+                || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+                    && catalogue.fanart.is_some());
+        if !any_configured || catalogue.mb.is_none() {
+            return Ok(ArtistArtworkResponse::not_configured(
+                "every artist-artwork provider is disabled or unavailable on this \
+                 device; enable at least one under Settings → Metadata → Sources \
+                 (fanart.tv also requires the artist_mbid + a fanart.tv \
+                 personal API key), and set `musicbrainz_user_agent` so the \
+                 cascade can reconcile artist identity",
+            ));
+        }
+        return Ok(ArtistArtworkResponse {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            image_url: None,
+            detail: Some(format!(
+                "no MusicBrainz-confident match for {artist} at ≥{MB_MIN_CONFIDENCE_PERCENT}% \
+                 — cascade requires MBID reconciliation to prevent wrong-entity images"
+            )),
+            attribution: None,
+            sources: Vec::new(),
+        });
     }
+
+    let effective_mbid: Option<&str> =
+        reconciled.as_ref().map(|l| l.artist_mbid.as_str());
+    let deezer_artist_id: Option<u64> = reconciled
+        .as_ref()
+        .and_then(|l| l.deezer_artist_url.as_deref())
+        .and_then(parse_deezer_artist_id);
 
     let (volumio_src, tadb_src, deezer_src, fanart_src) = tokio::join!(
         fetch_volumio_meta_artist(
@@ -541,9 +690,19 @@ pub(crate) async fn query_artist_artwork(
             &catalogue.volumio_meta_variant,
             want_volumio,
         ),
-        fetch_theaudiodb_artist(&artist, catalogue, want_theaudiodb),
-        fetch_deezer_artist(&artist, catalogue, want_deezer),
-        fetch_fanart_artist(artist_mbid.as_deref(), catalogue, want_fanart,),
+        fetch_theaudiodb_artist(
+            effective_mbid,
+            &artist,
+            catalogue,
+            want_theaudiodb,
+        ),
+        fetch_deezer_artist_by_id(
+            deezer_artist_id,
+            &artist,
+            catalogue,
+            want_deezer,
+        ),
+        fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
     );
 
     let mut sources: Vec<SourceEntry> =
@@ -670,6 +829,7 @@ async fn fetch_volumio_meta_artist(
 }
 
 async fn fetch_theaudiodb_artist(
+    artist_mbid: Option<&str>,
     artist: &str,
     catalogue: &ArtistCatalogue,
     enabled: bool,
@@ -678,19 +838,42 @@ async fn fetch_theaudiodb_artist(
         return None;
     }
     let tadb = catalogue.theaudiodb.as_ref()?;
-    let hit = match tadb.search_artist_bio(artist).await {
-        Ok(Some(h)) => h,
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::warn!(
-                plugin = crate::PLUGIN_NAME,
-                provider = "theaudiodb",
-                artist,
-                error = %e,
-                "TheAudioDB artist artwork transient; skipping"
-            );
-            return None;
-        }
+    // MBID-first: TheAudioDB's `artist-mb.php?i=<mbid>` returns
+    // the canonical entity for the given MBID; name-search
+    // (`search.php`) cross-matches on namesake artists and is
+    // therefore only a fallback when no MBID is available (the
+    // upstream cascade currently blocks that fallback, so this
+    // path stays for API-shape completeness).
+    let hit = match artist_mbid {
+        Some(mbid) => match tadb.fetch_artist_bio_by_mbid(mbid).await {
+            Ok(Some(h)) => h,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "theaudiodb",
+                    artist,
+                    mbid,
+                    error = %e,
+                    "TheAudioDB artist artwork by MBID transient; skipping"
+                );
+                return None;
+            }
+        },
+        None => match tadb.search_artist_bio(artist).await {
+            Ok(Some(h)) => h,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "theaudiodb",
+                    artist,
+                    error = %e,
+                    "TheAudioDB artist artwork transient; skipping"
+                );
+                return None;
+            }
+        },
     };
     let thumb = hit
         .artist_thumb_url
@@ -714,7 +897,8 @@ async fn fetch_theaudiodb_artist(
     })
 }
 
-async fn fetch_deezer_artist(
+async fn fetch_deezer_artist_by_id(
+    deezer_artist_id: Option<u64>,
     artist: &str,
     catalogue: &ArtistCatalogue,
     enabled: bool,
@@ -723,6 +907,7 @@ async fn fetch_deezer_artist(
         return None;
     }
     let deezer = catalogue.deezer.as_ref()?;
+    let id = deezer_artist_id?;
     // Deezer live-fetch invariant (ToS-mandated):
     // ------------------------------------------------------------
     // `ArtistImageHit` deliberately does NOT derive `Serialize`.
@@ -741,7 +926,15 @@ async fn fetch_deezer_artist(
     // This entry's presence in `sources[]` implicitly declares
     // to the UI: "render live from these URLs; do not persist
     // the image data".
-    let hit = match deezer.search_artist_image(artist).await {
+    //
+    // MBID-first: `deezer_artist_id` is sourced from a
+    // MusicBrainz URL-relation whose target hostname is
+    // `deezer.com`. Fetching by id guarantees the returned
+    // entity matches MB's canonical identity for the artist —
+    // the wire-observed cross-match (Abba → deezer id
+    // `204768937` [anime] instead of `1071` [ABBA]) cannot
+    // happen because we never re-search by name.
+    let hit = match deezer.get_artist_image_by_id(id).await {
         Ok(Some(h)) => h,
         Ok(None) => return None,
         Err(e) => {
@@ -749,8 +942,9 @@ async fn fetch_deezer_artist(
                 plugin = crate::PLUGIN_NAME,
                 provider = "deezer",
                 artist,
+                deezer_id = id,
                 error = %e,
-                "Deezer artist image transient; skipping"
+                "Deezer artist image by id transient; skipping"
             );
             return None;
         }
@@ -851,6 +1045,115 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Reconcile an artist name to a MusicBrainz canonical
+/// artist entity plus URL-relations.
+///
+/// Two calls when the client is present:
+///
+/// 1. `search_artist` → highest-scoring hit. Score must be
+///    ≥ [`MB_MIN_CONFIDENCE_PERCENT`] (typically the top hit
+///    for common artists returns exactly 100). Below that
+///    threshold the reconciliation refuses so a namesake /
+///    misspelling does not surface a wrong entity.
+/// 2. `lookup_artist` on the reconciled MBID with
+///    `inc=url-rels` → carries the Deezer artist page URL when
+///    MB has recorded one, which the Deezer fetch consumes as
+///    an authoritative artist id.
+///
+/// Returns `None` on: no MB client (operator has not
+/// configured a MusicBrainz UA), no search hit at confidence,
+/// or transient MB failure (never caches — the next request
+/// re-attempts).
+async fn reconcile_artist_mbid(
+    artist: &str,
+    mb: Option<&MusicBrainzClient>,
+) -> Option<evo_online_providers::musicbrainz::ArtistLookup> {
+    let mb = mb?;
+    let hit = match mb.search_artist(artist).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "musicbrainz",
+                artist,
+                "MB artist search returned no hits"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "musicbrainz",
+                artist,
+                error = %mb_error_display(&e),
+                "MB artist search transient; skipping"
+            );
+            return None;
+        }
+    };
+    if hit.confidence_percent < MB_MIN_CONFIDENCE_PERCENT {
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "musicbrainz",
+            artist,
+            canonical = %hit.canonical_name,
+            confidence = hit.confidence_percent,
+            threshold = MB_MIN_CONFIDENCE_PERCENT,
+            "MB artist match below confidence threshold; refusing to key providers on it"
+        );
+        return None;
+    }
+    match mb.lookup_artist(&hit.artist_mbid).await {
+        Ok(lookup) => Some(lookup),
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "musicbrainz",
+                artist,
+                mbid = %hit.artist_mbid,
+                error = %mb_error_display(&e),
+                "MB artist lookup transient; falling back to MBID-only"
+            );
+            Some(bare_lookup_from_mbid(&hit.artist_mbid, artist))
+        }
+    }
+}
+
+/// Construct a fabricated `ArtistLookup` from an MBID + query
+/// name when the full URL-rels lookup did not succeed. Lets
+/// the downstream providers that key on MBID (fanart.tv,
+/// TheAudioDB) still fire, at the cost of the Deezer-by-id
+/// path which requires an explicit URL-rel.
+fn bare_lookup_from_mbid(
+    mbid: &str,
+    artist: &str,
+) -> evo_online_providers::musicbrainz::ArtistLookup {
+    evo_online_providers::musicbrainz::ArtistLookup {
+        artist_mbid: mbid.to_string(),
+        canonical_name: artist.to_string(),
+        artist_type: None,
+        life_span_begin: None,
+        life_span_end: None,
+        country: None,
+        wikipedia_url: None,
+        wikidata_url: None,
+        official_homepage_url: None,
+        deezer_artist_url: None,
+    }
+}
+
+/// Render a MusicBrainz error compactly for a tracing warn.
+fn mb_error_display(e: &MusicBrainzError) -> String {
+    match e {
+        MusicBrainzError::Http(err) => format!("http: {err}"),
+        MusicBrainzError::Status { status, body } => {
+            let truncated: String = body.chars().take(120).collect();
+            format!("status={status} body={truncated}")
+        }
+        MusicBrainzError::Decode(msg) => format!("decode: {msg}"),
+    }
 }
 
 #[cfg(test)]
@@ -1035,6 +1338,60 @@ mod tests {
     }
 
     #[test]
+    fn pick_canonical_image_url_rejects_empty_entity_hash() {
+        // Wire-observed failure mode: Deezer returns a URL with
+        // an empty entity slug when the provider does not
+        // resolve the entity, e.g.
+        // `.../artist//1000x1000-...`. That URL must not surface
+        // as a hit — the picker must return `None` so the
+        // caller falls through to the next source or emits
+        // NotFound.
+        let deezer_empty = serde_json::json!({
+            "picture_xl_url": "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg",
+        });
+        assert_eq!(pick_canonical_image_url(&deezer_empty), None);
+        // The same shape on a TheAudioDB or volumio_meta payload.
+        let tadb_empty = serde_json::json!({
+            "thumb_url": "https://theaudiodb.com/images/media/artist//thumb.jpg",
+        });
+        assert_eq!(pick_canonical_image_url(&tadb_empty), None);
+    }
+
+    #[test]
+    fn pick_canonical_image_url_rejects_empty_entity_in_array_key() {
+        // Same guard on array-key sources: an entry with an
+        // empty entity segment must not be picked, and the
+        // picker must fall through to the next non-empty entry
+        // in the same array.
+        let mixed = serde_json::json!({
+            "hd_music_logo_urls": [
+                "https://f/artist//logo.png",
+                "https://f/artist/real/logo.png",
+            ],
+        });
+        assert_eq!(
+            pick_canonical_image_url(&mixed).as_deref(),
+            Some("https://f/artist/real/logo.png")
+        );
+    }
+
+    #[test]
+    fn is_real_image_url_accepts_normal_shapes() {
+        assert!(is_real_image_url(
+            "https://cdn-images.dzcdn.net/images/artist/abc123/1000x1000.jpg"
+        ));
+        assert!(is_real_image_url("https://x/y/z.jpg"));
+    }
+
+    #[test]
+    fn is_real_image_url_rejects_empty_path_segment() {
+        assert!(!is_real_image_url("https://x/y//z.jpg"));
+        assert!(!is_real_image_url(
+            "https://cdn-images.dzcdn.net/images/artist//1000x1000.jpg"
+        ));
+    }
+
+    #[test]
     fn from_sources_populates_top_level_image_url_from_primary() {
         // Consumer contract: the UI fires this verb per visible
         // artist tile and `<img src>`s the top-level image_url
@@ -1045,6 +1402,63 @@ mod tests {
             serde_json::json!({"picture_xl_url": "https://d/xl.jpg"}),
         )]);
         assert_eq!(resp.image_url.as_deref(), Some("https://d/xl.jpg"));
+    }
+
+    #[test]
+    fn from_sources_falls_through_source_with_empty_url_to_next_usable() {
+        // The primary source returned a URL-shaped-but-empty
+        // response (empty entity segment). The cascade must
+        // skip it and pick the next source whose payload
+        // carries a real URL — never surface status=ok with
+        // a broken URL.
+        let sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn/artist//1000x1000.jpg",
+                }),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({
+                    "thumb_url": "https://theaudiodb.example/artist/real.jpg",
+                }),
+            ),
+        ];
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert!(matches!(resp.status, CascadeStatus::Ok));
+        assert_eq!(
+            resp.image_url.as_deref(),
+            Some("https://theaudiodb.example/artist/real.jpg")
+        );
+        assert_eq!(resp.provider_id.as_deref(), Some("theaudiodb"));
+    }
+
+    #[test]
+    fn from_sources_returns_not_found_when_every_source_is_empty() {
+        // Every source returned a URL-shaped-but-empty payload
+        // (the compilation-artist wire failure mode). The
+        // cascade MUST surface NotFound so the caller can
+        // render an honest placeholder — never status=ok with
+        // no image_url, and never status=ok with a broken URL.
+        let sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn/artist//1000x1000.jpg",
+                }),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({
+                    "thumb_url": "https://theaudiodb.example/artist//thumb.jpg",
+                }),
+            ),
+        ];
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert!(matches!(resp.status, CascadeStatus::NotFound));
+        assert!(resp.image_url.is_none());
+        assert!(resp.provider_id.is_none());
     }
 
     /// Compile-fence attestation: ArtistImageHit MUST NOT derive
