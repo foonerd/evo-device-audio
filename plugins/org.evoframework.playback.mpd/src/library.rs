@@ -876,11 +876,22 @@ pub(crate) async fn handle_browse_library(
 /// Payload for the four facet-browse verbs
 /// (`library.browse_by_artist`, `_album`, `_genre`, `_year`).
 ///
-/// Pagination shape mirrors [`BrowseLibraryPayload`]: `page` +
-/// `page_size` both optional; response envelope carries
-/// `next_page` + `truncated` + `total` so the operator UI can
-/// scroll a long facet list without fetching everything at
-/// once.
+/// The verb has two modes:
+///
+/// 1. **Enumeration** — the default when `select` is absent.
+///    Returns a paged list of distinct facet values (artist
+///    names / album names / genre labels / year strings).
+///    Pagination shape mirrors [`BrowseLibraryPayload`]:
+///    `page` + `page_size` both optional; response envelope
+///    carries `next_page` + `truncated` + `total` so the UI
+///    can scroll a long facet list without fetching
+///    everything at once.
+///
+/// 2. **Drill** — when `select` is present. Returns the paged
+///    list of TRACKS matching the selector, in the file-entry
+///    shape [`handle_search_library`] uses (`uri`, `title`,
+///    `artist`, `album`, `artwork_url`, `duration_ms`,
+///    classical fields). Same pagination envelope.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BrowseByTagPayload {
     pub(crate) v: u32,
@@ -888,18 +899,68 @@ pub(crate) struct BrowseByTagPayload {
     pub(crate) page: Option<usize>,
     #[serde(default)]
     pub(crate) page_size: Option<usize>,
+    /// When present the verb switches to drill mode: returns
+    /// the tracks matching the selector on the target tag,
+    /// scoped by any parent context. When absent the verb
+    /// returns the facet enumeration.
+    #[serde(default)]
+    pub(crate) select: Option<BrowseSelector>,
 }
 
-/// Return the paged distinct values for a single MPD tag.
+/// Facet-drill selector. The target tag is the verb's tag
+/// (album / artist / genre / year); `value` is the value on
+/// that tag to filter tracks by. `parent`, when present, adds
+/// a second (tag, value) constraint that MPD ANDs into the
+/// find — e.g. albums named "Older" credited to multiple
+/// artists distinguish via `parent = {tag: "albumartist",
+/// value: "George Michael"}`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BrowseSelector {
+    pub(crate) value: String,
+    #[serde(default)]
+    pub(crate) parent: Option<BrowseSelectorParent>,
+}
+
+/// Parent context for a drill selector — a second
+/// `(tag, value)` pair the drill constrains on.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BrowseSelectorParent {
+    pub(crate) tag: String,
+    pub(crate) value: String,
+}
+
+/// Return the paged distinct values for a single MPD tag, OR
+/// the paged tracks matching a selector when the payload
+/// carries one.
 ///
 /// Common core for all four facet-browse verbs — the caller
 /// supplies the tag protocol string (`artist`, `album`,
-/// `genre`, `date`) and the verb name for error attribution;
-/// this function issues the MPD `list <tag>` command, applies
-/// optional value post-processing (e.g. year extraction from
-/// `date` which MPD stores as YYYY or YYYY-MM-DD), sorts case-
-/// insensitively for a stable operator-visible ordering, and
-/// paginates. Returns the standard envelope shape.
+/// `genre`, `date`) and the verb name for error attribution.
+///
+/// **Enumeration path** (payload.select absent): issues the
+/// MPD `list <tag>` command, applies value post-processing
+/// (year extraction from MPD's `date`), sorts case-
+/// insensitively, and paginates. Album enumeration additionally
+/// enriches each entry with `artist` (via `list album group
+/// albumartist`), `cover_url` (synthesised under the existing
+/// `mpd-album` scheme the framework's artwork endpoint already
+/// serves), and `track_count` (via `count group album` — one
+/// MPD roundtrip for the whole library). Artist enumeration
+/// carries an `artwork_lookup` object that names the shelf,
+/// request type, and payload the UI dispatches per visible
+/// tile to obtain a live image URL — the UI fans out per-tile
+/// rather than following an `<img src>` URL, so live-fetch
+/// providers can honour their terms.
+///
+/// **Drill path** (payload.select present): issues MPD
+/// `find <tag> <value>` (case-sensitive exact) or, when the
+/// selector carries a parent, `find <tag> <value>
+/// <parent_tag> <parent_value>` for the multi-tag AND. Year
+/// selection uses `search date <YYYY>` (substring) so files
+/// tagged `1996-05-13` still match the operator's `1996`
+/// bucket. Renders each returned track via
+/// [`render_library_entry`] — identical shape to
+/// [`handle_search_library`].
 pub(crate) async fn handle_browse_by_tag(
     conn: &mut MpdConnection,
     payload: BrowseByTagPayload,
@@ -914,6 +975,24 @@ pub(crate) async fn handle_browse_by_tag(
     let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
     let range_start = page.saturating_mul(page_size);
 
+    // Drill path — return TRACKS matching the selector.
+    if let Some(selector) = payload.select.as_ref() {
+        return drill_by_tag(
+            conn,
+            verb_name,
+            tag,
+            facet_key,
+            selector,
+            page,
+            page_size,
+            range_start,
+        )
+        .await;
+    }
+
+    // Enumeration path — return distinct facet values, with
+    // per-facet enrichment where the shape carries a
+    // meaningful identity (album cover / artist portrait).
     let raw_values = conn.list_tag(tag).await.map_err(|e| VerbError::Mpd {
         verb: verb_name.to_string(),
         reason: e.to_string(),
@@ -940,13 +1019,267 @@ pub(crate) async fn handle_browse_by_tag(
     // alphabetical.
     processed.sort_by_key(|a| a.to_lowercase());
 
-    let rendered: Vec<serde_json::Value> =
-        processed.iter().map(|v| json!({ facet_key: v })).collect();
+    // Album enrichment: one MPD `list album group albumartist`
+    // + one `count group album` for the whole library, keyed
+    // per-album into artist and track-count maps used to
+    // decorate each entry. Only issued for the album facet —
+    // the other three (artist / genre / year) don't have a
+    // comparable enrichment shape (no artist for a genre, etc.).
+    let (album_artists, album_counts) = if facet_key == "album" {
+        let artists =
+            conn.list_tag_grouped(tag, "albumartist")
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                })?;
+        // Grouped list emits every (album, artist) pair MPD
+        // knows about; when an album is credited to multiple
+        // artists the map keeps the last one MPD emitted
+        // (matches the browse-list's "one row per album"
+        // shape). Empty artist maps to `None` on the entry.
+        let mut artists_map = std::collections::HashMap::new();
+        for (album, artist) in artists {
+            if !artist.is_empty() {
+                artists_map.entry(album).or_insert(artist);
+            }
+        }
+        let counts = conn.count_grouped_by_tag(tag).await.map_err(|e| {
+            VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        (Some(artists_map), Some(counts))
+    } else {
+        (None, None)
+    };
+
+    let rendered: Vec<serde_json::Value> = processed
+        .iter()
+        .map(|v| {
+            render_facet_entry(
+                facet_key,
+                v,
+                album_artists.as_ref(),
+                album_counts.as_ref(),
+            )
+        })
+        .collect();
     let (page_entries, next_page, truncated) =
         paginate(&rendered, range_start, page_size);
     Ok(json!({
         "v":         LIBRARY_PAYLOAD_VERSION,
         "facet":     facet_key,
+        "entries":   page_entries,
+        "page":      page,
+        "page_size": page_size,
+        "total":     rendered.len(),
+        "truncated": truncated,
+        "next_page": next_page,
+    }))
+}
+
+/// Render one facet-enumeration entry with the enrichment
+/// appropriate to its facet kind.
+///
+/// - `album`: `{album, artist?, cover_url, track_count?}` — the
+///   maps carry per-album artist + track_count when the
+///   enumeration is over albums; `cover_url` is a synthesised
+///   `mpd-album` URL the framework's existing artwork endpoint
+///   already resolves.
+/// - `artist`: `{artist, artwork_lookup}` — the `artwork_lookup`
+///   object is an opaque, plugin-declared dispatch hint that
+///   names the shelf and request type the UI should fire per
+///   visible tile to obtain a live image URL. It is NOT an
+///   `<img src>` URL: consumption is a per-tile wire-op
+///   dispatch, lazy-gated by the UI (Deezer / live-fetch
+///   providers require this; a cache-able URL would violate
+///   their terms). The plugin never learns the UI's rendering
+///   strategy; the UI never learns which providers exist.
+/// - `genre` / `year`: `{genre}` / `{year}` — no imagery for
+///   these facets by design.
+fn render_facet_entry(
+    facet_key: &'static str,
+    value: &str,
+    album_artists: Option<&std::collections::HashMap<String, String>>,
+    album_counts: Option<&std::collections::HashMap<String, u64>>,
+) -> serde_json::Value {
+    match facet_key {
+        "album" => {
+            let artist = album_artists.and_then(|m| m.get(value).cloned());
+            let track_count = album_counts.and_then(|m| m.get(value).copied());
+            let cover_url =
+                evo_device_audio_shared::artwork_target_url_for_track(
+                    // No file-path fallback for the enumeration
+                    // shape — the mpd-album URL is the identity
+                    // every list-surface row uses, and passing an
+                    // empty file-path guarantees the mpd-album
+                    // branch when both artist + album are present.
+                    "",
+                    artist.as_deref(),
+                    Some(value),
+                );
+            json!({
+                "album":       value,
+                "artist":      artist,
+                "cover_url":   cover_url,
+                "track_count": track_count,
+            })
+        }
+        "artist" => {
+            // Dispatch hint the UI fires per visible tile via
+            // its normal wire-op client. Names the shelf and
+            // request type verbatim — no framework surface
+            // learns about artist artwork, and the UI never
+            // learns which providers back the response. Empty /
+            // whitespace-only names skip the hint so the UI does
+            // not fire a request that can only bad-request.
+            let trimmed = value.trim();
+            let artwork_lookup = if trimmed.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "shelf":        "artwork.providers",
+                    "request_type": "artwork.resolve_artist_artwork",
+                    "payload":      { "v": 1, "artist": trimmed },
+                }))
+            };
+            json!({
+                "artist":         value,
+                "artwork_lookup": artwork_lookup,
+            })
+        }
+        _ => json!({ facet_key: value }),
+    }
+}
+
+/// Drill path for [`handle_browse_by_tag`]. Issues an MPD
+/// find (or search for year) constrained by the selector,
+/// renders each track via [`render_library_entry`], and
+/// paginates the same envelope shape as the enumeration
+/// response.
+#[allow(clippy::too_many_arguments)]
+async fn drill_by_tag(
+    conn: &mut MpdConnection,
+    verb_name: &'static str,
+    tag: &'static str,
+    facet_key: &'static str,
+    selector: &BrowseSelector,
+    page: usize,
+    page_size: usize,
+    range_start: usize,
+) -> Result<serde_json::Value, VerbError> {
+    let selector_value = selector.value.trim();
+    if selector_value.is_empty() {
+        return Err(VerbError::Mpd {
+            verb: verb_name.to_string(),
+            reason: "browse selector value must be non-empty".to_string(),
+        });
+    }
+
+    // Map the verb's tag string to the search-field enum.
+    // year is special: MPD indexes the raw `date` tag and files
+    // may be tagged `1996-05-13`; the operator picked the
+    // `1996` bucket, so we substring-search rather than exact-
+    // match. The map here is per-verb; unknown tag strings are
+    // treated as raw protocol names to let future verbs opt in.
+    let entries: Vec<crate::mpd::MpdLibraryEntry> = if tag == "date" {
+        // Year drill uses MPD `search date <YYYY>` — a
+        // case-insensitive substring against the `date` tag
+        // only. So a file tagged `1996-05-13` matches the
+        // operator's `1996` bucket, and a track titled "Party
+        // like it's 1999" does NOT accidentally slip into the
+        // 1999 year bucket (which `find date 1999` misses,
+        // and `search any 1999` over-matches).
+        conn.search(crate::mpd::MpdSearchField::Date, selector_value)
+            .await
+            .map_err(|e| VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: e.to_string(),
+            })?
+    } else {
+        let field = match tag {
+            "album" => crate::mpd::MpdSearchField::Album,
+            "artist" => crate::mpd::MpdSearchField::Artist,
+            "genre" => crate::mpd::MpdSearchField::Genre,
+            _ => {
+                return Err(VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: format!(
+                        "drill on tag {tag:?} is not supported by this verb"
+                    ),
+                });
+            }
+        };
+        match selector.parent.as_ref() {
+            None => conn.find(field, selector_value).await.map_err(|e| {
+                VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                }
+            })?,
+            Some(parent) => {
+                let parent_tag = parent.tag.trim().to_ascii_lowercase();
+                let parent_value = parent.value.trim();
+                if parent_value.is_empty() {
+                    return Err(VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: "parent context value must be non-empty"
+                            .to_string(),
+                    });
+                }
+                let parent_field = match parent_tag.as_str() {
+                    "album" => crate::mpd::MpdSearchField::Album,
+                    "albumartist" => crate::mpd::MpdSearchField::AlbumArtist,
+                    "artist" => crate::mpd::MpdSearchField::Artist,
+                    "genre" => crate::mpd::MpdSearchField::Genre,
+                    other => {
+                        return Err(VerbError::Mpd {
+                            verb: verb_name.to_string(),
+                            reason: format!(
+                                "parent tag {other:?} is not supported"
+                            ),
+                        });
+                    }
+                };
+                conn.find_multi(&[
+                    (field, selector_value),
+                    (parent_field, parent_value),
+                ])
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                })?
+            }
+        }
+    };
+
+    // Render the tracks in the same file-entry shape
+    // handle_search_library uses so any consumer of that
+    // envelope reads the drill response identically.
+    let rendered: Vec<serde_json::Value> = entries
+        .iter()
+        .filter_map(|e| match e {
+            crate::mpd::MpdLibraryEntry::File { .. } => {
+                Some(render_library_entry(e))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let (page_entries, next_page, truncated) =
+        paginate(&rendered, range_start, page_size);
+    Ok(json!({
+        "v":         LIBRARY_PAYLOAD_VERSION,
+        "facet":     facet_key,
+        "select":    {
+            "value":  selector.value,
+            "parent": selector.parent.as_ref().map(|p| {
+                json!({ "tag": p.tag, "value": p.value })
+            }),
+        },
         "entries":   page_entries,
         "page":      page,
         "page_size": page_size,
