@@ -587,7 +587,14 @@ impl ShelfBundle {
                 self.dispatch_library_browse_by_tag(
                     req,
                     "library.browse_by_artist",
-                    "artist",
+                    // MPD's per-album primary-artist tag. The
+                    // browse-by-artist facet is "one entry per
+                    // real artist"; `albumartist` matches that
+                    // shape closely (featurings and per-track
+                    // credits collapse), whereas the raw
+                    // `artist` tag returns every per-track
+                    // credit as a distinct facet value.
+                    "albumartist",
                     "artist",
                     library::identity_post_process,
                 )

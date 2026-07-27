@@ -1007,52 +1007,119 @@ pub(crate) async fn handle_browse_by_tag(
     // (rather than at MPD's list layer) because MPD's list is
     // already-distinct for the RAW tag value, not the processed
     // form.
-    let mut seen = std::collections::HashSet::new();
-    let mut processed: Vec<String> = raw_values
-        .into_iter()
-        .filter_map(post_process)
-        .filter(|v| seen.insert(v.clone()))
-        .collect();
+    //
+    // The artist facet applies an additional fold-key dedupe:
+    // MPD's raw tag values carry per-file drift (diacritic
+    // form, "Last, First" reversal, trailing "| garbage" tag-
+    // editor droppings) that surface the same real artist as
+    // multiple tiles. `artist_fold_key` collapses those into
+    // one entry; the display value is the most common raw
+    // form that folded into the group.
+    let mut processed: Vec<String> = if facet_key == "artist" {
+        let mut groups: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, usize>,
+        > = std::collections::HashMap::new();
+        for raw in raw_values.into_iter().filter_map(post_process) {
+            let key = artist_fold_key(&raw);
+            if key.is_empty() {
+                continue;
+            }
+            *groups.entry(key).or_default().entry(raw).or_insert(0) += 1;
+        }
+        groups
+            .into_values()
+            .filter_map(|forms| {
+                // Break ties by longest form so
+                // "Céline Dion" wins over "Celine Dion" — the
+                // diacritic-carrying form is closer to the
+                // artist's canonical presentation.
+                forms
+                    .into_iter()
+                    .max_by(|a, b| {
+                        a.1.cmp(&b.1).then_with(|| {
+                            a.0.chars().count().cmp(&b.0.chars().count())
+                        })
+                    })
+                    .map(|(display, _)| display)
+            })
+            .collect()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        raw_values
+            .into_iter()
+            .filter_map(post_process)
+            .filter(|v| seen.insert(v.clone()))
+            .collect()
+    };
     // Case-insensitive lexicographic sort for a stable
     // operator-visible ordering — MPD returns tags in an
     // internal order that is stable across calls but not
     // alphabetical.
     processed.sort_by_key(|a| a.to_lowercase());
 
-    // Album enrichment: one MPD `list album group albumartist`
-    // + one `count group album` for the whole library, keyed
-    // per-album into artist and track-count maps used to
-    // decorate each entry. Only issued for the album facet —
-    // the other three (artist / genre / year) don't have a
-    // comparable enrichment shape (no artist for a genre, etc.).
-    let (album_artists, album_counts) = if facet_key == "album" {
-        let artists =
-            conn.list_tag_grouped(tag, "albumartist")
+    // Facet-specific enrichment. Two shapes both keyed off one
+    // MPD `list album group albumartist` roundtrip:
+    //
+    // - Album facet: album → artist map + `count group album`
+    //   for track counts.
+    // - Artist facet: artist → first-album map, used to
+    //   synthesise a local `mpd-album` cover_url as the artist
+    //   tile's guaranteed-correct thumbnail.
+    let (album_artists, album_counts, artist_first_album) = match facet_key {
+        "album" => {
+            let pairs = conn
+                .list_tag_grouped(tag, "albumartist")
                 .await
                 .map_err(|e| VerbError::Mpd {
                     verb: verb_name.to_string(),
                     reason: e.to_string(),
                 })?;
-        // Grouped list emits every (album, artist) pair MPD
-        // knows about; when an album is credited to multiple
-        // artists the map keeps the last one MPD emitted
-        // (matches the browse-list's "one row per album"
-        // shape). Empty artist maps to `None` on the entry.
-        let mut artists_map = std::collections::HashMap::new();
-        for (album, artist) in artists {
-            if !artist.is_empty() {
-                artists_map.entry(album).or_insert(artist);
+            // Grouped list emits every (album, artist) pair MPD
+            // knows about; when an album is credited to multiple
+            // artists the map keeps the last one MPD emitted
+            // (matches the browse-list's "one row per album"
+            // shape). Empty artist maps to `None` on the entry.
+            let mut artists_map = std::collections::HashMap::new();
+            for (album, artist) in pairs {
+                if !artist.is_empty() {
+                    artists_map.entry(album).or_insert(artist);
+                }
             }
+            let counts = conn.count_grouped_by_tag(tag).await.map_err(|e| {
+                VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            (Some(artists_map), Some(counts), None)
         }
-        let counts = conn.count_grouped_by_tag(tag).await.map_err(|e| {
-            VerbError::Mpd {
-                verb: verb_name.to_string(),
-                reason: e.to_string(),
+        "artist" => {
+            // Pairs come from `list album group albumartist`;
+            // we invert to per-artist first-album so each
+            // artist tile gets one representative album cover
+            // via the existing `mpd-album` scheme. Every fold-
+            // key variant of an artist gets its own entry in
+            // the raw map — the fold-key lookup at render time
+            // handles the collapse.
+            let pairs = conn
+                .list_tag_grouped("album", "albumartist")
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                })?;
+            let mut first_album: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (album, artist) in pairs {
+                if artist.is_empty() || album.is_empty() {
+                    continue;
+                }
+                first_album.entry(artist).or_insert(album);
             }
-        })?;
-        (Some(artists_map), Some(counts))
-    } else {
-        (None, None)
+            (None, None, Some(first_album))
+        }
+        _ => (None, None, None),
     };
 
     let rendered: Vec<serde_json::Value> = processed
@@ -1063,6 +1130,7 @@ pub(crate) async fn handle_browse_by_tag(
                 v,
                 album_artists.as_ref(),
                 album_counts.as_ref(),
+                artist_first_album.as_ref(),
             )
         })
         .collect();
@@ -1088,15 +1156,18 @@ pub(crate) async fn handle_browse_by_tag(
 ///   enumeration is over albums; `cover_url` is a synthesised
 ///   `mpd-album` URL the framework's existing artwork endpoint
 ///   already resolves.
-/// - `artist`: `{artist, artwork_lookup}` — the `artwork_lookup`
-///   object is an opaque, plugin-declared dispatch hint that
-///   names the shelf and request type the UI should fire per
-///   visible tile to obtain a live image URL. It is NOT an
-///   `<img src>` URL: consumption is a per-tile wire-op
-///   dispatch, lazy-gated by the UI (Deezer / live-fetch
-///   providers require this; a cache-able URL would violate
-///   their terms). The plugin never learns the UI's rendering
-///   strategy; the UI never learns which providers exist.
+/// - `artist`: `{artist, cover_url?, artwork_lookup}` — the
+///   `cover_url` is a synthesised `mpd-album` URL for one of
+///   this artist's albums, present whenever the artist has at
+///   least one album in the library. Always the right artist,
+///   no external match required — the UI has a guaranteed
+///   thumbnail. `artwork_lookup` is an opaque, plugin-declared
+///   dispatch hint the UI may fire per visible tile to
+///   attempt a higher-fidelity portrait; consumption is a
+///   wire-op dispatch, not an `<img src>` URL, so live-fetch
+///   providers keep their terms. The plugin never learns the
+///   UI's rendering strategy; the UI never learns which
+///   providers exist.
 /// - `genre` / `year`: `{genre}` / `{year}` — no imagery for
 ///   these facets by design.
 fn render_facet_entry(
@@ -1104,6 +1175,7 @@ fn render_facet_entry(
     value: &str,
     album_artists: Option<&std::collections::HashMap<String, String>>,
     album_counts: Option<&std::collections::HashMap<String, u64>>,
+    artist_first_album: Option<&std::collections::HashMap<String, String>>,
 ) -> serde_json::Value {
     match facet_key {
         "album" => {
@@ -1128,6 +1200,29 @@ fn render_facet_entry(
             })
         }
         "artist" => {
+            let trimmed = value.trim();
+            // Local thumbnail: pick one of this artist's albums
+            // and synthesise the mpd-album URL — always the
+            // right artist, no external provider match needed.
+            // The lookup uses fold-key equivalence so a display
+            // form like `Céline Dion` still finds an album
+            // tagged under `Celine Dion`.
+            let cover_url = if trimmed.is_empty() {
+                None
+            } else {
+                artist_first_album.and_then(|m| {
+                    let target_key = artist_fold_key(trimmed);
+                    m.iter()
+                        .find(|(artist, _)| artist_fold_key(artist) == target_key)
+                        .map(|(artist, album)| {
+                            evo_device_audio_shared::artwork_target_url_for_track(
+                                "",
+                                Some(artist.as_str()),
+                                Some(album.as_str()),
+                            )
+                        })
+                })
+            };
             // Dispatch hint the UI fires per visible tile via
             // its normal wire-op client. Names the shelf and
             // request type verbatim — no framework surface
@@ -1135,7 +1230,6 @@ fn render_facet_entry(
             // learns which providers back the response. Empty /
             // whitespace-only names skip the hint so the UI does
             // not fire a request that can only bad-request.
-            let trimmed = value.trim();
             let artwork_lookup = if trimmed.is_empty() {
                 None
             } else {
@@ -1147,6 +1241,7 @@ fn render_facet_entry(
             };
             json!({
                 "artist":         value,
+                "cover_url":      cover_url,
                 "artwork_lookup": artwork_lookup,
             })
         }
@@ -1198,6 +1293,88 @@ async fn drill_by_tag(
                 verb: verb_name.to_string(),
                 reason: e.to_string(),
             })?
+    } else if tag == "albumartist" {
+        // Artist facet drill: the enumeration folded diacritic /
+        // punctuation / sort-form variants into one entry, so
+        // the selector value is only one of the raw tag forms.
+        // Union every raw form whose fold-key matches — a
+        // single MPD `list albumartist` roundtrip plus one
+        // `find` per matching form. Typical library carries
+        // 1-3 raw forms per real artist.
+        let raw_forms =
+            conn.list_tag("albumartist")
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: verb_name.to_string(),
+                    reason: e.to_string(),
+                })?;
+        let target_key = artist_fold_key(selector_value);
+        let matching: Vec<String> = raw_forms
+            .into_iter()
+            .filter(|raw| artist_fold_key(raw) == target_key)
+            .collect();
+        if matching.is_empty() {
+            Vec::new()
+        } else {
+            match selector.parent.as_ref() {
+                None => {
+                    let mut all = Vec::new();
+                    for raw in &matching {
+                        let batch = conn
+                            .find(crate::mpd::MpdSearchField::AlbumArtist, raw)
+                            .await
+                            .map_err(|e| VerbError::Mpd {
+                                verb: verb_name.to_string(),
+                                reason: e.to_string(),
+                            })?;
+                        all.extend(batch);
+                    }
+                    all
+                }
+                Some(parent) => {
+                    let parent_tag = parent.tag.trim().to_ascii_lowercase();
+                    let parent_value = parent.value.trim();
+                    if parent_value.is_empty() {
+                        return Err(VerbError::Mpd {
+                            verb: verb_name.to_string(),
+                            reason: "parent context value must be non-empty"
+                                .to_string(),
+                        });
+                    }
+                    let parent_field = match parent_tag.as_str() {
+                        "album" => crate::mpd::MpdSearchField::Album,
+                        "albumartist" => {
+                            crate::mpd::MpdSearchField::AlbumArtist
+                        }
+                        "artist" => crate::mpd::MpdSearchField::Artist,
+                        "genre" => crate::mpd::MpdSearchField::Genre,
+                        other => {
+                            return Err(VerbError::Mpd {
+                                verb: verb_name.to_string(),
+                                reason: format!(
+                                    "parent tag {other:?} is not supported"
+                                ),
+                            });
+                        }
+                    };
+                    let mut all = Vec::new();
+                    for raw in &matching {
+                        let batch = conn
+                            .find_multi(&[
+                                (crate::mpd::MpdSearchField::AlbumArtist, raw),
+                                (parent_field.clone(), parent_value),
+                            ])
+                            .await
+                            .map_err(|e| VerbError::Mpd {
+                                verb: verb_name.to_string(),
+                                reason: e.to_string(),
+                            })?;
+                        all.extend(batch);
+                    }
+                    all
+                }
+            }
+        }
     } else {
         let field = match tag {
             "album" => crate::mpd::MpdSearchField::Album,
@@ -1309,6 +1486,101 @@ pub(crate) fn year_from_mpd_date(raw: String) -> Option<String> {
 /// Identity post-process for tags that don't need transforming.
 pub(crate) fn identity_post_process(raw: String) -> Option<String> {
     Some(raw)
+}
+
+/// Fold an artist tag value into a dedupe key.
+///
+/// MPD's raw tag store carries per-file drift that surfaces the
+/// same real artist as multiple facet tiles:
+///
+/// - Diacritic form: `Céline Dion` vs `Celine Dion`.
+/// - Punctuation drift: `Jean-Michel Jarre` vs `Jean Michel Jarre`.
+/// - Sort-form reversal: `Cohen, Leonard` vs `Leonard Cohen`.
+/// - Tag-editor droppings: `Bruno Mars | www.RNBxBeatz.com`.
+///
+/// Fold rules, applied in order:
+///
+/// 1. Trim; empty → empty key (caller drops).
+/// 2. Strip trailing `| <suffix>` (tag-editor watermarks). The
+///    `|` is a rare literal in artist names — dropping the
+///    suffix removes the watermark while preserving anything
+///    before it verbatim.
+/// 3. Split on `,`; if the head is a plausible last name (single
+///    token) and the tail is a plausible first-name run, reorder
+///    to `<tail> <head>`. Handles `Cohen, Leonard` → `Leonard
+///    Cohen` but leaves `Nick Cave, Kylie Minogue` (duet credit)
+///    unchanged because the head has multiple tokens.
+/// 4. NFD-decompose, drop combining marks (U+0300..=U+036F —
+///    Latin diacritics), lowercase, replace every non-alnum
+///    run with a single space, trim.
+///
+/// The resulting key is not human-readable — it is only a
+/// group discriminator. The caller keeps the raw form for
+/// display.
+pub(crate) fn artist_fold_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Strip trailing `| ...` watermark. The pipe is
+    // exceptionally rare in real artist names; anything after
+    // it is more likely to be a tagger's URL / tag-editor
+    // signature than part of the credit.
+    let without_watermark = match trimmed.split_once('|') {
+        Some((head, _)) => head.trim(),
+        None => trimmed,
+    };
+    // "Last, First" → "First Last" when the head is a single
+    // token. Multiple commas / multi-token heads look like duet
+    // credits and stay as-is.
+    let reordered: String =
+        if let Some((head, tail)) = without_watermark.split_once(',') {
+            let head_trim = head.trim();
+            let tail_trim = tail.trim();
+            let head_is_single_token = !head_trim.contains(char::is_whitespace);
+            let tail_has_no_comma = !tail_trim.contains(',');
+            if head_is_single_token
+                && tail_has_no_comma
+                && !head_trim.is_empty()
+                && !tail_trim.is_empty()
+            {
+                format!("{tail_trim} {head_trim}")
+            } else {
+                without_watermark.to_string()
+            }
+        } else {
+            without_watermark.to_string()
+        };
+    // NFD, drop combining marks, lowercase.
+    use unicode_normalization::UnicodeNormalization;
+    let mut folded = String::with_capacity(reordered.len());
+    let mut last_was_space = true;
+    for ch in reordered.nfd() {
+        if is_combining_mark(ch) {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            for lc in ch.to_lowercase() {
+                folded.push(lc);
+                last_was_space = false;
+            }
+        } else if !last_was_space {
+            folded.push(' ');
+            last_was_space = true;
+        }
+    }
+    if folded.ends_with(' ') {
+        folded.pop();
+    }
+    folded
+}
+
+/// Test whether a char is a Unicode combining mark used for
+/// diacritics on Latin script. Covers the primary Combining
+/// Diacritical Marks block (U+0300..=U+036F); adequate for the
+/// Latin-script fold the artist facet needs.
+fn is_combining_mark(ch: char) -> bool {
+    matches!(ch as u32, 0x0300..=0x036F)
 }
 
 /// Slice a full entry list into the requested page.
@@ -2243,5 +2515,60 @@ mod tests {
         // changes, the doc must change too. Pins the value
         // so a future contributor can't silently loosen it.
         assert_eq!(BROWSE_HARD_CAP, 2_000);
+    }
+
+    #[test]
+    fn artist_fold_key_collapses_diacritic_forms() {
+        assert_eq!(
+            artist_fold_key("Céline Dion"),
+            artist_fold_key("Celine Dion")
+        );
+        assert_eq!(
+            artist_fold_key("Sinéad O'Connor"),
+            artist_fold_key("Sinead O'Connor")
+        );
+    }
+
+    #[test]
+    fn artist_fold_key_reorders_sort_form() {
+        assert_eq!(
+            artist_fold_key("Cohen, Leonard"),
+            artist_fold_key("Leonard Cohen")
+        );
+    }
+
+    #[test]
+    fn artist_fold_key_strips_pipe_watermark() {
+        assert_eq!(
+            artist_fold_key("Bruno Mars | www.RNBxBeatz.com"),
+            artist_fold_key("Bruno Mars")
+        );
+    }
+
+    #[test]
+    fn artist_fold_key_collapses_hyphen_variants() {
+        // Jean-Michel Jarre vs Jean Michel Jarre — hyphenation
+        // drift is normalized into a single fold-key because
+        // non-alnum runs become one space in the key.
+        assert_eq!(
+            artist_fold_key("Jean-Michel Jarre"),
+            artist_fold_key("Jean Michel Jarre")
+        );
+    }
+
+    #[test]
+    fn artist_fold_key_leaves_multi_artist_credits_alone() {
+        // "Nick Cave, Kylie Minogue" is a duet credit, not a
+        // sort-form. Head is multi-token → no reorder.
+        let a = artist_fold_key("Nick Cave, Kylie Minogue");
+        let b = artist_fold_key("Kylie Minogue Nick Cave");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn artist_fold_key_empty_when_blank() {
+        assert!(artist_fold_key("").is_empty());
+        assert!(artist_fold_key("   ").is_empty());
+        assert!(artist_fold_key("|").is_empty());
     }
 }
