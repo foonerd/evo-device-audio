@@ -279,6 +279,21 @@ pub(crate) struct ArtistArtworkResponse {
     pub(crate) privacy_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) payload: Option<serde_json::Value>,
+    /// Canonical top-level image URL derived from the primary
+    /// source's provider-specific payload. Every source uses
+    /// its own key (`image_url`, `thumb_url`, `picture_xl_url`,
+    /// `artist_thumb_urls[0]`, …); this field surfaces one
+    /// stable name for the UI, which fires this verb per
+    /// visible artist tile and `<img src>`s the resulting URL
+    /// directly at the provider's origin. No framework
+    /// byte-cache is involved: live-fetch providers keep their
+    /// terms, and the framework's content-hash artwork endpoint
+    /// stays out of the artist path entirely.
+    ///
+    /// Present iff `status == Ok` AND the primary source's
+    /// payload carries a URL the picker recognises.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,6 +314,7 @@ impl ArtistArtworkResponse {
             provider_id: None,
             privacy_class: None,
             payload: None,
+            image_url: None,
             detail: Some(detail.into()),
             attribution: None,
             sources: Vec::new(),
@@ -312,6 +328,7 @@ impl ArtistArtworkResponse {
             provider_id: None,
             privacy_class: None,
             payload: None,
+            image_url: None,
             detail: Some(detail.into()),
             attribution: None,
             sources: Vec::new(),
@@ -325,29 +342,99 @@ impl ArtistArtworkResponse {
     /// docstring for the licensing rationale — mirroring here
     /// keeps text and image sources on one attribution contract.
     pub(crate) fn from_sources(sources: Vec<SourceEntry>) -> Self {
-        let (status, provider_id, privacy_class, payload, attribution) =
-            if let Some(primary) = sources.first() {
-                (
-                    CascadeStatus::Ok,
-                    Some(primary.provider_id.clone()),
-                    Some(primary.privacy_class.clone()),
-                    Some(primary.payload.clone()),
-                    Some(primary.attribution.clone()),
-                )
-            } else {
-                (CascadeStatus::NotFound, None, None, None, None)
-            };
+        let (
+            status,
+            provider_id,
+            privacy_class,
+            payload,
+            image_url,
+            attribution,
+        ) = if let Some(primary) = sources.first() {
+            (
+                CascadeStatus::Ok,
+                Some(primary.provider_id.clone()),
+                Some(primary.privacy_class.clone()),
+                Some(primary.payload.clone()),
+                pick_canonical_image_url(&primary.payload),
+                Some(primary.attribution.clone()),
+            )
+        } else {
+            (CascadeStatus::NotFound, None, None, None, None, None)
+        };
         Self {
             v: 1,
             status,
             provider_id,
             privacy_class,
             payload,
+            image_url,
             detail: None,
             attribution,
             sources,
         }
     }
+}
+
+/// Pick a canonical image URL from a provider-specific payload.
+///
+/// The four artist-artwork sources use different keys:
+///
+/// - `volumio_meta` → `image_url` (string)
+/// - `theaudiodb` → `thumb_url` (string)
+/// - `deezer` → `picture_xl_url` / `_big_url` / `_medium_url` /
+///   `_small_url` (strings; pick the largest non-empty)
+/// - `fanart_tv` → `hd_music_logo_urls[0]` /
+///   `hd_artist_logo_urls[0]` / `artist_thumb_urls[0]` /
+///   `music_banner_urls[0]` / `artist_background_urls[0]`
+///   (arrays; pick the first non-empty entry from the
+///   highest-preference key)
+///
+/// The picker probes each key in preference order and returns
+/// the first non-empty string it finds. Returns `None` when the
+/// payload carries no URL under any recognised key — the
+/// resolver then surfaces `Ok(Not Found)` at the framework
+/// boundary rather than a partial hit.
+fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
+    let obj = payload.as_object()?;
+    const STRING_KEYS: &[&str] = &[
+        "image_url",
+        "thumb_url",
+        "picture_xl_url",
+        "picture_big_url",
+        "picture_medium_url",
+        "picture_small_url",
+    ];
+    for key in STRING_KEYS {
+        if let Some(url) = obj
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        {
+            return Some(url);
+        }
+    }
+    const ARRAY_KEYS: &[&str] = &[
+        "hd_music_logo_urls",
+        "hd_artist_logo_urls",
+        "artist_thumb_urls",
+        "music_banner_urls",
+        "artist_background_urls",
+    ];
+    for key in ARRAY_KEYS {
+        if let Some(url) = obj
+            .get(*key)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.iter().find_map(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        {
+            return Some(url);
+        }
+    }
+    None
 }
 
 /// Sort a `sources` slice in place by operator priority
@@ -473,6 +560,7 @@ pub(crate) async fn query_artist_artwork(
             provider_id: None,
             privacy_class: None,
             payload: None,
+            image_url: None,
             detail: Some(format!(
                 "no artist artwork found for {artist} across enabled providers"
             )),
@@ -880,6 +968,83 @@ mod tests {
         assert!(matches!(ok.status, CascadeStatus::Ok));
         let empty = ArtistArtworkResponse::from_sources(vec![]);
         assert!(matches!(empty.status, CascadeStatus::NotFound));
+    }
+
+    #[test]
+    fn pick_canonical_image_url_prefers_string_keys_by_order() {
+        // volumio_meta shape
+        let vol = serde_json::json!({"image_url": "https://vol/x.jpg"});
+        assert_eq!(
+            pick_canonical_image_url(&vol).as_deref(),
+            Some("https://vol/x.jpg")
+        );
+        // theaudiodb shape
+        let tadb = serde_json::json!({"thumb_url": "https://t/x.jpg"});
+        assert_eq!(
+            pick_canonical_image_url(&tadb).as_deref(),
+            Some("https://t/x.jpg")
+        );
+        // deezer shape — picks the largest available first
+        let deezer = serde_json::json!({
+            "picture_xl_url": "https://d/xl.jpg",
+            "picture_big_url": "https://d/big.jpg",
+        });
+        assert_eq!(
+            pick_canonical_image_url(&deezer).as_deref(),
+            Some("https://d/xl.jpg")
+        );
+        // deezer shape — falls through to next size when top is empty
+        let deezer_no_xl = serde_json::json!({
+            "picture_xl_url": "",
+            "picture_big_url": "https://d/big.jpg",
+        });
+        assert_eq!(
+            pick_canonical_image_url(&deezer_no_xl).as_deref(),
+            Some("https://d/big.jpg")
+        );
+    }
+
+    #[test]
+    fn pick_canonical_image_url_falls_back_to_array_keys() {
+        // fanart shape — hd_music_logo_urls wins over other arrays
+        let fanart = serde_json::json!({
+            "hd_music_logo_urls": ["https://f/logo.png"],
+            "artist_thumb_urls": ["https://f/thumb.jpg"],
+        });
+        assert_eq!(
+            pick_canonical_image_url(&fanart).as_deref(),
+            Some("https://f/logo.png")
+        );
+        // Empty top array + non-empty next → returns next
+        let fanart_partial = serde_json::json!({
+            "hd_music_logo_urls": [],
+            "artist_thumb_urls": ["https://f/thumb.jpg"],
+        });
+        assert_eq!(
+            pick_canonical_image_url(&fanart_partial).as_deref(),
+            Some("https://f/thumb.jpg")
+        );
+    }
+
+    #[test]
+    fn pick_canonical_image_url_returns_none_when_no_recognised_key() {
+        let empty = serde_json::json!({});
+        assert!(pick_canonical_image_url(&empty).is_none());
+        let junk = serde_json::json!({"random_key": "https://x/y.jpg"});
+        assert!(pick_canonical_image_url(&junk).is_none());
+    }
+
+    #[test]
+    fn from_sources_populates_top_level_image_url_from_primary() {
+        // Consumer contract: the UI fires this verb per visible
+        // artist tile and `<img src>`s the top-level image_url
+        // straight at the provider. Regression test the picker
+        // is wired into from_sources correctly.
+        let resp = ArtistArtworkResponse::from_sources(vec![source_of(
+            "deezer",
+            serde_json::json!({"picture_xl_url": "https://d/xl.jpg"}),
+        )]);
+        assert_eq!(resp.image_url.as_deref(), Some("https://d/xl.jpg"));
     }
 
     /// Compile-fence attestation: ArtistImageHit MUST NOT derive
