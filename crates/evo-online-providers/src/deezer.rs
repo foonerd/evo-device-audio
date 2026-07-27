@@ -211,10 +211,92 @@ impl DeezerClient {
     }
 }
 
+impl DeezerClient {
+    /// Fetch an artist's image URLs by canonical Deezer id.
+    ///
+    /// Preferred over [`Self::search_artist_image`] when the
+    /// caller has an authoritative Deezer artist id (e.g.
+    /// extracted from a MusicBrainz URL-relation). Bypasses the
+    /// name-search step so a well-known artist whose name
+    /// collides with a namesake still yields the correct
+    /// entity's image.
+    ///
+    /// Returns `Ok(None)` when Deezer reports the id as
+    /// unknown (404-shaped API-error `code=800`).
+    pub async fn get_artist_image_by_id(
+        &self,
+        deezer_artist_id: u64,
+    ) -> Result<Option<ArtistImageHit>, DeezerError> {
+        if self.user_agent.trim().is_empty() {
+            return Err(DeezerError::Invalid(
+                "user-agent must be non-empty (Deezer refuses \
+                 anonymous UAs)"
+                    .into(),
+            ));
+        }
+        self.rate.acquire().await;
+        let url = format!("https://api.deezer.com/artist/{deezer_artist_id}");
+        let resp = self
+            .http
+            .get(&url)
+            .header("User-Agent", &self.user_agent)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(DeezerError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let bytes = resp.bytes().await?;
+        // The `/artist/<id>` endpoint returns the artist object
+        // on success or the same `{error: {...}}` shape on
+        // API-level failure. Reuse the untagged discriminator.
+        let outcome: LookupOutcome = serde_json::from_slice(&bytes)
+            .map_err(|e| DeezerError::Decode(e.to_string()))?;
+        match outcome {
+            LookupOutcome::Error { error } => {
+                // Deezer's "unknown data" code — treat as clean
+                // miss so the cascade moves on rather than
+                // surfacing a transient upstream error.
+                if error.code == 800 {
+                    return Ok(None);
+                }
+                Err(DeezerError::Api {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            LookupOutcome::Ok(entry) => {
+                let source_url =
+                    format!("https://www.deezer.com/artist/{}", entry.id);
+                Ok(Some(ArtistImageHit {
+                    deezer_artist_id: entry.id,
+                    artist_name: entry.name,
+                    picture_xl_url: entry.picture_xl,
+                    picture_big_url: entry.picture_big,
+                    picture_medium_url: entry.picture_medium,
+                    picture_small_url: entry.picture_small,
+                    source_url,
+                }))
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------
 // JSON shape — Deezer's public search endpoint. Untagged enum
 // discriminates success vs API-level error.
 // -----------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LookupOutcome {
+    Error { error: ApiErrorBody },
+    Ok(ArtistEntry),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]

@@ -187,6 +187,14 @@ pub struct ArtistLookup {
     pub wikidata_url: Option<String>,
     /// Official homepage URL if the artist has one linked.
     pub official_homepage_url: Option<String>,
+    /// Deezer artist page URL (`https://www.deezer.com/artist/<id>`)
+    /// extracted from any URL-relation whose target host is
+    /// `deezer.com`. Present when MusicBrainz has recorded a
+    /// Deezer link for this MBID; the artist-artwork cascade
+    /// uses it to identify the correct Deezer entity by ID
+    /// rather than by name-search (which mismatches for common
+    /// or ambiguous artist names).
+    pub deezer_artist_url: Option<String>,
 }
 
 /// Work search hit (classical composition / opera / etc.).
@@ -857,6 +865,7 @@ fn artist_lookup_from_response(r: ArtistLookupResponse) -> ArtistLookup {
         Some(l) => (l.begin, l.end),
         None => (None, None),
     };
+    let deezer_artist_url = extract_url_by_host(&r.relations, "deezer.com");
     ArtistLookup {
         artist_mbid: r.id,
         canonical_name: r.name,
@@ -870,7 +879,63 @@ fn artist_lookup_from_response(r: ArtistLookupResponse) -> ArtistLookup {
             &r.relations,
             "official homepage",
         ),
+        deezer_artist_url,
     }
+}
+
+/// Extract the first URL relationship whose resource host ends
+/// with the given suffix (typically a bare domain like
+/// `"deezer.com"`). Case-insensitive; ignores the URL-rel type
+/// so a Deezer link is picked up regardless of whether
+/// MusicBrainz has typed it as `streaming music`, `free
+/// streaming`, `discography`, or plain `other databases`.
+fn extract_url_by_host(
+    relations: &[UrlRelation],
+    host_suffix: &str,
+) -> Option<String> {
+    let host_lc = host_suffix.to_ascii_lowercase();
+    relations.iter().find_map(|r| {
+        let url = r.url.as_ref()?.resource.as_ref()?;
+        let lc = url.to_ascii_lowercase();
+        let after_scheme = lc.split_once("://").map(|(_, r)| r).unwrap_or(&lc);
+        let host = after_scheme.split(['/', '?', '#']).next()?;
+        if host.ends_with(&host_lc) {
+            Some(url.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a Deezer artist id out of a canonical Deezer artist
+/// URL. Accepts every shape MB has recorded — with or without
+/// `www.`, http or https, trailing slash or path fragment, and
+/// international variants like `deezer.com/en/artist/<id>`.
+/// Returns `None` when the URL is not a Deezer artist page or
+/// when the id segment is not a positive integer.
+pub fn parse_deezer_artist_id(url: &str) -> Option<u64> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    // Drop query / fragment first.
+    let path_only = after_scheme.split(['?', '#']).next()?;
+    let mut segments = path_only.split('/').filter(|s| !s.is_empty());
+    // First segment must be a deezer.com host.
+    let host = segments.next()?.to_ascii_lowercase();
+    if !host.ends_with("deezer.com") {
+        return None;
+    }
+    // Walk remaining segments looking for the literal `artist`
+    // followed by a numeric id — tolerates the `/<lang>/artist/`
+    // shape.
+    let mut prev_was_artist = false;
+    for seg in segments {
+        if prev_was_artist {
+            return seg.parse::<u64>().ok();
+        }
+        if seg.eq_ignore_ascii_case("artist") {
+            prev_was_artist = true;
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -1199,6 +1264,82 @@ mod tests {
         assert_eq!(hit.canonical_artist, "Radiohead");
         assert_eq!(hit.canonical_album, "OK Computer");
         assert_eq!(hit.confidence_percent, 100);
+    }
+
+    #[test]
+    fn parse_deezer_artist_id_accepts_canonical_url() {
+        assert_eq!(
+            parse_deezer_artist_id("https://www.deezer.com/artist/1071"),
+            Some(1071)
+        );
+    }
+
+    #[test]
+    fn parse_deezer_artist_id_accepts_language_prefixed_url() {
+        assert_eq!(
+            parse_deezer_artist_id("https://www.deezer.com/en/artist/1071"),
+            Some(1071)
+        );
+    }
+
+    #[test]
+    fn parse_deezer_artist_id_accepts_trailing_slash_and_query() {
+        assert_eq!(
+            parse_deezer_artist_id(
+                "http://deezer.com/artist/75798/?utm_source=musicbrainz"
+            ),
+            Some(75798)
+        );
+        assert_eq!(
+            parse_deezer_artist_id("https://www.deezer.com/artist/1071#top"),
+            Some(1071)
+        );
+    }
+
+    #[test]
+    fn parse_deezer_artist_id_rejects_non_deezer_url() {
+        assert_eq!(
+            parse_deezer_artist_id("https://open.spotify.com/artist/1071"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_deezer_artist_id_rejects_non_artist_deezer_url() {
+        assert_eq!(
+            parse_deezer_artist_id("https://www.deezer.com/album/12345"),
+            None
+        );
+    }
+
+    #[test]
+    fn artist_lookup_extracts_deezer_url_from_urls_relations() {
+        // MB shape: url-relations carry a `type` and a `url`
+        // object with `resource`. The Deezer URL surfaces as
+        // `deezer_artist_url` regardless of the URL-rel type
+        // label MB assigns.
+        let raw = r#"{
+            "id": "d87e52c5-bb8d-4da8-b941-9f4928627dc8",
+            "name": "ABBA",
+            "type": "Group",
+            "life-span": { "begin": "1972", "end": "1982" },
+            "country": "SE",
+            "relations": [
+                { "type": "wikipedia", "url": { "resource": "https://en.wikipedia.org/wiki/ABBA" } },
+                { "type": "wikidata", "url": { "resource": "https://www.wikidata.org/wiki/Q26" } },
+                { "type": "streaming music", "url": { "resource": "https://www.deezer.com/artist/1071" } }
+            ]
+        }"#;
+        let response: ArtistLookupResponse = serde_json::from_str(raw).unwrap();
+        let lookup = artist_lookup_from_response(response);
+        assert_eq!(
+            lookup.deezer_artist_url.as_deref(),
+            Some("https://www.deezer.com/artist/1071")
+        );
+        assert_eq!(
+            lookup.wikipedia_url.as_deref(),
+            Some("https://en.wikipedia.org/wiki/ABBA")
+        );
     }
 
     #[test]

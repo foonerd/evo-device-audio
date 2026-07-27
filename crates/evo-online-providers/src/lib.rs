@@ -67,8 +67,9 @@ pub use lastfm::{
 };
 pub use lrclib::{LrclibClient, LrclibError, LyricsHit};
 pub use musicbrainz::{
-    ArtistLookup, ArtistSearchHit, MusicBrainzClient, MusicBrainzError,
-    ReleaseCreditsLookup, TrackCredits, WorkLookup, WorkSearchHit,
+    parse_deezer_artist_id, ArtistLookup, ArtistSearchHit, MusicBrainzClient,
+    MusicBrainzError, ReleaseCreditsLookup, TrackCredits, WorkLookup,
+    WorkSearchHit,
 };
 pub use rate_limit::RateLimiter;
 /// Re-export of the concrete HTTPS client type
