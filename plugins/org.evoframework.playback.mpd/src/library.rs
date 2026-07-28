@@ -948,9 +948,11 @@ pub(crate) struct BrowseSelectorParent {
 /// MPD roundtrip for the whole library). Artist enumeration
 /// carries an `artwork_lookup` object that names the shelf,
 /// request type, and payload the UI dispatches per visible
-/// tile to obtain a live image URL — the UI fans out per-tile
-/// rather than following an `<img src>` URL, so live-fetch
-/// providers can honour their terms.
+/// tile to obtain a live *portrait* URL — no synthesised
+/// `cover_url` (album art is the wrong image type for this
+/// facet). The UI fans out per-tile rather than following an
+/// `<img src>` URL, so live-fetch providers can honour their
+/// terms.
 ///
 /// **Drill path** (payload.select present): issues MPD
 /// `find <tag> <value>` (case-sensitive exact) or, when the
@@ -1071,15 +1073,16 @@ pub(crate) async fn handle_browse_by_tag(
     // alphabetical.
     processed.sort_by_key(|a| a.to_lowercase());
 
-    // Facet-specific enrichment. Two shapes both keyed off one
-    // MPD `list album group albumartist` roundtrip:
+    // Facet-specific enrichment.
     //
     // - Album facet: album → artist map + `count group album`
-    //   for track counts.
-    // - Artist facet: artist → first-album map, used to
-    //   synthesise a local `mpd-album` cover_url as the artist
-    //   tile's guaranteed-correct thumbnail.
-    let (album_artists, album_counts, artist_first_album) = match facet_key {
+    //   for track counts, plus synthesised `mpd-album` cover_url.
+    // - Artist facet: no local album cover. Artist tiles resolve
+    //   portraits via `artwork_lookup` only; emitting a synthesised
+    //   `mpd-album` cover_url caused the glass to paint album art
+    //   as a face and drove local MPEG / online album-cascade work
+    //   that does not belong on this surface.
+    let (album_artists, album_counts) = match facet_key {
         "album" => {
             let pairs = conn
                 .list_tag_grouped(tag, "albumartist")
@@ -1105,34 +1108,9 @@ pub(crate) async fn handle_browse_by_tag(
                     reason: e.to_string(),
                 }
             })?;
-            (Some(artists_map), Some(counts), None)
+            (Some(artists_map), Some(counts))
         }
-        "artist" => {
-            // Pairs come from `list album group albumartist`;
-            // we invert to per-artist first-album so each
-            // artist tile gets one representative album cover
-            // via the existing `mpd-album` scheme. Every fold-
-            // key variant of an artist gets its own entry in
-            // the raw map — the fold-key lookup at render time
-            // handles the collapse.
-            let pairs = conn
-                .list_tag_grouped("album", "albumartist")
-                .await
-                .map_err(|e| VerbError::Mpd {
-                    verb: verb_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-            let mut first_album: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for (album, artist) in pairs {
-                if artist.is_empty() || album.is_empty() {
-                    continue;
-                }
-                first_album.entry(artist).or_insert(album);
-            }
-            (None, None, Some(first_album))
-        }
-        _ => (None, None, None),
+        _ => (None, None),
     };
 
     let rendered: Vec<serde_json::Value> = processed
@@ -1143,7 +1121,6 @@ pub(crate) async fn handle_browse_by_tag(
                 v,
                 album_artists.as_ref(),
                 album_counts.as_ref(),
-                artist_first_album.as_ref(),
             )
         })
         .collect();
@@ -1169,18 +1146,12 @@ pub(crate) async fn handle_browse_by_tag(
 ///   enumeration is over albums; `cover_url` is a synthesised
 ///   `mpd-album` URL the framework's existing artwork endpoint
 ///   already resolves.
-/// - `artist`: `{artist, cover_url?, artwork_lookup}` — the
-///   `cover_url` is a synthesised `mpd-album` URL for one of
-///   this artist's albums, present whenever the artist has at
-///   least one album in the library. Always the right artist,
-///   no external match required — the UI has a guaranteed
-///   thumbnail. `artwork_lookup` is an opaque, plugin-declared
-///   dispatch hint the UI may fire per visible tile to
-///   attempt a higher-fidelity portrait; consumption is a
+/// - `artist`: `{artist, artwork_lookup}` — portrait only.
+///   `artwork_lookup` is an opaque, plugin-declared dispatch
+///   hint the UI may fire per visible tile; consumption is a
 ///   wire-op dispatch, not an `<img src>` URL, so live-fetch
-///   providers keep their terms. The plugin never learns the
-///   UI's rendering strategy; the UI never learns which
-///   providers exist.
+///   providers keep their terms. No `cover_url`: album art is
+///   the wrong image type for an artist facet.
 /// - `genre` / `year`: `{genre}` / `{year}` — no imagery for
 ///   these facets by design.
 fn render_facet_entry(
@@ -1188,14 +1159,13 @@ fn render_facet_entry(
     value: &str,
     album_artists: Option<&std::collections::HashMap<String, String>>,
     album_counts: Option<&std::collections::HashMap<String, u64>>,
-    artist_first_album: Option<&std::collections::HashMap<String, String>>,
 ) -> serde_json::Value {
     match facet_key {
         "album" => {
             let artist = album_artists.and_then(|m| m.get(value).cloned());
             let track_count = album_counts.and_then(|m| m.get(value).copied());
             let cover_url =
-                evo_device_audio_shared::artwork_target_url_for_track(
+                evo_device_audio_shared::artwork_target_url_for_track_sized(
                     // No file-path fallback for the enumeration
                     // shape — the mpd-album URL is the identity
                     // every list-surface row uses, and passing an
@@ -1204,6 +1174,13 @@ fn render_facet_entry(
                     "",
                     artist.as_deref(),
                     Some(value),
+                    // Facet tiles render at ~44–88 px; request the
+                    // `small` (300 px) size variant so the browser
+                    // does not pull a 1000×1000 original per tile.
+                    // Hero surfaces (now-playing, album detail)
+                    // synthesise their own URL with `Some("original")`
+                    // or omit the size hint.
+                    Some("small"),
                 );
             json!({
                 "album":       value,
@@ -1214,28 +1191,6 @@ fn render_facet_entry(
         }
         "artist" => {
             let trimmed = value.trim();
-            // Local thumbnail: pick one of this artist's albums
-            // and synthesise the mpd-album URL — always the
-            // right artist, no external provider match needed.
-            // The lookup uses fold-key equivalence so a display
-            // form like `Céline Dion` still finds an album
-            // tagged under `Celine Dion`.
-            let cover_url = if trimmed.is_empty() {
-                None
-            } else {
-                artist_first_album.and_then(|m| {
-                    let target_key = artist_fold_key(trimmed);
-                    m.iter()
-                        .find(|(artist, _)| artist_fold_key(artist) == target_key)
-                        .map(|(artist, album)| {
-                            evo_device_audio_shared::artwork_target_url_for_track(
-                                "",
-                                Some(artist.as_str()),
-                                Some(album.as_str()),
-                            )
-                        })
-                })
-            };
             // Dispatch hint the UI fires per visible tile via
             // its normal wire-op client. Names the shelf and
             // request type verbatim — no framework surface
@@ -1243,6 +1198,9 @@ fn render_facet_entry(
             // learns which providers back the response. Empty /
             // whitespace-only names skip the hint so the UI does
             // not fire a request that can only bad-request.
+            // Payload artist is the cleaned display form (caller
+            // already ran `artist_display_form`), so MB reconcile
+            // is not poisoned by `A/A` or `(Album)` tag junk.
             let artwork_lookup = if trimmed.is_empty() {
                 None
             } else {
@@ -1254,7 +1212,6 @@ fn render_facet_entry(
             };
             json!({
                 "artist":         value,
-                "cover_url":      cover_url,
                 "artwork_lookup": artwork_lookup,
             })
         }
@@ -1620,10 +1577,14 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
                 // skip-traversal / queue path consults the sticker
                 // for authoritative checks during play.
                 "available":       true,
-                "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track(
+                "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track_sized(
                     path,
                     artist.as_deref(),
                     album.as_deref(),
+                    // Search / drill list rows render at tile
+                    // scale; request the `small` variant so N
+                    // rows do not each pull a full-size original.
+                    Some("small"),
                 ),
                 "composer":        classical.composer,
                 "composer_sort":   classical.composer_sort,
