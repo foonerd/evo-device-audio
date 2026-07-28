@@ -416,6 +416,25 @@ impl Plugin for ArtworkOnlinePlugin {
             // reactor spawned below extends this into the
             // live-run so `set_enabled(false)` removes the
             // source on the next query, no restart.
+            //
+            // Keyed-provider policy — credential-authoritative:
+            // when a keyed provider's credential IS present in
+            // the vault at load time, the framework's
+            // `online_provider_config` store row for that
+            // provider is skipped in this overlay. Plugin
+            // defaults hold (enabled = true, priority = the
+            // per-provider plugin default). Rationale: the
+            // framework historically seeds keyed providers with
+            // `enabled = false` as an implicit "credential not
+            // supplied yet" signal — once the operator has
+            // supplied the credential the seed is a stale
+            // intent-signal that would otherwise force-disable
+            // a source the operator IS trying to use. The
+            // binding requirement in
+            // `METADATA-ENRICHMENT-FLOW.md` — "off until the
+            // key exists" — treats credential presence as the
+            // enable-authority for keyed providers.
+            let fanart_credential_present = self.fanart_client.is_some();
             {
                 let mut cfg = self.artist_provider_config.write().await;
                 if let Some(store) = ctx.online_provider_config.as_ref() {
@@ -437,6 +456,20 @@ impl Plugin for ArtworkOnlinePlugin {
                                     );
                                     continue;
                                 };
+                                if pid == artist_cascade::ArtistProviderId::FanartTv
+                                    && fanart_credential_present
+                                {
+                                    tracing::info!(
+                                        plugin = PLUGIN_NAME,
+                                        provider_id = %row.provider_id,
+                                        store_enabled = row.enabled,
+                                        store_priority = row.priority,
+                                        "credential-authoritative: fanart.tv API key is \
+                                         wired at load, so the store overlay row is skipped \
+                                         and plugin defaults hold (enabled=true, priority=40)"
+                                    );
+                                    continue;
+                                }
                                 // Sentinel semantics (migration 042):
                                 // priority < 0 means "operator has NOT
                                 // explicitly set a priority for this
@@ -467,12 +500,21 @@ impl Plugin for ArtworkOnlinePlugin {
                 }
             }
             // Spawn the store-change reactor so live operator
-            // gestures re-resolve the cascade in place.
+            // gestures re-resolve the cascade in place. The
+            // reactor honours the same credential-authoritative
+            // policy — fanart_tv change events are ignored when
+            // its credential is present, so a stale store
+            // gesture cannot silently disable the source the
+            // operator is using.
             if let Some(store) = ctx.online_provider_config.as_ref() {
                 let rx = store.subscribe_changes();
                 let config_slot = Arc::clone(&self.artist_provider_config);
                 self.reactor_tasks.push(tokio::spawn(
-                    online_provider_config_reactor(rx, config_slot),
+                    online_provider_config_reactor(
+                        rx,
+                        config_slot,
+                        fanart_credential_present,
+                    ),
                 ));
             }
             tracing::info!(
@@ -873,6 +915,7 @@ async fn online_provider_config_reactor(
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
     >,
     config_slot: Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
+    fanart_credential_present: bool,
 ) {
     loop {
         match rx.recv().await {
@@ -889,6 +932,20 @@ async fn online_provider_config_reactor(
                     );
                     continue;
                 };
+                if pid == artist_cascade::ArtistProviderId::FanartTv
+                    && fanart_credential_present
+                {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        provider_id = %event.provider_id,
+                        event_enabled = event.enabled,
+                        event_priority = event.priority,
+                        "reactor: credential-authoritative — fanart.tv credential is \
+                         present, so this config-change event is not applied to the \
+                         plugin's local cascade (plugin defaults hold)"
+                    );
+                    continue;
+                }
                 // Sentinel: priority < 0 means "operator has not
                 // explicitly set a priority" (migration 042).
                 // Keep the plugin's cascade default; still apply
