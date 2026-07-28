@@ -68,9 +68,15 @@
 //! Every provider is independently enable/disable-able and
 //! orderable by the operator via the framework
 //! `online_provider_config` store, exactly like the text-verb
-//! cascade. Priority default is Deezer 45, TheAudioDB 50,
-//! Volumio meta 55, fanart.tv 60 — anonymous baseline before
-//! the keyed source.
+//! cascade. Priority default is fanart.tv 40, Deezer 45,
+//! TheAudioDB 50, Volumio meta 55 — highest-quality
+//! identity-bearing source wins whenever its credential is
+//! present. When the fanart key is unset the provider returns
+//! `Absent` (no source emitted), so the picker automatically
+//! falls through to Deezer's live fetch. Result: keyed
+//! deployments get the curated fanart portrait; keyless
+//! deployments stay on the Deezer fallback without any
+//! operator ordering step.
 
 use std::sync::Arc;
 
@@ -166,6 +172,10 @@ pub(crate) struct ArtistProviderConfig {
 impl ArtistProviderConfig {
     pub(crate) fn defaults() -> Self {
         Self {
+            fanart_tv: ArtistProviderFlags {
+                enabled: true,
+                priority: 40,
+            },
             deezer: ArtistProviderFlags {
                 enabled: true,
                 priority: 45,
@@ -177,10 +187,6 @@ impl ArtistProviderConfig {
             volumio_meta: ArtistProviderFlags {
                 enabled: true,
                 priority: 55,
-            },
-            fanart_tv: ArtistProviderFlags {
-                enabled: true,
-                priority: 60,
             },
         }
     }
@@ -782,9 +788,9 @@ async fn run_cascade(
                         "MB rels lookup for caller-supplied MBID failed; \
                          proceeding with bare MBID (caller-trusted)"
                     );
-                    ReconcileOutcome::Found(Box::new(
-                        bare_lookup_from_mbid(&mbid, &artist),
-                    ))
+                    ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
+                        &mbid, &artist,
+                    )))
                 }
             },
             None => ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
@@ -1679,16 +1685,82 @@ mod tests {
     fn sort_sources_by_priority_uses_operator_config() {
         let cfg = ArtistProviderConfig::defaults();
         let mut sources = vec![
-            source_of("fanart_tv", serde_json::json!({})),
             source_of("deezer", serde_json::json!({})),
             source_of("theaudiodb", serde_json::json!({})),
             source_of("volumio_meta", serde_json::json!({})),
+            source_of("fanart_tv", serde_json::json!({})),
         ];
         sort_sources_by_priority(&mut sources, &cfg);
-        assert_eq!(sources[0].provider_id, "deezer");
-        assert_eq!(sources[1].provider_id, "theaudiodb");
-        assert_eq!(sources[2].provider_id, "volumio_meta");
-        assert_eq!(sources[3].provider_id, "fanart_tv");
+        // Priority order (lower wins): fanart 40, deezer 45,
+        // theaudiodb 50, volumio 55. fanart wins when its key
+        // is present and it produced a source; deezer stays
+        // the keyless fallback.
+        assert_eq!(sources[0].provider_id, "fanart_tv");
+        assert_eq!(sources[1].provider_id, "deezer");
+        assert_eq!(sources[2].provider_id, "theaudiodb");
+        assert_eq!(sources[3].provider_id, "volumio_meta");
+    }
+
+    #[test]
+    fn primary_source_is_fanart_when_fanart_hit_beside_deezer() {
+        // Both providers produced a source. Priority default
+        // puts fanart ahead of Deezer, so after
+        // sort_sources_by_priority the primary
+        // (top-level payload + provider_id) MUST be fanart's.
+        // Provider order in input intentionally reversed so
+        // the assertion depends on the sort, not on input
+        // order.
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn.deezer.example/xl.jpg",
+                }),
+            ),
+            source_of(
+                "fanart_tv",
+                serde_json::json!({
+                    "image_url": "https://fanart.example/hd.jpg",
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("fanart_tv"));
+        let payload = resp.payload.unwrap();
+        assert_eq!(
+            payload.get("image_url").unwrap(),
+            "https://fanart.example/hd.jpg",
+        );
+        assert!(
+            payload.get("picture_xl_url").is_none(),
+            "primary payload must be fanart's verbatim; the deezer \
+             field must not appear at top level"
+        );
+    }
+
+    #[test]
+    fn primary_source_falls_back_to_deezer_when_fanart_absent() {
+        // Only Deezer produced a source (fanart key unset or
+        // provider absent — either surface as `Absent`, which
+        // emits no source). Deezer becomes primary; the
+        // operator's keyless deployment stays warm.
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![source_of(
+            "deezer",
+            serde_json::json!({
+                "picture_xl_url": "https://cdn.deezer.example/xl.jpg",
+            }),
+        )];
+        sort_sources_by_priority(&mut sources, &cfg);
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("deezer"));
+        let payload = resp.payload.unwrap();
+        assert_eq!(
+            payload.get("picture_xl_url").unwrap(),
+            "https://cdn.deezer.example/xl.jpg",
+        );
     }
 
     #[test]
