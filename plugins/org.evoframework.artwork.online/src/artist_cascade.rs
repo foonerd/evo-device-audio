@@ -504,27 +504,58 @@ impl ArtistArtworkResponse {
     }
 }
 
-/// Pick a canonical image URL from a provider-specific payload.
+/// Pick a canonical PORTRAIT (photograph) URL from a
+/// provider-specific payload for the artist-tile context.
+///
+/// Image-type suitability outranks provider priority for the
+/// portrait: the artist tile displays a photograph of the
+/// artist, never a wordmark / band logo / promotional banner.
+/// Fanart.tv carries five image classes in one payload
+/// (`hd_music_logo_urls`, `hd_artist_logo_urls`,
+/// `artist_thumb_urls`, `music_banner_urls`,
+/// `artist_background_urls`) — only two are photographs:
+///
+/// - `artist_thumb_urls` — 1000×1000 square photo (primary
+///   portrait class per fanart's taxonomy).
+/// - `artist_background_urls` — 1920×1080 fanart-style photo,
+///   secondary portrait fallback (some artists have a
+///   background photo but no thumb yet).
+///
+/// The other three fanart classes are wordmarks, band logos,
+/// or mixed promotional banners — none is a photograph and
+/// none is picked for the portrait context. When fanart's
+/// payload carries only logo/banner classes and no photo, the
+/// picker returns `None`, and the surrounding source-walk in
+/// [`ArtistArtworkResponse::from_sources`] falls through to
+/// the next provider (Deezer / TheAudioDB / Volumio meta),
+/// whose payloads are photo-only by shape.
 ///
 /// The four artist-artwork sources use different keys:
 ///
-/// - `volumio_meta` → `image_url` (string)
-/// - `theaudiodb` → `thumb_url` (string)
-/// - `deezer` → `picture_xl_url` / `_big_url` / `_medium_url` /
-///   `_small_url` (strings; pick the largest non-empty)
-/// - `fanart_tv` → `hd_music_logo_urls[0]` /
-///   `hd_artist_logo_urls[0]` / `artist_thumb_urls[0]` /
-///   `music_banner_urls[0]` / `artist_background_urls[0]`
-///   (arrays; pick the first non-empty entry from the
-///   highest-preference key)
+/// - `volumio_meta` → `image_url` (string, photo)
+/// - `theaudiodb` → `thumb_url` (string, photo)
+/// - `deezer` → `picture_xl_url` / `_big_url` / `_medium_url`
+///   / `_small_url` (strings, photos; pick the largest
+///   non-empty)
+/// - `fanart_tv` → `artist_thumb_urls[0]` /
+///   `artist_background_urls[0]` (arrays, photos ONLY —
+///   logos and banners deliberately excluded from this
+///   picker).
 ///
 /// The picker probes each key in preference order and returns
-/// the first non-empty string it finds. Returns `None` when the
-/// payload carries no URL under any recognised key — the
-/// resolver then surfaces `Ok(Not Found)` at the framework
-/// boundary rather than a partial hit.
+/// the first non-empty string it finds. Returns `None` when
+/// the payload carries no photograph URL under any
+/// portrait-suitable key — the resolver then falls through to
+/// the next source rather than promoting a logo to portrait.
+///
+/// A separate context (artist-page hero / logo mark / banner
+/// strip) may render logos and banners later; the portrait
+/// picker MUST NOT select them.
 fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
     let obj = payload.as_object()?;
+    // String-shaped photo keys — used by volumio_meta,
+    // theaudiodb, and deezer. All of these payloads carry
+    // photographs exclusively.
     const STRING_KEYS: &[&str] = &[
         "image_url",
         "thumb_url",
@@ -545,14 +576,14 @@ fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
             return Some(url);
         }
     }
-    const ARRAY_KEYS: &[&str] = &[
-        "hd_music_logo_urls",
-        "hd_artist_logo_urls",
-        "artist_thumb_urls",
-        "music_banner_urls",
-        "artist_background_urls",
-    ];
-    for key in ARRAY_KEYS {
+    // Array-shaped photo keys — used by fanart_tv. ONLY the
+    // photo classes appear here; logos (`hd_music_logo_urls`,
+    // `hd_artist_logo_urls`) and banners (`music_banner_urls`)
+    // are deliberately excluded — see the module docstring for
+    // the image-type suitability rule.
+    const PORTRAIT_ARRAY_KEYS: &[&str] =
+        &["artist_thumb_urls", "artist_background_urls"];
+    for key in PORTRAIT_ARRAY_KEYS {
         if let Some(url) = obj
             .get(*key)
             .and_then(serde_json::Value::as_array)
@@ -1967,25 +1998,117 @@ mod tests {
     }
 
     #[test]
-    fn pick_canonical_image_url_falls_back_to_array_keys() {
-        // fanart shape — hd_music_logo_urls wins over other arrays
-        let fanart = serde_json::json!({
+    fn pick_canonical_image_url_picks_only_portrait_array_keys() {
+        // Image-type suitability rule: for the artist portrait
+        // context, ONLY `artist_thumb_urls` and
+        // `artist_background_urls` are photograph classes.
+        // Fanart's logo and banner classes must NOT be selected
+        // as a portrait — a wordmark is not a photo of the
+        // artist. See module docstring.
+        //
+        // Regression fixed 2026-07-28: previously
+        // `hd_music_logo_urls` won over the portrait keys,
+        // producing Abba/Bruno Mars/Queen tiles rendering as
+        // wordmarks instead of photographs.
+        let fanart_with_logo_only = serde_json::json!({
             "hd_music_logo_urls": ["https://f/logo.png"],
-            "artist_thumb_urls": ["https://f/thumb.jpg"],
+            "hd_artist_logo_urls": ["https://f/hdlogo.png"],
+            "music_banner_urls": ["https://f/banner.png"],
         });
-        assert_eq!(
-            pick_canonical_image_url(&fanart).as_deref(),
-            Some("https://f/logo.png")
+        // Fanart with only logos/banners → picker returns None so
+        // the source-walk falls through to the next provider
+        // (Deezer / TheAudioDB / Volumio meta) whose payloads are
+        // photo-only.
+        assert!(
+            pick_canonical_image_url(&fanart_with_logo_only).is_none(),
+            "logos and banners must NOT surface as portraits"
         );
-        // Empty top array + non-empty next → returns next
-        let fanart_partial = serde_json::json!({
-            "hd_music_logo_urls": [],
+
+        // Full fanart payload — thumb wins over background,
+        // logos/banners are ignored regardless of position.
+        let fanart_full = serde_json::json!({
+            "hd_music_logo_urls": ["https://f/logo.png"],
+            "hd_artist_logo_urls": ["https://f/hdlogo.png"],
             "artist_thumb_urls": ["https://f/thumb.jpg"],
+            "music_banner_urls": ["https://f/banner.png"],
+            "artist_background_urls": ["https://f/bg.jpg"],
         });
         assert_eq!(
-            pick_canonical_image_url(&fanart_partial).as_deref(),
+            pick_canonical_image_url(&fanart_full).as_deref(),
             Some("https://f/thumb.jpg")
         );
+
+        // Fanart with no thumb, only background — background
+        // is the photo fallback, wins over any logo/banner.
+        let fanart_bg_only = serde_json::json!({
+            "hd_music_logo_urls": ["https://f/logo.png"],
+            "artist_thumb_urls": [],
+            "music_banner_urls": ["https://f/banner.png"],
+            "artist_background_urls": ["https://f/bg.jpg"],
+        });
+        assert_eq!(
+            pick_canonical_image_url(&fanart_bg_only).as_deref(),
+            Some("https://f/bg.jpg")
+        );
+    }
+
+    #[test]
+    fn from_sources_prefers_fanart_photo_over_fanart_logo_via_deezer() {
+        // End-to-end shape: fanart is priority 40 (winner) but
+        // its payload carries only logos → its picker returns
+        // None → source walk falls through to Deezer's photo.
+        // Property: portrait context serves a PHOTOGRAPH always
+        // — never a logo — even when the priority-winning
+        // provider only has logos.
+        let sources = vec![
+            source_of(
+                "fanart_tv",
+                serde_json::json!({
+                    "hd_music_logo_urls": ["https://f/logo.png"],
+                    "hd_artist_logo_urls": ["https://f/hdlogo.png"],
+                    "music_banner_urls": ["https://f/banner.png"],
+                }),
+            ),
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://d/xl.jpg",
+                }),
+            ),
+        ];
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        // Provider attribution reflects the actual source
+        // whose URL was picked (Deezer), not the priority-
+        // winning provider (fanart, whose payload was logo-only).
+        assert_eq!(resp.provider_id.as_deref(), Some("deezer"));
+        assert_eq!(resp.image_url.as_deref(), Some("https://d/xl.jpg"));
+    }
+
+    #[test]
+    fn from_sources_prefers_fanart_photo_when_present() {
+        // The other side of the coin: fanart carries a real
+        // photo (thumb) alongside logos. Fanart wins the
+        // portrait — the photo class beats the logo classes
+        // within fanart's payload, and fanart's priority beats
+        // Deezer's.
+        let sources = vec![
+            source_of(
+                "fanart_tv",
+                serde_json::json!({
+                    "hd_music_logo_urls": ["https://f/logo.png"],
+                    "artist_thumb_urls": ["https://f/thumb.jpg"],
+                }),
+            ),
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://d/xl.jpg",
+                }),
+            ),
+        ];
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("fanart_tv"));
+        assert_eq!(resp.image_url.as_deref(), Some("https://f/thumb.jpg"));
     }
 
     #[test]
@@ -2022,15 +2145,21 @@ mod tests {
         // empty entity segment must not be picked, and the
         // picker must fall through to the next non-empty entry
         // in the same array.
+        //
+        // Uses `artist_thumb_urls` — a photo class, so the
+        // portrait picker actually walks it (the logo array
+        // keys were removed 2026-07-28; see the
+        // portrait-suitability comment on
+        // `pick_canonical_image_url`).
         let mixed = serde_json::json!({
-            "hd_music_logo_urls": [
-                "https://f/artist//logo.png",
-                "https://f/artist/real/logo.png",
+            "artist_thumb_urls": [
+                "https://f/artist//thumb.jpg",
+                "https://f/artist/real/thumb.jpg",
             ],
         });
         assert_eq!(
             pick_canonical_image_url(&mixed).as_deref(),
-            Some("https://f/artist/real/logo.png")
+            Some("https://f/artist/real/thumb.jpg")
         );
     }
 
