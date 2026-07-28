@@ -568,25 +568,8 @@ impl Respondent for ArtworkOnlinePlugin {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             if req.request_type == REQUEST_ARTWORK_ONLINE_CLEAR_CACHE {
-                let (reconcile_dropped, provider_dropped) =
-                    self.artwork_caches.drop_all();
-                tracing::info!(
-                    plugin = PLUGIN_NAME,
-                    reconcile_entries_dropped = reconcile_dropped,
-                    provider_entries_dropped = provider_dropped,
-                    "artwork.online.clear_cache: in-mem LRUs cleared"
-                );
-                let body = serde_json::to_vec(&serde_json::json!({
-                    "v": 1,
-                    "status": "ok",
-                    "reconcile_entries_dropped": reconcile_dropped,
-                    "provider_entries_dropped": provider_dropped,
-                }))
-                .map_err(|e| {
-                    PluginError::Permanent(format!(
-                        "artwork.online.clear_cache response JSON: {e}"
-                    ))
-                })?;
+                let body =
+                    handle_online_clear_cache(req, &self.artwork_caches)?;
                 return Ok(Response::for_request(req, body));
             }
 
@@ -698,6 +681,193 @@ impl Respondent for ArtworkOnlinePlugin {
 /// terminates: the reactor logs the dropped-event count and
 /// continues so a burst of operator gestures does not stall
 /// the substrate.
+/// Request payload for `artwork.online.clear_cache`.
+///
+/// `target` is optional: absent target = global wipe (the
+/// Settings-panel "Clear all" button); present target =
+/// scoped drop of the entry that identifies that one artist.
+/// Absent-target behaviour is preserved verbatim from the
+/// pre-target build so operator UIs that only issue the
+/// global form need no change.
+#[derive(Debug, serde::Deserialize)]
+struct OnlineClearCacheRequest {
+    #[allow(dead_code)]
+    #[serde(default = "default_v")]
+    v: u8,
+    #[serde(default)]
+    target: Option<OnlineClearTarget>,
+}
+
+fn default_v() -> u8 {
+    1
+}
+
+/// Target selector for a scoped drop.
+///
+/// Two supported schemes:
+///
+/// - `artist-name` — `value` is the raw artist display name.
+///   The plugin computes the same `artist_fold_key` used at
+///   store time and drops the entry from both LRUs.
+/// - `artist-mbid` — `value` is the MusicBrainz artist MBID.
+///   The plugin scans the reconcile LRU for a `Hit` whose
+///   `ArtistLookup.artist_mbid` matches, then drops the
+///   surrounding fold-key from both LRUs.
+///
+/// Any other scheme returns `status: "bad_request"` with a
+/// human-readable `detail` — the operator UI can surface it
+/// so the caller learns which schemes are accepted here.
+#[derive(Debug, serde::Deserialize)]
+struct OnlineClearTarget {
+    scheme: String,
+    value: String,
+}
+
+fn handle_online_clear_cache(
+    req: &Request,
+    caches: &artwork_caches::ArtworkCaches,
+) -> Result<Vec<u8>, PluginError> {
+    // Preserve the pre-target behaviour verbatim on an empty
+    // payload — the framework's dispatch layer still delivers
+    // `{v:1}` as valid JSON, but some early callers issued
+    // no payload at all.
+    let parsed: OnlineClearCacheRequest = if req.payload.is_empty() {
+        OnlineClearCacheRequest { v: 1, target: None }
+    } else {
+        match serde_json::from_slice(&req.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "bad_request",
+                    "detail": format!("artwork.online.clear_cache payload JSON: {e}"),
+                }))
+                .map_err(|se| PluginError::Permanent(format!(
+                    "artwork.online.clear_cache error response JSON: {se}"
+                )))?;
+                return Ok(body);
+            }
+        }
+    };
+
+    match parsed.target {
+        None => {
+            let (reconcile_dropped, provider_dropped) = caches.drop_all();
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                scope = "all",
+                reconcile_entries_dropped = reconcile_dropped,
+                provider_entries_dropped = provider_dropped,
+                "artwork.online.clear_cache: in-mem LRUs cleared (global)"
+            );
+            serde_json::to_vec(&serde_json::json!({
+                "v": 1,
+                "status": "ok",
+                "scope": "all",
+                "reconcile_entries_dropped": reconcile_dropped,
+                "provider_entries_dropped": provider_dropped,
+            }))
+        }
+        Some(target) => {
+            let (fold_key, resolved_from) = match target.scheme.as_str() {
+                "artist-name" => {
+                    let key =
+                        evo_device_audio_shared::artist_name::artist_fold_key(
+                            &target.value,
+                        );
+                    (Some(key), "name_fold_key")
+                }
+                "artist-mbid" => {
+                    let key = caches
+                        .find_reconcile_fold_key_by_mbid(&target.value);
+                    (key, "mbid_reverse_lookup")
+                }
+                other => {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "v": 1,
+                        "status": "bad_request",
+                        "detail": format!(
+                            "artwork.online.clear_cache: unknown target.scheme {other:?}; \
+                             supported: \"artist-name\" (value = raw display name) and \
+                             \"artist-mbid\" (value = MusicBrainz artist MBID)"
+                        ),
+                    }))
+                    .map_err(|e| PluginError::Permanent(format!(
+                        "artwork.online.clear_cache error response JSON: {e}"
+                    )))?;
+                    return Ok(body);
+                }
+            };
+
+            let Some(fold_key) = fold_key else {
+                // Reverse-lookup by MBID found nothing in the
+                // reconcile LRU. Honest zero-count response —
+                // the operator asked to drop something that was
+                // never resolved (or already evicted).
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    scope = "targeted",
+                    target_scheme = %target.scheme,
+                    target_value = %target.value,
+                    resolved_from = resolved_from,
+                    reconcile_entries_dropped = 0usize,
+                    provider_entries_dropped = 0usize,
+                    "artwork.online.clear_cache: target not present in LRU (nothing to drop)"
+                );
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "ok",
+                    "scope": "targeted",
+                    "target": {
+                        "scheme": target.scheme,
+                        "value": target.value,
+                        "fold_key": null,
+                    },
+                    "resolved_from": resolved_from,
+                    "reconcile_entries_dropped": 0,
+                    "provider_entries_dropped": 0,
+                }))
+                .map_err(|e| PluginError::Permanent(format!(
+                    "artwork.online.clear_cache response JSON: {e}"
+                )))?;
+                return Ok(body);
+            };
+
+            let (reconcile_dropped, provider_dropped) =
+                caches.drop_one(&fold_key);
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                scope = "targeted",
+                target_scheme = %target.scheme,
+                target_value = %target.value,
+                fold_key = %fold_key,
+                resolved_from = resolved_from,
+                reconcile_entries_dropped = reconcile_dropped,
+                provider_entries_dropped = provider_dropped,
+                "artwork.online.clear_cache: targeted LRU drop"
+            );
+            serde_json::to_vec(&serde_json::json!({
+                "v": 1,
+                "status": "ok",
+                "scope": "targeted",
+                "target": {
+                    "scheme": target.scheme,
+                    "value": target.value,
+                    "fold_key": fold_key,
+                },
+                "resolved_from": resolved_from,
+                "reconcile_entries_dropped": reconcile_dropped,
+                "provider_entries_dropped": provider_dropped,
+            }))
+        }
+    }
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "artwork.online.clear_cache response JSON: {e}"
+        ))
+    })
+}
+
 async fn online_provider_config_reactor(
     mut rx: tokio::sync::broadcast::Receiver<
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,

@@ -201,7 +201,7 @@ fn extension_for_mime(mime: &str) -> &str {
 }
 
 /// Stable path under `state_dir/artwork_cache/` for this `track` file.
-fn cache_basename_for_track(track: &Path) -> String {
+pub(crate) fn cache_basename_for_track(track: &Path) -> String {
     let mut h = DefaultHasher::new();
     track.hash(&mut h);
     let digest = h.finish();

@@ -181,6 +181,47 @@ impl ArtworkCaches {
         };
         (reconcile_dropped, provider_dropped)
     }
+
+    /// Drop one entry from both LRUs by fold-key. Returns
+    /// `(reconcile_dropped_bool, provider_dropped_bool)`
+    /// coerced to `(0|1, 0|1)` so the caller can surface a
+    /// numeric drop count identical in shape to `drop_all`.
+    /// A miss on either LRU is not an error — an operator may
+    /// legitimately target an artist that was never resolved.
+    pub(crate) fn drop_one(&self, fold_key: &str) -> (usize, usize) {
+        let reconcile_dropped = {
+            let mut lru =
+                self.reconcile.lock().expect("reconcile lock poisoned");
+            lru.pop(fold_key).is_some() as usize
+        };
+        let provider_dropped = {
+            let mut lru = self.provider.lock().expect("provider lock poisoned");
+            lru.pop(fold_key).is_some() as usize
+        };
+        (reconcile_dropped, provider_dropped)
+    }
+
+    /// Reverse-lookup: given an MBID, return the fold-key
+    /// under which the reconcile LRU stored the `Hit`, or
+    /// `None` if no `Hit` in the LRU references that MBID.
+    /// Linear scan over the reconcile LRU (bounded by
+    /// [`CACHE_CAPACITY`]). Used by the targeted-clear verb
+    /// when the caller identified an artist by MBID rather
+    /// than by raw name.
+    pub(crate) fn find_reconcile_fold_key_by_mbid(
+        &self,
+        mbid: &str,
+    ) -> Option<String> {
+        let lru = self.reconcile.lock().expect("reconcile lock poisoned");
+        for (key, entry) in lru.iter() {
+            if let ReconcileEntry::Hit { lookup, .. } = entry {
+                if lookup.artist_mbid.as_str() == mbid {
+                    return Some(key.clone());
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Default for ArtworkCaches {
@@ -376,5 +417,66 @@ mod tests {
         assert!(caches
             .get_reconcile(&format!("artist-{}", CACHE_CAPACITY + 9))
             .is_some());
+    }
+
+    #[test]
+    fn drop_one_removes_only_the_named_fold_key() {
+        let caches = ArtworkCaches::new();
+        caches.put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"));
+        caches.put_reconcile_hit("adele".into(), bare_lookup("adele-mbid"));
+        caches.put_provider(
+            "abba".into(),
+            ProviderEntry::new(vec![serde_json::json!({"src":"a"})]),
+        );
+        caches.put_provider(
+            "adele".into(),
+            ProviderEntry::new(vec![serde_json::json!({"src":"b"})]),
+        );
+        // Precondition: both keys resolve.
+        assert!(caches.get_reconcile("abba").is_some());
+        assert!(caches.get_reconcile("adele").is_some());
+        assert!(caches.get_provider("abba").is_some());
+        assert!(caches.get_provider("adele").is_some());
+        // Drop only "abba".
+        let (r, p) = caches.drop_one("abba");
+        assert_eq!(r, 1);
+        assert_eq!(p, 1);
+        // "abba" gone from both LRUs, "adele" untouched.
+        assert!(caches.get_reconcile("abba").is_none());
+        assert!(caches.get_reconcile("adele").is_some());
+        assert!(caches.get_provider("abba").is_none());
+        assert!(caches.get_provider("adele").is_some());
+    }
+
+    #[test]
+    fn drop_one_reports_zero_on_missing_fold_key() {
+        let caches = ArtworkCaches::new();
+        let (r, p) = caches.drop_one("never-cached");
+        assert_eq!(r, 0);
+        assert_eq!(p, 0);
+    }
+
+    #[test]
+    fn find_reconcile_fold_key_by_mbid_reverse_lookup() {
+        let caches = ArtworkCaches::new();
+        caches.put_reconcile_hit("abba".into(), bare_lookup("abba-mbid-x"));
+        caches.put_reconcile_hit("adele".into(), bare_lookup("adele-mbid-y"));
+        // Miss (never stored) also present so we prove we skip
+        // non-`Hit` entries.
+        caches
+            .put_reconcile_miss("someone".into(), MissReason::NoConfidentMatch);
+
+        assert_eq!(
+            caches.find_reconcile_fold_key_by_mbid("abba-mbid-x"),
+            Some("abba".into())
+        );
+        assert_eq!(
+            caches.find_reconcile_fold_key_by_mbid("adele-mbid-y"),
+            Some("adele".into())
+        );
+        assert_eq!(
+            caches.find_reconcile_fold_key_by_mbid("does-not-exist"),
+            None
+        );
     }
 }

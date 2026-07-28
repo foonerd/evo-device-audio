@@ -101,6 +101,53 @@ pub fn manifest() -> Manifest {
 ///
 /// Idempotent — an absent cache directory returns
 /// `status: ok` with zero counts.
+/// Request payload for `artwork.local.clear_cache`.
+///
+/// `target` is optional: absent target = global wipe (the
+/// Settings-panel "Clear all" button); present target =
+/// scoped drop of one track's embedded-extract entry.
+/// Absent-target behaviour is preserved verbatim.
+#[derive(Debug, serde::Deserialize)]
+struct LocalClearCacheRequest {
+    #[allow(dead_code)]
+    #[serde(default = "default_v")]
+    v: u8,
+    #[serde(default)]
+    target: Option<LocalClearTarget>,
+}
+
+fn default_v() -> u8 {
+    1
+}
+
+/// Target selector for a scoped drop on artwork.local.
+///
+/// Supported schemes:
+///
+/// - `mpd-path` — `value` is an MPD-visible track path (the
+///   same string this plugin's `artwork.resolve` accepts as a
+///   subject). The plugin computes the same
+///   `cache_basename_for_track` prefix it stored under and
+///   deletes every extension variant (`.jpg` / `.png` /
+///   `.webp` / `.gif`) that matched.
+///
+/// Rejected schemes (with `status: "bad_request"`):
+///
+/// - `mpd-album` — the on-disk cache is per-track (embedded
+///   extractions from `read_embedded_cover`). Album covers
+///   come from sidecar files on disk (`folder.jpg` etc) which
+///   this plugin never persists a copy of — clearing a
+///   per-album entry has no meaning here. The UI can iterate
+///   `mpd-path` per track in the album if it needs the
+///   embedded extracts wiped.
+///
+/// - Anything else — same shape refusal.
+#[derive(Debug, serde::Deserialize)]
+struct LocalClearTarget {
+    scheme: String,
+    value: String,
+}
+
 async fn handle_clear_cache(
     req: &Request,
     state_dir: Option<&std::path::Path>,
@@ -124,41 +171,193 @@ async fn handle_clear_cache(
         }
     };
     let cache_dir = state_dir.join("artwork_cache");
-    // Recursive walk-and-remove runs on a blocking thread —
-    // fs::remove_dir_all is synchronous and can iterate a
-    // sizeable tree.
-    let cache_dir_for_thread = cache_dir.clone();
-    let (cleared_bytes, cleared_files) =
-        tokio::task::spawn_blocking(move || {
-            wipe_dir_reporting(&cache_dir_for_thread)
-        })
-        .await
-        .map_err(|e| {
-            PluginError::Permanent(format!(
-                "artwork.local.clear_cache blocking join failed: {e}"
-            ))
-        })?
-        .map_err(PluginError::Permanent)?;
-    tracing::info!(
-        plugin = PLUGIN_NAME,
-        path = %cache_dir.display(),
-        cleared_bytes,
-        cleared_files,
-        "artwork.local.clear_cache: wiped on-disk cache"
-    );
-    let body = serde_json::to_vec(&serde_json::json!({
-        "v": 1,
-        "status": "ok",
-        "cleared_bytes": cleared_bytes,
-        "cleared_files": cleared_files,
-        "path": cache_dir.display().to_string(),
-    }))
-    .map_err(|e| {
-        PluginError::Permanent(format!(
-            "artwork.local.clear_cache response JSON: {e}"
-        ))
-    })?;
-    Ok(Response::for_request(req, body))
+
+    let parsed: LocalClearCacheRequest = if req.payload.is_empty() {
+        LocalClearCacheRequest { v: 1, target: None }
+    } else {
+        match serde_json::from_slice(&req.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "bad_request",
+                    "detail": format!("artwork.local.clear_cache payload JSON: {e}"),
+                }))
+                .map_err(|se| PluginError::Permanent(format!(
+                    "artwork.local.clear_cache error response JSON: {se}"
+                )))?;
+                return Ok(Response::for_request(req, body));
+            }
+        }
+    };
+
+    match parsed.target {
+        None => {
+            // Global wipe — pre-target behaviour preserved.
+            let cache_dir_for_thread = cache_dir.clone();
+            let (cleared_bytes, cleared_files) =
+                tokio::task::spawn_blocking(move || {
+                    wipe_dir_reporting(&cache_dir_for_thread)
+                })
+                .await
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "artwork.local.clear_cache blocking join failed: {e}"
+                    ))
+                })?
+                .map_err(PluginError::Permanent)?;
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                scope = "all",
+                path = %cache_dir.display(),
+                cleared_bytes,
+                cleared_files,
+                "artwork.local.clear_cache: wiped on-disk cache (global)"
+            );
+            let body = serde_json::to_vec(&serde_json::json!({
+                "v": 1,
+                "status": "ok",
+                "scope": "all",
+                "cleared_bytes": cleared_bytes,
+                "cleared_files": cleared_files,
+                "path": cache_dir.display().to_string(),
+            }))
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "artwork.local.clear_cache response JSON: {e}"
+                ))
+            })?;
+            Ok(Response::for_request(req, body))
+        }
+        Some(target) => match target.scheme.as_str() {
+            "mpd-path" => {
+                let track_path = std::path::PathBuf::from(target.value.clone());
+                let basename =
+                    crate::embedded::cache_basename_for_track(&track_path);
+                let cache_dir_for_thread = cache_dir.clone();
+                let basename_for_thread = basename.clone();
+                let (cleared_bytes, cleared_files) =
+                    tokio::task::spawn_blocking(move || {
+                        drop_by_basename(
+                            &cache_dir_for_thread,
+                            &basename_for_thread,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "artwork.local.clear_cache blocking join failed: {e}"
+                        ))
+                    })?
+                    .map_err(PluginError::Permanent)?;
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    scope = "targeted",
+                    target_scheme = %target.scheme,
+                    target_value = %target.value,
+                    basename = %basename,
+                    cleared_bytes,
+                    cleared_files,
+                    "artwork.local.clear_cache: targeted on-disk drop"
+                );
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "ok",
+                    "scope": "targeted",
+                    "target": {
+                        "scheme": target.scheme,
+                        "value": target.value,
+                        "basename": basename,
+                    },
+                    "cleared_bytes": cleared_bytes,
+                    "cleared_files": cleared_files,
+                    "path": cache_dir.display().to_string(),
+                }))
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "artwork.local.clear_cache response JSON: {e}"
+                    ))
+                })?;
+                Ok(Response::for_request(req, body))
+            }
+            "mpd-album" => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "bad_request",
+                    "detail": "artwork.local.clear_cache: scheme \"mpd-album\" not \
+                               supported by this plugin — the on-disk cache is a \
+                               per-track embedded-extract store, not a per-album \
+                               store. Album covers come from sidecar files on disk \
+                               (folder.jpg etc), which this plugin never persists a \
+                               copy of; nothing to drop at the album level. If the \
+                               operator intent is \"drop embedded extracts for every \
+                               track in this album\", iterate scheme=\"mpd-path\" per \
+                               track from the caller.",
+                }))
+                .map_err(|e| PluginError::Permanent(format!(
+                    "artwork.local.clear_cache error response JSON: {e}"
+                )))?;
+                Ok(Response::for_request(req, body))
+            }
+            other => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "bad_request",
+                    "detail": format!(
+                        "artwork.local.clear_cache: unknown target.scheme {other:?}; \
+                         supported: \"mpd-path\" (value = MPD track path)"
+                    ),
+                }))
+                .map_err(|e| PluginError::Permanent(format!(
+                    "artwork.local.clear_cache error response JSON: {e}"
+                )))?;
+                Ok(Response::for_request(req, body))
+            }
+        },
+    }
+}
+
+/// Delete every file under `cache_dir` whose stem equals
+/// `basename` (extension varies with the source image's MIME
+/// — `.jpg` / `.png` / `.webp` / `.gif`). Returns
+/// `(cleared_bytes, cleared_files)` identical to
+/// [`wipe_dir_reporting`] so the caller reports the same
+/// shape for global and targeted paths. Missing cache
+/// directory returns `(0, 0)` — same idempotent shape as the
+/// global wipe.
+fn drop_by_basename(
+    cache_dir: &std::path::Path,
+    basename: &str,
+) -> Result<(u64, u64), String> {
+    if !cache_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut bytes: u64 = 0;
+    let mut files: u64 = 0;
+    let entries = std::fs::read_dir(cache_dir)
+        .map_err(|e| format!("read_dir {}: {e}", cache_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!("read_dir entry in {}: {e}", cache_dir.display())
+        })?;
+        let path = entry.path();
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if stem != basename {
+            continue;
+        }
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            files = files.saturating_add(1);
+        }
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("remove_file {}: {e}", path.display()))?;
+    }
+    Ok((bytes, files))
 }
 
 /// Recursively delete `dir` and every file / subdirectory
@@ -716,6 +915,57 @@ mod tests {
         let pstr = v["path"].as_str().unwrap();
         let pb = PathBuf::from(pstr);
         assert!(pb.ends_with("folder.jpg"), "{pstr}");
+    }
+
+    #[test]
+    fn drop_by_basename_removes_matching_stem_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("artwork_cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // Two variants of the same basename (jpg + webp); a
+        // different basename; and a mismatched-name file.
+        std::fs::write(cache.join("abc_track1.jpg"), b"jpeg-bytes").unwrap();
+        std::fs::write(cache.join("abc_track1.webp"), b"webp-bytes-longer")
+            .unwrap();
+        std::fs::write(cache.join("def_track2.jpg"), b"other").unwrap();
+        std::fs::write(cache.join("unrelated.jpg"), b"unrelated").unwrap();
+
+        let (bytes, files) = drop_by_basename(&cache, "abc_track1").unwrap();
+        assert_eq!(files, 2, "both jpg + webp variants removed");
+        assert_eq!(
+            bytes,
+            (b"jpeg-bytes".len() + b"webp-bytes-longer".len()) as u64
+        );
+
+        // The targeted files are gone.
+        assert!(!cache.join("abc_track1.jpg").exists());
+        assert!(!cache.join("abc_track1.webp").exists());
+        // The untouched files remain.
+        assert!(cache.join("def_track2.jpg").exists());
+        assert!(cache.join("unrelated.jpg").exists());
+    }
+
+    #[test]
+    fn drop_by_basename_missing_cache_dir_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("does_not_exist");
+        let (bytes, files) = drop_by_basename(&cache, "anything").unwrap();
+        assert_eq!(bytes, 0);
+        assert_eq!(files, 0);
+    }
+
+    #[test]
+    fn drop_by_basename_missing_basename_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("artwork_cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("keep_me.jpg"), b"stay").unwrap();
+
+        let (bytes, files) =
+            drop_by_basename(&cache, "no_such_basename").unwrap();
+        assert_eq!(bytes, 0);
+        assert_eq!(files, 0);
+        assert!(cache.join("keep_me.jpg").exists());
     }
 
     #[tokio::test]
