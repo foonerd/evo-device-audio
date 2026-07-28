@@ -1345,18 +1345,64 @@ async fn fetch_fanart_artist(
     catalogue: &ArtistCatalogue,
     enabled: bool,
 ) -> ProviderOutcome {
+    // Three silent pre-conditions that used to return Absent
+    // without any journal breadcrumb — operators triaging "why
+    // is fanart never firing?" had to code-read to know these
+    // gates existed. Each emits one INFO line naming exactly
+    // which gate refused, so a single journal grep answers the
+    // question.
     if !enabled {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "fanart_tv",
+            artist_mbid,
+            outcome = "absent",
+            reason = "operator_disabled",
+            "fanart.tv artist images: operator disabled the provider in the artist-artwork config (no network call fired)"
+        );
         return ProviderOutcome::Absent;
     }
     let Some(fanart) = catalogue.fanart.as_ref() else {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "fanart_tv",
+            artist_mbid,
+            outcome = "absent",
+            reason = "no_api_key_wired",
+            "fanart.tv artist images: no API key resolved from the credential vault at plugin load, so the client is not wired (no network call fired); set `fanart_tv_personal_api_key` in the vault to enable"
+        );
         return ProviderOutcome::Absent;
     };
     let Some(mbid) = artist_mbid else {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "fanart_tv",
+            outcome = "absent",
+            reason = "no_mbid_available",
+            "fanart.tv artist images: reconcile did not produce an MBID, and fanart.tv is MBID-keyed (no network call fired)"
+        );
         return ProviderOutcome::Absent;
     };
     let hit = match fanart.get_artist_images(mbid).await {
         Ok(Some(h)) => h,
-        Ok(None) => return ProviderOutcome::Absent,
+        Ok(None) => {
+            // Upstream returned a structural miss (fanart.tv
+            // responds `404 Not Found` when no entry exists
+            // for this MBID at all). Surface it explicitly so
+            // operators triaging a fanart-quiet rig can tell
+            // "key rejected / endpoint wrong" (this line
+            // absent, transient warn instead) from "catalogue
+            // has nothing for this artist" (this line present).
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "fanart_tv",
+                artist_mbid = mbid,
+                outcome = "absent",
+                reason = "upstream_404_no_entry_for_mbid",
+                "fanart.tv artist images: upstream reports no entry for this MBID (structural absence, not a schema / key / endpoint problem)"
+            );
+            return ProviderOutcome::Absent;
+        }
         Err(e) => {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
@@ -1371,6 +1417,31 @@ async fn fetch_fanart_artist(
         }
     };
     if !hit.has_any_artwork() {
+        // Upstream returned `200 OK` but every image array
+        // decoded to zero elements. Two shapes can produce
+        // this: (a) fanart has the MBID entry but genuinely
+        // no images uploaded yet, or (b) their JSON schema
+        // shifted under us and our deserialiser dropped every
+        // field. Log the per-array counts + the MBID so an
+        // operator or the next commit can tell one from the
+        // other with one grep — a real "empty entry" logs
+        // all-zero counts consistently across artists; a
+        // schema drift shows all-zero counts even for
+        // populated MBIDs (spot-check against fanart's own
+        // web UI for the same MBID).
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "fanart_tv",
+            artist_mbid = mbid,
+            outcome = "absent",
+            reason = "upstream_200_all_arrays_empty",
+            hd_music_logo_urls = hit.hd_music_logo_urls.len(),
+            hd_artist_logo_urls = hit.hd_artist_logo_urls.len(),
+            artist_background_urls = hit.artist_background_urls.len(),
+            artist_thumb_urls = hit.artist_thumb_urls.len(),
+            music_banner_urls = hit.music_banner_urls.len(),
+            "fanart.tv artist images: upstream returned 200 but every image array is empty (either a real empty entry or a schema drift — cross-check against fanart's web UI for this MBID)"
+        );
         return ProviderOutcome::Absent;
     }
     let payload = serde_json::json!({
