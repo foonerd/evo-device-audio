@@ -570,25 +570,46 @@ fn pick_canonical_image_url(payload: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// MD5 hex digest of the empty string. Providers (Deezer
+/// observed in the wild on 2026-07-28) use this well-known
+/// constant as a "no image" placeholder segment in CDN URLs
+/// when the artist has no portrait — e.g.
+/// `https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/1000x1000-…`.
+/// The URL is structurally valid and its bytes decode as an
+/// image (Deezer serves a generic silhouette), so a hash-only
+/// or Content-Type guard would still pass it. The only honest
+/// signal is the segment itself.
+const EMPTY_HASH_MD5_HEX: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
 /// Reject URLs that are structurally shaped like a valid image
-/// URL but carry no entity identifier — the wire-observed
-/// failure mode where Deezer returns
-/// `https://cdn-images.dzcdn.net/images/artist//1000x1000-…`
-/// (empty artist hash between the `artist/` and size segments)
-/// for entities the provider did not resolve. Absent this
-/// guard the picker returns the placeholder URL and callers
-/// see a status=ok with a URL that renders as a broken image.
+/// URL but carry no entity identifier — two observed provider
+/// failure modes where the picker would otherwise return a
+/// status=ok response with a URL that renders as a generic
+/// silhouette / broken image.
 ///
-/// The rule: any `//` inside the path portion of the URL that
-/// is not the scheme separator disqualifies the URL. Covers
-/// the observed Deezer shape and every equivalent shape in
-/// which a provider CDN elides an entity segment.
+/// 1. `//` inside the path (empty segment) — the pre-2026-07-28
+///    Deezer shape `.../artist//<size>-…` where the artist
+///    slug was elided outright.
+/// 2. The MD5-of-empty-string segment
+///    [`EMPTY_HASH_MD5_HEX`] anywhere in the path — the
+///    post-2026-07-28 Deezer shape `.../artist/<md5-empty>/<size>-…`
+///    where the artist slug was replaced with the well-known
+///    "no data" hash. This is what surfaced on the Elton John
+///    tile after the outcome-contract landing.
+///
+/// Both rules apply per-URL; either match rejects.
 fn is_real_image_url(url: &str) -> bool {
     let path = match url.split_once("://") {
         Some((_, rest)) => rest.split_once('/').map(|(_, p)| p).unwrap_or(""),
         None => url,
     };
-    !path.contains("//")
+    if path.contains("//") {
+        return false;
+    }
+    if path.split('/').any(|seg| seg == EMPTY_HASH_MD5_HEX) {
+        return false;
+    }
+    true
 }
 
 /// Sort a `sources` slice in place by operator priority
@@ -785,25 +806,39 @@ async fn run_cascade(
                         artist = %artist,
                         mbid = %mbid,
                         error = %mb_error_display(&e),
-                        "MB rels lookup for caller-supplied MBID failed; \
-                         proceeding with bare MBID (caller-trusted)"
+                        outcome = "found_bare_mbid",
+                        next_attempt = "on_next_demand",
+                        cache_policy = "not_written_by_caller",
+                        "MB URL-rels lookup for caller-supplied MBID transient; identity trusted by caller but Deezer URL-rel absent; caller MUST NOT cache — next request re-attempts full URL-rels lookup"
                     );
-                    ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
-                        &mbid, &artist,
-                    )))
+                    ReconcileOutcome::FoundPartial(Box::new(
+                        bare_lookup_from_mbid(&mbid, &artist),
+                    ))
                 }
             },
-            None => ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
-                &mbid, &artist,
-            ))),
+            // No MB client at all: caller trusts the MBID
+            // but there is no client to fetch URL-rels. Same
+            // degraded shape — MBID-keyed providers can
+            // fire, Deezer URL-rel cannot.
+            None => ReconcileOutcome::FoundPartial(Box::new(
+                bare_lookup_from_mbid(&mbid, &artist),
+            )),
         }
     } else if can_cache {
         // Cache-first name reconciliation. Only `Found` +
         // `Absent` write to the cache; a fresh Hit / Miss
         // entry short-circuits the two MB round trips. An
-        // Unavailable outcome NEVER writes — the next request
-        // re-attempts, so a passing rate-limit spike does not
-        // poison the tile for hours.
+        // `Unavailable` outcome NEVER writes — the next
+        // request re-attempts, so a passing rate-limit spike
+        // does not poison the tile for hours.
+        // A `FoundPartial` outcome (search hit confident but
+        // URL-rels transient) also NEVER writes — the
+        // identity is fresh but incomplete (no Deezer
+        // URL-rel), and caching it would keep Deezer-by-id
+        // dead until the 7 d hit-TTL expired. The current
+        // call still proceeds to the MBID-keyed providers so
+        // the tile has a chance to render; the next request
+        // re-attempts the full URL-rels lookup.
         use crate::artwork_caches::{MissReason, ReconcileEntry};
         match catalogue.caches.get_reconcile(&fold_key) {
             Some(ReconcileEntry::Hit { lookup, .. }) => {
@@ -827,10 +862,11 @@ async fn run_cascade(
                             MissReason::NoConfidentMatch,
                         );
                     }
-                    ReconcileOutcome::Unavailable => {
+                    ReconcileOutcome::FoundPartial(_)
+                    | ReconcileOutcome::Unavailable => {
                         // Deliberately no cache write. The
                         // next request retries; the UI's
-                        // session cache also skips Unavailable
+                        // session cache also skips these
                         // per the wire contract.
                     }
                 }
@@ -842,10 +878,15 @@ async fn run_cascade(
     };
 
     // Reconcile short-circuits: Absent → NotFound (definitive
-    // absence); Unavailable → Unavailable (retry-safe). Only
-    // Found proceeds to the provider wave.
+    // absence); Unavailable → Unavailable (retry-safe). `Found`
+    // and `FoundPartial` both proceed to the provider wave —
+    // `FoundPartial` differs only in that its identity lacks
+    // the Deezer URL-rel, so the Deezer-by-id fetch will noop
+    // for this call; MBID-keyed providers (fanart, theaudiodb)
+    // still fire.
     let reconciled = match reconciled {
-        ReconcileOutcome::Found(lookup) => *lookup,
+        ReconcileOutcome::Found(lookup)
+        | ReconcileOutcome::FoundPartial(lookup) => *lookup,
         ReconcileOutcome::Absent => {
             let any_configured = any_provider_configured(catalogue);
             if !any_configured || catalogue.mb.is_none() {
@@ -1076,7 +1117,9 @@ async fn fetch_volumio_meta_artist(
                 provider = "volumio_meta",
                 artist,
                 error = %e,
-                "volumio meta artistArt transient; NOT caching negatively"
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "volumio_meta artist artwork transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
             );
             return ProviderOutcome::Unavailable;
         }
@@ -1163,7 +1206,9 @@ async fn fetch_theaudiodb_artist(
                     artist,
                     mbid,
                     error = %e,
-                    "TheAudioDB artist artwork by MBID transient; NOT caching negatively"
+                    outcome = "unavailable",
+                    next_attempt = "on_next_demand",
+                    "theaudiodb artist artwork by MBID transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
                 );
                 return ProviderOutcome::Unavailable;
             }
@@ -1177,7 +1222,9 @@ async fn fetch_theaudiodb_artist(
                     provider = "theaudiodb",
                     artist,
                     error = %e,
-                    "TheAudioDB artist artwork transient; NOT caching negatively"
+                    outcome = "unavailable",
+                    next_attempt = "on_next_demand",
+                    "theaudiodb artist artwork by name transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
                 );
                 return ProviderOutcome::Unavailable;
             }
@@ -1259,7 +1306,9 @@ async fn fetch_deezer_artist_by_id(
                 artist,
                 deezer_id = id,
                 error = %e,
-                "Deezer artist image by id transient; NOT caching negatively"
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "deezer artist image by id transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
             );
             return ProviderOutcome::Unavailable;
         }
@@ -1314,7 +1363,9 @@ async fn fetch_fanart_artist(
                 provider = "fanart_tv",
                 artist_mbid = mbid,
                 error = %e,
-                "fanart.tv artist images transient; NOT caching negatively"
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "fanart.tv artist images transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
             );
             return ProviderOutcome::Unavailable;
         }
@@ -1366,7 +1417,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Three-way outcome of an artist-name → MBID reconcile pass.
+/// Four-way outcome of an artist-name → MBID reconcile pass.
 ///
 /// The original `Option<ArtistLookup>` shape collapsed transient
 /// upstream failures (rate-limit / 5xx / transport) into the
@@ -1376,13 +1427,25 @@ fn percent_encode(s: &str) -> String {
 /// limiter that shape converts a single rate-limit spike into
 /// six hours of blank tiles for the affected artists.
 ///
-/// The three variants:
+/// The four variants:
 ///
 /// - [`ReconcileOutcome::Found`] — MB search returned a hit at
-///   ≥ [`MB_MIN_CONFIDENCE_PERCENT`] and the URL-rels lookup
-///   succeeded (or fabricated a bare MBID-only lookup after a
-///   transient on the second call). Cacheable under the hit
-///   TTL.
+///   ≥ [`MB_MIN_CONFIDENCE_PERCENT`] AND the URL-rels lookup
+///   returned a complete identity (Deezer URL-rel, canonical
+///   name, etc). Cacheable under the hit TTL.
+/// - [`ReconcileOutcome::FoundPartial`] — MB search returned a
+///   confident hit but the URL-rels lookup itself was
+///   transient (rate-limit / 5xx). The identity (MBID + query
+///   name) is nailed so MBID-keyed providers (fanart.tv,
+///   TheAudioDB) can still fire on the current call, but the
+///   Deezer URL-rel path stays inactive because we did not
+///   receive the URL-rel. The caller MUST NOT cache this
+///   outcome to the reconcile cache — otherwise the degraded
+///   identity persists for the 7 d hit-TTL and Deezer-by-id
+///   stays dead across every subsequent request. The next
+///   request re-runs the full reconcile; the full URL-rels
+///   lookup either succeeds (upgrade to `Found`) or fails
+///   again (stay `FoundPartial`).
 /// - [`ReconcileOutcome::Absent`] — MB returned no hits or the
 ///   top hit was below the confidence threshold. Definitive
 ///   absence at MB's catalogue; cacheable under the miss TTL.
@@ -1393,6 +1456,7 @@ fn percent_encode(s: &str) -> String {
 ///   without poisoning its session cache.
 pub(crate) enum ReconcileOutcome {
     Found(Box<evo_online_providers::musicbrainz::ArtistLookup>),
+    FoundPartial(Box<evo_online_providers::musicbrainz::ArtistLookup>),
     Absent,
     Unavailable,
 }
@@ -1479,7 +1543,9 @@ async fn reconcile_artist_mbid(
                 provider = "musicbrainz",
                 artist,
                 error = %mb_error_display(&e),
-                "MB artist search transient; NOT caching"
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "MB artist search transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
             );
             return ReconcileOutcome::Unavailable;
         }
@@ -1505,15 +1571,24 @@ async fn reconcile_artist_mbid(
                 artist,
                 mbid = %hit.artist_mbid,
                 error = %mb_error_display(&e),
-                "MB artist lookup transient; using bare MBID (search hit is confident)"
+                outcome = "found_bare_mbid",
+                next_attempt = "on_next_demand",
+                cache_policy = "not_written_by_caller",
+                "MB artist URL-rels lookup transient; identity nailed by confident search hit but Deezer URL-rel absent; caller MUST NOT cache this degraded Found — next request for this artist re-attempts the full lookup"
             );
             // Search was confident, only URL-rels lookup
-            // transiently failed. Return Found with a bare
-            // lookup so downstream MBID-keyed providers
-            // (fanart.tv, TheAudioDB) still fire; the Deezer
-            // URL-rel path stays inactive for this call but
-            // the identity is nailed down.
-            ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
+            // transiently failed. Return FoundPartial with a
+            // bare lookup so downstream MBID-keyed providers
+            // (fanart.tv, TheAudioDB) still fire on the
+            // current call; the Deezer URL-rel path stays
+            // inactive for this call. The caller MUST NOT
+            // write this outcome to the reconcile cache —
+            // otherwise the degraded identity persists for
+            // the 7 d hit-TTL and the Deezer-by-id path stays
+            // dead across every subsequent request until the
+            // operator clears the cache. See the
+            // `FoundPartial` docstring.
+            ReconcileOutcome::FoundPartial(Box::new(bare_lookup_from_mbid(
                 &hit.artist_mbid,
                 artist,
             )))
@@ -1902,6 +1977,74 @@ mod tests {
         assert!(!is_real_image_url(
             "https://cdn-images.dzcdn.net/images/artist//1000x1000.jpg"
         ));
+    }
+
+    #[test]
+    fn is_real_image_url_rejects_empty_md5_placeholder_segment() {
+        // Observed on 2026-07-28 (Elton John tile):
+        // Deezer's "no image for this artist" placeholder now
+        // carries the MD5 of the empty string
+        // (`d41d8cd98f00b204e9800998ecf8427e`) as the
+        // artist-slug segment. The URL is structurally valid
+        // and the byte-response decodes as an image (generic
+        // silhouette), so an HTTP-shape or Content-Type guard
+        // still passes it. Only the segment itself carries
+        // the honest signal.
+        assert!(!is_real_image_url(
+            "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/1000x1000-000000-80-0-0.jpg"
+        ));
+        assert!(!is_real_image_url(
+            "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/500x500-000000-80-0-0.jpg"
+        ));
+        // Case-sensitive: the observed placeholder is always
+        // lowercase hex. If some future provider emits the
+        // upper-case form we'll extend, but do not over-
+        // reach today.
+        assert!(is_real_image_url(
+            "https://cdn-images.dzcdn.net/images/artist/D41D8CD98F00B204E9800998ECF8427E/500x500.jpg"
+        ));
+        // Adjacent segments containing the digest as a
+        // substring are NOT the placeholder; only an EXACT
+        // segment match rejects.
+        assert!(is_real_image_url(
+            "https://x/somepath/d41d8cd98f00b204e9800998ecf8427eSUFFIX/thumb.jpg"
+        ));
+    }
+
+    #[test]
+    fn from_sources_falls_through_deezer_empty_md5_placeholder_to_theaudiodb() {
+        // Elton John reproduction: Deezer priority (45) sits
+        // above TheAudioDB (50) and Volumio meta (55), but
+        // Deezer's payload carries the empty-MD5 placeholder
+        // artist slug. The picker MUST skip Deezer's URLs
+        // and land on TheAudioDB's real thumb.
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/1000x1000-000000-80-0-0.jpg",
+                    "picture_big_url": "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/500x500-000000-80-0-0.jpg",
+                    "picture_medium_url": "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/250x250-000000-80-0-0.jpg",
+                    "picture_small_url": "https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/56x56-000000-80-0-0.jpg",
+                }),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({
+                    "thumb_url": "https://r2.theaudiodb.com/images/media/artist/thumb/9o30sk1687869267.jpg",
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("theaudiodb"));
+        assert_eq!(
+            resp.image_url.as_deref(),
+            Some(
+                "https://r2.theaudiodb.com/images/media/artist/thumb/9o30sk1687869267.jpg"
+            )
+        );
     }
 
     #[test]
