@@ -357,10 +357,11 @@ async fn build_get_playlist_envelope(
             "album":           entry.album,
             "duration_ms":     entry.duration.map(|d| d.as_millis() as u64),
             "available":       available,
-            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track(
+            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track_sized(
                 &entry.file_path,
                 entry.artist.as_deref(),
                 entry.album.as_deref(),
+                Some("small"),
             ),
             "composer":        entry.classical.composer,
             "composer_sort":   entry.classical.composer_sort,

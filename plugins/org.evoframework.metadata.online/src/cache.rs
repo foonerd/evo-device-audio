@@ -95,6 +95,13 @@ impl ReconcileCache {
         }
     }
 
+    /// The on-disk root directory this cache writes into. Used
+    /// by the `metadata.online.clear_cache` verb to enumerate
+    /// and wipe each cache's tree.
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.inner.root
+    }
+
     /// Compute the cache key for a normalised `(artist, album)`
     /// pair. Callers normalise BEFORE calling — the cache does
     /// not want to know about the normalisation policy (which

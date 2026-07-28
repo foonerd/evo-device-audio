@@ -265,11 +265,31 @@ pub(crate) struct SourceEntry {
 }
 
 /// Wire-serialised status.
+/// Wire-facing status for the artist-artwork verb. Mirrors the
+/// album-artwork surface's `ResponseStatus` (see
+/// [`crate::resolve::ResponseStatus`]) so both surfaces speak
+/// one vocabulary — and, critically, so `Unavailable` (a
+/// reachable-but-transient outcome that MUST NOT cache
+/// negatively) is representable on this path too. Prior to
+/// this variant every transient (MB rate-limit / 5xx / DNS
+/// hiccup) collapsed to `NotFound` and was durably memoised
+/// for hours — a well-known-artist tile could stick blank
+/// for the full negative TTL after one MB rate-limit spike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CascadeStatus {
     Ok,
+    /// Reconciliation + every enabled provider gave a clean
+    /// "no such artist" answer. Framework MAY memoise
+    /// negatively under the reconcile-miss TTL.
     NotFound,
+    /// At least one identity-bearing step (MB reconcile, or a
+    /// provider after a good reconcile) was reachable-but-
+    /// transient (rate-limit, HTTP 5xx, timeout, transport
+    /// error). Callers MUST NOT memoise this as definitive
+    /// absence — the operator UI treats it as "retry on next
+    /// gesture" rather than a poison-null.
+    Unavailable,
     NotConfigured,
     BadRequest,
 }
@@ -348,12 +368,86 @@ impl ArtistArtworkResponse {
         }
     }
 
+    /// Definitive absence: MB search returned no confident
+    /// match, or (after a good reconcile) every enabled
+    /// provider clean-missed. Cacheable at the caller under the
+    /// miss TTL; UI may render an honest placeholder.
+    pub(crate) fn not_found(detail: impl Into<String>) -> Self {
+        Self {
+            v: 1,
+            status: CascadeStatus::NotFound,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            image_url: None,
+            detail: Some(detail.into()),
+            attribution: None,
+            sources: Vec::new(),
+        }
+    }
+
+    /// Reachable-but-transient upstream: MB search or every
+    /// provider errored (rate-limit / 5xx / transport). NOT
+    /// cacheable — the plugin refuses to write, and the wire
+    /// contract tells the UI to retry on next gesture rather
+    /// than poison its session cache with a null.
+    pub(crate) fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            v: 1,
+            status: CascadeStatus::Unavailable,
+            provider_id: None,
+            privacy_class: None,
+            payload: None,
+            image_url: None,
+            detail: Some(detail.into()),
+            attribution: None,
+            sources: Vec::new(),
+        }
+    }
+
     /// Build an OK response from an ordered vector of source
     /// entries. Top-level payload = primary source's payload
     /// verbatim (no field-level merge). Top-level attribution
     /// matches. See the text-verb cascade's `from_sources`
     /// docstring for the licensing rationale — mirroring here
     /// keeps text and image sources on one attribution contract.
+    /// Build a wire response from the aggregate provider
+    /// outcomes. Three-way aggregation over `[ProviderOutcome]`
+    /// after a good reconcile:
+    ///
+    /// - Any Hit whose payload picker returns a real URL → Ok.
+    ///   Even if other providers were Unavailable — a good hit
+    ///   wins.
+    /// - No Hit, at least one Unavailable → Unavailable. We
+    ///   cannot say the artist is absent when a provider
+    ///   errored; the UI retries on next gesture.
+    /// - No Hit, all clean Absent → NotFound. Cacheable.
+    pub(crate) fn from_provider_outcomes(
+        outcomes: Vec<ProviderOutcome>,
+    ) -> Self {
+        let mut hits = Vec::new();
+        let mut had_unavailable = false;
+        for out in outcomes {
+            match out {
+                ProviderOutcome::Hit(entry) => hits.push(entry),
+                ProviderOutcome::Absent => {}
+                ProviderOutcome::Unavailable => had_unavailable = true,
+            }
+        }
+        if hits.is_empty() {
+            if had_unavailable {
+                return Self::unavailable(
+                    "every enabled provider errored transiently; \
+                     retry on next gesture",
+                );
+            }
+            return Self::not_found(
+                "no artist artwork across enabled providers",
+            );
+        }
+        Self::from_sources(hits)
+    }
+
     pub(crate) fn from_sources(sources: Vec<SourceEntry>) -> Self {
         // The `sources` list is already sorted by operator
         // priority. Walk it and pick the first source whose
@@ -541,6 +635,19 @@ pub(crate) struct ArtistCatalogue {
     /// flight cascade calls so a browse of the same artist
     /// set warm-caches from the second visit onwards.
     pub(crate) caches: Arc<crate::artwork_caches::ArtworkCaches>,
+    /// Single-flight coalescer keyed on `fold_key`. Ensures at
+    /// most one cascade runs per key at any moment; every
+    /// concurrent same-key caller subscribes and receives the
+    /// same outcome — so a browse fan-out over N tiles that
+    /// happen to share an artist collapses to one MB round
+    /// trip and one provider wave. Orthogonal to `caches`
+    /// (memoises across time; coalescer collapses within one
+    /// call cycle).
+    pub(crate) coalescer: Arc<
+        crate::reconcile_coalescer::ReconcileCoalescer<
+            Result<ArtistArtworkResponse, String>,
+        >,
+    >,
     pub(crate) config: ArtistProviderConfig,
 }
 
@@ -556,6 +663,14 @@ pub(crate) struct ArtistCatalogue {
 const MB_MIN_CONFIDENCE_PERCENT: u32 = 90;
 
 /// Entry point invoked by the plugin's request handler.
+///
+/// Parses the request, computes the fold-key identity, and
+/// routes cache-eligible calls through the single-flight
+/// coalescer so that a browse fan-out over N tiles sharing a
+/// fold-key collapses to one cascade run. Caller-supplied MBID
+/// bypasses the coalescer (the caller has stamped the identity;
+/// coalescing on a fold-key that may not correspond to the
+/// caller's MBID risks cross-wiring outcomes).
 pub(crate) async fn query_artist_artwork(
     payload: &[u8],
     catalogue: &ArtistCatalogue,
@@ -584,35 +699,79 @@ pub(crate) async fn query_artist_artwork(
             "artist is required and must be non-empty",
         ));
     };
-    // Cache key: fold(input artist) — stable across display
-    // cleaning so a browse tile rendered from a cleaned form
-    // hits the same cache slot as the raw MPD tag it came
-    // from. Empty fold-key means the input trims to nothing
-    // (already caught above, but re-check for safety).
-    let fold_key =
-        evo_device_audio_shared::artist_name::artist_fold_key(&artist);
-    let can_cache = !fold_key.is_empty();
-
-    // MBID reconciliation is mandatory for identity-bearing
-    // providers. Prefer any MBID the caller supplied (already
-    // reconciled upstream); otherwise consult the reconcile
-    // cache; on cache miss, hit MusicBrainz for a name → MBID
-    // match, gated on confidence. Missing / weak reconciliation
-    // is not an error — the fallback path is "no source",
-    // which becomes `not_found` at the envelope.
     let caller_supplied_mbid = req
         .artist_mbid
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // Cache key: fold(input artist) — stable across display
+    // cleaning so a browse tile rendered from a cleaned form
+    // hits the same cache slot as the raw MPD tag it came
+    // from.
+    let fold_key =
+        evo_device_audio_shared::artist_name::artist_fold_key(&artist);
+    let can_cache = !fold_key.is_empty();
+    let use_coalescer = can_cache && caller_supplied_mbid.is_none();
+
+    if use_coalescer {
+        let artist_owned = artist.clone();
+        let fold_key_for_run = fold_key.clone();
+        catalogue
+            .coalescer
+            .run(fold_key.clone(), move || async move {
+                run_cascade(
+                    artist_owned,
+                    fold_key_for_run,
+                    None,
+                    can_cache,
+                    catalogue,
+                )
+                .await
+            })
+            .await
+    } else {
+        run_cascade(
+            artist,
+            fold_key,
+            caller_supplied_mbid,
+            can_cache,
+            catalogue,
+        )
+        .await
+    }
+}
+
+/// Body of the cascade — the parsed request has been split
+/// into `(artist, fold_key, caller_supplied_mbid, can_cache)`
+/// and this function performs the actual reconcile + provider
+/// wave, honouring the cache policy and the three-way outcome
+/// contract.
+async fn run_cascade(
+    artist: String,
+    fold_key: String,
+    caller_supplied_mbid: Option<String>,
+    can_cache: bool,
+    catalogue: &ArtistCatalogue,
+) -> Result<ArtistArtworkResponse, String> {
+    // MBID reconciliation is mandatory for identity-bearing
+    // providers. Three shapes on the outcome (see
+    // [`ReconcileOutcome`]): `Found` proceeds to the provider
+    // wave; `Absent` short-circuits to a cacheable `NotFound`;
+    // `Unavailable` short-circuits to `Unavailable` on the
+    // wire with NO cache write (rate-limit / transport spikes
+    // must not durably poison a valid artist).
     let reconciled = if let Some(mbid) = caller_supplied_mbid.clone() {
         // The caller passed an MBID they already trust; skip
         // MusicBrainz search, but still fetch URL-rels so the
-        // Deezer path can key on the recorded Deezer link.
+        // Deezer path can key on the recorded Deezer link. A
+        // transient on the rels lookup still keeps the MBID
+        // (search-side confidence is proxied by the caller's
+        // trust); no bare-lookup fabrication on the "no MB
+        // client" arm because we know nothing beyond the id.
         match &catalogue.mb {
             Some(mb) => match mb.lookup_artist(&mbid).await {
-                Ok(lookup) => Some(lookup),
+                Ok(lookup) => ReconcileOutcome::Found(Box::new(lookup)),
                 Err(e) => {
                     tracing::warn!(
                         plugin = crate::PLUGIN_NAME,
@@ -620,45 +779,54 @@ pub(crate) async fn query_artist_artwork(
                         artist = %artist,
                         mbid = %mbid,
                         error = %mb_error_display(&e),
-                        "MB lookup for caller-supplied MBID failed; \
-                         proceeding with MBID only"
+                        "MB rels lookup for caller-supplied MBID failed; \
+                         proceeding with bare MBID (caller-trusted)"
                     );
-                    // Fabricate a URL-rel-less lookup so the
-                    // downstream providers still use the MBID
-                    // where they can (fanart.tv, TheAudioDB).
-                    Some(bare_lookup_from_mbid(&mbid, &artist))
+                    ReconcileOutcome::Found(Box::new(
+                        bare_lookup_from_mbid(&mbid, &artist),
+                    ))
                 }
             },
-            None => Some(bare_lookup_from_mbid(&mbid, &artist)),
+            None => ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
+                &mbid, &artist,
+            ))),
         }
     } else if can_cache {
-        // Cache-first name reconciliation. A fresh hit / miss
-        // entry short-circuits the two MB round trips (search +
-        // URL-rels lookup); an expired or absent entry falls
-        // through to live reconcile and updates the cache with
-        // the outcome. Negatives are always TTL-bounded (never
-        // eternal) so an operator tag correction or a later MB
-        // submission surfaces on the next cache expiry.
+        // Cache-first name reconciliation. Only `Found` +
+        // `Absent` write to the cache; a fresh Hit / Miss
+        // entry short-circuits the two MB round trips. An
+        // Unavailable outcome NEVER writes — the next request
+        // re-attempts, so a passing rate-limit spike does not
+        // poison the tile for hours.
         use crate::artwork_caches::{MissReason, ReconcileEntry};
         match catalogue.caches.get_reconcile(&fold_key) {
-            Some(ReconcileEntry::Hit { lookup, .. }) => Some(*lookup),
-            Some(ReconcileEntry::Miss { .. }) => None,
+            Some(ReconcileEntry::Hit { lookup, .. }) => {
+                ReconcileOutcome::Found(lookup)
+            }
+            Some(ReconcileEntry::Miss { .. }) => ReconcileOutcome::Absent,
             None => {
                 let outcome =
                     reconcile_artist_mbid(&artist, catalogue.mb.as_deref())
                         .await;
                 match &outcome {
-                    Some(lookup) => catalogue
-                        .caches
-                        .put_reconcile_hit(fold_key.clone(), lookup.clone()),
-                    None => catalogue.caches.put_reconcile_miss(
-                        fold_key.clone(),
-                        if catalogue.mb.is_none() {
-                            MissReason::NoClient
-                        } else {
-                            MissReason::NoConfidentMatch
-                        },
-                    ),
+                    ReconcileOutcome::Found(lookup) => {
+                        catalogue.caches.put_reconcile_hit(
+                            fold_key.clone(),
+                            (**lookup).clone(),
+                        );
+                    }
+                    ReconcileOutcome::Absent => {
+                        catalogue.caches.put_reconcile_miss(
+                            fold_key.clone(),
+                            MissReason::NoConfidentMatch,
+                        );
+                    }
+                    ReconcileOutcome::Unavailable => {
+                        // Deliberately no cache write. The
+                        // next request retries; the UI's
+                        // session cache also skips Unavailable
+                        // per the wire contract.
+                    }
                 }
                 outcome
             }
@@ -667,75 +835,65 @@ pub(crate) async fn query_artist_artwork(
         reconcile_artist_mbid(&artist, catalogue.mb.as_deref()).await
     };
 
-    let want_theaudiodb =
-        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some()
-            && reconciled.is_some();
-    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
-        && catalogue.deezer.is_some()
-        && reconciled
-            .as_ref()
-            .and_then(|l| l.deezer_artist_url.as_deref())
-            .is_some();
-    let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
-        && catalogue.fanart.is_some()
-        && reconciled.is_some();
-    // volumio_meta remains a name-only source; it takes no MBID
-    // and no way to validate against a canonical identity. Keep
-    // it enabled only when MBID reconciliation confirmed the
-    // artist exists — that gate blocks the compilation-artist
-    // wire failure mode (raw tag "Al Di Meola and John
-    // McLaughlin and Paco De Lucía" resolves to no MB entity,
-    // so volumio_meta doesn't fire, so no false-ok URL surfaces).
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
-            && reconciled.is_some();
-
-    if !(want_volumio || want_theaudiodb || want_deezer || want_fanart) {
-        // Two shapes of "cascade would not fire":
-        //   - Every provider disabled / unavailable → not_configured
-        //     (operator gesture would help).
-        //   - Providers configured but MBID did not reconcile
-        //     → not_found (no configuration change would help;
-        //     the artist is not in MusicBrainz at confidence).
-        let any_configured =
-            catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
-                || (catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-                    && catalogue.theaudiodb.is_some())
-                || (catalogue.config.is_enabled(ArtistProviderId::Deezer)
-                    && catalogue.deezer.is_some())
-                || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
-                    && catalogue.fanart.is_some());
-        if !any_configured || catalogue.mb.is_none() {
-            return Ok(ArtistArtworkResponse::not_configured(
-                "every artist-artwork provider is disabled or unavailable on this \
-                 device; enable at least one under Settings → Metadata → Sources \
-                 (fanart.tv also requires the artist_mbid + a fanart.tv \
-                 personal API key), and set `musicbrainz_user_agent` so the \
-                 cascade can reconcile artist identity",
-            ));
-        }
-        return Ok(ArtistArtworkResponse {
-            v: 1,
-            status: CascadeStatus::NotFound,
-            provider_id: None,
-            privacy_class: None,
-            payload: None,
-            image_url: None,
-            detail: Some(format!(
+    // Reconcile short-circuits: Absent → NotFound (definitive
+    // absence); Unavailable → Unavailable (retry-safe). Only
+    // Found proceeds to the provider wave.
+    let reconciled = match reconciled {
+        ReconcileOutcome::Found(lookup) => *lookup,
+        ReconcileOutcome::Absent => {
+            let any_configured = any_provider_configured(catalogue);
+            if !any_configured || catalogue.mb.is_none() {
+                return Ok(ArtistArtworkResponse::not_configured(
+                    "every artist-artwork provider is disabled or unavailable on this \
+                     device; enable at least one under Settings → Metadata → Sources \
+                     (fanart.tv also requires the artist_mbid + a fanart.tv \
+                     personal API key), and set `musicbrainz_user_agent` so the \
+                     cascade can reconcile artist identity",
+                ));
+            }
+            return Ok(ArtistArtworkResponse::not_found(format!(
                 "no MusicBrainz-confident match for {artist} at ≥{MB_MIN_CONFIDENCE_PERCENT}% \
                  — cascade requires MBID reconciliation to prevent wrong-entity images"
-            )),
-            attribution: None,
-            sources: Vec::new(),
-        });
+            )));
+        }
+        ReconcileOutcome::Unavailable => {
+            return Ok(ArtistArtworkResponse::unavailable(format!(
+                "musicbrainz reconcile transient for {artist}; retry on next gesture"
+            )));
+        }
+    };
+
+    let want_theaudiodb =
+        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+            && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+        && catalogue.deezer.is_some()
+        && reconciled.deezer_artist_url.is_some();
+    let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+        && catalogue.fanart.is_some();
+    // volumio_meta remains a name-only source; it takes no MBID
+    // and no way to validate against a canonical identity. The
+    // MBID reconcile above already confirmed the artist exists
+    // (we would not be here otherwise); volumio_meta fires only
+    // as one of the enabled providers.
+    let want_volumio =
+        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+
+    if !(want_volumio || want_theaudiodb || want_deezer || want_fanart) {
+        // Reconcile succeeded but no provider is enabled /
+        // available. Not the "reconcile-absent" case above.
+        return Ok(ArtistArtworkResponse::not_configured(
+            "every artist-artwork provider is disabled or unavailable on this \
+             device; enable at least one under Settings → Metadata → Sources \
+             (fanart.tv also requires the artist_mbid + a fanart.tv \
+             personal API key)",
+        ));
     }
 
-    let effective_mbid: Option<&str> =
-        reconciled.as_ref().map(|l| l.artist_mbid.as_str());
+    let effective_mbid: Option<&str> = Some(reconciled.artist_mbid.as_str());
     let deezer_artist_id: Option<u64> = reconciled
-        .as_ref()
-        .and_then(|l| l.deezer_artist_url.as_deref())
+        .deezer_artist_url
+        .as_deref()
         .and_then(parse_deezer_artist_id);
 
     // Non-Deezer provider result cache. Volumio meta,
@@ -755,62 +913,85 @@ pub(crate) async fn query_artist_artwork(
     } else {
         None
     };
-    let (volumio_src, tadb_src, fanart_src) = if let Some(sources) =
-        cached_non_deezer.as_ref()
-    {
-        // Warm cache — re-use the memoised entries per
-        // provider. Every source in the cache was created
-        // by a prior successful fetch, so the vector is
-        // already sort-order agnostic.
-        let mut v = None;
-        let mut t = None;
-        let mut f = None;
-        for src in sources {
-            match src.provider_id.as_str() {
-                "volumio_meta" => v = Some(src.clone()),
-                "theaudiodb" => t = Some(src.clone()),
-                "fanart_tv" => f = Some(src.clone()),
-                _ => {}
+    let (volumio_out, tadb_out, fanart_out) =
+        if let Some(sources) = cached_non_deezer.as_ref() {
+            // Warm cache — re-hydrate cached entries as Hits. The
+            // cache only ever stores successful entries (see the
+            // cold-path serialisation below); an absent provider
+            // in the snapshot is a definitive absence at reconcile
+            // time and stays Absent on warm calls. Transients are
+            // never cached, so no Unavailable can come from cache.
+            let mut v = ProviderOutcome::Absent;
+            let mut t = ProviderOutcome::Absent;
+            let mut f = ProviderOutcome::Absent;
+            for src in sources {
+                match src.provider_id.as_str() {
+                    "volumio_meta" => v = ProviderOutcome::Hit(src.clone()),
+                    "theaudiodb" => t = ProviderOutcome::Hit(src.clone()),
+                    "fanart_tv" => f = ProviderOutcome::Hit(src.clone()),
+                    _ => {}
+                }
             }
-        }
-        (v, t, f)
-    } else {
-        // Cold cache — hit every enabled non-Deezer
-        // provider and cache the successful entries.
-        let (volumio_src, tadb_src, fanart_src) = tokio::join!(
-            fetch_volumio_meta_artist(
-                &artist,
-                &catalogue.volumio_meta_http,
-                &catalogue.volumio_meta_variant,
-                want_volumio,
-            ),
-            fetch_theaudiodb_artist(
-                effective_mbid,
-                &artist,
-                catalogue,
-                want_theaudiodb,
-            ),
-            fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
-        );
-        if can_cache {
-            let snapshot: Vec<serde_json::Value> =
-                [volumio_src.as_ref(), tadb_src.as_ref(), fanart_src.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serialize_source_entry)
-                    .collect();
-            catalogue.caches.put_provider(
-                fold_key.clone(),
-                crate::artwork_caches::ProviderEntry::new(snapshot),
+            (v, t, f)
+        } else {
+            // Cold cache — hit every enabled non-Deezer provider
+            // and cache only the Hits. Absent/Unavailable never
+            // enter the cache: absence gets re-tried next request
+            // (cheap) and unavailable MUST NOT durably poison.
+            let (v, t, f) = tokio::join!(
+                fetch_volumio_meta_artist(
+                    &artist,
+                    &catalogue.volumio_meta_http,
+                    &catalogue.volumio_meta_variant,
+                    want_volumio,
+                ),
+                fetch_theaudiodb_artist(
+                    effective_mbid,
+                    &artist,
+                    catalogue,
+                    want_theaudiodb,
+                ),
+                fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
             );
-        }
-        (volumio_src, tadb_src, fanart_src)
-    };
+            // Cache-write policy: only write the aggregate provider
+            // snapshot when EVERY non-Deezer outcome is non-transient
+            // (Hit or Absent). A single Unavailable in the wave means
+            // the memoised set would be incomplete — a subsequent
+            // read would treat the missing entry as a durable Absent,
+            // reproducing the bug we just fixed. Keep the cold cost
+            // and re-fetch next call.
+            let all_non_transient =
+                matches!(v, ProviderOutcome::Hit(_) | ProviderOutcome::Absent)
+                    && matches!(
+                        t,
+                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
+                    )
+                    && matches!(
+                        f,
+                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
+                    );
+            if can_cache && all_non_transient {
+                let snapshot: Vec<serde_json::Value> = [&v, &t, &f]
+                    .into_iter()
+                    .filter_map(|out| match out {
+                        ProviderOutcome::Hit(entry) => {
+                            serialize_source_entry(entry)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                catalogue.caches.put_provider(
+                    fold_key.clone(),
+                    crate::artwork_caches::ProviderEntry::new(snapshot),
+                );
+            }
+            (v, t, f)
+        };
 
     // Deezer always fires live — the by-id fetch is cheap
     // (single HTTPS round on a known id) and the URL is under
     // the live-fetch invariant.
-    let deezer_src = fetch_deezer_artist_by_id(
+    let deezer_out = fetch_deezer_artist_by_id(
         deezer_artist_id,
         &artist,
         catalogue,
@@ -818,38 +999,48 @@ pub(crate) async fn query_artist_artwork(
     )
     .await;
 
-    let mut sources: Vec<SourceEntry> =
-        [volumio_src, tadb_src, deezer_src, fanart_src]
-            .into_iter()
-            .flatten()
-            .collect();
-    sort_sources_by_priority(&mut sources, &catalogue.config);
-
-    if sources.is_empty() {
-        return Ok(ArtistArtworkResponse {
-            v: 1,
-            status: CascadeStatus::NotFound,
-            provider_id: None,
-            privacy_class: None,
-            payload: None,
-            image_url: None,
-            detail: Some(format!(
-                "no artist artwork found for {artist} across enabled providers"
-            )),
-            attribution: None,
-            sources: Vec::new(),
-        });
+    // Aggregate over all four provider outcomes. `from_provider_outcomes`
+    // implements the three-way rule: any Hit wins → Ok; otherwise
+    // any Unavailable → Unavailable (retry-safe, no negative cache);
+    // otherwise all Absent → NotFound.
+    let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
+        volumio_out,
+        tadb_out,
+        deezer_out,
+        fanart_out,
+    ]);
+    if matches!(response.status, CascadeStatus::Ok) {
+        sort_sources_by_priority(&mut response.sources, &catalogue.config);
+        // The picker in from_sources ran on the pre-sort order;
+        // re-run it so `image_url` / `provider_id` reflect the
+        // priority-sorted top hit.
+        response = ArtistArtworkResponse::from_sources(response.sources);
     }
-    Ok(ArtistArtworkResponse::from_sources(sources))
+    Ok(response)
+}
+
+fn any_provider_configured(catalogue: &ArtistCatalogue) -> bool {
+    catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
+        || (catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+            && catalogue.theaudiodb.is_some())
+        || (catalogue.config.is_enabled(ArtistProviderId::Deezer)
+            && catalogue.deezer.is_some())
+        || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+            && catalogue.fanart.is_some())
 }
 
 // ---------------------------------------------------------------
-// Per-provider fetch helpers. Each returns
-// `Option<SourceEntry>`: `None` on disabled / unavailable /
-// clean miss / transient error. Transient errors NEVER cache
-// and NEVER surface a non-`None` entry — silence is a cascade-
-// level skip. The transient-not-cached discipline mirrors the
-// album-artwork cascade's posture.
+// Per-provider fetch helpers. Each returns [`ProviderOutcome`]:
+//
+// - `Hit(SourceEntry)` on a successful fetch with a usable
+//   payload.
+// - `Absent` on disabled / no lookup identity / clean upstream
+//   miss (404 / empty result). Aggregatable as definitive
+//   absence at the wire level.
+// - `Unavailable` on transient upstream failure (rate-limit,
+//   HTTP 5xx, timeout, transport, decode). MUST NOT durably
+//   cache — the wire aggregate surfaces `Unavailable` unless
+//   another provider hits.
 // ---------------------------------------------------------------
 
 async fn fetch_volumio_meta_artist(
@@ -857,9 +1048,9 @@ async fn fetch_volumio_meta_artist(
     http: &Client,
     variant: &str,
     enabled: bool,
-) -> Option<SourceEntry> {
+) -> ProviderOutcome {
     if !enabled {
-        return None;
+        return ProviderOutcome::Absent;
     }
     // Volumio meta proxy: same base as the album cascade but
     // with `mode=artistArt`. No cache layer at the plugin — the
@@ -879,15 +1070,14 @@ async fn fetch_volumio_meta_artist(
                 provider = "volumio_meta",
                 artist,
                 error = %e,
-                "volumio meta artistArt transient; skipping"
+                "volumio meta artistArt transient; NOT caching negatively"
             );
-            return None;
+            return ProviderOutcome::Unavailable;
         }
     };
     if !resp.status().is_success() {
-        // Only 200 counts. 404 → clean miss (structural); 5xx / 429
-        // → transient. Both fall out to None here and are logged
-        // at debug for structural misses and warn for transient.
+        // 404 → clean miss (structural, cacheable at aggregate);
+        // 5xx / 429 / other → transient (NOT cacheable).
         let status = resp.status();
         if status.as_u16() == 404 {
             tracing::debug!(
@@ -896,16 +1086,16 @@ async fn fetch_volumio_meta_artist(
                 artist,
                 "volumio meta artistArt clean miss"
             );
-        } else {
-            tracing::warn!(
-                plugin = crate::PLUGIN_NAME,
-                provider = "volumio_meta",
-                artist,
-                status = status.as_u16(),
-                "volumio meta artistArt non-success status; skipping"
-            );
+            return ProviderOutcome::Absent;
         }
-        return None;
+        tracing::warn!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "volumio_meta",
+            artist,
+            status = status.as_u16(),
+            "volumio meta artistArt non-success status; NOT caching negatively"
+        );
+        return ProviderOutcome::Unavailable;
     }
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
@@ -915,21 +1105,24 @@ async fn fetch_volumio_meta_artist(
                 provider = "volumio_meta",
                 artist,
                 error = %e,
-                "volumio meta artistArt json decode failed; skipping"
+                "volumio meta artistArt json decode failed; NOT caching negatively"
             );
-            return None;
+            return ProviderOutcome::Unavailable;
         }
     };
-    let image_url = json
+    let Some(image_url) = json
         .get("data")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .map(String::from)?;
+        .map(String::from)
+    else {
+        return ProviderOutcome::Absent;
+    };
     let payload = serde_json::json!({
         "image_url": image_url,
         "source_url": "https://meta.volumio.org",
     });
-    Some(SourceEntry {
+    ProviderOutcome::Hit(SourceEntry {
         provider_id: ArtistProviderId::VolumioMeta.as_str().to_string(),
         privacy_class: ArtistPrivacyClass::Anonymous.as_str().to_string(),
         payload,
@@ -946,21 +1139,17 @@ async fn fetch_theaudiodb_artist(
     artist: &str,
     catalogue: &ArtistCatalogue,
     enabled: bool,
-) -> Option<SourceEntry> {
+) -> ProviderOutcome {
     if !enabled {
-        return None;
+        return ProviderOutcome::Absent;
     }
-    let tadb = catalogue.theaudiodb.as_ref()?;
-    // MBID-first: TheAudioDB's `artist-mb.php?i=<mbid>` returns
-    // the canonical entity for the given MBID; name-search
-    // (`search.php`) cross-matches on namesake artists and is
-    // therefore only a fallback when no MBID is available (the
-    // upstream cascade currently blocks that fallback, so this
-    // path stays for API-shape completeness).
+    let Some(tadb) = catalogue.theaudiodb.as_ref() else {
+        return ProviderOutcome::Absent;
+    };
     let hit = match artist_mbid {
         Some(mbid) => match tadb.fetch_artist_bio_by_mbid(mbid).await {
             Ok(Some(h)) => h,
-            Ok(None) => return None,
+            Ok(None) => return ProviderOutcome::Absent,
             Err(e) => {
                 tracing::warn!(
                     plugin = crate::PLUGIN_NAME,
@@ -968,37 +1157,40 @@ async fn fetch_theaudiodb_artist(
                     artist,
                     mbid,
                     error = %e,
-                    "TheAudioDB artist artwork by MBID transient; skipping"
+                    "TheAudioDB artist artwork by MBID transient; NOT caching negatively"
                 );
-                return None;
+                return ProviderOutcome::Unavailable;
             }
         },
         None => match tadb.search_artist_bio(artist).await {
             Ok(Some(h)) => h,
-            Ok(None) => return None,
+            Ok(None) => return ProviderOutcome::Absent,
             Err(e) => {
                 tracing::warn!(
                     plugin = crate::PLUGIN_NAME,
                     provider = "theaudiodb",
                     artist,
                     error = %e,
-                    "TheAudioDB artist artwork transient; skipping"
+                    "TheAudioDB artist artwork transient; NOT caching negatively"
                 );
-                return None;
+                return ProviderOutcome::Unavailable;
             }
         },
     };
-    let thumb = hit
+    let Some(thumb) = hit
         .artist_thumb_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)?;
+        .map(str::to_string)
+    else {
+        return ProviderOutcome::Absent;
+    };
     let payload = serde_json::json!({
         "thumb_url": thumb,
         "source_url": hit.source_url,
     });
-    Some(SourceEntry {
+    ProviderOutcome::Hit(SourceEntry {
         provider_id: ArtistProviderId::TheAudioDb.as_str().to_string(),
         privacy_class: ArtistPrivacyClass::Anonymous.as_str().to_string(),
         payload,
@@ -1015,12 +1207,16 @@ async fn fetch_deezer_artist_by_id(
     artist: &str,
     catalogue: &ArtistCatalogue,
     enabled: bool,
-) -> Option<SourceEntry> {
+) -> ProviderOutcome {
     if !enabled {
-        return None;
+        return ProviderOutcome::Absent;
     }
-    let deezer = catalogue.deezer.as_ref()?;
-    let id = deezer_artist_id?;
+    let Some(deezer) = catalogue.deezer.as_ref() else {
+        return ProviderOutcome::Absent;
+    };
+    let Some(id) = deezer_artist_id else {
+        return ProviderOutcome::Absent;
+    };
     // Deezer live-fetch invariant (ToS-mandated):
     // ------------------------------------------------------------
     // `ArtistImageHit` deliberately does NOT derive `Serialize`.
@@ -1049,7 +1245,7 @@ async fn fetch_deezer_artist_by_id(
     // happen because we never re-search by name.
     let hit = match deezer.get_artist_image_by_id(id).await {
         Ok(Some(h)) => h,
-        Ok(None) => return None,
+        Ok(None) => return ProviderOutcome::Absent,
         Err(e) => {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
@@ -1057,9 +1253,9 @@ async fn fetch_deezer_artist_by_id(
                 artist,
                 deezer_id = id,
                 error = %e,
-                "Deezer artist image by id transient; skipping"
+                "Deezer artist image by id transient; NOT caching negatively"
             );
-            return None;
+            return ProviderOutcome::Unavailable;
         }
     };
     let payload = serde_json::json!({
@@ -1076,7 +1272,7 @@ async fn fetch_deezer_artist_by_id(
     // `hit` drops here — the ArtistImageHit type is un-Serialize,
     // so it cannot leak through JSON. Only the URL strings above
     // survive into the response payload.
-    Some(SourceEntry {
+    ProviderOutcome::Hit(SourceEntry {
         provider_id: ArtistProviderId::Deezer.as_str().to_string(),
         privacy_class: ArtistPrivacyClass::Anonymous.as_str().to_string(),
         payload,
@@ -1093,28 +1289,32 @@ async fn fetch_fanart_artist(
     artist_mbid: Option<&str>,
     catalogue: &ArtistCatalogue,
     enabled: bool,
-) -> Option<SourceEntry> {
+) -> ProviderOutcome {
     if !enabled {
-        return None;
+        return ProviderOutcome::Absent;
     }
-    let fanart = catalogue.fanart.as_ref()?;
-    let mbid = artist_mbid?;
+    let Some(fanart) = catalogue.fanart.as_ref() else {
+        return ProviderOutcome::Absent;
+    };
+    let Some(mbid) = artist_mbid else {
+        return ProviderOutcome::Absent;
+    };
     let hit = match fanart.get_artist_images(mbid).await {
         Ok(Some(h)) => h,
-        Ok(None) => return None,
+        Ok(None) => return ProviderOutcome::Absent,
         Err(e) => {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
                 provider = "fanart_tv",
                 artist_mbid = mbid,
                 error = %e,
-                "fanart.tv artist images transient; skipping"
+                "fanart.tv artist images transient; NOT caching negatively"
             );
-            return None;
+            return ProviderOutcome::Unavailable;
         }
     };
     if !hit.has_any_artwork() {
-        return None;
+        return ProviderOutcome::Absent;
     }
     let payload = serde_json::json!({
         "hd_music_logo_urls": hit.hd_music_logo_urls,
@@ -1126,7 +1326,7 @@ async fn fetch_fanart_artist(
         "artist_name": hit.artist_name,
         "source_url": hit.source_url,
     });
-    Some(SourceEntry {
+    ProviderOutcome::Hit(SourceEntry {
         provider_id: ArtistProviderId::FanartTv.as_str().to_string(),
         privacy_class: ArtistPrivacyClass::IdentityBearing.as_str().to_string(),
         payload,
@@ -1160,6 +1360,71 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// Three-way outcome of an artist-name → MBID reconcile pass.
+///
+/// The original `Option<ArtistLookup>` shape collapsed transient
+/// upstream failures (rate-limit / 5xx / transport) into the
+/// same `None` sentinel as a genuine "no MB entity at
+/// confidence" — the caller then durably cached the transient
+/// as an absence. Under browse fan-out on MB's 1 req/sec
+/// limiter that shape converts a single rate-limit spike into
+/// six hours of blank tiles for the affected artists.
+///
+/// The three variants:
+///
+/// - [`ReconcileOutcome::Found`] — MB search returned a hit at
+///   ≥ [`MB_MIN_CONFIDENCE_PERCENT`] and the URL-rels lookup
+///   succeeded (or fabricated a bare MBID-only lookup after a
+///   transient on the second call). Cacheable under the hit
+///   TTL.
+/// - [`ReconcileOutcome::Absent`] — MB returned no hits or the
+///   top hit was below the confidence threshold. Definitive
+///   absence at MB's catalogue; cacheable under the miss TTL.
+/// - [`ReconcileOutcome::Unavailable`] — MB search itself
+///   errored (rate-limit / transport / 5xx). NOT definitive;
+///   the caller MUST NOT cache this as an absence, and MUST
+///   surface `Unavailable` on the wire so the UI can retry
+///   without poisoning its session cache.
+pub(crate) enum ReconcileOutcome {
+    Found(Box<evo_online_providers::musicbrainz::ArtistLookup>),
+    Absent,
+    Unavailable,
+}
+
+/// Three-way outcome of one provider fetch after a good
+/// reconcile. Mirrors [`ReconcileOutcome`] at the provider
+/// layer so `from_provider_outcomes` can aggregate honestly:
+///
+/// - `Hit` — provider returned a real payload with a usable
+///   image URL (or was in-cache).
+/// - `Absent` — provider gave a clean structural miss (404,
+///   empty response, disabled, or no MBID/URL-rel to look up
+///   with). Aggregatable as definitive absence.
+/// - `Unavailable` — provider was reachable-but-transient
+///   (rate-limit, HTTP 5xx, timeout, transport error). Must
+///   NOT roll up into a durable "not found" — the aggregate
+///   surfaces `Unavailable` unless another provider hits.
+#[derive(Debug, Clone)]
+pub(crate) enum ProviderOutcome {
+    Hit(SourceEntry),
+    Absent,
+    Unavailable,
+}
+
+impl ProviderOutcome {
+    /// Convenience for the two-value case (provider was
+    /// disabled or returned no lookup id): treat both as clean
+    /// absence. Never as unavailable — a disabled provider is
+    /// not a transient upstream failure.
+    pub(crate) fn absent_when(condition: bool) -> Option<Self> {
+        if condition {
+            Some(Self::Absent)
+        } else {
+            None
+        }
+    }
+}
+
 /// Reconcile an artist name to a MusicBrainz canonical
 /// artist entity plus URL-relations.
 ///
@@ -1175,15 +1440,22 @@ fn percent_encode(s: &str) -> String {
 ///    MB has recorded one, which the Deezer fetch consumes as
 ///    an authoritative artist id.
 ///
-/// Returns `None` on: no MB client (operator has not
-/// configured a MusicBrainz UA), no search hit at confidence,
-/// or transient MB failure (never caches — the next request
-/// re-attempts).
+/// Returns [`ReconcileOutcome`]: `Found` on ≥90% hit + rels
+/// (or bare-MBID fallback when only the second call
+/// transiently failed), `Absent` on definitive no-match or
+/// below-confidence match, `Unavailable` on transient MB
+/// failure or absent MB client (no client + no cache write is
+/// safer than caching an absence we cannot verify).
 async fn reconcile_artist_mbid(
     artist: &str,
     mb: Option<&MusicBrainzClient>,
-) -> Option<evo_online_providers::musicbrainz::ArtistLookup> {
-    let mb = mb?;
+) -> ReconcileOutcome {
+    let Some(mb) = mb else {
+        // No MB client is a configuration state, not a real
+        // "not found" — treat as unavailable so the caller
+        // does not memoise a false absence for hours.
+        return ReconcileOutcome::Unavailable;
+    };
     let hit = match mb.search_artist(artist).await {
         Ok(Some(h)) => h,
         Ok(None) => {
@@ -1193,7 +1465,7 @@ async fn reconcile_artist_mbid(
                 artist,
                 "MB artist search returned no hits"
             );
-            return None;
+            return ReconcileOutcome::Absent;
         }
         Err(e) => {
             tracing::warn!(
@@ -1201,9 +1473,9 @@ async fn reconcile_artist_mbid(
                 provider = "musicbrainz",
                 artist,
                 error = %mb_error_display(&e),
-                "MB artist search transient; skipping"
+                "MB artist search transient; NOT caching"
             );
-            return None;
+            return ReconcileOutcome::Unavailable;
         }
     };
     if hit.confidence_percent < MB_MIN_CONFIDENCE_PERCENT {
@@ -1216,10 +1488,10 @@ async fn reconcile_artist_mbid(
             threshold = MB_MIN_CONFIDENCE_PERCENT,
             "MB artist match below confidence threshold; refusing to key providers on it"
         );
-        return None;
+        return ReconcileOutcome::Absent;
     }
     match mb.lookup_artist(&hit.artist_mbid).await {
-        Ok(lookup) => Some(lookup),
+        Ok(lookup) => ReconcileOutcome::Found(Box::new(lookup)),
         Err(e) => {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
@@ -1227,9 +1499,18 @@ async fn reconcile_artist_mbid(
                 artist,
                 mbid = %hit.artist_mbid,
                 error = %mb_error_display(&e),
-                "MB artist lookup transient; falling back to MBID-only"
+                "MB artist lookup transient; using bare MBID (search hit is confident)"
             );
-            Some(bare_lookup_from_mbid(&hit.artist_mbid, artist))
+            // Search was confident, only URL-rels lookup
+            // transiently failed. Return Found with a bare
+            // lookup so downstream MBID-keyed providers
+            // (fanart.tv, TheAudioDB) still fire; the Deezer
+            // URL-rel path stays inactive for this call but
+            // the identity is nailed down.
+            ReconcileOutcome::Found(Box::new(bare_lookup_from_mbid(
+                &hit.artist_mbid,
+                artist,
+            )))
         }
     }
 }

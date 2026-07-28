@@ -159,6 +159,28 @@ impl ArtworkCaches {
         let mut lru = self.provider.lock().expect("provider lock poisoned");
         lru.put(fold_key, entry);
     }
+
+    /// Drop every entry from both LRUs. Returns
+    /// `(reconcile_entries_dropped, provider_entries_dropped)`
+    /// so the caller can surface the counts to the operator.
+    /// Called by the plugin's `artwork.online.clear_cache`
+    /// verb; also used at unload via a fresh replacement.
+    pub(crate) fn drop_all(&self) -> (usize, usize) {
+        let reconcile_dropped = {
+            let mut lru =
+                self.reconcile.lock().expect("reconcile lock poisoned");
+            let n = lru.len();
+            lru.clear();
+            n
+        };
+        let provider_dropped = {
+            let mut lru = self.provider.lock().expect("provider lock poisoned");
+            let n = lru.len();
+            lru.clear();
+            n
+        };
+        (reconcile_dropped, provider_dropped)
+    }
 }
 
 impl Default for ArtworkCaches {
@@ -197,19 +219,16 @@ pub(crate) enum ReconcileEntry {
     },
 }
 
-/// Why the reconcile missed. Kept as a small discriminated
-/// enum so the caller can distinguish "no MB entity at
-/// confidence" (won't retry within TTL) from "reconcile client
-/// unavailable" (a configuration issue).
+/// Why the reconcile missed. Only definitive-absence reasons
+/// are cacheable — transient upstream failures (rate-limit,
+/// 5xx, transport) surface as `Unavailable` on the wire and
+/// write NOTHING to this cache (see `ReconcileOutcome`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MissReason {
     /// The MB search returned no hits, or the top hit was
-    /// below the confidence threshold.
+    /// below the confidence threshold. Definitive at MB's
+    /// catalogue; safe to memoise under the miss TTL.
     NoConfidentMatch,
-    /// The MB client is not available (should not happen
-    /// after the default-UA change, but preserved for
-    /// completeness so the miss is representable).
-    NoClient,
 }
 
 /// Cached per-provider result for one fold-key.

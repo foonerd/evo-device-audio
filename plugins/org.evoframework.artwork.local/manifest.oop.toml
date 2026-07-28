@@ -34,7 +34,7 @@ role = "respondent"
 # the same shelf and owns `artwork.resolve_online` (CAA / Last.fm
 # / iTunes / Volumio meta cascade). The framework's partition
 # gate routes each verb to its declaring plugin.
-request_types = ["artwork.resolve"]
+request_types = ["artwork.resolve", "artwork.local.clear_cache"]
 
 [kind]
 instance = "singleton"
@@ -84,5 +84,5 @@ restart_on_crash = true
 restart_budget = 5
 
 [capabilities.respondent]
-request_types = ["artwork.resolve"]
+request_types = ["artwork.resolve", "artwork.local.clear_cache"]
 response_budget_ms = 10000

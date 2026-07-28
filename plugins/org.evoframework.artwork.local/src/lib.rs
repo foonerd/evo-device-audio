@@ -71,10 +71,142 @@ pub const PLUGIN_NAME: &str = "org.evoframework.artwork.local";
 /// Request type: resolve cover / visual material for a subject.
 const REQUEST_ARTWORK_RESOLVE: &str = "artwork.resolve";
 
+/// Request type: wipe this plugin's on-disk artwork cache.
+///
+/// Recursively deletes `state_dir/artwork_cache/` — the
+/// full-size embedded-cover extracts this plugin writes on
+/// resolve. Idempotent: an absent cache directory is a no-op.
+/// Runs on a blocking thread because filesystem walks are
+/// synchronous.
+///
+/// The operator-facing intent is "the on-disk artwork data
+/// looks wrong and I want it re-derived from source" — a
+/// subsequent `artwork.resolve` call re-extracts the cover
+/// from the audio file's tags.
+const REQUEST_ARTWORK_LOCAL_CLEAR_CACHE: &str = "artwork.local.clear_cache";
+
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML)
         .expect("org-evoframework-artwork-local: embedded manifest must parse")
+}
+
+/// Handle `artwork.local.clear_cache`.
+///
+/// Wipes `state_dir/artwork_cache/` recursively — the on-disk
+/// store this plugin writes embedded-cover extracts into.
+/// Returns a small JSON envelope describing the outcome:
+/// `{ v: 1, status: "ok" | "no_state_dir", cleared_bytes:
+/// <u64>, cleared_files: <u64>, path: <string> }`.
+///
+/// Idempotent — an absent cache directory returns
+/// `status: ok` with zero counts.
+async fn handle_clear_cache(
+    req: &Request,
+    state_dir: Option<&std::path::Path>,
+) -> Result<Response, PluginError> {
+    let state_dir = match state_dir {
+        Some(d) => d.to_path_buf(),
+        None => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "v": 1,
+                "status": "no_state_dir",
+                "cleared_bytes": 0u64,
+                "cleared_files": 0u64,
+                "path": null,
+            }))
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "artwork.local.clear_cache response JSON: {e}"
+                ))
+            })?;
+            return Ok(Response::for_request(req, body));
+        }
+    };
+    let cache_dir = state_dir.join("artwork_cache");
+    // Recursive walk-and-remove runs on a blocking thread —
+    // fs::remove_dir_all is synchronous and can iterate a
+    // sizeable tree.
+    let cache_dir_for_thread = cache_dir.clone();
+    let (cleared_bytes, cleared_files) =
+        tokio::task::spawn_blocking(move || {
+            wipe_dir_reporting(&cache_dir_for_thread)
+        })
+        .await
+        .map_err(|e| {
+            PluginError::Permanent(format!(
+                "artwork.local.clear_cache blocking join failed: {e}"
+            ))
+        })?
+        .map_err(PluginError::Permanent)?;
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        path = %cache_dir.display(),
+        cleared_bytes,
+        cleared_files,
+        "artwork.local.clear_cache: wiped on-disk cache"
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "status": "ok",
+        "cleared_bytes": cleared_bytes,
+        "cleared_files": cleared_files,
+        "path": cache_dir.display().to_string(),
+    }))
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "artwork.local.clear_cache response JSON: {e}"
+        ))
+    })?;
+    Ok(Response::for_request(req, body))
+}
+
+/// Recursively delete `dir` and every file / subdirectory
+/// under it, tallying the bytes and file count removed. An
+/// absent `dir` is a no-op that returns `(0, 0)`. Errors
+/// bubble as `String` for the caller to wrap in
+/// `PluginError::Permanent`.
+fn wipe_dir_reporting(dir: &std::path::Path) -> Result<(u64, u64), String> {
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut bytes: u64 = 0;
+    let mut files: u64 = 0;
+    for entry in walk_files(dir)? {
+        let meta = std::fs::metadata(&entry)
+            .map_err(|e| format!("stat {}: {e}", entry.display()))?;
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            files = files.saturating_add(1);
+        }
+    }
+    std::fs::remove_dir_all(dir)
+        .map_err(|e| format!("remove_dir_all {}: {e}", dir.display()))?;
+    Ok((bytes, files))
+}
+
+/// Depth-first walk producing every entry (files + dirs)
+/// under `root`. Used only for the tally before removal.
+fn walk_files(
+    root: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut out = Vec::new();
+    while let Some(path) = stack.pop() {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            let entries = std::fs::read_dir(&path)
+                .map_err(|e| format!("read_dir {}: {e}", path.display()))?;
+            for e in entries.flatten() {
+                stack.push(e.path());
+            }
+        }
+        out.push(path);
+    }
+    Ok(out)
 }
 
 fn plugin_crate_version() -> semver::Version {
@@ -152,7 +284,10 @@ impl Plugin for ArtworkLocalPlugin {
                     contract: 1,
                 },
                 runtime_capabilities: RuntimeCapabilities {
-                    request_types: vec![REQUEST_ARTWORK_RESOLVE.to_string()],
+                    request_types: vec![
+                        REQUEST_ARTWORK_RESOLVE.to_string(),
+                        REQUEST_ARTWORK_LOCAL_CLEAR_CACHE.to_string(),
+                    ],
                     accepts_custody: false,
                     flags: Default::default(),
                     course_correct_verbs: Vec::new(),
@@ -249,18 +384,24 @@ impl Respondent for ArtworkLocalPlugin {
                 ));
             }
 
+            self.requests_handled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if req.request_type == REQUEST_ARTWORK_LOCAL_CLEAR_CACHE {
+                return handle_clear_cache(req, self.state_dir.as_deref())
+                    .await;
+            }
+
             if req.request_type != REQUEST_ARTWORK_RESOLVE {
-                self.requests_handled
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(PluginError::Permanent(format!(
                     "unknown request type: {:?} (not one of: {:?})",
                     req.request_type,
-                    [REQUEST_ARTWORK_RESOLVE]
+                    [
+                        REQUEST_ARTWORK_RESOLVE,
+                        REQUEST_ARTWORK_LOCAL_CLEAR_CACHE,
+                    ]
                 )));
             }
-
-            self.requests_handled
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,
@@ -384,7 +525,7 @@ mod tests {
         assert!(!d.runtime_capabilities.accepts_custody);
         assert_eq!(
             d.runtime_capabilities.request_types,
-            vec![REQUEST_ARTWORK_RESOLVE]
+            vec![REQUEST_ARTWORK_RESOLVE, REQUEST_ARTWORK_LOCAL_CLEAR_CACHE,]
         );
         let drift =
             evo_plugin_sdk::drift::detect_drift(&m, &d.runtime_capabilities);

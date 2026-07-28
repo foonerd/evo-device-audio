@@ -73,6 +73,12 @@ struct Inner {
 }
 
 impl EnrichmentCache {
+    /// The on-disk root directory this cache writes into.
+    /// Used by the `metadata.online.clear_cache` verb.
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.inner.root
+    }
+
     pub(crate) fn new(root: PathBuf, negative_ttl: Duration) -> Self {
         Self {
             inner: Arc::new(Inner { root, negative_ttl }),

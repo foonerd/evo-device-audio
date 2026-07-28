@@ -264,10 +264,13 @@ pub(crate) async fn build_envelope(
             "album":           item.album,
             "duration_ms":     item.duration.map(|d| d.as_millis() as u64),
             "available":       available,
-            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track(
+            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track_sized(
                 &item.file_path,
                 item.artist.as_deref(),
                 item.album.as_deref(),
+                // Queue row is a list surface — request the small
+                // (300 px) size variant.
+                Some("small"),
             ),
             "composer":        item.classical.composer,
             "composer_sort":   item.classical.composer_sort,

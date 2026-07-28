@@ -150,11 +150,174 @@ const REQUEST_METADATA_QUERY_TRACK_ANNOTATION: &str =
 /// identity-bearing provider currently improves on it.
 const REQUEST_METADATA_QUERY_WORK_NOTES: &str = "metadata.query_work_notes";
 
+/// Request type: wipe every on-disk metadata cache this
+/// plugin owns.
+///
+/// Recursively deletes each `state_dir/<name>_cache/`
+/// directory the plugin writes into: `reconcile_cache`,
+/// `lyrics_cache`, `bio_cache`, `album_notes_cache`,
+/// `release_credits_cache`, `track_annotation_cache`,
+/// `work_notes_cache`. Idempotent — an absent directory is a
+/// no-op. Returns per-cache counts so the operator sees which
+/// caches actually held state.
+const REQUEST_METADATA_ONLINE_CLEAR_CACHE: &str = "metadata.online.clear_cache";
+
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML).expect(
         "org-evoframework-metadata-online: embedded manifest must parse",
     )
+}
+
+/// Handle `metadata.online.clear_cache`.
+///
+/// Wipes every `state_dir/<name>_cache/` directory this
+/// plugin owns. Skips absent caches (a cache is `None` before
+/// the plugin has been loaded, or when a specific enrichment
+/// verb has never been configured). Returns per-cache byte /
+/// file counts.
+async fn handle_metadata_clear_cache(
+    req: &Request,
+    plugin: &MetadataOnlinePlugin,
+) -> Result<Response, PluginError> {
+    let dirs: Vec<(&'static str, std::path::PathBuf)> = [
+        (
+            "reconcile_cache",
+            plugin
+                .reconcile_cache
+                .as_ref()
+                .map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "lyrics_cache",
+            plugin.lyrics_cache.as_ref().map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "bio_cache",
+            plugin.bio_cache.as_ref().map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "album_notes_cache",
+            plugin.notes_cache.as_ref().map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "release_credits_cache",
+            plugin
+                .credits_cache
+                .as_ref()
+                .map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "track_annotation_cache",
+            plugin
+                .annotation_cache
+                .as_ref()
+                .map(|c| c.root().to_path_buf()),
+        ),
+        (
+            "work_notes_cache",
+            plugin
+                .work_notes_cache
+                .as_ref()
+                .map(|c| c.root().to_path_buf()),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, dir)| dir.map(|d| (name, d)))
+    .collect();
+
+    let cleared = tokio::task::spawn_blocking(move || {
+        let mut per_cache = Vec::with_capacity(dirs.len());
+        for (name, dir) in dirs {
+            match wipe_dir_reporting(&dir) {
+                Ok((bytes, files)) => per_cache.push(serde_json::json!({
+                    "cache": name,
+                    "path": dir.display().to_string(),
+                    "cleared_bytes": bytes,
+                    "cleared_files": files,
+                    "status": "ok",
+                })),
+                Err(e) => per_cache.push(serde_json::json!({
+                    "cache": name,
+                    "path": dir.display().to_string(),
+                    "cleared_bytes": 0u64,
+                    "cleared_files": 0u64,
+                    "status": "error",
+                    "detail": e,
+                })),
+            }
+        }
+        per_cache
+    })
+    .await
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "metadata.online.clear_cache blocking join failed: {e}"
+        ))
+    })?;
+
+    let total_bytes: u64 = cleared
+        .iter()
+        .filter_map(|v| {
+            v.get("cleared_bytes").and_then(serde_json::Value::as_u64)
+        })
+        .sum();
+    let total_files: u64 = cleared
+        .iter()
+        .filter_map(|v| {
+            v.get("cleared_files").and_then(serde_json::Value::as_u64)
+        })
+        .sum();
+    tracing::info!(
+        plugin = PLUGIN_NAME,
+        total_bytes,
+        total_files,
+        "metadata.online.clear_cache: wiped {} on-disk caches",
+        cleared.len()
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "status": "ok",
+        "total_cleared_bytes": total_bytes,
+        "total_cleared_files": total_files,
+        "per_cache": cleared,
+    }))
+    .map_err(|e| {
+        PluginError::Permanent(format!(
+            "metadata.online.clear_cache response JSON: {e}"
+        ))
+    })?;
+    Ok(Response::for_request(req, body))
+}
+
+/// Recursively delete `dir` and every file / subdirectory
+/// under it, tallying the bytes and file count removed.
+fn wipe_dir_reporting(dir: &std::path::Path) -> Result<(u64, u64), String> {
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut bytes: u64 = 0;
+    let mut files: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for e in entries.flatten() {
+                    stack.push(e.path());
+                }
+            }
+        } else if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            files = files.saturating_add(1);
+        }
+    }
+    std::fs::remove_dir_all(dir)
+        .map_err(|e| format!("remove_dir_all {}: {e}", dir.display()))?;
+    Ok((bytes, files))
 }
 
 fn plugin_crate_version() -> semver::Version {
@@ -285,6 +448,7 @@ impl Plugin for MetadataOnlinePlugin {
                         REQUEST_METADATA_QUERY_RELEASE_CREDITS.to_string(),
                         REQUEST_METADATA_QUERY_TRACK_ANNOTATION.to_string(),
                         REQUEST_METADATA_QUERY_WORK_NOTES.to_string(),
+                        REQUEST_METADATA_ONLINE_CLEAR_CACHE.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -651,6 +815,7 @@ impl Respondent for MetadataOnlinePlugin {
                 REQUEST_METADATA_QUERY_RELEASE_CREDITS,
                 REQUEST_METADATA_QUERY_TRACK_ANNOTATION,
                 REQUEST_METADATA_QUERY_WORK_NOTES,
+                REQUEST_METADATA_ONLINE_CLEAR_CACHE,
             ];
             if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
@@ -662,6 +827,10 @@ impl Respondent for MetadataOnlinePlugin {
             }
             self.requests_handled
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if req.request_type == REQUEST_METADATA_ONLINE_CLEAR_CACHE {
+                return handle_metadata_clear_cache(req, self).await;
+            }
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,

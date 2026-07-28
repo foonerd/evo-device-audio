@@ -19,6 +19,7 @@ role = "respondent"
 request_types = [
     "artwork.resolve_online",
     "artwork.resolve_artist_artwork",
+    "artwork.online.clear_cache",
 ]
 
 [kind]
@@ -64,6 +65,7 @@ restart_budget = 5
 request_types = [
     "artwork.resolve_online",
     "artwork.resolve_artist_artwork",
+    "artwork.online.clear_cache",
 ]
 # Online providers respond within ~2-3s under good network
 # conditions; the budget allows for one slow upstream + the

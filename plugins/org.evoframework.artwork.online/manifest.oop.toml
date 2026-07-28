@@ -16,6 +16,7 @@ role = "respondent"
 request_types = [
     "artwork.resolve_online",
     "artwork.resolve_artist_artwork",
+    "artwork.online.clear_cache",
 ]
 
 [kind]
@@ -49,5 +50,6 @@ restart_budget = 5
 request_types = [
     "artwork.resolve_online",
     "artwork.resolve_artist_artwork",
+    "artwork.online.clear_cache",
 ]
 response_budget_ms = 15000

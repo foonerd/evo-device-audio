@@ -65,6 +65,7 @@ mod artist_cascade;
 mod artwork_caches;
 mod config;
 mod providers;
+mod reconcile_coalescer;
 mod resolve;
 
 use std::future::Future;
@@ -111,6 +112,16 @@ const REQUEST_ARTWORK_RESOLVE_ONLINE: &str = "artwork.resolve_online";
 /// code path.
 const REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK: &str =
     "artwork.resolve_artist_artwork";
+
+/// Request type: drop this plugin's in-memory caches.
+///
+/// Wipes the artist-artwork reconcile cache (MB name → MBID
+/// memo, positive + negative under TTL) and the non-Deezer
+/// provider result cache. Deezer entries were never cached
+/// (ToS live-fetch); a clear is a no-op for that provider.
+/// Idempotent. Returns a small JSON envelope describing the
+/// cleared counts.
+const REQUEST_ARTWORK_ONLINE_CLEAR_CACHE: &str = "artwork.online.clear_cache";
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -200,6 +211,20 @@ pub struct ArtworkOnlinePlugin {
     /// caches (live-fetch invariant enforced by
     /// `ArtistImageHit`'s missing `Serialize`).
     artwork_caches: Arc<artwork_caches::ArtworkCaches>,
+    /// Single-flight coalescer for the artist-artwork cascade.
+    /// Keyed on fold-key so a browse fan-out that surfaces the
+    /// same artist under multiple tiles (or the same tile
+    /// twice from separate WS calls within one browse) runs
+    /// the cascade at most once — the concurrent waiters
+    /// subscribe to the in-flight future and share its
+    /// outcome. Orthogonal to `artwork_caches`: the coalescer
+    /// collapses within one call cycle, the caches memoise
+    /// across time.
+    reconcile_coalescer: Arc<
+        reconcile_coalescer::ReconcileCoalescer<
+            Result<artist_cascade::ArtistArtworkResponse, String>,
+        >,
+    >,
     requests_handled: std::sync::atomic::AtomicU64,
 }
 
@@ -221,6 +246,9 @@ impl ArtworkOnlinePlugin {
             volumio_meta_variant: "community".to_string(),
             reactor_tasks: Vec::new(),
             artwork_caches: Arc::new(artwork_caches::ArtworkCaches::new()),
+            reconcile_coalescer: Arc::new(
+                reconcile_coalescer::ReconcileCoalescer::new(),
+            ),
             requests_handled: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -251,6 +279,7 @@ impl Plugin for ArtworkOnlinePlugin {
                     request_types: vec![
                         REQUEST_ARTWORK_RESOLVE_ONLINE.to_string(),
                         REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK.to_string(),
+                        REQUEST_ARTWORK_ONLINE_CLEAR_CACHE.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -476,9 +505,13 @@ impl Plugin for ArtworkOnlinePlugin {
             self.mb_client = None;
             // Drop the cache state and replace with a fresh
             // empty pair so a subsequent load() starts with
-            // no memoised reconcile / provider entries.
+            // no memoised reconcile / provider entries. Same
+            // for the coalescer's in-flight map (should be
+            // empty at unload, but reset defensively).
             self.artwork_caches =
                 Arc::new(artwork_caches::ArtworkCaches::new());
+            self.reconcile_coalescer =
+                Arc::new(reconcile_coalescer::ReconcileCoalescer::new());
             // Abort every background reactor so a subsequent
             // re-load spawns fresh subscriptions.
             for task in self.reactor_tasks.drain(..) {
@@ -521,6 +554,7 @@ impl Respondent for ArtworkOnlinePlugin {
             let known = [
                 REQUEST_ARTWORK_RESOLVE_ONLINE,
                 REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK,
+                REQUEST_ARTWORK_ONLINE_CLEAR_CACHE,
             ];
             if !known.contains(&req.request_type.as_str()) {
                 self.requests_handled
@@ -532,6 +566,29 @@ impl Respondent for ArtworkOnlinePlugin {
             }
             self.requests_handled
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if req.request_type == REQUEST_ARTWORK_ONLINE_CLEAR_CACHE {
+                let (reconcile_dropped, provider_dropped) =
+                    self.artwork_caches.drop_all();
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    reconcile_entries_dropped = reconcile_dropped,
+                    provider_entries_dropped = provider_dropped,
+                    "artwork.online.clear_cache: in-mem LRUs cleared"
+                );
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "ok",
+                    "reconcile_entries_dropped": reconcile_dropped,
+                    "provider_entries_dropped": provider_dropped,
+                }))
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "artwork.online.clear_cache response JSON: {e}"
+                    ))
+                })?;
+                return Ok(Response::for_request(req, body));
+            }
 
             tracing::debug!(
                 plugin = PLUGIN_NAME,
@@ -602,6 +659,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         fanart: self.fanart_client.clone(),
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
+                        coalescer: Arc::clone(&self.reconcile_coalescer),
                         config: config_snapshot,
                     };
                     let response = artist_cascade::query_artist_artwork(

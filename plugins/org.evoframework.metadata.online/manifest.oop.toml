@@ -20,6 +20,7 @@ request_types = [
     "metadata.query_release_credits",
     "metadata.query_track_annotation",
     "metadata.query_work_notes",
+    "metadata.online.clear_cache",
 ]
 
 [[stockings]]
@@ -67,5 +68,6 @@ request_types = [
     "metadata.query_track_annotation",
     "metadata.query_work_notes",
     "library.browse_by_recording_type",
+    "metadata.online.clear_cache",
 ]
 response_budget_ms = 120000

@@ -441,6 +441,39 @@ pub fn artwork_target_url(scheme: &str, value: &str) -> String {
     )
 }
 
+/// Same as [`artwork_target_url`], but appends an explicit
+/// `&size=<size>` query parameter so the framework artwork
+/// endpoint returns a per-size variant instead of the default
+/// (`medium`). The endpoint's canonical size taxonomy is
+/// `small | medium | large | original` (with `tiny` accepted
+/// as a backward-compatible alias for `small`); every
+/// downstream cache (framework asset cache + the artwork.local
+/// plugin's on-disk cache) keys per size so a browse of small
+/// tiles never pulls a 1000×1000 original.
+///
+/// Callers should default to `Some("small")` for facet /
+/// list-row artwork (thumbnails) and `Some("original")` for
+/// hero surfaces (now-playing, album detail, multi-room
+/// propagation). Passing `None` collapses to the sizeless URL
+/// (the endpoint default), useful for callers that intend the
+/// server-side default and want browser cache identity to
+/// match legacy emissions.
+pub fn artwork_target_url_sized(
+    scheme: &str,
+    value: &str,
+    size: Option<&str>,
+) -> String {
+    match size {
+        Some(s) if !s.trim().is_empty() => format!(
+            "/api/v1/audio/artwork?scheme={}&value={}&size={}",
+            percent_encode_query_value(scheme),
+            percent_encode_query_value(value),
+            percent_encode_query_value(s),
+        ),
+        _ => artwork_target_url(scheme, value),
+    }
+}
+
 /// Cover-identity-picking `artwork_target_url` for track rows.
 ///
 /// Picks the resolve scheme based on tag availability so list
@@ -474,6 +507,19 @@ pub fn artwork_target_url_for_track(
     artist: Option<&str>,
     album: Option<&str>,
 ) -> String {
+    artwork_target_url_for_track_sized(file_path, artist, album, None)
+}
+
+/// Same as [`artwork_target_url_for_track`], but appends an
+/// explicit `&size=<size>` query parameter (e.g. `small` for
+/// facet tiles, `original` for hero surfaces). See
+/// [`artwork_target_url_sized`] for the size taxonomy.
+pub fn artwork_target_url_for_track_sized(
+    file_path: &str,
+    artist: Option<&str>,
+    album: Option<&str>,
+    size: Option<&str>,
+) -> String {
     let artist_ok = artist
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -485,9 +531,9 @@ pub fn artwork_target_url_for_track(
     match (artist_ok, album_ok) {
         (Some(a), Some(al)) => {
             let value = format!("{a}|{al}");
-            artwork_target_url("mpd-album", &value)
+            artwork_target_url_sized("mpd-album", &value, size)
         }
-        _ => artwork_target_url("mpd-path", file_path),
+        _ => artwork_target_url_sized("mpd-path", file_path, size),
     }
 }
 
@@ -650,6 +696,84 @@ mod artwork_url_tests {
             "different album names by the same artist must emit \
              distinct URLs so the resolver can pick the right cover"
         );
+    }
+
+    // ------------------------------------------------------------
+    // Sized helpers (Part 3 of the artist-facet contract)
+    // ------------------------------------------------------------
+
+    #[test]
+    fn sized_url_appends_size_query_param() {
+        let url =
+            artwork_target_url_sized("mpd-album", "ABBA|21", Some("small"));
+        assert_eq!(
+            url,
+            "/api/v1/audio/artwork?scheme=mpd-album&value=ABBA%7C21&size=small"
+        );
+    }
+
+    #[test]
+    fn sized_url_none_collapses_to_sizeless_form() {
+        // A `None` size hint returns the same URL the legacy
+        // `artwork_target_url` produces — preserves browser
+        // cache identity for callers that intend the framework
+        // endpoint default.
+        let sized = artwork_target_url_sized("mpd-album", "ABBA|21", None);
+        let sizeless = artwork_target_url("mpd-album", "ABBA|21");
+        assert_eq!(sized, sizeless);
+    }
+
+    #[test]
+    fn sized_url_empty_string_collapses_to_sizeless_form() {
+        // Empty / whitespace size hint is also a sizeless URL —
+        // avoids emitting `?size=` (which the endpoint would
+        // reject as invalid).
+        let empty = artwork_target_url_sized("mpd-album", "ABBA|21", Some(""));
+        let ws = artwork_target_url_sized("mpd-album", "ABBA|21", Some("  "));
+        let sizeless = artwork_target_url("mpd-album", "ABBA|21");
+        assert_eq!(empty, sizeless);
+        assert_eq!(ws, sizeless);
+    }
+
+    #[test]
+    fn sized_track_url_carries_size_on_mpd_album_branch() {
+        let url = artwork_target_url_for_track_sized(
+            "",
+            Some("ABBA"),
+            Some("21"),
+            Some("small"),
+        );
+        assert!(url.contains("scheme=mpd-album"));
+        assert!(url.contains("size=small"));
+    }
+
+    #[test]
+    fn sized_track_url_carries_size_on_mpd_path_branch() {
+        // No artist / album → falls back to mpd-path. The size
+        // hint travels the same.
+        let url = artwork_target_url_for_track_sized(
+            "loose/track.flac",
+            None,
+            None,
+            Some("original"),
+        );
+        assert!(url.contains("scheme=mpd-path"));
+        assert!(url.contains("size=original"));
+    }
+
+    #[test]
+    fn sized_track_url_none_matches_legacy_helper() {
+        // Regression guard: existing callers that pass no size
+        // hint get the exact same URL the pre-sized helper
+        // produced, so browser cache keys stay stable.
+        let sized = artwork_target_url_for_track_sized(
+            "",
+            Some("ABBA"),
+            Some("21"),
+            None,
+        );
+        let legacy = artwork_target_url_for_track("", Some("ABBA"), Some("21"));
+        assert_eq!(sized, legacy);
     }
 }
 
