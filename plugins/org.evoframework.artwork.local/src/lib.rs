@@ -151,6 +151,7 @@ struct LocalClearTarget {
 async fn handle_clear_cache(
     req: &Request,
     state_dir: Option<&std::path::Path>,
+    library_roots: &[std::path::PathBuf],
 ) -> Result<Response, PluginError> {
     let state_dir = match state_dir {
         Some(d) => d.to_path_buf(),
@@ -281,22 +282,115 @@ async fn handle_clear_cache(
                 Ok(Response::for_request(req, body))
             }
             "mpd-album" => {
+                // Best-effort per-album drop. The on-disk cache
+                // is per-track (embedded extracts keyed on the
+                // track's basename hash — see
+                // `cache_basename_for_track`), so an album-
+                // scoped drop resolves to "the set of per-track
+                // entries for tracks in this album's directory."
+                //
+                // Approach: find the album directory by
+                // walking library_roots for the first track
+                // whose `(artist, album)` tags match, take its
+                // parent directory, and drop the cache entry
+                // for every audio file at that directory's top
+                // level. Deterministic per-artist/album input;
+                // no MPD round trip needed.
+                //
+                // Note on the framework AssetCache: the resized
+                // WebP variants live under content-hash keys in
+                // the framework's asset cache. That cache is
+                // content-addressed and immutable — if the
+                // source bytes change (operator replaces
+                // folder.jpg), the next resolve produces a new
+                // hash and a new URL, and the browser fetches
+                // fresh bytes without any eviction step. If the
+                // source bytes did not change but the operator
+                // wants a re-cascade (e.g., online provider
+                // updated its data), the framework endpoint
+                // exposes `?refresh=1` on
+                // `GET /api/v1/audio/artwork?scheme=mpd-album&value=…&refresh=1`
+                // which evicts the negative memo and re-runs
+                // the cascade.
+                let parsed = evo_device_audio_shared::parse_mpd_album_value(
+                    &target.value,
+                );
+                let (artist, album) = match parsed {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        let body = serde_json::to_vec(&serde_json::json!({
+                            "v": 1,
+                            "status": "bad_request",
+                            "detail": format!(
+                                "artwork.local.clear_cache: invalid mpd-album value \
+                                 {value:?}; expected \"artist|album\"",
+                                value = target.value
+                            ),
+                        }))
+                        .map_err(|e| PluginError::Permanent(format!(
+                            "artwork.local.clear_cache error response JSON: {e}"
+                        )))?;
+                        return Ok(Response::for_request(req, body));
+                    }
+                };
+
+                let library_roots_for_thread = library_roots.to_vec();
+                let cache_dir_for_thread = cache_dir.clone();
+                let artist_for_thread = artist.clone();
+                let album_for_thread = album.clone();
+                let dropped: Result<
+                    (Option<std::path::PathBuf>, u64, u64),
+                    String,
+                > = tokio::task::spawn_blocking(move || {
+                    clear_album_cache_entries(
+                        &library_roots_for_thread,
+                        &cache_dir_for_thread,
+                        &artist_for_thread,
+                        &album_for_thread,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "artwork.local.clear_cache blocking join failed: {e}"
+                    ))
+                })?;
+                let (album_dir, cleared_bytes, cleared_files) =
+                    dropped.map_err(PluginError::Permanent)?;
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    scope = "targeted",
+                    target_scheme = %target.scheme,
+                    target_value = %target.value,
+                    album_dir = ?album_dir.as_ref().map(|p| p.display().to_string()),
+                    cleared_bytes,
+                    cleared_files,
+                    "artwork.local.clear_cache: targeted mpd-album drop (best-effort per-track scan of album directory)"
+                );
                 let body = serde_json::to_vec(&serde_json::json!({
                     "v": 1,
-                    "status": "bad_request",
-                    "detail": "artwork.local.clear_cache: scheme \"mpd-album\" not \
-                               supported by this plugin — the on-disk cache is a \
-                               per-track embedded-extract store, not a per-album \
-                               store. Album covers come from sidecar files on disk \
-                               (folder.jpg etc), which this plugin never persists a \
-                               copy of; nothing to drop at the album level. If the \
-                               operator intent is \"drop embedded extracts for every \
-                               track in this album\", iterate scheme=\"mpd-path\" per \
-                               track from the caller.",
+                    "status": "ok",
+                    "scope": "targeted",
+                    "target": {
+                        "scheme": target.scheme,
+                        "value": target.value,
+                        "album_dir": album_dir.as_ref().map(|p| p.display().to_string()),
+                    },
+                    "cleared_bytes": cleared_bytes,
+                    "cleared_files": cleared_files,
+                    "path": cache_dir.display().to_string(),
+                    "refresh_url_hint": format!(
+                        "GET /api/v1/audio/artwork?scheme=mpd-album&value={artist}|{album}&refresh=1 \
+                         evicts the framework endpoint's negative memo and re-runs the five-source cascade; \
+                         content-addressed bytes in the framework AssetCache are re-served only when the \
+                         source produces different bytes (new hash → new URL, natural browser cache miss)"
+                    ),
                 }))
-                .map_err(|e| PluginError::Permanent(format!(
-                    "artwork.local.clear_cache error response JSON: {e}"
-                )))?;
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "artwork.local.clear_cache response JSON: {e}"
+                    ))
+                })?;
                 Ok(Response::for_request(req, body))
             }
             other => {
@@ -305,7 +399,8 @@ async fn handle_clear_cache(
                     "status": "bad_request",
                     "detail": format!(
                         "artwork.local.clear_cache: unknown target.scheme {other:?}; \
-                         supported: \"mpd-path\" (value = MPD track path)"
+                         supported: \"mpd-path\" (value = MPD track path) or \
+                         \"mpd-album\" (value = \"Artist|Album\")"
                     ),
                 }))
                 .map_err(|e| PluginError::Permanent(format!(
@@ -365,6 +460,103 @@ fn drop_by_basename(
 /// absent `dir` is a no-op that returns `(0, 0)`. Errors
 /// bubble as `String` for the caller to wrap in
 /// `PluginError::Permanent`.
+/// Best-effort per-album cache eviction.
+///
+/// Walks `library_roots` looking for the first track whose
+/// `(artist, album)` tags match the supplied pair, uses its
+/// parent directory as the album directory, then drops the
+/// per-track cache entry (via [`drop_by_basename`]) for every
+/// audio file at that directory's top level. Returns
+/// `(album_dir, cleared_bytes, cleared_files)`. On no
+/// matching track the album directory is `None` and both
+/// counts are zero — the operator asked to drop artwork for
+/// an album the plugin has never seen, which is honest zero,
+/// not an error.
+///
+/// Subdirectory scan is intentionally shallow: multi-disc
+/// box-sets typically nest one level deep, and a shallow scan
+/// keeps the cost bounded for large libraries. Operators with
+/// deeply nested layouts can iterate `mpd-path` per track
+/// through the same verb for the same effect.
+fn clear_album_cache_entries(
+    library_roots: &[std::path::PathBuf],
+    cache_dir: &std::path::Path,
+    artist: &str,
+    album: &str,
+) -> Result<(Option<std::path::PathBuf>, u64, u64), String> {
+    let tag_walk_result = evo_device_audio_shared::first_matching_audio_path(
+        library_roots,
+        artist,
+        album,
+    );
+    let first_track = match tag_walk_result {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok((None, 0, 0)),
+        Err(e) => {
+            return Err(format!(
+                "artwork.local.clear_cache mpd-album tag-walk error: {e:?}"
+            ));
+        }
+    };
+    let Some(album_dir) =
+        first_track.parent().map(std::path::Path::to_path_buf)
+    else {
+        return Ok((None, 0, 0));
+    };
+    if !album_dir.is_dir() {
+        return Ok((Some(album_dir), 0, 0));
+    }
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
+    let entries = match std::fs::read_dir(&album_dir) {
+        Ok(it) => it,
+        Err(e) => {
+            return Err(format!("read_dir {}: {e}", album_dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!("read_dir entry in {}: {e}", album_dir.display())
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Filter for audio-file extensions the plugin's
+        // embedded extractor knows how to write cache
+        // entries for.
+        let is_audio = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase)
+            .is_some_and(|ext| {
+                matches!(
+                    ext.as_str(),
+                    "mp3"
+                        | "flac"
+                        | "m4a"
+                        | "ogg"
+                        | "opus"
+                        | "wav"
+                        | "aiff"
+                        | "aif"
+                        | "wma"
+                        | "alac"
+                        | "ape"
+                        | "mp4"
+                )
+            });
+        if !is_audio {
+            continue;
+        }
+        let basename = crate::embedded::cache_basename_for_track(&path);
+        let (bytes, files) = drop_by_basename(cache_dir, &basename)?;
+        total_bytes = total_bytes.saturating_add(bytes);
+        total_files = total_files.saturating_add(files);
+    }
+    Ok((Some(album_dir), total_bytes, total_files))
+}
+
 fn wipe_dir_reporting(dir: &std::path::Path) -> Result<(u64, u64), String> {
     if !dir.exists() {
         return Ok((0, 0));
@@ -587,8 +779,12 @@ impl Respondent for ArtworkLocalPlugin {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             if req.request_type == REQUEST_ARTWORK_LOCAL_CLEAR_CACHE {
-                return handle_clear_cache(req, self.state_dir.as_deref())
-                    .await;
+                return handle_clear_cache(
+                    req,
+                    self.state_dir.as_deref(),
+                    &self.config.library_roots,
+                )
+                .await;
             }
 
             if req.request_type != REQUEST_ARTWORK_RESOLVE {

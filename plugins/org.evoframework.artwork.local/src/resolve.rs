@@ -17,6 +17,16 @@ use crate::embedded;
 pub(crate) const SCHEME_MPD_PATH: &str = "mpd-path";
 /// `mpd-album` scheme: value is `Artist|Album` (see MPD warden).
 pub(crate) const SCHEME_MPD_ALBUM: &str = "mpd-album";
+/// `mpd-directory` scheme: value is an MPD-visible directory path
+/// (relative to a library root, or absolute on disk). The
+/// plugin scans the directory itself — not the parent — for a
+/// cover file matching the priority list, then falls back to
+/// any image extension. Used by the browse-library folder
+/// surface so operator-tagged folders render their sidecar
+/// cover in the folder view, not a generic folder icon. Does
+/// NOT walk subdirectories: the operator's per-folder cover is
+/// always at the same level as the folder they clicked.
+pub(crate) const SCHEME_MPD_DIRECTORY: &str = "mpd-directory";
 
 /// Priority-ordered cover-art filenames in **lowercase**. The
 /// directory walk lowercases each entry against this list, so
@@ -247,6 +257,16 @@ fn mime_for_path(p: &Path) -> Option<&'static str> {
 /// function is invoked.
 pub(crate) fn find_cover_beside_audio_file(mpd_file: &Path) -> Option<PathBuf> {
     let dir = mpd_file.parent()?;
+    find_cover_in_directory(dir)
+}
+
+/// Same priority-and-fallback walk as
+/// [`find_cover_beside_audio_file`] but takes the directory
+/// path directly rather than a track path. Used by the
+/// [`SCHEME_MPD_DIRECTORY`] resolve — the caller identifies a
+/// directory subject and the plugin returns the cover file
+/// (if any) at that directory's top level.
+pub(crate) fn find_cover_in_directory(dir: &Path) -> Option<PathBuf> {
     let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
         Ok(it) => it.filter_map(Result::ok).collect(),
         Err(_) => return None,
@@ -463,6 +483,9 @@ pub(crate) fn resolve_artwork(
         }
         SCHEME_MPD_PATH => {
             resolve_mpd_path(library_roots, state_dir, &req.target.value)?
+        }
+        SCHEME_MPD_DIRECTORY => {
+            resolve_mpd_directory(library_roots, &req.target.value)?
         }
         other => ArtworkResolveResponse {
             v: 1,
@@ -878,6 +901,137 @@ fn resolve_mpd_path(
     };
 
     resolve_cover_for_audio_file(state_dir, &track_path, None)
+}
+
+/// MIME inference from file extension for sidecar covers.
+/// The set matches the priority list (`.jpg` / `.jpeg` /
+/// `.png` / `.webp` / `.gif`); anything else falls back to
+/// `image/jpeg` — the framework transcode step re-encodes
+/// resized variants to WebP regardless, so a wrong MIME on
+/// the source only affects the pass-through case.
+fn mime_from_extension(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png".into(),
+        Some("webp") => "image/webp".into(),
+        Some("gif") => "image/gif".into(),
+        _ => "image/jpeg".into(),
+    }
+}
+
+/// Resolve MPD-visible directory string to an on-disk
+/// [`PathBuf`] if the directory exists. Symmetric with
+/// [`resolve_audio_path`] but for directories.
+fn resolve_directory_path(
+    library_roots: &[PathBuf],
+    value: &str,
+) -> Option<PathBuf> {
+    if value
+        .get(..7)
+        .map(|p| p.eq_ignore_ascii_case("http://"))
+        .unwrap_or(false)
+        || value
+            .get(..8)
+            .map(|p| p.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let p = Path::new(value);
+    if p.is_absolute() {
+        return p.is_dir().then(|| p.to_path_buf());
+    }
+    for root in library_roots {
+        let joined = root.join(value);
+        if joined.is_dir() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// Resolve the [`SCHEME_MPD_DIRECTORY`] scheme.
+///
+/// The caller identifies a directory subject (an MPD-visible
+/// path — library-relative or absolute); the plugin scans the
+/// directory itself (NOT subdirectories) for a sidecar cover
+/// file matching the priority list, then falls back to any
+/// image extension. Returns `NotFound` when the directory
+/// exists but carries no cover file; `BadRequest` when the
+/// path is empty or a URL; passes an unknown directory through
+/// as `NotFound` (symmetric with `mpd-path`).
+///
+/// Used by `library.browse_library` to emit a `cover_url` on
+/// directory entries — the operator's folder-browser view
+/// then renders folder art instead of a generic folder icon.
+fn resolve_mpd_directory(
+    library_roots: &[PathBuf],
+    value: &str,
+) -> Result<ArtworkResolveResponse, String> {
+    if value.is_empty() {
+        return Ok(ArtworkResolveResponse {
+            v: 1,
+            status: ResponseStatus::BadRequest,
+            path: None,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            identity: None,
+            detail: Some("empty mpd-directory value".to_string()),
+        });
+    }
+
+    let Some(dir_path) = resolve_directory_path(library_roots, value) else {
+        return Ok(ArtworkResolveResponse {
+            v: 1,
+            status: ResponseStatus::NotFound,
+            path: None,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            identity: None,
+            detail: Some(format!(
+                "directory not found for mpd-directory value {value:?}"
+            )),
+        });
+    };
+
+    match find_cover_in_directory(&dir_path) {
+        Some(cover) => {
+            let mime = mime_from_extension(&cover);
+            Ok(ArtworkResolveResponse {
+                v: 1,
+                status: ResponseStatus::Ok,
+                path: Some(cover.to_string_lossy().into_owned()),
+                content_hash: None,
+                mime: Some(mime),
+                size: None,
+                provider_id: Some("local_sidecar".into()),
+                identity: None,
+                detail: None,
+            })
+        }
+        None => Ok(ArtworkResolveResponse {
+            v: 1,
+            status: ResponseStatus::NotFound,
+            path: None,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            identity: None,
+            detail: Some(format!(
+                "no sidecar cover in directory {}",
+                dir_path.display()
+            )),
+        }),
+    }
 }
 
 #[cfg(test)]

@@ -824,14 +824,61 @@ fn handle_online_clear_cache(
                         .find_reconcile_fold_key_by_mbid(&target.value);
                     (key, "mbid_reverse_lookup")
                 }
+                "mpd-album" => {
+                    // Honest no-op. This plugin's LRUs are
+                    // ARTIST-keyed (reconcile + provider result)
+                    // — album covers pass through the online
+                    // cascade without persistence at this
+                    // plugin's layer. The framework endpoint's
+                    // NegativeCache (per `(scheme, value, size)`)
+                    // is the only album-scoped memoisation, and
+                    // it is invalidated by the endpoint's
+                    // `?refresh=1` query param on the resolve
+                    // URL — that is the canonical album refresh
+                    // path.
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        scope = "targeted",
+                        target_scheme = %target.scheme,
+                        target_value = %target.value,
+                        outcome = "no_op",
+                        reason = "no_album_scoped_cache_at_this_plugin",
+                        "artwork.online.clear_cache: mpd-album target is a no-op — \
+                         this plugin has no album-scoped cache; refresh via \
+                         `?refresh=1` on the framework artwork endpoint"
+                    );
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "v": 1,
+                        "status": "ok",
+                        "scope": "targeted",
+                        "target": {
+                            "scheme": target.scheme,
+                            "value": target.value,
+                        },
+                        "outcome": "no_op",
+                        "reason": "no_album_scoped_cache_at_this_plugin",
+                        "reconcile_entries_dropped": 0,
+                        "provider_entries_dropped": 0,
+                        "refresh_url_hint": format!(
+                            "GET /api/v1/audio/artwork?scheme=mpd-album&value={v}&refresh=1 \
+                             evicts the framework endpoint's negative memo for this album \
+                             and re-runs the five-source cascade (embedded → sidecar → \
+                             online → override → placeholder)",
+                            v = target.value
+                        ),
+                    }))
+                    .map_err(|e| PluginError::Permanent(format!(
+                        "artwork.online.clear_cache response JSON: {e}"
+                    )))?;
+                    return Ok(body);
+                }
                 other => {
                     let body = serde_json::to_vec(&serde_json::json!({
                         "v": 1,
                         "status": "bad_request",
                         "detail": format!(
                             "artwork.online.clear_cache: unknown target.scheme {other:?}; \
-                             supported: \"artist-name\" (value = raw display name) and \
-                             \"artist-mbid\" (value = MusicBrainz artist MBID)"
+                             supported: \"artist-name\", \"artist-mbid\", \"mpd-album\""
                         ),
                     }))
                     .map_err(|e| PluginError::Permanent(format!(

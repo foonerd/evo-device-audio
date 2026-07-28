@@ -1542,10 +1542,24 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
     match entry {
         MpdLibraryEntry::Directory { path, .. } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            // Folder-cover surface: emit a `cover_url` that the
+            // framework artwork endpoint resolves via
+            // `mpd-directory` — artwork.local scans this
+            // directory (top level only) for a sidecar cover
+            // and returns it. Operator-tagged folders now render
+            // their art in the folder browser instead of a
+            // generic folder icon. Request the `small` variant
+            // so tile-scale rows do not pull originals.
+            let cover_url = evo_device_audio_shared::artwork_target_url_sized(
+                "mpd-directory",
+                path,
+                Some("small"),
+            );
             json!({
-                "kind": "directory",
-                "name": name,
-                "uri":  path,
+                "kind":      "directory",
+                "name":      name,
+                "uri":       path,
+                "cover_url": cover_url,
             })
         }
         MpdLibraryEntry::Playlist { path, .. } => {
