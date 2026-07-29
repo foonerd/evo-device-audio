@@ -617,6 +617,11 @@ UCONF
         "$SYSTEMD_DROPIN_DIR/asound-dropin-write.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/asound-dropin-write.conf"
 
+    install -m 0644 -o root -g root \
+        "$DIST_DIR/systemd/evo.service.d/shutdown-ordering.conf" \
+        "$SYSTEMD_DROPIN_DIR/shutdown-ordering.conf"
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/shutdown-ordering.conf"
+
     "$SYSTEMCTL_BIN" daemon-reload
     echo "[bootstrap] systemctl daemon-reload"
 

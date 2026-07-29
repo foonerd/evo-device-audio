@@ -446,21 +446,85 @@ impl Plugin for AudioTerminusPlugin {
         async move {
             tracing::info!(plugin = PLUGIN_NAME, "plugin unload beginning");
 
+            // Each `handle.await` below joins a `spawn_blocking`
+            // thread that ran an ALSA capture loop, a
+            // transport-gate subscriber, or a local-role
+            // subscriber. Under KillMode=mixed, the plugin
+            // subprocess stays alive until the steward's
+            // wire-Unload arrives — at which point this future
+            // runs and MUST return within the framework's
+            // shutdown budget (10s default global_deadline in
+            // `admission::ShutdownConfig`) or the steward
+            // SIGKILLs the child, producing a zero-fail-in-logs
+            // violation.
+            //
+            // A blocking-thread task that is mid-syscall (e.g.
+            // `snd_pcm_readi` waiting for the next PCM period)
+            // does not unwind on `shutdown.notify_waiters()` —
+            // the shutdown Notify only wakes the async
+            // `handle.block_on(select! { shutdown | ... })`
+            // arms, and libc syscalls are not part of the tokio
+            // scheduler.
+            //
+            // Bounding each join with `tokio::time::timeout`
+            // caps unload wall-time regardless of how deep the
+            // hang is. On timeout we log at info (this is a
+            // normal-under-real-hardware lifecycle event, not
+            // an anomaly), abandon the JoinHandle, and continue.
+            // The tokio runtime tears down at process exit; the
+            // OS reaps any orphaned blocking threads. The
+            // framework's wire-close (fired after this future
+            // returns Ok) still causes the plugin's dispatch
+            // loop to break on EOF, so the process exits
+            // cleanly under the systemd unit's TimeoutStopSec
+            // budget.
             #[cfg(feature = "alsa-substrate")]
             {
+                const JOIN_BUDGET: std::time::Duration =
+                    std::time::Duration::from_secs(3);
                 if let Some(shutdown) = self.capture_shutdown.take() {
                     shutdown.notify_waiters();
                 }
                 if let Some(handle) = self.capture_task.take() {
-                    let _ = handle.await;
+                    if tokio::time::timeout(JOIN_BUDGET, handle).await.is_err()
+                    {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            join_budget_ms = JOIN_BUDGET.as_millis() as u64,
+                            task = "capture",
+                            "capture task join budget elapsed; abandoning \
+                             blocking thread (runtime tears down at process \
+                             exit; OS reaps)"
+                        );
+                    }
                 }
                 if let Some(sub) = self.transport_gate_subscriber.take() {
                     sub.shutdown.notify_waiters();
-                    let _ = sub.task.await;
+                    if tokio::time::timeout(JOIN_BUDGET, sub.task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            join_budget_ms = JOIN_BUDGET.as_millis() as u64,
+                            task = "transport_gate_subscriber",
+                            "subscriber join budget elapsed; abandoning"
+                        );
+                    }
                 }
                 if let Some(sub) = self.local_role_subscriber.take() {
                     sub.shutdown.notify_waiters();
-                    let _ = sub.task.await;
+                    if tokio::time::timeout(JOIN_BUDGET, sub.task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            join_budget_ms = JOIN_BUDGET.as_millis() as u64,
+                            task = "local_role_subscriber",
+                            "subscriber join budget elapsed; abandoning"
+                        );
+                    }
                 }
             }
 

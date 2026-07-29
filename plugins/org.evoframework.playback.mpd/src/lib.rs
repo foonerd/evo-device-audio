@@ -2446,68 +2446,111 @@ impl Plugin for MpdPlaybackPlugin {
                 "plugin unload; draining active custodies"
             );
 
-            // Drain and shut down each supervisor in sequence.
-            let custodies = std::mem::take(&mut self.custodies);
-            for (id, tracked) in custodies {
-                tracing::debug!(
+            // The full unload sequence walks through nine
+            // asynchronous subsystem-stop steps (custody
+            // supervisors, reactor, worker, subscribers,
+            // watchers, shelf integration). Any single
+            // `.shutdown().await` / `.stop().await` on a
+            // subsystem whose internal task is mid-MPD-round-
+            // trip can stall long enough to trip the
+            // framework's global shutdown deadline (10s in
+            // `admission::ShutdownConfig::default()`), which
+            // then SIGKILLs the plugin child and prints a
+            // fail-class WARN pair.
+            //
+            // Prior art: bound the graceful-shutdown budget.
+            // Below the budget, subsystems shut down in the
+            // order the comments describe (fragment worker
+            // before reactor to avoid the closed-channel
+            // race, envelope subscriber after the two so
+            // in-flight dispatches complete, etc.). Above
+            // the budget, we abandon whatever is still
+            // running — the plugin subprocess then exits on
+            // wire-close and the tokio runtime aborts every
+            // orphaned task at drop; the OS reaps any
+            // blocking-thread threads.
+            const UNLOAD_BUDGET: std::time::Duration =
+                std::time::Duration::from_secs(5);
+
+            let sequence = async {
+                // Drain and shut down each supervisor in sequence.
+                let custodies = std::mem::take(&mut self.custodies);
+                for (id, tracked) in custodies {
+                    tracing::debug!(
+                        plugin = PLUGIN_NAME,
+                        handle = %id,
+                        custody_type = %tracked.custody_type,
+                        "shutting down supervisor during unload"
+                    );
+                    tracked.supervisor.shutdown().await;
+                }
+
+                // Stop the fragment-writer worker first — it
+                // subscribes to the reactor's snapshot channel,
+                // so tearing the reactor down before the worker
+                // would race the worker against a closed
+                // channel. Then stop the reactor (which also
+                // clears the framework-held callback). Finally
+                // release the routing handle.
+                self.stop_capabilities_watcher().await;
+                self.stop_fragment_worker().await;
+                self.stop_reactor().await;
+                // Stop the envelope subscriber AFTER the fragment
+                // worker + reactor so any in-flight pause /
+                // resume dispatch completes against a still-live
+                // supervisor before unload tears the custody
+                // down.
+                if let Some(handle) = self.envelope_subscriber.take() {
+                    handle.stop().await;
+                }
+                // Stop the ambient now-playing observer.
+                // Independent of any custody supervisor; safe
+                // to stop any time after the custodies drain
+                // above.
+                if let Some(handle) = self.ambient_observer.take() {
+                    handle.stop().await;
+                }
+                // Stop the startup-volume applier if it is
+                // still waiting for options settings or in
+                // its retry loop. On the happy path the
+                // applier has already exited (successful
+                // `setvol`); the take + stop is a no-op when
+                // the join handle is completed.
+                if let Some(handle) = self.startup_volume_applier.take() {
+                    handle.stop().await;
+                }
+                // Stop the asound watcher last. The
+                // supervisor's command sender may still be
+                // live for a few more microseconds at this
+                // point; the watcher's background-task drain
+                // races a CycleOutput dispatch at worst, and
+                // a Shutdown reply is the observed outcome
+                // that path is designed for.
+                if let Some(handle) = self.asound_watcher.take() {
+                    handle.stop().await;
+                }
+                // Tear down the shelf integration last. Stops
+                // the sticker reconciler and persists the
+                // source registry so the next load rehydrates
+                // state without operator effort.
+                if let Some(shelves) = self.shelves.take() {
+                    shelves.shutdown().await;
+                }
+            };
+
+            if tokio::time::timeout(UNLOAD_BUDGET, sequence).await.is_err() {
+                tracing::info!(
                     plugin = PLUGIN_NAME,
-                    handle = %id,
-                    custody_type = %tracked.custody_type,
-                    "shutting down supervisor during unload"
+                    unload_budget_ms = UNLOAD_BUDGET.as_millis() as u64,
+                    "unload sequence budget elapsed; abandoning remaining \
+                     shutdown steps (runtime tears down at process exit; \
+                     the wire-close EOF from the framework still drives \
+                     the dispatch loop to break, so the process exits \
+                     under the systemd unit's TimeoutStopSec budget)"
                 );
-                tracked.supervisor.shutdown().await;
             }
 
-            // Stop the fragment-writer worker first — it
-            // subscribes to the reactor's snapshot channel,
-            // so tearing the reactor down before the worker
-            // would race the worker against a closed
-            // channel. Then stop the reactor (which also
-            // clears the framework-held callback). Finally
-            // release the routing handle.
-            self.stop_capabilities_watcher().await;
-            self.stop_fragment_worker().await;
-            self.stop_reactor().await;
-            // Stop the envelope subscriber AFTER the fragment
-            // worker + reactor so any in-flight pause /
-            // resume dispatch completes against a still-live
-            // supervisor before unload tears the custody
-            // down.
-            if let Some(handle) = self.envelope_subscriber.take() {
-                handle.stop().await;
-            }
-            // Stop the ambient now-playing observer. Independent
-            // of any custody supervisor; safe to stop any time
-            // after the custodies drain above.
-            if let Some(handle) = self.ambient_observer.take() {
-                handle.stop().await;
-            }
-            // Stop the startup-volume applier if it is still
-            // waiting for options settings or in its retry
-            // loop. On the happy path the applier has already
-            // exited (successful `setvol`); the take + stop
-            // is a no-op when the join handle is completed.
-            if let Some(handle) = self.startup_volume_applier.take() {
-                handle.stop().await;
-            }
-            // Stop the asound watcher last. The supervisor's
-            // command sender may still be live for a few more
-            // microseconds at this point; the watcher's
-            // background-task drain races a CycleOutput
-            // dispatch at worst, and a Shutdown reply is the
-            // observed outcome that path is designed for.
-            if let Some(handle) = self.asound_watcher.take() {
-                handle.stop().await;
-            }
-            // Tear down the shelf integration last. Stops the
-            // sticker reconciler and persists the source
-            // registry so the next load rehydrates state
-            // without operator effort.
-            if let Some(shelves) = self.shelves.take() {
-                shelves.shutdown().await;
-            }
             self.audio_routing = None;
-
             self.loaded = false;
             Ok(())
         }
