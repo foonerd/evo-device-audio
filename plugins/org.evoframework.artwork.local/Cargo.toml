@@ -23,6 +23,13 @@ path = "src/bin/artwork-local-wire.rs"
 anyhow = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { workspace = true }
+# MPD's own tag index for the mpd-album resolve fast path —
+# `find album <album> artist <artist>` returns matching files
+# through MPD's O(index) lookup instead of the O(library) tag
+# walk the local fallback uses. Cold browse over a large
+# library is bounded by MPD find latency (single-digit ms per
+# tile) regardless of track count.
+evo-mpd-shared = { workspace = true }
 lofty = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }

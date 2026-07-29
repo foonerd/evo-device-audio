@@ -7,11 +7,137 @@
 //! `org.evoframework.playback.mpd` (`mpd-path`, `mpd-album`).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::embedded;
+
+/// Localhost MPD endpoint used by the [`try_mpd_index_hint`]
+/// fast path. Every audio-reference rig runs MPD on the
+/// canonical localhost port; a vendor distribution that runs
+/// MPD elsewhere still falls through to the tag-walk cascade,
+/// so this constant is a fast-path optimisation, not a hard
+/// contract.
+const MPD_HOST: &str = "127.0.0.1";
+const MPD_PORT: u16 = 6600;
+
+/// Wall-clock budget for the MPD-index fast path (connect +
+/// `find` round trip + first-result path translation). A
+/// slow / hung MPD must NOT block a browse tile; on timeout
+/// we fall through to the tag-walk cascade below.
+const MPD_INDEX_HINT_BUDGET: Duration = Duration::from_millis(500);
+
+/// Ask MPD for the first file matching `(album == album,
+/// artist == artist)` and return its confined-to-library-root
+/// absolute path.
+///
+/// This is the mpd-album fast path — MPD's own tag index makes
+/// the lookup O(matching_tracks) with an indexed-lookup
+/// constant factor, replacing the tag-walk fallback's
+/// O(library) worst case. On a library too large for the
+/// legacy tag-walk to complete inside the operator's browse
+/// budget (see `MAX_MPD_ALBUM_SCAN_CANDIDATES = 100_000`),
+/// this path is the only one that keeps browse-artwork
+/// resolution flat.
+///
+/// Returns `None` on any of: MPD unreachable, connect / query
+/// exceeds [`MPD_INDEX_HINT_BUDGET`], zero matches, or the
+/// returned relative path cannot be confined to a library
+/// root. Every `None` outcome cascades to the existing tag-
+/// walk in [`resolve_mpd_album`]; the fast path never
+/// changes the 404 semantics, only the cost of the common
+/// case.
+fn try_mpd_index_hint(
+    artist: &str,
+    album: &str,
+    library_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    use evo_mpd_shared::{
+        MpdConnection, MpdEndpoint, MpdLibraryEntry, MpdSearchField,
+    };
+
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let endpoint = MpdEndpoint::tcp(MPD_HOST, MPD_PORT).ok()?;
+    let artist_owned = artist.to_string();
+    let album_owned = album.to_string();
+    // Try `albumartist` first — the canonical tag for an
+    // album-scoped lookup; MPD does not silently fall back to
+    // `artist` when `albumartist` is unset (verified on rig by
+    // observing that a library with only `Artist` set misses
+    // `find album X albumartist Y`). On the miss we retry with
+    // `artist` so libraries that carry the shared value on the
+    // `artist` tag alone still hit the fast path.
+    let entries = handle
+        .block_on(async {
+            tokio::time::timeout(MPD_INDEX_HINT_BUDGET, async {
+                let mut conn = MpdConnection::connect(endpoint).await.ok()?;
+                let by_album_artist = conn
+                    .find_multi(&[
+                        (MpdSearchField::Album, album_owned.as_str()),
+                        (MpdSearchField::AlbumArtist, artist_owned.as_str()),
+                    ])
+                    .await
+                    .ok()?;
+                if !by_album_artist.is_empty() {
+                    return Some(by_album_artist);
+                }
+                conn.find_multi(&[
+                    (MpdSearchField::Album, album_owned.as_str()),
+                    (MpdSearchField::Artist, artist_owned.as_str()),
+                ])
+                .await
+                .ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default();
+    for entry in entries {
+        let MpdLibraryEntry::File { path, .. } = entry else {
+            continue;
+        };
+        if let Some(abs) = confine_mpd_path_to_roots(&path, library_roots) {
+            return Some(abs);
+        }
+    }
+    None
+}
+
+/// Translate an MPD-relative file path (rooted at MPD's
+/// `music_directory`) to an absolute filesystem path confined
+/// to one of the plugin's `library_roots`. Refuses paths that
+/// canonicalise outside every root (defence against a
+/// misconfigured MPD `music_directory` that points at a
+/// different tree than the plugin's library roots).
+fn confine_mpd_path_to_roots(
+    mpd_path: &str,
+    library_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let canonical_roots: Vec<PathBuf> = library_roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    if canonical_roots.is_empty() {
+        return None;
+    }
+    for root in &canonical_roots {
+        let joined = root.join(mpd_path);
+        let canonical = std::fs::canonicalize(&joined).ok()?;
+        if !canonical.is_file() {
+            continue;
+        }
+        if canonical_roots
+            .iter()
+            .any(|r| canonical == *r || canonical.starts_with(r))
+        {
+            return Some(canonical);
+        }
+    }
+    None
+}
 
 /// `mpd-path` scheme: value is MPD's `file` (library-relative or absolute).
 pub(crate) const SCHEME_MPD_PATH: &str = "mpd-path";
@@ -608,6 +734,47 @@ fn resolve_mpd_album(
             });
             }
         };
+    // Fast path: MPD's own tag index. `find album <album>
+    // artist <artist>` returns matching files through MPD's
+    // in-memory index — O(matching_tracks) with an
+    // ~indexed-lookup constant factor rather than the tag-walk
+    // fallback's O(library) worst case. On a large library the
+    // cold browse cost drops from hundreds of file `read_from_
+    // path` reads per tile to a single-digit-ms MPD round trip.
+    //
+    // Falls through to the tag-walk cascade if MPD is
+    // unreachable, the query times out, the file returned
+    // cannot be confined to a library root (e.g., MPD
+    // music_directory diverged from the plugin's library
+    // roots), or the query returns no matches — the fallback
+    // preserves the original operator-facing guarantee that a
+    // 404 is legitimate only when every strategy genuinely has
+    // nothing.
+    if let Some(hinted) = try_mpd_index_hint(&artist, &album, library_roots) {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            resolved_via = "mpd_index",
+            artist = %artist,
+            album = %album,
+            file = %hinted.display(),
+            "mpd-album fast path via MPD index"
+        );
+        return resolve_cover_for_audio_file(
+            state_dir,
+            &hinted,
+            Some(Identity {
+                artist: artist.clone(),
+                album: album.clone(),
+            }),
+        );
+    }
+    tracing::info!(
+        plugin = crate::PLUGIN_NAME,
+        resolved_via = "tag_walk_fallback",
+        artist = %artist,
+        album = %album,
+        "mpd-album MPD-index miss; cascading to tag-walk"
+    );
     // Cascade — the operator memo mandates that a 404 is
     // legitimate ONLY when every strategy on every source
     // genuinely has nothing:

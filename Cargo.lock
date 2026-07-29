@@ -3576,6 +3576,7 @@ dependencies = [
  "anyhow",
  "base64",
  "evo-device-audio-shared",
+ "evo-mpd-shared",
  "evo-plugin-sdk",
  "lofty",
  "semver",

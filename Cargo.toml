@@ -58,6 +58,7 @@ repository = "https://github.com/foonerd/evo-device-audio"
 [workspace.dependencies]
 evo-plugin-sdk = { path = "../evo-core-eng/crates/evo-plugin-sdk" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
+evo-mpd-shared = { path = "crates/evo-mpd-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 # `futures` gives the plugins `future::join_all` for parallel-
