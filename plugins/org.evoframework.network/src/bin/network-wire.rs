@@ -6,28 +6,31 @@
 #![warn(missing_docs)]
 
 use anyhow::{anyhow, Result};
-use evo_plugin_sdk::host::{run_oop, HostConfig};
+use evo_plugin_sdk::host::{run_oop_and_exit, HostConfig};
 use org_evoframework_network::{NetworkPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> ! {
     init_logging();
-    let socket_path = parse_args()?;
+    let socket_path = match parse_args() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("network-wire: {e}");
+            std::process::exit(2);
+        }
+    };
     tracing::info!(
         plugin = PLUGIN_NAME,
         socket = %socket_path.display(),
         "network-wire starting"
     );
-    run_oop(
+    run_oop_and_exit(
         NetworkPlugin::new(),
         HostConfig::new(PLUGIN_NAME),
         &socket_path,
+        "network-wire",
     )
-    .await?;
-    tracing::info!("network-wire: steward disconnected, exiting");
-    Ok(())
 }
 
 fn init_logging() {

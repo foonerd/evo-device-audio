@@ -38,16 +38,21 @@
 #![warn(missing_docs)]
 
 use anyhow::{anyhow, Result};
-use evo_plugin_sdk::host::{run_oop, HostConfig};
+use evo_plugin_sdk::host::{run_oop_and_exit, HostConfig};
 use org_evoframework_metadata_local::{MetadataLocalPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> ! {
     init_logging();
 
-    let socket_path = parse_args()?;
+    let socket_path = match parse_args() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("metadata-local-wire: {e}");
+            std::process::exit(2);
+        }
+    };
     tracing::info!(
         socket = %socket_path.display(),
         plugin = PLUGIN_NAME,
@@ -56,9 +61,7 @@ async fn main() -> Result<()> {
 
     let plugin = MetadataLocalPlugin::new();
     let config = HostConfig::new(PLUGIN_NAME);
-    run_oop(plugin, config, &socket_path).await?;
-    tracing::info!("metadata-local-wire: steward disconnected, exiting");
-    Ok(())
+    run_oop_and_exit(plugin, config, &socket_path, "metadata-local-wire")
 }
 
 fn init_logging() {
