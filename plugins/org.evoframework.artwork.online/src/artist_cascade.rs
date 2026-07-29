@@ -800,6 +800,409 @@ pub(crate) async fn query_artist_artwork(
     }
 }
 
+/// Deezer CDN host token used to identify URLs whose bytes
+/// MUST NOT be cached durably by this device per Deezer's
+/// terms of service (live-fetch invariant, mirrored
+/// structurally by [`evo_online_providers::deezer::ArtistImageHit`]'s
+/// missing `Serialize`). Any winning image URL whose host
+/// matches this token is refused at the byte-caching path;
+/// the endpoint returns `not_found` on the artist scheme,
+/// which drives the source-walk to the next cacheable
+/// provider on the next resolve if one is available, and
+/// stays honest (no ToS-violating byte copy on disk) if
+/// Deezer was the only source.
+const DEEZER_CDN_HOST_TOKEN: &str = "dzcdn.net";
+
+/// Wire request for the endpoint-facing artist byte-resolve
+/// path — mirrors the shape the framework's `artwork.resolve`
+/// / `artwork.resolve_online` dispatch already uses so the
+/// runtime's cascade dispatcher can treat this verb like any
+/// other artwork resolve leg.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ResolveArtistBytesRequest {
+    #[allow(dead_code)]
+    #[serde(default = "one")]
+    v: u8,
+    target: ResolveArtistBytesTarget,
+    #[serde(default)]
+    size: Option<String>,
+}
+
+fn one() -> u8 {
+    1
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ResolveArtistBytesTarget {
+    scheme: String,
+    value: String,
+}
+
+/// Wire response for the endpoint-facing artist byte-resolve
+/// path — MIRROR of [`crate::resolve::ResolveOnlineResponse`]
+/// so the framework endpoint's response peeler works for both
+/// verbs without a scheme-specific decoder.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ResolveArtistBytesResponse {
+    v: u8,
+    status: crate::resolve::ResponseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// Output of [`resolve_artist_bytes_to_hash`] — carries the
+/// wire response plus an optional `(content_hash, bytes)` pair
+/// for the plugin to push into the framework's AssetCache
+/// asynchronously (mirrors [`crate::resolve::ResolveOutput`]).
+pub(crate) struct ResolveArtistBytesOutput {
+    pub(crate) response: ResolveArtistBytesResponse,
+    pub(crate) cache_payload: Option<(String, Vec<u8>)>,
+}
+
+impl ResolveArtistBytesResponse {
+    pub(crate) fn json_bytes(self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self)
+    }
+}
+
+fn artist_bytes_bad_request(detail: &str) -> ResolveArtistBytesOutput {
+    ResolveArtistBytesOutput {
+        response: ResolveArtistBytesResponse {
+            v: 1,
+            status: crate::resolve::ResponseStatus::BadRequest,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            detail: Some(detail.to_string()),
+        },
+        cache_payload: None,
+    }
+}
+
+fn artist_bytes_not_found(
+    detail: String,
+    provider_id: Option<String>,
+) -> ResolveArtistBytesOutput {
+    ResolveArtistBytesOutput {
+        response: ResolveArtistBytesResponse {
+            v: 1,
+            status: crate::resolve::ResponseStatus::NotFound,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id,
+            detail: Some(detail),
+        },
+        cache_payload: None,
+    }
+}
+
+fn artist_bytes_unavailable(
+    detail: String,
+    provider_id: Option<String>,
+) -> ResolveArtistBytesOutput {
+    ResolveArtistBytesOutput {
+        response: ResolveArtistBytesResponse {
+            v: 1,
+            status: crate::resolve::ResponseStatus::Unavailable,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id,
+            detail: Some(detail),
+        },
+        cache_payload: None,
+    }
+}
+
+/// Byte-cached artist-portrait resolve path.
+///
+/// This is the framework-endpoint-facing counterpart to the
+/// UI-facing [`query_artist_artwork`] verb: it runs the same
+/// cascade, but instead of returning the raw external CDN URL
+/// on the wire it FETCHES the winning provider's image bytes,
+/// transcodes them to WebP at the requested size (small /
+/// medium / large / original), and returns a
+/// `(content_hash, mime, size, provider_id)` shape identical to
+/// [`crate::resolve::ResolveOnlineResponse`] so the framework's
+/// artwork endpoint can 302-redirect to
+/// `/api/v1/audio/artwork/{content_hash}` — same local serve
+/// path album covers already use.
+///
+/// ## Deezer live-fetch invariant
+///
+/// Deezer's terms of service prohibit persisting image bytes.
+/// The plugin's byte-cache path refuses any winning URL whose
+/// host matches [`DEEZER_CDN_HOST_TOKEN`] — the response
+/// becomes `not_found` (with the Deezer `provider_id` echoed
+/// for observability), so the endpoint surfaces a 404 rather
+/// than storing ToS-restricted bytes locally. Deezer remains
+/// available to callers of [`query_artist_artwork`] over the
+/// WebSocket verb (which returns URLs, not bytes) — this
+/// carve-out only applies to the durable local pipeline.
+///
+/// The rig proof (2026-07-28) shows fanart_tv wins for the
+/// overwhelming majority of artists with a fanart photo, so
+/// this Deezer-refusal leaves the fleet portrait coverage
+/// essentially unchanged in practice.
+pub(crate) async fn resolve_artist_bytes_to_hash(
+    payload: &[u8],
+    catalogue: &ArtistCatalogue,
+    http: &reqwest::Client,
+) -> ResolveArtistBytesOutput {
+    if payload.is_empty() {
+        return artist_bytes_bad_request("empty payload");
+    }
+    let text = match std::str::from_utf8(payload) {
+        Ok(t) => t,
+        Err(e) => {
+            return artist_bytes_bad_request(&format!(
+                "payload is not UTF-8: {e}"
+            ));
+        }
+    };
+    let req: ResolveArtistBytesRequest = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => {
+            return artist_bytes_bad_request(&format!("invalid JSON: {e}"));
+        }
+    };
+    let size_str = req.size.as_deref().unwrap_or("original");
+    let size = match evo_device_audio_shared::transcode::ArtworkSize::parse(
+        size_str,
+    ) {
+        Some(s) => s,
+        None => {
+            return artist_bytes_bad_request(&format!(
+                "unknown size: {size_str} (expected small | medium | large | original; \
+                 `tiny` accepted as alias for `small`)"
+            ));
+        }
+    };
+
+    // Translate the endpoint's target shape into
+    // [`ArtistArtworkRequest`]. Two schemes:
+    //
+    // - `artist-name` — value = raw display name; MBID is
+    //   discovered via the cascade's MB reconcile leg.
+    // - `artist-mbid` — value = MusicBrainz artist MBID; the
+    //   cascade uses the caller-supplied MBID directly and
+    //   skips the MB search step (see the caller-supplied
+    //   MBID branch in the cascade). We pass the MBID as the
+    //   artist name too so the cascade has a non-empty name
+    //   to key MBID-blind providers; the MBID-bearing
+    //   providers (fanart, theaudiodb) use the MBID field
+    //   directly.
+    let artist_req_json = match req.target.scheme.as_str() {
+        "artist-name" => {
+            serde_json::json!({
+                "v": 1,
+                "artist": req.target.value,
+            })
+        }
+        "artist-mbid" => {
+            serde_json::json!({
+                "v": 1,
+                "artist": req.target.value.clone(),
+                "artist_mbid": req.target.value,
+            })
+        }
+        other => {
+            return artist_bytes_bad_request(&format!(
+                "unsupported target.scheme {other:?}; \
+                 supported: \"artist-name\", \"artist-mbid\""
+            ));
+        }
+    };
+    let artist_req_bytes = artist_req_json.to_string().into_bytes();
+
+    // Run the cascade — this returns the winning provider's
+    // URL alongside `provider_id`.
+    let cascade_response =
+        match query_artist_artwork(&artist_req_bytes, catalogue).await {
+            Ok(r) => r,
+            Err(e) => {
+                return artist_bytes_unavailable(
+                    format!("artist cascade failed: {e}"),
+                    None,
+                );
+            }
+        };
+
+    // Translate the cascade's status into the endpoint-facing
+    // response shape.
+    match cascade_response.status {
+        CascadeStatus::Ok => {}
+        CascadeStatus::NotFound => {
+            return artist_bytes_not_found(
+                cascade_response
+                    .detail
+                    .unwrap_or_else(|| "artist not resolved".into()),
+                cascade_response.provider_id,
+            );
+        }
+        CascadeStatus::Unavailable => {
+            return artist_bytes_unavailable(
+                cascade_response.detail.unwrap_or_else(|| {
+                    "artist cascade transient upstream failure".into()
+                }),
+                cascade_response.provider_id,
+            );
+        }
+        CascadeStatus::NotConfigured => {
+            return artist_bytes_not_found(
+                cascade_response.detail.unwrap_or_else(|| {
+                    "artist cascade not configured on this device".into()
+                }),
+                cascade_response.provider_id,
+            );
+        }
+        CascadeStatus::BadRequest => {
+            return artist_bytes_bad_request(
+                &cascade_response.detail.unwrap_or_else(|| {
+                    "artist cascade rejected the request".into()
+                }),
+            );
+        }
+    }
+
+    let Some(image_url) = cascade_response.image_url else {
+        return artist_bytes_not_found(
+            "cascade returned Ok but no image_url".into(),
+            cascade_response.provider_id,
+        );
+    };
+    let provider_id = cascade_response.provider_id.clone();
+
+    // Deezer live-fetch invariant — refuse to persist bytes
+    // whose host matches Deezer's CDN. The check is on the
+    // URL host, not the provider_id, so a Volumio meta source
+    // that proxies a Deezer URL is caught too.
+    if image_url_host_is_deezer(&image_url) {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = ?provider_id,
+            image_url = %image_url,
+            outcome = "not_found",
+            reason = "deezer_live_fetch_only",
+            "artist byte-cache path refuses Deezer-CDN bytes (ToS live-fetch invariant); \
+             endpoint surfaces 404 rather than caching a copy locally"
+        );
+        return artist_bytes_not_found(
+            format!(
+                "winning provider is Deezer-hosted \
+                 ({image_url}); the endpoint's byte-cache \
+                 path refuses Deezer bytes per its ToS \
+                 live-fetch invariant"
+            ),
+            provider_id,
+        );
+    }
+
+    // Fetch the bytes.
+    let (bytes, source_mime) = match fetch_image_bytes(http, &image_url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return artist_bytes_unavailable(
+                format!("artist image download failed for {image_url}: {e}"),
+                provider_id,
+            );
+        }
+    };
+
+    // Transcode via the shared pipeline.
+    let evo_device_audio_shared::transcode::TranscodedArtwork {
+        bytes: transcoded_bytes,
+        content_hash,
+        mime,
+    } = match evo_device_audio_shared::transcode::transcode(
+        bytes,
+        &source_mime,
+        size,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = ?provider_id,
+                error = %e,
+                "artist byte-cache transcode failed; surfacing as unavailable (not cacheable)"
+            );
+            return artist_bytes_unavailable(
+                format!(
+                    "transcode of {source_mime} bytes from artist provider {provider_id:?} \
+                     failed: {e}"
+                ),
+                provider_id,
+            );
+        }
+    };
+
+    ResolveArtistBytesOutput {
+        response: ResolveArtistBytesResponse {
+            v: 1,
+            status: crate::resolve::ResponseStatus::Ok,
+            content_hash: Some(content_hash.clone()),
+            mime: Some(mime),
+            size: Some(size.as_str().to_string()),
+            provider_id,
+            detail: None,
+        },
+        cache_payload: Some((content_hash, transcoded_bytes)),
+    }
+}
+
+fn image_url_host_is_deezer(url: &str) -> bool {
+    // Parse enough of the URL to grab the host portion. Cheap
+    // string split — no full URL parser needed for the ToS
+    // check.
+    let rest = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => url,
+    };
+    let host_and_rest = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
+    let host = host_and_rest
+        .split_once('?')
+        .map(|(h, _)| h)
+        .unwrap_or(host_and_rest);
+    host.to_ascii_lowercase().contains(DEEZER_CDN_HOST_TOKEN)
+}
+
+async fn fetch_image_bytes(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP GET failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP status={}", resp.status().as_u16()));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("body read failed: {e}"))?
+        .to_vec();
+    Ok((bytes, mime))
+}
+
 /// Body of the cascade — the parsed request has been split
 /// into `(artist, fold_key, caller_supplied_mbid, can_cache)`
 /// and this function performs the actual reconcile + provider

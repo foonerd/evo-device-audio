@@ -1210,8 +1210,29 @@ fn render_facet_entry(
                     "payload":      { "v": 1, "artist": trimmed },
                 }))
             };
+            // Byte-cached endpoint URL for the artist portrait
+            // — routes through the framework artwork endpoint's
+            // `artist-name` scheme, which dispatches to
+            // `artwork.resolve_artist_online` for a
+            // fetch + transcode + AssetCache push, then
+            // 302-redirects to `/api/v1/audio/artwork/<hash>`.
+            // The glass renders this URL as a plain `<img src>`;
+            // subsequent renders serve from the local device with
+            // no external CDN hop. `artwork_lookup` remains for
+            // consumers that want the raw external URL (Deezer
+            // live-fetch fallback, operator debug surface).
+            let cover_url = if trimmed.is_empty() {
+                None
+            } else {
+                Some(evo_device_audio_shared::artwork_target_url_sized(
+                    "artist-name",
+                    trimmed,
+                    Some("small"),
+                ))
+            };
             json!({
                 "artist":         value,
+                "cover_url":      cover_url,
                 "artwork_lookup": artwork_lookup,
             })
         }

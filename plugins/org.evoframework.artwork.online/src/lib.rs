@@ -113,6 +113,29 @@ const REQUEST_ARTWORK_RESOLVE_ONLINE: &str = "artwork.resolve_online";
 const REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK: &str =
     "artwork.resolve_artist_artwork";
 
+/// Byte-cached artist-portrait verb (endpoint-facing).
+///
+/// Mirrors [`REQUEST_ARTWORK_RESOLVE_ONLINE`] but for artist
+/// portraits: accepts the endpoint's canonical
+/// `{v, target: {scheme, value}, size}` shape where `scheme`
+/// is `artist-name` or `artist-mbid`, runs the artist cascade
+/// exactly like `artwork.resolve_artist_artwork` does, and
+/// then FETCHES the winning provider's image bytes, transcodes
+/// them to WebP at the requested size, and returns a
+/// `content_hash` the plugin has already pushed into the
+/// framework's AssetCache. The framework endpoint 302-redirects
+/// to `/api/v1/audio/artwork/{content_hash}` — same local
+/// serve path album covers already use.
+///
+/// The Deezer live-fetch invariant is preserved structurally:
+/// any winning URL whose host is on Deezer's CDN is refused at
+/// the byte-cache path with `status=not_found` so the
+/// endpoint never persists ToS-restricted bytes locally. See
+/// [`crate::artist_cascade::resolve_artist_bytes_to_hash`]
+/// for the full contract.
+const REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE: &str =
+    "artwork.resolve_artist_online";
+
 /// Request type: drop this plugin's in-memory caches.
 ///
 /// Wipes the artist-artwork reconcile cache (MB name → MBID
@@ -279,6 +302,7 @@ impl Plugin for ArtworkOnlinePlugin {
                     request_types: vec![
                         REQUEST_ARTWORK_RESOLVE_ONLINE.to_string(),
                         REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK.to_string(),
+                        REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE.to_string(),
                         REQUEST_ARTWORK_ONLINE_CLEAR_CACHE.to_string(),
                     ],
                     accepts_custody: false,
@@ -596,6 +620,7 @@ impl Respondent for ArtworkOnlinePlugin {
             let known = [
                 REQUEST_ARTWORK_RESOLVE_ONLINE,
                 REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK,
+                REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE,
                 REQUEST_ARTWORK_ONLINE_CLEAR_CACHE,
             ];
             if !known.contains(&req.request_type.as_str()) {
@@ -698,6 +723,62 @@ impl Respondent for ArtworkOnlinePlugin {
                             "artwork.resolve_artist_artwork response JSON: {e}"
                         ))
                     })?;
+                    Ok(Response::for_request(req, body))
+                }
+                REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE => {
+                    let http = self
+                        .http_client
+                        .clone()
+                        .expect("http client present after load");
+                    let config_snapshot =
+                        self.artist_provider_config.read().await.clone();
+                    let catalogue = artist_cascade::ArtistCatalogue {
+                        volumio_meta_http: Arc::new(http.clone()),
+                        volumio_meta_variant: self.volumio_meta_variant.clone(),
+                        theaudiodb: self.theaudiodb_client.clone(),
+                        deezer: self.deezer_client.clone(),
+                        fanart: self.fanart_client.clone(),
+                        mb: self.mb_client.clone(),
+                        caches: Arc::clone(&self.artwork_caches),
+                        coalescer: Arc::clone(&self.reconcile_coalescer),
+                        config: config_snapshot,
+                    };
+                    let resolve_output =
+                        artist_cascade::resolve_artist_bytes_to_hash(
+                            &req.payload,
+                            &catalogue,
+                            &http,
+                        )
+                        .await;
+                    if let Some((content_hash, bytes)) =
+                        resolve_output.cache_payload
+                    {
+                        if let Some(cache) = &self.asset_cache {
+                            if let Err(e) =
+                                cache.put(&content_hash, bytes).await
+                            {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    content_hash = %content_hash,
+                                    error = %e,
+                                    "asset cache put failed on artist byte-cache path; \
+                                     response still carries content_hash"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                content_hash = %content_hash,
+                                "no asset cache wired; artist byte-cache content_hash returned for path-only consumers"
+                            );
+                        }
+                    }
+                    let body =
+                        resolve_output.response.json_bytes().map_err(|e| {
+                            PluginError::Permanent(format!(
+                                "artwork.resolve_artist_online response JSON: {e}"
+                            ))
+                        })?;
                     Ok(Response::for_request(req, body))
                 }
                 other => Err(PluginError::Permanent(format!(
