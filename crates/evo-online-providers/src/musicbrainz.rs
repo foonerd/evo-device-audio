@@ -44,7 +44,7 @@
 use std::sync::Arc;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::rate_limit::RateLimiter;
 
@@ -163,7 +163,7 @@ pub struct ArtistSearchHit {
 /// Wikipedia / Wikidata URL entries to drive the anonymous
 /// enrichment chain — MusicBrainz relation → Wikipedia summary
 /// (bio prose) → Wikidata entity (biographical facts).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtistLookup {
     /// Artist MBID (echoes the input).
     pub artist_mbid: String,

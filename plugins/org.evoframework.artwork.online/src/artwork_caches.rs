@@ -44,11 +44,15 @@
 //! `Arc<ArtworkCaches>`).
 
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use evo_online_providers::musicbrainz::ArtistLookup;
 use lru::LruCache;
+
+use crate::provider_index::ProviderIndex;
+use crate::reconcile_index::ReconcileIndex;
 
 /// Working-set cap for both caches. A library with fewer than
 /// ~5000 unique fold-keys stays warm indefinitely; larger
@@ -75,18 +79,67 @@ const PROVIDER_RESULT_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// The cache pair owned by the plugin. Cheap to `Arc`-share
 /// across the request-handler and the reactor task.
+///
+/// Two orthogonal tiers layered on the same fold-key:
+///
+/// - The in-memory `Mutex<LruCache>` pair. Fast, TTL-bound,
+///   size-capped. Absorbs same-session repeat browse. Contains
+///   BOTH positives (Hit / Ok) and short-lived negatives
+///   (Miss / stale-reason). Dies at process restart.
+/// - The persistent `reconcile_index` / `provider_index`
+///   sidecars, optional (present iff constructed with
+///   [`ArtworkCaches::with_state_dir`]). Positive-only, no
+///   expiry. Survives restart. Invalidated by the operator's
+///   `artwork.online.clear_cache` verb and the framework's
+///   `?refresh=1`.
+///
+/// Read path: LRU first, then sidecar. Sidecar hit hydrates
+/// the LRU as a `Hit` so subsequent same-session reads are
+/// LRU-fast; no MusicBrainz call runs on the way in.
+///
+/// Write path (Hit / Ok): LRU first (fast for same-session
+/// repeat), then sidecar (survives restart). Both writes fire;
+/// a sidecar write failure logs but does not block the return
+/// path — the plugin degrades to in-memory-only for the affected
+/// key rather than refusing to answer.
 pub(crate) struct ArtworkCaches {
     pub(crate) reconcile: Mutex<LruCache<String, ReconcileEntry>>,
     pub(crate) provider: Mutex<LruCache<String, ProviderEntry>>,
+    reconcile_index: Option<Arc<ReconcileIndex>>,
+    provider_index: Option<Arc<ProviderIndex>>,
 }
 
 impl ArtworkCaches {
     pub(crate) fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Construct with a persistent sidecar rooted at the
+    /// plugin's `state_dir`. Called by `load()` once the
+    /// framework has handed the plugin its per-plugin state
+    /// directory; a positive identity persisted here survives
+    /// restart AND a MusicBrainz outage AND cold boot with MB
+    /// unreachable — the four properties Andrew's memo pinned
+    /// as P1 acceptance.
+    pub(crate) fn with_state_dir(state_dir: PathBuf) -> Self {
+        Self::build(Some(state_dir))
+    }
+
+    fn build(state_dir: Option<PathBuf>) -> Self {
         let cap = NonZeroUsize::new(CACHE_CAPACITY)
             .expect("CACHE_CAPACITY is non-zero");
+        let (reconcile_index, provider_index) = match state_dir {
+            Some(dir) => (
+                Some(Arc::new(ReconcileIndex::new(dir.clone()))),
+                Some(Arc::new(ProviderIndex::new(dir))),
+            ),
+            None => (None, None),
+        };
         Self {
             reconcile: Mutex::new(LruCache::new(cap)),
             provider: Mutex::new(LruCache::new(cap)),
+            reconcile_index,
+            provider_index,
         }
     }
 
@@ -94,40 +147,89 @@ impl ArtworkCaches {
     /// entries are removed from the LRU (so the next miss falls
     /// through to a live reconcile without leaving expired
     /// state in the cache).
-    pub(crate) fn get_reconcile(
+    ///
+    /// Two-tier read: consults the in-memory LRU first (fast),
+    /// then the persistent [`ReconcileIndex`] sidecar (survives
+    /// restart). A sidecar hit is hydrated back into the LRU
+    /// under a fresh `Hit` TTL so subsequent same-session reads
+    /// stay LRU-fast — and, critically, so a persisted identity
+    /// makes MusicBrainz consultation "at most once per artist,
+    /// ever" (the P1 invariant): subsequent reconciles skip the
+    /// MB round trip entirely.
+    pub(crate) async fn get_reconcile(
         &self,
         fold_key: &str,
     ) -> Option<ReconcileEntry> {
-        let mut lru = self.reconcile.lock().expect("reconcile lock poisoned");
-        let entry = lru.get(fold_key)?.clone();
-        let now = Instant::now();
-        let expiry = match &entry {
-            ReconcileEntry::Hit { expires_at, .. }
-            | ReconcileEntry::Miss { expires_at, .. } => *expires_at,
-        };
-        if expiry > now {
-            Some(entry)
-        } else {
-            lru.pop(fold_key);
-            None
+        {
+            let mut lru =
+                self.reconcile.lock().expect("reconcile lock poisoned");
+            if let Some(entry) = lru.get(fold_key).cloned() {
+                let expiry = match &entry {
+                    ReconcileEntry::Hit { expires_at, .. }
+                    | ReconcileEntry::Miss { expires_at, .. } => *expires_at,
+                };
+                if expiry > Instant::now() {
+                    return Some(entry);
+                }
+                lru.pop(fold_key);
+            }
         }
+        let sidecar = self.reconcile_index.as_ref()?;
+        let lookup = sidecar.get(fold_key).await?;
+        let hydrated = ReconcileEntry::Hit {
+            lookup: Box::new(lookup),
+            expires_at: Instant::now() + RECONCILE_HIT_TTL,
+        };
+        let mut lru = self.reconcile.lock().expect("reconcile lock poisoned");
+        lru.put(fold_key.to_string(), hydrated.clone());
+        Some(hydrated)
     }
 
-    pub(crate) fn put_reconcile_hit(
+    /// Record a positive reconcile. Writes to LRU (fast,
+    /// TTL-bound) AND to the persistent sidecar (no expiry, so a
+    /// restart or MB outage does not blank the tile). Called
+    /// from BOTH the `Found` path (URL-rels complete) AND the
+    /// `FoundPartial` path (search-confident, URL-rels
+    /// transient) so an MBID that has been proven at least once
+    /// survives every restart — even when the URL-rels sub-step
+    /// blipped on the same call.
+    pub(crate) async fn put_reconcile_hit(
         &self,
         fold_key: String,
         lookup: ArtistLookup,
     ) {
-        let mut lru = self.reconcile.lock().expect("reconcile lock poisoned");
-        lru.put(
-            fold_key,
-            ReconcileEntry::Hit {
-                lookup: Box::new(lookup),
-                expires_at: Instant::now() + RECONCILE_HIT_TTL,
-            },
-        );
+        {
+            let mut lru =
+                self.reconcile.lock().expect("reconcile lock poisoned");
+            lru.put(
+                fold_key.clone(),
+                ReconcileEntry::Hit {
+                    lookup: Box::new(lookup.clone()),
+                    expires_at: Instant::now() + RECONCILE_HIT_TTL,
+                },
+            );
+        }
+        if let Some(sidecar) = &self.reconcile_index {
+            if let Err(e) = sidecar.put(&fold_key, &lookup).await {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    fold_key = %fold_key,
+                    error = %e,
+                    "artwork online reconcile-index put failed; \
+                     persistent identity write skipped for this artist"
+                );
+            }
+        }
     }
 
+    /// Record a definitive-absence reconcile. In-memory ONLY,
+    /// under the short 6 h Miss TTL. Not persisted: the corpus
+    /// changes underneath (MB adds artists; the operator
+    /// retags), and a durable negative would block newly-
+    /// available data until manual refresh — the classic
+    /// negative-cache anti-pattern (DNS / HTTP / resolver design
+    /// all use short-TTL negatives, never durable ones). A
+    /// restart correctly re-tries the same day.
     pub(crate) fn put_reconcile_miss(
         &self,
         fold_key: String,
@@ -144,83 +246,206 @@ impl ArtworkCaches {
     }
 
     /// Look up a fresh provider-result entry.
-    pub(crate) fn get_provider(&self, fold_key: &str) -> Option<ProviderEntry> {
+    ///
+    /// Two-tier read symmetric with [`Self::get_reconcile`]:
+    /// LRU first, then the persistent [`ProviderIndex`]
+    /// sidecar. A sidecar hit hydrates the LRU under a fresh
+    /// TTL. Deezer entries are excluded upstream (in the caller)
+    /// per the live-fetch invariant; the sidecar stores whatever
+    /// the caller passed.
+    pub(crate) async fn get_provider(
+        &self,
+        fold_key: &str,
+    ) -> Option<ProviderEntry> {
+        {
+            let mut lru = self.provider.lock().expect("provider lock poisoned");
+            if let Some(entry) = lru.get(fold_key).cloned() {
+                if entry.expires_at > Instant::now() {
+                    return Some(entry);
+                }
+                lru.pop(fold_key);
+            }
+        }
+        let sidecar = self.provider_index.as_ref()?;
+        let sources = sidecar.get(fold_key).await?;
+        let hydrated = ProviderEntry::new(sources);
         let mut lru = self.provider.lock().expect("provider lock poisoned");
-        let entry = lru.get(fold_key)?.clone();
-        if entry.expires_at > Instant::now() {
-            Some(entry)
-        } else {
-            lru.pop(fold_key);
-            None
+        lru.put(fold_key.to_string(), hydrated.clone());
+        Some(hydrated)
+    }
+
+    /// Record a provider-result entry. Writes to LRU + sidecar.
+    /// An empty `sources` list is a valid entry meaning "every
+    /// non-Deezer provider was tried and none returned content";
+    /// persisting it prevents a browse burst from re-hammering
+    /// exhausted providers after restart.
+    pub(crate) async fn put_provider(
+        &self,
+        fold_key: String,
+        entry: ProviderEntry,
+    ) {
+        {
+            let mut lru = self.provider.lock().expect("provider lock poisoned");
+            lru.put(fold_key.clone(), entry.clone());
+        }
+        if let Some(sidecar) = &self.provider_index {
+            if let Err(e) = sidecar.put(&fold_key, &entry.sources).await {
+                tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    fold_key = %fold_key,
+                    error = %e,
+                    "artwork online provider-index put failed; \
+                     persistent provider-result write skipped for this artist"
+                );
+            }
         }
     }
 
-    pub(crate) fn put_provider(&self, fold_key: String, entry: ProviderEntry) {
-        let mut lru = self.provider.lock().expect("provider lock poisoned");
-        lru.put(fold_key, entry);
-    }
-
-    /// Drop every entry from both LRUs. Returns
+    /// Drop every entry from both tiers. Returns
     /// `(reconcile_entries_dropped, provider_entries_dropped)`
-    /// so the caller can surface the counts to the operator.
-    /// Called by the plugin's `artwork.online.clear_cache`
-    /// verb; also used at unload via a fresh replacement.
-    pub(crate) fn drop_all(&self) -> (usize, usize) {
-        let reconcile_dropped = {
+    /// aggregated across the LRU and the persistent sidecar;
+    /// the same numeric-shape the operator UI has always
+    /// consumed. Called by the plugin's
+    /// `artwork.online.clear_cache` verb (global scope) and at
+    /// unload via a fresh replacement.
+    pub(crate) async fn drop_all(&self) -> (usize, usize) {
+        let mut reconcile_dropped = {
             let mut lru =
                 self.reconcile.lock().expect("reconcile lock poisoned");
             let n = lru.len();
             lru.clear();
             n
         };
-        let provider_dropped = {
+        let mut provider_dropped = {
             let mut lru = self.provider.lock().expect("provider lock poisoned");
             let n = lru.len();
             lru.clear();
             n
         };
+        if let Some(sidecar) = &self.reconcile_index {
+            match sidecar.drop_all().await {
+                Ok(n) => reconcile_dropped += n,
+                Err(e) => tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    error = %e,
+                    "artwork online reconcile-index drop_all partial failure"
+                ),
+            }
+        }
+        if let Some(sidecar) = &self.provider_index {
+            match sidecar.drop_all().await {
+                Ok(n) => provider_dropped += n,
+                Err(e) => tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    error = %e,
+                    "artwork online provider-index drop_all partial failure"
+                ),
+            }
+        }
         (reconcile_dropped, provider_dropped)
     }
 
-    /// Drop one entry from both LRUs by fold-key. Returns
-    /// `(reconcile_dropped_bool, provider_dropped_bool)`
-    /// coerced to `(0|1, 0|1)` so the caller can surface a
-    /// numeric drop count identical in shape to `drop_all`.
-    /// A miss on either LRU is not an error — an operator may
-    /// legitimately target an artist that was never resolved.
-    pub(crate) fn drop_one(&self, fold_key: &str) -> (usize, usize) {
-        let reconcile_dropped = {
+    /// Drop one entry from both tiers by fold-key. Returns
+    /// `(reconcile_dropped_count, provider_dropped_count)` where
+    /// each count is `0`, `1`, or `2` — 1 for LRU-only hit or
+    /// sidecar-only hit, 2 for both. A miss on both is not an
+    /// error — an operator may legitimately target an artist
+    /// that was never resolved.
+    pub(crate) async fn drop_one(&self, fold_key: &str) -> (usize, usize) {
+        let mut reconcile_dropped = {
             let mut lru =
                 self.reconcile.lock().expect("reconcile lock poisoned");
             lru.pop(fold_key).is_some() as usize
         };
-        let provider_dropped = {
+        let mut provider_dropped = {
             let mut lru = self.provider.lock().expect("provider lock poisoned");
             lru.pop(fold_key).is_some() as usize
         };
+        if let Some(sidecar) = &self.reconcile_index {
+            match sidecar.forget(fold_key).await {
+                Ok(true) => reconcile_dropped += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    fold_key = %fold_key,
+                    error = %e,
+                    "artwork online reconcile-index forget failed"
+                ),
+            }
+        }
+        if let Some(sidecar) = &self.provider_index {
+            match sidecar.forget(fold_key).await {
+                Ok(true) => provider_dropped += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    plugin = crate::PLUGIN_NAME,
+                    fold_key = %fold_key,
+                    error = %e,
+                    "artwork online provider-index forget failed"
+                ),
+            }
+        }
         (reconcile_dropped, provider_dropped)
     }
 
     /// Reverse-lookup: given an MBID, return the fold-key
-    /// under which the reconcile LRU stored the `Hit`, or
-    /// `None` if no `Hit` in the LRU references that MBID.
-    /// Linear scan over the reconcile LRU (bounded by
-    /// [`CACHE_CAPACITY`]). Used by the targeted-clear verb
-    /// when the caller identified an artist by MBID rather
-    /// than by raw name.
-    pub(crate) fn find_reconcile_fold_key_by_mbid(
+    /// under which a `Hit` is stored. Scans the LRU first
+    /// (fast, bounded by [`CACHE_CAPACITY`]), then the
+    /// persistent reconcile sidecar (bounded by disk entries).
+    /// Used by the targeted-clear verb when the caller
+    /// identified an artist by MBID.
+    ///
+    /// When the LRU carries a matching Hit, returns the RAW
+    /// fold-key (invertible to plaintext because the LRU stores
+    /// it plaintext). When only the sidecar has a match, returns
+    /// the hashed key hex-string prefixed with `sha256:` — the
+    /// caller cannot look this up in the LRU, but can pass it
+    /// verbatim to [`Self::drop_one_by_sidecar_key_hash`] to
+    /// evict.
+    pub(crate) async fn find_reconcile_fold_key_by_mbid(
         &self,
         mbid: &str,
     ) -> Option<String> {
-        let lru = self.reconcile.lock().expect("reconcile lock poisoned");
-        for (key, entry) in lru.iter() {
-            if let ReconcileEntry::Hit { lookup, .. } = entry {
-                if lookup.artist_mbid.as_str() == mbid {
-                    return Some(key.clone());
+        {
+            let lru = self.reconcile.lock().expect("reconcile lock poisoned");
+            for (key, entry) in lru.iter() {
+                if let ReconcileEntry::Hit { lookup, .. } = entry {
+                    if lookup.artist_mbid.as_str() == mbid {
+                        return Some(key.clone());
+                    }
                 }
             }
         }
-        None
+        let sidecar = self.reconcile_index.as_ref()?;
+        let key_hash = sidecar.find_key_hash_by_mbid(mbid).await?;
+        Some(format!("sha256:{key_hash}"))
+    }
+
+    /// Companion to [`Self::find_reconcile_fold_key_by_mbid`]
+    /// for the sidecar-only case: the LRU had no matching
+    /// plaintext fold-key but the persistent index did. Takes
+    /// the `sha256:<hex>` form returned in that case and evicts
+    /// the entry from both sidecars.
+    pub(crate) async fn drop_one_by_sidecar_key_hash(
+        &self,
+        prefixed_key_hash: &str,
+    ) -> (usize, usize) {
+        let Some(key_hash) = prefixed_key_hash.strip_prefix("sha256:") else {
+            return (0, 0);
+        };
+        let mut reconcile_dropped = 0usize;
+        let mut provider_dropped = 0usize;
+        if let Some(sidecar) = &self.reconcile_index {
+            if let Ok(true) = sidecar.forget_by_key_hash(key_hash).await {
+                reconcile_dropped += 1;
+            }
+        }
+        if let Some(sidecar) = &self.provider_index {
+            if let Ok(true) = sidecar.forget_by_key_hash(key_hash).await {
+                provider_dropped += 1;
+            }
+        }
+        (reconcile_dropped, provider_dropped)
     }
 }
 
@@ -315,12 +540,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconcile_hit_round_trips() {
+    #[tokio::test]
+    async fn reconcile_hit_round_trips() {
         let caches = ArtworkCaches::new();
-        caches.put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"));
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"))
+            .await;
         let entry = caches
             .get_reconcile("abba")
+            .await
             .expect("hit entry must be present");
         match entry {
             ReconcileEntry::Hit { lookup, .. } => {
@@ -330,12 +558,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconcile_miss_round_trips() {
+    #[tokio::test]
+    async fn reconcile_miss_round_trips() {
         let caches = ArtworkCaches::new();
         caches
             .put_reconcile_miss("nobody".into(), MissReason::NoConfidentMatch);
-        match caches.get_reconcile("nobody") {
+        match caches.get_reconcile("nobody").await {
             Some(ReconcileEntry::Miss { reason, .. }) => {
                 assert_eq!(reason, MissReason::NoConfidentMatch);
             }
@@ -343,11 +571,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconcile_expired_entry_is_dropped() {
+    #[tokio::test]
+    async fn reconcile_expired_entry_is_dropped() {
         let caches = ArtworkCaches::new();
         // Insert an already-expired entry by reaching into the
-        // LRU directly. Simulates a natural expiration.
+        // LRU directly. Simulates a natural expiration. No
+        // sidecar wired in ::new() so the get falls through to
+        // None once the LRU expires the entry.
         {
             let mut lru = caches.reconcile.lock().unwrap();
             lru.put(
@@ -358,9 +588,7 @@ mod tests {
                 },
             );
         }
-        // Get should treat the expired entry as absent and
-        // remove it from the LRU.
-        assert!(caches.get_reconcile("stale").is_none());
+        assert!(caches.get_reconcile("stale").await.is_none());
         assert!(!caches
             .reconcile
             .lock()
@@ -368,18 +596,22 @@ mod tests {
             .contains(&"stale".to_string()));
     }
 
-    #[test]
-    fn provider_entry_round_trips() {
+    #[tokio::test]
+    async fn provider_entry_round_trips() {
         let caches = ArtworkCaches::new();
         let sources = vec![serde_json::json!({"provider_id": "theaudiodb"})];
-        caches.put_provider("abba".into(), ProviderEntry::new(sources.clone()));
-        let entry =
-            caches.get_provider("abba").expect("provider entry present");
+        caches
+            .put_provider("abba".into(), ProviderEntry::new(sources.clone()))
+            .await;
+        let entry = caches
+            .get_provider("abba")
+            .await
+            .expect("provider entry present");
         assert_eq!(entry.sources, sources);
     }
 
-    #[test]
-    fn provider_expired_entry_is_dropped() {
+    #[tokio::test]
+    async fn provider_expired_entry_is_dropped() {
         let caches = ArtworkCaches::new();
         {
             let mut lru = caches.provider.lock().unwrap();
@@ -391,7 +623,7 @@ mod tests {
                 },
             );
         }
-        assert!(caches.get_provider("stale").is_none());
+        assert!(caches.get_provider("stale").await.is_none());
         assert!(!caches
             .provider
             .lock()
@@ -399,84 +631,198 @@ mod tests {
             .contains(&"stale".to_string()));
     }
 
-    #[test]
-    fn lru_evicts_oldest_when_capacity_reached() {
+    #[tokio::test]
+    async fn lru_evicts_oldest_when_capacity_reached() {
         let caches = ArtworkCaches::new();
-        // The capacity is 5000; simulate with lower-scoped test
-        // by asserting the LRU behaves LRU-shaped.
+        // No sidecar wired: the LRU cap of 5000 is the ONLY
+        // bound. With sidecar wired the LRU still bounds itself
+        // but a fell-out entry can be re-hydrated from disk;
+        // that path is exercised in the state-dir tests below.
         for i in 0..(CACHE_CAPACITY + 10) {
-            caches.put_reconcile_hit(
-                format!("artist-{i}"),
-                bare_lookup(&format!("mbid-{i}")),
-            );
+            caches
+                .put_reconcile_hit(
+                    format!("artist-{i}"),
+                    bare_lookup(&format!("mbid-{i}")),
+                )
+                .await;
         }
-        // The oldest entries should have evicted.
-        assert!(caches.get_reconcile("artist-0").is_none());
-        assert!(caches.get_reconcile("artist-9").is_none());
-        // The newest ones remain.
+        assert!(caches.get_reconcile("artist-0").await.is_none());
+        assert!(caches.get_reconcile("artist-9").await.is_none());
         assert!(caches
             .get_reconcile(&format!("artist-{}", CACHE_CAPACITY + 9))
+            .await
             .is_some());
     }
 
-    #[test]
-    fn drop_one_removes_only_the_named_fold_key() {
+    #[tokio::test]
+    async fn drop_one_removes_only_the_named_fold_key() {
         let caches = ArtworkCaches::new();
-        caches.put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"));
-        caches.put_reconcile_hit("adele".into(), bare_lookup("adele-mbid"));
-        caches.put_provider(
-            "abba".into(),
-            ProviderEntry::new(vec![serde_json::json!({"src":"a"})]),
-        );
-        caches.put_provider(
-            "adele".into(),
-            ProviderEntry::new(vec![serde_json::json!({"src":"b"})]),
-        );
-        // Precondition: both keys resolve.
-        assert!(caches.get_reconcile("abba").is_some());
-        assert!(caches.get_reconcile("adele").is_some());
-        assert!(caches.get_provider("abba").is_some());
-        assert!(caches.get_provider("adele").is_some());
-        // Drop only "abba".
-        let (r, p) = caches.drop_one("abba");
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"))
+            .await;
+        caches
+            .put_reconcile_hit("adele".into(), bare_lookup("adele-mbid"))
+            .await;
+        caches
+            .put_provider(
+                "abba".into(),
+                ProviderEntry::new(vec![serde_json::json!({"src":"a"})]),
+            )
+            .await;
+        caches
+            .put_provider(
+                "adele".into(),
+                ProviderEntry::new(vec![serde_json::json!({"src":"b"})]),
+            )
+            .await;
+        assert!(caches.get_reconcile("abba").await.is_some());
+        assert!(caches.get_reconcile("adele").await.is_some());
+        assert!(caches.get_provider("abba").await.is_some());
+        assert!(caches.get_provider("adele").await.is_some());
+        let (r, p) = caches.drop_one("abba").await;
         assert_eq!(r, 1);
         assert_eq!(p, 1);
-        // "abba" gone from both LRUs, "adele" untouched.
-        assert!(caches.get_reconcile("abba").is_none());
-        assert!(caches.get_reconcile("adele").is_some());
-        assert!(caches.get_provider("abba").is_none());
-        assert!(caches.get_provider("adele").is_some());
+        assert!(caches.get_reconcile("abba").await.is_none());
+        assert!(caches.get_reconcile("adele").await.is_some());
+        assert!(caches.get_provider("abba").await.is_none());
+        assert!(caches.get_provider("adele").await.is_some());
     }
 
-    #[test]
-    fn drop_one_reports_zero_on_missing_fold_key() {
+    #[tokio::test]
+    async fn drop_one_reports_zero_on_missing_fold_key() {
         let caches = ArtworkCaches::new();
-        let (r, p) = caches.drop_one("never-cached");
+        let (r, p) = caches.drop_one("never-cached").await;
         assert_eq!(r, 0);
         assert_eq!(p, 0);
     }
 
-    #[test]
-    fn find_reconcile_fold_key_by_mbid_reverse_lookup() {
+    #[tokio::test]
+    async fn find_reconcile_fold_key_by_mbid_reverse_lookup() {
         let caches = ArtworkCaches::new();
-        caches.put_reconcile_hit("abba".into(), bare_lookup("abba-mbid-x"));
-        caches.put_reconcile_hit("adele".into(), bare_lookup("adele-mbid-y"));
-        // Miss (never stored) also present so we prove we skip
-        // non-`Hit` entries.
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid-x"))
+            .await;
+        caches
+            .put_reconcile_hit("adele".into(), bare_lookup("adele-mbid-y"))
+            .await;
         caches
             .put_reconcile_miss("someone".into(), MissReason::NoConfidentMatch);
 
         assert_eq!(
-            caches.find_reconcile_fold_key_by_mbid("abba-mbid-x"),
+            caches.find_reconcile_fold_key_by_mbid("abba-mbid-x").await,
             Some("abba".into())
         );
         assert_eq!(
-            caches.find_reconcile_fold_key_by_mbid("adele-mbid-y"),
+            caches.find_reconcile_fold_key_by_mbid("adele-mbid-y").await,
             Some("adele".into())
         );
         assert_eq!(
-            caches.find_reconcile_fold_key_by_mbid("does-not-exist"),
+            caches
+                .find_reconcile_fold_key_by_mbid("does-not-exist")
+                .await,
             None
         );
+    }
+
+    // -----------------------------------------------------------
+    // Persistent-sidecar tests (with_state_dir)
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_hit_persists_across_lru_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"))
+            .await;
+        // Flush the LRU to simulate restart (fresh process, LRU
+        // empty). Sidecar should re-hydrate on get.
+        caches.reconcile.lock().unwrap().clear();
+        let entry = caches
+            .get_reconcile("abba")
+            .await
+            .expect("sidecar must re-hydrate LRU on read");
+        match entry {
+            ReconcileEntry::Hit { lookup, .. } => {
+                assert_eq!(lookup.artist_mbid, "abba-mbid");
+            }
+            _ => panic!("expected Hit"),
+        }
+        // LRU is now warm again.
+        assert!(caches
+            .reconcile
+            .lock()
+            .unwrap()
+            .contains(&"abba".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_miss_does_not_persist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
+        caches
+            .put_reconcile_miss("nobody".into(), MissReason::NoConfidentMatch);
+        // Flush LRU — a Miss must NOT survive restart.
+        caches.reconcile.lock().unwrap().clear();
+        assert!(caches.get_reconcile("nobody").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_entry_persists_across_lru_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
+        let sources = vec![serde_json::json!({"provider_id": "theaudiodb"})];
+        caches
+            .put_provider("abba".into(), ProviderEntry::new(sources.clone()))
+            .await;
+        caches.provider.lock().unwrap().clear();
+        let entry = caches
+            .get_provider("abba")
+            .await
+            .expect("sidecar must re-hydrate LRU on read");
+        assert_eq!(entry.sources, sources);
+    }
+
+    #[tokio::test]
+    async fn drop_one_purges_both_lru_and_sidecar() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"))
+            .await;
+        caches
+            .put_provider(
+                "abba".into(),
+                ProviderEntry::new(vec![serde_json::json!({"src": "a"})]),
+            )
+            .await;
+        // Both dropped: LRU + sidecar = 2 each.
+        let (r, p) = caches.drop_one("abba").await;
+        assert_eq!(r, 2);
+        assert_eq!(p, 2);
+        // Flush LRU proves sidecar is really gone.
+        caches.reconcile.lock().unwrap().clear();
+        caches.provider.lock().unwrap().clear();
+        assert!(caches.get_reconcile("abba").await.is_none());
+        assert!(caches.get_provider("abba").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_reconcile_fold_key_by_mbid_falls_through_to_sidecar() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
+        caches
+            .put_reconcile_hit("abba".into(), bare_lookup("abba-mbid"))
+            .await;
+        // Flush the LRU to prove sidecar path fires.
+        caches.reconcile.lock().unwrap().clear();
+        let recovered = caches
+            .find_reconcile_fold_key_by_mbid("abba-mbid")
+            .await
+            .expect("sidecar reverse lookup must find the fold_key hash");
+        assert!(recovered.starts_with("sha256:"));
+        // And the sidecar-key-hash drop must evict.
+        let (r, _) = caches.drop_one_by_sidecar_key_hash(&recovered).await;
+        assert_eq!(r, 1);
     }
 }

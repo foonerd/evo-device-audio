@@ -64,8 +64,10 @@
 mod artist_cascade;
 mod artwork_caches;
 mod config;
+mod provider_index;
 mod providers;
 mod reconcile_coalescer;
+mod reconcile_index;
 mod resolve;
 
 use std::future::Future;
@@ -335,6 +337,16 @@ impl Plugin for ArtworkOnlinePlugin {
                         "invalid plugin config: {e}"
                     ))
                 })?;
+            // Wire the cache pair to the plugin's per-plugin
+            // state dir so a positive identity or provider
+            // result survives restart AND a MusicBrainz outage
+            // AND cold boot with MB unreachable. Reset here
+            // rather than at construction because state_dir
+            // arrives via LoadContext, not the constructor.
+            self.artwork_caches =
+                Arc::new(artwork_caches::ArtworkCaches::with_state_dir(
+                    ctx.state_dir.clone(),
+                ));
             let http =
                 providers::build_http_client(self.config.request_timeout);
             self.http_client = Some(http.clone());
@@ -635,8 +647,8 @@ impl Respondent for ArtworkOnlinePlugin {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             if req.request_type == REQUEST_ARTWORK_ONLINE_CLEAR_CACHE {
-                let body =
-                    handle_online_clear_cache(req, &self.artwork_caches)?;
+                let body = handle_online_clear_cache(req, &self.artwork_caches)
+                    .await?;
                 return Ok(Response::for_request(req, body));
             }
 
@@ -846,7 +858,7 @@ struct OnlineClearTarget {
     value: String,
 }
 
-fn handle_online_clear_cache(
+async fn handle_online_clear_cache(
     req: &Request,
     caches: &artwork_caches::ArtworkCaches,
 ) -> Result<Vec<u8>, PluginError> {
@@ -875,13 +887,13 @@ fn handle_online_clear_cache(
 
     match parsed.target {
         None => {
-            let (reconcile_dropped, provider_dropped) = caches.drop_all();
+            let (reconcile_dropped, provider_dropped) = caches.drop_all().await;
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 scope = "all",
                 reconcile_entries_dropped = reconcile_dropped,
                 provider_entries_dropped = provider_dropped,
-                "artwork.online.clear_cache: in-mem LRUs cleared (global)"
+                "artwork.online.clear_cache: LRU + persistent sidecar cleared (global)"
             );
             serde_json::to_vec(&serde_json::json!({
                 "v": 1,
@@ -902,7 +914,8 @@ fn handle_online_clear_cache(
                 }
                 "artist-mbid" => {
                     let key = caches
-                        .find_reconcile_fold_key_by_mbid(&target.value);
+                        .find_reconcile_fold_key_by_mbid(&target.value)
+                        .await;
                     (key, "mbid_reverse_lookup")
                 }
                 "mpd-album" => {
@@ -1003,8 +1016,20 @@ fn handle_online_clear_cache(
                 return Ok(body);
             };
 
-            let (reconcile_dropped, provider_dropped) =
-                caches.drop_one(&fold_key);
+            // The `find_reconcile_fold_key_by_mbid` API returns
+            // either the raw plaintext fold_key (LRU hit path) or
+            // a `sha256:<hex>` string when only the persistent
+            // sidecar had a matching MBID (LRU was cold on this
+            // artist since load). Route the drop accordingly so
+            // an operator's targeted-clear-by-MBID works whether
+            // the artist is warm or cold on the process.
+            let (reconcile_dropped, provider_dropped) = if fold_key
+                .starts_with("sha256:")
+            {
+                caches.drop_one_by_sidecar_key_hash(&fold_key).await
+            } else {
+                caches.drop_one(&fold_key).await
+            };
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 scope = "targeted",

@@ -23,7 +23,12 @@ semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `fs` is on top of the workspace default because the persistent
+# artwork.online sidecars (reconcile-index, provider-index) live
+# under the plugin's state_dir and use tokio::fs for atomic
+# tempfile+rename writes and non-blocking reads on the request
+# hot path.
+tokio = { workspace = true, features = ["fs"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

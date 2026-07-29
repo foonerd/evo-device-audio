@@ -1230,7 +1230,16 @@ async fn run_cascade(
         // (search-side confidence is proxied by the caller's
         // trust); no bare-lookup fabrication on the "no MB
         // client" arm because we know nothing beyond the id.
-        match &catalogue.mb {
+        //
+        // P1 decision #4 (caller-MBID wins): on `Found` or
+        // `FoundPartial`, we OVERWRITE any persisted entry
+        // under fold_key with this fresh lookup. An explicit
+        // caller-supplied MBID is an operator or upstream
+        // assertion and outranks a search-derived guess; a
+        // bare-lookup FoundPartial fired here still nails the
+        // MBID and is worth persisting for the same reasons
+        // as the name-reconcile branch below.
+        let outcome = match &catalogue.mb {
             Some(mb) => match mb.lookup_artist(&mbid).await {
                 Ok(lookup) => ReconcileOutcome::Found(Box::new(lookup)),
                 Err(e) => {
@@ -1242,8 +1251,8 @@ async fn run_cascade(
                         error = %mb_error_display(&e),
                         outcome = "found_bare_mbid",
                         next_attempt = "on_next_demand",
-                        cache_policy = "not_written_by_caller",
-                        "MB URL-rels lookup for caller-supplied MBID transient; identity trusted by caller but Deezer URL-rel absent; caller MUST NOT cache — next request re-attempts full URL-rels lookup"
+                        cache_policy = "persisted_bare_by_caller_mbid",
+                        "MB URL-rels lookup for caller-supplied MBID transient; identity trusted by caller and persisted as FoundPartial under fold_key so restart / MB outage does not blank the tile; MBID-keyed providers still fire — operator refresh will upgrade to full URL-rels"
                     );
                     ReconcileOutcome::FoundPartial(Box::new(
                         bare_lookup_from_mbid(&mbid, &artist),
@@ -1257,24 +1266,53 @@ async fn run_cascade(
             None => ReconcileOutcome::FoundPartial(Box::new(
                 bare_lookup_from_mbid(&mbid, &artist),
             )),
+        };
+        if can_cache {
+            match &outcome {
+                ReconcileOutcome::Found(lookup)
+                | ReconcileOutcome::FoundPartial(lookup) => {
+                    catalogue
+                        .caches
+                        .put_reconcile_hit(fold_key.clone(), (**lookup).clone())
+                        .await;
+                }
+                _ => {}
+            }
         }
+        outcome
     } else if can_cache {
-        // Cache-first name reconciliation. Only `Found` +
-        // `Absent` write to the cache; a fresh Hit / Miss
-        // entry short-circuits the two MB round trips. An
-        // `Unavailable` outcome NEVER writes — the next
-        // request re-attempts, so a passing rate-limit spike
-        // does not poison the tile for hours.
-        // A `FoundPartial` outcome (search hit confident but
-        // URL-rels transient) also NEVER writes — the
-        // identity is fresh but incomplete (no Deezer
-        // URL-rel), and caching it would keep Deezer-by-id
-        // dead until the 7 d hit-TTL expired. The current
-        // call still proceeds to the MBID-keyed providers so
-        // the tile has a chance to render; the next request
-        // re-attempts the full URL-rels lookup.
+        // Cache-first name reconciliation.
+        //
+        // Write policy after the P1 defect fix:
+        //
+        // - `Found` writes to BOTH tiers: in-memory LRU (fast
+        //   same-session repeat) + persistent sidecar (survives
+        //   restart, MB outage, cold boot).
+        // - `FoundPartial` (search-confident MBID, URL-rels
+        //   transient) writes to BOTH tiers too. The identity
+        //   is proven — the memo pinned this: an MBID nailed
+        //   by the search step is a stable identifier and must
+        //   NEVER be discarded because a secondary URL-rels
+        //   call blipped. The LRU `Hit` stores the bare
+        //   lookup (empty `deezer_artist_url`), which makes
+        //   Deezer-by-id noop for this artist until an
+        //   operator refresh upgrades the entry via a fresh
+        //   MB lookup; MBID-keyed providers (fanart /
+        //   theaudiodb) still fire.
+        // - `Absent` writes to the in-memory Miss LRU under the
+        //   6 h short TTL. NOT persisted — the corpus changes
+        //   underneath (MB adds artists; operator retags); a
+        //   durable negative would block newly-available data
+        //   until manual refresh (classic negative-cache
+        //   anti-pattern). A restart correctly re-tries the
+        //   same day.
+        // - `Unavailable` writes NOTHING (in-memory or on-disk).
+        //   A rate-limit / transport spike must never
+        //   masquerade as definitive absence, and must never
+        //   overwrite a persisted positive identity we already
+        //   have.
         use crate::artwork_caches::{MissReason, ReconcileEntry};
-        match catalogue.caches.get_reconcile(&fold_key) {
+        match catalogue.caches.get_reconcile(&fold_key).await {
             Some(ReconcileEntry::Hit { lookup, .. }) => {
                 ReconcileOutcome::Found(lookup)
             }
@@ -1285,10 +1323,31 @@ async fn run_cascade(
                         .await;
                 match &outcome {
                     ReconcileOutcome::Found(lookup) => {
-                        catalogue.caches.put_reconcile_hit(
-                            fold_key.clone(),
-                            (**lookup).clone(),
-                        );
+                        catalogue
+                            .caches
+                            .put_reconcile_hit(
+                                fold_key.clone(),
+                                (**lookup).clone(),
+                            )
+                            .await;
+                    }
+                    ReconcileOutcome::FoundPartial(lookup) => {
+                        // P1 defect fix. Identity confidently
+                        // nailed by MB search; URL-rels
+                        // transient. Persist the identity so
+                        // the next request skips MB entirely.
+                        // No wait for the URL-rels to succeed —
+                        // MBID stability outranks URL-rel
+                        // completeness. Operator refresh can
+                        // upgrade the entry when they want a
+                        // fresh URL-rels lookup.
+                        catalogue
+                            .caches
+                            .put_reconcile_hit(
+                                fold_key.clone(),
+                                (**lookup).clone(),
+                            )
+                            .await;
                     }
                     ReconcileOutcome::Absent => {
                         catalogue.caches.put_reconcile_miss(
@@ -1296,12 +1355,9 @@ async fn run_cascade(
                             MissReason::NoConfidentMatch,
                         );
                     }
-                    ReconcileOutcome::FoundPartial(_)
-                    | ReconcileOutcome::Unavailable => {
-                        // Deliberately no cache write. The
-                        // next request retries; the UI's
-                        // session cache also skips these
-                        // per the wire contract.
+                    ReconcileOutcome::Unavailable => {
+                        // Never written. See policy comment
+                        // above.
                     }
                 }
                 outcome
@@ -1390,6 +1446,7 @@ async fn run_cascade(
         catalogue
             .caches
             .get_provider(&fold_key)
+            .await
             .map(|entry| deserialize_provider_entries(&entry.sources))
     } else {
         None
@@ -1461,10 +1518,13 @@ async fn run_cascade(
                         _ => None,
                     })
                     .collect();
-                catalogue.caches.put_provider(
-                    fold_key.clone(),
-                    crate::artwork_caches::ProviderEntry::new(snapshot),
-                );
+                catalogue
+                    .caches
+                    .put_provider(
+                        fold_key.clone(),
+                        crate::artwork_caches::ProviderEntry::new(snapshot),
+                    )
+                    .await;
             }
             (v, t, f)
         };
