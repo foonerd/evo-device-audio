@@ -117,6 +117,209 @@ pub fn artist_display_form(raw: &str) -> String {
     display.nfc().collect()
 }
 
+/// Split a raw artist credit into its individual contributors.
+///
+/// Prior art (MusicBrainz artist-credit model; Roon, Plex,
+/// Apple, Spotify, Discogs, beets): a joined credit like `Al Di
+/// Meola, John McLaughlin & Paco de Lucía` is a MULTI-artist
+/// collaboration, not one act with a compound name. The
+/// browse-by-artist facet fans them out to individual tiles;
+/// the album still appears under every contributor and its
+/// display line keeps the full credit.
+///
+/// Rules, applied in order:
+///
+/// 1. **Known single-act allowlist**: `Hall & Oates`, `Simon &
+///    Garfunkel`, `Florence + the Machine`, `Emerson, Lake &
+///    Palmer`, etc. — real acts whose name contains a
+///    delimiter. Matched case-insensitively via
+///    [`artist_fold_key`]. These MUST NOT split.
+/// 2. **Watermark / parenthetical / self-slash strip** on the
+///    raw credit before delimiter sniffing so
+///    `Bruno Mars & Alicia Keys | www.junk.com` still detects
+///    the collab.
+/// 3. **Delimiter split** on `;`, ` & `, ` and `, or a
+///    multi-token-head comma (the same set the display path
+///    treats as a collab). PLUS ` feat. ` / ` ft. ` (case-
+///    insensitive) for featured-artist credits — MusicBrainz
+///    reconciliation treats `feat.` as an artist-credit join
+///    phrase.
+/// 4. **Slash does not split** — MusicBrainz and beets treat a
+///    lone `/` as a split-release marker, not a collaboration.
+///    Self-slash (`A/A`) is collapsed by rule 2.
+/// 5. Each split component is laundered through
+///    [`artist_display_form`] (sort-form reordering,
+///    diacritic-preserving NFC), then deduped within the
+///    credit by fold-key.
+/// 6. Returns the input, cleaned via [`artist_display_form`],
+///    as a single-element vec when no delimiter matched or
+///    when the allowlist fired. Empty input → empty vec.
+pub fn split_artist_credit(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if is_known_single_act(trimmed) {
+        // Bypass the collab path so `Hall & Oates` stays
+        // `Hall & Oates`, not the fold-through-collab
+        // `Hall, Oates` (which then sort-form-reorders to
+        // `Oates Hall`). NFC-normalise so composed and
+        // decomposed inputs render identically.
+        return vec![trimmed.nfc().collect()];
+    }
+    let without_watermark = match trimmed.split_once('|') {
+        Some((head, _)) => head.trim(),
+        None => trimmed,
+    };
+    let without_parens = strip_trailing_parentheticals(without_watermark);
+    let without_self_slash = collapse_self_slash(&without_parens);
+
+    let owned_parts: Vec<String> =
+        if let Some(parts) = split_collab(&without_self_slash) {
+            parts.into_iter().map(str::to_string).collect()
+        } else if let Some(parts) = split_on_feat_ft(&without_self_slash) {
+            parts
+        } else {
+            return vec![artist_display_form(trimmed)];
+        };
+
+    // Recursion terminates because [`split_collab`] returns
+    // `None` on a delimiter-free credit — the recursive call
+    // falls through to the `artist_display_form` single-artist
+    // return and the walk unwinds. Real-world credits like
+    // `A, B & C` split on ` & ` first into `["A, B", "C"]`,
+    // then the recursion splits `A, B` on the multi-token-head
+    // comma into `["A", "B"]`. Final: `["A", "B", "C"]`.
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for p in owned_parts {
+        for member in split_artist_credit(&p) {
+            let key = artist_fold_key(&member);
+            if key.is_empty() {
+                continue;
+            }
+            if seen.insert(key) {
+                out.push(member);
+            }
+        }
+    }
+    if out.is_empty() {
+        return vec![artist_display_form(trimmed)];
+    }
+    out
+}
+
+/// Known-single-act allowlist. Real acts whose canonical name
+/// contains `&` / `and` / `+` — splitting them on the delimiter
+/// would fabricate two artists that do not exist.
+///
+/// Matching is fold-key equal: `hall & oates`, `Hall & Oates`,
+/// `HALL & OATES`, and `Hall  &  Oates` all match. Additions
+/// welcome as libraries surface them.
+fn is_known_single_act(raw: &str) -> bool {
+    // Order and casing preserved for source readability; the
+    // matcher folds both sides through [`artist_fold_key`].
+    const KNOWN_SINGLE_ACTS: &[&str] = &[
+        "Hall & Oates",
+        "Daryl Hall & John Oates",
+        "Simon & Garfunkel",
+        "Florence + the Machine",
+        "Florence and the Machine",
+        "Sly & the Family Stone",
+        "Ike & Tina Turner",
+        "Emerson, Lake & Palmer",
+        "Emerson, Lake and Palmer",
+        "Earth, Wind & Fire",
+        "Peter, Paul and Mary",
+        "Peter, Paul & Mary",
+        "Crosby, Stills, Nash & Young",
+        "Crosby, Stills & Nash",
+        "Blood, Sweat & Tears",
+        "Derek and the Dominos",
+        "Booker T. & the M.G.'s",
+        "Diana Ross & the Supremes",
+        "Bob Marley & the Wailers",
+        "Prince and the Revolution",
+        "The Mamas & the Papas",
+        "The Mamas and the Papas",
+        "Tom Petty and the Heartbreakers",
+        "Tom Petty & the Heartbreakers",
+        "Huey Lewis and the News",
+        "Huey Lewis & the News",
+        "KC and the Sunshine Band",
+        "KC & the Sunshine Band",
+        "Iron & Wine",
+        "Mumford & Sons",
+        "Ashford & Simpson",
+        "Chas & Dave",
+        "Kool & the Gang",
+        "Echo & the Bunnymen",
+        "Nick Cave & the Bad Seeds",
+        "Belle & Sebastian",
+        "Belle and Sebastian",
+        "Edward Sharpe & the Magnetic Zeros",
+        "Edward Sharpe and the Magnetic Zeros",
+        "Selena Gomez & the Scene",
+        "Little Anthony & the Imperials",
+        "Martha and the Vandellas",
+        "Martha Reeves & the Vandellas",
+        "Frankie Valli & the Four Seasons",
+        "Gladys Knight & the Pips",
+        "Smokey Robinson & the Miracles",
+        "Sam & Dave",
+        "Nina & Frederik",
+        "Angus & Julia Stone",
+    ];
+    let key = artist_fold_key(raw);
+    if key.is_empty() {
+        return false;
+    }
+    KNOWN_SINGLE_ACTS.iter().any(|k| artist_fold_key(k) == key)
+}
+
+/// Split on ` feat. ` / ` ft. ` (case-insensitive). Returns
+/// `None` if neither delimiter is present. Matches inside a
+/// larger token (`featuring`) also fire when preceded by a
+/// space and followed by `.` or space — the MusicBrainz set is
+/// literally `feat.` / `ft.` / `featuring` at word boundaries.
+fn split_on_feat_ft(s: &str) -> Option<Vec<String>> {
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    // Iterate boundaries and try each delimiter. Word boundary
+    // is a leading space; trailing may be `.` (from feat./ft.)
+    // followed by whitespace, or whitespace directly for
+    // `featuring`.
+    for delim in [" feat. ", " ft. ", " feat ", " ft ", " featuring "] {
+        if lower.contains(delim) {
+            let mut parts: Vec<String> = Vec::new();
+            let mut cursor = 0usize;
+            while cursor <= bytes.len() {
+                match lower[cursor..].find(delim) {
+                    Some(rel) => {
+                        let end = cursor + rel;
+                        let part = s[cursor..end].trim();
+                        if !part.is_empty() {
+                            parts.push(part.to_string());
+                        }
+                        cursor = end + delim.len();
+                    }
+                    None => {
+                        let tail = s[cursor..].trim();
+                        if !tail.is_empty() {
+                            parts.push(tail.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            if parts.len() >= 2 {
+                return Some(parts);
+            }
+        }
+    }
+    None
+}
+
 /// Shared structural cleaning used by both fold-key and display.
 /// Order matters: watermark → parentheticals → self-slash →
 /// collab-credit split → `Last, First` reorder. The collab
@@ -759,5 +962,179 @@ mod tests {
                 "collab fold mismatch for {raw:?} → {display:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------
+    // split_artist_credit — browse-by-artist fan-out
+    // ------------------------------------------------------------
+
+    fn contains_fold_of(parts: &[String], target: &str) -> bool {
+        let key = artist_fold_key(target);
+        parts.iter().any(|p| artist_fold_key(p) == key)
+    }
+
+    #[test]
+    fn split_credit_returns_three_individuals_for_comma_collab() {
+        let parts =
+            split_artist_credit("Al Di Meola, John McLaughlin, Paco de Lucía");
+        assert_eq!(parts.len(), 3);
+        assert!(contains_fold_of(&parts, "Al Di Meola"));
+        assert!(contains_fold_of(&parts, "John McLaughlin"));
+        assert!(contains_fold_of(&parts, "Paco de Lucía"));
+    }
+
+    #[test]
+    fn split_credit_returns_three_individuals_for_ampersand_collab() {
+        let parts = split_artist_credit(
+            "Al Di Meola & John McLaughlin & Paco de Lucía",
+        );
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn split_credit_returns_three_individuals_for_and_collab() {
+        let parts = split_artist_credit(
+            "Al Di Meola and John McLaughlin and Paco de Lucía",
+        );
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn split_credit_returns_two_for_semicolon() {
+        let parts = split_artist_credit("Nick Cave; Kylie Minogue");
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn split_credit_does_not_split_slash_delimiter() {
+        // MusicBrainz: `/` = split release, not collaboration.
+        let parts = split_artist_credit("Artist A / Artist B");
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn split_credit_collapses_self_slash_to_one() {
+        let parts = split_artist_credit("Passenger/Passenger");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "Passenger");
+    }
+
+    #[test]
+    fn split_credit_preserves_hall_and_oates() {
+        let parts = split_artist_credit("Hall & Oates");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(artist_fold_key(&parts[0]), artist_fold_key("Hall & Oates"));
+    }
+
+    #[test]
+    fn split_credit_preserves_simon_and_garfunkel() {
+        let parts = split_artist_credit("Simon & Garfunkel");
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn split_credit_preserves_florence_and_the_machine() {
+        for form in [
+            "Florence + the Machine",
+            "Florence and the Machine",
+            "Florence + The Machine",
+        ] {
+            let parts = split_artist_credit(form);
+            assert_eq!(parts.len(), 1, "form {form:?}");
+        }
+    }
+
+    #[test]
+    fn split_credit_preserves_emerson_lake_and_palmer() {
+        for form in ["Emerson, Lake & Palmer", "Emerson, Lake and Palmer"] {
+            let parts = split_artist_credit(form);
+            assert_eq!(parts.len(), 1, "form {form:?}");
+        }
+    }
+
+    #[test]
+    fn split_credit_preserves_last_first_sort_form() {
+        // Head has single token → sort form, not collab.
+        let parts = split_artist_credit("Cohen, Leonard");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "Leonard Cohen");
+    }
+
+    #[test]
+    fn split_credit_single_artist_returns_one() {
+        let parts = split_artist_credit("Passenger");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "Passenger");
+    }
+
+    #[test]
+    fn split_credit_empty_input_returns_empty() {
+        assert!(split_artist_credit("").is_empty());
+        assert!(split_artist_credit("   ").is_empty());
+    }
+
+    #[test]
+    fn split_credit_dedupes_repeated_names_within_credit() {
+        let parts = split_artist_credit("Passenger, Passenger");
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn split_credit_handles_feat_delimiter() {
+        for raw in [
+            "Jay-Z feat. Alicia Keys",
+            "Jay-Z Feat. Alicia Keys",
+            "Jay-Z FEAT. Alicia Keys",
+            "Jay-Z ft. Alicia Keys",
+            "Jay-Z featuring Alicia Keys",
+        ] {
+            let parts = split_artist_credit(raw);
+            assert_eq!(parts.len(), 2, "raw {raw:?}");
+            assert!(contains_fold_of(&parts, "Jay-Z"));
+            assert!(contains_fold_of(&parts, "Alicia Keys"));
+        }
+    }
+
+    #[test]
+    fn split_credit_strips_watermark_before_splitting() {
+        let parts =
+            split_artist_credit("Al Di Meola & John McLaughlin | www.junk.com");
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn split_credit_strips_trailing_parenthetical() {
+        // Album-title stuffed in artist tag — cleaner drops it
+        // before splitting.
+        let parts = split_artist_credit("Nick Cave, Kylie Minogue (Duet)");
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn split_credit_deep_splits_mixed_delimiters() {
+        // `A, B & C` splits on ` & ` first into `["A, B", "C"]`,
+        // then recursively splits `A, B` on the multi-token-
+        // head comma into `["A", "B"]`. Final: three tiles.
+        let parts =
+            split_artist_credit("Al Di Meola, John McLaughlin & Paco de Lucía");
+        assert_eq!(parts.len(), 3);
+        assert!(contains_fold_of(&parts, "Al Di Meola"));
+        assert!(contains_fold_of(&parts, "John McLaughlin"));
+        assert!(contains_fold_of(&parts, "Paco de Lucía"));
+    }
+
+    #[test]
+    fn split_credit_deep_splits_semicolon_comma_mix() {
+        let parts =
+            split_artist_credit("Al Di Meola; John McLaughlin, Paco de Lucía");
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn split_credit_preserves_the_and_prefix() {
+        // "The Mamas and the Papas" — allowlist should catch
+        // this pattern too.
+        let parts = split_artist_credit("The Mamas and the Papas");
+        assert_eq!(parts.len(), 1);
     }
 }

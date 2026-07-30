@@ -1931,6 +1931,7 @@ fn parse_library_entries(fields: &[Field]) -> Vec<MpdLibraryEntry> {
                     path: f.value.clone(),
                     title: None,
                     artist: None,
+                    albumartist: None,
                     album: None,
                     duration: None,
                     classical: super::types::ClassicalTags::default(),
@@ -1976,6 +1977,7 @@ enum LibraryEntryBuilder {
         path: String,
         title: Option<String>,
         artist: Option<String>,
+        albumartist: Option<String>,
         album: Option<String>,
         duration: Option<Duration>,
         classical: super::types::ClassicalTags,
@@ -2007,6 +2009,9 @@ impl LibraryEntryBuilder {
             }
             (Self::File { artist, .. }, "Artist") => {
                 *artist = Some(value.to_string())
+            }
+            (Self::File { albumartist, .. }, "AlbumArtist") => {
+                *albumartist = Some(value.to_string())
             }
             (Self::File { album, .. }, "Album") => {
                 *album = Some(value.to_string())
@@ -2040,6 +2045,7 @@ impl LibraryEntryBuilder {
                 path,
                 title,
                 artist,
+                albumartist,
                 album,
                 duration,
                 classical,
@@ -2047,6 +2053,7 @@ impl LibraryEntryBuilder {
                 path,
                 title,
                 artist,
+                albumartist,
                 album,
                 duration,
                 classical,

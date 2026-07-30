@@ -992,138 +992,45 @@ pub(crate) async fn handle_browse_by_tag(
         .await;
     }
 
-    // Enumeration path — return distinct facet values, with
-    // per-facet enrichment where the shape carries a
-    // meaningful identity (album cover / artist portrait).
-    let raw_values = conn.list_tag(tag).await.map_err(|e| VerbError::Mpd {
-        verb: verb_name.to_string(),
-        reason: e.to_string(),
-    })?;
-
-    // Post-process + deduplicate.
+    // Enumeration path.
     //
-    // Some tags need normalisation before the facet list is
-    // useful (year extraction from MPD's `date` field). After
-    // that, distinct values may collapse — e.g. `1997` and
-    // `1997-06-16` both yield `1997`. Deduplication happens here
-    // (rather than at MPD's list layer) because MPD's list is
-    // already-distinct for the RAW tag value, not the processed
-    // form.
+    // Dispatch on `facet_key` because the three families have
+    // fundamentally different identity models:
     //
-    // The artist facet applies an additional fold-key dedupe:
-    // MPD's raw tag values carry per-file drift (diacritic
-    // form, "Last, First" reversal, trailing "| garbage" tag-
-    // editor droppings) that surface the same real artist as
-    // multiple tiles. `artist_fold_key` collapses those into
-    // one entry; the display value is the most common raw
-    // form that folded into the group.
-    let mut processed: Vec<String> = if facet_key == "artist" {
-        let mut groups: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, usize>,
-        > = std::collections::HashMap::new();
-        for raw in raw_values.into_iter().filter_map(post_process) {
-            let key = artist_fold_key(&raw);
-            if key.is_empty() {
-                continue;
-            }
-            *groups.entry(key).or_default().entry(raw).or_insert(0) += 1;
+    // - Album: canonical identity via
+    //   [`album_identity`] — multi-disc variants fold, edition
+    //   qualifiers strip from the display, degenerate tags
+    //   (album tag holding the artist credit) fall back to the
+    //   parent folder basename. Prior art: Roon, Plex,
+    //   Jellyfin, Picard, beets. See
+    //   [`enumerate_albums_via_identity`].
+    // - Artist: multi-artist credits fan out into their
+    //   individual entities via
+    //   [`split_artist_credit`] — a credit like
+    //   `Al Di Meola, John McLaughlin & Paco de Lucía` yields
+    //   three tiles, not one compound tile. Prior art:
+    //   MusicBrainz artist-credit model, Roon, Plex, Apple,
+    //   Spotify. See [`enumerate_artists_via_fanout`].
+    // - Genre / year: distinct raw values with post-processing
+    //   (year extraction) and case-insensitive dedupe. See
+    //   [`enumerate_generic_facet`].
+    let rendered: Vec<serde_json::Value> = match facet_key {
+        "album" => enumerate_albums_via_identity(conn, verb_name).await?,
+        "artist" => {
+            enumerate_artists_via_fanout(conn, tag, verb_name, post_process)
+                .await?
         }
-        groups
-            .into_values()
-            .filter_map(|forms| {
-                // Break ties by longest form so
-                // "Céline Dion" wins over "Celine Dion" — the
-                // diacritic-carrying form is closer to the
-                // artist's canonical presentation. Then run
-                // `artist_display_form` on the winner so tag-
-                // editor watermarks and `Last, First` sort-
-                // form drop out before the tile is rendered.
-                // Cleaning preserves fold-key equivalence
-                // (proven in the shared crate's tests), so
-                // the drill path still matches every raw form
-                // that belongs to the group.
-                let raw_winner = forms
-                    .into_iter()
-                    .max_by(|a, b| {
-                        a.1.cmp(&b.1).then_with(|| {
-                            a.0.chars().count().cmp(&b.0.chars().count())
-                        })
-                    })
-                    .map(|(display, _)| display)?;
-                let cleaned = artist_display_form(&raw_winner);
-                Some(if cleaned.is_empty() {
-                    raw_winner
-                } else {
-                    cleaned
-                })
-            })
-            .collect()
-    } else {
-        let mut seen = std::collections::HashSet::new();
-        raw_values
-            .into_iter()
-            .filter_map(post_process)
-            .filter(|v| seen.insert(v.clone()))
-            .collect()
-    };
-    // Case-insensitive lexicographic sort for a stable
-    // operator-visible ordering — MPD returns tags in an
-    // internal order that is stable across calls but not
-    // alphabetical.
-    processed.sort_by_key(|a| a.to_lowercase());
-
-    // Facet-specific enrichment.
-    //
-    // - Album facet: album → artist map + `count group album`
-    //   for track counts, plus synthesised `mpd-album` cover_url.
-    // - Artist facet: no local album cover. Artist tiles resolve
-    //   portraits via `artwork_lookup` only; emitting a synthesised
-    //   `mpd-album` cover_url caused the glass to paint album art
-    //   as a face and drove local MPEG / online album-cascade work
-    //   that does not belong on this surface.
-    let (album_artists, album_counts) = match facet_key {
-        "album" => {
-            let pairs = conn
-                .list_tag_grouped(tag, "albumartist")
-                .await
-                .map_err(|e| VerbError::Mpd {
-                    verb: verb_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-            // Grouped list emits every (album, artist) pair MPD
-            // knows about; when an album is credited to multiple
-            // artists the map keeps the last one MPD emitted
-            // (matches the browse-list's "one row per album"
-            // shape). Empty artist maps to `None` on the entry.
-            let mut artists_map = std::collections::HashMap::new();
-            for (album, artist) in pairs {
-                if !artist.is_empty() {
-                    artists_map.entry(album).or_insert(artist);
-                }
-            }
-            let counts = conn.count_grouped_by_tag(tag).await.map_err(|e| {
-                VerbError::Mpd {
-                    verb: verb_name.to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
-            (Some(artists_map), Some(counts))
-        }
-        _ => (None, None),
-    };
-
-    let rendered: Vec<serde_json::Value> = processed
-        .iter()
-        .map(|v| {
-            render_facet_entry(
+        _ => {
+            enumerate_generic_facet(
+                conn,
+                tag,
                 facet_key,
-                v,
-                album_artists.as_ref(),
-                album_counts.as_ref(),
+                verb_name,
+                post_process,
             )
-        })
-        .collect();
+            .await?
+        }
+    };
     let (page_entries, next_page, truncated) =
         paginate(&rendered, range_start, page_size);
     Ok(json!({
@@ -1138,91 +1045,295 @@ pub(crate) async fn handle_browse_by_tag(
     }))
 }
 
-/// Render one facet-enumeration entry with the enrichment
-/// appropriate to its facet kind.
+/// One album row projected from MPD's raw `list_tag_grouped`
+/// / `count_grouped_by_tag` pair, plus the canonical identity
+/// [`album_identity`] resolves for it (with a folder-lookup
+/// side-effect for degenerate rows).
 ///
-/// - `album`: `{album, artist?, cover_url, track_count?}` — the
-///   maps carry per-album artist + track_count when the
-///   enumeration is over albums; `cover_url` is a synthesised
-///   `mpd-album` URL the framework's existing artwork endpoint
-///   already resolves.
-/// - `artist`: `{artist, artwork_lookup}` — portrait only.
-///   `artwork_lookup` is an opaque, plugin-declared dispatch
-///   hint the UI may fire per visible tile; consumption is a
-///   wire-op dispatch, not an `<img src>` URL, so live-fetch
-///   providers keep their terms. No `cover_url`: album art is
-///   the wrong image type for an artist facet.
-/// - `genre` / `year`: `{genre}` / `{year}` — no imagery for
-///   these facets by design.
-fn render_facet_entry(
-    facet_key: &'static str,
-    value: &str,
-    album_artists: Option<&std::collections::HashMap<String, String>>,
-    album_counts: Option<&std::collections::HashMap<String, u64>>,
-) -> serde_json::Value {
-    match facet_key {
-        "album" => {
-            // Launder the raw albumartist through
-            // `artist_display_form` before it drives either the
-            // emitted `artist` field or the synthesised
-            // `cover_url`. Same helper the artist facet uses on
-            // its winner (see the `caller already ran
-            // artist_display_form` comment in the artist
-            // branch). Without this, dirty forms — self-slash
-            // (`Passenger/Passenger`), editor watermarks, sort-
-            // form (`Cohen, Leonard`), collab credits — flow
-            // straight into the tile as the label AND into the
-            // `mpd-album?value=<artist>|<album>` cascade key,
-            // where the framework endpoint has no match and
-            // returns 502 disc-icon placeholders. Cleaning here
-            // preserves fold-key equivalence (proven in the
-            // shared crate's tests), so the drill / resolve
-            // paths still match every raw form that belongs to
-            // the same album. Collab credits (real
-            // multi-artist albums) render through
-            // `artist_display_form`'s canonical `A, B` join,
-            // NOT collapsed to a single name.
-            let artist = album_artists
-                .and_then(|m| m.get(value))
-                .map(|raw| artist_display_form(raw));
-            let track_count = album_counts.and_then(|m| m.get(value).copied());
+/// Shared between the browse-by-album enumeration path and the
+/// drill-by-album path so both key off the same grouping-key
+/// arithmetic.
+#[derive(Debug, Clone)]
+pub(crate) struct AlbumRow {
+    pub(crate) raw_album: String,
+    pub(crate) raw_albumartist: String,
+    pub(crate) count: u64,
+    pub(crate) identity: AlbumIdentity,
+}
+
+/// Resolve every album MPD knows about into its canonical
+/// [`AlbumIdentity`] plus the raw tag data needed for cover
+/// synthesis and drill matching.
+///
+/// One MPD `listallinfo` roundtrip walks the entire database
+/// and lets us aggregate per `(raw_album, raw_albumartist)`
+/// pair. That's essential because MPD's `count group album`
+/// merges tracks across every albumartist — Elton John's and
+/// Billy Joel's "The Ultimate Collection" appear as one row.
+/// Aggregating locally keeps the pairs distinct so downstream
+/// grouping can key on `(identity.grouping_key,
+/// artist_fold_key)` and same-titled albums by different
+/// artists stay separate tiles.
+///
+/// The `listallinfo` walk also yields the parent folder
+/// basename per file at zero extra cost, which feeds
+/// [`album_identity`]'s degenerate-tag fallback without the
+/// previous shape's per-degenerate `find album X` roundtrip.
+///
+/// Cost: for a 100 k-track library `listallinfo` is roughly
+/// one second over the Unix socket (same shape the works /
+/// library-state paths already pay for); small libraries stay
+/// sub-second.
+pub(crate) async fn resolve_album_rows(
+    conn: &mut MpdConnection,
+    verb_name: &'static str,
+) -> Result<Vec<AlbumRow>, VerbError> {
+    let entries = conn.listallinfo("").await.map_err(|e| VerbError::Mpd {
+        verb: verb_name.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    struct Agg {
+        count: u64,
+        folder: String,
+    }
+    let mut aggregates: HashMap<(String, String), Agg> = HashMap::new();
+    for entry in entries {
+        let MpdLibraryEntry::File {
+            path,
+            album,
+            albumartist,
+            artist,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let raw_album = album.unwrap_or_default();
+        // Prefer ALBUMARTIST for the album row's primary
+        // credit (release-level, collab-friendly). Fall back to
+        // the per-track ARTIST tag when ALBUMARTIST is absent —
+        // libraries without release-level metadata still need
+        // some artist to render.
+        let raw_albumartist = albumartist.or(artist).unwrap_or_default();
+        let folder = parent_folder_basename(&path).unwrap_or_default();
+        let key = (raw_album, raw_albumartist);
+        let agg = aggregates.entry(key).or_insert_with(|| Agg {
+            count: 0,
+            folder: folder.clone(),
+        });
+        agg.count = agg.count.saturating_add(1);
+        if agg.folder.is_empty() && !folder.is_empty() {
+            agg.folder = folder;
+        }
+    }
+
+    let mut rows: Vec<AlbumRow> = Vec::with_capacity(aggregates.len());
+    for ((raw_album, raw_albumartist), agg) in aggregates {
+        let identity =
+            album_identity(&raw_album, &raw_albumartist, &agg.folder);
+        rows.push(AlbumRow {
+            raw_album,
+            raw_albumartist,
+            count: agg.count,
+            identity,
+        });
+    }
+    Ok(rows)
+}
+
+/// Extract the last directory component of an MPD-relative
+/// file path. MPD emits forward slashes on every platform, so
+/// this is a pure byte-position operation.
+fn parent_folder_basename(mpd_relative_path: &str) -> Option<String> {
+    let trimmed = mpd_relative_path.trim();
+    let last_slash = trimmed.rfind('/')?;
+    let parent = &trimmed[..last_slash];
+    if parent.is_empty() {
+        return None;
+    }
+    let basename = match parent.rfind('/') {
+        Some(i) => &parent[i + 1..],
+        None => parent,
+    };
+    let trimmed_basename = basename.trim();
+    if trimmed_basename.is_empty() {
+        None
+    } else {
+        Some(trimmed_basename.to_string())
+    }
+}
+
+/// Browse-by-album enumeration.
+///
+/// Resolves canonical [`AlbumIdentity`] for every album row,
+/// groups by `identity.grouping_key`, sums track counts across
+/// grouped rows (multi-disc folds into one tile), and emits
+/// `{album, artist, cover_url, track_count}` tiles sorted
+/// case-insensitively by display title.
+///
+/// The synthesised `cover_url` targets ONE representative raw
+/// album tag from the group — the framework's `mpd-album`
+/// resolver runs `find album X albumartist Y` against MPD, so
+/// the raw tag value must be one that MPD's index still
+/// matches. The tile's DISPLAY is the cleaned identity; the
+/// cover-URL VALUE is a raw form MPD can find.
+async fn enumerate_albums_via_identity(
+    conn: &mut MpdConnection,
+    verb_name: &'static str,
+) -> Result<Vec<serde_json::Value>, VerbError> {
+    let rows = resolve_album_rows(conn, verb_name).await?;
+
+    struct Tile {
+        display: String,
+        representative_raw_album: String,
+        representative_artist: String,
+        total_count: u64,
+    }
+    // Composite key `(album grouping_key, artist fold-key)`:
+    // same-titled albums by different artists stay separate
+    // tiles. Multi-disc variants by the SAME artist fold into
+    // one; multi-disc variants across artists do not (Elton
+    // John's "The Ultimate Collection" and Billy Joel's "The
+    // Ultimate Collection" render as two tiles).
+    let mut tiles: HashMap<(String, String), Tile> = HashMap::new();
+    for row in rows {
+        if row.identity.grouping_key.is_empty() {
+            continue;
+        }
+        let composite_key = (
+            row.identity.grouping_key.clone(),
+            artist_fold_key(&row.raw_albumartist),
+        );
+        let entry = tiles.entry(composite_key).or_insert_with(|| Tile {
+            display: row.identity.display.clone(),
+            representative_raw_album: row.raw_album.clone(),
+            representative_artist: row.raw_albumartist.clone(),
+            total_count: 0,
+        });
+        entry.total_count = entry.total_count.saturating_add(row.count);
+    }
+
+    let mut result: Vec<Tile> = tiles.into_values().collect();
+    result.sort_by(|a, b| {
+        a.display
+            .to_lowercase()
+            .cmp(&b.display.to_lowercase())
+            .then_with(|| a.display.cmp(&b.display))
+    });
+
+    let rendered = result
+        .into_iter()
+        .map(|tile| {
+            let cleaned_artist = if tile.representative_artist.trim().is_empty()
+            {
+                None
+            } else {
+                Some(artist_display_form(&tile.representative_artist))
+            };
             let cover_url =
                 evo_device_audio_shared::artwork_target_url_for_track_sized(
-                    // No file-path fallback for the enumeration
-                    // shape — the mpd-album URL is the identity
-                    // every list-surface row uses, and passing an
-                    // empty file-path guarantees the mpd-album
-                    // branch when both artist + album are present.
+                    // Empty file-path forces the mpd-album branch;
+                    // the resolver runs `find album X albumartist Y`
+                    // against MPD's index using the RAW album tag —
+                    // a form MPD's index still matches — even when
+                    // the tile's DISPLAY has been cleaned by
+                    // `album_identity`.
                     "",
-                    artist.as_deref(),
-                    Some(value),
-                    // Facet tiles render at ~44–88 px; request the
-                    // `small` (300 px) size variant so the browser
-                    // does not pull a 1000×1000 original per tile.
-                    // Hero surfaces (now-playing, album detail)
-                    // synthesise their own URL with `Some("original")`
-                    // or omit the size hint.
+                    cleaned_artist.as_deref(),
+                    Some(&tile.representative_raw_album),
                     Some("small"),
                 );
             json!({
-                "album":       value,
-                "artist":      artist,
+                "album":       tile.display,
+                "artist":      cleaned_artist,
                 "cover_url":   cover_url,
-                "track_count": track_count,
+                "track_count": tile.total_count,
             })
+        })
+        .collect();
+    Ok(rendered)
+}
+
+/// Browse-by-artist enumeration with multi-artist fan-out.
+///
+/// Prior art (MusicBrainz artist-credit model; Roon, Plex,
+/// Apple, Spotify): a joined credit like `A, B & C` is a
+/// multi-artist collaboration — the browse facet lists each
+/// contributor as a first-class tile.
+///
+/// Sources consulted for the tile pool:
+///
+/// 1. The requested `tag` (typically `albumartist`) —
+///    fan-out via [`split_artist_credit`] catches compound
+///    credits placed directly on the album's primary-artist
+///    tag.
+/// 2. When the primary source is `albumartist`, the per-track
+///    `artist` tags are also consulted — this catches
+///    contributors on `ALBUMARTIST="Various Artists"`
+///    compilation albums (Verve-style Paco/Al/John where the
+///    individuals appear only on the per-track tag).
+///
+/// Within a group (a fold-key bucket) the display form is the
+/// most-common cleaned form; ties broken by longest chars so a
+/// diacritic-carrying variant (`Céline Dion`) wins over its
+/// stripped twin (`Celine Dion`).
+async fn enumerate_artists_via_fanout(
+    conn: &mut MpdConnection,
+    tag: &'static str,
+    verb_name: &'static str,
+    post_process: fn(String) -> Option<String>,
+) -> Result<Vec<serde_json::Value>, VerbError> {
+    let primary_raw = conn.list_tag(tag).await.map_err(|e| VerbError::Mpd {
+        verb: verb_name.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let mut groups: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let ingest =
+        |raw: String, groups: &mut HashMap<String, HashMap<String, usize>>| {
+            for member in split_artist_credit(&raw) {
+                let key = artist_fold_key(&member);
+                if key.is_empty() {
+                    continue;
+                }
+                *groups.entry(key).or_default().entry(member).or_insert(0) += 1;
+            }
+        };
+
+    for raw in primary_raw.into_iter().filter_map(post_process) {
+        ingest(raw, &mut groups);
+    }
+    if tag == "albumartist" {
+        let secondary_raw =
+            conn.list_tag("artist").await.map_err(|e| VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: e.to_string(),
+            })?;
+        for raw in secondary_raw {
+            ingest(raw, &mut groups);
         }
-        "artist" => {
-            let trimmed = value.trim();
-            // Dispatch hint the UI fires per visible tile via
-            // its normal wire-op client. Names the shelf and
-            // request type verbatim — no framework surface
-            // learns about artist artwork, and the UI never
-            // learns which providers back the response. Empty /
-            // whitespace-only names skip the hint so the UI does
-            // not fire a request that can only bad-request.
-            // Payload artist is the cleaned display form (caller
-            // already ran `artist_display_form`), so MB reconcile
-            // is not poisoned by `A/A` or `(Album)` tag junk.
+    }
+
+    let mut displays: Vec<String> = groups
+        .into_values()
+        .filter_map(|forms| {
+            forms
+                .into_iter()
+                .max_by(|a, b| {
+                    a.1.cmp(&b.1).then_with(|| {
+                        a.0.chars().count().cmp(&b.0.chars().count())
+                    })
+                })
+                .map(|(display, _)| display)
+        })
+        .collect();
+    displays.sort_by_key(|a| a.to_lowercase());
+
+    let rendered = displays
+        .into_iter()
+        .map(|display| {
+            let trimmed = display.trim();
             let artwork_lookup = if trimmed.is_empty() {
                 None
             } else {
@@ -1232,17 +1343,6 @@ fn render_facet_entry(
                     "payload":      { "v": 1, "artist": trimmed },
                 }))
             };
-            // Byte-cached endpoint URL for the artist portrait
-            // — routes through the framework artwork endpoint's
-            // `artist-name` scheme, which dispatches to
-            // `artwork.resolve_artist_online` for a
-            // fetch + transcode + AssetCache push, then
-            // 302-redirects to `/api/v1/audio/artwork/<hash>`.
-            // The glass renders this URL as a plain `<img src>`;
-            // subsequent renders serve from the local device with
-            // no external CDN hop. `artwork_lookup` remains for
-            // consumers that want the raw external URL (Deezer
-            // live-fetch fallback, operator debug surface).
             let cover_url = if trimmed.is_empty() {
                 None
             } else {
@@ -1253,13 +1353,43 @@ fn render_facet_entry(
                 ))
             };
             json!({
-                "artist":         value,
+                "artist":         display,
                 "cover_url":      cover_url,
                 "artwork_lookup": artwork_lookup,
             })
-        }
-        _ => json!({ facet_key: value }),
-    }
+        })
+        .collect();
+    Ok(rendered)
+}
+
+/// Generic-facet enumeration (genre / year).
+///
+/// Fetches the raw tag list, applies the post-process
+/// transformation (year extraction from MPD's `date` tag),
+/// deduplicates, sorts case-insensitively, and emits
+/// `{<facet_key>: value}` records.
+async fn enumerate_generic_facet(
+    conn: &mut MpdConnection,
+    tag: &'static str,
+    facet_key: &'static str,
+    verb_name: &'static str,
+    post_process: fn(String) -> Option<String>,
+) -> Result<Vec<serde_json::Value>, VerbError> {
+    let raw_values = conn.list_tag(tag).await.map_err(|e| VerbError::Mpd {
+        verb: verb_name.to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    let mut processed: Vec<String> = raw_values
+        .into_iter()
+        .filter_map(post_process)
+        .filter(|v| seen.insert(v.clone()))
+        .collect();
+    processed.sort_by_key(|a| a.to_lowercase());
+    Ok(processed
+        .into_iter()
+        .map(|v| json!({ facet_key: v }))
+        .collect())
 }
 
 /// Drill path for [`handle_browse_by_tag`]. Issues an MPD
@@ -1307,92 +1437,153 @@ async fn drill_by_tag(
                 reason: e.to_string(),
             })?
     } else if tag == "albumartist" {
-        // Artist facet drill: the enumeration folded diacritic /
-        // punctuation / sort-form variants into one entry, so
-        // the selector value is only one of the raw tag forms.
-        // Union every raw form whose fold-key matches — a
-        // single MPD `list albumartist` roundtrip plus one
-        // `find` per matching form. Typical library carries
-        // 1-3 raw forms per real artist.
-        let raw_forms =
+        // Artist facet drill.
+        //
+        // The enumeration path fanned multi-artist credits out
+        // via [`split_artist_credit`] AND consulted per-track
+        // ARTIST tags (Various-Artists fallback for Verve-style
+        // compilations), so the selector may name an
+        // individual whose fold-key does not equal any full raw
+        // ALBUMARTIST / ARTIST tag. Match rows in both sources
+        // whose split members contain the target key. Typical
+        // library carries a handful of raw forms per real
+        // artist across both tags; a single MPD `find` per
+        // matching raw form covers every track.
+        let target_key = artist_fold_key(selector_value);
+        if target_key.is_empty() {
+            return Err(VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: "browse selector value did not fold to a match key"
+                    .to_string(),
+            });
+        }
+        let raw_albumartists =
             conn.list_tag("albumartist")
                 .await
                 .map_err(|e| VerbError::Mpd {
                     verb: verb_name.to_string(),
                     reason: e.to_string(),
                 })?;
-        let target_key = artist_fold_key(selector_value);
-        let matching: Vec<String> = raw_forms
+        let matching_albumartist: Vec<String> = raw_albumartists
             .into_iter()
-            .filter(|raw| artist_fold_key(raw) == target_key)
+            .filter(|raw| {
+                split_artist_credit(raw)
+                    .iter()
+                    .any(|m| artist_fold_key(m) == target_key)
+            })
             .collect();
-        if matching.is_empty() {
-            Vec::new()
-        } else {
-            match selector.parent.as_ref() {
-                None => {
-                    let mut all = Vec::new();
-                    for raw in &matching {
-                        let batch = conn
-                            .find(crate::mpd::MpdSearchField::AlbumArtist, raw)
-                            .await
-                            .map_err(|e| VerbError::Mpd {
-                                verb: verb_name.to_string(),
-                                reason: e.to_string(),
-                            })?;
-                        all.extend(batch);
-                    }
-                    all
-                }
-                Some(parent) => {
-                    let parent_tag = parent.tag.trim().to_ascii_lowercase();
-                    let parent_value = parent.value.trim();
-                    if parent_value.is_empty() {
-                        return Err(VerbError::Mpd {
-                            verb: verb_name.to_string(),
-                            reason: "parent context value must be non-empty"
-                                .to_string(),
-                        });
-                    }
-                    let parent_field = match parent_tag.as_str() {
-                        "album" => crate::mpd::MpdSearchField::Album,
-                        "albumartist" => {
-                            crate::mpd::MpdSearchField::AlbumArtist
-                        }
-                        "artist" => crate::mpd::MpdSearchField::Artist,
-                        "genre" => crate::mpd::MpdSearchField::Genre,
-                        other => {
-                            return Err(VerbError::Mpd {
-                                verb: verb_name.to_string(),
-                                reason: format!(
-                                    "parent tag {other:?} is not supported"
-                                ),
-                            });
-                        }
-                    };
-                    let mut all = Vec::new();
-                    for raw in &matching {
-                        let batch = conn
-                            .find_multi(&[
-                                (crate::mpd::MpdSearchField::AlbumArtist, raw),
-                                (parent_field.clone(), parent_value),
-                            ])
-                            .await
-                            .map_err(|e| VerbError::Mpd {
-                                verb: verb_name.to_string(),
-                                reason: e.to_string(),
-                            })?;
-                        all.extend(batch);
-                    }
-                    all
-                }
-            }
+        let raw_artists =
+            conn.list_tag("artist").await.map_err(|e| VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: e.to_string(),
+            })?;
+        let matching_artist: Vec<String> = raw_artists
+            .into_iter()
+            .filter(|raw| {
+                split_artist_credit(raw)
+                    .iter()
+                    .any(|m| artist_fold_key(m) == target_key)
+            })
+            .collect();
+
+        let parent_ctx = build_parent_field(selector, verb_name)?;
+        let mut all: Vec<MpdLibraryEntry> = Vec::new();
+        for raw in &matching_albumartist {
+            let batch = match &parent_ctx {
+                None => conn
+                    .find(MpdSearchField::AlbumArtist, raw)
+                    .await
+                    .map_err(|e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    })?,
+                Some((field, value)) => conn
+                    .find_multi(&[
+                        (MpdSearchField::AlbumArtist, raw),
+                        (field.clone(), value),
+                    ])
+                    .await
+                    .map_err(|e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    })?,
+            };
+            all.extend(batch);
         }
+        for raw in &matching_artist {
+            let batch = match &parent_ctx {
+                None => conn.find(MpdSearchField::Artist, raw).await.map_err(
+                    |e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    },
+                )?,
+                Some((field, value)) => conn
+                    .find_multi(&[
+                        (MpdSearchField::Artist, raw),
+                        (field.clone(), value),
+                    ])
+                    .await
+                    .map_err(|e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    })?,
+            };
+            all.extend(batch);
+        }
+        dedupe_entries_by_path(all)
+    } else if tag == "album" {
+        // Album facet drill.
+        //
+        // The enumeration path grouped raw ALBUM tags by
+        // [`AlbumIdentity::grouping_key`], collapsing multi-disc
+        // variants and falling back to the parent folder for
+        // degenerate tags. The selector value is the tile's
+        // DISPLAY (cleaned title) — match every raw album whose
+        // resolved identity groups to the selected key, then
+        // union `find album X` batches across the matches.
+        let target_key = album_identity(selector_value, "", "").grouping_key;
+        if target_key.is_empty() {
+            return Err(VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: "browse selector value did not fold to a match key"
+                    .to_string(),
+            });
+        }
+        let rows = resolve_album_rows(conn, verb_name).await?;
+        let matching: Vec<String> = rows
+            .into_iter()
+            .filter(|r| r.identity.grouping_key == target_key)
+            .map(|r| r.raw_album)
+            .collect();
+        let parent_ctx = build_parent_field(selector, verb_name)?;
+        let mut all: Vec<MpdLibraryEntry> = Vec::new();
+        for raw in &matching {
+            let batch = match &parent_ctx {
+                None => conn.find(MpdSearchField::Album, raw).await.map_err(
+                    |e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    },
+                )?,
+                Some((field, value)) => conn
+                    .find_multi(&[
+                        (MpdSearchField::Album, raw),
+                        (field.clone(), value),
+                    ])
+                    .await
+                    .map_err(|e| VerbError::Mpd {
+                        verb: verb_name.to_string(),
+                        reason: e.to_string(),
+                    })?,
+            };
+            all.extend(batch);
+        }
+        dedupe_entries_by_path(all)
     } else {
         let field = match tag {
-            "album" => crate::mpd::MpdSearchField::Album,
-            "artist" => crate::mpd::MpdSearchField::Artist,
-            "genre" => crate::mpd::MpdSearchField::Genre,
+            "artist" => MpdSearchField::Artist,
+            "genre" => MpdSearchField::Genre,
             _ => {
                 return Err(VerbError::Mpd {
                     verb: verb_name.to_string(),
@@ -1420,10 +1611,10 @@ async fn drill_by_tag(
                     });
                 }
                 let parent_field = match parent_tag.as_str() {
-                    "album" => crate::mpd::MpdSearchField::Album,
-                    "albumartist" => crate::mpd::MpdSearchField::AlbumArtist,
-                    "artist" => crate::mpd::MpdSearchField::Artist,
-                    "genre" => crate::mpd::MpdSearchField::Genre,
+                    "album" => MpdSearchField::Album,
+                    "albumartist" => MpdSearchField::AlbumArtist,
+                    "artist" => MpdSearchField::Artist,
+                    "genre" => MpdSearchField::Genre,
                     other => {
                         return Err(VerbError::Mpd {
                             verb: verb_name.to_string(),
@@ -1479,6 +1670,70 @@ async fn drill_by_tag(
     }))
 }
 
+/// Resolve the drill's optional parent-context selector into
+/// the MPD `(field, value)` pair used by `find_multi`.
+///
+/// Returns `Ok(None)` when the selector has no parent. Returns
+/// `Err` when the parent value is empty (an operator UI bug —
+/// the parent should always name a non-empty value) or when
+/// the parent tag is not a browseable dimension.
+fn build_parent_field<'a>(
+    selector: &'a BrowseSelector,
+    verb_name: &'static str,
+) -> Result<Option<(MpdSearchField, &'a str)>, VerbError> {
+    let Some(parent) = selector.parent.as_ref() else {
+        return Ok(None);
+    };
+    let parent_value = parent.value.trim();
+    if parent_value.is_empty() {
+        return Err(VerbError::Mpd {
+            verb: verb_name.to_string(),
+            reason: "parent context value must be non-empty".to_string(),
+        });
+    }
+    let parent_tag = parent.tag.trim().to_ascii_lowercase();
+    let parent_field = match parent_tag.as_str() {
+        "album" => MpdSearchField::Album,
+        "albumartist" => MpdSearchField::AlbumArtist,
+        "artist" => MpdSearchField::Artist,
+        "genre" => MpdSearchField::Genre,
+        other => {
+            return Err(VerbError::Mpd {
+                verb: verb_name.to_string(),
+                reason: format!("parent tag {other:?} is not supported"),
+            });
+        }
+    };
+    Ok(Some((parent_field, parent_value)))
+}
+
+/// Deduplicate a list of MPD library entries by their file
+/// path.
+///
+/// The multi-source drill fetches from more than one MPD raw
+/// tag form (a real artist that lands in both ALBUMARTIST and
+/// per-track ARTIST tags surfaces the same track twice). The
+/// order of the first occurrence is preserved so the drill's
+/// output ordering is deterministic.
+fn dedupe_entries_by_path(
+    entries: Vec<MpdLibraryEntry>,
+) -> Vec<MpdLibraryEntry> {
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut out: Vec<MpdLibraryEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match &entry {
+            MpdLibraryEntry::File { path, .. } => {
+                if seen.insert(path.clone()) {
+                    out.push(entry);
+                }
+            }
+            _ => out.push(entry),
+        }
+    }
+    out
+}
+
 /// Extract the four-character year from MPD's `date` tag,
 /// tolerating any of the shapes MPD emits (`YYYY`, `YYYY-MM`,
 /// `YYYY-MM-DD`). Returns `None` when the tag doesn't start
@@ -1501,8 +1756,11 @@ pub(crate) fn identity_post_process(raw: String) -> Option<String> {
     Some(raw)
 }
 
+pub(crate) use evo_device_audio_shared::album_name::{
+    album_identity, AlbumIdentity,
+};
 pub(crate) use evo_device_audio_shared::artist_name::{
-    artist_display_form, artist_fold_key,
+    artist_display_form, artist_fold_key, split_artist_credit,
 };
 
 /// Slice a full entry list into the requested page.
@@ -1620,6 +1878,7 @@ fn render_library_entry(entry: &MpdLibraryEntry) -> serde_json::Value {
             album,
             duration,
             classical,
+            ..
         } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
             json!({

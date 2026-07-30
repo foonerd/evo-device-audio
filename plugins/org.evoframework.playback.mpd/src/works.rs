@@ -491,6 +491,7 @@ mod tests {
             path: path.to_string(),
             title: None,
             artist: None,
+            albumartist: None,
             album: album.map(String::from),
             duration: duration_ms.map(Duration::from_millis),
             classical,

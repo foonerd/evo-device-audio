@@ -611,8 +611,13 @@ pub enum MpdLibraryEntry {
         path: String,
         /// Track title tag.
         title: Option<String>,
-        /// Artist tag.
+        /// Artist tag (per-track credit; on collaboration
+        /// releases this differs from `albumartist`).
         artist: Option<String>,
+        /// Album-artist tag (release-level primary credit;
+        /// distinct from the per-track `artist` on
+        /// compilations and collaborations).
+        albumartist: Option<String>,
         /// Album tag.
         album: Option<String>,
         /// Track duration.
