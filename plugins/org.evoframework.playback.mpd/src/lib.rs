@@ -120,6 +120,7 @@ mod mpd_restart;
 mod playback_supervisor;
 mod playlist;
 mod queue;
+mod selection;
 mod shelves;
 mod skip_traversal;
 mod source_probe;
@@ -243,6 +244,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "queue.save_queue_as_playlist",
     "queue.skip_to_next_available",
     "queue.play_from_position",
+    "queue.enqueue_selection",
     // audio.playlist.v1 shelf verbs
     "playlist.list_playlists",
     "playlist.get_playlist",
@@ -252,6 +254,7 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "playlist.add_to_playlist",
     "playlist.remove_from_playlist",
     "playlist.move_in_playlist",
+    "playlist.save_selection",
     // audio.favourites.v1 shelf verbs
     "favourites.list_favourites",
     "favourites.is_favourite",

@@ -508,6 +508,9 @@ impl ShelfBundle {
             "queue.play_from_position" => {
                 Ok(Some(self.dispatch_queue_play_from_position(req).await?))
             }
+            "queue.enqueue_selection" => {
+                Ok(Some(self.dispatch_queue_enqueue_selection(req).await?))
+            }
             // Playlist verbs
             "playlist.list_playlists" => {
                 Ok(Some(self.dispatch_playlist_list_playlists(req).await?))
@@ -532,6 +535,9 @@ impl ShelfBundle {
             )),
             "playlist.move_in_playlist" => {
                 Ok(Some(self.dispatch_playlist_move_in_playlist(req).await?))
+            }
+            "playlist.save_selection" => {
+                Ok(Some(self.dispatch_playlist_save_selection(req).await?))
             }
             // Favourites verbs
             "favourites.list_favourites" => {
@@ -759,6 +765,24 @@ impl ShelfBundle {
         encode_ok_response(req)
     }
 
+    async fn dispatch_queue_enqueue_selection(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: queue::EnqueueSelectionPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let resolver = crate::selection::MpdSelectionResolver;
+        let body = queue::handle_enqueue_selection(
+            &self.queue,
+            &mut conn,
+            &resolver,
+            payload,
+        )
+        .await
+        .map_err(queue_verb_to_plugin_error)?;
+        encode_json_response(req, &body)
+    }
+
     // ----- playlist dispatchers -----
 
     async fn dispatch_playlist_list_playlists(
@@ -856,6 +880,24 @@ impl ShelfBundle {
             .await
             .map_err(playlist_verb_to_plugin_error)?;
         encode_ok_response(req)
+    }
+
+    async fn dispatch_playlist_save_selection(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: playlist::SaveSelectionPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let resolver = crate::selection::MpdSelectionResolver;
+        let body = playlist::handle_save_selection(
+            &self.playlist,
+            &mut conn,
+            &resolver,
+            payload,
+        )
+        .await
+        .map_err(playlist_verb_to_plugin_error)?;
+        encode_json_response(req, &body)
     }
 
     // ----- favourites dispatchers -----

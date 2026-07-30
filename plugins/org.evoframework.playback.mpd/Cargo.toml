@@ -36,6 +36,10 @@ tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# async_trait is used by the SelectionResolver seam so a
+# future non-MPD source (UPnP/DLNA ContentDirectory) can
+# implement the trait without duck-typing.
+async-trait = "0.1"
 # Source-verb request/response payload encoding. play_now and the
 # rest of the source-verb surface ship typed payloads as UTF-8 JSON
 # (per the audio.playback shape contract).

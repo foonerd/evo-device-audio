@@ -68,7 +68,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::mpd::MpdConnection;
+use crate::library::LIBRARY_PAYLOAD_VERSION;
+use crate::mpd::{MpdConnection, MpdLibraryEntry};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
 
@@ -407,6 +408,56 @@ pub(crate) struct EnqueuePayload {
     pub(crate) position: Option<u32>,
 }
 
+/// `queue.enqueue_selection` request payload — multi-
+/// dimensional server-side resolution. The UI passes a
+/// selection criteria + mode; the plugin resolves via the
+/// [`crate::selection::SelectionResolver`] seam and applies
+/// the resulting URI set atomically. No URI list crosses the
+/// wire from UI to plugin.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EnqueueSelectionPayload {
+    /// Envelope version.
+    pub(crate) v: u32,
+    /// Selection criteria (dimension + value + optional
+    /// parent context). Same shape as the browse drill's
+    /// `BrowseSelector`.
+    pub(crate) selection: crate::selection::SelectionCriteria,
+    /// Mode: `replace` clears + adds + plays atomically;
+    /// `next` inserts after the currently-playing item;
+    /// `append` adds to the tail.
+    #[serde(default)]
+    pub(crate) mode: EnqueueSelectionMode,
+}
+
+/// Mode for [`EnqueueSelectionPayload`].
+///
+/// - `Append` (default) — add at the tail of the current
+///   queue.
+/// - `Next` — insert after the currently-playing item; the
+///   verb resolves URIs first (materialising a filter via
+///   `find` when needed) so it can position each add.
+/// - `Replace` — atomic clear + add + play in one MPD
+///   command list; on resolution failure the existing queue
+///   is left intact (all-or-nothing).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EnqueueSelectionMode {
+    #[default]
+    Append,
+    Next,
+    Replace,
+}
+
+impl EnqueueSelectionMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EnqueueSelectionMode::Append => "append",
+            EnqueueSelectionMode::Next => "next",
+            EnqueueSelectionMode::Replace => "replace",
+        }
+    }
+}
+
 /// `queue.remove_queue_item` request payload.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RemoveQueueItemPayload {
@@ -613,6 +664,263 @@ pub(crate) async fn handle_enqueue(
     }
     publish_queue(ctx, conn).await;
     Ok(())
+}
+
+/// `queue.enqueue_selection` — server-side resolve + apply.
+///
+/// The verb dispatches the selection to a
+/// [`crate::selection::SelectionResolver`] chosen by the
+/// caller's `source_id` (today: MPD-only, so the resolver is
+/// [`crate::selection::MpdSelectionResolver`]). The
+/// [`crate::selection::ResolvedSelection`] is applied
+/// according to `mode`:
+///
+/// - `Replace` — atomic `command_list_begin, clear,
+///   findadd/searchadd/add..., play, command_list_end`. On
+///   resolution failure the existing queue is left intact.
+///   On zero-match the queue is left intact and the response
+///   returns `status: "empty"` — never a silent clear.
+/// - `Append` — `findadd/searchadd` (Filter) or `add`-loop
+///   (UriList) at the tail. One MPD roundtrip.
+/// - `Next` — insert at `status.song + 1`. Filter is
+///   materialised via `find` first because MPD's `findadd`
+///   goes to end. Each URI is `addid`ed at an incrementing
+///   position.
+///
+/// Returns a structured response with `status`, `mode`,
+/// `dimension`, `added_uris_count`, `queue_pos_start`.
+pub(crate) async fn handle_enqueue_selection(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    resolver: &dyn crate::selection::SelectionResolver,
+    payload: EnqueueSelectionPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "queue.enqueue_selection")?;
+    let dimension_label = payload.selection.dimension.as_str().to_string();
+    let mode_label = payload.mode.as_str().to_string();
+    let resolved =
+        resolver
+            .resolve(conn, &payload.selection)
+            .await
+            .map_err(|e| VerbError::Mpd {
+                verb: "enqueue_selection".to_string(),
+                reason: e.to_string(),
+            })?;
+    // Zero-match short-circuit — explicit empty, queue left
+    // intact, no atomic clear. For `Filter` selections the
+    // resolver's `is_empty` only catches the "no pairs"
+    // shape; the actual match count requires an MPD `count`
+    // roundtrip (cheap — MPD answers with one songs line).
+    let is_empty = match &resolved {
+        crate::selection::ResolvedSelection::UriList(list) => list.is_empty(),
+        crate::selection::ResolvedSelection::Filter { pairs, .. } => {
+            let pairs_ref: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(t, v)| (t.as_str(), v.as_str()))
+                .collect();
+            conn.count_matching(&pairs_ref).await.map_err(|e| {
+                VerbError::Mpd {
+                    verb: "enqueue_selection".to_string(),
+                    reason: e.to_string(),
+                }
+            })? == 0
+        }
+    };
+    if is_empty {
+        return Ok(serde_json::json!({
+            "v":                LIBRARY_PAYLOAD_VERSION,
+            "status":           "empty",
+            "mode":             mode_label,
+            "dimension":        dimension_label,
+            "added_uris_count": 0,
+            "detail":           "selection matched zero tracks; queue unchanged",
+        }));
+    }
+    // Materialise the URI list for `Next` (and for reporting
+    // added-count) — MPD's `findadd` cannot target a
+    // position. For `Append` / `Replace` a Filter runs
+    // as-is via findadd/searchadd for a single roundtrip.
+    let materialise_needed = matches!(payload.mode, EnqueueSelectionMode::Next);
+    let uris: Vec<String> = if materialise_needed {
+        materialise_to_uris(conn, &resolved).await.map_err(|e| {
+            VerbError::Mpd {
+                verb: "enqueue_selection".to_string(),
+                reason: e.to_string(),
+            }
+        })?
+    } else {
+        match &resolved {
+            crate::selection::ResolvedSelection::UriList(list) => list.clone(),
+            crate::selection::ResolvedSelection::Filter { .. } => Vec::new(),
+        }
+    };
+    match payload.mode {
+        EnqueueSelectionMode::Append => {
+            apply_append(conn, &resolved, &uris).await?;
+        }
+        EnqueueSelectionMode::Next => {
+            let start_pos = current_song_position(conn).await? + 1;
+            let mut current = start_pos;
+            for uri in &uris {
+                conn.addid(uri, Some(current)).await.map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                current = current.saturating_add(1);
+            }
+        }
+        EnqueueSelectionMode::Replace => {
+            apply_replace(conn, &resolved, &uris).await?;
+        }
+    }
+    publish_queue(ctx, conn).await;
+    let added = if uris.is_empty() {
+        // Filter path (Append) — MPD executed one findadd/searchadd;
+        // we do not have an exact count without a follow-up status
+        // read. Report `null` in that case; the queue subject
+        // subscribers see the actual tracks arriving.
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(uris.len())
+    };
+    Ok(serde_json::json!({
+        "v":                LIBRARY_PAYLOAD_VERSION,
+        "status":           "ok",
+        "mode":             mode_label,
+        "dimension":        dimension_label,
+        "added_uris_count": added,
+    }))
+}
+
+async fn apply_append(
+    conn: &mut MpdConnection,
+    resolved: &crate::selection::ResolvedSelection,
+    uris: &[String],
+) -> Result<(), VerbError> {
+    match resolved {
+        crate::selection::ResolvedSelection::Filter { pairs, substring } => {
+            let pairs_ref: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(t, v)| (t.as_str(), v.as_str()))
+                .collect();
+            let result = if *substring {
+                conn.searchadd(&pairs_ref).await
+            } else {
+                conn.findadd(&pairs_ref).await
+            };
+            result.map_err(|e| VerbError::Mpd {
+                verb: "enqueue_selection".to_string(),
+                reason: e.to_string(),
+            })
+        }
+        crate::selection::ResolvedSelection::UriList(_) => {
+            for uri in uris {
+                conn.add(uri).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".to_string(),
+                    reason: e.to_string(),
+                })?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn apply_replace(
+    conn: &mut MpdConnection,
+    resolved: &crate::selection::ResolvedSelection,
+    uris: &[String],
+) -> Result<(), VerbError> {
+    // Atomic replace: clear + add* + play in one MPD
+    // command list. On resolution failure the earlier `resolve`
+    // step already returned Err and the queue was never
+    // touched.
+    let mut commands: Vec<(&str, Vec<String>)> = vec![("clear", Vec::new())];
+    match resolved {
+        crate::selection::ResolvedSelection::Filter { pairs, substring } => {
+            let cmd = if *substring { "searchadd" } else { "findadd" };
+            let args: Vec<String> = pairs
+                .iter()
+                .flat_map(|(t, v)| [t.clone(), v.clone()])
+                .collect();
+            commands.push((cmd, args));
+        }
+        crate::selection::ResolvedSelection::UriList(_) => {
+            for uri in uris {
+                commands.push(("add", vec![uri.clone()]));
+            }
+        }
+    }
+    // Play from position 0 explicitly. MPD's plain `play`
+    // uses the queue's `song_position` pointer, which can
+    // retain a stale index from a pre-clear state; the
+    // observed symptom was a Replace landing playback in the
+    // middle of the newly-loaded queue. `play 0` starts at
+    // the top of the freshly-materialised selection every
+    // time.
+    commands.push(("play", vec!["0".to_string()]));
+    conn.command_list(&commands)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "enqueue_selection".to_string(),
+            reason: e.to_string(),
+        })
+}
+
+async fn materialise_to_uris(
+    conn: &mut MpdConnection,
+    resolved: &crate::selection::ResolvedSelection,
+) -> Result<Vec<String>, crate::mpd::MpdError> {
+    match resolved {
+        crate::selection::ResolvedSelection::UriList(list) => Ok(list.clone()),
+        crate::selection::ResolvedSelection::Filter { pairs, substring } => {
+            let pairs_ref: Vec<(crate::mpd::MpdSearchField, &str)> = pairs
+                .iter()
+                .filter_map(|(t, v)| {
+                    let field = match t.as_str() {
+                        "artist" => crate::mpd::MpdSearchField::Artist,
+                        "albumartist" => {
+                            crate::mpd::MpdSearchField::AlbumArtist
+                        }
+                        "album" => crate::mpd::MpdSearchField::Album,
+                        "genre" => crate::mpd::MpdSearchField::Genre,
+                        "date" => crate::mpd::MpdSearchField::Date,
+                        _ => return None,
+                    };
+                    Some((field, v.as_str()))
+                })
+                .collect();
+            let entries = if *substring {
+                // `search` semantics for substring; single-pair
+                // shape covers the year case.
+                if let Some((field, value)) = pairs_ref.first() {
+                    conn.search(field.clone(), value).await?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                conn.find_multi(&pairs_ref).await?
+            };
+            Ok(entries
+                .into_iter()
+                .filter_map(|e| match e {
+                    MpdLibraryEntry::File { path, .. } => Some(path),
+                    _ => None,
+                })
+                .collect())
+        }
+    }
+}
+
+async fn current_song_position(
+    conn: &mut MpdConnection,
+) -> Result<u32, VerbError> {
+    let status = conn.status().await.map_err(|e| VerbError::Mpd {
+        verb: "enqueue_selection".to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(status.song_position.unwrap_or(0))
 }
 
 /// `queue.remove_queue_item` — delete by songid.

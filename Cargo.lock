@@ -3824,6 +3824,7 @@ name = "org-evoframework-playback-mpd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "evo-device-audio-shared",
  "evo-mpd-shared",
  "evo-plugin-sdk",

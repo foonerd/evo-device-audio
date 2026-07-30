@@ -737,6 +737,128 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Count tracks that match a tag filter without
+    /// materialising the URI list. One MPD roundtrip.
+    ///
+    /// Wire form: `count TAG1 "V1" [TAG2 "V2" ...]\n`. MPD
+    /// responds with a `songs:` line + `playtime:` line;
+    /// this method returns the parsed songs count.
+    ///
+    /// Used by the `queue.enqueue_selection` and
+    /// `playlist.save_selection` verbs to detect a
+    /// zero-match Filter selection before dispatching the
+    /// mutating `findadd` / `searchaddpl` — so the caller
+    /// can surface an explicit empty response instead of a
+    /// silent no-op.
+    pub async fn count_matching(
+        &mut self,
+        pairs: &[(&str, &str)],
+    ) -> Result<u64, MpdError> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(pairs.len() * 2);
+        for (tag, value) in pairs {
+            args.push(tag);
+            args.push(value);
+        }
+        let fields = self.dispatch("count", &args).await?;
+        for f in &fields {
+            if f.key == "songs" {
+                return f.value.trim().parse::<u64>().map_err(|_| {
+                    MpdError::Protocol(ProtocolError::UnparseableField {
+                        field: "songs",
+                        value: f.value.clone(),
+                    })
+                });
+            }
+        }
+        Ok(0)
+    }
+
+    /// Resolve a tag-filter to a track set and add every match
+    /// to the CURRENT queue, in MPD's canonical order (disc-
+    /// then-track within album, album order within artist).
+    /// One MPD roundtrip — no per-track URI dispatch.
+    ///
+    /// Wire form: `findadd TAG1 "V1" [TAG2 "V2" ...]\n`. Empty
+    /// pairs is a no-op (no wire dispatch).
+    ///
+    /// Used by the `queue.enqueue_selection` verb for
+    /// dimensions that map cleanly to an MPD tag filter
+    /// (`artist`, `albumartist`, `genre`, exact `date`).
+    /// Substring dimensions (`year` against `date` = `1996-05`)
+    /// use [`Self::searchadd`] instead.
+    pub async fn findadd(
+        &mut self,
+        pairs: &[(&str, &str)],
+    ) -> Result<(), MpdError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(pairs.len() * 2);
+        for (tag, value) in pairs {
+            args.push(tag);
+            args.push(value);
+        }
+        self.dispatch("findadd", &args).await?;
+        Ok(())
+    }
+
+    /// Substring-match variant of [`Self::findadd`]. Resolves
+    /// `TAG` values that contain the given substring
+    /// (case-insensitive per MPD's `search` semantics) and
+    /// adds every match to the CURRENT queue.
+    ///
+    /// Wire form: `searchadd TAG1 "V1" [TAG2 "V2" ...]\n`.
+    ///
+    /// Used for the `year` dimension against MPD's `date` tag
+    /// so a track tagged `1996-05-13` matches the operator's
+    /// `1996` bucket without listing every date suffix.
+    pub async fn searchadd(
+        &mut self,
+        pairs: &[(&str, &str)],
+    ) -> Result<(), MpdError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(pairs.len() * 2);
+        for (tag, value) in pairs {
+            args.push(tag);
+            args.push(value);
+        }
+        self.dispatch("searchadd", &args).await?;
+        Ok(())
+    }
+
+    /// Substring-match resolve + write to a STORED playlist.
+    /// Creates the playlist if it doesn't exist; appends to it
+    /// if it does. One MPD roundtrip.
+    ///
+    /// Wire form: `searchaddpl "<name>" TAG1 "V1" [TAG2 "V2" ...]\n`.
+    ///
+    /// Used by the `playlist.save_selection` verb. The
+    /// `mode = "create"` variant uses [`Self::playlistclear`]
+    /// (or delete) via a command list before this call so the
+    /// playlist starts empty.
+    pub async fn searchaddpl(
+        &mut self,
+        name: &str,
+        pairs: &[(&str, &str)],
+    ) -> Result<(), MpdError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(pairs.len() * 2 + 1);
+        args.push(name);
+        for (tag, value) in pairs {
+            args.push(tag);
+            args.push(value);
+        }
+        self.dispatch("searchaddpl", &args).await?;
+        Ok(())
+    }
+
     /// Remove an entry from a stored playlist by position.
     ///
     /// Wire form: `playlistdelete "<name>" "<position>"\n`.

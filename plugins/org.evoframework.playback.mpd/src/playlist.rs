@@ -708,6 +708,176 @@ pub(crate) async fn handle_add_to_playlist(
     Ok(())
 }
 
+/// `playlist.save_selection` request payload — server-side
+/// resolve + write into a stored playlist. Mirrors the
+/// `queue.enqueue_selection` contract for the playlist
+/// surface.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SaveSelectionPayload {
+    /// Envelope version.
+    pub(crate) v: u32,
+    /// Stored playlist name to write into.
+    pub(crate) playlist_name: String,
+    /// Selection criteria.
+    pub(crate) selection: crate::selection::SelectionCriteria,
+    /// Mode: `create` clears the playlist before adding
+    /// (creates it if absent); `append` adds to the existing
+    /// playlist (creates it if absent).
+    #[serde(default)]
+    pub(crate) mode: SaveSelectionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SaveSelectionMode {
+    #[default]
+    Create,
+    Append,
+}
+
+impl SaveSelectionMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SaveSelectionMode::Create => "create",
+            SaveSelectionMode::Append => "append",
+        }
+    }
+}
+
+/// `playlist.save_selection` — server-side resolve + write.
+///
+/// Resolves the selection via
+/// [`crate::selection::SelectionResolver`] (routed by
+/// `source_id`), then writes into the stored playlist via
+/// MPD's `searchaddpl` (Filter) or `playlistadd`-loop
+/// (UriList). `Create` mode clears the playlist first via a
+/// `command_list` batch so the write is atomic-ish.
+///
+/// Zero-match returns `status: "empty"`; the playlist is not
+/// modified in that case (Create mode does NOT clear on
+/// zero-match).
+pub(crate) async fn handle_save_selection(
+    ctx: &PlaylistContext,
+    conn: &mut MpdConnection,
+    resolver: &dyn crate::selection::SelectionResolver,
+    payload: SaveSelectionPayload,
+) -> Result<serde_json::Value, VerbError> {
+    check_version(payload.v, "playlist.save_selection")?;
+    validate_playlist_name(&payload.playlist_name)?;
+    let dimension_label = payload.selection.dimension.as_str().to_string();
+    let mode_label = payload.mode.as_str().to_string();
+    let resolved =
+        resolver
+            .resolve(conn, &payload.selection)
+            .await
+            .map_err(|e| VerbError::Mpd {
+                verb: "save_selection".to_string(),
+                reason: e.to_string(),
+            })?;
+    // Same pattern as `queue.enqueue_selection`: Filter's
+    // `is_empty` misses the actual match count, so a one-
+    // roundtrip MPD `count` confirms whether the selection
+    // resolves to zero tracks before the mutating write.
+    let is_empty = match &resolved {
+        crate::selection::ResolvedSelection::UriList(list) => list.is_empty(),
+        crate::selection::ResolvedSelection::Filter { pairs, .. } => {
+            let pairs_ref: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(t, v)| (t.as_str(), v.as_str()))
+                .collect();
+            conn.count_matching(&pairs_ref).await.map_err(|e| {
+                VerbError::Mpd {
+                    verb: "save_selection".to_string(),
+                    reason: e.to_string(),
+                }
+            })? == 0
+        }
+    };
+    if is_empty {
+        return Ok(serde_json::json!({
+            "v":                1,
+            "status":           "empty",
+            "mode":             mode_label,
+            "dimension":        dimension_label,
+            "playlist_name":    payload.playlist_name,
+            "added_uris_count": 0,
+            "detail":           "selection matched zero tracks; playlist unchanged",
+        }));
+    }
+    // Create mode: ensure the playlist starts empty. MPD's
+    // `playlistclear` acks with "No such playlist" when the
+    // playlist doesn't exist yet (as of 0.24), which would
+    // trap the whole command list. Fire it as a standalone
+    // pre-op and swallow the "no such playlist" ack — every
+    // other error propagates.
+    if matches!(payload.mode, SaveSelectionMode::Create) {
+        if let Err(e) = conn.playlistclear(&payload.playlist_name).await {
+            let msg = e.to_string().to_lowercase();
+            let is_absent = msg.contains("no such playlist")
+                || msg.contains("no such file");
+            if !is_absent {
+                return Err(VerbError::Mpd {
+                    verb: "save_selection".to_string(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    let mut commands: Vec<(&str, Vec<String>)> = Vec::new();
+    let uris: Vec<String> = match &resolved {
+        crate::selection::ResolvedSelection::UriList(list) => list.clone(),
+        crate::selection::ResolvedSelection::Filter { .. } => Vec::new(),
+    };
+    match &resolved {
+        crate::selection::ResolvedSelection::Filter { pairs, substring } => {
+            // MPD spells both exact-match and substring
+            // playlist-add as `searchaddpl` (substring
+            // semantics); the exact-match sibling is
+            // `findaddpl` on newer MPD builds. To keep the
+            // resolver source-neutral we use `searchaddpl`
+            // uniformly here — substring collapses to exact
+            // for typical dimension values (`artist`, `genre`,
+            // clean album title) and does the right thing for
+            // year (`1996-*` matches on substring).
+            let _ = substring;
+            let mut args: Vec<String> = vec![payload.playlist_name.clone()];
+            for (t, v) in pairs {
+                args.push(t.clone());
+                args.push(v.clone());
+            }
+            commands.push(("searchaddpl", args));
+        }
+        crate::selection::ResolvedSelection::UriList(list) => {
+            for uri in list {
+                commands.push((
+                    "playlistadd",
+                    vec![payload.playlist_name.clone(), uri.clone()],
+                ));
+            }
+        }
+    }
+    conn.command_list(&commands)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "save_selection".to_string(),
+            reason: e.to_string(),
+        })?;
+    publish_index(ctx, conn).await;
+    let added = if uris.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(uris.len())
+    };
+    Ok(serde_json::json!({
+        "v":                1,
+        "status":           "ok",
+        "mode":             mode_label,
+        "dimension":        dimension_label,
+        "playlist_name":    payload.playlist_name,
+        "added_uris_count": added,
+    }))
+}
+
 pub(crate) async fn handle_remove_from_playlist(
     ctx: &PlaylistContext,
     conn: &mut MpdConnection,
