@@ -1,0 +1,60 @@
+# Ship-time configuration for org.evoframework.artwork.online.
+#
+# Cover-art cascade — see plugin docs for the full contract.
+# The defaults here mirror the plugin's own `PluginConfig::defaults()`
+# so a bootstrap install and a from-code build behave identically.
+#
+# Every field is optional; omitted fields fall back to the plugin
+# defaults. Operators wanting a working out-of-the-box install
+# should not need to touch this file.
+
+# MusicBrainz-TOS-compliant User-Agent for the Cover Art Archive
+# provider. MB refuses requests without an identifying UA. The
+# distribution ships a spec-compliant default identifying this
+# plugin's crate name + version + a public contact link; the
+# plugin also carries the same default in code, so removing
+# this line is safe.
+musicbrainz_user_agent = "org.evoframework.artwork.online/0.1.0 (+https://github.com/foonerd/evo-device-audio)"
+
+# Per-provider hard timeout (seconds). Bounds a single provider
+# from stalling the cascade when its upstream hangs. The parallel
+# race across Tier 1 providers means an average lookup completes
+# in well under this budget.
+request_timeout_secs = 5
+
+# Tier 1 — free, no-auth, load-bearing. Dispatched in parallel;
+# first Hit wins.
+
+[providers.cover_art_archive]
+# MusicBrainz release search + Cover Art Archive front-cover
+# fetch. Roon / Picard / Jellyfin / Plex / beets all use this
+# as their canonical album-art path.
+enabled = true
+
+[providers.itunes]
+# Apple iTunes Search API. No key required. Ranks well on popular
+# Western releases including the vast bulk of chart-topping albums.
+enabled = true
+
+[providers.deezer]
+# Deezer public album search. No key required. Wide catalogue
+# for pop / rock / jazz / hip-hop; Navidrome uses this as its
+# no-auth fallback.
+enabled = true
+
+# Tier 2 — operator-key-gated.
+
+[providers.lastfm]
+# Last.fm album.getinfo. Requires an operator-supplied API key
+# under `api_key = "..."`. Disabled without a key.
+enabled = false
+
+# Tier 3 — operator opt-in.
+
+[providers.volumio_meta]
+# Volumio meta proxy. Historical primary that regularly returned
+# HTTP 500 on the shipping build; retired from the default set.
+# Operators who have a working `meta.volumio.org` upstream can
+# opt in by setting `enabled = true`.
+enabled = false
+variant = "community"

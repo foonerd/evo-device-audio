@@ -147,7 +147,40 @@ pub(crate) struct ProviderHit {
 
 /// Cascade walker.
 ///
-/// Invokes enabled providers in priority order. Returns:
+/// # Shape
+///
+/// - **Input sanitisation**: `artist` and `album` are
+///   laundered through
+///   [`evo_device_audio_shared::artist_name::artist_display_form`]
+///   and
+///   [`evo_device_audio_shared::album_name::clean_album_title`]
+///   before any provider is queried. Raw MPD tag drift
+///   (`(Disc 1)` / `[Explicit]` / `(Remastered Version)` on
+///   the album; watermarks and sort-form drift on the
+///   artist) would otherwise miss every provider's
+///   catalogue on well-known releases.
+/// - **Tier 1 race**: `cover_art_archive`, `itunes`,
+///   `deezer` dispatch in parallel via a `FuturesUnordered`
+///   race. The first provider returning
+///   [`ProviderOutcome::Hit`] wins; the other in-flight
+///   requests are dropped. Every provider call is wrapped in
+///   a per-provider hard timeout ([`PluginConfig::request_timeout`]);
+///   a hung upstream cannot stall the cascade.
+/// - **Tier 2 sequential**: `lastfm` (requires operator API
+///   key) and `volumio_meta` (operator-opt-in). Attempted in
+///   order only when Tier 1 exhausted without a hit; they
+///   are not raced so operator upstreams see traffic only
+///   when the free canonical Tier 1 could not resolve.
+/// - **Circuit breaker per provider**: three consecutive
+///   [`ProviderOutcome::Unavailable`] outcomes inside a 60-s
+///   window opens the breaker for 5 minutes; open providers
+///   are skipped entirely and the cascade continues with the
+///   remaining set. A single probe request re-closes the
+///   breaker on success or extends the open window on
+///   failure.
+///
+/// # Return
+///
 /// - [`CascadeResult::Hit`] on the first provider hit;
 /// - [`CascadeResult::GenuinelyEmpty`] when every attempted
 ///   provider returned [`ProviderOutcome::Miss`] — the album
@@ -162,90 +195,352 @@ pub(crate) async fn run_cascade(
     client: &Client,
     config: &PluginConfig,
 ) -> CascadeResult {
-    let mut unavailable_reasons: Vec<String> = Vec::new();
+    // Sanitise inputs before ANY provider sees them. MPD tag
+    // drift on well-known releases (Elton's
+    // "Goodbye Yellow Brick Road (Disc 1)" → CAA/iTunes/Deezer
+    // all miss on the disc suffix; `[Explicit]` /
+    // `(Remastered Version)` similarly poison the search
+    // terms) is fixed here at the cascade entry so every
+    // provider queries with the canonical release title.
+    let clean_artist =
+        evo_device_audio_shared::artist_name::artist_display_form(artist);
+    let clean_album =
+        evo_device_audio_shared::album_name::clean_album_title(album);
+    let artist_ref = if clean_artist.is_empty() {
+        artist
+    } else {
+        clean_artist.as_str()
+    };
+    let album_ref = if clean_album.is_empty() {
+        album
+    } else {
+        clean_album.as_str()
+    };
+    tracing::info!(
+        plugin = crate::PLUGIN_NAME,
+        artist_raw = artist,
+        artist_clean = artist_ref,
+        album_raw = album,
+        album_clean = album_ref,
+        "artwork.online.cascade.begin",
+    );
 
-    let attempted = |outcome: Option<ProviderOutcome>,
-                     name: &'static str,
-                     unavailable: &mut Vec<String>|
-     -> Option<ProviderOutcome> {
+    let mut unavailable_reasons: Vec<String> = Vec::new();
+    let mut any_miss = false;
+
+    // ------- Tier 1: race the free canonical providers ------
+    //
+    // FuturesUnordered gives us first-completed semantics: the
+    // fastest provider that returns a Hit wins; the rest are
+    // dropped as their futures unwind. Provider outcomes that
+    // are not a Hit fold into the miss/unavailable
+    // accumulators so the aggregate result is still faithful.
+
+    type Tier1Fut = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (&'static str, ProviderOutcome)>
+                + Send,
+        >,
+    >;
+    let tier1: futures_util::stream::FuturesUnordered<Tier1Fut> =
+        futures_util::stream::FuturesUnordered::new();
+    let mut tier1 = tier1;
+
+    if config.providers.cover_art_archive.enabled
+        && circuit_breaker::allow("cover_art_archive")
+    {
+        let a = artist_ref.to_string();
+        let b = album_ref.to_string();
+        let c = client.clone();
+        let cfg = config.clone();
+        tier1.push(Box::pin(async move {
+            let out = timed(
+                "cover_art_archive",
+                cfg.request_timeout,
+                cover_art_archive::fetch(&a, &b, &c, &cfg),
+            )
+            .await;
+            ("cover_art_archive", out)
+        }));
+    }
+    if config.providers.itunes.enabled && circuit_breaker::allow("itunes") {
+        let a = artist_ref.to_string();
+        let b = album_ref.to_string();
+        let c = client.clone();
+        let to = config.request_timeout;
+        tier1.push(Box::pin(async move {
+            let out = timed_raw("itunes", to, itunes::fetch(&a, &b, &c)).await;
+            ("itunes", out)
+        }));
+    }
+    if config.providers.deezer.enabled && circuit_breaker::allow("deezer") {
+        let a = artist_ref.to_string();
+        let b = album_ref.to_string();
+        let c = client.clone();
+        let to = config.request_timeout;
+        tier1.push(Box::pin(async move {
+            let out = timed_raw("deezer", to, deezer::fetch(&a, &b, &c)).await;
+            ("deezer", out)
+        }));
+    }
+
+    use futures_util::StreamExt;
+    while let Some((name, outcome)) = tier1.next().await {
         match outcome {
-            None => {
+            ProviderOutcome::Hit(hit) => {
+                circuit_breaker::record_success(name);
+                tracing::info!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = name,
+                    tier = "1",
+                    winner = true,
+                    "artwork.online.cascade.result",
+                );
+                return CascadeResult::Hit(hit);
+            }
+            ProviderOutcome::Miss => {
+                circuit_breaker::record_success(name);
                 tracing::debug!(
                     plugin = crate::PLUGIN_NAME,
                     provider = name,
-                    "disabled"
+                    "clean miss",
                 );
-                None
+                any_miss = true;
             }
-            Some(ProviderOutcome::Hit(hit)) => Some(ProviderOutcome::Hit(hit)),
-            Some(ProviderOutcome::Miss) => {
-                tracing::debug!(
-                    plugin = crate::PLUGIN_NAME,
-                    provider = name,
-                    "clean miss"
-                );
-                Some(ProviderOutcome::Miss)
-            }
-            Some(ProviderOutcome::Unavailable(reason)) => {
+            ProviderOutcome::Unavailable(reason) => {
+                circuit_breaker::record_failure(name);
                 tracing::warn!(
                     plugin = crate::PLUGIN_NAME,
                     provider = name,
                     reason = %reason,
-                    "provider unavailable; cascading (result will not be cached negatively)"
+                    "provider unavailable; cascading (result will not be cached negatively)",
                 );
-                unavailable.push(reason.clone());
-                Some(ProviderOutcome::Unavailable(reason))
+                unavailable_reasons.push(reason);
             }
         }
-    };
+    }
 
-    let mut any_miss = false;
-    macro_rules! step {
-        ($outcome:expr, $name:literal) => {
-            if let Some(result) =
-                attempted($outcome, $name, &mut unavailable_reasons)
-            {
-                match result {
-                    ProviderOutcome::Hit(hit) => {
-                        return CascadeResult::Hit(hit);
-                    }
-                    ProviderOutcome::Miss => any_miss = true,
-                    ProviderOutcome::Unavailable(_) => {}
-                }
+    // ------- Tier 2: sequential operator-opt-in providers ---
+
+    if config.providers.lastfm.enabled && circuit_breaker::allow("lastfm") {
+        let outcome = timed(
+            "lastfm",
+            config.request_timeout,
+            lastfm::fetch(artist_ref, album_ref, client, config),
+        )
+        .await;
+        match outcome {
+            ProviderOutcome::Hit(hit) => {
+                circuit_breaker::record_success("lastfm");
+                tracing::info!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "lastfm",
+                    tier = "2",
+                    winner = true,
+                    "artwork.online.cascade.result",
+                );
+                return CascadeResult::Hit(hit);
             }
-        };
+            ProviderOutcome::Miss => {
+                circuit_breaker::record_success("lastfm");
+                any_miss = true;
+            }
+            ProviderOutcome::Unavailable(reason) => {
+                circuit_breaker::record_failure("lastfm");
+                unavailable_reasons.push(reason);
+            }
+        }
     }
 
-    if config.providers.cover_art_archive.enabled {
-        step!(
-            cover_art_archive::fetch(artist, album, client, config).await,
-            "cover_art_archive"
-        );
-    }
-    if config.providers.lastfm.enabled {
-        step!(lastfm::fetch(artist, album, client, config).await, "lastfm");
-    }
-    if config.providers.itunes.enabled {
-        step!(Some(itunes::fetch(artist, album, client).await), "itunes");
-    }
-    if config.providers.volumio_meta.enabled {
-        step!(
-            Some(volumio_meta::fetch(artist, album, client, config).await),
-            "volumio_meta"
-        );
+    if config.providers.volumio_meta.enabled
+        && circuit_breaker::allow("volumio_meta")
+    {
+        let outcome = timed_raw(
+            "volumio_meta",
+            config.request_timeout,
+            volumio_meta::fetch(artist_ref, album_ref, client, config),
+        )
+        .await;
+        match outcome {
+            ProviderOutcome::Hit(hit) => {
+                circuit_breaker::record_success("volumio_meta");
+                tracing::info!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = "volumio_meta",
+                    tier = "3",
+                    winner = true,
+                    "artwork.online.cascade.result",
+                );
+                return CascadeResult::Hit(hit);
+            }
+            ProviderOutcome::Miss => {
+                circuit_breaker::record_success("volumio_meta");
+                any_miss = true;
+            }
+            ProviderOutcome::Unavailable(reason) => {
+                circuit_breaker::record_failure("volumio_meta");
+                unavailable_reasons.push(reason);
+            }
+        }
     }
 
+    let _ = any_miss;
     if unavailable_reasons.is_empty() {
-        // Every attempted provider gave a clean Miss (or no
-        // providers were attempted at all — vacuous empty).
-        // Safe to cache as not_found.
-        let _ = any_miss;
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            "artwork.online.cascade.result exhausted (genuinely_empty)",
+        );
         CascadeResult::GenuinelyEmpty
     } else {
-        // At least one provider was Unavailable. We do not
-        // have complete negative evidence — return Unavailable
-        // so the framework's memoisation skips this outcome.
+        tracing::warn!(
+            plugin = crate::PLUGIN_NAME,
+            reasons = %unavailable_reasons.join("; "),
+            "artwork.online.cascade.result exhausted (unavailable)",
+        );
         CascadeResult::Unavailable(unavailable_reasons.join("; "))
+    }
+}
+
+/// Wrap an Option-returning provider fetch in a hard per-
+/// provider timeout. `None` (provider disabled by
+/// configuration) becomes a Miss for accounting; a timeout
+/// becomes Unavailable so the circuit breaker sees it.
+async fn timed<F>(
+    provider: &'static str,
+    limit: std::time::Duration,
+    fut: F,
+) -> ProviderOutcome
+where
+    F: std::future::Future<Output = Option<ProviderOutcome>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => ProviderOutcome::Miss,
+        Err(_) => ProviderOutcome::Unavailable(format!(
+            "{provider}: hard timeout after {} ms",
+            limit.as_millis(),
+        )),
+    }
+}
+
+/// Same as [`timed`] but for providers whose fetch signature
+/// is `-> ProviderOutcome` (no Option).
+async fn timed_raw<F>(
+    provider: &'static str,
+    limit: std::time::Duration,
+    fut: F,
+) -> ProviderOutcome
+where
+    F: std::future::Future<Output = ProviderOutcome>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(outcome) => outcome,
+        Err(_) => ProviderOutcome::Unavailable(format!(
+            "{provider}: hard timeout after {} ms",
+            limit.as_millis(),
+        )),
+    }
+}
+
+/// Per-provider circuit breaker.
+///
+/// Tracks consecutive [`ProviderOutcome::Unavailable`]
+/// outcomes per provider name inside a rolling 60-second
+/// window. Three failures opens the breaker for 5 minutes:
+/// the provider is skipped by `run_cascade` until the window
+/// elapses, then a single probe request runs and closes the
+/// breaker on success or resets the open window on failure.
+///
+/// Scope: process-local, `Mutex`-guarded `HashMap` — no
+/// cross-process state, no persistence. On plugin reload the
+/// state resets, which is the correct behaviour: a reload
+/// probably came from an operator gesture that wants a fresh
+/// attempt.
+mod circuit_breaker {
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Number of consecutive failures inside `WINDOW` before
+    /// the breaker opens.
+    const THRESHOLD: u32 = 3;
+    /// Rolling window during which failures are counted
+    /// toward `THRESHOLD`. Older failures are discarded.
+    const WINDOW: Duration = Duration::from_secs(60);
+    /// How long the breaker stays open before allowing one
+    /// probe request through.
+    const OPEN_FOR: Duration = Duration::from_secs(5 * 60);
+
+    #[derive(Debug, Clone)]
+    struct State {
+        recent_failures: Vec<Instant>,
+        opened_at: Option<Instant>,
+    }
+
+    impl State {
+        fn new() -> Self {
+            Self {
+                recent_failures: Vec::new(),
+                opened_at: None,
+            }
+        }
+    }
+
+    static STATE: Lazy<Mutex<HashMap<&'static str, State>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// True when the provider is allowed to attempt a request
+    /// right now. False when the breaker is open. The single-
+    /// probe transition happens naturally: after `OPEN_FOR`
+    /// elapses, `allow` returns true again; the outcome is
+    /// recorded via `record_success` / `record_failure`.
+    pub(super) fn allow(provider: &'static str) -> bool {
+        let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
+        let state = map.entry(provider).or_insert_with(State::new);
+        match state.opened_at {
+            None => true,
+            Some(t) => {
+                if t.elapsed() >= OPEN_FOR {
+                    // Probe window: allow one request through.
+                    state.opened_at = None;
+                    state.recent_failures.clear();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    pub(super) fn record_success(provider: &'static str) {
+        let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
+        let state = map.entry(provider).or_insert_with(State::new);
+        state.recent_failures.clear();
+        state.opened_at = None;
+    }
+
+    pub(super) fn record_failure(provider: &'static str) {
+        let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
+        let state = map.entry(provider).or_insert_with(State::new);
+        let now = Instant::now();
+        state
+            .recent_failures
+            .retain(|t| now.duration_since(*t) < WINDOW);
+        state.recent_failures.push(now);
+        if state.recent_failures.len() >= THRESHOLD as usize
+            && state.opened_at.is_none()
+        {
+            state.opened_at = Some(now);
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider,
+                threshold = THRESHOLD,
+                window_secs = WINDOW.as_secs(),
+                open_for_secs = OPEN_FOR.as_secs(),
+                "artwork.online.circuit_breaker OPEN",
+            );
+        }
     }
 }
 
@@ -658,6 +953,138 @@ pub(crate) mod itunes {
             bytes,
             mime: None,
             provider_id: "itunes",
+        })
+    }
+}
+
+pub(crate) mod deezer {
+    //! Deezer public album search provider.
+    //!
+    //! Endpoint: `https://api.deezer.com/search/album?q=...`.
+    //! No API key required. Returns a JSON array of album
+    //! matches; each has a `cover_xl` (1000×1000) URL.
+    //!
+    //! Prior art: this is exactly what Navidrome uses as a
+    //! non-authenticated album-art fallback. Deezer's public
+    //! search catalogue is wide (they license from every major
+    //! label) so it hits well-known Western pop / rock /
+    //! jazz / hip-hop releases reliably.
+    //!
+    //! Query shape: `q=artist:"<artist>" album:"<album>"` —
+    //! Deezer's advanced-search grammar. Fold to plain terms
+    //! when the advanced query returns no results, so an album
+    //! whose title contains characters the advanced grammar
+    //! doesn't escape still gets a try.
+    use super::*;
+
+    const DEEZER_BASE: &str = "https://api.deezer.com/search/album";
+
+    pub(crate) async fn fetch(
+        artist: &str,
+        album: &str,
+        client: &Client,
+    ) -> ProviderOutcome {
+        // Plain-terms search (`artist album`) — matches the shape
+        // Navidrome ships. Deezer's ranking is strong enough that
+        // the correct release lands at index 0 for popular albums
+        // without the advanced-grammar quoting; the quoted-fields
+        // form is significantly slower on complex artist names
+        // (multi-artist credits with commas), and its extra
+        // budget is not worth the small selectivity gain.
+        let plain_query = format!("{artist} {album}");
+        try_query(client, &plain_query, "deezer").await
+    }
+
+    async fn try_query(
+        client: &Client,
+        q: &str,
+        label: &str,
+    ) -> ProviderOutcome {
+        let url = format!("{}?q={}&limit=1", DEEZER_BASE, super::urlencode(q));
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderOutcome::Unavailable(format!("{label}: {e}"));
+            }
+        };
+        match classify_status(label, resp.status()) {
+            StatusClass::Success => {}
+            StatusClass::Miss => return ProviderOutcome::Miss,
+            StatusClass::Unavailable(r) => {
+                return ProviderOutcome::Unavailable(r);
+            }
+        }
+        let json: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                return ProviderOutcome::Unavailable(format!(
+                    "{label} json: {e}",
+                ));
+            }
+        };
+        // Deezer signals catalogue misses as `{ data: [], ... }`.
+        // Some error shapes come back as `{ error: {...} }` at
+        // 200 OK — treat as Unavailable when the error type is
+        // upstream-transient, else Miss.
+        if let Some(err) = json.get("error") {
+            let code = err
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let msg = err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            return ProviderOutcome::Unavailable(format!(
+                "{label}: code={code} {msg}",
+            ));
+        }
+        let cover_url = json
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|hit| {
+                hit.get("cover_xl")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        hit.get("cover_big").and_then(serde_json::Value::as_str)
+                    })
+                    .or_else(|| {
+                        hit.get("cover_medium")
+                            .and_then(serde_json::Value::as_str)
+                    })
+            })
+            .map(String::from);
+        let Some(cover_url) = cover_url else {
+            return ProviderOutcome::Miss;
+        };
+        let img_resp = match client.get(&cover_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderOutcome::Unavailable(format!(
+                    "{label} image: {e}",
+                ));
+            }
+        };
+        match classify_status(&format!("{label} image"), img_resp.status()) {
+            StatusClass::Success => {}
+            StatusClass::Miss => return ProviderOutcome::Miss,
+            StatusClass::Unavailable(r) => {
+                return ProviderOutcome::Unavailable(r);
+            }
+        }
+        let bytes = match img_resp.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                return ProviderOutcome::Unavailable(format!(
+                    "{label} bytes: {e}",
+                ));
+            }
+        };
+        ProviderOutcome::Hit(ProviderHit {
+            bytes,
+            mime: Some("image/jpeg".to_string()),
+            provider_id: "deezer",
         })
     }
 }

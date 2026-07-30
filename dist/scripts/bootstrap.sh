@@ -704,6 +704,28 @@ else
     echo "[bootstrap] EVO_INSTALL_NETWORK_PLUGIN_CONFIG=0 — skipping network plugin config"
 fi
 
+# 2.6a2 — artwork.online plugin distribution-tier default
+#
+# Ships the ready-to-use online-cover-cascade defaults so a
+# fresh install resolves album art out of the box: MusicBrainz
+# + Cover Art Archive + iTunes + Deezer enabled by default;
+# volumio_meta (the historical primary that shipped 500s)
+# disabled by default. Operators may re-enable volumio_meta
+# by editing the installed file.
+if [[ "${EVO_INSTALL_ARTWORK_ONLINE_PLUGIN_CONFIG:-1}" != "0" ]]; then
+    ARTWORK_ONLINE_TEMPLATE="$DIST_DIR/plugins.d/org.evoframework.artwork.online.toml"
+    ARTWORK_ONLINE_PATH="$PLUGINS_D_DIR/org.evoframework.artwork.online.toml"
+    if [[ -f "$ARTWORK_ONLINE_TEMPLATE" ]]; then
+        install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+            "$ARTWORK_ONLINE_TEMPLATE" "$ARTWORK_ONLINE_PATH"
+        echo "[bootstrap] installed $ARTWORK_ONLINE_PATH (Tier 1: CAA + iTunes + Deezer race; volumio_meta opt-in)"
+    else
+        echo "[bootstrap] WARN: artwork.online plugin template not found at $ARTWORK_ONLINE_TEMPLATE; skipping"
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_ARTWORK_ONLINE_PLUGIN_CONFIG=0 — skipping artwork.online plugin config"
+fi
+
 # 2.6b — multiroom plugin distribution-tier default
 #
 # Install the unconditional default (role=auto, no group, no

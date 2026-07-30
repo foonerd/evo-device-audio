@@ -49,6 +49,13 @@ webp = { workspace = true }
 # library cannot exhaust the plugin's memory, and evicts the
 # oldest entry on insert. Small (~15 KB), zero transitive deps.
 lru = "0.12"
+# Parallel-race semantics on the Tier 1 cover-art cascade:
+# FuturesUnordered gives first-completed-wins across CAA +
+# iTunes + Deezer without waiting for the slowest to finish.
+futures-util = "0.3"
+# Process-local circuit-breaker state for the per-provider
+# open/closed tracking.
+once_cell = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -39,6 +39,24 @@
 
 use std::time::Duration;
 
+/// MusicBrainz-TOS-compliant default User-Agent for the album
+/// cover-art cascade — mirrors the artist-cascade's default in
+/// `lib.rs`, kept here so `PluginConfig::defaults()` is
+/// self-contained.
+///
+/// MusicBrainz TOS requires a UA that identifies "software,
+/// version, and contact info". This one names the plugin's
+/// crate id + version and points at the distribution
+/// repository. Operator override lands as
+/// `musicbrainz_user_agent = "..."` in the plugin config.
+fn default_musicbrainz_user_agent() -> String {
+    format!(
+        "{}/{} (+https://github.com/foonerd/evo-device-audio)",
+        crate::PLUGIN_NAME,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
 /// Parsed plugin configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginConfig {
@@ -60,6 +78,7 @@ pub(crate) struct ProvidersConfig {
     pub(crate) cover_art_archive: CoverArtArchiveConfig,
     pub(crate) lastfm: LastFmConfig,
     pub(crate) itunes: ITunesConfig,
+    pub(crate) deezer: DeezerConfig,
     pub(crate) volumio_meta: VolumioMetaConfig,
 }
 
@@ -99,22 +118,63 @@ pub(crate) struct VolumioMetaConfig {
 
 impl Default for VolumioMetaConfig {
     fn default() -> Self {
+        // volumio_meta is disabled by default. It was previously
+        // load-bearing in the cascade despite ships-with-500s
+        // reliability, blanking covers on well-known albums.
+        // Operators who have a working `meta.volumio.org`
+        // upstream can opt in via
+        // `[providers.volumio_meta] enabled = true`.
         Self {
-            enabled: true,
+            enabled: false,
             variant: "community".to_string(),
         }
     }
 }
 
+/// Config for the Deezer album-search provider. No API key
+/// required; the public search endpoint is used. Enabled by
+/// default so the Tier 1 cascade has a second no-auth
+/// fallback alongside iTunes.
+#[derive(Debug, Clone)]
+pub(crate) struct DeezerConfig {
+    pub(crate) enabled: bool,
+}
+
+impl Default for DeezerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl PluginConfig {
-    /// Default config: every provider enabled by default,
-    /// timeouts at 8 seconds, MusicBrainz UA unset (CAA disabled
-    /// in effect until the operator sets it).
+    /// Default config.
+    ///
+    /// - **MusicBrainz UA**: a MB-TOS-compliant default is
+    ///   pre-filled so the Cover Art Archive provider fires on
+    ///   a fresh install without operator configuration. The
+    ///   default identifies the plugin's crate name + version
+    ///   and points at the plugin repository as the operator-
+    ///   visible contact channel. Operator may override via
+    ///   `musicbrainz_user_agent = "..."`.
+    /// - **Per-provider request timeout**: 3 seconds (hard).
+    ///   Bounds a single provider from stalling the cascade
+    ///   when its upstream hangs.
+    /// - **Providers**: `cover_art_archive`, `itunes`, `deezer`
+    ///   enabled by default (all no-auth, canonical); `lastfm`
+    ///   disabled unless an operator supplies a key;
+    ///   `volumio_meta` disabled by default (operator-opt-in
+    ///   only — historical primary that shipped 500s).
     pub(crate) fn defaults() -> Self {
         Self {
-            musicbrainz_user_agent: None,
+            musicbrainz_user_agent: Some(default_musicbrainz_user_agent()),
             providers: ProvidersConfig::default(),
-            request_timeout: Duration::from_secs(8),
+            // 5-second per-provider hard timeout. CAA's two-step
+            // (MB release-search under a 1-req/sec rate limit,
+            // then CAA `/front` fetch that can 307 redirect
+            // through Internet Archive) needs headroom beyond 3s;
+            // 5s covers the tail of MB+CAA and remains bounded
+            // for a race across three Tier 1 providers.
+            request_timeout: Duration::from_secs(5),
         }
     }
 
@@ -184,6 +244,11 @@ fn parse_providers(
             out.itunes.enabled = *b;
         }
     }
+    if let Some(toml::Value::Table(t)) = table.get("deezer") {
+        if let Some(toml::Value::Boolean(b)) = t.get("enabled") {
+            out.deezer.enabled = *b;
+        }
+    }
     if let Some(toml::Value::Table(t)) = table.get("volumio_meta") {
         if let Some(toml::Value::Boolean(b)) = t.get("enabled") {
             out.volumio_meta.enabled = *b;
@@ -216,12 +281,18 @@ mod tests {
     fn empty_config_yields_defaults() {
         let t: toml::Table = "".parse().unwrap();
         let c = PluginConfig::from_toml_table(&t).unwrap();
-        assert!(c.musicbrainz_user_agent.is_none());
-        assert_eq!(c.request_timeout, Duration::from_secs(8));
+        // MB UA is pre-filled with a TOS-compliant default so
+        // CAA works out of the box.
+        let ua = c.musicbrainz_user_agent.expect("default UA must be set");
+        assert!(ua.contains(crate::PLUGIN_NAME));
+        assert!(ua.contains("+https://"));
+        assert_eq!(c.request_timeout, Duration::from_secs(5));
         assert!(c.providers.cover_art_archive.enabled);
         assert!(!c.providers.lastfm.enabled); // disabled until api_key set
         assert!(c.providers.itunes.enabled);
-        assert!(c.providers.volumio_meta.enabled);
+        assert!(c.providers.deezer.enabled);
+        // volumio_meta is operator-opt-in only.
+        assert!(!c.providers.volumio_meta.enabled);
     }
 
     #[test]
@@ -267,12 +338,15 @@ mod tests {
             enabled = false
             [providers.itunes]
             enabled = false
+            [providers.volumio_meta]
+            enabled = true
         "#
         .parse()
         .unwrap();
         let c = PluginConfig::from_toml_table(&t).unwrap();
         assert!(!c.providers.cover_art_archive.enabled);
         assert!(!c.providers.itunes.enabled);
+        // Operator opt-in works.
         assert!(c.providers.volumio_meta.enabled);
     }
 }
