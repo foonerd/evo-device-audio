@@ -997,13 +997,16 @@ pub(crate) async fn handle_browse_by_tag(
     // Dispatch on `facet_key` because the three families have
     // fundamentally different identity models:
     //
-    // - Album: canonical identity via
-    //   [`album_identity`] — multi-disc variants fold, edition
-    //   qualifiers strip from the display, degenerate tags
-    //   (album tag holding the artist credit) fall back to the
-    //   parent folder basename. Prior art: Roon, Plex,
-    //   Jellyfin, Picard, beets. See
-    //   [`enumerate_albums_via_identity`].
+    // - Album: **folder-anchored** identity via
+    //   [`canonical_album_folder`] — the album unit is the
+    //   containing directory. Multi-disc subfolders and disc-
+    //   suffix sibling folders roll up; title / artist derive
+    //   from consistent tag population OR the folder basename
+    //   fallback; cover cascade keys on a representative track
+    //   path (mpd-path), not on the artist|album tag tuple.
+    //   Prior art: Plex / Jellyfin / Roon / Picard / beets —
+    //   the folder is the album unit. See
+    //   [`enumerate_albums_via_folder`].
     // - Artist: multi-artist credits fan out into their
     //   individual entities via
     //   [`split_artist_credit`] — a credit like
@@ -1015,7 +1018,7 @@ pub(crate) async fn handle_browse_by_tag(
     //   (year extraction) and case-insensitive dedupe. See
     //   [`enumerate_generic_facet`].
     let rendered: Vec<serde_json::Value> = match facet_key {
-        "album" => enumerate_albums_via_identity(conn, verb_name).await?,
+        "album" => enumerate_albums_via_folder(conn, verb_name).await?,
         "artist" => {
             enumerate_artists_via_fanout(conn, tag, verb_name, post_process)
                 .await?
@@ -1045,210 +1048,293 @@ pub(crate) async fn handle_browse_by_tag(
     }))
 }
 
-/// One album row projected from MPD's raw `list_tag_grouped`
-/// / `count_grouped_by_tag` pair, plus the canonical identity
-/// [`album_identity`] resolves for it (with a folder-lookup
-/// side-effect for degenerate rows).
+/// Folder-anchored album tile.
+///
+/// The album unit is the containing directory — see
+/// [`canonical_album_folder`] for the rollup vocabulary
+/// (bare `Disc N` subfolders, `(Disc N)` / `- CD N` / `vol2`
+/// sibling folders). Everything on this record is derived
+/// from the population of tracks inside one canonical folder;
+/// none of it is a function of the artist|album tag tuple.
 ///
 /// Shared between the browse-by-album enumeration path and the
-/// drill-by-album path so both key off the same grouping-key
-/// arithmetic.
+/// drill-by-album path so both dispatch off the same
+/// identity.
 #[derive(Debug, Clone)]
-pub(crate) struct AlbumRow {
-    pub(crate) raw_album: String,
-    pub(crate) raw_albumartist: String,
-    pub(crate) count: u64,
-    pub(crate) identity: AlbumIdentity,
+pub(crate) struct AlbumTile {
+    /// Rolled-up canonical folder key. Grouping identity.
+    pub(crate) canonical_folder: String,
+    /// Display title. Derived from consistent album tag when
+    /// available (majority-vote of `clean_album_title(raw)`
+    /// across tracks in this folder), else the folder basename
+    /// (cleaned).
+    pub(crate) display_title: String,
+    /// Display artist. Derived from consistent `albumartist`
+    /// tag → consistent per-track `artist` tag → `"Various
+    /// Artists"`. Never empty — the memo requires a rendered
+    /// artist on every tile.
+    pub(crate) display_artist: String,
+    /// First track in the folder (deterministic sort). Drives
+    /// the `mpd-path`-scheme cover URL; the framework artwork
+    /// cascade (sidecar → embedded → online) resolves from
+    /// this track's on-disk neighbourhood.
+    pub(crate) representative_track_path: String,
+    /// Every File entry in the canonical folder, in sorted
+    /// order. Feeds the drill path (returned to the operator
+    /// as tracks) without a second MPD roundtrip.
+    pub(crate) tracks: Vec<MpdLibraryEntry>,
+    /// Which source [`derive_album_title`] chose: `"tag"` or
+    /// `"folder"`. Emitted on the identity-decision log line
+    /// and retained on the tile for tests and downstream
+    /// callers that want to audit the decision without
+    /// re-parsing the log.
+    #[allow(dead_code)]
+    pub(crate) title_source: &'static str,
+    /// Which source [`derive_album_artist`] chose:
+    /// `"albumartist_consistent"` / `"artist_majority"` /
+    /// `"various_fallback"`. Emitted on the identity-decision
+    /// log line and retained for the same test-audit reason as
+    /// `title_source`.
+    #[allow(dead_code)]
+    pub(crate) artist_source: &'static str,
 }
 
-/// Resolve every album MPD knows about into its canonical
-/// [`AlbumIdentity`] plus the raw tag data needed for cover
-/// synthesis and drill matching.
+impl AlbumTile {
+    /// Track count = number of File entries in the canonical
+    /// folder.
+    pub(crate) fn track_count(&self) -> u64 {
+        self.tracks.len() as u64
+    }
+}
+
+/// Resolve every album MPD knows about via folder-anchored
+/// identity.
 ///
-/// One MPD `listallinfo` roundtrip walks the entire database
-/// and lets us aggregate per `(raw_album, raw_albumartist)`
-/// pair. That's essential because MPD's `count group album`
-/// merges tracks across every albumartist — Elton John's and
-/// Billy Joel's "The Ultimate Collection" appear as one row.
-/// Aggregating locally keeps the pairs distinct so downstream
-/// grouping can key on `(identity.grouping_key,
-/// artist_fold_key)` and same-titled albums by different
-/// artists stay separate tiles.
+/// One `listallinfo` roundtrip walks the entire database and
+/// aggregates per canonical folder (multi-disc subfolders and
+/// disc-suffix sibling folders roll up automatically via
+/// [`canonical_album_folder`]). For each folder group:
 ///
-/// The `listallinfo` walk also yields the parent folder
-/// basename per file at zero extra cost, which feeds
-/// [`album_identity`]'s degenerate-tag fallback without the
-/// previous shape's per-degenerate `find album X` roundtrip.
+/// - **Title**: majority-vote across `clean_album_title(raw)`
+///   values from every track's `Album` tag. If ≥ 50 % of
+///   tagged tracks agree on a non-empty cleaned title, that's
+///   the display; otherwise the folder basename (cleaned) wins
+///   — no tag inconsistency can blank or fragment a title.
+/// - **Artist**: consistent `AlbumArtist` (majority-vote,
+///   non-empty) → consistent per-track `Artist` (same rule)
+///   → `"Various Artists"`. Never empty.
+/// - **Cover source**: the folder's alphabetically-first
+///   track; the `mpd-path`-scheme resolver handles the
+///   embedded → folder-sidecar → online cascade so a bad tag
+///   cannot break the cover.
 ///
 /// Cost: for a 100 k-track library `listallinfo` is roughly
-/// one second over the Unix socket (same shape the works /
-/// library-state paths already pay for); small libraries stay
-/// sub-second.
-pub(crate) async fn resolve_album_rows(
+/// one second over the Unix socket (same shape the works
+/// aggregation path pays); small libraries stay sub-second.
+pub(crate) async fn resolve_album_tiles(
     conn: &mut MpdConnection,
     verb_name: &'static str,
-) -> Result<Vec<AlbumRow>, VerbError> {
+) -> Result<Vec<AlbumTile>, VerbError> {
     let entries = conn.listallinfo("").await.map_err(|e| VerbError::Mpd {
         verb: verb_name.to_string(),
         reason: e.to_string(),
     })?;
 
-    struct Agg {
-        count: u64,
-        folder: String,
+    struct FolderAgg {
+        tracks: Vec<MpdLibraryEntry>,
+        album_tag_votes: HashMap<String, u64>,
+        albumartist_tag_votes: HashMap<String, u64>,
+        artist_tag_votes: HashMap<String, u64>,
     }
-    let mut aggregates: HashMap<(String, String), Agg> = HashMap::new();
+    let mut folders: HashMap<String, FolderAgg> = HashMap::new();
     for entry in entries {
+        let path_ref = match &entry {
+            MpdLibraryEntry::File { path, .. } => path.clone(),
+            _ => continue,
+        };
+        let canonical = canonical_album_folder(&path_ref);
+        if canonical.is_empty() {
+            continue;
+        }
         let MpdLibraryEntry::File {
-            path,
             album,
             albumartist,
             artist,
             ..
-        } = entry
+        } = &entry
         else {
-            continue;
+            unreachable!("guarded above");
         };
-        let raw_album = album.unwrap_or_default();
-        // Prefer ALBUMARTIST for the album row's primary
-        // credit (release-level, collab-friendly). Fall back to
-        // the per-track ARTIST tag when ALBUMARTIST is absent —
-        // libraries without release-level metadata still need
-        // some artist to render.
-        let raw_albumartist = albumartist.or(artist).unwrap_or_default();
-        let folder = parent_folder_basename(&path).unwrap_or_default();
-        let key = (raw_album, raw_albumartist);
-        let agg = aggregates.entry(key).or_insert_with(|| Agg {
-            count: 0,
-            folder: folder.clone(),
+        let cleaned_album = album.as_deref().map(clean_album_title);
+        let raw_albumartist = albumartist.clone().unwrap_or_default();
+        let raw_artist = artist.clone().unwrap_or_default();
+
+        let agg = folders.entry(canonical).or_insert_with(|| FolderAgg {
+            tracks: Vec::new(),
+            album_tag_votes: HashMap::new(),
+            albumartist_tag_votes: HashMap::new(),
+            artist_tag_votes: HashMap::new(),
         });
-        agg.count = agg.count.saturating_add(1);
-        if agg.folder.is_empty() && !folder.is_empty() {
-            agg.folder = folder;
+        if let Some(clean) = cleaned_album {
+            if !clean.is_empty() {
+                *agg.album_tag_votes.entry(clean).or_insert(0) += 1;
+            }
         }
+        if !raw_albumartist.trim().is_empty() {
+            *agg.albumartist_tag_votes
+                .entry(raw_albumartist)
+                .or_insert(0) += 1;
+        }
+        if !raw_artist.trim().is_empty() {
+            *agg.artist_tag_votes.entry(raw_artist).or_insert(0) += 1;
+        }
+        agg.tracks.push(entry);
     }
 
-    let mut rows: Vec<AlbumRow> = Vec::with_capacity(aggregates.len());
-    for ((raw_album, raw_albumartist), agg) in aggregates {
-        let identity =
-            album_identity(&raw_album, &raw_albumartist, &agg.folder);
-        rows.push(AlbumRow {
-            raw_album,
-            raw_albumartist,
-            count: agg.count,
-            identity,
+    let mut tiles: Vec<AlbumTile> = Vec::with_capacity(folders.len());
+    for (canonical, mut agg) in folders {
+        agg.tracks.sort_by(|a, b| match (a, b) {
+            (
+                MpdLibraryEntry::File { path: pa, .. },
+                MpdLibraryEntry::File { path: pb, .. },
+            ) => pa.cmp(pb),
+            _ => std::cmp::Ordering::Equal,
+        });
+        let representative_track_path = match agg.tracks.first() {
+            Some(MpdLibraryEntry::File { path, .. }) => path.clone(),
+            _ => String::new(),
+        };
+        let folder_basename = canonical_folder_basename(&canonical);
+        let track_count = agg.tracks.len() as u64;
+        let (display_title, title_source) =
+            derive_album_title(&agg.album_tag_votes, &folder_basename);
+        let (display_artist, artist_source) = derive_album_artist(
+            &agg.albumartist_tag_votes,
+            &agg.artist_tag_votes,
+        );
+        tracing::info!(
+            album = %display_title,
+            artist = %display_artist,
+            folder = %canonical,
+            title_source,
+            artist_source,
+            track_count,
+            "browse.album.identity"
+        );
+        tiles.push(AlbumTile {
+            canonical_folder: canonical,
+            display_title,
+            display_artist,
+            representative_track_path,
+            tracks: agg.tracks,
+            title_source,
+            artist_source,
         });
     }
-    Ok(rows)
+    tiles.sort_by(|a, b| {
+        a.display_title
+            .to_lowercase()
+            .cmp(&b.display_title.to_lowercase())
+            .then_with(|| a.display_title.cmp(&b.display_title))
+    });
+    Ok(tiles)
 }
 
-/// Extract the last directory component of an MPD-relative
-/// file path. MPD emits forward slashes on every platform, so
-/// this is a pure byte-position operation.
-fn parent_folder_basename(mpd_relative_path: &str) -> Option<String> {
-    let trimmed = mpd_relative_path.trim();
-    let last_slash = trimmed.rfind('/')?;
-    let parent = &trimmed[..last_slash];
-    if parent.is_empty() {
+/// Last `/`-delimited segment of a canonical folder path, used
+/// as a fallback album title when the tag population fails the
+/// majority-vote test.
+fn canonical_folder_basename(canonical: &str) -> String {
+    let trimmed = canonical.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(idx) => trimmed[idx + 1..].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Title derivation with observability tag: `"tag"` when the
+/// cleaned `Album` tag population passes majority-vote,
+/// `"folder"` when it falls through to the folder basename.
+fn derive_album_title(
+    album_tag_votes: &HashMap<String, u64>,
+    folder_basename: &str,
+) -> (String, &'static str) {
+    if let Some(majority) = pick_majority(album_tag_votes) {
+        return (majority, "tag");
+    }
+    (clean_album_title(folder_basename), "folder")
+}
+
+/// Artist derivation with observability tag. Order: consistent
+/// `AlbumArtist` → consistent per-track `Artist` → `"Various
+/// Artists"`. Never empty — the memo requires a rendered
+/// artist on every tile even when tags are absent.
+fn derive_album_artist(
+    albumartist_tag_votes: &HashMap<String, u64>,
+    artist_tag_votes: &HashMap<String, u64>,
+) -> (String, &'static str) {
+    if let Some(majority) = pick_majority(albumartist_tag_votes) {
+        return (artist_display_form(&majority), "albumartist_consistent");
+    }
+    if let Some(majority) = pick_majority(artist_tag_votes) {
+        return (artist_display_form(&majority), "artist_majority");
+    }
+    ("Various Artists".to_string(), "various_fallback")
+}
+
+/// Pick the majority value from a vote-count map (≥ 50 % of
+/// the total counted). Returns `None` when the map is empty or
+/// when no value clears the threshold.
+fn pick_majority(votes: &HashMap<String, u64>) -> Option<String> {
+    if votes.is_empty() {
         return None;
     }
-    let basename = match parent.rfind('/') {
-        Some(i) => &parent[i + 1..],
-        None => parent,
-    };
-    let trimmed_basename = basename.trim();
-    if trimmed_basename.is_empty() {
-        None
+    let total: u64 = votes.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let (best, best_count) = votes.iter().max_by_key(|(_, c)| **c)?;
+    if best_count.saturating_mul(2) >= total {
+        Some(best.clone())
     } else {
-        Some(trimmed_basename.to_string())
+        None
     }
 }
 
 /// Browse-by-album enumeration.
 ///
-/// Resolves canonical [`AlbumIdentity`] for every album row,
-/// groups by `identity.grouping_key`, sums track counts across
-/// grouped rows (multi-disc folds into one tile), and emits
-/// `{album, artist, cover_url, track_count}` tiles sorted
-/// case-insensitively by display title.
+/// Emits `{album, album_id, artist, cover_url, track_count}`
+/// tiles keyed on folder-anchored identity. The `album_id` is
+/// the opaque canonical-folder key downstream surfaces can
+/// pass back as `select.value` to drill by identity when they
+/// have it; `album` remains the display title so existing
+/// operator-visible surfaces render without knowing the ID
+/// contract.
 ///
-/// The synthesised `cover_url` targets ONE representative raw
-/// album tag from the group — the framework's `mpd-album`
-/// resolver runs `find album X albumartist Y` against MPD, so
-/// the raw tag value must be one that MPD's index still
-/// matches. The tile's DISPLAY is the cleaned identity; the
-/// cover-URL VALUE is a raw form MPD can find.
-async fn enumerate_albums_via_identity(
+/// The `cover_url` scheme is `mpd-path` targeting the folder's
+/// alphabetically-first track. The framework artwork cascade
+/// (sidecar → embedded → online) runs against that track's
+/// neighbourhood — the cover cannot be broken by a bad
+/// `Album` / `AlbumArtist` tag.
+async fn enumerate_albums_via_folder(
     conn: &mut MpdConnection,
     verb_name: &'static str,
 ) -> Result<Vec<serde_json::Value>, VerbError> {
-    let rows = resolve_album_rows(conn, verb_name).await?;
-
-    struct Tile {
-        display: String,
-        representative_raw_album: String,
-        representative_artist: String,
-        total_count: u64,
-    }
-    // Composite key `(album grouping_key, artist fold-key)`:
-    // same-titled albums by different artists stay separate
-    // tiles. Multi-disc variants by the SAME artist fold into
-    // one; multi-disc variants across artists do not (Elton
-    // John's "The Ultimate Collection" and Billy Joel's "The
-    // Ultimate Collection" render as two tiles).
-    let mut tiles: HashMap<(String, String), Tile> = HashMap::new();
-    for row in rows {
-        if row.identity.grouping_key.is_empty() {
-            continue;
-        }
-        let composite_key = (
-            row.identity.grouping_key.clone(),
-            artist_fold_key(&row.raw_albumartist),
-        );
-        let entry = tiles.entry(composite_key).or_insert_with(|| Tile {
-            display: row.identity.display.clone(),
-            representative_raw_album: row.raw_album.clone(),
-            representative_artist: row.raw_albumartist.clone(),
-            total_count: 0,
-        });
-        entry.total_count = entry.total_count.saturating_add(row.count);
-    }
-
-    let mut result: Vec<Tile> = tiles.into_values().collect();
-    result.sort_by(|a, b| {
-        a.display
-            .to_lowercase()
-            .cmp(&b.display.to_lowercase())
-            .then_with(|| a.display.cmp(&b.display))
-    });
-
-    let rendered = result
+    let tiles = resolve_album_tiles(conn, verb_name).await?;
+    let rendered = tiles
         .into_iter()
         .map(|tile| {
-            let cleaned_artist = if tile.representative_artist.trim().is_empty()
-            {
-                None
-            } else {
-                Some(artist_display_form(&tile.representative_artist))
-            };
-            let cover_url =
-                evo_device_audio_shared::artwork_target_url_for_track_sized(
-                    // Empty file-path forces the mpd-album branch;
-                    // the resolver runs `find album X albumartist Y`
-                    // against MPD's index using the RAW album tag —
-                    // a form MPD's index still matches — even when
-                    // the tile's DISPLAY has been cleaned by
-                    // `album_identity`.
-                    "",
-                    cleaned_artist.as_deref(),
-                    Some(&tile.representative_raw_album),
-                    Some("small"),
-                );
+            let cover_url = evo_device_audio_shared::artwork_target_url_sized(
+                "mpd-path",
+                &tile.representative_track_path,
+                Some("small"),
+            );
+            let track_count = tile.track_count();
             json!({
-                "album":       tile.display,
-                "artist":      cleaned_artist,
+                "album":       tile.display_title,
+                "album_id":    tile.canonical_folder,
+                "artist":      tile.display_artist,
                 "cover_url":   cover_url,
-                "track_count": tile.total_count,
+                "track_count": track_count,
             })
         })
         .collect();
@@ -1533,51 +1619,62 @@ async fn drill_by_tag(
         }
         dedupe_entries_by_path(all)
     } else if tag == "album" {
-        // Album facet drill.
+        // Album facet drill — folder-anchored.
         //
-        // The enumeration path grouped raw ALBUM tags by
-        // [`AlbumIdentity::grouping_key`], collapsing multi-disc
-        // variants and falling back to the parent folder for
-        // degenerate tags. The selector value is the tile's
-        // DISPLAY (cleaned title) — match every raw album whose
-        // resolved identity groups to the selected key, then
-        // union `find album X` batches across the matches.
-        let target_key = album_identity(selector_value, "", "").grouping_key;
-        if target_key.is_empty() {
+        // The enumeration path grouped tracks by
+        // [`AlbumTile::canonical_folder`]. The selector may
+        // carry the tile's `album_id` (canonical folder path,
+        // when the UI emits it) or the tile's `album` display
+        // title (backward-compatible path). Match tiles by
+        // whichever the selector value equals, then return the
+        // tracks the tile already carries — no second MPD
+        // roundtrip.
+        let tiles = resolve_album_tiles(conn, verb_name).await?;
+        let matching: Vec<&AlbumTile> = tiles
+            .iter()
+            .filter(|t| {
+                t.canonical_folder == selector_value
+                    || t.display_title.eq_ignore_ascii_case(selector_value)
+            })
+            .collect();
+        if matching.is_empty() {
             return Err(VerbError::Mpd {
                 verb: verb_name.to_string(),
-                reason: "browse selector value did not fold to a match key"
-                    .to_string(),
+                reason: format!(
+                    "no album matched selector value {selector_value:?}"
+                ),
             });
         }
-        let rows = resolve_album_rows(conn, verb_name).await?;
-        let matching: Vec<String> = rows
-            .into_iter()
-            .filter(|r| r.identity.grouping_key == target_key)
-            .map(|r| r.raw_album)
-            .collect();
+        // Optional parent-context filter: when the operator UI
+        // passes a parent artist (e.g. drill from an artist
+        // tile → an album under that artist), narrow the
+        // matched tiles by artist fold-key so same-titled
+        // albums by different artists disambiguate.
         let parent_ctx = build_parent_field(selector, verb_name)?;
+        let filtered: Vec<&AlbumTile> = match &parent_ctx {
+            None => matching,
+            Some((field, value)) => {
+                let target_key = match field {
+                    MpdSearchField::AlbumArtist | MpdSearchField::Artist => {
+                        artist_fold_key(value)
+                    }
+                    _ => String::new(),
+                };
+                if target_key.is_empty() {
+                    matching
+                } else {
+                    matching
+                        .into_iter()
+                        .filter(|t| {
+                            artist_fold_key(&t.display_artist) == target_key
+                        })
+                        .collect()
+                }
+            }
+        };
         let mut all: Vec<MpdLibraryEntry> = Vec::new();
-        for raw in &matching {
-            let batch = match &parent_ctx {
-                None => conn.find(MpdSearchField::Album, raw).await.map_err(
-                    |e| VerbError::Mpd {
-                        verb: verb_name.to_string(),
-                        reason: e.to_string(),
-                    },
-                )?,
-                Some((field, value)) => conn
-                    .find_multi(&[
-                        (MpdSearchField::Album, raw),
-                        (field.clone(), value),
-                    ])
-                    .await
-                    .map_err(|e| VerbError::Mpd {
-                        verb: verb_name.to_string(),
-                        reason: e.to_string(),
-                    })?,
-            };
-            all.extend(batch);
+        for tile in &filtered {
+            all.extend(tile.tracks.iter().cloned());
         }
         dedupe_entries_by_path(all)
     } else {
@@ -1756,12 +1853,11 @@ pub(crate) fn identity_post_process(raw: String) -> Option<String> {
     Some(raw)
 }
 
-pub(crate) use evo_device_audio_shared::album_name::{
-    album_identity, AlbumIdentity,
-};
+pub(crate) use evo_device_audio_shared::album_name::clean_album_title;
 pub(crate) use evo_device_audio_shared::artist_name::{
     artist_display_form, artist_fold_key, split_artist_credit,
 };
+pub(crate) use evo_device_audio_shared::folder_album::canonical_album_folder;
 
 /// Slice a full entry list into the requested page.
 ///

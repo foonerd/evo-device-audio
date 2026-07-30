@@ -1,132 +1,66 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
 
-//! Album identity: canonical display + grouping key for
-//! browse-by-album.
+//! Album-title cleaning primitives.
 //!
-//! MPD's raw `album` tag carries three failure classes that
-//! break browse-by-album on ordinary libraries the same way
-//! Roon, Plex, Jellyfin, Picard, and beets model around:
+//! Pure string helpers used by [`folder_album`] when it derives
+//! an album's display title from either its raw MPD `album` tag
+//! (majority-vote across tracks) or its parent folder basename
+//! (fallback when the tag is absent or degenerate).
 //!
-//! - **Multi-disc.** Two tags (`Album (Disc 1)`, `Album (Disc
-//!   2)`) surface as two tiles for a single release. Enterprise
-//!   music software folds them into one and preserves disc-
-//!   then-track order on drill.
-//! - **Decoration.** `(Deluxe Edition)`, `(Remastered
-//!   Version)`, `[Explicit]`, `(Bonus Track Version)` clutter
-//!   the display; the tile should show the plain title.
-//! - **Degenerate tag.** The ALBUM tag holds the artist credit,
-//!   not the album title. The real title exists only in the
-//!   folder basename. Standard Plex / Jellyfin fallback: use
-//!   the folder.
+//! Album IDENTITY (grouping + cover key) is folder-anchored —
+//! see [`folder_album`]. This module carries only the
+//! decoration-stripping vocabulary shared between tag-derived
+//! titles and folder-derived titles:
 //!
-//! [`album_identity`] resolves the display title and the
-//! grouping key from raw MPD tag data plus the file's parent
-//! folder basename. Applied once at the browse-by-album call
-//! site; downstream consumers (cover-url synthesis, drill by
-//! album) key off the same helper.
+//! - **Multi-disc suffix strip.** `Album (Disc 1)` /
+//!   `Album [CD 2]` / `Album - CD 1` / `Album vol2` / `Album
+//!   (Disc 1 of 3)` all reduce to `Album`. Applied to both tag
+//!   titles (so multi-disc raw tags render as one) and folder
+//!   basenames (so a `Disc 1` sibling folder collapses to its
+//!   parent-canonical form).
+//! - **Edition-qualifier strip.** `(Deluxe Edition)`,
+//!   `(Remastered Version)`, `[Explicit]`, `(NNth Anniversary
+//!   Edition)`, `(Bonus Track Version)`, `(Radio Edit)`, and
+//!   the stacked forms (`(Deluxe Edition) (Deluxe)`) come off
+//!   the DISPLAY. Prior art: Roon / Plex / Jellyfin / Picard
+//!   / beets.
+//! - **Degenerate-tag detection.** `is_degenerate_album_tag`
+//!   answers "does this album tag look like the artist credit
+//!   or a label rather than a real title?" — the signal that
+//!   folder-anchored resolution should prefer the folder
+//!   basename over the tag.
+//!
+//! [`folder_album`]: crate::folder_album
 
 use unicode_normalization::UnicodeNormalization;
 
-/// Canonical album identity emitted at the browse-by-album
-/// boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AlbumIdentity {
-    /// Display title for the tile. Multi-disc suffix and
-    /// edition decoration removed. NFC-normalised so composed
-    /// and decomposed inputs render identically.
-    pub display: String,
-    /// Grouping discriminator. Two raw tag forms with the same
-    /// grouping key belong to the same tile. Case- and
-    /// diacritic-insensitive; multi-disc variants fold; edition
-    /// qualifiers stay part of the key so a deluxe / standard
-    /// release with genuinely different track counts stay
-    /// separate tiles.
-    pub grouping_key: String,
-}
-
-/// Resolve an album's canonical identity from its raw MPD
-/// `album` tag, the raw artist credit (used to detect a
-/// mistagged album), and the file's parent folder basename.
+/// Clean an album title for display: strip trailing multi-disc
+/// suffix AND trailing edition qualifier, then NFC-normalise.
 ///
-/// Rules, applied in order:
-///
-/// 1. Degenerate-tag fallback (Plex/Jellyfin folder model):
-///    when `raw_album` is empty OR every token in it appears
-///    in `raw_artist_credit` (the strong mistag signal — the
-///    album tag repeats the artist names), use `parent_folder`
-///    as the effective album name.
-/// 2. Trailing disc/medium suffix removed (`(Disc 1)`,
-///    `(CD 2 of 3)`, `[Vol 3]`, `(Part 1)`). Applied to BOTH
-///    display and grouping key so multi-disc folds.
-/// 3. Trailing edition/qualifier suffix removed from the
-///    DISPLAY (`(Deluxe Edition)`, `[Explicit]`,
-///    `(Remastered)`, `(NNth Anniversary Edition)`, …). Kept
-///    on the grouping key so `Album (Deluxe Edition)` and
-///    `Album` stay separate tiles when the release genuinely
-///    differs.
-/// 4. Display is NFC-normalised.
-///
-/// If every step produces an empty string, returns the trimmed
-/// raw album (or the trimmed folder) so the tile always has a
-/// label.
-pub fn album_identity(
-    raw_album: &str,
-    raw_artist_credit: &str,
-    parent_folder: &str,
-) -> AlbumIdentity {
-    let effective_raw = if is_degenerate_album_tag(raw_album, raw_artist_credit)
-    {
-        parent_folder.trim()
-    } else {
-        raw_album.trim()
-    };
-
-    let base_without_disc = strip_trailing_disc_suffix(effective_raw);
-    let display_clean = strip_trailing_edition_qualifier(base_without_disc);
-    let display_source = if display_clean.trim().is_empty() {
-        effective_raw
-    } else {
-        display_clean
-    };
-    let display: String = display_source.nfc().collect();
-
-    let grouping_key = fold_alnum(base_without_disc);
-
-    AlbumIdentity {
-        display,
-        grouping_key,
+/// Idempotent: `clean_album_title("Album (Deluxe Edition) (Disc
+/// 1)")` → `"Album"`. Returns the trimmed original when both
+/// strippers produce empty (so the tile never renders blank).
+pub fn clean_album_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
+    let without_disc = strip_trailing_disc_suffix(trimmed);
+    let without_edition = strip_trailing_edition_qualifier(without_disc);
+    let source = if without_edition.trim().is_empty() {
+        trimmed
+    } else {
+        without_edition
+    };
+    source.nfc().collect()
 }
 
-/// True when the raw `album` tag is missing or holds the
-/// artist credit rather than the album title — the browse
-/// facet caller should fetch a parent folder basename before
-/// calling [`album_identity`], otherwise the tile falls back
-/// to the raw (dirty) album tag.
-///
-/// Called at the browse-by-album call site so an MPD
-/// `find album X` roundtrip only fires for the degenerate
-/// rows.
-pub fn album_needs_folder_fallback(
-    raw_album: &str,
-    raw_artist_credit: &str,
-) -> bool {
-    is_degenerate_album_tag(raw_album, raw_artist_credit)
-}
-
-/// True when the raw `album` tag is missing or holds the
-/// artist credit rather than the album title.
-///
-/// - Empty album is trivially degenerate.
-/// - Non-empty is degenerate when every token in the album
-///   tag appears as a token in the artist credit — the
-///   strong mistag signal enterprise libraries use to trigger
-///   a folder fallback.
-///
-/// Comparison is on fold-normalised alphanumeric tokens so
-/// diacritic form and delimiter choice do not matter.
-fn is_degenerate_album_tag(album: &str, artist_credit: &str) -> bool {
+/// True when the raw `album` tag looks like the artist credit
+/// (Verve-style mistag: every token appears in `artist_credit`)
+/// or is empty. Signal to prefer the folder basename over the
+/// tag.
+pub fn is_degenerate_album_tag(album: &str, artist_credit: &str) -> bool {
     let album_trim = album.trim();
     if album_trim.is_empty() {
         return true;
@@ -165,10 +99,10 @@ fn token_bag(s: &str) -> std::collections::BTreeSet<String> {
 ///   token.
 ///
 /// All matched forms strip to `Album`, unifying multi-disc
-/// variants into one tile. Non-matching parentheticals
-/// (`(Live at Wembley)`, `(Deluxe Edition)`) are left for the
-/// edition-qualifier stripper.
-fn strip_trailing_disc_suffix(s: &str) -> &str {
+/// variants into one canonical form. Non-matching
+/// parentheticals (`(Live at Wembley)`, `(Deluxe Edition)`)
+/// are left for the edition-qualifier stripper.
+pub fn strip_trailing_disc_suffix(s: &str) -> &str {
     let trimmed = s.trim_end();
     if trimmed.len() < 3 {
         return trimmed;
@@ -183,6 +117,15 @@ fn strip_trailing_disc_suffix(s: &str) -> &str {
         return stripped;
     }
     trimmed
+}
+
+/// True when `s` is a bare disc marker (`Disc 1`, `CD 2`,
+/// `Volume 3`, `Part 1`), case-insensitive. Used by the
+/// folder-rollup rule: a folder whose ENTIRE basename is a
+/// disc marker is a subfolder of the real album folder — the
+/// grandparent is the canonical album folder.
+pub fn is_disc_only_basename(s: &str) -> bool {
+    parse_disc_group(s.trim()).is_some()
 }
 
 fn strip_paren_disc_suffix(trimmed: &str) -> Option<&str> {
@@ -203,10 +146,6 @@ fn strip_paren_disc_suffix(trimmed: &str) -> Option<&str> {
 }
 
 fn strip_dash_disc_suffix(trimmed: &str) -> Option<&str> {
-    // Find the last dash separator surrounded by spaces:
-    // ` - `, ` – ` (en-dash U+2013), ` — ` (em-dash U+2014).
-    // Whitespace-flanked because a hyphen inside a title
-    // (`Wham! - Last Christmas`) is not a disc marker.
     for delim in [" - ", " \u{2013} ", " \u{2014} "] {
         if let Some(idx) = trimmed.rfind(delim) {
             let tail = trimmed[idx + delim.len()..].trim();
@@ -219,12 +158,6 @@ fn strip_dash_disc_suffix(trimmed: &str) -> Option<&str> {
 }
 
 fn strip_glued_disc_suffix(trimmed: &str) -> Option<&str> {
-    // Last whitespace-delimited token; if it parses as
-    // `<label><digits>` (`vol2`, `disc1`, `cd3`), strip it
-    // and the whitespace before it. Guards against tokens
-    // that happen to end in digits (`Album 2` — album track
-    // number two) by requiring the alpha prefix be a known
-    // disc-label vocabulary.
     let last_space = trimmed.rfind(char::is_whitespace)?;
     let tail = &trimmed[last_space + 1..];
     if tail.is_empty() {
@@ -271,11 +204,9 @@ fn parse_disc_group(inner: &str) -> Option<u32> {
 /// Strip a trailing edition/qualifier parenthetical from the
 /// display title. Fires only for a known qualifier vocabulary;
 /// anything else stays — a group like `(Live at Wembley)`
-/// remains part of the title.
-///
-/// Repeats so stacked decorations (`(Deluxe Edition) (Deluxe)`)
-/// collapse in one pass.
-fn strip_trailing_edition_qualifier(s: &str) -> &str {
+/// remains part of the title. Repeats so stacked decorations
+/// (`(Deluxe Edition) (Deluxe)`) collapse in one pass.
+pub fn strip_trailing_edition_qualifier(s: &str) -> &str {
     let mut out = s.trim_end();
     loop {
         let Some(stripped) = strip_one_trailing_edition(out) else {
@@ -386,29 +317,12 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------
-    // Multi-disc merge (Elton "Goodbye Yellow Brick Road" / "The
-    // Ultimate Collection" — both tagged (Disc 1)/(Disc 2))
+    // Multi-disc suffix strip — three input shapes fold to one
+    // canonical form.
     // ------------------------------------------------------------
 
     #[test]
-    fn multi_disc_variants_share_grouping_key() {
-        let a = album_identity(
-            "Goodbye Yellow Brick Road (Disc 1)",
-            "Elton John",
-            "Elton John - Goodbye Yellow Brick Road",
-        );
-        let b = album_identity(
-            "Goodbye Yellow Brick Road (Disc 2)",
-            "Elton John",
-            "Elton John - Goodbye Yellow Brick Road",
-        );
-        assert_eq!(a.grouping_key, b.grouping_key);
-        assert_eq!(a.display, "Goodbye Yellow Brick Road");
-        assert_eq!(b.display, "Goodbye Yellow Brick Road");
-    }
-
-    #[test]
-    fn multi_disc_variants_display_without_disc_suffix() {
+    fn strip_disc_paren_forms() {
         for raw in [
             "Album X (Disc 1)",
             "Album X (Disk 2)",
@@ -419,25 +333,16 @@ mod tests {
             "Album X (Part 1)",
             "Album X (Disc. 1)",
         ] {
-            let id = album_identity(raw, "Artist", "folder");
-            assert_eq!(id.display, "Album X", "raw {raw:?}");
+            assert_eq!(
+                strip_trailing_disc_suffix(raw),
+                "Album X",
+                "raw {raw:?}"
+            );
         }
     }
 
     #[test]
-    fn non_disc_parenthetical_kept_intact_on_display() {
-        // "Live at Wembley" is not a disc marker and not a
-        // known edition qualifier; the tile keeps it.
-        let id = album_identity(
-            "Bad (Live at Wembley)",
-            "Michael Jackson",
-            "Michael Jackson - Bad (Live at Wembley)",
-        );
-        assert_eq!(id.display, "Bad (Live at Wembley)");
-    }
-
-    #[test]
-    fn dash_form_disc_recognised() {
+    fn strip_disc_dash_forms() {
         for raw in [
             "Les Concerts En Chine - CD 1",
             "Les Concerts En Chine - Disc 2",
@@ -445,67 +350,82 @@ mod tests {
             "Les Concerts En Chine \u{2013} CD 2",
             "Les Concerts En Chine \u{2014} CD 2",
         ] {
-            let id = album_identity(raw, "Jean Michel Jarre", "folder");
-            assert_eq!(id.display, "Les Concerts En Chine", "raw {raw:?}");
+            assert_eq!(
+                strip_trailing_disc_suffix(raw),
+                "Les Concerts En Chine",
+                "raw {raw:?}"
+            );
         }
     }
 
     #[test]
-    fn glued_form_disc_recognised() {
+    fn strip_disc_glued_forms() {
         for raw in [
             "Les Concerts en Chine vol2",
             "Les Concerts en Chine disc1",
             "Les Concerts en Chine cd3",
         ] {
-            let id = album_identity(raw, "Jean Michel Jarre", "folder");
-            assert_eq!(id.display, "Les Concerts en Chine", "raw {raw:?}");
+            assert_eq!(
+                strip_trailing_disc_suffix(raw),
+                "Les Concerts en Chine",
+                "raw {raw:?}"
+            );
         }
     }
 
     #[test]
+    fn strip_disc_leaves_non_disc_paren_alone() {
+        // `Live at Wembley` is not a disc marker; the edition
+        // stripper decides if `(Deluxe Edition)` stays.
+        assert_eq!(
+            strip_trailing_disc_suffix("Bad (Live at Wembley)"),
+            "Bad (Live at Wembley)"
+        );
+    }
+
+    #[test]
     fn album_ending_in_digits_not_treated_as_disc() {
-        // "Album 2" — the trailing token is just digits, no
-        // alpha label. Must NOT strip.
-        let id = album_identity("Grease 2", "Various", "folder");
-        assert_eq!(id.display, "Grease 2");
+        assert_eq!(strip_trailing_disc_suffix("Grease 2"), "Grease 2");
     }
 
     #[test]
     fn hyphen_inside_title_not_treated_as_disc_delimiter() {
-        // `Wham! - Last Christmas` has ` - ` but the tail is
-        // not a disc marker. Must NOT strip.
-        let id = album_identity("Wham! - Last Christmas", "Wham!", "folder");
-        assert_eq!(id.display, "Wham! - Last Christmas");
-    }
-
-    #[test]
-    fn dash_form_variants_share_grouping_key() {
-        let a = album_identity(
-            "Les Concerts En Chine - CD 1",
-            "Jean Michel Jarre",
-            "folder",
+        assert_eq!(
+            strip_trailing_disc_suffix("Wham! - Last Christmas"),
+            "Wham! - Last Christmas"
         );
-        let b = album_identity(
-            "Les Concerts en Chine vol2",
-            "Jean Michel Jarre",
-            "folder",
-        );
-        assert_eq!(a.grouping_key, b.grouping_key);
-    }
-
-    #[test]
-    fn disc_of_m_form_recognised() {
-        let id = album_identity(
-            "Ultimate Collection (Disc 1 of 2)",
-            "Elton John",
-            "folder",
-        );
-        assert_eq!(id.display, "Ultimate Collection");
     }
 
     // ------------------------------------------------------------
-    // Decoration stripping (display-clean; grouping keeps edition
-    // so deluxe/standard don't wrongly merge)
+    // is_disc_only_basename — folder-rollup signal.
+    // ------------------------------------------------------------
+
+    #[test]
+    fn disc_only_basename_recognised() {
+        for name in [
+            "Disc 1", "Disk 2", "CD 3", "Vol 1", "Volume 2", "Part 1",
+            "Disc. 1", "cd 4",
+        ] {
+            assert!(is_disc_only_basename(name), "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn non_disc_only_basename_rejected() {
+        for name in [
+            "Album",
+            "Disc 1 Bonus Tracks",
+            "The Ultimate Collection (Disc 1)",
+            "",
+            "CD",
+            "Disc",
+        ] {
+            assert!(!is_disc_only_basename(name), "name {name:?}");
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Edition-qualifier strip.
     // ------------------------------------------------------------
 
     #[test]
@@ -521,141 +441,72 @@ mod tests {
             ("Some Album (Extended Edition)", "Some Album"),
             ("Some Album (Special Edition)", "Some Album"),
         ] {
-            let id = album_identity(raw, "Some Artist", "folder");
-            assert_eq!(id.display, want, "raw {raw:?}");
+            assert_eq!(
+                strip_trailing_edition_qualifier(raw),
+                want,
+                "raw {raw:?}"
+            );
         }
     }
 
     #[test]
     fn stacked_edition_qualifiers_collapse() {
-        // The observed real-rig case: two stacked qualifiers.
-        let id = album_identity(
-            "Rumours (Deluxe Edition) (Deluxe)",
-            "Fleetwood Mac",
-            "folder",
+        assert_eq!(
+            strip_trailing_edition_qualifier(
+                "Rumours (Deluxe Edition) (Deluxe)"
+            ),
+            "Rumours"
         );
-        assert_eq!(id.display, "Rumours");
-    }
-
-    #[test]
-    fn edition_qualifier_kept_in_grouping_key() {
-        // Standard and Deluxe stay separate tiles because
-        // enterprise libraries treat them as different
-        // releases when the track counts differ.
-        let standard = album_identity("Rumours", "Fleetwood Mac", "folder");
-        let deluxe = album_identity(
-            "Rumours (Deluxe Edition)",
-            "Fleetwood Mac",
-            "folder",
-        );
-        assert_ne!(standard.grouping_key, deluxe.grouping_key);
-    }
-
-    #[test]
-    fn edition_and_disc_stack_display_clean() {
-        // Disc suffix stripped for grouping AND display;
-        // edition suffix stripped for display only.
-        let id = album_identity(
-            "Album X (Deluxe Edition) (Disc 1)",
-            "Artist",
-            "folder",
-        );
-        assert_eq!(id.display, "Album X");
     }
 
     // ------------------------------------------------------------
-    // Degenerate-tag fallback (Plex / Jellyfin folder model)
+    // clean_album_title — both strippers together.
     // ------------------------------------------------------------
 
     #[test]
-    fn degenerate_album_falls_back_to_folder() {
-        // The ALBUM tag holds the artist credit; folder holds
-        // the real album title. Verve/Paco fixture.
-        let id = album_identity(
-            "Paco De Lucia, Al Di Meola, John McLaughlin",
-            "Paco De Lucia, Al Di Meola, John McLaughlin",
-            "Friday Night in San Francisco",
+    fn clean_album_title_strips_disc_then_edition() {
+        assert_eq!(
+            clean_album_title("Album X (Deluxe Edition) (Disc 1)"),
+            "Album X"
         );
-        assert_eq!(id.display, "Friday Night in San Francisco");
     }
 
     #[test]
-    fn empty_album_falls_back_to_folder() {
-        let id = album_identity("", "Some Artist", "The Real Title");
-        assert_eq!(id.display, "The Real Title");
-    }
-
-    #[test]
-    fn valid_album_ignores_folder_hint() {
-        // The ALBUM tag is a real title; folder name should
-        // NOT override it.
-        let id = album_identity(
-            "Kind of Blue",
-            "Miles Davis",
-            "Miles Davis - Kind of Blue [1959]",
-        );
-        assert_eq!(id.display, "Kind of Blue");
-    }
-
-    #[test]
-    fn album_with_extra_tokens_beyond_credit_not_degenerate() {
-        // Album name contains the artist name plus additional
-        // tokens — not a mistag. Keep the raw album.
-        let id = album_identity(
-            "The Beatles Anthology",
-            "The Beatles",
-            "The Beatles - Anthology",
-        );
-        assert_eq!(id.display, "The Beatles Anthology");
-    }
-
-    #[test]
-    fn degenerate_across_delimiter_variations() {
-        // Different delimiters in album vs credit still match
-        // as subset once folded.
-        let id = album_identity(
-            "Paco De Lucia; Al Di Meola; John McLaughlin",
-            "Paco de Lucía, Al Di Meola, John McLaughlin",
-            "Friday Night in San Francisco",
-        );
-        assert_eq!(id.display, "Friday Night in San Francisco");
-    }
-
-    // ------------------------------------------------------------
-    // Grouping-key invariants
-    // ------------------------------------------------------------
-
-    #[test]
-    fn grouping_key_case_and_diacritic_insensitive() {
-        let a = album_identity("Café Bleu", "Style Council", "folder");
-        let b = album_identity("CAFE BLEU", "Style Council", "folder");
-        assert_eq!(a.grouping_key, b.grouping_key);
-    }
-
-    #[test]
-    fn grouping_key_stable_across_disc_variants() {
-        let a = album_identity("Album X (Disc 1)", "Artist", "folder");
-        let b = album_identity("Album X (Disc 2)", "Artist", "folder");
-        let c = album_identity("Album X", "Artist", "folder");
-        assert_eq!(a.grouping_key, b.grouping_key);
-        assert_eq!(b.grouping_key, c.grouping_key);
-    }
-
-    #[test]
-    fn empty_everything_returns_empty_identity() {
-        let id = album_identity("", "", "");
-        assert!(id.display.is_empty());
-        assert!(id.grouping_key.is_empty());
-    }
-
-    #[test]
-    fn display_nfc_normalises_decomposed_input() {
-        // "Cafe" + combining acute → NFC "Café".
+    fn clean_album_title_nfc_normalises() {
         let decomposed = "Cafe\u{0301}";
         let composed = "Café";
-        let a = album_identity(decomposed, "Artist", "folder");
-        let b = album_identity(composed, "Artist", "folder");
-        assert_eq!(a.display, b.display);
-        assert_eq!(a.display, composed);
+        assert_eq!(clean_album_title(decomposed), clean_album_title(composed));
+    }
+
+    #[test]
+    fn clean_album_title_empty_returns_empty() {
+        assert!(clean_album_title("").is_empty());
+        assert!(clean_album_title("   ").is_empty());
+    }
+
+    // ------------------------------------------------------------
+    // Degenerate-tag detection.
+    // ------------------------------------------------------------
+
+    #[test]
+    fn degenerate_when_album_matches_artist_credit_tokens() {
+        assert!(is_degenerate_album_tag(
+            "Paco De Lucia, Al Di Meola, John McLaughlin",
+            "Paco de Lucía, Al Di Meola & John McLaughlin"
+        ));
+    }
+
+    #[test]
+    fn degenerate_when_album_empty() {
+        assert!(is_degenerate_album_tag("", "Any Artist"));
+    }
+
+    #[test]
+    fn non_degenerate_when_album_has_own_tokens() {
+        assert!(!is_degenerate_album_tag("Kind of Blue", "Miles Davis"));
+        assert!(!is_degenerate_album_tag(
+            "The Beatles Anthology",
+            "The Beatles"
+        ));
     }
 }
