@@ -746,17 +746,38 @@ pub(crate) async fn query_artist_artwork(
             req.v
         )));
     }
-    let artist = req
+    let raw_artist = req
         .artist
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let Some(artist) = artist else {
+    let Some(raw_artist) = raw_artist else {
         return Ok(ArtistArtworkResponse::bad_request(
             "artist is required and must be non-empty",
         ));
     };
+    // Sanitise before any provider is queried. Raw MPD tag drift
+    // (watermark tails like `Tim Foust | www.junk.com`, sort-form
+    // `Foust, Tim`, self-slash `Tim Foust/Tim Foust`, trailing
+    // parentheticals, NFD decomposition of diacritics) misses
+    // every provider's exact-match search on well-known artists.
+    // `artist_display_form` mirrors the album cascade's cleaning
+    // step so the raw tag never poisons TheAudioDB / Deezer /
+    // MusicBrainz reconcile.
+    let cleaned =
+        evo_device_audio_shared::artist_name::artist_display_form(&raw_artist);
+    let artist = if cleaned.trim().is_empty() {
+        raw_artist.clone()
+    } else {
+        cleaned
+    };
+    tracing::info!(
+        plugin = crate::PLUGIN_NAME,
+        artist_raw = %raw_artist,
+        artist_clean = %artist,
+        "artwork.online.artist.cascade.begin",
+    );
     let caller_supplied_mbid = req
         .artist_mbid
         .as_deref()
@@ -1388,12 +1409,36 @@ async fn run_cascade(
                      cascade can reconcile artist identity",
                 ));
             }
-            return Ok(ArtistArtworkResponse::not_found(format!(
-                "no MusicBrainz-confident match for {artist} at ≥{MB_MIN_CONFIDENCE_PERCENT}% \
-                 — cascade requires MBID reconciliation to prevent wrong-entity images"
-            )));
+            // Safety-net: MB did not clear the ≥90 % confidence
+            // threshold, but the artist may still resolve via
+            // providers whose search does NOT depend on the
+            // MBID — TheAudioDB by name, Deezer by name,
+            // volumio_meta by name. Well-known artists (e.g.
+            // Tim Foust, indie / niche performers with public
+            // portraits) frequently fall through the MB
+            // confidence gate; without this fallback the tile
+            // renders a placeholder for artists every
+            // mainstream music-metadata product resolves.
+            let response = name_search_safety_net(&artist, catalogue).await;
+            if !matches!(response.status, CascadeStatus::Ok) {
+                return Ok(ArtistArtworkResponse::not_found(format!(
+                    "no MusicBrainz-confident match for {artist} at ≥{MB_MIN_CONFIDENCE_PERCENT}% \
+                     and no name-search provider had a portrait for this artist"
+                )));
+            }
+            return Ok(response);
         }
         ReconcileOutcome::Unavailable => {
+            // Same safety-net: MB is transient. If any name-
+            // search provider has a portrait, prefer it over
+            // the transient failure. Only fall through to
+            // Unavailable when the name-search Hit set is
+            // empty AND at least one name-search provider was
+            // also transient (retry-safe honest signalling).
+            let response = name_search_safety_net(&artist, catalogue).await;
+            if matches!(response.status, CascadeStatus::Ok) {
+                return Ok(response);
+            }
             return Ok(ArtistArtworkResponse::unavailable(format!(
                 "musicbrainz reconcile transient for {artist}; retry on next gesture"
             )));
@@ -1583,6 +1628,90 @@ fn any_provider_configured(catalogue: &ArtistCatalogue) -> bool {
 //   cache — the wire aggregate surfaces `Unavailable` unless
 //   another provider hits.
 // ---------------------------------------------------------------
+
+/// Name-search safety net.
+///
+/// Consulted when the MusicBrainz reconcile step returned
+/// `Absent` (no ≥90 % confidence match) or `Unavailable`
+/// (transient). Dispatches the three MBID-independent providers
+/// in parallel (`tokio::join!`) and aggregates their outcomes.
+///
+/// - **TheAudioDB by name** — free, no auth, indexes both major
+///   and independent artists with community-uploaded portraits.
+/// - **Deezer by name** — free, no auth, wide catalogue for pop
+///   / rock / jazz / hip-hop / indie including Tim Foust and
+///   the Home Free members he performs with.
+/// - **volumio_meta by name** — operator-opt-in; historical
+///   third-party proxy. Skipped unless the operator enabled it.
+///
+/// Any `Hit` wins the safety net (aggregated by
+/// `ArtistArtworkResponse::from_provider_outcomes`, which
+/// implements the three-way rule: any Hit → Ok; else any
+/// Unavailable → Unavailable; else all Absent → NotFound). The
+/// caller decides whether the returned Ok supersedes the MB
+/// failure or falls through.
+///
+/// Rationale: MusicBrainz's confidence threshold is calibrated
+/// for identity-critical downstream (fanart.tv, Deezer URL-rels
+/// that would return a wrong-entity picture on a low-confidence
+/// match). But every MBID-INDEPENDENT provider carries its own
+/// canonical entity resolution — TheAudioDB and Deezer both
+/// return the artist ID + canonical spelling with their portrait
+/// hit, so a wrong-entity picture cannot come out of a
+/// name-search hit at those providers.
+async fn name_search_safety_net(
+    artist: &str,
+    catalogue: &ArtistCatalogue,
+) -> ArtistArtworkResponse {
+    let want_theaudiodb =
+        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+            && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+        && catalogue.deezer.is_some();
+    let want_volumio =
+        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    tracing::info!(
+        plugin = crate::PLUGIN_NAME,
+        artist,
+        theaudiodb_enabled = want_theaudiodb,
+        deezer_enabled = want_deezer,
+        volumio_meta_enabled = want_volumio,
+        "artwork.online.artist.name_search_safety_net.begin",
+    );
+    let (tadb_out, deezer_out, volumio_out) = tokio::join!(
+        fetch_theaudiodb_artist(None, artist, catalogue, want_theaudiodb),
+        fetch_deezer_artist_by_name(artist, catalogue, want_deezer),
+        fetch_volumio_meta_artist(
+            artist,
+            &catalogue.volumio_meta_http,
+            &catalogue.volumio_meta_variant,
+            want_volumio,
+        ),
+    );
+    let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
+        tadb_out,
+        deezer_out,
+        volumio_out,
+    ]);
+    if matches!(response.status, CascadeStatus::Ok) {
+        sort_sources_by_priority(&mut response.sources, &catalogue.config);
+        response = ArtistArtworkResponse::from_sources(response.sources);
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            artist,
+            winner = %response.provider_id.as_deref().unwrap_or("?"),
+            "artwork.online.artist.name_search_safety_net.hit",
+        );
+    } else {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            artist,
+            status = ?response.status,
+            "artwork.online.artist.name_search_safety_net.no_hit",
+        );
+    }
+    response
+}
 
 async fn fetch_volumio_meta_artist(
     artist: &str,
@@ -1821,6 +1950,68 @@ async fn fetch_deezer_artist_by_id(
     // `hit` drops here — the ArtistImageHit type is un-Serialize,
     // so it cannot leak through JSON. Only the URL strings above
     // survive into the response payload.
+    ProviderOutcome::Hit(SourceEntry {
+        provider_id: ArtistProviderId::Deezer.as_str().to_string(),
+        privacy_class: ArtistPrivacyClass::Anonymous.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Deezer".into(),
+            source_url: Some(source_url),
+            license: "Deezer terms of use (live-fetch only, no persistence)"
+                .into(),
+        },
+    })
+}
+
+/// Deezer artist portrait via name-search — no MBID required.
+///
+/// Consulted by the name-search safety net when the MusicBrainz
+/// reconcile step returns Absent or Unavailable, so the cascade
+/// can still land a portrait for well-known artists whose name
+/// does not clear MB's ≥90 % confidence threshold or when MB is
+/// transiently unreachable.
+///
+/// Same Deezer live-fetch invariant as
+/// [`fetch_deezer_artist_by_id`]: the `ArtistImageHit` is never
+/// serialised; only URL strings cross the wire.
+async fn fetch_deezer_artist_by_name(
+    artist: &str,
+    catalogue: &ArtistCatalogue,
+    enabled: bool,
+) -> ProviderOutcome {
+    if !enabled {
+        return ProviderOutcome::Absent;
+    }
+    let Some(deezer) = catalogue.deezer.as_ref() else {
+        return ProviderOutcome::Absent;
+    };
+    let hit = match deezer.search_artist_image(artist).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return ProviderOutcome::Absent,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "deezer",
+                artist,
+                error = %e,
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "deezer artist image by name transient; response=Unavailable, no cache write, retry fires on next request for this artist"
+            );
+            return ProviderOutcome::Unavailable;
+        }
+    };
+    let payload = serde_json::json!({
+        "picture_xl_url": hit.picture_xl_url,
+        "picture_big_url": hit.picture_big_url,
+        "picture_medium_url": hit.picture_medium_url,
+        "picture_small_url": hit.picture_small_url,
+        "deezer_artist_id": hit.deezer_artist_id,
+        "artist_name": hit.artist_name,
+        "source_url": hit.source_url.clone(),
+        "cache_policy": "live_fetch_only",
+    });
+    let source_url = hit.source_url.clone();
     ProviderOutcome::Hit(SourceEntry {
         provider_id: ArtistProviderId::Deezer.as_str().to_string(),
         privacy_class: ArtistPrivacyClass::Anonymous.as_str().to_string(),

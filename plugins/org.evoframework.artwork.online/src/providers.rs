@@ -159,13 +159,16 @@ pub(crate) struct ProviderHit {
 ///   the album; watermarks and sort-form drift on the
 ///   artist) would otherwise miss every provider's
 ///   catalogue on well-known releases.
-/// - **Tier 1 race**: `cover_art_archive`, `itunes`,
-///   `deezer` dispatch in parallel via a `FuturesUnordered`
-///   race. The first provider returning
-///   [`ProviderOutcome::Hit`] wins; the other in-flight
-///   requests are dropped. Every provider call is wrapped in
-///   a per-provider hard timeout ([`PluginConfig::request_timeout`]);
-///   a hung upstream cannot stall the cascade.
+/// - **Tier 1 race**: `cover_art_archive` and `itunes`
+///   dispatch in parallel via a `FuturesUnordered` race. The
+///   first provider returning [`ProviderOutcome::Hit`] wins;
+///   the other in-flight request is dropped. Every provider
+///   call is wrapped in a per-provider hard timeout
+///   ([`PluginConfig::request_timeout`]); a hung upstream
+///   cannot stall the cascade. Deezer is deliberately
+///   excluded from this cascade per its live-fetch ToS
+///   invariant (DEFECT-4 fix — one canonical Deezer posture
+///   across album and artist paths).
 /// - **Tier 2 sequential**: `lastfm` (requires operator API
 ///   key) and `volumio_meta` (operator-opt-in). Attempted in
 ///   order only when Tier 1 exhausted without a hit; they
@@ -236,10 +239,16 @@ pub(crate) async fn run_cascade(
     // are not a Hit fold into the miss/unavailable
     // accumulators so the aggregate result is still faithful.
 
+    // Tier 1 futures return `Option<ProviderOutcome>`: `None`
+    // means the provider abstained (disabled by config — e.g.
+    // CAA when the operator explicitly cleared
+    // `musicbrainz_user_agent` to ""). Abstained outcomes do
+    // not vote toward `any_miss` (DEFECT-5).
     type Tier1Fut = std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = (&'static str, ProviderOutcome)>
-                + Send,
+            dyn std::future::Future<
+                    Output = (&'static str, Option<ProviderOutcome>),
+                > + Send,
         >,
     >;
     let tier1: futures_util::stream::FuturesUnordered<Tier1Fut> =
@@ -269,23 +278,41 @@ pub(crate) async fn run_cascade(
         let c = client.clone();
         let to = config.request_timeout;
         tier1.push(Box::pin(async move {
-            let out = timed_raw("itunes", to, itunes::fetch(&a, &b, &c)).await;
+            let out =
+                Some(timed_raw("itunes", to, itunes::fetch(&a, &b, &c)).await);
             ("itunes", out)
         }));
     }
-    if config.providers.deezer.enabled && circuit_breaker::allow("deezer") {
-        let a = artist_ref.to_string();
-        let b = album_ref.to_string();
-        let c = client.clone();
-        let to = config.request_timeout;
-        tier1.push(Box::pin(async move {
-            let out = timed_raw("deezer", to, deezer::fetch(&a, &b, &c)).await;
-            ("deezer", out)
-        }));
-    }
+    // DEFECT-4 fix: Deezer is deliberately excluded from the
+    // album byte-cache cascade. The artist cascade forbids
+    // dzcdn.net-hosted bytes structurally via
+    // `ArtistImageHit`'s missing `Serialize` derive because
+    // Deezer's Terms of Service mandate live-fetch only,
+    // never persist. The album path used to fetch Deezer
+    // image bytes that the framework's AssetCache persisted
+    // under a content hash — the same ToS breach on a
+    // different code path. One canonical Deezer posture
+    // across artist and album: live-fetch only, no byte
+    // cache. CAA and iTunes cover the practical case for the
+    // album path. The `[providers.deezer]` config toggle is
+    // retained for the artist path (via the wire-op
+    // response's `image_url` live-fetch channel) — it has no
+    // effect on this album cascade.
 
     use futures_util::StreamExt;
-    while let Some((name, outcome)) = tier1.next().await {
+    while let Some((name, maybe_outcome)) = tier1.next().await {
+        let Some(outcome) = maybe_outcome else {
+            // Abstained (DEFECT-5): provider did not run
+            // because a required config is absent. Skip
+            // without counting toward `any_miss` or
+            // `unavailable_reasons`.
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = name,
+                "abstained (required config absent)",
+            );
+            continue;
+        };
         match outcome {
             ProviderOutcome::Hit(hit) => {
                 circuit_breaker::record_success(name);
@@ -323,31 +350,35 @@ pub(crate) async fn run_cascade(
     // ------- Tier 2: sequential operator-opt-in providers ---
 
     if config.providers.lastfm.enabled && circuit_breaker::allow("lastfm") {
-        let outcome = timed(
+        let maybe_outcome = timed(
             "lastfm",
             config.request_timeout,
             lastfm::fetch(artist_ref, album_ref, client, config),
         )
         .await;
-        match outcome {
-            ProviderOutcome::Hit(hit) => {
-                circuit_breaker::record_success("lastfm");
-                tracing::info!(
-                    plugin = crate::PLUGIN_NAME,
-                    provider = "lastfm",
-                    tier = "2",
-                    winner = true,
-                    "artwork.online.cascade.result",
-                );
-                return CascadeResult::Hit(hit);
-            }
-            ProviderOutcome::Miss => {
-                circuit_breaker::record_success("lastfm");
-                any_miss = true;
-            }
-            ProviderOutcome::Unavailable(reason) => {
-                circuit_breaker::record_failure("lastfm");
-                unavailable_reasons.push(reason);
+        // Abstained (no API key) → skip without voting toward
+        // `any_miss` (DEFECT-5).
+        if let Some(outcome) = maybe_outcome {
+            match outcome {
+                ProviderOutcome::Hit(hit) => {
+                    circuit_breaker::record_success("lastfm");
+                    tracing::info!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider = "lastfm",
+                        tier = "2",
+                        winner = true,
+                        "artwork.online.cascade.result",
+                    );
+                    return CascadeResult::Hit(hit);
+                }
+                ProviderOutcome::Miss => {
+                    circuit_breaker::record_success("lastfm");
+                    any_miss = true;
+                }
+                ProviderOutcome::Unavailable(reason) => {
+                    circuit_breaker::record_failure("lastfm");
+                    unavailable_reasons.push(reason);
+                }
             }
         }
     }
@@ -384,13 +415,32 @@ pub(crate) async fn run_cascade(
         }
     }
 
-    let _ = any_miss;
-    if unavailable_reasons.is_empty() {
+    // DEFECT-1 fix: `GenuinelyEmpty` requires at least one
+    // provider to have actually reached and cleanly missed. An
+    // empty consultation set (every provider disabled, or every
+    // Tier-1 breaker open, or every provider both) is NOT
+    // "definitively absent" — it's "we didn't check". Returning
+    // GenuinelyEmpty in that case propagates as NotFound and the
+    // framework negatively caches it, poisoning every album
+    // resolved during the breaker window until manual cache
+    // invalidation. Treat as Unavailable so the framework MUST
+    // NOT cache negatively — the honest signal for
+    // "we-do-not-know".
+    if any_miss && unavailable_reasons.is_empty() {
         tracing::info!(
             plugin = crate::PLUGIN_NAME,
             "artwork.online.cascade.result exhausted (genuinely_empty)",
         );
         CascadeResult::GenuinelyEmpty
+    } else if unavailable_reasons.is_empty() {
+        tracing::warn!(
+            plugin = crate::PLUGIN_NAME,
+            "artwork.online.cascade.result exhausted (no provider consulted)",
+        );
+        CascadeResult::Unavailable(
+            "every enabled provider was skipped by a circuit-breaker OPEN state; no provider was consulted for this request"
+                .to_string(),
+        )
     } else {
         tracing::warn!(
             plugin = crate::PLUGIN_NAME,
@@ -402,24 +452,36 @@ pub(crate) async fn run_cascade(
 }
 
 /// Wrap an Option-returning provider fetch in a hard per-
-/// provider timeout. `None` (provider disabled by
-/// configuration) becomes a Miss for accounting; a timeout
-/// becomes Unavailable so the circuit breaker sees it.
+/// provider timeout.
+///
+/// - `Ok(Some(outcome))` — provider ran and returned a result;
+///   propagate to the cascade.
+/// - `Ok(None)` — provider ABSTAINED (disabled by config: no
+///   API key, empty UA, etc.). Returned as `None` here so the
+///   cascade skips it without counting as a Miss.
+/// - `Err(_)` — hard timeout. Returned as
+///   `Some(Unavailable)` so the circuit breaker sees it.
+///
+/// DEFECT-5 fix: an abstained provider must NOT vote toward
+/// `any_miss` — an empty UA on CAA (operator explicitly
+/// cleared the string) would otherwise contribute to
+/// `GenuinelyEmpty` and negatively cache a false "no such
+/// release" for every album resolved during that config
+/// state.
 async fn timed<F>(
     provider: &'static str,
     limit: std::time::Duration,
     fut: F,
-) -> ProviderOutcome
+) -> Option<ProviderOutcome>
 where
     F: std::future::Future<Output = Option<ProviderOutcome>>,
 {
     match tokio::time::timeout(limit, fut).await {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => ProviderOutcome::Miss,
-        Err(_) => ProviderOutcome::Unavailable(format!(
+        Ok(outcome) => outcome,
+        Err(_) => Some(ProviderOutcome::Unavailable(format!(
             "{provider}: hard timeout after {} ms",
             limit.as_millis(),
-        )),
+        ))),
     }
 }
 
@@ -472,17 +534,35 @@ mod circuit_breaker {
     /// probe request through.
     const OPEN_FOR: Duration = Duration::from_secs(5 * 60);
 
+    /// Per-provider phase.
+    ///
+    /// - `Closed` — normal operation; every request runs.
+    /// - `Open` — every request is skipped until `open_until`
+    ///   elapses; then the next `allow()` call may promote to
+    ///   `Probing` (single request under a probe-holder guard).
+    /// - `Probing` — one in-flight probe request; subsequent
+    ///   `allow()` calls return false until the probe records
+    ///   an outcome. The probe promotes the breaker back to
+    ///   `Closed` on success or to a fresh `Open` window on
+    ///   failure.
+    #[derive(Debug, Clone)]
+    enum Phase {
+        Closed,
+        Open { open_until: Instant },
+        Probing,
+    }
+
     #[derive(Debug, Clone)]
     struct State {
+        phase: Phase,
         recent_failures: Vec<Instant>,
-        opened_at: Option<Instant>,
     }
 
     impl State {
         fn new() -> Self {
             Self {
+                phase: Phase::Closed,
                 recent_failures: Vec::new(),
-                opened_at: None,
             }
         }
     }
@@ -491,47 +571,96 @@ mod circuit_breaker {
         Lazy::new(|| Mutex::new(HashMap::new()));
 
     /// True when the provider is allowed to attempt a request
-    /// right now. False when the breaker is open. The single-
-    /// probe transition happens naturally: after `OPEN_FOR`
-    /// elapses, `allow` returns true again; the outcome is
-    /// recorded via `record_success` / `record_failure`.
+    /// right now.
+    ///
+    /// - `Closed` → true.
+    /// - `Open` with time elapsed → promote to `Probing` under
+    ///   the mutex and return true (single-probe admission).
+    /// - `Open` still active → false.
+    /// - `Probing` → false (a probe is already in flight).
+    ///
+    /// DEFECT-2 fix: the phase enum makes the single-probe
+    /// invariant explicit and holds across concurrent
+    /// `allow()` callers. The prior shape cleared
+    /// `recent_failures` speculatively before the probe
+    /// resolved, so a persistently-down provider was re-
+    /// admitted in bursts of THRESHOLD after each 5-minute
+    /// tick — and multiple concurrent cascades all passed
+    /// simultaneously through the "elapsed" branch. Now
+    /// exactly one probe is in flight at a time; the failure-
+    /// count clear happens only when the probe reports
+    /// success.
     pub(super) fn allow(provider: &'static str) -> bool {
         let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
         let state = map.entry(provider).or_insert_with(State::new);
-        match state.opened_at {
-            None => true,
-            Some(t) => {
-                if t.elapsed() >= OPEN_FOR {
-                    // Probe window: allow one request through.
-                    state.opened_at = None;
-                    state.recent_failures.clear();
+        match &state.phase {
+            Phase::Closed => true,
+            Phase::Open { open_until } => {
+                if Instant::now() >= *open_until {
+                    state.phase = Phase::Probing;
+                    tracing::info!(
+                        plugin = crate::PLUGIN_NAME,
+                        provider,
+                        "artwork.online.circuit_breaker PROBING",
+                    );
                     true
                 } else {
                     false
                 }
             }
+            Phase::Probing => false,
         }
     }
 
     pub(super) fn record_success(provider: &'static str) {
         let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
         let state = map.entry(provider).or_insert_with(State::new);
+        let was_probing = matches!(state.phase, Phase::Probing);
+        state.phase = Phase::Closed;
         state.recent_failures.clear();
-        state.opened_at = None;
+        if was_probing {
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider,
+                "artwork.online.circuit_breaker CLOSED (probe succeeded)",
+            );
+        }
     }
 
     pub(super) fn record_failure(provider: &'static str) {
         let mut map = STATE.lock().expect("circuit-breaker mutex poisoned");
         let state = map.entry(provider).or_insert_with(State::new);
         let now = Instant::now();
+        // DEFECT-2 fix: on a failed probe, re-open for the full
+        // OPEN_FOR window. Do NOT allow the failure to accrue
+        // into a fresh THRESHOLD-count window (which would
+        // re-admit after 3 more failures — a burst-open
+        // anti-pattern for a persistently-down upstream). The
+        // failed probe is proof the upstream is still bad;
+        // hold it off for the clean 5-minute window.
+        if matches!(state.phase, Phase::Probing) {
+            state.phase = Phase::Open {
+                open_until: now + OPEN_FOR,
+            };
+            state.recent_failures.clear();
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider,
+                open_for_secs = OPEN_FOR.as_secs(),
+                "artwork.online.circuit_breaker RE-OPENED (probe failed)",
+            );
+            return;
+        }
         state
             .recent_failures
             .retain(|t| now.duration_since(*t) < WINDOW);
         state.recent_failures.push(now);
         if state.recent_failures.len() >= THRESHOLD as usize
-            && state.opened_at.is_none()
+            && matches!(state.phase, Phase::Closed)
         {
-            state.opened_at = Some(now);
+            state.phase = Phase::Open {
+                open_until: now + OPEN_FOR,
+            };
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
                 provider,
@@ -953,138 +1082,6 @@ pub(crate) mod itunes {
             bytes,
             mime: None,
             provider_id: "itunes",
-        })
-    }
-}
-
-pub(crate) mod deezer {
-    //! Deezer public album search provider.
-    //!
-    //! Endpoint: `https://api.deezer.com/search/album?q=...`.
-    //! No API key required. Returns a JSON array of album
-    //! matches; each has a `cover_xl` (1000×1000) URL.
-    //!
-    //! Prior art: this is exactly what Navidrome uses as a
-    //! non-authenticated album-art fallback. Deezer's public
-    //! search catalogue is wide (they license from every major
-    //! label) so it hits well-known Western pop / rock /
-    //! jazz / hip-hop releases reliably.
-    //!
-    //! Query shape: `q=artist:"<artist>" album:"<album>"` —
-    //! Deezer's advanced-search grammar. Fold to plain terms
-    //! when the advanced query returns no results, so an album
-    //! whose title contains characters the advanced grammar
-    //! doesn't escape still gets a try.
-    use super::*;
-
-    const DEEZER_BASE: &str = "https://api.deezer.com/search/album";
-
-    pub(crate) async fn fetch(
-        artist: &str,
-        album: &str,
-        client: &Client,
-    ) -> ProviderOutcome {
-        // Plain-terms search (`artist album`) — matches the shape
-        // Navidrome ships. Deezer's ranking is strong enough that
-        // the correct release lands at index 0 for popular albums
-        // without the advanced-grammar quoting; the quoted-fields
-        // form is significantly slower on complex artist names
-        // (multi-artist credits with commas), and its extra
-        // budget is not worth the small selectivity gain.
-        let plain_query = format!("{artist} {album}");
-        try_query(client, &plain_query, "deezer").await
-    }
-
-    async fn try_query(
-        client: &Client,
-        q: &str,
-        label: &str,
-    ) -> ProviderOutcome {
-        let url = format!("{}?q={}&limit=1", DEEZER_BASE, super::urlencode(q));
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ProviderOutcome::Unavailable(format!("{label}: {e}"));
-            }
-        };
-        match classify_status(label, resp.status()) {
-            StatusClass::Success => {}
-            StatusClass::Miss => return ProviderOutcome::Miss,
-            StatusClass::Unavailable(r) => {
-                return ProviderOutcome::Unavailable(r);
-            }
-        }
-        let json: serde_json::Value = match resp.json().await {
-            Ok(j) => j,
-            Err(e) => {
-                return ProviderOutcome::Unavailable(format!(
-                    "{label} json: {e}",
-                ));
-            }
-        };
-        // Deezer signals catalogue misses as `{ data: [], ... }`.
-        // Some error shapes come back as `{ error: {...} }` at
-        // 200 OK — treat as Unavailable when the error type is
-        // upstream-transient, else Miss.
-        if let Some(err) = json.get("error") {
-            let code = err
-                .get("code")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let msg = err
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            return ProviderOutcome::Unavailable(format!(
-                "{label}: code={code} {msg}",
-            ));
-        }
-        let cover_url = json
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|hit| {
-                hit.get("cover_xl")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        hit.get("cover_big").and_then(serde_json::Value::as_str)
-                    })
-                    .or_else(|| {
-                        hit.get("cover_medium")
-                            .and_then(serde_json::Value::as_str)
-                    })
-            })
-            .map(String::from);
-        let Some(cover_url) = cover_url else {
-            return ProviderOutcome::Miss;
-        };
-        let img_resp = match client.get(&cover_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ProviderOutcome::Unavailable(format!(
-                    "{label} image: {e}",
-                ));
-            }
-        };
-        match classify_status(&format!("{label} image"), img_resp.status()) {
-            StatusClass::Success => {}
-            StatusClass::Miss => return ProviderOutcome::Miss,
-            StatusClass::Unavailable(r) => {
-                return ProviderOutcome::Unavailable(r);
-            }
-        }
-        let bytes = match img_resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                return ProviderOutcome::Unavailable(format!(
-                    "{label} bytes: {e}",
-                ));
-            }
-        };
-        ProviderOutcome::Hit(ProviderHit {
-            bytes,
-            mime: Some("image/jpeg".to_string()),
-            provider_id: "deezer",
         })
     }
 }

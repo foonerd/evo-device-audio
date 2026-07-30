@@ -14,13 +14,30 @@
 //!
 //! ## Cascade order
 //!
-//! 1. Cover Art Archive (MusicBrainz) — free; requires a
-//!    properly-identifying User-Agent per MusicBrainz TOS.
-//! 2. Last.fm `album.getinfo` — operator-supplied API key.
-//! 3. iTunes Search API — no key; rewrites 100×100 thumbnail
-//!    URLs to 600×600 via documented URL-pattern.
-//! 4. Volumio meta proxy — no key; takes a `variant` parameter
-//!    selecting Volumio's community vs commercial paths.
+//! **Tier 1** — free, no-auth, byte-cache safe. Dispatched in
+//! parallel via `FuturesUnordered`; first `Hit` wins, other
+//! in-flight requests are cancelled:
+//!
+//! - Cover Art Archive (MusicBrainz release search + CAA
+//!   `/release/{mbid}/front`) — pre-filled User-Agent per
+//!   MusicBrainz TOS.
+//! - iTunes Search API — no key; 100×100 thumbnail URL
+//!   rewritten to 600×600.
+//!
+//! **Tier 2** — sequential, operator-key-gated:
+//!
+//! - Last.fm `album.getinfo` — operator-supplied API key.
+//!
+//! **Tier 3** — sequential, operator-opt-in:
+//!
+//! - Volumio meta proxy — no key; disabled by default
+//!   (historical primary that shipped 500s).
+//!
+//! Deezer is deliberately excluded from the album cascade per
+//! its live-fetch ToS invariant — the artist cascade also
+//! forbids Deezer bytes structurally via `ArtistImageHit`'s
+//! missing `Serialize`. The `[providers.deezer]` toggle is
+//! retained for the artist path's live-fetch channel.
 //!
 //! Each provider is enable/disable + per-key configurable via
 //! `/etc/evo/plugins.d/org.evoframework.artwork.online.toml`.

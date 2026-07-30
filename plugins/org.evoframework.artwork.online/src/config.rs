@@ -156,14 +156,20 @@ impl PluginConfig {
     ///   and points at the plugin repository as the operator-
     ///   visible contact channel. Operator may override via
     ///   `musicbrainz_user_agent = "..."`.
-    /// - **Per-provider request timeout**: 3 seconds (hard).
+    /// - **Per-provider request timeout**: 5 seconds (hard).
     ///   Bounds a single provider from stalling the cascade
-    ///   when its upstream hangs.
-    /// - **Providers**: `cover_art_archive`, `itunes`, `deezer`
-    ///   enabled by default (all no-auth, canonical); `lastfm`
-    ///   disabled unless an operator supplies a key;
-    ///   `volumio_meta` disabled by default (operator-opt-in
-    ///   only — historical primary that shipped 500s).
+    ///   when its upstream hangs. Covers CAA's two-step
+    ///   (MB release-search under 1 req/sec + CAA `/front`
+    ///   307-redirect through the Internet Archive).
+    /// - **Providers**: `cover_art_archive` and `itunes`
+    ///   enabled by default (no-auth, canonical, byte-cache
+    ///   safe); `deezer` toggle is retained for the artist
+    ///   path's live-fetch channel — the album cascade
+    ///   deliberately does not consult Deezer per its
+    ///   live-fetch ToS invariant; `lastfm` disabled unless
+    ///   the operator supplies a key; `volumio_meta`
+    ///   disabled by default (operator-opt-in only —
+    ///   historical primary that shipped 500s).
     pub(crate) fn defaults() -> Self {
         Self {
             musicbrainz_user_agent: Some(default_musicbrainz_user_agent()),

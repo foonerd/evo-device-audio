@@ -938,16 +938,23 @@ pub(crate) struct BrowseSelectorParent {
 /// `genre`, `date`) and the verb name for error attribution.
 ///
 /// **Enumeration path** (payload.select absent): issues the
-/// MPD `list <tag>` command, applies value post-processing
-/// (year extraction from MPD's `date`), sorts case-
-/// insensitively, and paginates. Album enumeration additionally
-/// enriches each entry with `artist` (via `list album group
-/// albumartist`), `cover_url` (synthesised under the existing
-/// `mpd-album` scheme the framework's artwork endpoint already
-/// serves), and `track_count` (via `count group album` — one
-/// MPD roundtrip for the whole library). Artist enumeration
-/// carries an `artwork_lookup` object that names the shelf,
-/// request type, and payload the UI dispatches per visible
+/// MPD `list <tag>` command (or `listallinfo` for the album
+/// facet's folder-anchored identity path), applies value
+/// post-processing (year extraction from MPD's `date`), sorts
+/// case-insensitively, and paginates. Album enumeration
+/// derives folder-anchored identity via
+/// [`canonical_album_folder`] on every track's parent
+/// directory, groups tracks per canonical folder, derives
+/// `album` (majority-vote clean tag with folder-basename
+/// fallback), `artist` (albumartist-consistent → artist-
+/// majority → `"Various Artists"`), and emits `album_id`
+/// (opaque canonical folder key) alongside a `cover_url`
+/// keyed on a representative track's `mpd-path` scheme so the
+/// framework's sidecar → embedded → online cascade decides
+/// the cover — the cover cannot be broken by a bad tag. Artist
+/// enumeration carries an `artwork_lookup` object that names
+/// the shelf, request type, and payload the UI dispatches per
+/// visible
 /// tile to obtain a live *portrait* URL — no synthesised
 /// `cover_url` (album art is the wrong image type for this
 /// facet). The UI fans out per-tile rather than following an
@@ -1284,6 +1291,28 @@ fn derive_album_artist(
 /// Pick the majority value from a vote-count map (≥ 50 % of
 /// the total counted). Returns `None` when the map is empty or
 /// when no value clears the threshold.
+/// Pick the STRICT majority value from a vote-count map
+/// (> 50 % of the total counted).
+///
+/// DEFECT-3 fix: two changes on the prior shape.
+///
+/// 1. **Strict `>` threshold instead of `>=`**. A 2-2 tie
+///    used to be accepted as a "majority" and stamped
+///    `title_source="tag"`; now a tie falls through to the
+///    caller's next tier (folder basename for the album
+///    title; per-track ARTIST or `"Various Artists"` for the
+///    album artist). Ties are not majorities.
+/// 2. **Deterministic tiebreak** on the max-by-count pick.
+///    The prior `iter().max_by_key(|(_, c)| c)` walked the
+///    HashMap's un-ordered iterator, so two candidates with
+///    the same count picked whichever the hash landed first
+///    — the tile title could flip between process restarts.
+///    Now ties on count break on the value string (Ord),
+///    which is stable across runs.
+///
+/// Returns `None` when the map is empty, when total votes
+/// are zero, or when no value clears the strict majority
+/// threshold.
 fn pick_majority(votes: &HashMap<String, u64>) -> Option<String> {
     if votes.is_empty() {
         return None;
@@ -1292,8 +1321,11 @@ fn pick_majority(votes: &HashMap<String, u64>) -> Option<String> {
     if total == 0 {
         return None;
     }
-    let (best, best_count) = votes.iter().max_by_key(|(_, c)| **c)?;
-    if best_count.saturating_mul(2) >= total {
+    let (best, best_count) =
+        votes.iter().max_by(|(a_val, a_cnt), (b_val, b_cnt)| {
+            a_cnt.cmp(b_cnt).then_with(|| a_val.cmp(b_val))
+        })?;
+    if best_count.saturating_mul(2) > total {
         Some(best.clone())
     } else {
         None

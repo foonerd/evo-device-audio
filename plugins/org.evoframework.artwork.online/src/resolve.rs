@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `artwork.resolve_online` request handler.
 //!
-//! Walks the online provider cascade (CAA → Last.fm → iTunes →
-//! Volumio meta), retrieves bytes from the first provider hit,
-//! transcodes via the shared pipeline, pushes the result to
-//! the framework's asset cache, and returns the content_hash on
-//! the wire. The response shape mirrors `artwork.resolve` from
-//! the local plugin so consumers can use identical decoder
-//! logic across the two cascade tiers.
+//! Walks the online provider cascade — Tier 1 parallel race
+//! (Cover Art Archive + iTunes) → Tier 2 Last.fm →
+//! Tier 3 Volumio meta — retrieves bytes from the first
+//! provider hit, transcodes via the shared pipeline, pushes
+//! the result to the framework's asset cache, and returns
+//! the content_hash on the wire. The response shape mirrors
+//! `artwork.resolve` from the local plugin so consumers can
+//! use identical decoder logic across the two cascade tiers.
+//!
+//! Deezer is deliberately excluded from the album cascade
+//! per its live-fetch ToS invariant (see `providers.rs`
+//! module doc + DEFECT-4 comment).
 
 use evo_device_audio_shared::transcode::{
     transcode, ArtworkSize, TranscodedArtwork,
