@@ -99,7 +99,7 @@ Three brand-neutral audio plugins live in this repository, signed by the evo pro
 
 `org.evoframework.delivery.alsa` currently provides deterministic ALSA pipeline composition (`alsa.pipeline.compose`) as a responder surface. Steward-side reconciliation hooks (trigger compose + reproject on plugin/output changes) are tracked at the framework tier (`evo-core`).
 
-A workspace-internal shared crate, `evo-device-audio-shared`, holds utilities common across plugins (local-library tag scanning, `mpd-album` value parsing). It is compiled into plugins; not shipped as a separate artefact.
+A workspace-internal shared crate, `evo-device-audio-shared`, holds utilities common across plugins: local-library tag scanning, `mpd-album` value parsing, folder-anchored album identity (`folder_album::canonical_album_folder`), display-form canonicalisation for album titles and artist credits (`album_name`, `artist_name`), and the artwork-target URL helpers (`artwork_target_url_sized`, `artwork_target_url_for_track_sized`) every list-surface uses when it emits a `cover_url`. It is compiled into plugins; not shipped as a separate artefact.
 
 `evo-core` is consumed via `[workspace.dependencies]` in `Cargo.toml`. During eng-side development the pin is a `path = "..."` dependency on the sibling `evo-core-eng` working tree; at release-cut time it flips to `git = "...evo-core.git", tag = "..."` against the matching published framework tag before the branch merges to main. See [DEVELOPING.md](DEVELOPING.md) for the flip procedure.
 

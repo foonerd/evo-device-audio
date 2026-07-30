@@ -74,9 +74,10 @@ pub enum FanartError {
 /// relevant field.
 ///
 /// URLs point at fanart.tv's CDN and are stable per artist MBID;
-/// unlike Deezer, fanart.tv responses are safe to cache under
-/// the plugin's per-provider cache layer (per the ADR-0107
-/// artwork-cache posture — same license/attribution invariants).
+/// unlike Deezer's live-fetch invariant, fanart.tv responses
+/// are safe to cache under the plugin's per-provider cache
+/// layer with the same license/attribution shape the other
+/// keyed-with-cache providers use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistImagesHit {
     /// The MusicBrainz artist MBID the manifest is keyed on
