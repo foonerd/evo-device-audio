@@ -495,10 +495,40 @@ pub(crate) async fn query_lyrics(
         }
         return Ok(from_cache_negative(entry.detail));
     }
-    let hit = lrclib
+    // Any LRCLIB failure (5xx, timeouts, decode errors, TLS) is
+    // surfaced as a well-formed `not_found` response, NOT
+    // propagated as a plugin error. Rationale: the framework's
+    // `ClientResponse::Error` variant carries no `payload_b64`,
+    // so the composite `track_detail` peel (`dispatch_shelf` in
+    // `crates/evo-runtime-http/src/track_detail_endpoint.rs`)
+    // renders the sub-source as `status=error` with the
+    // "response missing payload_b64" detail — the exact
+    // regression class the deploy gate refuses. Every LRCLIB
+    // outage would then fail every rig's deploy for every
+    // track that fails to hit its cache. The UI already treats
+    // `status=not_found` as "no lyrics section"; a transient
+    // outage looks identical to a genuine no-lyrics case, and
+    // the miss is NOT cached (only clean `Ok(None)` misses
+    // populate the negative memo) so a subsequent play after
+    // the outage clears re-queries LRCLIB and delivers the
+    // lyrics on the next fetch. The 24-hour negative TTL never
+    // shadows the recovery path.
+    let hit = match lrclib
         .get_lyrics(&artist, &track, req.album.as_deref(), req.duration_seconds)
         .await
-        .map_err(|e| format!("LRCLIB error: {e}"))?;
+    {
+        Ok(hit) => hit,
+        Err(e) => {
+            let detail = format!("LRCLIB provider unavailable: {e}");
+            return Ok(EnrichmentResponse {
+                v: 1,
+                status: ResponseStatus::NotFound,
+                provider_id: Some("lrclib".to_string()),
+                payload: None,
+                detail: Some(detail),
+            });
+        }
+    };
     match hit {
         None => {
             let detail = "LRCLIB returned no lyrics for this track".to_string();
@@ -771,6 +801,174 @@ mod tests {
         let k_wp = bio_cache_key(&e, e.mbid.as_deref(), ProviderId::Wikipedia);
         let k_wd = bio_cache_key(&e, e.mbid.as_deref(), ProviderId::Wikidata);
         assert_ne!(k_wp, k_wd);
+    }
+
+    // -----------------------------------------------------------
+    // Lyrics miss-path: when LRCLIB is unavailable (5xx / transport
+    // error / decode failure) `query_lyrics` MUST return a well-
+    // formed `EnrichmentResponse` (status = not_found, provider_id
+    // = lrclib) so the composite `track_detail` peel emits
+    // `sources.lyrics = { status: not_found, ... }` — never
+    // `status: error` with a "response missing payload_b64"
+    // detail. Regression guard for the UI-team's deploy-gate
+    // invariant "A dropped payload_b64 must fail CI, never a
+    // listening device."
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn lrclib_unavailable_returns_well_formed_not_found() {
+        use crate::enrichment_cache::EnrichmentCache;
+        use evo_online_providers::rate_limit::RateLimiter;
+        use evo_online_providers::LrclibClient;
+        use reqwest::Client;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Point LrclibClient at a bad address so every request
+        // fails at the transport layer. This exercises the same
+        // error branch that a 504 gateway timeout or a full
+        // outage would produce.
+        let http = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let rate = Arc::new(RateLimiter::new(Duration::from_millis(0)));
+        let lrclib = LrclibClient::new_with_base_url(
+            http,
+            rate,
+            "evo-test/1.0",
+            "http://127.0.0.1:1/api",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = EnrichmentCache::new(
+            tmp.path().to_path_buf(),
+            Duration::from_secs(60),
+        );
+        let cfg = crate::cascade::ProviderConfig::defaults();
+
+        let payload = serde_json::json!({
+            "v": 1,
+            "artist": "Any Artist",
+            "track": "Any Track",
+            "album": "Any Album",
+            "duration_seconds": 200.0,
+            "locale": "en"
+        })
+        .to_string();
+
+        let resp = query_lyrics(payload.as_bytes(), &lrclib, &cache, &cfg)
+            .await
+            .expect(
+                "query_lyrics MUST return Ok — a well-formed \
+                 EnrichmentResponse — even on LRCLIB transport error, \
+                 so the wire response envelope carries payload_b64",
+            );
+
+        assert_eq!(
+            resp.status,
+            ResponseStatus::NotFound,
+            "LRCLIB-unavailable path must map to status=not_found so \
+             the UI treats it as 'no lyrics section', not error"
+        );
+        assert_eq!(
+            resp.provider_id.as_deref(),
+            Some("lrclib"),
+            "provider_id must attribute the miss to lrclib so the UI \
+             can label the source honestly"
+        );
+        assert!(resp.payload.is_none(), "no lyrics payload on the miss path");
+        assert!(
+            resp.detail
+                .as_deref()
+                .map(|d| d.contains("LRCLIB provider unavailable"))
+                .unwrap_or(false),
+            "detail must name the unavailability so operators can \
+             distinguish 'LRCLIB is down' from 'this track has no \
+             lyrics on LRCLIB' in journal review; got {:?}",
+            resp.detail
+        );
+
+        // The bytes MUST round-trip through serde — this is the
+        // exact serialisation the wire respondent will emit and
+        // what the framework will base64 into payload_b64.
+        let bytes = resp.json_bytes().expect("serialises to JSON");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "not_found");
+        assert_eq!(v["provider_id"], "lrclib");
+        assert!(v["payload"].is_null());
+    }
+
+    #[tokio::test]
+    async fn lrclib_unavailable_does_not_write_negative_cache() {
+        // A transient outage MUST NOT pollute the negative cache
+        // — otherwise the 24 h negative TTL would shadow the
+        // recovery path and every operator would see "no lyrics"
+        // for a day after every LRCLIB blip. Only a clean
+        // Ok(None) miss (LRCLIB returned 404 or an empty body,
+        // i.e. definitively no lyrics for this track) is
+        // eligible for the negative memo.
+        use crate::enrichment_cache::EnrichmentCache;
+        use evo_online_providers::rate_limit::RateLimiter;
+        use evo_online_providers::LrclibClient;
+        use reqwest::Client;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let http = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let rate = Arc::new(RateLimiter::new(Duration::from_millis(0)));
+        let lrclib = LrclibClient::new_with_base_url(
+            http,
+            rate,
+            "evo-test/1.0",
+            "http://127.0.0.1:1/api",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = EnrichmentCache::new(
+            tmp.path().to_path_buf(),
+            Duration::from_secs(60),
+        );
+        let cfg = crate::cascade::ProviderConfig::defaults();
+
+        let payload = serde_json::json!({
+            "v": 1,
+            "artist": "Cache Test Artist",
+            "track": "Cache Test Track",
+            "duration_seconds": 200.0,
+            "locale": "en"
+        })
+        .to_string();
+
+        let _ = query_lyrics(payload.as_bytes(), &lrclib, &cache, &cfg)
+            .await
+            .expect("first call: transient error surfaces as not_found");
+
+        // Same key, same lookup path. If the previous call had
+        // written a negative cache entry, this second call would
+        // hit `from_cache_negative` and return WITHOUT touching
+        // LrclibClient. Because the transient path skips the
+        // cache write, the second call must again go through the
+        // client (which is still pointed at the bad address) and
+        // still return not_found — but from the LIVE path, not
+        // a memoised negative. The user-visible symptom would be
+        // identical either way, so we assert the cache miss
+        // directly.
+        let key = EnrichmentCache::key_for(&[
+            "lyrics",
+            &normalise("Cache Test Artist"),
+            &normalise("Cache Test Track"),
+            "",
+            "200",
+        ]);
+        assert!(
+            cache.get(&key).is_none(),
+            "transient LRCLIB failure MUST NOT populate the negative \
+             cache; a subsequent play must re-attempt the live fetch"
+        );
     }
 }
 

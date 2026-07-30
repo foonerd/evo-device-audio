@@ -3723,6 +3723,7 @@ dependencies = [
  "evo-online-providers",
  "evo-plugin-sdk",
  "futures",
+ "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",

@@ -32,3 +32,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test-only: the lyrics `query_lyrics` unavailable-path regression
+# constructs a `LrclibClient` pointed at an unroutable URL so
+# every request fails at the transport layer. Requires a
+# direct handle to a `reqwest::Client` that the test can build
+# with a short timeout so the assertion runs in a bounded time.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -76,6 +76,12 @@ pub struct LrclibClient {
     http: Client,
     rate: Arc<RateLimiter>,
     user_agent: String,
+    /// Override for [`LRCLIB_API_BASE`]. Production callers use
+    /// [`Self::new`] which pins the canonical LRCLIB URL; tests
+    /// use [`Self::new_with_base_url`] to point the client at a
+    /// local stub server or a bad address so the unavailable-
+    /// provider path can be exercised without a real network.
+    api_base: String,
 }
 
 impl LrclibClient {
@@ -87,10 +93,26 @@ impl LrclibClient {
         rate: Arc<RateLimiter>,
         user_agent: impl Into<String>,
     ) -> Self {
+        Self::new_with_base_url(http, rate, user_agent, LRCLIB_API_BASE)
+    }
+
+    /// Same as [`Self::new`] but with a caller-supplied API base
+    /// URL. Present so tests can force the unavailable-provider
+    /// path (5xx / decode / transport error) by pointing the
+    /// client at a stub server or an unroutable address, without
+    /// touching the real LRCLIB endpoint. Production code stays
+    /// on [`Self::new`] which pins [`LRCLIB_API_BASE`].
+    pub fn new_with_base_url(
+        http: Client,
+        rate: Arc<RateLimiter>,
+        user_agent: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
         Self {
             http,
             rate,
             user_agent: user_agent.into(),
+            api_base: api_base.into(),
         }
     }
 
@@ -122,7 +144,7 @@ impl LrclibClient {
             // to match how mp3/flac tag decoders report duration.
             params.push(("duration", (dur.round() as i64).to_string()));
         }
-        let url = format!("{LRCLIB_API_BASE}/get");
+        let url = format!("{}/get", self.api_base);
         let resp = self
             .http
             .get(&url)
