@@ -1162,7 +1162,29 @@ fn render_facet_entry(
 ) -> serde_json::Value {
     match facet_key {
         "album" => {
-            let artist = album_artists.and_then(|m| m.get(value).cloned());
+            // Launder the raw albumartist through
+            // `artist_display_form` before it drives either the
+            // emitted `artist` field or the synthesised
+            // `cover_url`. Same helper the artist facet uses on
+            // its winner (see the `caller already ran
+            // artist_display_form` comment in the artist
+            // branch). Without this, dirty forms — self-slash
+            // (`Passenger/Passenger`), editor watermarks, sort-
+            // form (`Cohen, Leonard`), collab credits — flow
+            // straight into the tile as the label AND into the
+            // `mpd-album?value=<artist>|<album>` cascade key,
+            // where the framework endpoint has no match and
+            // returns 502 disc-icon placeholders. Cleaning here
+            // preserves fold-key equivalence (proven in the
+            // shared crate's tests), so the drill / resolve
+            // paths still match every raw form that belongs to
+            // the same album. Collab credits (real
+            // multi-artist albums) render through
+            // `artist_display_form`'s canonical `A, B` join,
+            // NOT collapsed to a single name.
+            let artist = album_artists
+                .and_then(|m| m.get(value))
+                .map(|raw| artist_display_form(raw));
             let track_count = album_counts.and_then(|m| m.get(value).copied());
             let cover_url =
                 evo_device_audio_shared::artwork_target_url_for_track_sized(
