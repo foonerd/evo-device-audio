@@ -22,6 +22,7 @@ pub mod album_name;
 pub mod artist_name;
 pub mod audio_ui_pack;
 pub mod folder_album;
+pub mod sidecar_cover;
 pub mod terminus_loopback;
 pub mod transcode;
 pub mod transition_envelope;

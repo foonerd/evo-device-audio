@@ -154,60 +154,15 @@ pub(crate) const SCHEME_MPD_ALBUM: &str = "mpd-album";
 /// always at the same level as the folder they clicked.
 pub(crate) const SCHEME_MPD_DIRECTORY: &str = "mpd-directory";
 
-/// Priority-ordered cover-art filenames in **lowercase**. The
-/// directory walk lowercases each entry against this list, so
-/// `Cover.JPG`, `FOLDER.jpg`, `CoVeR.JpG`, and Unicode-cased
-/// variants all resolve without listing every permutation.
-///
-/// Ordering follows the established convention (cover > folder >
-/// front > coverart > albumart > artist variants > scan > album)
-/// and matches volumio-evo's reference list. `.webp` entries are
-/// included so libraries already adopting modern formats are
-/// served without operator action.
-///
-/// Operator-curated sidecars in the music tree work identically
-/// whether the audio file resolves under `LocalInternal`,
-/// `LocalUsb`, `NetworkNasSmb`, `NetworkNasNfs`, or any other
-/// mount the framework's source registry exposes: the cascade
-/// walks the audio file's parent directory regardless of which
-/// source ID resolved the file. Network-bound sources are
-/// preflight-gated by source state via the registry; the
-/// walk never blocks on an Offline mount because the source
-/// resolver refuses to materialise the path in the first place.
-const COVER_FILE_NAMES: &[&str] = &[
-    "cover.jpg",
-    "folder.jpg",
-    "cover.png",
-    "folder.png",
-    "coverart.jpg",
-    "albumart.jpg",
-    "coverart.png",
-    "albumart.png",
-    "artists.jpg",
-    "artist.jpg",
-    "artists.png",
-    "artist.png",
-    "front.jpg",
-    "front.png",
-    "album.jpg",
-    "scan.jpg",
-    "cover.webp",
-    "folder.webp",
-    "front.webp",
-    "artists.webp",
-];
-
-/// Image file extensions accepted as last-resort cover candidates
-/// when the priority list above misses. Matches volumio-evo's
-/// fallback: any image in the audio file's parent directory is
-/// treated as cover art unless it exceeds [`MAX_COVER_BYTES`].
-const FALLBACK_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
-
-/// Maximum sidecar file size accepted as cover art. Above this
-/// the file is rejected as cover-art-too-large — embedded
-/// extraction or online providers take over downstream.
-/// Matches volumio-evo's 5 MB ceiling.
-const MAX_COVER_BYTES: u64 = 5_000_000;
+/// Priority-ordered cover-art filenames, image extension fallback
+/// list, and 5 MB size ceiling live in the shared crate so
+/// `artwork.local` (this file) and the browse-tile emitter in
+/// `playback.mpd` walk the exact same primitive. Operator-curated
+/// sidecars work identically whether the audio file resolves
+/// under `LocalInternal`, `LocalUsb`, `NetworkNasSmb`,
+/// `NetworkNasNfs`, or any other mount the framework's source
+/// registry exposes.
+use evo_device_audio_shared::sidecar_cover;
 
 /// Request body for `artwork.resolve` (JSON, UTF-8).
 #[derive(Debug, Deserialize)]
@@ -361,20 +316,23 @@ fn mime_for_path(p: &Path) -> Option<&'static str> {
 /// Resolution proceeds in two passes against the file's parent:
 ///
 /// 1. **Priority pass** — directory entries are read once and
-///    lowercased; the first match against [`COVER_FILE_NAMES`]
-///    (in priority order) wins. This catches `Cover.JPG`,
-///    `FOLDER.png`, mixed-case Unicode filenames, etc., without
-///    listing every casing permutation.
+///    lowercased; the first match against
+///    [`sidecar_cover::COVER_FILE_NAMES`] (in priority order)
+///    wins. This catches `Cover.JPG`, `FOLDER.png`, mixed-case
+///    Unicode filenames, etc., without listing every casing
+///    permutation.
 /// 2. **Fallback pass** — if no priority name matched, the first
 ///    file in directory-traversal order with an extension in
-///    [`FALLBACK_IMAGE_EXTENSIONS`] is returned, provided its
-///    size is under [`MAX_COVER_BYTES`]. This handles libraries
+///    [`sidecar_cover::FALLBACK_IMAGE_EXTENSIONS`] is returned,
+///    provided its size is under
+///    [`sidecar_cover::MAX_COVER_BYTES`]. This handles libraries
 ///    where the operator names cover files after the album
 ///    (e.g. `Symphony No. 5.jpg`) rather than `cover.jpg`.
 ///
-/// File sizes above [`MAX_COVER_BYTES`] are skipped so an
-/// accidentally-dropped multi-megabyte PSD or scan PDF doesn't
-/// override a smaller cover image elsewhere in the directory.
+/// File sizes above [`sidecar_cover::MAX_COVER_BYTES`] are
+/// skipped so an accidentally-dropped multi-megabyte PSD or scan
+/// PDF doesn't override a smaller cover image elsewhere in the
+/// directory.
 ///
 /// Source-kind agnostic: the parent-directory walk applies
 /// identically whether `mpd_file` resolves to a local-internal
@@ -388,62 +346,13 @@ pub(crate) fn find_cover_beside_audio_file(mpd_file: &Path) -> Option<PathBuf> {
 
 /// Same priority-and-fallback walk as
 /// [`find_cover_beside_audio_file`] but takes the directory
-/// path directly rather than a track path. Used by the
-/// [`SCHEME_MPD_DIRECTORY`] resolve — the caller identifies a
-/// directory subject and the plugin returns the cover file
-/// (if any) at that directory's top level.
+/// path directly rather than a track path. Delegates to
+/// [`sidecar_cover::find_cover_in_directory`] — the shared
+/// primitive both `artwork.local` and the browse-tile emitter
+/// in `playback.mpd` consume so the two paths never disagree
+/// on what counts as folder art.
 pub(crate) fn find_cover_in_directory(dir: &Path) -> Option<PathBuf> {
-    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
-        Ok(it) => it.filter_map(Result::ok).collect(),
-        Err(_) => return None,
-    };
-    // Priority pass — exact case-insensitive match against the
-    // ordered list. Build a lowercase→entry map so each priority
-    // lookup is O(1) on the directory size.
-    let mut by_lower: std::collections::HashMap<String, &std::fs::DirEntry> =
-        std::collections::HashMap::with_capacity(entries.len());
-    for e in &entries {
-        if let Some(name) = e.file_name().to_str() {
-            by_lower.insert(name.to_lowercase(), e);
-        }
-    }
-    for priority_name in COVER_FILE_NAMES {
-        if let Some(entry) = by_lower.get(*priority_name) {
-            let path = entry.path();
-            if cover_size_ok(&path) {
-                return Some(path);
-            }
-        }
-    }
-    // Fallback pass — any image in the directory, first hit.
-    for e in &entries {
-        let path = e.path();
-        let Some(ext) = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(str::to_lowercase)
-        else {
-            continue;
-        };
-        if !FALLBACK_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        if cover_size_ok(&path) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// True when the candidate file exists and is below
-/// [`MAX_COVER_BYTES`]. A metadata error (transient I/O,
-/// permission denied) skips the candidate without aborting
-/// the walk — the next priority entry gets a fair attempt.
-fn cover_size_ok(path: &Path) -> bool {
-    match std::fs::metadata(path) {
-        Ok(m) => m.is_file() && m.len() <= MAX_COVER_BYTES,
-        Err(_) => false,
-    }
+    sidecar_cover::find_cover_in_directory(dir)
 }
 
 /// Resolve MPD `file` string to a local [`PathBuf`] if the file exists.
@@ -1307,7 +1216,7 @@ mod tests {
         ];
         for name in expected_subset {
             assert!(
-                COVER_FILE_NAMES.contains(&name),
+                sidecar_cover::COVER_FILE_NAMES.contains(&name),
                 "missing priority name: {}",
                 name
             );
