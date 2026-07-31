@@ -1828,12 +1828,64 @@ impl NmInner {
         }
     }
 
-    async fn curl_probe(
+    /// Read the current IPv4 address of `ifname` from nmcli's
+    /// `IP4.ADDRESS[1]` field, stripped of the CIDR prefix.
+    /// Used to bind captive-plane curl calls to the wifi
+    /// interface's source IP so a device with both eth0 (admin
+    /// uplink) and wlan0 (captive segment) up sends portal
+    /// traffic over wlan0 regardless of which interface owns
+    /// the default route.
+    ///
+    /// Source-IP binding via `curl --interface <ip>` does NOT
+    /// require CAP_NET_RAW / root — curl just `bind()`s the
+    /// socket. `SO_BINDTODEVICE` (which would require the cap)
+    /// is deliberately avoided here.
+    ///
+    /// Returns `None` when the interface has no IPv4 address
+    /// (never associated, waiting on DHCP, or the read fails);
+    /// callers then let the routing table pick the source.
+    async fn wifi_source_ipv4(&self, ifname: &str) -> Option<String> {
+        let raw = self
+            .nmcli_output(&[
+                "-t",
+                "-f",
+                "IP4.ADDRESS",
+                "device",
+                "show",
+                ifname,
+            ])
+            .await
+            .ok()?;
+        for line in raw.lines() {
+            let after_colon =
+                line.rsplit_once(':').map(|(_, r)| r).unwrap_or(line);
+            let value = match after_colon.split_once('=') {
+                Some((_, v)) => v.trim(),
+                None => continue,
+            };
+            // Value shape: `192.168.1.42/24` — strip the CIDR.
+            if let Some(ip) = value.split('/').next() {
+                let ip = ip.trim();
+                if !ip.is_empty() && ip.contains('.') {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// GET a URL via curl and return `(http_code, effective_url)`
+    /// after redirect follow. When `source_ip` is `Some`, adds
+    /// `--interface <ip>` so the outbound socket binds to that
+    /// source (used to force the captive-plane traffic through
+    /// wlan0 even when eth0 owns the default route).
+    async fn curl_probe_bound(
         &self,
         url: &str,
+        source_ip: Option<&str>,
     ) -> Result<(Option<u16>, Option<String>), PluginError> {
         let mut cmd = Command::new("curl");
-        cmd.args([
+        let mut args: Vec<&str> = vec![
             "-sS",
             "-L",
             "-o",
@@ -1842,8 +1894,13 @@ impl NmInner {
             "%{http_code}|%{url_effective}",
             "--max-time",
             "20",
-            url,
-        ]);
+        ];
+        if let Some(ip) = source_ip {
+            args.push("--interface");
+            args.push(ip);
+        }
+        args.push(url);
+        cmd.args(&args);
         let out = run_command_output_with_timeout(
             cmd,
             self.config.curl_timeout_ms,
@@ -1922,17 +1979,30 @@ impl NmInner {
     /// deliberately reuse the same subprocess idiom the legacy
     /// probe uses so egress binding / privilege discipline
     /// stays uniform across the plugin.
-    async fn fetch_capport_api(&self, uri: &str) -> Option<serde_json::Value> {
+    /// GET the RFC 8908 API URI with the correct Accept header,
+    /// optionally binding the outbound socket to `source_ip` so
+    /// the traffic traverses the captive-carrying interface
+    /// (wlan0) even when eth0 owns the default route.
+    async fn fetch_capport_api_bound(
+        &self,
+        uri: &str,
+        source_ip: Option<&str>,
+    ) -> Option<serde_json::Value> {
         let mut cmd = Command::new("curl");
-        cmd.args([
+        let mut args: Vec<&str> = vec![
             "-sS",
             "-L",
             "-H",
             "Accept: application/captive+json",
             "--max-time",
             "10",
-            uri,
-        ]);
+        ];
+        if let Some(ip) = source_ip {
+            args.push("--interface");
+            args.push(ip);
+        }
+        args.push(uri);
+        cmd.args(&args);
         let out = run_command_output_with_timeout(
             cmd,
             self.config.curl_timeout_ms,
@@ -1968,12 +2038,20 @@ impl NmInner {
         // matches every RFC 8910-aware captive-portal stack
         // (iOS / macOS / Android 12+ / systemd-resolved).
         let ifname = self.config.default_wifi_iface.trim();
+        let source_ip = if ifname.is_empty() {
+            None
+        } else {
+            self.wifi_source_ipv4(ifname).await
+        };
         if !ifname.is_empty() {
             if let Some(api_uri) =
                 self.read_capport_api_uri_from_lease(ifname).await
             {
                 state.capport_api_uri = Some(api_uri.clone());
-                if let Some(body) = self.fetch_capport_api(&api_uri).await {
+                if let Some(body) = self
+                    .fetch_capport_api_bound(&api_uri, source_ip.as_deref())
+                    .await
+                {
                     // RFC 8908 field names use kebab-case.
                     let captive = body.get("captive").and_then(|v| v.as_bool());
                     let user_portal = body
@@ -2033,7 +2111,9 @@ impl NmInner {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("http://connectivitycheck.gstatic.com/generate_204");
-        let (http_code, effective_url) = self.curl_probe(probe_url).await?;
+        let (http_code, effective_url) = self
+            .curl_probe_bound(probe_url, source_ip.as_deref())
+            .await?;
         state.capport_api_uri = None;
         state.last_probe_url = Some(probe_url.to_string());
         state.last_http_code = http_code;
@@ -2144,6 +2224,31 @@ impl NmInner {
             return Ok(state);
         }
 
+        // Resolve wlan0 source IP so the submit binds to the
+        // captive-carrying interface. When absent (wlan0 has no
+        // IPv4 yet, or the plugin is running against a rig with
+        // no wifi) we fall through to the routing-table pick.
+        let ifname = self.config.default_wifi_iface.trim();
+        let source_ip = if ifname.is_empty() {
+            None
+        } else {
+            self.wifi_source_ipv4(ifname).await
+        };
+
+        // If the submit target matches the RFC 8910 API URI's
+        // host and the operator declared a JSON-body submit
+        // (form is empty, method is POST), add the RFC 8908
+        // `Accept: application/captive+json` header so a
+        // spec-compliant venue returns the updated state JSON
+        // in the response — which we then re-parse.
+        let is_capport_api_submit = state
+            .capport_api_uri
+            .as_deref()
+            .and_then(hostname_of)
+            .zip(hostname_of(url))
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+
         let mut args: Vec<String> = vec![
             "-sS".into(),
             "-L".into(),
@@ -2156,6 +2261,16 @@ impl NmInner {
             "-X".into(),
             method,
         ];
+        if let Some(ref ip) = source_ip {
+            args.push("--interface".into());
+            args.push(ip.clone());
+        }
+        if is_capport_api_submit {
+            args.push("-H".into());
+            args.push("Accept: application/captive+json".into());
+            args.push("-H".into());
+            args.push("Content-Type: application/captive+json".into());
+        }
         let mut field_names = Vec::new();
         for (k, v) in &payload.form {
             if k.trim().is_empty() {
@@ -2198,22 +2313,84 @@ impl NmInner {
         state.last_http_code = http_code;
         state.portal_url = effective_url;
         state.last_submission_fields = field_names;
-        let connectivity = self.nm_connectivity().await.unwrap_or_default();
-        if connectivity == "full" || http_code == Some(204) {
-            state.phase = CaptivePhase::Authenticated;
-            state.last_error = None;
-            state.requires_user_confirmation = false;
-        } else {
-            state.phase = CaptivePhase::AwaitingCredentials;
-            state.last_error = Some(
-                "captivity may still be active; credentials might be invalid or additional portal step is required"
-                    .to_string(),
-            );
-            state.requires_user_confirmation = matches!(
-                policy,
-                CaptiveCredentialPolicy::ManualAfterFailure
-                    | CaptiveCredentialPolicy::SingleUseTicket
-            );
+
+        // Post-submit RFC 8908 re-detection. When the venue
+        // exposed a capport API URI, re-hit it (wlan0-bound) to
+        // learn the authoritative post-submit state
+        // (is_captive, seconds/bytes remaining). This is the
+        // fastest, most accurate confirmation — RFC 8908 spec-
+        // compliant venues report `captive: false` immediately
+        // once the operator's session is admitted, without
+        // waiting for the connectivity check to walk the probe.
+        let mut detected_ok = false;
+        if let Some(ref api_uri) = state.capport_api_uri.clone() {
+            if let Some(body) = self
+                .fetch_capport_api_bound(api_uri, source_ip.as_deref())
+                .await
+            {
+                let captive = body.get("captive").and_then(|v| v.as_bool());
+                state.is_captive = captive;
+                state.user_portal_url = body
+                    .get("user-portal-url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                state.portal_url = state.user_portal_url.clone();
+                state.venue_info_url = body
+                    .get("venue-info-url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                state.seconds_remaining =
+                    body.get("seconds-remaining").and_then(|v| v.as_u64());
+                state.bytes_remaining =
+                    body.get("bytes-remaining").and_then(|v| v.as_u64());
+                match captive {
+                    Some(false) => {
+                        state.phase = CaptivePhase::Authenticated;
+                        state.last_error = None;
+                        state.requires_user_confirmation = false;
+                    }
+                    Some(true) => {
+                        state.phase = CaptivePhase::AwaitingCredentials;
+                        state.last_error = Some(
+                            "captive API still reports captive:true after \
+                             submit; credentials may be invalid or an \
+                             additional step is required"
+                                .to_string(),
+                        );
+                        state.requires_user_confirmation = matches!(
+                            policy,
+                            CaptiveCredentialPolicy::ManualAfterFailure
+                                | CaptiveCredentialPolicy::SingleUseTicket
+                        );
+                    }
+                    None => {}
+                }
+                detected_ok = true;
+            }
+        }
+
+        if !detected_ok {
+            // Fall back to the legacy connectivity walk when no
+            // RFC 8908 API is available (or its GET failed).
+            let connectivity = self.nm_connectivity().await.unwrap_or_default();
+            if connectivity == "full" || http_code == Some(204) {
+                state.phase = CaptivePhase::Authenticated;
+                state.is_captive = Some(false);
+                state.last_error = None;
+                state.requires_user_confirmation = false;
+            } else {
+                state.phase = CaptivePhase::AwaitingCredentials;
+                state.last_error = Some(
+                    "captivity may still be active; credentials might be \
+                     invalid or additional portal step is required"
+                        .to_string(),
+                );
+                state.requires_user_confirmation = matches!(
+                    policy,
+                    CaptiveCredentialPolicy::ManualAfterFailure
+                        | CaptiveCredentialPolicy::SingleUseTicket
+                );
+            }
         }
         Ok(state)
     }
@@ -2838,6 +3015,29 @@ impl NmInner {
         out.map(|o| o.status.success()).unwrap_or(false)
     }
 
+    /// Purge the 802-11-wireless-security setting from an
+    /// existing NM connection profile. Used before a modify
+    /// on an open-network join: NM keeps stale WEP-key + PSK
+    /// material on the profile across re-modifies, so a prior
+    /// secured configuration leaves behind
+    /// `802-11-wireless-security.wep-key0..3` / `.psk` fields
+    /// that flip the join into a `need-auth → no-secrets`
+    /// failure even after the current apply intends "open"
+    /// semantics. Best-effort — a "setting not found"
+    /// exit-nonzero from nmcli is the desired end state (setting
+    /// already absent).
+    async fn nm_purge_wifi_security(&self, con_name: &str) {
+        let _ = self
+            .nmcli_output(&[
+                "connection",
+                "modify",
+                con_name,
+                "remove",
+                "802-11-wireless-security",
+            ])
+            .await;
+    }
+
     async fn nm_device_table(&self) -> Result<Vec<DeviceRow>, PluginError> {
         let raw = self
             .nmcli_output(&[
@@ -3408,8 +3608,31 @@ impl NmInner {
         } else {
             base.extend(["802-11-wireless.bssid".to_string(), String::new()]);
         }
+        // Open-network join = ABSENCE of the 802-11-wireless-security
+        // setting on the profile. `wifi-sec.key-mgmt none` is
+        // NetworkManager's static-WEP shape (not open); it makes NM
+        // demand a WEP key at activate time and the join fails with
+        // `no-secrets`. Standard nmcli prior art: `nmcli dev wifi
+        // connect <ssid>` against an open AP creates a profile with
+        // NO wireless-security block. Open = absent block;
+        // `key-mgmt none` = WEP; `key-mgmt owe` = Enhanced Open.
+        //
+        // For the modify path we ALSO have to actively purge any
+        // leftover 802-11-wireless-security setting from a prior
+        // configuration attempt, since NM keeps stale
+        // `wep-key0..3` / `psk` fields on the profile across
+        // re-modifies and the join then still trips the WEP secret
+        // demand. The purge is best-effort — a "setting not found"
+        // exit-nonzero is exactly the end state we want.
         if wifi.sta_open {
-            base.extend(["wifi-sec.key-mgmt".into(), "none".into()]);
+            if self.nm_connection_exists(NM_CON_WIFI_STA).await {
+                self.nm_purge_wifi_security(NM_CON_WIFI_STA).await;
+                steps.push(format!(
+                    "purged 802-11-wireless-security on {NM_CON_WIFI_STA} \
+                     (open network — no security setting on profile)"
+                ));
+            }
+            // No wifi-sec.* args on `base`.
         } else {
             let psk = sta_psk
                 .map(str::trim)
@@ -3460,9 +3683,12 @@ impl NmInner {
             if let Some(ref bssid) = selected_bssid {
                 add.extend(["802-11-wireless.bssid".into(), bssid.to_string()]);
             }
-            if wifi.sta_open {
-                add.extend(["wifi-sec.key-mgmt".into(), "none".into()]);
-            } else {
+            // Open-network add: omit every wifi-sec.* arg. The
+            // resulting profile has no 802-11-wireless-security
+            // setting — the shape NM expects for a truly open AP
+            // (see the modify-path comment above for the WEP-vs-
+            // open distinction).
+            if !wifi.sta_open {
                 let psk = sta_psk
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -5442,6 +5668,32 @@ fn parse_http_probe_metrics(raw: &str) -> (Option<u16>, Option<String>) {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     (code, url)
+}
+
+/// Extract the host component (lowercased) of a URL string.
+/// Minimal parser — enough to compare two URLs for same-host
+/// membership in the captive submit path (matching against the
+/// captured `capport_api_uri` so RFC 8908 JSON headers only
+/// attach when the target actually is that API). Returns `None`
+/// on malformed input; callers treat that as "not the API URI"
+/// and fall through to the plain form-POST path.
+fn hostname_of(url: &str) -> Option<String> {
+    let after_scheme =
+        url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host_and_rest = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host = host_and_rest
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(host_and_rest);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
 }
 
 fn parse_radio_enabled_token(token: &str) -> Option<bool> {
@@ -7456,6 +7708,72 @@ exit 0\n",
         assert_eq!(v["seconds_remaining"], serde_json::Value::Null);
         assert_eq!(v["bytes_remaining"], serde_json::Value::Null);
         assert_eq!(v["capport_api_uri"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn hostname_of_extracts_bare_host() {
+        assert_eq!(
+            hostname_of("http://portal.example.com/api"),
+            Some("portal.example.com".to_string())
+        );
+        assert_eq!(
+            hostname_of("https://portal.example.com/api?x=1#frag"),
+            Some("portal.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn hostname_of_strips_port_and_userinfo() {
+        assert_eq!(
+            hostname_of("https://user:pw@portal.example.com:8443/x"),
+            Some("portal.example.com".to_string())
+        );
+        assert_eq!(
+            hostname_of("http://192.168.1.1:8080/login"),
+            Some("192.168.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn hostname_of_is_case_insensitive() {
+        // Same-host comparisons across the captive submit path
+        // rely on lowercasing so `Portal.Example.COM` vs
+        // `portal.example.com` matches.
+        assert_eq!(
+            hostname_of("HTTPS://Portal.Example.COM/api"),
+            Some("portal.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn hostname_of_rejects_empty_and_malformed() {
+        assert_eq!(hostname_of(""), None);
+        assert_eq!(hostname_of("http://"), None);
+        // Missing scheme still yields something — the raw form
+        // that looks like a URL path returns the first segment
+        // as the "host". This is fine: the captive submit only
+        // compares two hosts from the same source shape, so any
+        // consistent extraction works.
+        assert_eq!(
+            hostname_of("portal.example.com/api"),
+            Some("portal.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn hostname_matches_between_api_and_submit_url() {
+        // The captive-submit path checks
+        // `hostname_of(capport_api_uri) == hostname_of(url)`
+        // to decide whether to attach RFC 8908 headers. Pin
+        // that the two forms it commonly sees (one from
+        // nmcli-lease → https://api.host/capport, the other
+        // from the same venue's submit URL → https://api.host/
+        // ...) resolve to the same host string.
+        let api = hostname_of("https://api.example.net/capport");
+        let submit_same = hostname_of("https://api.example.net/consent");
+        let submit_other = hostname_of("https://portal.example.net/consent");
+        assert_eq!(api, submit_same);
+        assert_ne!(api, submit_other);
     }
 
     #[test]
