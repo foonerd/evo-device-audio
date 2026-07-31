@@ -3050,7 +3050,9 @@ mod tests {
              per-track extractor runs, got {url}"
         );
         assert!(
-            url.contains("Adele%2F21%2F01%20-%20Rolling%20in%20the%20Deep.flac"),
+            url.contains(
+                "Adele%2F21%2F01%20-%20Rolling%20in%20the%20Deep.flac"
+            ),
             "Tier 2 must point at the stable-sorted first audio track \
              (basename lexicographic — '01' before '02'), got {url}"
         );
