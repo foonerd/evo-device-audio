@@ -55,6 +55,47 @@ The plugin uses these intent fields:
 - `radio_policy.country` (ISO-3166 alpha-2; applied via `iw reg set`)
 - `radio_policy.band_2ghz` / `band_5ghz` / `band_6ghz` (operator band surface)
 
+## Captive detection contract (RFC 8910 / RFC 8908)
+
+`network.nm.captive.status` runs a two-tier detection:
+
+1. **RFC 8910 lease-carried capport URI.** The plugin reads
+   the active Wi-Fi lease (via `nmcli device show <ifname>` on
+   the DHCP4 / DHCP6 / IP6 rows) for a `capport` /
+   `captive_portal` / `captive_portal_uri` / `option_114` key
+   pointing at an `http(s)://` URL. When present it GETs that
+   URI with `Accept: application/captive+json` per RFC 8908
+   and parses the response into `is_captive` /
+   `user_portal_url` / `venue_info_url` / `seconds_remaining`
+   / `bytes_remaining`.
+2. **Legacy unencrypted-probe fallback.** When the lease
+   carries no capport URI (or the API GET fails to yield a
+   JSON body), the plugin curls
+   `http://connectivitycheck.gstatic.com/generate_204`
+   (override via the `url` payload field). A clean `204`
+   reports `is_captive: false`; any redirect target becomes
+   `user_portal_url` (the intercepted URL — NOT the probe URL,
+   which is retained only as `last_probe_url` for
+   diagnostics).
+
+Response field surface on the `captive` block:
+
+- `is_captive` — `true|false|null`. `null` on hard probe
+  failure; `false` on clean 204 or RFC 8908 `captive: false`.
+- `user_portal_url` — the URL the operator visits to
+  authenticate. Sourced from RFC 8908 `user-portal-url` when
+  available, else the legacy-probe redirect target. NEVER
+  the probe URL.
+- `venue_info_url` — RFC 8908 `venue-info-url` when reported.
+- `seconds_remaining` / `bytes_remaining` — RFC 8908
+  session-remaining budgets when reported.
+- `capport_api_uri` — the RFC 8910 URI from the lease; kept
+  for diagnostics.
+- `last_probe_url` — the probe URL consulted (legacy path).
+  Clearly labelled as a probe.
+- `portal_url` — DEPRECATED alias for `user_portal_url`;
+  retained for pre-RFC-8908 consumers.
+
 ## Captive reliability policy config
 
 Plugin config accepts optional reliability controls (either top-level or under `[captive]`):

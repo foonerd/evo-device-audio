@@ -1036,8 +1036,50 @@ enum CaptivePhase {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CaptiveSessionState {
     phase: CaptivePhase,
+    /// RFC 8910 detection outcome, when present: `true` when the
+    /// active lease's capport URI reports a captive state (or
+    /// the legacy probe fallback observed an intercepted
+    /// redirect). `false` when RFC 8908 reports `captive: false`
+    /// or the probe returned a clean 204.
+    #[serde(default)]
+    is_captive: Option<bool>,
+    /// The URL the operator actually needs to visit to
+    /// authenticate — sourced from the RFC 8908 API response's
+    /// `user-portal-url` field when available, else the
+    /// intercepted redirect target from the legacy probe. NEVER
+    /// the probe URL itself (`generate_204` and friends).
+    #[serde(default)]
+    user_portal_url: Option<String>,
+    /// RFC 8908 `venue-info-url` — optional venue metadata /
+    /// terms page. Present when the API returns it; omitted
+    /// otherwise.
+    #[serde(default)]
+    venue_info_url: Option<String>,
+    /// RFC 8908 `seconds-remaining` — session-remaining budget
+    /// reported by the venue when the operator is already
+    /// authenticated. `None` when not reported.
+    #[serde(default)]
+    seconds_remaining: Option<u64>,
+    /// RFC 8908 `bytes-remaining` — session-remaining byte
+    /// budget when reported. `None` when not reported.
+    #[serde(default)]
+    bytes_remaining: Option<u64>,
+    /// RFC 8910 capport API URI, when the DHCP option 114 (or
+    /// IPv6 RA option 37) was present on the current lease.
+    /// Diagnostic surface only; the operator hits
+    /// `user_portal_url`, not this.
+    #[serde(default)]
+    capport_api_uri: Option<String>,
+    /// The probe URL that was consulted (legacy path). Retained
+    /// for operator diagnostics — clearly labelled as a probe,
+    /// not a portal. When the RFC 8910 lease-driven path
+    /// succeeds this may be absent.
     #[serde(default)]
     last_probe_url: Option<String>,
+    /// DEPRECATED alias for `user_portal_url`. Retained for
+    /// wire-compatibility with pre-RFC-8908 consumers that read
+    /// this field. New consumers MUST read `user_portal_url`;
+    /// this field mirrors it verbatim.
     #[serde(default)]
     portal_url: Option<String>,
     #[serde(default)]
@@ -1819,31 +1861,204 @@ impl NmInner {
         Ok(parse_http_probe_metrics(raw.trim()))
     }
 
+    /// Read the RFC 8910 Captive-Portal API URI advertised on
+    /// the current lease, when the router set DHCPv4 option 114
+    /// or the IPv6 RA option (option 37). NetworkManager exposes
+    /// these under DHCP4 / DHCP6 / IP6 rows on `nmcli device
+    /// show`. Keys vary across NM versions (`capport`,
+    /// `option_114`, `captive_portal`, `captive_portal_uri`); we
+    /// scan for any of them, case-insensitive, matching the
+    /// first `http(s)://` value.
+    ///
+    /// Returns `None` when the lease carries no captive-portal
+    /// URI — the common case on a home / corporate router that
+    /// isn't a captive-portal gateway. Callers fall back to the
+    /// legacy probe path when this returns `None`.
+    async fn read_capport_api_uri_from_lease(
+        &self,
+        ifname: &str,
+    ) -> Option<String> {
+        let raw = self
+            .nmcli_output(&[
+                "-t",
+                "-f",
+                "DHCP4,DHCP6,IP6",
+                "device",
+                "show",
+                ifname,
+            ])
+            .await
+            .ok()?;
+        for line in raw.lines() {
+            // nmcli terse format: `<KEY> = <VALUE>` (possibly
+            // preceded by row-header like `DHCP4.OPTION[N]:`).
+            let after_colon =
+                line.rsplit_once(':').map(|(_, r)| r).unwrap_or(line);
+            let (key, value) = match after_colon.split_once('=') {
+                Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim()),
+                None => continue,
+            };
+            let key_hit = key.contains("capport")
+                || key.contains("captive_portal")
+                || key == "captive-portal"
+                || key == "option_114";
+            if !key_hit {
+                continue;
+            }
+            if value.starts_with("http://") || value.starts_with("https://") {
+                return Some(value.to_string());
+            }
+        }
+        None
+    }
+
+    /// GET the RFC 8908 Captive-Portal API endpoint with
+    /// `Accept: application/captive+json` and parse the response.
+    /// Returns `None` on any non-2xx status, non-JSON body, or
+    /// missing required fields — the caller then treats the
+    /// URI as the operator portal itself (some pre-RFC-8908
+    /// captive gateways expose only an HTML login page at the
+    /// same URI). Curl handles TLS + redirects + timeouts; we
+    /// deliberately reuse the same subprocess idiom the legacy
+    /// probe uses so egress binding / privilege discipline
+    /// stays uniform across the plugin.
+    async fn fetch_capport_api(&self, uri: &str) -> Option<serde_json::Value> {
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sS",
+            "-L",
+            "-H",
+            "Accept: application/captive+json",
+            "--max-time",
+            "10",
+            uri,
+        ]);
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.curl_timeout_ms,
+            "capport api GET",
+        )
+        .await
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let body = String::from_utf8_lossy(&out.stdout).into_owned();
+        serde_json::from_str::<serde_json::Value>(body.trim()).ok()
+    }
+
     async fn captive_detect(
         &self,
         url: Option<&str>,
     ) -> Result<CaptiveSessionState, PluginError> {
+        let mut state = self.load_captive_state().await.unwrap_or_default();
+        state.last_error = None;
+
+        // ---- Tier 1: RFC 8910 lease-carried capport URI ----
+        //
+        // When the router advertises DHCPv4 option 114 or the
+        // IPv6 RA captive-portal option, that URI is the
+        // canonical entry point (RFC 8910). We GET it with the
+        // RFC 8908 Accept header; the response's
+        // `user-portal-url` is the URL the operator visits (and
+        // the venue-info-url + seconds/bytes-remaining fields
+        // populate the operator surface). This path fires
+        // BEFORE the legacy probe so a spec-compliant venue is
+        // handled without touching an unencrypted probe URL —
+        // matches every RFC 8910-aware captive-portal stack
+        // (iOS / macOS / Android 12+ / systemd-resolved).
+        let ifname = self.config.default_wifi_iface.trim();
+        if !ifname.is_empty() {
+            if let Some(api_uri) =
+                self.read_capport_api_uri_from_lease(ifname).await
+            {
+                state.capport_api_uri = Some(api_uri.clone());
+                if let Some(body) = self.fetch_capport_api(&api_uri).await {
+                    // RFC 8908 field names use kebab-case.
+                    let captive = body.get("captive").and_then(|v| v.as_bool());
+                    let user_portal = body
+                        .get("user-portal-url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let venue_info = body
+                        .get("venue-info-url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let seconds_remaining =
+                        body.get("seconds-remaining").and_then(|v| v.as_u64());
+                    let bytes_remaining =
+                        body.get("bytes-remaining").and_then(|v| v.as_u64());
+                    state.is_captive = captive;
+                    state.user_portal_url = user_portal.clone();
+                    state.portal_url = user_portal;
+                    state.venue_info_url = venue_info;
+                    state.seconds_remaining = seconds_remaining;
+                    state.bytes_remaining = bytes_remaining;
+                    state.last_probe_url = None;
+                    state.last_http_code = None;
+                    state.phase = match captive {
+                        Some(true) => CaptivePhase::ProbeDetected,
+                        Some(false) => CaptivePhase::Authenticated,
+                        None => CaptivePhase::ProbeDetected,
+                    };
+                    return Ok(state);
+                }
+                // API GET failed or non-JSON — assume the URI is
+                // the operator's portal itself (pre-RFC-8908
+                // gateways expose only HTML). Mark captive but
+                // populate user_portal_url from the lease.
+                state.is_captive = Some(true);
+                state.user_portal_url = Some(api_uri.clone());
+                state.portal_url = Some(api_uri);
+                state.venue_info_url = None;
+                state.seconds_remaining = None;
+                state.bytes_remaining = None;
+                state.last_probe_url = None;
+                state.last_http_code = None;
+                state.phase = CaptivePhase::ProbeDetected;
+                return Ok(state);
+            }
+        }
+
+        // ---- Tier 2: legacy unencrypted-probe fallback ----
+        //
+        // No RFC 8910 URI on the lease. Fall back to the
+        // pre-8910 pattern: GET an unencrypted probe URL and
+        // capture the intercepted redirect target — that
+        // redirect target IS the portal, NOT the probe URL. We
+        // ALWAYS labelled the probe URL as `last_probe_url` (not
+        // `portal_url`) so the wire response never confuses the
+        // two.
         let probe_url = url
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("http://connectivitycheck.gstatic.com/generate_204");
         let (http_code, effective_url) = self.curl_probe(probe_url).await?;
-        let mut state = self.load_captive_state().await.unwrap_or_default();
+        state.capport_api_uri = None;
         state.last_probe_url = Some(probe_url.to_string());
         state.last_http_code = http_code;
+        state.seconds_remaining = None;
+        state.bytes_remaining = None;
+        state.venue_info_url = None;
         if let Some(ref u) = effective_url {
-            let changed = u.trim() != probe_url;
+            let redirected = u.trim() != probe_url;
             let non_204 = http_code != Some(204);
-            if changed || non_204 {
-                state.phase = CaptivePhase::ProbeDetected;
+            if redirected || non_204 {
+                // Intercepted — the redirect target is the
+                // portal. Populate user_portal_url from that,
+                // NOT from the probe URL.
+                state.is_captive = Some(true);
+                state.user_portal_url = Some(u.clone());
                 state.portal_url = Some(u.clone());
-                state.last_error = None;
+                state.phase = CaptivePhase::ProbeDetected;
                 return Ok(state);
             }
         }
+        // Clean 204 — internet reachable, no captive.
+        state.is_captive = Some(false);
+        state.user_portal_url = None;
+        state.portal_url = None;
         state.phase = CaptivePhase::Authenticated;
-        state.portal_url = effective_url;
-        state.last_error = None;
         Ok(state)
     }
 
@@ -7172,5 +7387,118 @@ exit 0\n",
             .await
             .expect_err("must reject");
         assert!(format!("{err}").contains("cannot harden secrets"));
+    }
+
+    // -----------------------------------------------------------
+    // Captive detection — wire-response shape tests. Pin the
+    // invariant that `user_portal_url` is the operator-visited
+    // URL (from RFC 8908 API or an intercepted redirect target),
+    // and that the probe URL never leaks into that field.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn captive_state_serialises_new_rfc_fields() {
+        // Wire regression guard: a CaptiveSessionState with the
+        // RFC 8908 fields populated MUST serialise them so
+        // `network.nm.captive.status` responses carry
+        // user_portal_url / venue_info_url / seconds_remaining
+        // / bytes_remaining / is_captive / capport_api_uri.
+        let state = CaptiveSessionState {
+            phase: CaptivePhase::ProbeDetected,
+            is_captive: Some(true),
+            user_portal_url: Some(
+                "https://portal.example.com/login".to_string(),
+            ),
+            venue_info_url: Some(
+                "https://portal.example.com/venue".to_string(),
+            ),
+            seconds_remaining: Some(1800),
+            bytes_remaining: Some(500_000_000),
+            capport_api_uri: Some("https://portal.example.com/api".to_string()),
+            last_probe_url: None,
+            portal_url: Some("https://portal.example.com/login".to_string()),
+            last_http_code: None,
+            last_error: None,
+            last_submission_fields: Vec::new(),
+            last_submit_fingerprint: None,
+            last_submit_at_epoch: None,
+            submit_attempts: 0,
+            requires_user_confirmation: false,
+        };
+        let v = serde_json::to_value(&state).expect("serialise");
+        assert_eq!(v["is_captive"], serde_json::json!(true));
+        assert_eq!(
+            v["user_portal_url"],
+            serde_json::json!("https://portal.example.com/login")
+        );
+        assert_eq!(
+            v["venue_info_url"],
+            serde_json::json!("https://portal.example.com/venue")
+        );
+        assert_eq!(v["seconds_remaining"], serde_json::json!(1800));
+        assert_eq!(v["bytes_remaining"], serde_json::json!(500_000_000));
+        assert_eq!(
+            v["capport_api_uri"],
+            serde_json::json!("https://portal.example.com/api")
+        );
+    }
+
+    #[test]
+    fn captive_state_default_omits_rfc_fields_cleanly() {
+        // Default state serialises with the new fields as null
+        // (not absent) — every wire consumer sees the same shape
+        // whether we detected a captive portal or not.
+        let state = CaptiveSessionState::default();
+        let v = serde_json::to_value(&state).expect("serialise");
+        assert_eq!(v["is_captive"], serde_json::Value::Null);
+        assert_eq!(v["user_portal_url"], serde_json::Value::Null);
+        assert_eq!(v["venue_info_url"], serde_json::Value::Null);
+        assert_eq!(v["seconds_remaining"], serde_json::Value::Null);
+        assert_eq!(v["bytes_remaining"], serde_json::Value::Null);
+        assert_eq!(v["capport_api_uri"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn captive_state_roundtrips_through_json_with_new_fields() {
+        // Loaded state from disk (via CaptiveStateEnvelope) must
+        // preserve the new RFC 8908 fields across a full
+        // serialise → parse cycle. Regression guard against
+        // schema_version bumps.
+        let state = CaptiveSessionState {
+            phase: CaptivePhase::Authenticated,
+            is_captive: Some(false),
+            user_portal_url: None,
+            venue_info_url: None,
+            seconds_remaining: Some(600),
+            bytes_remaining: None,
+            capport_api_uri: Some("https://api.example/capport".to_string()),
+            last_probe_url: Some(
+                "http://connectivitycheck.gstatic.com/generate_204".to_string(),
+            ),
+            portal_url: None,
+            last_http_code: Some(204),
+            last_error: None,
+            last_submission_fields: Vec::new(),
+            last_submit_fingerprint: None,
+            last_submit_at_epoch: None,
+            submit_attempts: 0,
+            requires_user_confirmation: false,
+        };
+        let env = CaptiveStateEnvelope {
+            schema_version: 1,
+            state,
+        };
+        let raw = serde_json::to_string(&env).expect("serialise");
+        let parsed = parse_captive_state_json(&raw).expect("roundtrip parse");
+        assert_eq!(parsed.is_captive, Some(false));
+        assert_eq!(parsed.seconds_remaining, Some(600));
+        assert_eq!(
+            parsed.capport_api_uri.as_deref(),
+            Some("https://api.example/capport")
+        );
+        assert_eq!(
+            parsed.last_probe_url.as_deref(),
+            Some("http://connectivitycheck.gstatic.com/generate_204")
+        );
     }
 }
