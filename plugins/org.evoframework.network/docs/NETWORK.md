@@ -49,6 +49,7 @@ version = 1
   role = "sta"             # "sta" | "ap" | "disabled"
   sta_ssid = ""
   sta_open = false
+  sta_hidden = false       # non-broadcast SSID join
   sta_ipv4_mode = "dhcp"
   sta_ipv4_address = ""
   sta_ipv4_gateway = ""
@@ -73,15 +74,28 @@ version = 1
   wifi_enabled_pref = true
   bluetooth_enabled_pref = true
   band_priority = ["6ghz", "5ghz", "2.4ghz"]
+  country = ""             # ISO-3166 alpha-2; `iw reg set` on apply
+  band_2ghz = true
+  band_5ghz = true
+  band_6ghz = true
 ```
 
 `radio_policy.flight_mode` is the device-wide kill that takes
-every wireless family offline. `wifi_enabled_pref` /
-`bluetooth_enabled_pref` are operator preferences applied when
-flight mode is off and the kernel's `rfkill` is not blocking.
-`band_priority` ranks bands for STA traffic assignment when more
-than one Wi-Fi PHY is present (see
-[Multi-radio role assignment](#multi-radio-role-assignment)).
+every wireless family offline. Successful
+`network.nm.flight_mode.set` fires exactly one bus emission —
+the steward's post-dispatch hook publishes
+`Happening::FlightModeChanged { rack_class: "wireless", on:
+<enabled> }`. The plugin does not emit a duplicate PluginEvent
+for this transition (single-story bus).
+`wifi_enabled_pref` / `bluetooth_enabled_pref` are operator
+preferences applied when flight mode is off and the kernel's
+`rfkill` is not blocking. `band_priority` ranks bands for STA
+traffic assignment when more than one Wi-Fi PHY is present
+(see [Multi-radio role assignment](#multi-radio-role-assignment)).
+`country` applies via `iw reg set` on `apply`. `band_2ghz` /
+`band_5ghz` / `band_6ghz` gate scan `available[]` and BSSID
+candidate lists — a disabled band's APs are dropped from the
+operator's scan view and never selected for STA association.
 
 PSK sidecars live next to the intent file:
 

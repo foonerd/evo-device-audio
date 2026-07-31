@@ -235,14 +235,15 @@ their plugins land.
 name = "link"
 shape = 1
 description = """
-Host link-layer respondent. Operator-facing networking \
-verbs (status / scan / intent.get|set|apply / captive.* / \
-security.* / flight_mode.get|set) for the
-NetworkManager-backed reference implementation. Plugin \
-dispatches every nmcli invocation through a privilege \
-composite that the framework's preflight runner resolves \
-at admission (direct under root, sudo -n under a non-root \
-service user).
+Host link-layer respondent. Single claimant: \
+`org.evoframework.network` (NetworkManager + nmcli + iw \
+virtual `ap0` + rfkill — not classic hostapd/dhcpcd). \
+Operator verbs: status / scan / intent.get|set|apply / \
+captive.* / security.* / flight_mode.get|set / radio.* / \
+supervisor.status / wifi_devices / refresh_connectivity. \
+Intent covers DHCP|static eth+STA, hotspot, hidden SSID, \
+regdomain country/bands. Bootstrap installs \
+`/etc/sudoers.d/evo-network-nm` for nmcli+iw+rfkill.
 """
 
 [[racks.shelves]]

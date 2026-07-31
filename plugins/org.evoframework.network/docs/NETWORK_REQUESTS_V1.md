@@ -20,6 +20,18 @@ Operational procedures: `docs/NETWORK_RUNBOOK.md`.
 - `network.nm.security.harden`
 - `network.nm.flight_mode.get`
 - `network.nm.flight_mode.set`
+- `network.nm.radio.status`
+- `network.nm.radio.set`
+- `network.nm.supervisor.status`
+- `network.nm.wifi_devices`
+- `network.refresh_connectivity`
+
+Successful `network.nm.flight_mode.set` fires exactly one bus
+emission: the steward's post-dispatch hook publishes
+`Happening::FlightModeChanged { rack_class: "wireless", on:
+<enabled> }`. The plugin does not emit a duplicate PluginEvent
+for this transition — every wireless-rack subscriber receives
+one wake per operator action.
 
 ## Intent model parity notes
 
@@ -30,7 +42,7 @@ The plugin uses these intent fields:
 - `ethernet.ipv4_mode` (`dhcp` or `static`, alias `manual` accepted)
 - `ethernet.ipv4_address`, `ethernet.ipv4_gateway`, `ethernet.ipv4_dns[]`
 - `wifi.ifname`, `wifi.role` (`sta|ap|disabled`)
-- `wifi.sta_ssid`, `wifi.sta_open`
+- `wifi.sta_ssid`, `wifi.sta_open`, `wifi.sta_hidden`
 - `wifi.sta_ipv4_mode`, `wifi.sta_ipv4_address`, `wifi.sta_ipv4_gateway`, `wifi.sta_ipv4_dns[]`
 - `wifi.sta_selection_mode` (`legacy|auto_stable|auto_performance|prefer_band|lock_bssid`)
 - `wifi.sta_preferred_band` (`2.4ghz|5ghz|6ghz`) for `prefer_band`
@@ -38,6 +50,10 @@ The plugin uses these intent fields:
 - `wifi.ap_ssid`, `wifi.ap_channel`, `wifi.ap_band` (`bg|a|6GHz`)
 - `fallback.hotspot_enabled`, `fallback.hotspot_connection_name`
 - `fallback.hotspot_ifname`, `fallback.hotspot_fallback`
+- `radio_policy.flight_mode`, `radio_policy.wifi_enabled_pref`, `radio_policy.bluetooth_enabled_pref`
+- `radio_policy.band_priority[]` (`6ghz|5ghz|2.4ghz`)
+- `radio_policy.country` (ISO-3166 alpha-2; applied via `iw reg set`)
+- `radio_policy.band_2ghz` / `band_5ghz` / `band_6ghz` (operator band surface)
 
 ## Captive reliability policy config
 

@@ -5,7 +5,7 @@
 # Grants the steward service user (substituted at install
 # time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
 # access to the binaries the network plugin invokes
-# (nmcli, iw). Two scopes:
+# (nmcli, iw, rfkill). Scopes:
 #
 # 1. `EVO_NM_POLL` `Cmnd_Alias` — the read-side enumeration
 #    commands the supervisor invokes when an rtnetlink event,
@@ -35,19 +35,26 @@
 #    `radio wifi off`, and similar). These retain full
 #    journald audit logging.
 #
-# Per-verb argv scoping on the broad nmcli rule is
-# intentionally not done: sudoers argv-match against nmcli's
-# option flags is brittle (any `-t -f FIELD` reordering
-# breaks the match) and the binary itself is the
+# 3. Broad `/usr/sbin/iw` grant — PHY probes, virtual `ap0`
+#    lifecycle (`interface add … type __ap` / `del`), and
+#    `iw reg set XX` for `radio_policy.country`.
+#
+# 4. Broad `rfkill` grant — flight-mode multi-family block
+#    coordination (Wi-Fi + Bluetooth). Read-only state stays
+#    on `/sys/class/rfkill` (no privilege).
+#
+# Per-verb argv scoping on the broad nmcli/iw/rfkill rules is
+# intentionally not done: sudoers argv-match against those
+# option flags is brittle and the binary itself is the
 # operator-relevant trust boundary.
 #
 # Path discipline: the nmcli path MUST match
 # `PluginConfig.nmcli_path` (default `/usr/bin/nmcli`,
 # overridable via the plugin's `nmcli_path` config field).
 # The bootstrap script substitutes this path verbatim at
-# install time. iw path in the polling alias is hardcoded to
-# the canonical Debian location; non-standard distributions
-# add new substitutions to the bootstrap script.
+# install time. iw / rfkill paths are the canonical Debian
+# locations; non-standard distributions add substitutions
+# to the bootstrap script.
 #
 # Apply via the bootstrap script:
 #   scripts/bootstrap.sh --install-network-nm-sudoers
@@ -78,8 +85,21 @@ Cmnd_Alias EVO_NM_POLL = \
 Cmnd_Alias EVO_NM_FULL = \
     /usr/bin/nmcli
 
+# Full iw — PHY inventory, ap0 vif lifecycle, regdomain.
+Cmnd_Alias EVO_IW_FULL = \
+    /usr/sbin/iw
+
+# Flight-mode kernel radio block (both common path layouts).
+Cmnd_Alias EVO_RFKILL_FULL = \
+    /usr/sbin/rfkill, \
+    /usr/bin/rfkill
+
 Defaults!EVO_NM_POLL !pam_session, !syslog
 Defaults!EVO_NM_FULL !pam_session, !syslog
+Defaults!EVO_IW_FULL !pam_session, !syslog
+Defaults!EVO_RFKILL_FULL !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NM_POLL
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NM_FULL
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_IW_FULL
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_RFKILL_FULL

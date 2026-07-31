@@ -464,6 +464,19 @@ struct RadioPolicy {
     /// (6 GHz > 5 GHz > 2.4 GHz).
     #[serde(default = "default_band_priority")]
     band_priority: Vec<BandPreference>,
+    /// ISO-3166 alpha-2 regulatory domain (e.g. `GB`, `US`). Empty
+    /// leaves the host's current `iw reg` domain unchanged on apply.
+    #[serde(default)]
+    country: String,
+    /// Operator band surface for scan/associate. Default all-on;
+    /// country legality still enforced by the kernel regulatory
+    /// database after `country` is applied.
+    #[serde(default = "default_true")]
+    band_2ghz: bool,
+    #[serde(default = "default_true")]
+    band_5ghz: bool,
+    #[serde(default = "default_true")]
+    band_6ghz: bool,
 }
 
 impl Default for RadioPolicy {
@@ -473,6 +486,10 @@ impl Default for RadioPolicy {
             wifi_enabled_pref: true,
             bluetooth_enabled_pref: true,
             band_priority: default_band_priority(),
+            country: String::new(),
+            band_2ghz: true,
+            band_5ghz: true,
+            band_6ghz: true,
         }
     }
 }
@@ -516,6 +533,10 @@ struct WifiIntent {
     sta_ssid: String,
     #[serde(default)]
     sta_open: bool,
+    /// Hidden / non-broadcast SSID join. Maps to NM
+    /// `802-11-wireless.hidden`.
+    #[serde(default)]
+    sta_hidden: bool,
     #[serde(default)]
     sta_ipv4_mode: Ipv4Mode,
     #[serde(default)]
@@ -545,6 +566,7 @@ impl Default for WifiIntent {
             role: WifiRole::Sta,
             sta_ssid: String::new(),
             sta_open: false,
+            sta_hidden: false,
             sta_ipv4_mode: Ipv4Mode::Dhcp,
             sta_ipv4_address: String::new(),
             sta_ipv4_gateway: String::new(),
@@ -927,6 +949,16 @@ struct ScanRow {
     signal: u8,
     security: String,
     active: bool,
+    /// Optional operating frequency in MHz — populated when nmcli
+    /// reports it. Retained so the scan handler can filter the
+    /// list against the operator's `radio_policy.band_*` gates
+    /// without a second nmcli round-trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freq_mhz: Option<u32>,
+    /// Band derived from `freq_mhz` (2.4 / 5 / 6 GHz). Emitted so
+    /// the UI can label rows without re-deriving the frequency
+    /// bucket itself.
+    band: BandClass,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -2623,7 +2655,10 @@ impl NmInner {
         let mut args: Vec<String> = vec![
             "-t".into(),
             "-f".into(),
-            "SSID,SIGNAL,SECURITY,ACTIVE".into(),
+            // FREQ appended so the scan handler can filter rows
+            // against `radio_policy.band_*` without a second
+            // nmcli round-trip (band derived from freq).
+            "SSID,SIGNAL,SECURITY,ACTIVE,FREQ".into(),
             "dev".into(),
             "wifi".into(),
             "list".into(),
@@ -2639,7 +2674,7 @@ impl NmInner {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut parts = line.splitn(4, ':');
+            let mut parts = line.splitn(5, ':');
             let ssid = parts.next().unwrap_or("").trim().to_string();
             if ssid.is_empty() || !seen.insert(ssid.clone()) {
                 continue;
@@ -2649,11 +2684,15 @@ impl NmInner {
             let security_raw = parts.next().unwrap_or("").trim();
             let active_raw =
                 parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            let freq_mhz =
+                parts.next().unwrap_or("").trim().parse::<u32>().ok();
             out.push(ScanRow {
                 ssid,
                 signal: signal_bars_from_pct(signal_pct),
                 security: security_label(security_raw).to_string(),
                 active: active_raw == "yes" || active_raw == "y",
+                freq_mhz,
+                band: band_from_freq(freq_mhz),
             });
         }
         Ok(out)
@@ -2962,6 +3001,43 @@ impl NmInner {
             .await
     }
 
+    /// Apply `radio_policy.country` via `iw reg set XX` when the
+    /// operator set a two-letter ISO code. Best-effort: failure is
+    /// recorded on the apply steps and does not abort the rest of
+    /// the pipeline (kernel may reject unknown codes).
+    async fn apply_regdomain(
+        &self,
+        policy: &RadioPolicy,
+        steps: &mut Vec<String>,
+    ) {
+        let country = policy.country.trim().to_ascii_uppercase();
+        if country.is_empty() {
+            return;
+        }
+        if country.len() != 2
+            || !country.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            steps.push(format!(
+                "warning: radio_policy.country {country:?} is not ISO-3166 alpha-2; skipping iw reg set"
+            ));
+            return;
+        }
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        match wifi_phy::iw_output(
+            self.effective_iw_exec().as_ref(),
+            &self.config.iw_path,
+            &["reg", "set", &country],
+            timeout,
+        )
+        .await
+        {
+            Ok(_) => steps.push(format!("regulatory domain set to {country}")),
+            Err(e) => {
+                steps.push(format!("warning: iw reg set {country} failed: {e}"))
+            }
+        }
+    }
+
     async fn nm_radio_state(&self) -> Result<NmRadioState, PluginError> {
         let compact = self
             .nmcli_output(&["-t", "-f", "WIFI-HW,WIFI,WWAN-HW,WWAN", "radio"])
@@ -3038,6 +3114,7 @@ impl NmInner {
         &self,
         wifi_ifname: &str,
         wifi: &WifiIntent,
+        radio_policy: &RadioPolicy,
         sta_psk: Option<&str>,
         sta_connection_up_nonfatal: bool,
         steps: &mut Vec<String>,
@@ -3062,8 +3139,19 @@ impl NmInner {
             ));
         }
 
-        let scan_candidates =
-            self.wifi_scan_candidates(Some(ifname)).await.ok();
+        // Filter scan candidates against the operator's
+        // `radio_policy.band_*` gates before BSSID selection.
+        // A disabled band never associates — matches what the
+        // scan-list UI would show the operator.
+        let scan_candidates: Option<Vec<WifiStaCandidate>> = self
+            .wifi_scan_candidates(Some(ifname))
+            .await
+            .ok()
+            .map(|cs| {
+                cs.into_iter()
+                    .filter(|c| radio_policy_admits_band(radio_policy, c.band))
+                    .collect()
+            });
         let selected_candidate = scan_candidates
             .as_ref()
             .and_then(|c| self.select_sta_candidate(wifi, c));
@@ -3090,6 +3178,12 @@ impl NmInner {
             ifname.to_string(),
             "802-11-wireless.ssid".to_string(),
             ssid.to_string(),
+            "802-11-wireless.hidden".to_string(),
+            if wifi.sta_hidden {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
         ];
         if let Some(ref bssid) = selected_bssid {
             base.extend([
@@ -3141,6 +3235,12 @@ impl NmInner {
                 ifname.to_string(),
                 "ssid".into(),
                 ssid.to_string(),
+                "802-11-wireless.hidden".into(),
+                if wifi.sta_hidden {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
             ];
             if let Some(ref bssid) = selected_bssid {
                 add.extend(["802-11-wireless.bssid".into(), bssid.to_string()]);
@@ -3883,6 +3983,8 @@ impl NmInner {
         };
         let hs_name = Self::hotspot_connection_name(intent);
 
+        self.apply_regdomain(&intent.radio_policy, &mut steps).await;
+
         self.ensure_ethernet(intent, &mut steps).await?;
 
         if !matches!(intent.wifi.role, WifiRole::Disabled) {
@@ -3944,6 +4046,7 @@ impl NmInner {
                 self.ensure_wifi_sta(
                     &sta_ifname,
                     &intent.wifi,
+                    &intent.radio_policy,
                     sta_psk,
                     sta_up_nonfatal,
                     &mut steps,
@@ -4584,6 +4687,27 @@ impl Respondent for NetworkPlugin {
                                 }
                             }
                         };
+                    // Apply operator's radio_policy band gates.
+                    // Scan cache stores the raw scan; filtering is
+                    // per-request so a band flip takes effect on
+                    // the next `network.nm.scan` call without a
+                    // cache flush. Rows whose FREQ nmcli did not
+                    // report keep BandClass::Unknown and pass the
+                    // filter — better an occasional un-classified
+                    // AP than a silent whole-list drop on a driver
+                    // that omits FREQ.
+                    let policy_intent = self.load_intent().await?;
+                    let policy = &policy_intent.radio_policy;
+                    let rows_total = rows.len();
+                    let candidates_total = candidates.len();
+                    let filtered_rows: Vec<ScanRow> = rows
+                        .into_iter()
+                        .filter(|r| radio_policy_admits_band(policy, r.band))
+                        .collect();
+                    let filtered_candidates: Vec<WifiStaCandidate> = candidates
+                        .into_iter()
+                        .filter(|c| radio_policy_admits_band(policy, c.band))
+                        .collect();
                     NmInner::response_json(
                         req,
                         self.with_observability(
@@ -4591,12 +4715,19 @@ impl Respondent for NetworkPlugin {
                             json!({
                                 "v": 1,
                                 "status": "ok",
-                                "available": rows,
-                                "candidates": candidates,
+                                "available": filtered_rows,
+                                "candidates": filtered_candidates,
                                 "cache": {
                                     "hit": cache_hit,
                                     "stale": cache_stale,
                                     "refresh_requested": scan_req.refresh,
+                                },
+                                "band_gate": {
+                                    "band_2ghz": policy.band_2ghz,
+                                    "band_5ghz": policy.band_5ghz,
+                                    "band_6ghz": policy.band_6ghz,
+                                    "dropped_available": rows_total.saturating_sub(filtered_rows.len()),
+                                    "dropped_candidates": candidates_total.saturating_sub(filtered_candidates.len()),
                                 },
                                 "scan_error": scan_error,
                             }),
@@ -4909,6 +5040,13 @@ impl Respondent for NetworkPlugin {
                             );
                         }
                     }
+                    // FlightModeChanged is emitted exclusively by the
+                    // framework's post-dispatch hook on the successful
+                    // networking.link / network.nm.flight_mode.set path
+                    // (single-story bus emission). Do NOT emit a plugin
+                    // PluginEvent duplicate here — that would put two
+                    // happenings on the bus for one operator action and
+                    // wake every subscriber twice.
                     let radio = self.nm_radio_state().await.ok();
                     NmInner::response_json(
                         req,
@@ -5362,6 +5500,21 @@ fn band_from_freq(freq_mhz: Option<u32>) -> BandClass {
         Some(v) if (5000..=5895).contains(&v) => BandClass::Ghz5,
         Some(v) if (5925..=7125).contains(&v) => BandClass::Ghz6,
         _ => BandClass::Unknown,
+    }
+}
+
+/// True when `radio_policy` admits this band. `Unknown` is
+/// always admitted — a scan row whose frequency nmcli could not
+/// report should not be silently dropped; the operator's band
+/// gates are best-effort filters against a rich source, not a
+/// strict allowlist against every scan artefact. Drivers that
+/// omit FREQ (rare) would otherwise render an empty list.
+fn radio_policy_admits_band(policy: &RadioPolicy, band: BandClass) -> bool {
+    match band {
+        BandClass::Ghz2_4 => policy.band_2ghz,
+        BandClass::Ghz5 => policy.band_5ghz,
+        BandClass::Ghz6 => policy.band_6ghz,
+        BandClass::Unknown => true,
     }
 }
 
@@ -6881,6 +7034,8 @@ exit 0\n",
                     signal: 4,
                     security: "wpa2".to_string(),
                     active: true,
+                    freq_mhz: Some(5180),
+                    band: BandClass::Ghz5,
                 }],
                 candidates: vec![WifiStaCandidate {
                     bssid: "AA:BB:CC:DD:EE:FF".to_string(),

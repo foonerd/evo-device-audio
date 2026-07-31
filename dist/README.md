@@ -65,16 +65,16 @@ target host.
   installs at `/etc/sudoers.d/evo-mpd-restart` after
   validating syntax via `visudo -c`.
 - `sudoers.d/evo-network-nm.in` — NOPASSWD sudoers template
-  for the network.nm plugin's privileged binaries. The
-  `EVO_NM_POLL` `Cmnd_Alias` groups the read-side polling
-  argv patterns (NetworkManager connectivity probe, fallback
-  HTTP connectivity probe, Wi-Fi device enumeration,
-  per-interface link state) and suppresses PAM session +
-  sudo invocation journald logging for those argvs via
-  `Defaults!EVO_NM_POLL !pam_session, !syslog`. A broader
-  `/usr/bin/nmcli` grant covers state-changing invocations
-  (connection up/down/add/modify, radio toggling) with full
-  journald audit logging retained.
+  for `org.evoframework.network` (`nmcli` + full `iw` +
+  `rfkill`). The `EVO_NM_POLL` `Cmnd_Alias` groups the
+  read-side polling argv patterns (NetworkManager
+  connectivity probe, Wi-Fi device enumeration, per-interface
+  link state) and suppresses PAM session + sudo invocation
+  journald logging for those argvs via
+  `Defaults!EVO_NM_POLL !pam_session, !syslog`. Broader
+  grants cover state-changing `nmcli`, `iw` (including
+  `ap0` vif lifecycle + `iw reg set`), and `rfkill`
+  (flight-mode multi-family block).
 - `scripts/bootstrap.sh` — idempotent installer that lays
   down all of the above artefacts, resolves the appliance-
   class service user, chowns `/etc/evo/mpd.conf` to that
