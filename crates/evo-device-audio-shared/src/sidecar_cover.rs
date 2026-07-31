@@ -159,9 +159,49 @@ pub fn stable_sorted_child_dir_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Stable-sorted basename of the first audio track at `dir`'s
+/// top level (non-recursive), or `None` when the directory
+/// carries no lofty-recognisable audio file. Powers the
+/// browse-tile cascade's embedded-art tier: an album folder
+/// whose art lives INSIDE the tracks (the common case — Adele /
+/// Phil Collins / most operator libraries) has no sidecar and
+/// no child dirs, but every track carries the same cover in its
+/// tags. The tile emitter routes to
+/// `artwork?scheme=mpd-path&value=<dir>/<first-track>`,
+/// re-using `artwork.local`'s existing per-track extractor
+/// which already delivers the embedded picture. Stable sort so
+/// repeat browses land on the same track and the browse cache
+/// serves an identical URL.
+///
+/// Skips symlinks and hidden files. Returns `None` on I/O
+/// failure so the caller cleanly falls through to the next
+/// cascade tier.
+pub fn first_audio_file_name_in_directory(dir: &Path) -> Option<String> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut names: Vec<String> = read
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let ft = entry.file_type().ok()?;
+            if ft.is_symlink() || !ft.is_file() {
+                return None;
+            }
+            let name = entry.file_name().to_str()?.to_string();
+            if name.starts_with('.') {
+                return None;
+            }
+            if !crate::is_probable_audio_file(&entry.path()) {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    names.sort();
+    names.into_iter().next()
+}
+
 /// True when `dir` has at least one non-symlink, non-hidden
-/// child subdirectory at its top level. The Tier 3 shape
-/// gate — an artist container looks like `Artist/Album1/`,
+/// child subdirectory at its top level. The artist-container
+/// shape gate — an artist container looks like `Artist/Album1/`,
 /// `Artist/Album2/` and always has child directories. A file-
 /// leaf directory (`Artist/Album/track.flac` with no
 /// sub-albums) has none, and correctly falls through to the
@@ -291,5 +331,86 @@ mod tests {
         std::os::unix::fs::symlink(real.path(), dir.path().join("link"))
             .unwrap();
         assert!(!directory_has_child_dirs(dir.path()));
+    }
+
+    #[test]
+    fn first_audio_stable_sorted_by_name() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("02 - Second.flac"), b"").unwrap();
+        std::fs::write(dir.path().join("01 - First.mp3"), b"").unwrap();
+        std::fs::write(dir.path().join("03 - Third.m4a"), b"").unwrap();
+        assert_eq!(
+            first_audio_file_name_in_directory(dir.path()).as_deref(),
+            Some("01 - First.mp3")
+        );
+    }
+
+    #[test]
+    fn first_audio_skips_non_audio_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("cover.jpg"), b"").unwrap();
+        std::fs::write(dir.path().join("liner_notes.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("track.flac"), b"").unwrap();
+        assert_eq!(
+            first_audio_file_name_in_directory(dir.path()).as_deref(),
+            Some("track.flac")
+        );
+    }
+
+    #[test]
+    fn first_audio_none_when_no_audio() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("cover.jpg"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        assert!(first_audio_file_name_in_directory(dir.path()).is_none());
+    }
+
+    #[test]
+    fn first_audio_none_when_only_subdirs() {
+        // Artist-container shape: children are album directories,
+        // no tracks at this level. Embedded-art tier must not
+        // fire — the cascade continues to the child-cover / artist-
+        // name tiers instead.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Album A")).unwrap();
+        std::fs::create_dir(dir.path().join("Album B")).unwrap();
+        assert!(first_audio_file_name_in_directory(dir.path()).is_none());
+    }
+
+    #[test]
+    fn first_audio_none_when_missing_dir() {
+        let missing = std::path::PathBuf::from("/tmp/does-not-exist-4b2c9-y");
+        assert!(first_audio_file_name_in_directory(&missing).is_none());
+    }
+
+    #[test]
+    fn first_audio_skips_hidden_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden.flac"), b"").unwrap();
+        std::fs::write(dir.path().join("visible.flac"), b"").unwrap();
+        assert_eq!(
+            first_audio_file_name_in_directory(dir.path()).as_deref(),
+            Some("visible.flac")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_audio_skips_symlinked_audio() {
+        // Symlinks bypass the library-confinement discipline;
+        // never pick a symlinked track as the representative for
+        // embedded-art extraction.
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let external_flac = external.path().join("outside.flac");
+        std::fs::write(&external_flac, b"").unwrap();
+        std::os::unix::fs::symlink(&external_flac, dir.path().join("aa.flac"))
+            .unwrap();
+        std::fs::write(dir.path().join("zz.flac"), b"").unwrap();
+        assert_eq!(
+            first_audio_file_name_in_directory(dir.path()).as_deref(),
+            Some("zz.flac"),
+            "the alphabetically-first REAL file wins; symlinked audio is skipped"
+        );
     }
 }

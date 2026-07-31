@@ -1987,30 +1987,42 @@ struct RenderCtx<'a> {
     music_directory: &'a std::path::Path,
 }
 
-/// Cascade the browse tile's `cover_url` through three tiers so
-/// container folders (artist folders in particular) render
-/// meaningful art instead of a glyph:
+/// Cascade the browse tile's `cover_url` through four tiers so
+/// every folder shape — album, artist container, empty leaf —
+/// renders meaningful art instead of a glyph:
 ///
 /// 1. **Direct sidecar** — the browsed directory itself carries a
 ///    `cover.jpg` / `folder.jpg` / etc. Emit
 ///    `mpd-directory?value=<self>`; `artwork.local` resolves the
-///    file. Same behaviour as the pre-cascade emission.
-/// 2. **Representative child cover** — the first stable-sorted
-///    child subdirectory whose top level carries a sidecar. Emit
-///    `mpd-directory?value=<self>/<child>` so `artwork.local`
-///    serves the album cover on the artist tile — the operator
-///    sees a real record cover, not a placeholder.
-/// 3. **Artist-name portrait** — when the directory has any
-///    non-hidden child subdirectory (the artist-container shape)
-///    and neither Tier 1 nor Tier 2 hit, emit
+///    file.
+/// 2. **Embedded art of representative track** — the directory
+///    holds audio tracks with no sidecar file. Emit
+///    `mpd-path?value=<self>/<first-track>` and re-use
+///    `artwork.local`'s per-track extractor, which pulls the
+///    embedded picture from the track's tags (the common case
+///    for operator libraries — Adele / Phil Collins / Ed Sheeran
+///    stored art inside the file). Stable-sorted first audio
+///    track wins so repeat browses land on the same URL and the
+///    browse cache stays coherent.
+/// 3. **Representative child cover** — the directory has no
+///    tracks of its own but has child subdirectories whose top
+///    level carries a sidecar or embedded art. Emit
+///    `mpd-directory?value=<self>/<first-child-with-cover>` so
+///    the artist tile shows an album cover from that artist's
+///    own discography. The child URL re-enters this cascade at
+///    the resolver, so a child whose art is embedded also
+///    surfaces here.
+/// 4. **Artist-name portrait** — when the directory has child
+///    subdirectories but none of them yielded a cover, and the
+///    directory has no tracks of its own, emit
 ///    `artist-name?value=<basename>`. The framework's artwork
 ///    cascade routes `artist-name` to `artwork.online`'s artist
 ///    verb; TheAudioDB / Deezer / volumio_meta by name deliver a
 ///    portrait when the MusicBrainz reconcile misses.
-/// 4. **Fallback** — emit the Tier 1 URL. The resolver returns
-///    `not_found` and the tile renders the honest glyph — better
-///    than fabricating art or firing an artist-name lookup on a
-///    directory shaped like a file-leaf (no children).
+/// 5. **Fallback** — emit the Tier 1 URL. The resolver returns
+///    `not_found` and the tile renders the honest glyph. Only
+///    reached for a leaf directory with no tracks, no sidecar,
+///    and no children.
 ///
 /// The picked URL is stored on the rendered entry which
 /// [`browse_library`] caches in `browse_cache` — repeat browses
@@ -2028,6 +2040,21 @@ fn pick_directory_cover_url(
         return evo_device_audio_shared::artwork_target_url_sized(
             "mpd-directory",
             mpd_relative_path,
+            Some("small"),
+        );
+    }
+
+    if let Some(track_name) =
+        sidecar_cover::first_audio_file_name_in_directory(&abs_dir)
+    {
+        let track_relative = if mpd_relative_path.is_empty() {
+            track_name
+        } else {
+            format!("{mpd_relative_path}/{track_name}")
+        };
+        return evo_device_audio_shared::artwork_target_url_sized(
+            "mpd-path",
+            &track_relative,
             Some("small"),
         );
     }
@@ -2965,20 +2992,28 @@ mod tests {
     // function itself.
 
     // -----------------------------------------------------------
-    // Tile-cascade tests — `pick_directory_cover_url`. Cover the
-    // four terminal states of the container-folder cascade so a
-    // future contributor cannot silently drop a tier.
+    // Tile-cascade tests — `pick_directory_cover_url`. Cover
+    // every terminal state of the folder cascade so a future
+    // contributor cannot silently drop a tier. Tier order:
+    //
+    //   1. sidecar in this dir
+    //   2. embedded art of representative track in this dir
+    //   3. sidecar cover in first stable-sorted child dir
+    //   4. artist-name portrait (basename)
+    //   5. fallback → honest glyph
     // -----------------------------------------------------------
 
     #[test]
     fn tier1_self_cover_wins_when_direct_sidecar_present() {
-        // Direct art at the browsed directory itself wins — the
-        // URL points at the directory the operator clicked.
+        // Direct art at the browsed directory itself wins over
+        // every later tier — the URL points at the directory
+        // the operator clicked.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("The Beatles");
         std::fs::create_dir_all(&artist_dir).unwrap();
         std::fs::write(artist_dir.join("cover.jpg"), b"x").unwrap();
+        std::fs::write(artist_dir.join("01 track.flac"), b"").unwrap();
         let url = pick_directory_cover_url("The Beatles", music_dir);
         assert!(
             url.contains("scheme=mpd-directory"),
@@ -2989,17 +3024,71 @@ mod tests {
             "Tier 1 URL must point at the browsed directory itself, got {url}"
         );
         assert!(
-            !url.contains("scheme=artist-name"),
-            "Tier 1 must not fall through to artist-name, got {url}"
+            !url.contains("scheme=mpd-path"),
+            "Tier 1 must beat embedded-art (mpd-path) when a sidecar exists, \
+             got {url}"
         );
     }
 
     #[test]
-    fn tier2_representative_child_cover_when_no_self_cover() {
-        // No direct art on the artist folder, but Abbey Road
-        // (child album) carries `cover.jpg`. Emit the child's
-        // mpd-directory URL so the artist tile shows an actual
-        // record cover.
+    fn tier2_embedded_art_track_when_no_sidecar_but_audio_present() {
+        // Album folder with tracks and no sidecar — the common
+        // case for operator libraries where art is embedded in
+        // the tags. Emit `mpd-path?value=<self>/<first-track>`
+        // and re-use artwork.local's per-track extractor.
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let album_dir = music_dir.join("Adele").join("21");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("02 - Rumour Has It.flac"), b"").unwrap();
+        std::fs::write(album_dir.join("01 - Rolling in the Deep.flac"), b"")
+            .unwrap();
+        let url = pick_directory_cover_url("Adele/21", music_dir);
+        assert!(
+            url.contains("scheme=mpd-path"),
+            "Tier 2 must emit mpd-path scheme so artwork.local's \
+             per-track extractor runs, got {url}"
+        );
+        assert!(
+            url.contains("Adele%2F21%2F01%20-%20Rolling%20in%20the%20Deep.flac"),
+            "Tier 2 must point at the stable-sorted first audio track \
+             (basename lexicographic — '01' before '02'), got {url}"
+        );
+    }
+
+    #[test]
+    fn tier2_beats_child_cover_when_directory_has_audio() {
+        // A directory that has BOTH audio tracks and a child
+        // subdirectory with a sidecar cover: Tier 2 (embedded)
+        // wins because the tracks describe this directory itself
+        // (album folder with a bonus-tracks child, hi-res
+        // variants, etc.). The child cover speaks for the child,
+        // not for this folder.
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let album_dir = music_dir.join("Album");
+        let bonus = album_dir.join("Bonus");
+        std::fs::create_dir_all(&bonus).unwrap();
+        std::fs::write(album_dir.join("01 track.flac"), b"").unwrap();
+        std::fs::write(bonus.join("cover.jpg"), b"bonus").unwrap();
+        let url = pick_directory_cover_url("Album", music_dir);
+        assert!(
+            url.contains("scheme=mpd-path"),
+            "Tier 2 wins over Tier 3 when the directory owns tracks, \
+             got {url}"
+        );
+        assert!(
+            !url.contains("Bonus"),
+            "picked URL must not point at the child directory, got {url}"
+        );
+    }
+
+    #[test]
+    fn tier3_representative_child_cover_when_no_self_cover_no_tracks() {
+        // Artist folder with no direct art AND no tracks, but
+        // Abbey Road (child album) carries `cover.jpg`. Emit
+        // the child's mpd-directory URL so the artist tile
+        // shows an actual record cover.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("The Beatles");
@@ -3011,17 +3100,17 @@ mod tests {
         let url = pick_directory_cover_url("The Beatles", music_dir);
         assert!(
             url.contains("scheme=mpd-directory"),
-            "Tier 2 must emit mpd-directory scheme, got {url}"
+            "Tier 3 must emit mpd-directory scheme, got {url}"
         );
         assert!(
             url.contains("Abbey%20Road"),
-            "Tier 2 must point at the child directory carrying the cover, \
+            "Tier 3 must point at the child directory carrying the cover, \
              got {url}"
         );
     }
 
     #[test]
-    fn tier2_stable_sort_picks_alphabetically_first_child() {
+    fn tier3_stable_sort_picks_alphabetically_first_child() {
         // Two children both have covers; alphabetically-first
         // wins. Guarantees the same URL across repeat browses
         // so `browse_cache` serves consistent art.
@@ -3042,11 +3131,12 @@ mod tests {
     }
 
     #[test]
-    fn tier3_artist_name_portrait_when_children_have_no_covers() {
+    fn tier4_artist_name_portrait_when_children_have_no_covers() {
         // Artist folder has child album subdirectories but none
-        // carry sidecar covers. Route to `artist-name` scheme
-        // so `artwork.online`'s artist cascade delivers a
-        // portrait via TheAudioDB / Deezer / volumio_meta.
+        // carry any cover (sidecar or otherwise resolvable). No
+        // tracks at the artist level either. Route to
+        // `artist-name` so `artwork.online`'s artist cascade
+        // delivers a portrait.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("Radiohead");
@@ -3055,18 +3145,18 @@ mod tests {
         let url = pick_directory_cover_url("Radiohead", music_dir);
         assert!(
             url.contains("scheme=artist-name"),
-            "Tier 3 must emit artist-name scheme, got {url}"
+            "Tier 4 must emit artist-name scheme, got {url}"
         );
         assert!(
             url.contains("Radiohead"),
-            "Tier 3 must carry the directory basename as artist name, \
+            "Tier 4 must carry the directory basename as artist name, \
              got {url}"
         );
     }
 
     #[test]
-    fn tier3_uses_basename_not_full_path() {
-        // For a nested container `Rock/Radiohead`, Tier 3 must
+    fn tier4_uses_basename_not_full_path() {
+        // For a nested container `Rock/Radiohead`, Tier 4 must
         // carry the basename `Radiohead`, not the full path.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
@@ -3075,30 +3165,27 @@ mod tests {
         let url = pick_directory_cover_url("Rock/Radiohead", music_dir);
         assert!(
             url.contains("scheme=artist-name"),
-            "nested container should still trigger Tier 3, got {url}"
+            "nested container should still trigger Tier 4, got {url}"
         );
         assert!(
             url.contains("value=Radiohead"),
-            "Tier 3 must use basename, not full path, got {url}"
+            "Tier 4 must use basename, not full path, got {url}"
         );
     }
 
     #[test]
-    fn fallback_when_no_children_and_no_direct_cover() {
-        // Directory with no direct art AND no child dirs — a
-        // file-leaf album folder whose sidecar was misnamed, or
-        // an empty folder. Emit the Tier 1 URL and let the
+    fn fallback_when_no_tracks_no_children_no_cover() {
+        // Empty leaf directory — no sidecar, no audio, no
+        // children. Fall back to Tier 1 URL and let the
         // resolver return `not_found` for the honest glyph.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let empty = music_dir.join("Empty Album");
         std::fs::create_dir_all(&empty).unwrap();
-        std::fs::write(empty.join("track1.flac"), b"").unwrap();
         let url = pick_directory_cover_url("Empty Album", music_dir);
         assert!(
             url.contains("scheme=mpd-directory"),
-            "fallback must emit mpd-directory (not artist-name — no children \
-             is not artist-container shape), got {url}"
+            "fallback must emit mpd-directory, got {url}"
         );
         assert!(
             url.contains("Empty%20Album"),
@@ -3106,8 +3193,13 @@ mod tests {
         );
         assert!(
             !url.contains("scheme=artist-name"),
-            "fallback must NOT fire artist-name for file-leaf directories, \
-             got {url}"
+            "fallback must NOT fire artist-name for a folder with no \
+             children, got {url}"
+        );
+        assert!(
+            !url.contains("scheme=mpd-path"),
+            "fallback must NOT fire embedded-art for a folder with no \
+             tracks, got {url}"
         );
     }
 
