@@ -67,21 +67,37 @@ request_types = [
 ]
 response_budget_ms = 15000
 
-# Per-verb capability gate declarations. Read-only verbs — status
-# / intent.get / wifi_devices / supervisor.status /
-# refresh_connectivity / scan — default to anonymous-OK. Scan
-# reconfigures nothing; every prior-art peer (NetworkManager's
-# `nmcli device wifi list`, iOS, Android, classic Volumio) lists
-# networks without elevation. Write-class verbs (intent.set /
-# captive.*) gate write:network_admin. Apply-class verbs
-# (intent.apply / security.harden / flight_mode.set / radio.set)
-# gate step_up:network_admin.
+# Per-verb capability gate declarations.
+#
+# Read-only verbs — status / intent.get / wifi_devices /
+# supervisor.status / refresh_connectivity / scan /
+# flight_mode.get / radio.status / captive.status — default to
+# anonymous-OK. Every prior-art peer (NetworkManager's
+# `nmcli device wifi list`, iOS, Android, classic Volumio)
+# lists networks without elevation; discovery reconfigures
+# nothing.
+#
+# Write-class verbs — the paired-operator connect path.
+# `intent.set` / `intent.apply` (join a network) and
+# `captive.start` / `captive.submit` / `captive.complete` (walk
+# the portal on a network already being joined) gate at
+# `write:network_admin`. Connecting to Wi-Fi is the most basic
+# network operation on every consumer device; no peer forces a
+# fresh admin re-auth on every join. A paired operator holds
+# `write` continuously; anonymous sessions lack it and are
+# refused.
+#
+# Step-up verbs — destructive posture changes that DO warrant
+# a fresh operator-presence proof: `flight_mode.set` (kills
+# every wireless family device-wide), `radio.set` (per-family
+# radio kill), `security.harden` (rewrites secret-at-rest
+# configuration).
 [capabilities.respondent.verb_capabilities]
 "network.nm.intent.set" = { kind = "write", scope = "network_admin" }
+"network.nm.intent.apply" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.start" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
-"network.nm.intent.apply" = { kind = "step_up", scope = "network_admin" }
 "network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
 "network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
 "network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }

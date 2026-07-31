@@ -75,22 +75,40 @@ response_budget_ms = 15000
 # prior-art peer (NetworkManager's `nmcli device wifi list`,
 # iOS, Android, classic Volumio) lists networks without
 # elevation; only join / apply / change is privileged.
-# Write-class verbs (intent.set / captive.*) record operator
-# intent or submit credentials; they gate at write:network_admin.
-# Apply-class verbs (intent.apply / security.harden /
-# flight_mode.set / radio.set) reconfigure the host's network
-# state or change radio posture; they gate at step_up:
-# network_admin so the operator must hold an active step-up auth
-# session for the change to proceed. The narrow nmcli + iw +
-# rfkill sudoers grants remain in place as the OS-layer
-# enforcement; the framework gate is the first line of defence,
-# the sudoers grant is the last.
+# Write-class verbs — the paired-operator connect path.
+# `intent.set` (record profile), `intent.apply` (join the
+# network), `captive.start` / `captive.submit` /
+# `captive.complete` (walk the portal on a network already
+# being joined) all gate at `write:network_admin`. Connecting
+# to a Wi-Fi network is the most basic network operation on
+# every consumer device; no prior-art peer (iOS, Android,
+# macOS, classic Volumio) forces a fresh admin re-auth on
+# every join. A paired operator holds `write` continuously
+# from pairing; an unpaired / anonymous session lacks `write`
+# and is refused by this gate.
+#
+# Step-up verbs — destructive posture changes that DO warrant
+# a fresh operator-presence proof: `flight_mode.set` (kills
+# every wireless family device-wide), `radio.set` (per-family
+# radio kill), `security.harden` (rewrites secret-at-rest
+# configuration). These pop the operator-password card by
+# design.
+#
+# Read-only verbs — `status`, `intent.get`, `wifi_devices`,
+# `supervisor.status`, `refresh_connectivity`, `scan`,
+# `flight_mode.get`, `radio.status`, `captive.status` — remain
+# unmapped and default to anonymous-OK per the framework's
+# backwards-compatible baseline.
+#
+# The narrow nmcli + iw + rfkill sudoers grants remain in
+# place as the OS-layer enforcement; the framework gate is the
+# first line of defence, the sudoers grant is the last.
 [capabilities.respondent.verb_capabilities]
 "network.nm.intent.set" = { kind = "write", scope = "network_admin" }
+"network.nm.intent.apply" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.start" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
-"network.nm.intent.apply" = { kind = "step_up", scope = "network_admin" }
 "network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
 "network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
 "network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
