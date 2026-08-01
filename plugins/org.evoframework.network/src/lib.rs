@@ -112,6 +112,40 @@ const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
 /// operator's mental model of "drop the link and don't
 /// silently rejoin". Gated at `write:network_admin`.
 const REQUEST_NETWORK_WIFI_DISCONNECT: &str = "network.nm.wifi.disconnect";
+
+/// Open an operator-facing captive-portal session that the
+/// framework's `attach_captive_session_endpoint` serves at a
+/// same-origin URL. The plugin allocates a `session_id`,
+/// records the current portal's `upstream_host` +
+/// `initial_path` + `initial_query`, initialises a fresh
+/// cookie jar keyed by `session_id`, and returns the
+/// framework-hosted `session_url` the UI iframes on the
+/// management plane. All portal HTTP travels wlan0-bound
+/// through the `evo-captive-probe` wrapper — the remote
+/// operator's browser never touches the venue.
+/// Gated `write:network_admin` (paired-operator connect path).
+const REQUEST_NETWORK_CAPTIVE_SESSION_START: &str =
+    "network.nm.captive.session.start";
+/// Framework-called upstream fetch on an open captive
+/// session. Body payload names `session_id`, HTTP method,
+/// path/query, request headers, request body_b64. Plugin
+/// resolves `upstream_host + path?query`, adds the jar's
+/// current `Cookie` header, invokes the wrapper's
+/// `proxy-fetch` mode, parses response headers (updating the
+/// jar from any `Set-Cookie`), and returns
+/// `{ http_status, http_status_text, headers, body_b64,
+///   upstream_host }`. Gated `write:network_admin` — the
+/// framework's endpoint carries the paired-operator bearer
+/// through to this dispatch.
+const REQUEST_NETWORK_CAPTIVE_UPSTREAM_FETCH: &str =
+    "network.nm.captive.upstream.fetch";
+/// Explicit close for an operator-facing captive session.
+/// Drops the jar for `session_id`, re-runs `captive_detect`
+/// (still wlan0-bound), and returns the fresh reachability
+/// verdict so the UI can flip its state without a follow-up
+/// status poll. Gated `write:network_admin`.
+const REQUEST_NETWORK_CAPTIVE_SESSION_CLOSE: &str =
+    "network.nm.captive.session.close";
 /// Read-side wire-op (no admin scope). Returns the freshly-
 /// published `networking.link.connectivity` subject value. When
 /// the plugin's `probe_kind` is `off` (the default), the
@@ -1223,6 +1257,52 @@ async fn run_command_output_with_timeout(
     }
 }
 
+/// Run `cmd` with `stdin_bytes` written to the child's stdin
+/// then EOF (child sees EOF once every byte has been written).
+/// Wraps the whole spawn + write + collect + wait cycle in the
+/// timeout; on timeout the child is dropped so tokio kills it.
+///
+/// Used by the captive proxy upstream fetch to hand the
+/// operator's request body to the `evo-captive-probe` wrapper
+/// (`--body-stdin` mode). Output is captured on stdout /
+/// stderr like the standard variant.
+async fn run_command_stdin_with_timeout(
+    mut cmd: Command,
+    stdin_bytes: Vec<u8>,
+    timeout_ms: u64,
+    label: &str,
+) -> Result<std::process::Output, PluginError> {
+    use tokio::io::AsyncWriteExt;
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        PluginError::Transient(format!("spawn {label} failed: {e}"))
+    })?;
+    if !stdin_bytes.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&stdin_bytes).await.map_err(|e| {
+                PluginError::Transient(format!(
+                    "write stdin to {label} failed: {e}"
+                ))
+            })?;
+            drop(stdin);
+        }
+    } else {
+        drop(child.stdin.take());
+    }
+    let fut = child.wait_with_output();
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
+        Ok(v) => v.map_err(|e| {
+            PluginError::Transient(format!("wait {label} failed: {e}"))
+        }),
+        Err(_) => Err(PluginError::Transient(format!(
+            "{label} timed out after {}ms",
+            timeout_ms
+        ))),
+    }
+}
+
 /// Universal per-interface device row surfaced on
 /// `network.nm.status.devices[]`. Covers every kind
 /// NetworkManager can enumerate — ethernet, wifi (STA + AP
@@ -1601,6 +1681,135 @@ impl Default for CaptiveStateEnvelope {
             state: CaptiveSessionState::default(),
         }
     }
+}
+
+/// One open operator-facing captive-portal session. Persisted
+/// on-disk (`captive-sessions.json`) so the framework
+/// endpoint's byte-substitution + upstream fetch survive a
+/// steward or plugin restart without dropping the operator's
+/// portal flow mid-authentication.
+///
+/// * `session_id` — 128-bit id, formatted as 32-char lowercase
+///   hex. Framework returns this in `session_url` and passes
+///   it back to the plugin on every upstream.fetch. Unguessable
+///   under `getrandom` so a rogue LAN client cannot hijack an
+///   open session by URL enumeration.
+/// * `upstream_host` — scheme + authority (e.g.
+///   `http://172.30.0.1:8880`), NO trailing slash. This is the
+///   byte-substitution needle: framework rewrites every
+///   occurrence in `Location`, HTML, CSS to
+///   `/api/v1/network/captive/session/{session_id}` so absolute
+///   URLs in portal content resolve back through the proxy
+///   instead of leaving via the operator's browser network
+///   directly (which would fail — the operator's browser is
+///   on the management LAN, not the captive segment).
+/// * `initial_path` + `initial_query` — the exact portal-side
+///   path and query the redirect-detect probe surfaced. The
+///   framework composes `session_url =
+///   /api/v1/network/captive/session/{sid}{initial_path}?{initial_query}`
+///   so the iframe's first navigation lands where the venue
+///   wants (many portals encode the operator's MAC + AP BSSID
+///   in the query on the initial redirect target).
+/// * `cookies` — jar keyed by cookie name. Simple `name=value`
+///   pairs; attribute handling (`Domain`, `Path`, `Expires`,
+///   `HttpOnly`) is deliberately omitted at this shape — the
+///   jar is per-session, per-portal, and lives only for the
+///   session's TTL. The framework strips upstream `Set-Cookie`
+///   from client-facing responses (plugin owns the jar, so
+///   the browser never needs to see cookies); the plugin
+///   updates the jar from response `Set-Cookie` on every
+///   upstream.fetch.
+/// * `created_at_epoch` / `expires_at_epoch` — TTL. Default
+///   30 minutes; expired sessions are pruned lazily on next
+///   read + eagerly on session.close.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CaptiveSession {
+    session_id: String,
+    upstream_host: String,
+    initial_path: String,
+    #[serde(default)]
+    initial_query: String,
+    #[serde(default)]
+    cookies: std::collections::BTreeMap<String, String>,
+    created_at_epoch: u64,
+    expires_at_epoch: u64,
+}
+
+const CAPTIVE_SESSION_TTL_SEC: u64 = 30 * 60;
+
+fn default_captive_sessions_schema_version() -> u32 {
+    1
+}
+
+/// On-disk envelope for the captive-session jar collection.
+/// LKG-mirrored + atomic-rename-persisted alongside
+/// `captive-session.json`; a plugin restart or steward reload
+/// mid-authentication does not orphan an operator's iframe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptiveSessionsEnvelope {
+    #[serde(default = "default_captive_sessions_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    sessions: Vec<CaptiveSession>,
+}
+
+impl Default for CaptiveSessionsEnvelope {
+    fn default() -> Self {
+        Self {
+            schema_version: default_captive_sessions_schema_version(),
+            sessions: Vec::new(),
+        }
+    }
+}
+
+/// Wire request payload for `network.nm.captive.session.start`.
+/// Empty body today; kept explicit so a future
+/// `preferred_ttl_sec` or similar is a `#[serde(default)]`
+/// field-add, not a shape-break.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CaptiveSessionStartRequest {}
+
+/// Wire request payload for `network.nm.captive.upstream.fetch`.
+/// The framework's HTTP endpoint composes this from the
+/// operator's browser request and dispatches it through the
+/// existing `request` wire-op path.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptiveUpstreamFetchRequest {
+    session_id: String,
+    method: String,
+    /// Path portion of the browser's URL relative to
+    /// `session_url` root — leading `/` is optional, plugin
+    /// normalises. E.g. `/guest/s/default/static/js/main.js`.
+    #[serde(default)]
+    path: String,
+    /// Query string without the leading `?`. Empty when the
+    /// browser request carried no query.
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    headers: Vec<HttpHeaderPair>,
+    /// Base64-encoded request body. Empty on GET/HEAD/DELETE
+    /// without a body; framework encodes whatever bytes the
+    /// browser sent.
+    #[serde(default)]
+    body_b64: String,
+}
+
+/// Wire request payload for `network.nm.captive.session.close`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptiveSessionCloseRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpHeaderPair {
+    name: String,
+    value: String,
 }
 
 /// Wire-op body for `network.nm.radio.set`. UI writes
@@ -2260,6 +2469,69 @@ impl NmInner {
         self.write_text_atomic_with_lkg(&path, &raw).await
     }
 
+    fn captive_sessions_path(&self) -> Result<PathBuf, PluginError> {
+        Ok(self.ensure_state_dir()?.join("captive-sessions.json"))
+    }
+
+    /// Load the persisted operator-facing captive-session
+    /// jar collection. Missing file → empty list; malformed
+    /// primary → LKG shadow fallback; malformed both → empty
+    /// list + warn (same discipline as `load_captive_state`).
+    /// Expired sessions are pruned lazily on every load so a
+    /// long-idle plugin does not accumulate stale jars.
+    async fn load_captive_sessions(
+        &self,
+    ) -> Result<Vec<CaptiveSession>, PluginError> {
+        let path = self.captive_sessions_path()?;
+        let lkg = lkg_shadow_path(&path);
+        let parse = |raw: &str| -> Result<Vec<CaptiveSession>, String> {
+            let env: CaptiveSessionsEnvelope = serde_json::from_str(raw)
+                .map_err(|e| format!("json parse: {e}"))?;
+            Ok(env.sessions)
+        };
+        let mut sessions =
+            if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                match parse(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            path = %path.display(),
+                            error = %e,
+                            "invalid captive-sessions file; trying LKG shadow"
+                        );
+                        if let Ok(raw) = tokio::fs::read_to_string(&lkg).await {
+                            parse(&raw).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+        let now = unix_epoch_seconds();
+        sessions.retain(|s| s.expires_at_epoch > now);
+        Ok(sessions)
+    }
+
+    async fn save_captive_sessions(
+        &self,
+        sessions: &[CaptiveSession],
+    ) -> Result<(), PluginError> {
+        let path = self.captive_sessions_path()?;
+        let envelope = CaptiveSessionsEnvelope {
+            schema_version: default_captive_sessions_schema_version(),
+            sessions: sessions.to_vec(),
+        };
+        let raw = serde_json::to_string_pretty(&envelope).map_err(|e| {
+            PluginError::Permanent(format!(
+                "captive-sessions serialization failed: {e}"
+            ))
+        })?;
+        self.write_text_atomic_with_lkg(&path, &raw).await
+    }
+
     /// Persist `flight_mode` to the unified intent. Equivalent to
     /// loading the intent, updating `radio_policy.flight_mode`, and
     /// saving — kept as a single call site so handlers do not race
@@ -2451,6 +2723,68 @@ impl NmInner {
     /// "k=v"` internally so no operator-supplied string ever
     /// reaches curl as a flag. Returns
     /// `(http_code, effective_url)` after redirect follow.
+    /// Dispatch a wlan0-bound HTTP request via the
+    /// `evo-captive-probe` wrapper's `proxy-fetch` mode.
+    /// Returns the parsed response `(status, reason, headers,
+    /// body)`. The request body — if any — is fed to the
+    /// wrapper on stdin via `--body-stdin`; the framework
+    /// captive endpoint hands the operator's browser body
+    /// through the plugin dispatch verbatim (base64-decoded
+    /// before this call).
+    ///
+    /// `-L` is intentionally omitted in the wrapper so
+    /// upstream redirects surface as 3xx + `Location` to the
+    /// caller; the framework endpoint rewrites `Location`
+    /// into a same-origin session-prefixed URL so the
+    /// operator's browser follows through the proxy.
+    async fn captive_upstream_fetch_bound(
+        &self,
+        ifname: &str,
+        method: &str,
+        url: &str,
+        headers: &[HttpHeaderPair],
+        body: Vec<u8>,
+    ) -> Result<(u16, String, Vec<HttpHeaderPair>, Vec<u8>), PluginError> {
+        // The proxy-fetch mode's argv shape differs from the
+        // three-positional convention captive_probe_command
+        // encodes: method sits BEFORE the URL, and the optional
+        // `--body-stdin` flag precedes the trailing name/value
+        // header pairs. Rebuild the argv inline rather than
+        // mutating captive_probe_command (which continues to
+        // serve the four legacy modes verbatim).
+        let has_body = !body.is_empty();
+        let needs_sudo = nmcli_dispatch::process_needs_sudo();
+        let mut cmd = if needs_sudo {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg(&self.config.captive_probe_path);
+            c
+        } else {
+            Command::new(&self.config.captive_probe_path)
+        };
+        cmd.arg(ifname).arg("proxy-fetch").arg(method).arg(url);
+        if has_body {
+            cmd.arg("--body-stdin");
+        }
+        for h in headers {
+            cmd.arg(&h.name).arg(&h.value);
+        }
+        let out = run_command_stdin_with_timeout(
+            cmd,
+            body,
+            self.config.curl_timeout_ms,
+            "captive proxy-fetch",
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(PluginError::Transient(format!(
+                "captive proxy-fetch failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        parse_proxy_fetch_response(&out.stdout)
+    }
+
     async fn captive_submit_bound(
         &self,
         ifname: &str,
@@ -5490,6 +5824,9 @@ impl Plugin for NetworkPlugin {
                         REQUEST_NETWORK_CAPTIVE_START.to_string(),
                         REQUEST_NETWORK_CAPTIVE_SUBMIT.to_string(),
                         REQUEST_NETWORK_CAPTIVE_COMPLETE.to_string(),
+                        REQUEST_NETWORK_CAPTIVE_SESSION_START.to_string(),
+                        REQUEST_NETWORK_CAPTIVE_UPSTREAM_FETCH.to_string(),
+                        REQUEST_NETWORK_CAPTIVE_SESSION_CLOSE.to_string(),
                         REQUEST_NETWORK_SECURITY_STATUS.to_string(),
                         REQUEST_NETWORK_SECURITY_HARDEN.to_string(),
                         REQUEST_NETWORK_FLIGHT_MODE_GET.to_string(),
@@ -6160,6 +6497,224 @@ impl Respondent for NetworkPlugin {
                         }
                     })))
                 }
+                REQUEST_NETWORK_CAPTIVE_SESSION_START => {
+                    let _body = if req.payload.is_empty() {
+                        CaptiveSessionStartRequest::default()
+                    } else {
+                        NmInner::parse_request_json::<CaptiveSessionStartRequest>(
+                            req,
+                        )?
+                    };
+                    // Portal must be currently detected — need a
+                    // portal_url the operator-facing session
+                    // targets.
+                    let cur = self.load_captive_state().await?;
+                    let portal_url = cur
+                        .user_portal_url
+                        .as_deref()
+                        .or(cur.portal_url.as_deref())
+                        .unwrap_or("");
+                    if portal_url.is_empty() {
+                        return Err(PluginError::Permanent(
+                            "no captive portal currently detected — call \
+                             network.nm.captive.status first"
+                                .to_string(),
+                        ));
+                    }
+                    let (upstream_host, initial_path, initial_query) =
+                        parse_portal_url(portal_url).ok_or_else(|| {
+                            PluginError::Permanent(format!(
+                                "portal URL not parseable: {portal_url}"
+                            ))
+                        })?;
+                    let session_id = generate_captive_session_id()?;
+                    let now = unix_epoch_seconds();
+                    let session = CaptiveSession {
+                        session_id: session_id.clone(),
+                        upstream_host: upstream_host.clone(),
+                        initial_path: initial_path.clone(),
+                        initial_query: initial_query.clone(),
+                        cookies: std::collections::BTreeMap::new(),
+                        created_at_epoch: now,
+                        expires_at_epoch: now
+                            .saturating_add(CAPTIVE_SESSION_TTL_SEC),
+                    };
+                    let mut sessions = self.load_captive_sessions().await?;
+                    sessions.push(session);
+                    self.save_captive_sessions(&sessions).await?;
+                    let session_url = compose_session_url(
+                        &session_id,
+                        &initial_path,
+                        &initial_query,
+                    );
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "session_id": session_id,
+                                "session_url": session_url,
+                                "upstream_host": upstream_host,
+                                "initial_path": initial_path,
+                                "initial_query": initial_query,
+                                "expires_at_epoch":
+                                    now + CAPTIVE_SESSION_TTL_SEC,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_CAPTIVE_UPSTREAM_FETCH => {
+                    let body = NmInner::parse_request_json::<
+                        CaptiveUpstreamFetchRequest,
+                    >(req)?;
+                    let mut sessions = self.load_captive_sessions().await?;
+                    let session_idx = sessions
+                        .iter()
+                        .position(|s| s.session_id == body.session_id)
+                        .ok_or_else(|| {
+                            PluginError::Permanent(format!(
+                                "captive session not found: {}",
+                                body.session_id
+                            ))
+                        })?;
+                    let upstream_host =
+                        sessions[session_idx].upstream_host.clone();
+                    // Compose upstream URL. `path` is relative
+                    // to session root; leading `/` is optional.
+                    let path_norm = if body.path.starts_with('/') {
+                        body.path.clone()
+                    } else {
+                        format!("/{}", body.path)
+                    };
+                    let url = if body.query.is_empty() {
+                        format!("{upstream_host}{path_norm}")
+                    } else {
+                        format!("{upstream_host}{path_norm}?{}", body.query)
+                    };
+                    // Build request-header list: caller's
+                    // headers PLUS a Cookie header assembled
+                    // from the jar (if any). Any caller-supplied
+                    // Cookie is preserved as the primary source
+                    // (browsers do not normally send cookies
+                    // through the proxy — the plugin's jar is
+                    // the authoritative source — but respect
+                    // an explicit override rather than mutate it).
+                    let mut req_headers: Vec<HttpHeaderPair> =
+                        body.headers.clone();
+                    let has_caller_cookie = req_headers
+                        .iter()
+                        .any(|h| h.name.eq_ignore_ascii_case("cookie"));
+                    if !has_caller_cookie {
+                        if let Some(v) = compose_cookie_header(
+                            &sessions[session_idx].cookies,
+                        ) {
+                            req_headers.push(HttpHeaderPair {
+                                name: "Cookie".to_string(),
+                                value: v,
+                            });
+                        }
+                    }
+                    let request_body = if body.body_b64.is_empty() {
+                        Vec::new()
+                    } else {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(body.body_b64.as_bytes())
+                            .map_err(|e| {
+                                PluginError::Permanent(format!(
+                                    "captive upstream body_b64 decode failed: {e}"
+                                ))
+                            })?
+                    };
+                    let ifname =
+                        self.config.default_wifi_iface.trim().to_string();
+                    if ifname.is_empty() {
+                        return Err(PluginError::Permanent(
+                            "captive upstream fetch requires \
+                             default_wifi_iface to be set"
+                                .to_string(),
+                        ));
+                    }
+                    let method = body.method.trim().to_ascii_uppercase();
+                    let (status, reason, response_headers, response_body) =
+                        self.captive_upstream_fetch_bound(
+                            &ifname,
+                            &method,
+                            &url,
+                            &req_headers,
+                            request_body,
+                        )
+                        .await?;
+                    // Update jar from any Set-Cookie response
+                    // headers. Multiple Set-Cookie headers are
+                    // allowed on one response; treat each
+                    // separately.
+                    for h in &response_headers {
+                        if h.name.eq_ignore_ascii_case("set-cookie") {
+                            if let Some((n, v)) =
+                                parse_set_cookie_pair(&h.value)
+                            {
+                                sessions[session_idx].cookies.insert(n, v);
+                            }
+                        }
+                    }
+                    self.save_captive_sessions(&sessions).await?;
+                    use base64::Engine as _;
+                    let body_b64 = base64::engine::general_purpose::STANDARD
+                        .encode(&response_body);
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "http_status": status,
+                                "http_status_text": reason,
+                                "headers": response_headers,
+                                "body_b64": body_b64,
+                                "upstream_host": upstream_host,
+                                "session_id": body.session_id,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_CAPTIVE_SESSION_CLOSE => {
+                    let body = NmInner::parse_request_json::<
+                        CaptiveSessionCloseRequest,
+                    >(req)?;
+                    let mut sessions = self.load_captive_sessions().await?;
+                    let before = sessions.len();
+                    sessions.retain(|s| s.session_id != body.session_id);
+                    let removed = before != sessions.len();
+                    self.save_captive_sessions(&sessions).await?;
+                    // Re-probe reachability so the response
+                    // carries the fresh verdict — UI flips its
+                    // state without a follow-up status poll.
+                    let mut state =
+                        self.load_captive_state().await.unwrap_or_default();
+                    if let Ok(v) = self.captive_detect(None).await {
+                        state = v;
+                        let _ = self.save_captive_state(&state).await;
+                    }
+                    let connectivity =
+                        self.nm_connectivity().await.unwrap_or_default();
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": "ok",
+                                "removed": removed,
+                                "connectivity": connectivity,
+                                "captive": state,
+                            }),
+                        ),
+                    )
+                }
                 REQUEST_NETWORK_SECURITY_STATUS => {
                     let security = self.build_security_status().await?;
                     NmInner::response_json(
@@ -6724,6 +7279,197 @@ fn unix_epoch_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Generate an unguessable 128-bit session id, formatted as
+/// 32-char lowercase hex. Backed by `getrandom` (same source
+/// used for the secret-encryption nonce), so a LAN attacker
+/// cannot enumerate open sessions by URL guessing.
+fn generate_captive_session_id() -> Result<String, PluginError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| {
+        PluginError::Permanent(format!(
+            "captive session id: getrandom failed: {e}"
+        ))
+    })?;
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(out)
+}
+
+/// Split a portal URL like
+/// `http://172.30.0.1:8880/guest/s/default/?ap=xx&id=yy` into
+/// `(upstream_host, initial_path, initial_query)`. The host
+/// portion carries scheme + authority (no trailing slash); the
+/// path is everything from the first `/` after the authority
+/// through the last `/` OR the last non-slash segment; the
+/// query is everything after `?` (empty when absent).
+///
+/// Portal URLs are ordinary http(s) URLs; we parse by hand so
+/// the plugin does not pull in a URL crate for a two-place use
+/// site. Returns `None` on any URL shape we cannot decode
+/// (scheme other than `http:` / `https:`, missing authority) —
+/// the caller then refuses `session.start` with a structured
+/// error so the operator surface says "no captive detected"
+/// instead of silently opening a session against nothing.
+fn parse_portal_url(url: &str) -> Option<(String, String, String)> {
+    let (scheme_end, scheme) = if url.starts_with("http://") {
+        (7usize, "http://")
+    } else if url.starts_with("https://") {
+        (8usize, "https://")
+    } else {
+        return None;
+    };
+    let after_scheme = &url[scheme_end..];
+    // authority ends at the first `/`, `?`, or end-of-string.
+    let authority_end =
+        after_scheme.find(['/', '?']).unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let rest = &after_scheme[authority_end..];
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (rest, ""),
+    };
+    let path = if path.is_empty() { "/" } else { path };
+    Some((
+        format!("{scheme}{authority}"),
+        path.to_string(),
+        query.to_string(),
+    ))
+}
+
+/// Compose the framework-hosted `session_url` the plugin
+/// returns to the UI. The framework's endpoint is mounted at
+/// `/api/v1/network/captive/session/{sid}`; the browser
+/// resolves relative URLs in portal content against this base,
+/// so the initial portal path + query MUST be preserved
+/// verbatim (portals encode operator AP BSSID / device MAC /
+/// timestamp in the initial query; stripping the query
+/// breaks admission).
+fn compose_session_url(
+    session_id: &str,
+    initial_path: &str,
+    initial_query: &str,
+) -> String {
+    let base = format!("/api/v1/network/captive/session/{session_id}");
+    let path_part = if initial_path.starts_with('/') {
+        initial_path.to_string()
+    } else {
+        format!("/{initial_path}")
+    };
+    if initial_query.is_empty() {
+        format!("{base}{path_part}")
+    } else {
+        format!("{base}{path_part}?{initial_query}")
+    }
+}
+
+/// Parse a `Set-Cookie` header value's first `name=value` pair.
+/// Attributes (`Domain=…`, `Path=…`, `Expires=…`, `HttpOnly`,
+/// etc.) are intentionally dropped — the plugin's jar lives
+/// per-session, per-portal, only for the session's TTL, so
+/// cookie attribute enforcement is not needed for correctness.
+/// Returns `None` when the header is malformed (no `=`, empty
+/// name, or `Set-Cookie` deletion sentinel).
+fn parse_set_cookie_pair(header_value: &str) -> Option<(String, String)> {
+    let first_segment = header_value.split(';').next()?.trim();
+    let (name, value) = first_segment.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), value.trim().to_string()))
+}
+
+/// Build a `Cookie` request header value from the jar's
+/// `name=value` map. Sort by name so the header is stable
+/// across calls (aids caching + debugging); portals do not
+/// care about order.
+fn compose_cookie_header(
+    jar: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if jar.is_empty() {
+        return None;
+    }
+    let mut pairs: Vec<String> =
+        jar.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    Some(pairs.join("; "))
+}
+
+/// Parse the wrapper `proxy-fetch` mode's stdout into
+/// `(http_status, http_status_text, headers, body_bytes)`. The
+/// wrapper's curl invocation uses `-D -` + `-o -`, so the byte
+/// layout is:
+///
+///   HTTP/<ver> <status> [<reason>]\r\n
+///   <hname>: <hvalue>\r\n
+///   ...
+///   \r\n
+///   <raw body bytes>
+///
+/// The status line and headers use CRLF line endings (curl
+/// preserves upstream's), the header/body separator is
+/// `\r\n\r\n`. We scan for that separator and split. Returns
+/// an error when the byte stream is not a valid HTTP response
+/// (no status line, no separator) — the operator surface
+/// treats that as an upstream fetch failure.
+fn parse_proxy_fetch_response(
+    bytes: &[u8],
+) -> Result<(u16, String, Vec<HttpHeaderPair>, Vec<u8>), PluginError> {
+    let sep = b"\r\n\r\n";
+    let head_end =
+        bytes
+            .windows(sep.len())
+            .position(|w| w == sep)
+            .ok_or_else(|| {
+                PluginError::Transient(
+                    "proxy-fetch response missing \\r\\n\\r\\n separator"
+                        .to_string(),
+                )
+            })?;
+    let head = &bytes[..head_end];
+    let body = bytes[head_end + sep.len()..].to_vec();
+    let head_str = std::str::from_utf8(head).map_err(|e| {
+        PluginError::Transient(format!(
+            "proxy-fetch response headers not UTF-8: {e}"
+        ))
+    })?;
+    let mut lines = head_str.split("\r\n");
+    let status_line = lines.next().ok_or_else(|| {
+        PluginError::Transient(
+            "proxy-fetch response missing status line".to_string(),
+        )
+    })?;
+    // Status line: `HTTP/1.1 200 OK` or `HTTP/1.1 200`. Split by
+    // whitespace, take second token as u16.
+    let mut parts = status_line.split_whitespace();
+    let _version = parts.next().unwrap_or("");
+    let status_str = parts.next().unwrap_or("");
+    let status: u16 = status_str.parse().map_err(|_| {
+        PluginError::Transient(format!(
+            "proxy-fetch response has non-numeric status: {status_line}"
+        ))
+    })?;
+    let reason: String = parts.collect::<Vec<&str>>().join(" ");
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push(HttpHeaderPair {
+                name: name.trim().to_string(),
+                value: value.trim().to_string(),
+            });
+        }
+    }
+    Ok((status, reason, headers, body))
 }
 
 fn captive_submit_fingerprint(

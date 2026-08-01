@@ -55,6 +55,9 @@ request_types = [
     "network.nm.captive.start",
     "network.nm.captive.submit",
     "network.nm.captive.complete",
+    "network.nm.captive.session.start",
+    "network.nm.captive.upstream.fetch",
+    "network.nm.captive.session.close",
     "network.nm.security.status",
     "network.nm.security.harden",
     "network.nm.flight_mode.get",
@@ -100,6 +103,10 @@ response_budget_ms = 15000
 "network.nm.captive.start" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
+# See manifest.toml — session_id unguessability is the auth for
+# upstream.fetch + session.close; session.start is the sole
+# capability-gated entry point.
+"network.nm.captive.session.start" = { kind = "write", scope = "network_admin" }
 "network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
 "network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
 "network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }

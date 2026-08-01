@@ -51,6 +51,9 @@ request_types = [
     "network.nm.captive.start",
     "network.nm.captive.submit",
     "network.nm.captive.complete",
+    "network.nm.captive.session.start",
+    "network.nm.captive.upstream.fetch",
+    "network.nm.captive.session.close",
     "network.nm.security.status",
     "network.nm.security.harden",
     "network.nm.flight_mode.get",
@@ -111,6 +114,17 @@ response_budget_ms = 15000
 "network.nm.captive.start" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
+# session.start is the sole authenticated entry point for the
+# device-proxied captive-session surface — it allocates a
+# 128-bit session_id (unguessable) that gates every subsequent
+# upstream.fetch. session.close and upstream.fetch require a
+# valid session_id to do anything and are therefore protected
+# by session_id unguessability rather than a per-verb capability
+# gate: the framework's captive-session HTTP endpoint gates
+# operator entry at write:network_admin BEFORE forwarding to
+# upstream.fetch, so a separate plugin-side capability check
+# would only block the framework's own dispatcher.
+"network.nm.captive.session.start" = { kind = "write", scope = "network_admin" }
 "network.nm.security.harden" = { kind = "step_up", scope = "network_admin" }
 "network.nm.flight_mode.set" = { kind = "step_up", scope = "network_admin" }
 "network.nm.radio.set" = { kind = "step_up", scope = "network_admin" }
