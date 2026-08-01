@@ -38,10 +38,46 @@
 #                                     and `Content-Type:
 #                                     application/captive+json`
 #                                     headers.
+#              proxy-fetch          — arbitrary HTTP verb (GET / POST /
+#                                     PUT / DELETE / HEAD / OPTIONS /
+#                                     PATCH) with caller-supplied
+#                                     header set and optional request
+#                                     body from stdin. Response headers
+#                                     (including the HTTP status line)
+#                                     stream to stdout followed by
+#                                     `\r\n\r\n` then the raw response
+#                                     body. `-L` is NOT set; redirects
+#                                     surface as 3xx + `Location` so
+#                                     the framework proxy can rewrite
+#                                     the Location into its
+#                                     session-prefixed URL and let the
+#                                     operator's browser follow through
+#                                     the proxy. Cookies travel via
+#                                     the caller's Cookie: header
+#                                     (jar owned by the plugin, keyed
+#                                     by session_id).
 #   url      http:// or https:// only. Any other scheme is
 #            rejected before invocation.
 #   field    Form-field name (submit modes only). Followed by
 #   value    the field value. Pairs may repeat.
+#
+# proxy-fetch argv extension:
+#   evo-captive-probe <ifname> proxy-fetch <method> <url>
+#                     [--body-stdin] [name value]...
+#
+#   method       One of GET / POST / PUT / DELETE / HEAD /
+#                OPTIONS / PATCH (case-sensitive). Any other
+#                verb is rejected.
+#   --body-stdin Optional flag; when present, curl reads the
+#                request body from this process's stdin
+#                (`--data-binary @-`). Content-Type MUST be set
+#                explicitly by a caller-supplied header — curl
+#                will NOT add `application/x-www-form-urlencoded`
+#                since we're not using `--data-urlencode`.
+#   name value   Header pair. Assembled inside the wrapper into
+#                `-H "${name}: ${value}"` — the caller never
+#                gets to name a curl flag directly. Pairs may
+#                repeat; header ordering is preserved.
 #
 # All operator-supplied inputs (ifname, url, field, value) are
 # passed through Rust's `Command::args`, so no shell
@@ -93,12 +129,32 @@ if [ ! -e "/sys/class/net/$IFNAME" ]; then
 fi
 
 case "$MODE" in
-    probe|capport-get|submit|submit-capport-json) : ;;
+    probe|capport-get|submit|submit-capport-json|proxy-fetch) : ;;
     *)
         echo "evo-captive-probe: unknown mode: $MODE" >&2
         exit 2
         ;;
 esac
+
+# For all modes except proxy-fetch, $3 is the URL. For proxy-fetch,
+# $3 is the METHOD and $4 is the URL. Peel accordingly before the
+# URL-scheme check.
+if [ "$MODE" = "proxy-fetch" ]; then
+    if [ "$#" -lt 1 ]; then
+        echo "evo-captive-probe: proxy-fetch requires <url> after <method>" >&2
+        exit 2
+    fi
+    PF_METHOD="$URL"
+    URL="$1"
+    shift
+    case "$PF_METHOD" in
+        GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH) : ;;
+        *)
+            echo "evo-captive-probe: proxy-fetch method must be one of GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH (got '$PF_METHOD')" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 case "$URL" in
     http://*|https://*) : ;;
@@ -118,6 +174,20 @@ case "$MODE" in
     submit|submit-capport-json)
         if [ "$(( $# % 2 ))" -ne 0 ]; then
             echo "evo-captive-probe: submit modes require paired field value args" >&2
+            exit 2
+        fi
+        ;;
+    proxy-fetch)
+        # Optional single --body-stdin flag preceding zero-or-more
+        # header pairs. Validate parity of the remaining args
+        # (excluding the flag) before the argv rewrite.
+        PF_BODY_STDIN=0
+        if [ "${1:-}" = "--body-stdin" ]; then
+            PF_BODY_STDIN=1
+            shift
+        fi
+        if [ "$(( $# % 2 ))" -ne 0 ]; then
+            echo "evo-captive-probe: proxy-fetch header args must be paired name value" >&2
             exit 2
         fi
         ;;
@@ -186,6 +256,63 @@ case "$MODE" in
                 --max-time 25 \
                 --interface "$IFNAME" \
                 -X POST \
+                "$@" \
+                "$URL"
+        fi
+        exec "$CURL_BIN" "$@"
+        ;;
+
+    proxy-fetch)
+        # Positional args hold N header pairs (name value)*.
+        # Rewrite each pair into `-H "name: value"`. Consume from
+        # the front, append to the back; a counter tracks the
+        # ORIGINAL pair count so the loop terminates (each
+        # iteration nets zero change in $#).
+        pairs_remaining=$#
+        while [ "$pairs_remaining" -ge 2 ]; do
+            hname="$1"
+            hvalue="$2"
+            shift 2
+            set -- "$@" -H "${hname}: ${hvalue}"
+            pairs_remaining=$((pairs_remaining - 2))
+        done
+
+        # Fixed curl flags for proxy-fetch:
+        #   -sS                 quiet progress, show errors
+        #   -D -                dump response headers to stdout
+        #                       (includes the HTTP/1.1 status line)
+        #   -o -                dump response body to stdout
+        #                       (comes after the header block +
+        #                       CRLF separator)
+        #   --max-time 30       hard cap per upstream request
+        #   --interface IFNAME  SO_BINDTODEVICE (curl-name form)
+        #   -X METHOD           caller's HTTP verb
+        #
+        # -L is intentionally OMITTED: redirects surface as
+        # 3xx + `Location` so the framework proxy can rewrite
+        # `Location` into its session-prefixed same-origin URL
+        # and let the operator's browser follow through the
+        # proxy (each hop persists cookie state via the plugin's
+        # session_id-keyed jar).
+        if [ "$PF_BODY_STDIN" = "1" ]; then
+            set -- \
+                -sS \
+                -D - \
+                -o - \
+                --max-time 30 \
+                --interface "$IFNAME" \
+                -X "$PF_METHOD" \
+                --data-binary @- \
+                "$@" \
+                "$URL"
+        else
+            set -- \
+                -sS \
+                -D - \
+                -o - \
+                --max-time 30 \
+                --interface "$IFNAME" \
+                -X "$PF_METHOD" \
                 "$@" \
                 "$URL"
         fi
