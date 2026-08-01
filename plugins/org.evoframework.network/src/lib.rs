@@ -537,6 +537,19 @@ struct WifiIntent {
     /// `802-11-wireless.hidden`.
     #[serde(default)]
     sta_hidden: bool,
+    /// Wi-Fi MAC randomization (advanced, opt-in, off by
+    /// default). Maps to NM `802-11-wireless.cloned-mac-
+    /// address` on the STA profile: `random` when `true`,
+    /// `permanent` when `false`. NEVER applied to the AP
+    /// profile — a stationary appliance's hotspot must keep a
+    /// stable BSSID for operator-set DHCP reservations, MAC
+    /// allowlists, and captive vouchers (which bind admission
+    /// to MAC on the venue's gateway). Toggling this on
+    /// breaks saved leases and forces re-signing in to guest
+    /// networks; the UI surfaces the option under Advanced
+    /// with that hint.
+    #[serde(default)]
+    sta_mac_random: bool,
     #[serde(default)]
     sta_ipv4_mode: Ipv4Mode,
     #[serde(default)]
@@ -567,6 +580,7 @@ impl Default for WifiIntent {
             sta_ssid: String::new(),
             sta_open: false,
             sta_hidden: false,
+            sta_mac_random: false,
             sta_ipv4_mode: Ipv4Mode::Dhcp,
             sta_ipv4_address: String::new(),
             sta_ipv4_gateway: String::new(),
@@ -666,22 +680,49 @@ fn default_wlan_if() -> String {
     "wlan0".to_string()
 }
 
+/// Per-unit default AP SSID.
+///
+/// Format: `evo-<last4>` where `<last4>` is the last two
+/// octets of a per-unit MAC in lowercase hex (four hex chars,
+/// no separator). Sourced from the AP's underlying PHY
+/// interface — `wlan0` when present, else the first non-
+/// loopback / non-docker netdev with an `address` sysfs entry.
+/// Only two units with identical wifi MACs would collide, and
+/// per IEEE 802 assignment two devices in one operator's fleet
+/// effectively never share the last two octets.
+///
+/// This function is only consulted for the SERDE DEFAULT of
+/// `WifiIntent.ap_ssid`. An operator-set name (via UI or a
+/// non-empty value in a persisted intent TOML) wins on every
+/// subsequent load.
+///
+/// The `"evo"` bare fallback is a last-resort for a boot where
+/// `/sys/class/net/*/address` cannot be read at all — every
+/// real device carries a MAC.
 fn default_ap_ssid() -> String {
-    netdev_mac_suffix_hex_upper()
-        .map(|s| format!("Evo-{s}"))
-        .unwrap_or_else(|| "Evo".to_string())
+    netdev_mac_last4_lower()
+        .map(|s| format!("evo-{s}"))
+        .unwrap_or_else(|| "evo".to_string())
 }
 
 /// Last three MAC octets of the first usable host netdev, upper-hex,
 /// no separators (e.g. `7B6816`). Used to derive a per-device
 /// hotspot SSID without leaking serial numbers.
-fn netdev_mac_suffix_hex_upper() -> Option<String> {
-    for iface in ["eth0", "end0", "wlan0"] {
+/// Read a per-unit MAC address from a preferred netdev and
+/// return its last two octets as four lowercase hex chars
+/// (no separator). Preference is `wlan0` first (the AP's
+/// underlying PHY interface, closest to the actual `ap0` vif
+/// MAC), then a walk of other non-loopback / non-docker
+/// netdevs. Returns `None` only when every candidate netdev
+/// lacks an `address` sysfs entry — a boot-blind state that
+/// real hardware never hits.
+fn netdev_mac_last4_lower() -> Option<String> {
+    for iface in ["wlan0", "eth0", "end0"] {
         let p = std::path::Path::new("/sys/class/net")
             .join(iface)
             .join("address");
         if let Ok(s) = std::fs::read_to_string(&p) {
-            return Some(mac_last_three_octets_hex_upper(&s));
+            return Some(mac_last_two_octets_hex_lower(&s));
         }
     }
     let dir = std::fs::read_dir("/sys/class/net").ok()?;
@@ -693,19 +734,23 @@ fn netdev_mac_suffix_hex_upper() -> Option<String> {
         }
         let p = ent.path().join("address");
         if let Ok(s) = std::fs::read_to_string(&p) {
-            return Some(mac_last_three_octets_hex_upper(&s));
+            return Some(mac_last_two_octets_hex_lower(&s));
         }
     }
     None
 }
 
-fn mac_last_three_octets_hex_upper(addr: &str) -> String {
+/// Last two octets of a MAC address, lowercase hex, no
+/// separator. `d8:3a:dd:b8:d6:74` → `d674`. Short-form MAC
+/// input (`d674` already) is returned as-is (lower-cased,
+/// stripped of colons).
+fn mac_last_two_octets_hex_lower(addr: &str) -> String {
     let p: Vec<&str> =
         addr.trim().split(':').filter(|x| !x.is_empty()).collect();
-    if p.len() >= 3 {
-        p[p.len() - 3..].join("").to_ascii_uppercase()
+    if p.len() >= 2 {
+        p[p.len() - 2..].join("").to_ascii_lowercase()
     } else {
-        addr.replace(':', "").to_ascii_uppercase()
+        addr.replace(':', "").to_ascii_lowercase()
     }
 }
 
@@ -3599,6 +3644,18 @@ impl NmInner {
             } else {
                 "no".to_string()
             },
+            // STA-only MAC randomization (advanced, opt-in).
+            // `permanent` (default) uses the hardware MAC and
+            // preserves DHCP reservations + MAC allowlists +
+            // captive vouchers. `random` mints a fresh MAC per
+            // association. Never applied to the AP profile —
+            // the hotspot must keep a stable BSSID.
+            "802-11-wireless.cloned-mac-address".to_string(),
+            if wifi.sta_mac_random {
+                "random".to_string()
+            } else {
+                "permanent".to_string()
+            },
         ];
         if let Some(ref bssid) = selected_bssid {
             base.extend([
@@ -3678,6 +3735,16 @@ impl NmInner {
                     "yes".into()
                 } else {
                     "no".into()
+                },
+                // STA-only MAC randomization — see modify-path
+                // comment for rationale (never AP; the AP must
+                // keep a stable BSSID for reservations /
+                // allowlists / captive vouchers).
+                "802-11-wireless.cloned-mac-address".into(),
+                if wifi.sta_mac_random {
+                    "random".into()
+                } else {
+                    "permanent".into()
                 },
             ];
             if let Some(ref bssid) = selected_bssid {
@@ -3779,8 +3846,22 @@ impl NmInner {
             "shared".into(),
             "ipv6.method".into(),
             "ignore".into(),
+            // Hotspot autoconnect ON when the profile is being
+            // configured: the operator enabled the hotspot in
+            // intent (ensure_hotspot_profile returns early
+            // when disabled, so reaching here proves enabled).
+            // Without this the AP never comes back after a cold
+            // boot; it depended on the plugin re-applying intent
+            // post-boot which is timing-dependent.
+            //
+            // Priority -100 sits below the STA profile's default
+            // 0 so a real client uplink wins when both are
+            // possible; the AP only fires when no higher-
+            // priority profile succeeds.
             "connection.autoconnect".into(),
-            "no".into(),
+            "yes".into(),
+            "connection.autoconnect-priority".into(),
+            "-100".into(),
         ];
         push_nm_ap_channel(&mut modify, wifi);
 
@@ -3819,8 +3900,16 @@ impl NmInner {
                 hotspot_name.to_string(),
                 "ifname".into(),
                 ifname.to_string(),
+                // See modify-path comment above. `nmcli con add`
+                // accepts either short-form (`autoconnect`) or
+                // long-form (`connection.autoconnect`); short-
+                // form matches the surrounding args and the
+                // priority uses long-form because there is no
+                // short-form alias for `autoconnect-priority`.
                 "autoconnect".into(),
-                "no".into(),
+                "yes".into(),
+                "connection.autoconnect-priority".into(),
+                "-100".into(),
                 "wifi.mode".into(),
                 "ap".into(),
                 "ssid".into(),
@@ -7818,5 +7907,75 @@ exit 0\n",
             parsed.last_probe_url.as_deref(),
             Some("http://connectivitycheck.gstatic.com/generate_204")
         );
+    }
+
+    // -----------------------------------------------------------
+    // Per-unit default AP SSID (Item 2) — MAC last-4 hex, lower.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn mac_last_two_octets_hex_lower_full_mac() {
+        // Standard 6-octet MAC: last two → 4 hex chars, lower.
+        assert_eq!(mac_last_two_octets_hex_lower("d8:3a:dd:b8:d6:74"), "d674");
+        // Upper-case input → lowercased.
+        assert_eq!(mac_last_two_octets_hex_lower("00:11:22:33:AA:BB"), "aabb");
+    }
+
+    #[test]
+    fn mac_last_two_octets_hex_lower_ignores_whitespace() {
+        // sysfs reads carry a trailing newline.
+        assert_eq!(
+            mac_last_two_octets_hex_lower("d8:3a:dd:b8:d6:74\n"),
+            "d674"
+        );
+    }
+
+    #[test]
+    fn mac_last_two_octets_hex_lower_short_input_falls_back() {
+        // If someone hands us fewer than 2 octets, we still
+        // produce a stable derived string — not a panic.
+        assert_eq!(mac_last_two_octets_hex_lower("d674"), "d674");
+        assert_eq!(mac_last_two_octets_hex_lower("D6:74"), "d674");
+    }
+
+    // -----------------------------------------------------------
+    // STA MAC randomization (Item 3) — serde defaults + wire.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn wifi_intent_default_omits_mac_randomization() {
+        // Serde default: the advanced toggle is off, so a
+        // freshly-loaded intent uses the hardware MAC.
+        let intent = WifiIntent::default();
+        assert!(!intent.sta_mac_random);
+    }
+
+    #[test]
+    fn wifi_intent_deserialises_sta_mac_random_true() {
+        let v: WifiIntent = serde_json::from_value(serde_json::json!({
+            "sta_mac_random": true
+        }))
+        .expect("parse");
+        assert!(v.sta_mac_random);
+    }
+
+    #[test]
+    fn wifi_intent_deserialises_sta_mac_random_false() {
+        let v: WifiIntent = serde_json::from_value(serde_json::json!({
+            "sta_mac_random": false
+        }))
+        .expect("parse");
+        assert!(!v.sta_mac_random);
+    }
+
+    #[test]
+    fn wifi_intent_absent_sta_mac_random_defaults_false() {
+        // Legacy intents on disk (pre-field-add) parse cleanly
+        // and keep the default of `permanent` MAC.
+        let v: WifiIntent = serde_json::from_value(serde_json::json!({
+            "sta_ssid": "SomeNet"
+        }))
+        .expect("parse");
+        assert!(!v.sta_mac_random);
     }
 }
