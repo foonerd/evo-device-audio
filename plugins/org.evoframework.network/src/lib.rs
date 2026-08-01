@@ -5983,98 +5983,138 @@ impl NmInner {
                     "restored connection.autoconnect=yes on {NM_CON_WIFI_STA}"
                 ));
 
-                if intent.fallback.hotspot_enabled
-                    && sta_ifname != resolved_ap_ifname
-                    && !intent_hotspot_if_is_explicit
-                {
-                    if self
-                        .ensure_ap_vif_present(&sta_ifname, &resolved_ap_ifname)
-                        .await
-                    {
+                // Captive-hold gate: while a captive sign-in
+                // is in progress (session open, or `is_captive`
+                // + active phase), the apply path must NOT
+                // bring the hotspot up alongside the STA. On
+                // Pi5 / brcmfmac and other single-radio chips
+                // an AP raise on the same PHY tears down the
+                // STA association the operator needs for the
+                // portal round-trip. Force any existing
+                // hotspot down + skip the AP-vif / ensure-
+                // profile / connection-up dance entirely.
+                // Operator's `fallback.hotspot_enabled` intent
+                // is preserved — the hold releases on the next
+                // apply after `session.close` / captive
+                // authenticated / captive cleared.
+                let captive_hold = self.captive_should_hold_hotspot().await;
+                if captive_hold {
+                    if !hs_name.trim().is_empty() {
+                        self.connection_down_lossy(&hs_name).await;
                         steps.push(format!(
-                            "created AP vif {} on phy of {} (type __ap)",
-                            resolved_ap_ifname, sta_ifname
+                            "captive hold: brought hotspot {hs_name} down (AP would disrupt captive STA association)"
                         ));
-                    } else {
-                        steps.push(format!(
-                            "warning: could not create AP vif {} on {}; falling back to shared iface {}",
-                            resolved_ap_ifname, sta_ifname, sta_ifname
-                        ));
-                        resolved_ap_ifname = sta_ifname.clone();
                     }
-                }
-
-                let mut wifi_for_ap = intent.wifi.clone();
-                if sta_ifname != resolved_ap_ifname
-                    && !intent_hotspot_if_is_explicit
-                {
-                    let link = self.sta_link_info(&sta_ifname).await;
-                    if link.connected {
-                        if let (Some(ch), Some(band)) =
-                            (link.channel, link.band.clone())
+                    if sta_ifname != resolved_ap_ifname {
+                        let _ = self
+                            .ensure_ap_vif_absent(&resolved_ap_ifname)
+                            .await;
+                        steps.push(format!(
+                            "captive hold: removed AP vif {resolved_ap_ifname} (concurrent-vif suspended)"
+                        ));
+                    }
+                    steps.push(
+                        "captive hold: skipping hotspot ensure/up while captive sign-in in progress"
+                            .to_string(),
+                    );
+                } else {
+                    if intent.fallback.hotspot_enabled
+                        && sta_ifname != resolved_ap_ifname
+                        && !intent_hotspot_if_is_explicit
+                    {
+                        if self
+                            .ensure_ap_vif_present(
+                                &sta_ifname,
+                                &resolved_ap_ifname,
+                            )
+                            .await
                         {
-                            wifi_for_ap.ap_channel = ch;
-                            wifi_for_ap.ap_band = band;
                             steps.push(format!(
-                                "AP follows STA: band={} channel={}",
-                                wifi_for_ap.ap_band, wifi_for_ap.ap_channel
+                                "created AP vif {} on phy of {} (type __ap)",
+                                resolved_ap_ifname, sta_ifname
+                            ));
+                        } else {
+                            steps.push(format!(
+                                "warning: could not create AP vif {} on {}; falling back to shared iface {}",
+                                resolved_ap_ifname, sta_ifname, sta_ifname
+                            ));
+                            resolved_ap_ifname = sta_ifname.clone();
+                        }
+                    }
+
+                    let mut wifi_for_ap = intent.wifi.clone();
+                    if sta_ifname != resolved_ap_ifname
+                        && !intent_hotspot_if_is_explicit
+                    {
+                        let link = self.sta_link_info(&sta_ifname).await;
+                        if link.connected {
+                            if let (Some(ch), Some(band)) =
+                                (link.channel, link.band.clone())
+                            {
+                                wifi_for_ap.ap_channel = ch;
+                                wifi_for_ap.ap_band = band;
+                                steps.push(format!(
+                                    "AP follows STA: band={} channel={}",
+                                    wifi_for_ap.ap_band, wifi_for_ap.ap_channel
+                                ));
+                            }
+                        } else {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                sta_if = %sta_ifname,
+                                "AP channel follow-STA skipped (STA not associated yet)"
+                            );
+                        }
+                    }
+
+                    self.ensure_hotspot_profile(
+                        &resolved_ap_ifname,
+                        &wifi_for_ap,
+                        ap_psk,
+                        &intent.fallback,
+                        &mut steps,
+                    )
+                    .await?;
+
+                    if intent.fallback.hotspot_enabled
+                        && !hs_name.trim().is_empty()
+                    {
+                        let ok = self
+                            .connection_up_hotspot_with_retries(
+                                hs_name.as_str(),
+                                &mut steps,
+                            )
+                            .await;
+                        let recovered = if !ok {
+                            self.try_critical_open_hotspot_recovery(
+                                intent,
+                                hs_name.as_str(),
+                                &mut steps,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                        if sta_ifname == resolved_ap_ifname {
+                            self.restore_sta_after_hotspot_on_shared_radio(
+                                intent,
+                                sta_ifname.as_str(),
+                                hs_name.as_str(),
+                                &mut steps,
+                            )
+                            .await?;
+                        } else {
+                            steps.push(format!(
+                                "intent: hotspot on {}, STA on {}",
+                                resolved_ap_ifname, sta_ifname
                             ));
                         }
-                    } else {
-                        tracing::debug!(
-                            plugin = PLUGIN_NAME,
-                            sta_if = %sta_ifname,
-                            "AP channel follow-STA skipped (STA not associated yet)"
-                        );
-                    }
-                }
-
-                self.ensure_hotspot_profile(
-                    &resolved_ap_ifname,
-                    &wifi_for_ap,
-                    ap_psk,
-                    &intent.fallback,
-                    &mut steps,
-                )
-                .await?;
-
-                if intent.fallback.hotspot_enabled && !hs_name.trim().is_empty()
-                {
-                    let ok = self
-                        .connection_up_hotspot_with_retries(
-                            hs_name.as_str(),
-                            &mut steps,
-                        )
-                        .await;
-                    let recovered = if !ok {
-                        self.try_critical_open_hotspot_recovery(
-                            intent,
-                            hs_name.as_str(),
-                            &mut steps,
-                        )
-                        .await?
-                    } else {
-                        false
-                    };
-                    if sta_ifname == resolved_ap_ifname {
-                        self.restore_sta_after_hotspot_on_shared_radio(
-                            intent,
-                            sta_ifname.as_str(),
-                            hs_name.as_str(),
-                            &mut steps,
-                        )
-                        .await?;
-                    } else {
-                        steps.push(format!(
-                            "intent: hotspot on {}, STA on {}",
-                            resolved_ap_ifname, sta_ifname
-                        ));
-                    }
-                    if !ok && !recovered {
-                        steps.push(
+                        if !ok && !recovered {
+                            steps.push(
                             "warning: hotspot did not activate after retries (and critical open recovery if applicable)"
                                 .to_string(),
                         );
+                        }
                     }
                 }
             }
@@ -10443,5 +10483,148 @@ exit 0\n",
              (was {:?})",
             final_intent.wifi.sta_ssid
         );
+    }
+
+    /// `captive_should_hold_hotspot` via the REAL method
+    /// (not a predicate copy) — seeds captive state files in
+    /// a tempdir, mutates them across the four scenarios the
+    /// hold predicate cares about, and asserts each verdict.
+    /// The audit noted the earlier version tested a predicate
+    /// copy rather than the actual load-and-check path.
+    #[tokio::test]
+    async fn captive_should_hold_hotspot_reads_state_files() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+
+        // Baseline: no captive state files, no sessions.
+        assert!(
+            !p.captive_should_hold_hotspot().await,
+            "empty state must not hold hotspot"
+        );
+
+        // Case 1: is_captive:true + phase=ProbeDetected →
+        // MUST hold.
+        let mut state = CaptiveSessionState {
+            is_captive: Some(true),
+            phase: CaptivePhase::ProbeDetected,
+            ..Default::default()
+        };
+        p.save_captive_state(&state).await.expect("save");
+        assert!(
+            p.captive_should_hold_hotspot().await,
+            "is_captive=true + ProbeDetected must hold"
+        );
+
+        // Case 2: is_captive:true + phase=Authenticated →
+        // MUST NOT hold (operator done with sign-in).
+        state.phase = CaptivePhase::Authenticated;
+        p.save_captive_state(&state).await.expect("save");
+        assert!(
+            !p.captive_should_hold_hotspot().await,
+            "phase=Authenticated must not hold hotspot"
+        );
+
+        // Case 3: is_captive:None + phase=Idle + one open
+        // session → MUST hold (framework proxy has an
+        // in-flight iframe).
+        state.is_captive = None;
+        state.phase = CaptivePhase::Idle;
+        p.save_captive_state(&state).await.expect("save");
+        let now = unix_epoch_seconds();
+        let session = CaptiveSession {
+            session_id: "abc123".to_string(),
+            upstream_host: "http://portal".to_string(),
+            initial_path: "/guest/".to_string(),
+            initial_query: String::new(),
+            cookies: Default::default(),
+            created_at_epoch: now,
+            expires_at_epoch: now + 1800,
+        };
+        p.save_captive_sessions(&[session])
+            .await
+            .expect("save session");
+        assert!(
+            p.captive_should_hold_hotspot().await,
+            "open session must hold hotspot even when captive state clean"
+        );
+
+        // Case 4: session expired → MUST NOT hold (load
+        // prunes expired jars on read).
+        let expired_session = CaptiveSession {
+            session_id: "expired".to_string(),
+            upstream_host: "http://portal".to_string(),
+            initial_path: "/".to_string(),
+            initial_query: String::new(),
+            cookies: Default::default(),
+            created_at_epoch: 0,
+            expires_at_epoch: 1,
+        };
+        p.save_captive_sessions(&[expired_session])
+            .await
+            .expect("save expired");
+        assert!(
+            !p.captive_should_hold_hotspot().await,
+            "expired session must not hold hotspot (pruned on load)"
+        );
+    }
+
+    /// `wifi_interface_is_associated` via the REAL method —
+    /// seeds a mock `nmcli device` script that emits row
+    /// data for each NM state string, then asserts the
+    /// method's verdict. Word-boundary matching is
+    /// exercised for real, not simulated.
+    #[tokio::test]
+    async fn wifi_interface_is_associated_via_real_method() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nmcli_path = dir.path().join("nmcli-mock-devstate.sh");
+        // Emit a nmcli-terse block for wlan0 in one of four
+        // states, driven by an env var the test sets.
+        std::fs::write(
+            &nmcli_path,
+            "#!/bin/sh\n\
+             cat <<EOF\n\
+             GENERAL.DEVICE:wlan0\n\
+             GENERAL.TYPE:wifi\n\
+             GENERAL.STATE:100 (${EVO_TEST_STATE:-disconnected})\n\
+             GENERAL.CONNECTION:--\n\
+             GENERAL.HWADDR:D8:3A:DD:B8:D6:74\n\
+             GENERAL.MTU:1500\n\
+             EOF\n",
+        )
+        .expect("write mock");
+        let mut perms = std::fs::metadata(&nmcli_path)
+            .expect("stat mock")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&nmcli_path, perms).expect("chmod mock");
+        if nmcli_dispatch::process_needs_sudo() {
+            // Under sudo, tempdir mock is unreachable; the
+            // predicate is otherwise covered by
+            // wifi_interface_is_associated_word_boundary.
+            eprintln!("skipping real-method exercise (needs sudo for tempdir)");
+            return;
+        }
+        let mut p = NetworkPlugin::new();
+        {
+            let inner = p.inner_mut();
+            inner.config.nmcli_path = nmcli_path.to_string_lossy().into_owned();
+            inner.config.default_wifi_iface = "wlan0".to_string();
+        }
+        // Case connected → true.
+        std::env::set_var("EVO_TEST_STATE", "connected");
+        assert!(p.wifi_interface_is_associated("wlan0").await);
+        // Case connected (site only) → true (word-boundary).
+        std::env::set_var("EVO_TEST_STATE", "connected (site only)");
+        assert!(p.wifi_interface_is_associated("wlan0").await);
+        // Case disconnected → false (regression target).
+        std::env::set_var("EVO_TEST_STATE", "disconnected");
+        assert!(!p.wifi_interface_is_associated("wlan0").await);
+        // Case unavailable → false.
+        std::env::set_var("EVO_TEST_STATE", "unavailable");
+        assert!(!p.wifi_interface_is_associated("wlan0").await);
+        std::env::remove_var("EVO_TEST_STATE");
     }
 }
