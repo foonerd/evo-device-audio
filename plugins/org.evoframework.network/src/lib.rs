@@ -101,6 +101,17 @@ const REQUEST_NETWORK_RADIO_STATUS: &str = "network.nm.radio.status";
 const REQUEST_NETWORK_RADIO_SET: &str = "network.nm.radio.set";
 const REQUEST_NETWORK_SUPERVISOR_STATUS: &str = "network.nm.supervisor.status";
 const REQUEST_NETWORK_WIFI_DEVICES: &str = "network.nm.wifi_devices";
+/// Drop the active Wi-Fi STA link while preserving the saved
+/// profile — `nmcli device disconnect <wifi-ifname>`. Distinct
+/// from Forget (which clears `wifi.sta_ssid` in intent): this
+/// verb leaves `evo-network-wifi-sta` in place with its SSID
+/// and PSK sidecar, so a later reconnect needs no re-entry.
+/// nmcli's `device disconnect` also disables autoconnect on
+/// the device until the operator issues an explicit
+/// `connection up` (or re-applies intent), matching the
+/// operator's mental model of "drop the link and don't
+/// silently rejoin". Gated at `write:network_admin`.
+const REQUEST_NETWORK_WIFI_DISCONNECT: &str = "network.nm.wifi.disconnect";
 /// Read-side wire-op (no admin scope). Returns the freshly-
 /// published `networking.link.connectivity` subject value. When
 /// the plugin's `probe_kind` is `off` (the default), the
@@ -740,6 +751,30 @@ fn netdev_mac_last4_lower() -> Option<String> {
     None
 }
 
+/// Normalise NM's `GENERAL.STATE` text from `device show`.
+/// nmcli reports state as `"<numeric> (<text>)"`, e.g.
+/// `"100 (connected)"` or `"30 (disconnected)"`. We surface
+/// the text form so downstream consumers see the same string
+/// shape the `device` summary command produced
+/// (`"connected"` / `"disconnected"` / `"unavailable"`).
+/// Falls back to the raw value on parse failure so an unknown
+/// / future NM state format still reaches the wire without
+/// dropping the row.
+fn nm_state_text(raw: &str) -> String {
+    let s = raw.trim();
+    if let Some(open) = s.find('(') {
+        if let Some(close) = s.rfind(')') {
+            if close > open {
+                let inner = s[open + 1..close].trim();
+                if !inner.is_empty() {
+                    return inner.to_string();
+                }
+            }
+        }
+    }
+    s.to_string()
+}
+
 /// Last two octets of a MAC address, lowercase hex, no
 /// separator. `d8:3a:dd:b8:d6:74` → `d674`. Short-form MAC
 /// input (`d674` already) is returned as-is (lower-cased,
@@ -986,6 +1021,14 @@ struct DeviceRow {
     kind: String,
     state: String,
     connection: String,
+    /// Primary IPv4 address in CIDR form (`192.168.30.24/24`),
+    /// or `None` when the device has no v4 lease (unavailable /
+    /// disconnected / v6-only). Sourced from
+    /// `IP4.ADDRESS[1]` on `nmcli device show`. Multi-address
+    /// interfaces surface only the primary — the info page needs
+    /// one line per device, not an address list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip4: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3084,26 +3127,78 @@ impl NmInner {
     }
 
     async fn nm_device_table(&self) -> Result<Vec<DeviceRow>, PluginError> {
+        // `nmcli device` (short form) cannot include IP4.ADDRESS
+        // as a synthetic field — nmcli refuses with
+        // `invalid field 'IP4.ADDRESS'; allowed fields: DEVICE,
+        // TYPE, STATE, ...` — so we consult `device show` which
+        // dumps one block per device with the full field surface
+        // including addresses. Block format:
+        //
+        //   GENERAL.DEVICE:eth0
+        //   GENERAL.TYPE:ethernet
+        //   GENERAL.STATE:100 (connected)
+        //   GENERAL.CONNECTION:evo-network-ethernet
+        //   IP4.ADDRESS[1]:192.168.30.24/24
+        //   <blank line>
+        //   GENERAL.DEVICE:wlan0
+        //   ...
+        //
+        // Blocks separated by blank lines. STATE arrives as
+        // `<numeric> (<text>)` — normalize to the text form
+        // (`connected` / `disconnected` / `unavailable` / ...)
+        // so downstream consumers see the same string shape as
+        // the summary command's STATE column produced.
         let raw = self
             .nmcli_output(&[
                 "-t",
                 "-f",
-                "DEVICE,TYPE,STATE,CONNECTION",
+                "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,\
+                 GENERAL.CONNECTION,IP4.ADDRESS",
                 "device",
+                "show",
             ])
             .await?;
         let mut rows = Vec::new();
+        let mut current: Option<DeviceRow> = None;
         for line in raw.lines() {
-            if line.trim().is_empty() {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                if let Some(row) = current.take() {
+                    if !row.device.is_empty() {
+                        rows.push(row);
+                    }
+                }
                 continue;
             }
-            let mut parts = line.splitn(4, ':');
-            rows.push(DeviceRow {
-                device: parts.next().unwrap_or("").to_string(),
-                kind: parts.next().unwrap_or("").to_string(),
-                state: parts.next().unwrap_or("").to_string(),
-                connection: parts.next().unwrap_or("").to_string(),
+            let (key, value) = match trimmed.split_once(':') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => continue,
+            };
+            let row = current.get_or_insert_with(|| DeviceRow {
+                device: String::new(),
+                kind: String::new(),
+                state: String::new(),
+                connection: String::new(),
+                ip4: None,
             });
+            match key {
+                "GENERAL.DEVICE" => row.device = value.to_string(),
+                "GENERAL.TYPE" => row.kind = value.to_string(),
+                "GENERAL.STATE" => row.state = nm_state_text(value),
+                "GENERAL.CONNECTION" => row.connection = value.to_string(),
+                k if (k == "IP4.ADDRESS[1]" || k == "IP4.ADDRESS")
+                    && row.ip4.is_none()
+                    && !value.is_empty() =>
+                {
+                    row.ip4 = Some(value.to_string());
+                }
+                _ => {}
+            }
+        }
+        if let Some(row) = current.take() {
+            if !row.device.is_empty() {
+                rows.push(row);
+            }
         }
         Ok(rows)
     }
@@ -4832,6 +4927,7 @@ impl Plugin for NetworkPlugin {
                         REQUEST_NETWORK_RADIO_SET.to_string(),
                         REQUEST_NETWORK_SUPERVISOR_STATUS.to_string(),
                         REQUEST_NETWORK_WIFI_DEVICES.to_string(),
+                        REQUEST_NETWORK_WIFI_DISCONNECT.to_string(),
                         REQUEST_NETWORK_REFRESH_CONNECTIVITY.to_string(),
                     ],
                     accepts_custody: false,
@@ -5697,6 +5793,86 @@ impl Respondent for NetworkPlugin {
                                 "v": 1,
                                 "status": "ok",
                                 "radios": radios,
+                            }),
+                        ),
+                    )
+                }
+                REQUEST_NETWORK_WIFI_DISCONNECT => {
+                    // Drop the active Wi-Fi STA link but keep the
+                    // saved profile intact — `nmcli device
+                    // disconnect <ifname>` disconnects AND
+                    // disables autoconnect on the device until
+                    // the operator issues an explicit `connection
+                    // up` (or re-applies intent). Matches the
+                    // operator's "moving places" flow: link
+                    // drops, SSID + PSK preserved, no silent
+                    // rejoin.
+                    //
+                    // Uses the current intent's wifi ifname when
+                    // set, else `default_wifi_iface` from config.
+                    // A `no such device` / `already disconnected`
+                    // stderr from nmcli is not an error state
+                    // for this verb — the desired end state
+                    // (device down) is the same.
+                    let intent = self.load_intent().await?;
+                    let ifname = self.effective_wifi_ifname(&intent);
+                    let ifname_trim = ifname.trim();
+                    if ifname_trim.is_empty() {
+                        return Err(PluginError::Permanent(
+                            "wifi.disconnect: no Wi-Fi interface name \
+                             resolvable from intent or default_wifi_iface"
+                                .to_string(),
+                        ));
+                    }
+                    let disconnect_out = self
+                        .nmcli_spawn_output(&[
+                            "device",
+                            "disconnect",
+                            ifname_trim,
+                        ])
+                        .await;
+                    let nmcli_detail = match disconnect_out {
+                        Ok(o) if o.status.success() => None,
+                        Ok(o) => Some(format!(
+                            "nmcli device disconnect {ifname_trim} \
+                             exited {}: {}",
+                            o.status.code().unwrap_or(-1),
+                            String::from_utf8_lossy(&o.stderr).trim(),
+                        )),
+                        Err(e) => Some(format!("{e}")),
+                    };
+                    // Read back the device state — this is the
+                    // authoritative outcome. `nmcli device
+                    // disconnect` returns exit 6 with "device is
+                    // not active" when the device was already
+                    // down (operator hits Disconnect on an
+                    // already-disconnected radio: idempotent, not
+                    // an error). Verdict is based on the POST
+                    // state, not the exit code: any state that
+                    // is not `connected` counts as the desired
+                    // end state.
+                    let devices = self.nm_device_table().await.ok();
+                    let device_state = devices
+                        .as_ref()
+                        .and_then(|d| {
+                            d.iter()
+                                .find(|r| r.device == ifname_trim)
+                                .map(|r| r.state.clone())
+                        })
+                        .unwrap_or_default();
+                    let ok = !device_state.contains("connected")
+                        || device_state.contains("disconnected");
+                    NmInner::response_json(
+                        req,
+                        self.with_observability(
+                            req,
+                            json!({
+                                "v": 1,
+                                "status": if ok { "ok" } else { "error" },
+                                "disconnected": ok,
+                                "ifname": ifname_trim,
+                                "device_state": device_state,
+                                "detail": nmcli_detail,
                             }),
                         ),
                     )
@@ -7147,8 +7323,8 @@ version = 1
             format!(
                 "#!/usr/bin/env bash\n\
 echo \"$@\" >> \"{}\"\n\
-if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"DEVICE,TYPE,STATE,CONNECTION\" && \"$4\" == \"device\" ]]; then\n\
-  echo \"wlan0:wifi:connected:evo-network-wifi-sta\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-wifi-sta\\nIP4.ADDRESS[1]:10.0.0.2/24\\n'\n\
   exit 0\n\
 fi\n\
 if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
@@ -7453,7 +7629,7 @@ exit 0\n",
         std::fs::write(
             &nmcli_path,
             "#!/usr/bin/env bash\n\
-if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"DEVICE,TYPE,STATE,CONNECTION\" && \"$4\" == \"device\" ]]; then\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
   echo \"device-table-failed\" 1>&2\n\
   exit 10\n\
 fi\n\
@@ -7966,6 +8142,35 @@ exit 0\n",
         }))
         .expect("parse");
         assert!(!v.sta_mac_random);
+    }
+
+    // -----------------------------------------------------------
+    // `device show` STATE normaliser + IP4.ADDRESS extraction.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn nm_state_text_extracts_parenthetical() {
+        assert_eq!(nm_state_text("100 (connected)"), "connected");
+        assert_eq!(nm_state_text("30 (disconnected)"), "disconnected");
+        assert_eq!(
+            nm_state_text("100 (connected (externally))"),
+            "connected (externally)"
+        );
+    }
+
+    #[test]
+    fn nm_state_text_falls_back_on_bare_string() {
+        // Older/unknown NM formats without parens still reach
+        // the wire without being dropped.
+        assert_eq!(nm_state_text("connected"), "connected");
+        assert_eq!(nm_state_text(""), "");
+    }
+
+    #[test]
+    fn nm_state_text_trims_and_defends_against_malformed_parens() {
+        assert_eq!(nm_state_text("  100 (connected)  "), "connected");
+        // Empty parens: fall back to raw.
+        assert_eq!(nm_state_text("100 ()"), "100 ()");
     }
 
     #[test]
