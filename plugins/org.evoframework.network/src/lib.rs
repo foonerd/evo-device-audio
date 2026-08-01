@@ -162,10 +162,21 @@ struct PluginConfig {
     /// block toggle. Overridable via `EVO_NETWORK_RFKILL`.
     /// Default `/usr/sbin/rfkill`.
     rfkill_path: String,
-    /// `curl` binary path for connectivity + captive-portal
-    /// probes. Overridable via `EVO_NETWORK_CURL`. Default
-    /// `/usr/bin/curl`.
+    /// `curl` binary path for the reachability supervisor's
+    /// whole-system connectivity probe (unbound; whichever
+    /// interface the routing table picks). Overridable via
+    /// `EVO_NETWORK_CURL`. Default `/usr/bin/curl`.
     curl_path: String,
+    /// Path to `evo-captive-probe`, the narrow root-elevated
+    /// wrapper that forces captive-plane HTTP (probe /
+    /// capport-api GET / operator submit) to egress via a
+    /// specific interface (SO_BINDTODEVICE). Sudoers granted
+    /// by `dist/sudoers.d/evo-network-captive.in`; installed
+    /// by the bootstrap script alongside the wrapper binary.
+    /// Overridable via `EVO_NETWORK_CAPTIVE_PROBE` (env) or
+    /// `captive_probe_path` (plugin TOML). Default
+    /// `/usr/local/bin/evo-captive-probe`.
+    captive_probe_path: String,
     default_wifi_iface: String,
     captive: CaptiveConfig,
     secret_key: Option<[u8; 32]>,
@@ -238,6 +249,11 @@ impl PluginConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "/usr/bin/curl".to_string());
+        let captive_probe_path = std::env::var("EVO_NETWORK_CAPTIVE_PROBE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/usr/local/bin/evo-captive-probe".to_string());
         let iw_timeout_ms = std::env::var("EVO_NETWORK_IW_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -253,6 +269,7 @@ impl PluginConfig {
             iw_path,
             rfkill_path,
             curl_path,
+            captive_probe_path,
             default_wifi_iface: "wlan0".to_string(),
             captive: CaptiveConfig::default(),
             secret_key: env_key,
@@ -280,6 +297,7 @@ impl PluginConfig {
             ("iw_path", &mut out.iw_path),
             ("rfkill_path", &mut out.rfkill_path),
             ("curl_path", &mut out.curl_path),
+            ("captive_probe_path", &mut out.captive_probe_path),
         ] {
             if let Some(v) = table.get(key).and_then(|v| v.as_str()) {
                 let t = v.trim();
@@ -2279,88 +2297,64 @@ impl NmInner {
         }
     }
 
-    /// Read the current IPv4 address of `ifname` from nmcli's
-    /// `IP4.ADDRESS[1]` field, stripped of the CIDR prefix.
-    /// Used to bind captive-plane curl calls to the wifi
-    /// interface's source IP so a device with both eth0 (admin
-    /// uplink) and wlan0 (captive segment) up sends portal
-    /// traffic over wlan0 regardless of which interface owns
-    /// the default route.
+    /// Build a `Command` that invokes `evo-captive-probe` for
+    /// the given `mode` on `ifname`, targeting `url`. Extra
+    /// argv (field/value pairs for submit modes) is appended
+    /// as-is after the URL. When the process is not already
+    /// root, prepends `sudo -n` so the narrow sudoers grant
+    /// installed by `dist/sudoers.d/evo-network-captive.in`
+    /// kicks in.
     ///
-    /// Source-IP binding via `curl --interface <ip>` does NOT
-    /// require CAP_NET_RAW / root — curl just `bind()`s the
-    /// socket. `SO_BINDTODEVICE` (which would require the cap)
-    /// is deliberately avoided here.
-    ///
-    /// Returns `None` when the interface has no IPv4 address
-    /// (never associated, waiting on DHCP, or the read fails);
-    /// callers then let the routing table pick the source.
-    async fn wifi_source_ipv4(&self, ifname: &str) -> Option<String> {
-        let raw = self
-            .nmcli_output(&[
-                "-t",
-                "-f",
-                "IP4.ADDRESS",
-                "device",
-                "show",
-                ifname,
-            ])
-            .await
-            .ok()?;
-        for line in raw.lines() {
-            let after_colon =
-                line.rsplit_once(':').map(|(_, r)| r).unwrap_or(line);
-            let value = match after_colon.split_once('=') {
-                Some((_, v)) => v.trim(),
-                None => continue,
-            };
-            // Value shape: `192.168.1.42/24` — strip the CIDR.
-            if let Some(ip) = value.split('/').next() {
-                let ip = ip.trim();
-                if !ip.is_empty() && ip.contains('.') {
-                    return Some(ip.to_string());
-                }
-            }
+    /// The wrapper is the trust boundary that lets curl call
+    /// `SO_BINDTODEVICE` (kernel forces egress via that
+    /// interface, not just source-IP bind); the plugin itself
+    /// runs as an unprivileged service user, so bare
+    /// `curl --interface <ifname>` from here would fail on
+    /// CAP_NET_RAW and fall back to source-IP-only bind — the
+    /// exact defect this wrapper exists to close.
+    fn captive_probe_command(
+        &self,
+        ifname: &str,
+        mode: &str,
+        url: &str,
+        extra: &[&str],
+    ) -> Command {
+        let needs_sudo = nmcli_dispatch::process_needs_sudo();
+        let mut cmd = if needs_sudo {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg(&self.config.captive_probe_path);
+            c
+        } else {
+            Command::new(&self.config.captive_probe_path)
+        };
+        cmd.arg(ifname).arg(mode).arg(url);
+        for token in extra {
+            cmd.arg(token);
         }
-        None
+        cmd
     }
 
-    /// GET a URL via curl and return `(http_code, effective_url)`
-    /// after redirect follow. When `source_ip` is `Some`, adds
-    /// `--interface <ip>` so the outbound socket binds to that
-    /// source (used to force the captive-plane traffic through
-    /// wlan0 even when eth0 owns the default route).
-    async fn curl_probe_bound(
+    /// GET a URL via the wrapper (`probe` mode) and return
+    /// `(http_code, effective_url)` after redirect follow. The
+    /// wrapper forces egress via `ifname` (SO_BINDTODEVICE),
+    /// so on a multi-uplink device (e.g. eth0 admin +
+    /// captive-carrying wlan0) the packet leaves via `ifname`
+    /// regardless of which interface owns the default route.
+    async fn captive_probe_bound(
         &self,
+        ifname: &str,
         url: &str,
-        source_ip: Option<&str>,
     ) -> Result<(Option<u16>, Option<String>), PluginError> {
-        let mut cmd = Command::new("curl");
-        let mut args: Vec<&str> = vec![
-            "-sS",
-            "-L",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}|%{url_effective}",
-            "--max-time",
-            "20",
-        ];
-        if let Some(ip) = source_ip {
-            args.push("--interface");
-            args.push(ip);
-        }
-        args.push(url);
-        cmd.args(&args);
+        let cmd = self.captive_probe_command(ifname, "probe", url, &[]);
         let out = run_command_output_with_timeout(
             cmd,
             self.config.curl_timeout_ms,
-            "curl probe",
+            "captive probe",
         )
         .await?;
         if !out.status.success() {
             return Err(PluginError::Transient(format!(
-                "curl probe failed (exit {}): {}",
+                "captive probe failed (exit {}): {}",
                 out.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
@@ -2426,34 +2420,16 @@ impl NmInner {
     /// missing required fields — the caller then treats the
     /// URI as the operator portal itself (some pre-RFC-8908
     /// captive gateways expose only an HTML login page at the
-    /// same URI). Curl handles TLS + redirects + timeouts; we
-    /// deliberately reuse the same subprocess idiom the legacy
-    /// probe uses so egress binding / privilege discipline
-    /// stays uniform across the plugin.
-    /// GET the RFC 8908 API URI with the correct Accept header,
-    /// optionally binding the outbound socket to `source_ip` so
-    /// the traffic traverses the captive-carrying interface
-    /// (wlan0) even when eth0 owns the default route.
+    /// same URI). The GET is dispatched through the wrapper in
+    /// `capport-get` mode so it egresses via `ifname`
+    /// (SO_BINDTODEVICE) — same egress-binding discipline as
+    /// the legacy probe.
     async fn fetch_capport_api_bound(
         &self,
+        ifname: &str,
         uri: &str,
-        source_ip: Option<&str>,
     ) -> Option<serde_json::Value> {
-        let mut cmd = Command::new("curl");
-        let mut args: Vec<&str> = vec![
-            "-sS",
-            "-L",
-            "-H",
-            "Accept: application/captive+json",
-            "--max-time",
-            "10",
-        ];
-        if let Some(ip) = source_ip {
-            args.push("--interface");
-            args.push(ip);
-        }
-        args.push(uri);
-        cmd.args(&args);
+        let cmd = self.captive_probe_command(ifname, "capport-get", uri, &[]);
         let out = run_command_output_with_timeout(
             cmd,
             self.config.curl_timeout_ms,
@@ -2466,6 +2442,48 @@ impl NmInner {
         }
         let body = String::from_utf8_lossy(&out.stdout).into_owned();
         serde_json::from_str::<serde_json::Value>(body.trim()).ok()
+    }
+
+    /// POST an operator-supplied captive-portal form via the
+    /// wrapper (`submit` or `submit-capport-json` mode). Field
+    /// pairs are handed to the wrapper as argv tokens; the
+    /// wrapper rewrites each pair into `--data-urlencode
+    /// "k=v"` internally so no operator-supplied string ever
+    /// reaches curl as a flag. Returns
+    /// `(http_code, effective_url)` after redirect follow.
+    async fn captive_submit_bound(
+        &self,
+        ifname: &str,
+        url: &str,
+        capport_json: bool,
+        fields: &[(String, String)],
+    ) -> Result<(Option<u16>, Option<String>), PluginError> {
+        let mode = if capport_json {
+            "submit-capport-json"
+        } else {
+            "submit"
+        };
+        let mut extra: Vec<&str> = Vec::with_capacity(fields.len() * 2);
+        for (k, v) in fields {
+            extra.push(k.as_str());
+            extra.push(v.as_str());
+        }
+        let cmd = self.captive_probe_command(ifname, mode, url, &extra);
+        let out = run_command_output_with_timeout(
+            cmd,
+            self.config.curl_timeout_ms,
+            "captive submit",
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(PluginError::Transient(format!(
+                "captive submit failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        Ok(parse_http_probe_metrics(raw.trim()))
     }
 
     async fn captive_detect(
@@ -2489,19 +2507,13 @@ impl NmInner {
         // matches every RFC 8910-aware captive-portal stack
         // (iOS / macOS / Android 12+ / systemd-resolved).
         let ifname = self.config.default_wifi_iface.trim();
-        let source_ip = if ifname.is_empty() {
-            None
-        } else {
-            self.wifi_source_ipv4(ifname).await
-        };
         if !ifname.is_empty() {
             if let Some(api_uri) =
                 self.read_capport_api_uri_from_lease(ifname).await
             {
                 state.capport_api_uri = Some(api_uri.clone());
-                if let Some(body) = self
-                    .fetch_capport_api_bound(&api_uri, source_ip.as_deref())
-                    .await
+                if let Some(body) =
+                    self.fetch_capport_api_bound(ifname, &api_uri).await
                 {
                     // RFC 8908 field names use kebab-case.
                     let captive = body.get("captive").and_then(|v| v.as_bool());
@@ -2562,9 +2574,15 @@ impl NmInner {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("http://connectivitycheck.gstatic.com/generate_204");
-        let (http_code, effective_url) = self
-            .curl_probe_bound(probe_url, source_ip.as_deref())
-            .await?;
+        if ifname.is_empty() {
+            return Err(PluginError::Permanent(
+                "captive probe requires default_wifi_iface (config.wifi_iface) \
+                 to be set — SO_BINDTODEVICE has no target interface"
+                    .to_string(),
+            ));
+        }
+        let (http_code, effective_url) =
+            self.captive_probe_bound(ifname, probe_url).await?;
         state.capport_api_uri = None;
         state.last_probe_url = Some(probe_url.to_string());
         state.last_http_code = http_code;
@@ -2675,23 +2693,40 @@ impl NmInner {
             return Ok(state);
         }
 
-        // Resolve wlan0 source IP so the submit binds to the
-        // captive-carrying interface. When absent (wlan0 has no
-        // IPv4 yet, or the plugin is running against a rig with
-        // no wifi) we fall through to the routing-table pick.
+        // Captive submits must egress via the captive-carrying
+        // interface (wlan0), else on a device with a second
+        // uplink whose default route wins (eth0), the POST
+        // never reaches the portal. Route via the wrapper —
+        // it sets SO_BINDTODEVICE, which forces egress. Requires
+        // `default_wifi_iface` to be set.
         let ifname = self.config.default_wifi_iface.trim();
-        let source_ip = if ifname.is_empty() {
-            None
-        } else {
-            self.wifi_source_ipv4(ifname).await
-        };
+        if ifname.is_empty() {
+            return Err(PluginError::Permanent(
+                "captive submit requires default_wifi_iface (config.wifi_iface) \
+                 to be set — SO_BINDTODEVICE has no target interface"
+                    .to_string(),
+            ));
+        }
+
+        // The wrapper only accepts POST — every captive portal
+        // in the wild uses POST for form submission, and the
+        // `docs/NETWORK_REQUESTS_V1.md` contract example shows
+        // POST. Reject any non-POST method explicitly rather
+        // than silently downgrading.
+        if method != "POST" {
+            return Err(PluginError::Permanent(format!(
+                "captive submit method must be POST (got {}); wrapper does \
+                 not currently expose other verbs",
+                method
+            )));
+        }
 
         // If the submit target matches the RFC 8910 API URI's
-        // host and the operator declared a JSON-body submit
-        // (form is empty, method is POST), add the RFC 8908
-        // `Accept: application/captive+json` header so a
-        // spec-compliant venue returns the updated state JSON
-        // in the response — which we then re-parse.
+        // host, use `submit-capport-json` mode so both
+        // `Accept:` and `Content-Type: application/captive+json`
+        // headers travel with the POST — a spec-compliant
+        // venue returns the updated state JSON we then re-parse
+        // on the follow-up GET.
         let is_capport_api_submit = state
             .capport_api_uri
             .as_deref()
@@ -2700,67 +2735,36 @@ impl NmInner {
             .map(|(a, b)| a == b)
             .unwrap_or(false);
 
-        let mut args: Vec<String> = vec![
-            "-sS".into(),
-            "-L".into(),
-            "-o".into(),
-            "/dev/null".into(),
-            "-w".into(),
-            "%{http_code}|%{url_effective}".into(),
-            "--max-time".into(),
-            "25".into(),
-            "-X".into(),
-            method,
-        ];
-        if let Some(ref ip) = source_ip {
-            args.push("--interface".into());
-            args.push(ip.clone());
-        }
-        if is_capport_api_submit {
-            args.push("-H".into());
-            args.push("Accept: application/captive+json".into());
-            args.push("-H".into());
-            args.push("Content-Type: application/captive+json".into());
-        }
+        let mut fields: Vec<(String, String)> = Vec::new();
         let mut field_names = Vec::new();
         for (k, v) in &payload.form {
             if k.trim().is_empty() {
                 continue;
             }
             field_names.push(k.clone());
-            args.push("--data-urlencode".into());
-            args.push(format!("{}={}", k, v));
+            fields.push((k.clone(), v.clone()));
         }
-        args.push(url.to_string());
 
         state.phase = CaptivePhase::Submitting;
         state.requires_user_confirmation = false;
         state.submit_attempts = state.submit_attempts.saturating_add(1);
         state.last_submit_fingerprint = Some(fingerprint);
         state.last_submit_at_epoch = Some(now_epoch);
-        let mut cmd = Command::new("curl");
-        cmd.args(args.iter().map(String::as_str));
-        let out = run_command_output_with_timeout(
-            cmd,
-            self.config.curl_timeout_ms,
-            "curl submit",
-        )
-        .await?;
-        if !out.status.success() {
-            state.phase = CaptivePhase::Failed;
-            state.last_error = Some(format!(
-                "curl submit failed (exit {}): {}",
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-            state.last_submission_fields = field_names;
-            state.requires_user_confirmation =
-                !matches!(policy, CaptiveCredentialPolicy::ReplayAllowed);
-            return Ok(state);
-        }
 
-        let probe = String::from_utf8_lossy(&out.stdout);
-        let (http_code, effective_url) = parse_http_probe_metrics(probe.trim());
+        let submit_result = self
+            .captive_submit_bound(ifname, url, is_capport_api_submit, &fields)
+            .await;
+        let (http_code, effective_url) = match submit_result {
+            Ok(pair) => pair,
+            Err(err) => {
+                state.phase = CaptivePhase::Failed;
+                state.last_error = Some(err.to_string());
+                state.last_submission_fields = field_names;
+                state.requires_user_confirmation =
+                    !matches!(policy, CaptiveCredentialPolicy::ReplayAllowed);
+                return Ok(state);
+            }
+        };
         state.last_http_code = http_code;
         state.portal_url = effective_url;
         state.last_submission_fields = field_names;
@@ -2775,9 +2779,8 @@ impl NmInner {
         // waiting for the connectivity check to walk the probe.
         let mut detected_ok = false;
         if let Some(ref api_uri) = state.capport_api_uri.clone() {
-            if let Some(body) = self
-                .fetch_capport_api_bound(api_uri, source_ip.as_deref())
-                .await
+            if let Some(body) =
+                self.fetch_capport_api_bound(ifname, api_uri).await
             {
                 let captive = body.get("captive").and_then(|v| v.as_bool());
                 state.is_captive = captive;
@@ -8844,5 +8847,202 @@ exit 0\n",
         }))
         .expect("parse");
         assert!(!v.sta_mac_random);
+    }
+
+    // --- captive-probe wrapper shape ---
+
+    /// Collect a `tokio::process::Command` into
+    /// `(program, args)` for shape assertions. Uses the stable
+    /// `get_program` / `get_args` accessors on the underlying
+    /// `std::process::Command`.
+    fn command_shape(cmd: &Command) -> (String, Vec<String>) {
+        let std_cmd = cmd.as_std();
+        let program = std_cmd.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        (program, args)
+    }
+
+    /// `captive_probe_command` runs the wrapper with `sudo -n`
+    /// prepended when the plugin process is unprivileged (EUID
+    /// != 0). Test runs unprivileged, so the assertion is the
+    /// sudo path.
+    #[test]
+    fn captive_probe_command_probe_mode_sudo_wraps_the_wrapper() {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            "/opt/test/evo-captive-probe".to_string();
+        let cmd = p.captive_probe_command(
+            "wlan0",
+            "probe",
+            "http://connectivitycheck.gstatic.com/generate_204",
+            &[],
+        );
+        let (program, args) = command_shape(&cmd);
+        if nmcli_dispatch::process_needs_sudo() {
+            assert_eq!(program, "sudo");
+            assert_eq!(
+                args,
+                vec![
+                    "-n",
+                    "/opt/test/evo-captive-probe",
+                    "wlan0",
+                    "probe",
+                    "http://connectivitycheck.gstatic.com/generate_204",
+                ]
+            );
+        } else {
+            // Root-run test env — no sudo prefix expected.
+            assert_eq!(program, "/opt/test/evo-captive-probe");
+            assert_eq!(
+                args,
+                vec![
+                    "wlan0",
+                    "probe",
+                    "http://connectivitycheck.gstatic.com/generate_204",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn captive_probe_command_capport_get_uses_capport_mode() {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            "/opt/w/evo-captive-probe".to_string();
+        let cmd = p.captive_probe_command(
+            "wlan0",
+            "capport-get",
+            "https://portal.example/api",
+            &[],
+        );
+        let (_, args) = command_shape(&cmd);
+        assert!(args.iter().any(|a| a == "capport-get"));
+        assert!(args.iter().any(|a| a == "https://portal.example/api"));
+    }
+
+    #[test]
+    fn captive_probe_command_submit_appends_field_value_pairs_as_argv() {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            "/opt/w/evo-captive-probe".to_string();
+        let extra = ["username", "guest", "password", "hunter2 with spaces"];
+        let cmd = p.captive_probe_command(
+            "wlan0",
+            "submit",
+            "http://portal/login",
+            &extra,
+        );
+        let (_, args) = command_shape(&cmd);
+        // The wrapper (not the plugin) rewrites pairs into
+        // `--data-urlencode k=v`; the plugin's job is only to
+        // hand the raw pairs through as argv tokens so no
+        // shell interpolation touches operator input.
+        let url_idx = args
+            .iter()
+            .position(|a| a == "http://portal/login")
+            .expect("url present");
+        let tail: Vec<&str> =
+            args[url_idx + 1..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            vec!["username", "guest", "password", "hunter2 with spaces"]
+        );
+    }
+
+    #[test]
+    fn captive_probe_command_zero_field_submit_has_no_trailing_pairs() {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            "/opt/w/evo-captive-probe".to_string();
+        let cmd = p.captive_probe_command(
+            "wlan0",
+            "submit",
+            "http://portal/login",
+            &[],
+        );
+        let (_, args) = command_shape(&cmd);
+        let url_idx = args
+            .iter()
+            .position(|a| a == "http://portal/login")
+            .expect("url present");
+        assert_eq!(url_idx, args.len() - 1, "no trailing tokens after URL");
+    }
+
+    #[test]
+    fn captive_probe_command_submit_capport_json_mode_is_selected() {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            "/opt/w/evo-captive-probe".to_string();
+        let cmd = p.captive_probe_command(
+            "wlan0",
+            "submit-capport-json",
+            "https://portal/api",
+            &[],
+        );
+        let (_, args) = command_shape(&cmd);
+        assert!(args.iter().any(|a| a == "submit-capport-json"));
+    }
+
+    /// End-to-end: point `captive_probe_path` at a shell mock
+    /// that emits the `-w` template format on stdout; the plugin
+    /// must parse the two fields into
+    /// `(Option<u16>, Option<String>)`. Also serves as a
+    /// regression against silently prepending sudo when the test
+    /// user IS root (mock has no setuid bit); the mock is
+    /// callable directly.
+    #[tokio::test]
+    async fn captive_probe_bound_parses_wrapper_probe_stdout() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wrapper = dir.path().join("evo-captive-probe-mock.sh");
+        // Mock echoes the -w template shape irrespective of
+        // argv. Real wrapper validates ifname / URL first; that
+        // path is covered by shell tests, not this Rust test.
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nprintf '302|http://portal.example/login'\n",
+        )
+        .expect("write mock");
+        let mut perms = std::fs::metadata(&wrapper)
+            .expect("stat mock")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perms).expect("chmod mock");
+        // For the test to bypass sudo, we require test process
+        // to be running as EUID != 0? No — we require the OPPOSITE:
+        // the shell path is invoked directly. The plugin decides
+        // sudo based on `process_needs_sudo()` which returns
+        // false when EUID == 0 (rare in tests) OR when the
+        // configured binary is directly executable. In CI, EUID
+        // is non-root, so `process_needs_sudo() == true` and the
+        // plugin prepends `sudo -n /path/to/mock`. sudo will
+        // fail on the mock (no sudoers grant for arbitrary
+        // tempdir paths). Skip this branch of the test in
+        // unprivileged environments — the shape tests above
+        // still cover the argv build.
+        if nmcli_dispatch::process_needs_sudo() {
+            eprintln!(
+                "skipping captive_probe_bound end-to-end \
+                 (process_needs_sudo=true; sudoers grant not \
+                 available for tempdir mock)"
+            );
+            return;
+        }
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config.captive_probe_path =
+            wrapper.to_string_lossy().into_owned();
+        p.inner_mut().config.curl_timeout_ms = 5000;
+        let (http_code, effective_url) = p
+            .captive_probe_bound("wlan0", "http://any/probe")
+            .await
+            .expect("mock returns success");
+        assert_eq!(http_code, Some(302));
+        assert_eq!(
+            effective_url,
+            Some("http://portal.example/login".to_string())
+        );
     }
 }

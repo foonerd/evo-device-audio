@@ -34,6 +34,8 @@
 # Toggles:
 #   EVO_INSTALL_MPD_SUDOERS=0          — skip /etc/sudoers.d/evo-mpd-restart
 #   EVO_INSTALL_NETWORK_NM_SUDOERS=0   — skip /etc/sudoers.d/evo-network-nm
+#   EVO_INSTALL_NETWORK_CAPTIVE_SUDOERS=0 — skip /etc/sudoers.d/evo-network-captive
+#                                       + /usr/local/bin/evo-captive-probe
 #   EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skip /etc/sudoers.d/evo-hardware-audio
 #   EVO_INSTALL_SYSTEM_POWER_SUDOERS=0  — skip /etc/sudoers.d/evo-system-power
 #   EVO_INSTALL_DACS_CATALOGUE=0       — skip /usr/share/evo-device-audio/dacs.json install
@@ -78,6 +80,9 @@ SERVICE_USER=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
+NETWORK_CAPTIVE_SUDOERS_FILE="/etc/sudoers.d/evo-network-captive"
+CAPTIVE_PROBE_WRAPPER_SRC=""
+CAPTIVE_PROBE_WRAPPER_DST="/usr/local/bin/evo-captive-probe"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
 SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
 NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
@@ -380,6 +385,61 @@ if [[ "${EVO_INSTALL_NETWORK_NM_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $NETWORK_NM_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_NETWORK_NM_SUDOERS=0 — skipping network.nm sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1b2: /usr/local/bin/evo-captive-probe +
+#           /etc/sudoers.d/evo-network-captive
+# ----------------------------------------------------------
+# Install the narrow root-elevated captive-plane HTTP wrapper
+# used by org.evoframework.network to force captive-portal
+# probes / capport-API GETs / operator form submits to egress
+# via a specific interface (SO_BINDTODEVICE). Curl cannot
+# call SO_BINDTODEVICE without CAP_NET_RAW, so the plugin —
+# which runs as an unprivileged service user — reaches this
+# wrapper via `sudo -n`. The wrapper is the trust boundary:
+# it hardcodes safe curl flags and validates ifname / URL
+# scheme before invocation, so a broad `NOPASSWD: curl` rule
+# is unnecessary (and would be far too wide).
+#
+# Both artefacts install together — an installed sudoers
+# grant without the wrapper binary would break every captive
+# detection; an installed wrapper without the sudoers grant
+# would leave every captive detection hung on a password
+# prompt.
+if [[ "${EVO_INSTALL_NETWORK_CAPTIVE_SUDOERS:-1}" != "0" ]]; then
+    CAPTIVE_PROBE_WRAPPER_SRC="$DIST_DIR/bin/evo-captive-probe"
+    if [[ ! -f "$CAPTIVE_PROBE_WRAPPER_SRC" ]]; then
+        echo "captive-probe wrapper not found at $CAPTIVE_PROBE_WRAPPER_SRC" >&2
+        exit 2
+    fi
+    install -m 0755 -o root -g root \
+        "$CAPTIVE_PROBE_WRAPPER_SRC" "$CAPTIVE_PROBE_WRAPPER_DST"
+    echo "[bootstrap] installed $CAPTIVE_PROBE_WRAPPER_DST"
+
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-network-captive.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+
+    install -m 0440 -o root -g root "$TMP" "$NETWORK_CAPTIVE_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $NETWORK_CAPTIVE_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_NETWORK_CAPTIVE_SUDOERS=0 — skipping captive-probe wrapper + sudoers drop-in"
 fi
 
 # ----------------------------------------------------------

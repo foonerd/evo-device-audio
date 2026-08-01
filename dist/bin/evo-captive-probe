@@ -1,0 +1,195 @@
+#!/bin/sh
+# evo-captive-probe — narrow root-elevated captive-plane HTTP.
+#
+# The org.evoframework.network plugin uses this wrapper to force
+# captive-portal traffic to egress through a specific network
+# interface (SO_BINDTODEVICE), which curl cannot do when invoked
+# without CAP_NET_RAW / root.
+#
+# Rationale: `curl --interface <IP>` only sets the source IP;
+# the kernel still picks the egress by routing table, so on a
+# device with two uplinks (e.g. eth0 admin + wlan0 captive
+# segment) a wlan0-source-bound probe still leaves via eth0
+# when eth0 owns the default route — and never sees the portal.
+# `curl --interface <ifname>` (device name, not IP) sets
+# SO_BINDTODEVICE, which forces egress via that interface but
+# requires root. This wrapper is the elevation boundary.
+#
+# Usage:
+#   evo-captive-probe <ifname> <mode> <url> [field value]...
+#
+#   ifname   Kernel interface name (wlan0 / wlan1 / ...).
+#            Validated against /sys/class/net so a bad arg
+#            fails before touching curl.
+#   mode     One of:
+#              probe                — GET probe, `-w`
+#                                     `%{http_code}|%{url_effective}`
+#                                     to stdout, no body, --max-time 20.
+#              capport-get          — GET with `Accept:
+#                                     application/captive+json`
+#                                     (RFC 8908), response body to
+#                                     stdout, --max-time 10.
+#              submit               — POST with `--data-urlencode
+#                                     field=value` per key/value
+#                                     pair on argv, `-w` metrics to
+#                                     stdout, no body, --max-time 25.
+#              submit-capport-json  — as submit, plus both
+#                                     `Accept: application/captive+json`
+#                                     and `Content-Type:
+#                                     application/captive+json`
+#                                     headers.
+#   url      http:// or https:// only. Any other scheme is
+#            rejected before invocation.
+#   field    Form-field name (submit modes only). Followed by
+#   value    the field value. Pairs may repeat.
+#
+# All operator-supplied inputs (ifname, url, field, value) are
+# passed through Rust's `Command::args`, so no shell
+# interpolation occurs anywhere on the path — the wrapper does
+# not need to defend against shell injection, only against
+# curl-flag smuggling. Field/value pairs are assembled INSIDE
+# the wrapper into `--data-urlencode "k=v"` tokens — the
+# operator never gets to name a curl flag themselves, only a
+# form field.
+#
+# Exit codes: 0 on curl success, 2 on argv-validation failure,
+# any other non-zero on curl failure (propagated).
+#
+# Sudoers grant (installed by bootstrap.sh from
+# dist/sudoers.d/evo-network-captive.in) restricts the service
+# user to NOPASSWD invocation of this path only — the wrapper
+# is the trust boundary, exactly the pattern already used for
+# nmcli / iw / rfkill.
+
+set -eu
+
+CURL_BIN="/usr/bin/curl"
+
+if [ ! -x "$CURL_BIN" ]; then
+    echo "evo-captive-probe: $CURL_BIN not found or not executable" >&2
+    exit 2
+fi
+
+if [ "$#" -lt 3 ]; then
+    echo "usage: evo-captive-probe <ifname> <mode> <url> [field value]..." >&2
+    exit 2
+fi
+
+IFNAME="$1"
+MODE="$2"
+URL="$3"
+shift 3
+
+case "$IFNAME" in
+    ''|.*|*/*|*[!A-Za-z0-9_.-]*)
+        echo "evo-captive-probe: invalid ifname: $IFNAME" >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -e "/sys/class/net/$IFNAME" ]; then
+    echo "evo-captive-probe: interface $IFNAME does not exist" >&2
+    exit 2
+fi
+
+case "$MODE" in
+    probe|capport-get|submit|submit-capport-json) : ;;
+    *)
+        echo "evo-captive-probe: unknown mode: $MODE" >&2
+        exit 2
+        ;;
+esac
+
+case "$URL" in
+    http://*|https://*) : ;;
+    *)
+        echo "evo-captive-probe: url must be http:// or https://" >&2
+        exit 2
+        ;;
+esac
+
+case "$MODE" in
+    probe|capport-get)
+        if [ "$#" -ne 0 ]; then
+            echo "evo-captive-probe: field/value pairs only valid in submit modes" >&2
+            exit 2
+        fi
+        ;;
+    submit|submit-capport-json)
+        if [ "$(( $# % 2 ))" -ne 0 ]; then
+            echo "evo-captive-probe: submit modes require paired field value args" >&2
+            exit 2
+        fi
+        ;;
+esac
+
+# Assemble curl argv into $@ in-place. Each `set --` call
+# fully replaces positional args; use `"$@"` to preserve
+# previously-set tokens so no string concatenation touches
+# operator input.
+case "$MODE" in
+
+    probe)
+        set -- \
+            -sS -L \
+            -o /dev/null \
+            -w '%{http_code}|%{url_effective}' \
+            --max-time 20 \
+            --interface "$IFNAME" \
+            "$URL"
+        exec "$CURL_BIN" "$@"
+        ;;
+
+    capport-get)
+        set -- \
+            -sS -L \
+            --max-time 10 \
+            --interface "$IFNAME" \
+            -H 'Accept: application/captive+json' \
+            "$URL"
+        exec "$CURL_BIN" "$@"
+        ;;
+
+    submit|submit-capport-json)
+        # Positional args currently hold N field/value pairs.
+        # Rewrite each pair into a `--data-urlencode "k=v"` token
+        # pair. Consume from the front, append to the back; a
+        # counter tracks the ORIGINAL pair count so the loop
+        # terminates (each iteration nets zero change in $#).
+        pairs_remaining=$#
+        while [ "$pairs_remaining" -ge 2 ]; do
+            k="$1"
+            v="$2"
+            shift 2
+            set -- "$@" --data-urlencode "${k}=${v}"
+            pairs_remaining=$((pairs_remaining - 2))
+        done
+
+        # Step 2: prepend the fixed curl flags + trailing URL.
+        if [ "$MODE" = "submit-capport-json" ]; then
+            set -- \
+                -sS -L \
+                -o /dev/null \
+                -w '%{http_code}|%{url_effective}' \
+                --max-time 25 \
+                --interface "$IFNAME" \
+                -X POST \
+                -H 'Accept: application/captive+json' \
+                -H 'Content-Type: application/captive+json' \
+                "$@" \
+                "$URL"
+        else
+            set -- \
+                -sS -L \
+                -o /dev/null \
+                -w '%{http_code}|%{url_effective}' \
+                --max-time 25 \
+                --interface "$IFNAME" \
+                -X POST \
+                "$@" \
+                "$URL"
+        fi
+        exec "$CURL_BIN" "$@"
+        ;;
+
+esac

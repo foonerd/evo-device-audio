@@ -1,0 +1,52 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-network-captive with mode
+# 0440, owned root:root.
+#
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to a single wrapper binary:
+#
+#   /usr/local/bin/evo-captive-probe
+#
+# The wrapper (shipped from dist/bin/evo-captive-probe and
+# installed by bootstrap.sh) is the sole path by which the
+# org.evoframework.network plugin performs captive-plane HTTP
+# GETs bound to a specific interface (SO_BINDTODEVICE), which
+# curl cannot do without CAP_NET_RAW / root.
+#
+# Why the wrapper instead of a bare `NOPASSWD: /usr/bin/curl`
+# rule: curl accepts every URL, method, header, output path,
+# and file-write flag — a broad curl grant would give the
+# service user root-equivalent egress + filesystem access. The
+# wrapper hardcodes safe flags (`-sS -L`, `--max-time`, a
+# fixed `-w` template, `-o /dev/null` on the probe path) and
+# validates its inputs (ifname must resolve under
+# /sys/class/net; URL must be http:// or https://) before
+# reaching curl. The wrapper binary is the operator-relevant
+# trust boundary; the sudoers grant tracks that boundary.
+#
+# The `Defaults!EVO_CAPTIVE_PROBE !pam_session, !syslog` line
+# below suppresses PAM session open/close journal entries for
+# this alias (the wrapper fires on every captive detection
+# tick / every operator-facing status refresh — 3 journal
+# lines per invocation is pure litter for a scoped grant).
+# Any invocation outside the alias retains full audit logging.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh --install-network-captive-sudoers
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-network-captive.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-network-captive
+#
+# `visudo -c -f /etc/sudoers.d/evo-network-captive` verifies
+# syntactically valid sudoers.
+
+Cmnd_Alias EVO_CAPTIVE_PROBE = \
+    /usr/local/bin/evo-captive-probe
+
+Defaults!EVO_CAPTIVE_PROBE !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_CAPTIVE_PROBE
