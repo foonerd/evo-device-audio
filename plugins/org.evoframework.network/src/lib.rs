@@ -751,6 +751,196 @@ fn netdev_mac_last4_lower() -> Option<String> {
     None
 }
 
+/// Parse an `IP4.ROUTE[N]` value from `nmcli device show`
+/// into a structured `Ip4Route`. nmcli emits routes in the
+/// form:
+///   `dst = 0.0.0.0/0, nh = 192.168.30.254, mt = 100`
+/// Fields may be re-ordered by NM version; we scan for `dst =`
+/// / `nh =` / `mt =` regardless of position. Empty next-hop
+/// means the route is on-link. `metric` absent when NM does
+/// not report one.
+fn parse_nm_route4(raw: &str) -> Option<Ip4Route> {
+    let mut r = Ip4Route::default();
+    for part in raw.split(',') {
+        let part = part.trim();
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "dst" => r.dst = v.trim().to_string(),
+            "nh" => r.next_hop = v.trim().to_string(),
+            "mt" | "metric" => r.metric = v.trim().parse::<u32>().ok(),
+            _ => {}
+        }
+    }
+    if r.dst.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// Enrich a `LinkInfo` with kernel-native fields via
+/// `/sys/class/net/<ifname>/`. Runs after nmcli-derived fields
+/// (MAC/MTU) are already set so we only overwrite when sysfs
+/// has richer / more accurate data. Values missing from sysfs
+/// (e.g. `speed` unreadable on wifi / loopback / virtual) are
+/// left `None`. Errors are swallowed — this is a diagnostic
+/// enrichment, never a failure path.
+fn enrich_link_from_sysfs(ifname: &str, link: &mut LinkInfo) {
+    let base = std::path::Path::new("/sys/class/net").join(ifname);
+    if link.mac.is_empty() {
+        if let Ok(s) = std::fs::read_to_string(base.join("address")) {
+            link.mac = s.trim().to_string();
+        }
+    }
+    if link.mtu.is_none() {
+        if let Ok(s) = std::fs::read_to_string(base.join("mtu")) {
+            link.mtu = s.trim().parse::<u32>().ok();
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string(base.join("speed")) {
+        // Speed reports `-1` on interfaces where it's not
+        // meaningful (wifi, loopback, virtual). Only surface
+        // positive values.
+        if let Ok(v) = s.trim().parse::<i64>() {
+            if v > 0 {
+                link.speed_mbps = Some(v as u64);
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string(base.join("duplex")) {
+        let d = s.trim();
+        if !d.is_empty() && d != "unknown" {
+            link.duplex = Some(d.to_string());
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string(base.join("carrier")) {
+        link.carrier = Some(s.trim() == "1");
+    }
+    // Driver: `readlink /sys/class/net/<ifname>/device/driver`
+    // yields `.../drivers/<driver-name>`; take the basename.
+    if let Ok(target) = std::fs::read_link(base.join("device/driver")) {
+        if let Some(name) = target.file_name().and_then(|s| s.to_str()) {
+            link.driver = Some(name.to_string());
+        }
+    }
+    let stats = base.join("statistics");
+    for (field, target) in [
+        ("rx_bytes", &mut link.rx_bytes),
+        ("tx_bytes", &mut link.tx_bytes),
+        ("rx_packets", &mut link.rx_packets),
+        ("tx_packets", &mut link.tx_packets),
+    ] {
+        if target.is_none() {
+            if let Ok(s) = std::fs::read_to_string(stats.join(field)) {
+                *target = s.trim().parse::<u64>().ok();
+            }
+        }
+    }
+}
+
+/// Parse `iw dev <ifname> link` output into a `WifiInfo`.
+/// Format when associated:
+///
+/// ```text
+/// Connected to 00:11:22:33:44:55 (on wlan0)
+///         SSID: G(uest) Spot
+///         freq: 5180
+///         signal: -58 dBm
+///         tx bitrate: 173.3 MBit/s
+/// ```
+///
+/// Every field is best-effort — a driver that omits e.g.
+/// `signal` leaves `signal_dbm` as `None`. Band + channel
+/// derived from freq.
+fn parse_iw_link(raw: &str) -> WifiInfo {
+    let mut w = WifiInfo::default();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Connected to ") {
+            if let Some(mac) = rest.split_whitespace().next() {
+                w.bssid = mac.to_ascii_lowercase();
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("SSID:") {
+            w.ssid = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("freq:") {
+            if let Ok(mhz) = rest.trim().parse::<u32>() {
+                w.freq_mhz = Some(mhz);
+                w.channel = channel_from_freq_mhz(mhz);
+                w.band = band_label_from_freq(mhz);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("signal:") {
+            // Format: `-58 dBm` — take the leading integer.
+            let n: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            if let Ok(dbm) = n.parse::<i32>() {
+                w.signal_dbm = Some(dbm);
+                w.signal_pct = Some(signal_pct_from_dbm(dbm));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("tx bitrate:") {
+            // Format: `173.3 MBit/s ...` — take the first float
+            // and truncate to Mbps.
+            let n: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(f) = n.parse::<f64>() {
+                w.bitrate_mbps = Some(f as u32);
+            }
+        }
+    }
+    w
+}
+
+fn channel_from_freq_mhz(mhz: u32) -> Option<u32> {
+    // Standard 2.4 GHz + 5 GHz + 6 GHz channel derivations.
+    if (2412..=2472).contains(&mhz) {
+        Some((mhz - 2407) / 5)
+    } else if mhz == 2484 {
+        Some(14)
+    } else if (5000..=5895).contains(&mhz) {
+        Some((mhz - 5000) / 5)
+    } else if (5925..=7125).contains(&mhz) {
+        Some((mhz - 5950) / 5 + 1)
+    } else {
+        None
+    }
+}
+
+fn band_label_from_freq(mhz: u32) -> String {
+    if (2400..=2500).contains(&mhz) {
+        "2.4ghz".to_string()
+    } else if (5000..=5900).contains(&mhz) {
+        "5ghz".to_string()
+    } else if (5925..=7125).contains(&mhz) {
+        "6ghz".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Map dBm signal strength to a 0-100 percentage using the
+/// linear approximation NM itself uses:
+///   -50 dBm or better → 100%
+///   -100 dBm or worse → 0%
+///   linear in between.
+fn signal_pct_from_dbm(dbm: i32) -> u8 {
+    if dbm >= -50 {
+        100
+    } else if dbm <= -100 {
+        0
+    } else {
+        (2 * (dbm + 100)) as u8
+    }
+}
+
 /// Normalise NM's `GENERAL.STATE` text from `device show`.
 /// nmcli reports state as `"<numeric> (<text>)"`, e.g.
 /// `"100 (connected)"` or `"30 (disconnected)"`. We surface
@@ -1015,20 +1205,193 @@ async fn run_command_output_with_timeout(
     }
 }
 
-#[derive(Debug, Serialize)]
+/// Universal per-interface device row surfaced on
+/// `network.nm.status.devices[]`. Covers every kind
+/// NetworkManager can enumerate — ethernet, wifi (STA + AP
+/// via `ap0` vif), bluetooth PAN (`bnep*`), bridges, VLANs,
+/// tun/tap, WireGuard, loopback, wifi-p2p — with the same
+/// self-describing shape. Sub-objects are `None` when they
+/// do not apply to the interface class (a loopback has no
+/// wifi block; a disconnected iface has no ip4 addresses).
+///
+/// All fields are optional at the wire so consumers can grow
+/// incrementally without a shape-break: adding a new field
+/// carries the same serde discipline (skip_serializing_if =
+/// "Option::is_none" on Option, Vec::is_empty on Vec).
+#[derive(Debug, Serialize, Default)]
 struct DeviceRow {
     device: String,
     kind: String,
     state: String,
     connection: String,
-    /// Primary IPv4 address in CIDR form (`192.168.30.24/24`),
-    /// or `None` when the device has no v4 lease (unavailable /
-    /// disconnected / v6-only). Sourced from
-    /// `IP4.ADDRESS[1]` on `nmcli device show`. Multi-address
-    /// interfaces surface only the primary — the info page needs
-    /// one line per device, not an address list.
+    /// L2 / physical link — MAC, MTU, driver, carrier,
+    /// counters, and (for ethernet) speed + duplex. Sourced
+    /// from `nmcli device show`'s GENERAL.HWADDR/MTU + kernel
+    /// sysfs (`/sys/class/net/<ifname>/`). Present for every
+    /// real or virtual netdev; loopback carries carrier=true
+    /// and zeroed physical fields.
     #[serde(skip_serializing_if = "Option::is_none")]
-    ip4: Option<String>,
+    link: Option<LinkInfo>,
+    /// Integrated IPv4 view — DHCP or static both surface the
+    /// same shape (the effective addressing on the interface
+    /// right now). `method` labels the origin from the
+    /// connection profile: `auto` (DHCP) / `manual` (static) /
+    /// `disabled` / `link-local`. `dhcp` sub-block present
+    /// iff method=auto AND a lease is held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip4: Option<Ip4Info>,
+    /// Integrated IPv6 view — SLAAC / DHCPv6 / static all
+    /// surface the same shape. `method` = `auto` (SLAAC) /
+    /// `dhcp` (DHCPv6) / `manual` / `disabled` / `link-local`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip6: Option<Ip6Info>,
+    /// Wi-Fi runtime — SSID / BSSID / signal / bitrate /
+    /// band / channel / frequency / security. Present only
+    /// when kind == "wifi" AND the interface is associated
+    /// (STA connected, or AP up). Sourced from `iw dev
+    /// <ifname> link` + `iw dev <ifname> info`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wifi: Option<WifiInfo>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct LinkInfo {
+    /// Hardware MAC (`GENERAL.HWADDR` on nmcli, or
+    /// `/sys/class/net/<ifname>/address`). Empty for
+    /// interfaces without a MAC (some tunnels).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    mac: String,
+    /// MTU in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtu: Option<u32>,
+    /// Link speed in Mbps — kernel-reported for ethernet
+    /// (`/sys/class/net/<ifname>/speed`). `None` for wifi
+    /// (see `wifi.bitrate_mbps` for the active bitrate) and
+    /// virtual interfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_mbps: Option<u64>,
+    /// Duplex string (`full` / `half`) for ethernet;
+    /// `None` for wifi / virtual.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duplex: Option<String>,
+    /// Kernel driver name (`bcmgenet`, `brcmfmac`, `iwlwifi`,
+    /// `virtio_net`, ...). Sourced from
+    /// `/sys/class/net/<ifname>/device/driver` symlink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver: Option<String>,
+    /// Carrier bit — `true` when the link is physically up
+    /// (cable inserted for ethernet, associated for wifi).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carrier: Option<bool>,
+    /// Kernel counters. `None` when unreadable (rare).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rx_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rx_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_packets: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct Ip4Info {
+    /// Origin label from the connection profile
+    /// (`ipv4.method`): `auto` (DHCP) / `manual` (static) /
+    /// `disabled` / `link-local` / `shared`. Empty when no
+    /// connection profile is bound (interface is unmanaged
+    /// or in the transitional state).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    method: String,
+    /// All addresses in CIDR form. Multi-address interfaces
+    /// carry the full set in nmcli order (primary first).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<String>,
+    /// Default gateway for this interface (empty when the
+    /// interface has no default route via itself).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    gateway: String,
+    /// DNS servers this interface's connection provides.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns: Vec<String>,
+    /// DNS search domains from this interface's connection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    domains: Vec<String>,
+    /// Routes carried by this interface. `next_hop` is empty
+    /// for on-link routes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    routes: Vec<Ip4Route>,
+    /// DHCP lease details. Present iff `method == "auto"` AND
+    /// a lease is currently held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dhcp: Option<Ip4Dhcp>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct Ip4Route {
+    dst: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    next_hop: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct Ip4Dhcp {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    server: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_time_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_epoch: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct Ip6Info {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    method: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    gateway: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    domains: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct WifiInfo {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    ssid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bssid: String,
+    /// Received signal strength in dBm (typical range -30
+    /// strong to -90 weak). Sourced from `iw dev <ifname>
+    /// link`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal_dbm: Option<i32>,
+    /// Normalised 0-100 signal strength derived from dBm.
+    /// UI convention: percentage bars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal_pct: Option<u8>,
+    /// Active bitrate in Mbps (Rx or symmetric per driver).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitrate_mbps: Option<u32>,
+    /// Band label — `2.4ghz` / `5ghz` / `6ghz`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    band: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freq_mhz: Option<u32>,
+    /// Security label — `open` / `wep` / `wpa2` / `wpa3` /
+    /// `owe`. Best-effort — surfaced from nmcli when the
+    /// active connection carries it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    security: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hidden: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3148,59 +3511,264 @@ impl NmInner {
         // (`connected` / `disconnected` / `unavailable` / ...)
         // so downstream consumers see the same string shape as
         // the summary command's STATE column produced.
+        // Full-field query: identity + link + integrated IP4 +
+        // integrated IP6 + DHCP4 (raw options). Same block-per-
+        // device shape as before; the block just carries more
+        // keys we now parse. Fields NM cannot produce for a
+        // given device (e.g. IP4.* on a disconnected iface,
+        // DHCP4 on a static profile) simply appear as
+        // `KEY:` with an empty value or are absent — the parser
+        // treats both as "field not present".
         let raw = self
             .nmcli_output(&[
                 "-t",
                 "-f",
                 "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,\
-                 GENERAL.CONNECTION,IP4.ADDRESS",
+                 GENERAL.CONNECTION,GENERAL.HWADDR,GENERAL.MTU,\
+                 IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,IP4.ROUTE,\
+                 IP6.ADDRESS,IP6.GATEWAY,IP6.DNS,IP6.DOMAIN,IP6.ROUTE,\
+                 DHCP4",
                 "device",
                 "show",
             ])
             .await?;
         let mut rows = Vec::new();
         let mut current: Option<DeviceRow> = None;
+        let mut cur_ip4: Ip4Info = Ip4Info::default();
+        let mut cur_ip6: Ip6Info = Ip6Info::default();
+        let mut cur_link: LinkInfo = LinkInfo::default();
+        let mut cur_dhcp: Ip4Dhcp = Ip4Dhcp::default();
+        let mut cur_has_dhcp = false;
         for line in raw.lines() {
             let trimmed = line.trim_end();
             if trimmed.is_empty() {
-                if let Some(row) = current.take() {
+                // Block boundary — flush the current row.
+                if let Some(mut row) = current.take() {
                     if !row.device.is_empty() {
+                        row.link = Some(std::mem::take(&mut cur_link));
+                        if !cur_ip4.addresses.is_empty()
+                            || !cur_ip4.gateway.is_empty()
+                            || !cur_ip4.dns.is_empty()
+                            || cur_has_dhcp
+                        {
+                            if cur_has_dhcp {
+                                cur_ip4.dhcp =
+                                    Some(std::mem::take(&mut cur_dhcp));
+                            }
+                            row.ip4 = Some(std::mem::take(&mut cur_ip4));
+                        }
+                        if !cur_ip6.addresses.is_empty()
+                            || !cur_ip6.gateway.is_empty()
+                            || !cur_ip6.dns.is_empty()
+                        {
+                            row.ip6 = Some(std::mem::take(&mut cur_ip6));
+                        }
                         rows.push(row);
                     }
                 }
+                // Reset accumulators for the next block. The
+                // Ip4/Ip6/Link/Dhcp taken above are already
+                // Default; overwrite unconditionally so the
+                // next iteration starts clean.
+                cur_ip4 = Ip4Info::default();
+                cur_ip6 = Ip6Info::default();
+                cur_link = LinkInfo::default();
+                cur_dhcp = Ip4Dhcp::default();
+                cur_has_dhcp = false;
                 continue;
             }
             let (key, value) = match trimmed.split_once(':') {
                 Some((k, v)) => (k.trim(), v.trim()),
                 None => continue,
             };
-            let row = current.get_or_insert_with(|| DeviceRow {
-                device: String::new(),
-                kind: String::new(),
-                state: String::new(),
-                connection: String::new(),
-                ip4: None,
-            });
+            let row = current.get_or_insert_with(DeviceRow::default);
             match key {
                 "GENERAL.DEVICE" => row.device = value.to_string(),
                 "GENERAL.TYPE" => row.kind = value.to_string(),
                 "GENERAL.STATE" => row.state = nm_state_text(value),
                 "GENERAL.CONNECTION" => row.connection = value.to_string(),
-                k if (k == "IP4.ADDRESS[1]" || k == "IP4.ADDRESS")
-                    && row.ip4.is_none()
-                    && !value.is_empty() =>
-                {
-                    row.ip4 = Some(value.to_string());
+                "GENERAL.HWADDR" => cur_link.mac = value.to_string(),
+                "GENERAL.MTU" => {
+                    cur_link.mtu = value.parse::<u32>().ok();
+                }
+                k if k.starts_with("IP4.ADDRESS") && !value.is_empty() => {
+                    cur_ip4.addresses.push(value.to_string());
+                }
+                "IP4.GATEWAY" if !value.is_empty() => {
+                    cur_ip4.gateway = value.to_string();
+                }
+                k if k.starts_with("IP4.DNS") && !value.is_empty() => {
+                    cur_ip4.dns.push(value.to_string());
+                }
+                k if k.starts_with("IP4.DOMAIN") && !value.is_empty() => {
+                    cur_ip4.domains.push(value.to_string());
+                }
+                k if k.starts_with("IP4.ROUTE") && !value.is_empty() => {
+                    if let Some(route) = parse_nm_route4(value) {
+                        cur_ip4.routes.push(route);
+                    }
+                }
+                k if k.starts_with("IP6.ADDRESS") && !value.is_empty() => {
+                    cur_ip6.addresses.push(value.to_string());
+                }
+                "IP6.GATEWAY" if !value.is_empty() => {
+                    cur_ip6.gateway = value.to_string();
+                }
+                k if k.starts_with("IP6.DNS") && !value.is_empty() => {
+                    cur_ip6.dns.push(value.to_string());
+                }
+                k if k.starts_with("IP6.DOMAIN") && !value.is_empty() => {
+                    cur_ip6.domains.push(value.to_string());
+                }
+                k if k.starts_with("DHCP4.OPTION") && !value.is_empty() => {
+                    // Option format: `option_name = value`.
+                    // We surface a small subset — server, lease
+                    // time, expiry — the rest stays on the
+                    // wire only in future extensions.
+                    cur_has_dhcp = true;
+                    if let Some((opt_key, opt_val)) = value.split_once('=') {
+                        let opt_key = opt_key.trim();
+                        let opt_val = opt_val.trim();
+                        match opt_key {
+                            "dhcp_server_identifier" => {
+                                cur_dhcp.server = opt_val.to_string();
+                            }
+                            "dhcp_lease_time" => {
+                                cur_dhcp.lease_time_sec =
+                                    opt_val.parse::<u64>().ok();
+                            }
+                            "expiry" => {
+                                cur_dhcp.expires_at_epoch =
+                                    opt_val.parse::<u64>().ok();
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-        if let Some(row) = current.take() {
+        if let Some(mut row) = current.take() {
             if !row.device.is_empty() {
+                row.link = Some(std::mem::take(&mut cur_link));
+                if !cur_ip4.addresses.is_empty()
+                    || !cur_ip4.gateway.is_empty()
+                    || !cur_ip4.dns.is_empty()
+                    || cur_has_dhcp
+                {
+                    if cur_has_dhcp {
+                        cur_ip4.dhcp = Some(std::mem::take(&mut cur_dhcp));
+                    }
+                    row.ip4 = Some(std::mem::take(&mut cur_ip4));
+                }
+                if !cur_ip6.addresses.is_empty()
+                    || !cur_ip6.gateway.is_empty()
+                    || !cur_ip6.dns.is_empty()
+                {
+                    row.ip6 = Some(std::mem::take(&mut cur_ip6));
+                }
                 rows.push(row);
             }
         }
+        // Enrich every row with kernel-native link stats,
+        // per-profile method label, and wifi runtime.
+        for row in rows.iter_mut() {
+            enrich_link_from_sysfs(
+                &row.device,
+                row.link.get_or_insert_with(LinkInfo::default),
+            );
+            if !row.connection.is_empty() {
+                let (m4, m6) =
+                    self.nm_connection_methods(&row.connection).await;
+                if let Some(ip4) = row.ip4.as_mut() {
+                    if !m4.is_empty() {
+                        ip4.method = m4;
+                    }
+                } else if !m4.is_empty() {
+                    row.ip4 = Some(Ip4Info {
+                        method: m4,
+                        ..Ip4Info::default()
+                    });
+                }
+                if let Some(ip6) = row.ip6.as_mut() {
+                    if !m6.is_empty() {
+                        ip6.method = m6;
+                    }
+                } else if !m6.is_empty() {
+                    row.ip6 = Some(Ip6Info {
+                        method: m6,
+                        ..Ip6Info::default()
+                    });
+                }
+            }
+            if row.kind == "wifi" {
+                if let Some(wifi) = self.wifi_runtime_for(&row.device).await {
+                    row.wifi = Some(wifi);
+                }
+            }
+        }
         Ok(rows)
+    }
+
+    /// Read `ipv4.method` and `ipv6.method` from an NM
+    /// connection profile in one call. Returns
+    /// `(ipv4_method, ipv6_method)` as bare strings (`auto` /
+    /// `manual` / `disabled` / `link-local` / `shared`), or
+    /// empty strings on failure. Best-effort: the caller
+    /// tolerates an empty method label.
+    async fn nm_connection_methods(&self, con_name: &str) -> (String, String) {
+        let raw = match self
+            .nmcli_output(&[
+                "-t",
+                "-f",
+                "ipv4.method,ipv6.method",
+                "connection",
+                "show",
+                con_name,
+            ])
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return (String::new(), String::new()),
+        };
+        let mut m4 = String::new();
+        let mut m6 = String::new();
+        for line in raw.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            match k.trim() {
+                "ipv4.method" => m4 = v.trim().to_string(),
+                "ipv6.method" => m6 = v.trim().to_string(),
+                _ => {}
+            }
+        }
+        (m4, m6)
+    }
+
+    /// Fetch wifi runtime info via `iw dev <ifname> link` +
+    /// `iw dev <ifname> info`. Only invoked when the device
+    /// row's kind is `wifi`. Returns `None` when the interface
+    /// is not associated or `iw` refuses (unauthorised /
+    /// missing binary).
+    async fn wifi_runtime_for(&self, ifname: &str) -> Option<WifiInfo> {
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let link_raw = wifi_phy::iw_output(
+            iw_exec.as_ref(),
+            &self.config.iw_path,
+            &["dev", ifname, "link"],
+            timeout,
+        )
+        .await
+        .ok()?;
+        // `iw dev <ifname> link` on a not-associated interface
+        // returns "Not connected." — treat that as no wifi
+        // runtime.
+        if link_raw.trim().starts_with("Not connected") {
+            return None;
+        }
+        Some(parse_iw_link(&link_raw))
     }
 
     async fn wifi_scan(
@@ -7323,8 +7891,8 @@ version = 1
             format!(
                 "#!/usr/bin/env bash\n\
 echo \"$@\" >> \"{}\"\n\
-if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
-  printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-wifi-sta\\nIP4.ADDRESS[1]:10.0.0.2/24\\n'\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == GENERAL.DEVICE* && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-wifi-sta\\nGENERAL.HWADDR:AA:BB:CC:DD:EE:FF\\nGENERAL.MTU:1500\\nIP4.ADDRESS[1]:10.0.0.2/24\\n'\n\
   exit 0\n\
 fi\n\
 if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
@@ -7629,7 +8197,7 @@ exit 0\n",
         std::fs::write(
             &nmcli_path,
             "#!/usr/bin/env bash\n\
-if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == \"GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == GENERAL.DEVICE* && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
   echo \"device-table-failed\" 1>&2\n\
   exit 10\n\
 fi\n\
@@ -8147,6 +8715,100 @@ exit 0\n",
     // -----------------------------------------------------------
     // `device show` STATE normaliser + IP4.ADDRESS extraction.
     // -----------------------------------------------------------
+
+    // -----------------------------------------------------------
+    // Universal device-info parsers (routes / iw link / freq).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn parse_nm_route4_full_form() {
+        let r =
+            parse_nm_route4("dst = 0.0.0.0/0, nh = 192.168.30.254, mt = 100")
+                .expect("route");
+        assert_eq!(r.dst, "0.0.0.0/0");
+        assert_eq!(r.next_hop, "192.168.30.254");
+        assert_eq!(r.metric, Some(100));
+    }
+
+    #[test]
+    fn parse_nm_route4_on_link_no_next_hop() {
+        let r =
+            parse_nm_route4("dst = 192.168.30.0/24, nh = 0.0.0.0, mt = 100")
+                .expect("route");
+        assert_eq!(r.dst, "192.168.30.0/24");
+        // "0.0.0.0" is retained verbatim from nmcli; the wire
+        // consumer distinguishes on-link vs remote by dst
+        // prefix, not by treating 0.0.0.0 specially.
+        assert_eq!(r.next_hop, "0.0.0.0");
+    }
+
+    #[test]
+    fn parse_nm_route4_reject_empty_dst() {
+        assert!(parse_nm_route4("nh = 192.168.1.1").is_none());
+    }
+
+    #[test]
+    fn parse_iw_link_full_associated() {
+        let raw = "Connected to aa:11:22:33:44:55 (on wlan0)\n\
+                   \tSSID: G(uest) Spot\n\
+                   \tfreq: 5180\n\
+                   \tsignal: -58 dBm\n\
+                   \ttx bitrate: 173.3 MBit/s\n";
+        let w = parse_iw_link(raw);
+        assert_eq!(w.bssid, "aa:11:22:33:44:55");
+        assert_eq!(w.ssid, "G(uest) Spot");
+        assert_eq!(w.freq_mhz, Some(5180));
+        assert_eq!(w.channel, Some(36));
+        assert_eq!(w.band, "5ghz");
+        assert_eq!(w.signal_dbm, Some(-58));
+        assert!(w.signal_pct.is_some() && w.signal_pct.unwrap() > 0);
+        assert_eq!(w.bitrate_mbps, Some(173));
+    }
+
+    #[test]
+    fn parse_iw_link_partial_fields_ok() {
+        // A driver that omits e.g. bitrate must still parse
+        // cleanly and leave that field None.
+        let raw = "Connected to aa:11:22:33:44:55 (on wlan0)\n\
+                   \tSSID: MyNet\n\
+                   \tfreq: 2412\n";
+        let w = parse_iw_link(raw);
+        assert_eq!(w.freq_mhz, Some(2412));
+        assert_eq!(w.channel, Some(1));
+        assert_eq!(w.band, "2.4ghz");
+        assert!(w.bitrate_mbps.is_none());
+        assert!(w.signal_dbm.is_none());
+    }
+
+    #[test]
+    fn channel_from_freq_covers_common_channels() {
+        assert_eq!(channel_from_freq_mhz(2412), Some(1));
+        assert_eq!(channel_from_freq_mhz(2437), Some(6));
+        assert_eq!(channel_from_freq_mhz(2462), Some(11));
+        assert_eq!(channel_from_freq_mhz(2484), Some(14));
+        assert_eq!(channel_from_freq_mhz(5180), Some(36));
+        assert_eq!(channel_from_freq_mhz(5745), Some(149));
+        assert_eq!(channel_from_freq_mhz(5955), Some(2)); // 6 GHz ch 2
+    }
+
+    #[test]
+    fn band_label_covers_common_bands() {
+        assert_eq!(band_label_from_freq(2412), "2.4ghz");
+        assert_eq!(band_label_from_freq(5180), "5ghz");
+        assert_eq!(band_label_from_freq(5955), "6ghz");
+        assert_eq!(band_label_from_freq(1000), "");
+    }
+
+    #[test]
+    fn signal_pct_from_dbm_matches_nm_curve() {
+        // Standard NM-style linear mapping: -50 or better =
+        // 100%, -100 or worse = 0%, linear between.
+        assert_eq!(signal_pct_from_dbm(-30), 100);
+        assert_eq!(signal_pct_from_dbm(-50), 100);
+        assert_eq!(signal_pct_from_dbm(-75), 50);
+        assert_eq!(signal_pct_from_dbm(-100), 0);
+        assert_eq!(signal_pct_from_dbm(-120), 0);
+    }
 
     #[test]
     fn nm_state_text_extracts_parenthetical() {
