@@ -63,6 +63,7 @@ request_types = [
     "network.nm.supervisor.status",
     "network.nm.wifi_devices",
     "network.nm.wifi.disconnect",
+    "network.nm.wifi.forget",
     "network.refresh_connectivity",
 ]
 response_budget_ms = 15000
@@ -111,6 +112,7 @@ response_budget_ms = 15000
 "network.nm.intent.set" = { kind = "write", scope = "network_admin" }
 "network.nm.intent.apply" = { kind = "write", scope = "network_admin" }
 "network.nm.wifi.disconnect" = { kind = "write", scope = "network_admin" }
+"network.nm.wifi.forget" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.start" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.submit" = { kind = "write", scope = "network_admin" }
 "network.nm.captive.complete" = { kind = "write", scope = "network_admin" }
