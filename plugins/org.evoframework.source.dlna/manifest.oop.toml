@@ -1,0 +1,50 @@
+[plugin]
+name = "org.evoframework.source.dlna"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.dlna"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = true
+filesystem_scopes = [
+  "/var/lib/evo/state/org.evoframework.source.dlna",
+]
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 10
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+  "source.dlna.refresh",
+  "source.dlna.list",
+  "source.dlna.browse",
+  "source.dlna.resolve",
+  "play_now",
+]
+response_budget_ms = 15000
+
+[capabilities.source]
+uri_schemes = ["dlna"]

@@ -1,0 +1,32 @@
+schema_version: "1.0"
+plugin: org.evoframework.source.dlna
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Pure-Rust SSDP + HTTP SOAP ContentDirectory client. No host
+# binaries required. `has_os_dependencies: false` matches the
+# empty required_* sets below; the parity gate refuses admission
+# when the two disagree.
+
+capability_intent:
+  - id: ssdp_multicast
+    need: send/receive SSDP M-SEARCH on 239.255.255.250:1900 to discover MediaServer:1 devices on the LAN.
+    access_path: network/udp
+    failure_mode: discovery returns empty; operator sees no media servers; steward keeps running.
+  - id: contentdirectory_http
+    need: HTTP GET device description + HTTP POST SOAP Browse/resolve against discovered control URLs.
+    access_path: network/tcp
+    failure_mode: browse/resolve verbs return PluginError::Transient; steward keeps running.
+
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+  expected:
+    - state directory exists as the steward identity
+
+host_provisioning: {}

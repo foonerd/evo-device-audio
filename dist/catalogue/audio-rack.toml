@@ -59,6 +59,16 @@ mpd-path URI scheme.
 """
 
 [[racks.shelves]]
+name = "dlna"
+shape = 1
+description = """
+UPnP/DLNA MediaServer client (org.evoframework.source.dlna). \
+SSDP discovery + paged ContentDirectory browse + HTTP stream \
+resolve. Discovered servers sync into audio.library as \
+network_dlna sources for the unified Library UI.
+"""
+
+[[racks.shelves]]
 name = "delivery"
 shape = 2
 description = """

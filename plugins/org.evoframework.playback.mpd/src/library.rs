@@ -53,6 +53,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use evo_plugin_sdk::contract::{
+    shelf_dispatch::{ShelfDispatchError, ShelfRequestDispatcher},
     ExternalAddressing, SubjectAnnouncement, SubjectAnnouncer,
 };
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,16 @@ pub(crate) struct LibraryContext {
     /// truth-or-null invariant.
     pub(crate) works_aggregate:
         Arc<Mutex<Option<crate::works::WorksAggregate>>>,
+    /// Peer-shelf dispatcher. Populated from
+    /// [`evo_plugin_sdk::contract::LoadContext::shelf_request_dispatcher`]
+    /// at plugin admission (both in-process and OOP wire paths).
+    /// `library.browse_library` uses this to dispatch to
+    /// `source.dlna.browse` on the `audio.dlna` shelf for
+    /// `NetworkDlna` sources rather than reaching into UPnP SOAP
+    /// in-process — that keeps DLNA IO owned by the plugin whose
+    /// manifest declares it and eliminates the MPD-music_directory
+    /// error surface for network sources.
+    pub(crate) shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
 }
 
 impl LibraryContext {
@@ -122,6 +133,7 @@ impl LibraryContext {
         music_directory: PathBuf,
         registry: SourceRegistry,
         subjects: Arc<dyn SubjectAnnouncer>,
+        shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
     ) -> Self {
         Self {
             music_directory,
@@ -131,6 +143,7 @@ impl LibraryContext {
             sources_mirror: Arc::new(Mutex::new(None)),
             state_mirror: Arc::new(Mutex::new(None)),
             works_aggregate: Arc::new(Mutex::new(None)),
+            shelf_dispatcher,
         }
     }
 }
@@ -246,11 +259,54 @@ pub(crate) async fn publish_subjects(ctx: &LibraryContext) {
 
 async fn render_sources_envelope(ctx: &LibraryContext) -> serde_json::Value {
     let snapshot = ctx.registry.snapshot().await;
+    let sources: Vec<serde_json::Value> =
+        snapshot.iter().map(render_source_row).collect();
     json!({
         "v":       LIBRARY_PAYLOAD_VERSION,
-        "sources": snapshot,
+        "sources": sources,
         "total":   snapshot.len(),
     })
+}
+
+/// Serialise one [`SourceRecord`] for the `audio_library_sources`
+/// wire envelope. Splits by kind so filesystem-derived fields
+/// (`mount_path`, `track_count`, `track_count_available`, `last_
+/// scan_at_ms`, `mpd_storage_name`) are omitted for `NetworkDlna`
+/// sources — a UPnP MediaServer is neither mounted at a path nor
+/// scanned track-by-track, and emitting those fields with
+/// synthesised or zero values leaks local-library semantics into
+/// an operator-facing surface that has none.
+fn render_source_row(record: &SourceRecord) -> serde_json::Value {
+    let mut row = json!({
+        "id":                    record.id,
+        "display_name":          record.display_name,
+        "kind":                  record.kind,
+        "state":                 record.state,
+        "probe_cadence_ms":      record.probe_cadence_ms,
+        "scan_policy":           record.scan_policy,
+        "last_seen_online_at_ms": record.last_seen_online_at_ms,
+    });
+    if !matches!(record.kind, SourceKind::NetworkDlna { .. }) {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "mount_path".into(),
+                json!(record.mount_path.to_string_lossy()),
+            );
+            obj.insert("track_count".into(), json!(record.track_count));
+            obj.insert(
+                "track_count_available".into(),
+                json!(record.track_count_available),
+            );
+            obj.insert("last_scan_at_ms".into(), json!(record.last_scan_at_ms));
+            if let Some(alias) = &record.mpd_storage_name {
+                obj.insert("mpd_storage_name".into(), json!(alias));
+            }
+        }
+    }
+    if let Some(obj) = row.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    row
 }
 
 async fn render_state_envelope(ctx: &LibraryContext) -> serde_json::Value {
@@ -473,6 +529,318 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Shelf name occupied by `org.evoframework.source.dlna`.
+const AUDIO_DLNA_SHELF: &str = "audio.dlna";
+/// Verb the DLNA source plugin exports for paged ContentDirectory
+/// browse. The wire shape is `{v, service_id, object_id, page?,
+/// page_size?}` and the response envelope carries
+/// `{v, status, service_id, path, entries, page, page_size, total,
+///  truncated, next_page}` where each entry carries a
+/// ContentDirectory-native shape (`kind`, `name`, `path` = objectId,
+/// plus `uri` = stream URL for items). Kept as a constant so a
+/// future verb-name change surfaces at compile time on this caller.
+const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
+
+/// Dispatch `library.browse_library` for a `NetworkDlna` source
+/// through the framework's peer-shelf dispatcher onto
+/// `source.dlna.browse`. Retires the in-process UPnP SOAP path that
+/// used to run inside `playback.mpd` — DLNA IO now lives entirely
+/// with the plugin whose manifest declares the `dlna:` URI scheme,
+/// eliminating both the ownership violation and the MPD-`music_
+/// directory` error surface that leaked "source is not under
+/// music_directory" for network browses.
+async fn browse_dlna_via_source_dlna(
+    dispatcher: &Arc<dyn ShelfRequestDispatcher>,
+    source_id: &str,
+    service_id: &str,
+    path: &str,
+    page: usize,
+    page_size: usize,
+    source_state: &SourceState,
+) -> Result<serde_json::Value, VerbError> {
+    // DLNA hard cap is 100 — distinct from local BROWSE_HARD_CAP.
+    let page_size = (page_size as u32).clamp(1, evo_dlna::DLNA_PAGE_HARD_CAP);
+    let page_u32 = page as u32;
+    let object_id = if path.is_empty() { "0" } else { path };
+    let request = json!({
+        "v": 1,
+        "service_id": service_id,
+        "object_id": object_id,
+        "page": page_u32,
+        "page_size": page_size,
+    });
+    let request_bytes =
+        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+            verb: "browse_library".into(),
+            reason: format!("dlna browse: serialise request: {e}"),
+        })?;
+    let response_bytes = dispatcher
+        .dispatch(
+            AUDIO_DLNA_SHELF,
+            SOURCE_DLNA_BROWSE_VERB,
+            request_bytes,
+            None,
+        )
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "browse_library".into(),
+            reason: format!("dlna browse: {}", shelf_error_reason(&e)),
+        })?;
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VerbError::Mpd {
+        verb: "browse_library".into(),
+        reason: format!("dlna browse: parse response: {e}"),
+    })?;
+
+    let native_entries = response
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let entries: Vec<serde_json::Value> = native_entries
+        .iter()
+        .map(|e| render_dlna_browse_entry(e, service_id))
+        .collect();
+    let page_out = response
+        .get("page")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(page_u32 as u64);
+    let page_size_out = response
+        .get("page_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(page_size as u64);
+    let total = response.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let truncated = response
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let next_page = response.get("next_page").cloned();
+
+    Ok(json!({
+        "v":            LIBRARY_PAYLOAD_VERSION,
+        "source_id":    source_id,
+        "path":         object_id,
+        "entries":      entries,
+        "stale":        false,
+        "source_state": source_state,
+        "page":         page_out,
+        "page_size":    page_size_out,
+        "total":        total,
+        "truncated":    truncated,
+        "next_page":    next_page,
+        "service_id":   service_id,
+    }))
+}
+
+/// Map a [`ShelfDispatchError`] onto an operator-readable one-line
+/// reason. Preserves the classification word so downstream telemetry
+/// / audit correlates on the same shape the wire-op layer emits.
+fn shelf_error_reason(e: &ShelfDispatchError) -> String {
+    match e {
+        ShelfDispatchError::NoPluginOnShelf { shelf } => {
+            format!("no plugin on shelf {shelf:?}")
+        }
+        ShelfDispatchError::VerbNotStockedOnShelf {
+            shelf,
+            request_type,
+        } => {
+            format!("verb {request_type:?} not stocked on shelf {shelf:?}")
+        }
+        ShelfDispatchError::Permanent { detail } => {
+            format!("permanent: {detail}")
+        }
+        ShelfDispatchError::Transient { detail } => {
+            format!("transient: {detail}")
+        }
+        ShelfDispatchError::DeadlineExceeded { budget_ms } => {
+            format!("deadline exceeded ({budget_ms}ms)")
+        }
+        ShelfDispatchError::SubstrateFailure { detail } => {
+            format!("substrate failure: {detail}")
+        }
+    }
+}
+
+/// Translate one `source.dlna.browse` entry into the
+/// `library.browse_library` entry shape. Container entries carry the
+/// ContentDirectory objectId as the browse `uri` so the UI drills
+/// into it via `library.browse_library` with `path = uri` (the same
+/// contract local-folder browses use). Item entries carry the picked
+/// stream URL as `uri` so the queue-enqueue path reaches MPD `add`
+/// unchanged. Both shapes also carry `stable_uri =
+/// dlna:<service_id>/<objectId>` — the identity the favourite +
+/// playlist stores round-trip so an operator's saved selection
+/// survives a server IP or token churn.
+fn render_dlna_browse_entry(
+    entry: &serde_json::Value,
+    service_id: &str,
+) -> serde_json::Value {
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let object_id = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let stable_uri = format!("dlna:{service_id}/{object_id}");
+    match kind {
+        "directory" => json!({
+            "kind": "directory",
+            "name": name,
+            "uri":  object_id,
+            "stable_uri": stable_uri,
+        }),
+        _ => {
+            let stream = entry.get("uri").and_then(|v| v.as_str());
+            let mut out = json!({
+                "kind": "file",
+                "name": name,
+                "title": entry.get("title").cloned(),
+                "artist": entry.get("artist").cloned(),
+                "album": entry.get("album").cloned(),
+                "artwork_url": entry.get("artwork_url").cloned(),
+                "uri": stream.unwrap_or(object_id),
+                "stable_uri": stable_uri,
+            });
+            if let Some(obj) = out.as_object_mut() {
+                obj.retain(|_, v| !v.is_null());
+            }
+            out
+        }
+    }
+}
+
+/// Upsert `NetworkDlna` sources from the source.dlna discovered sidecar.
+pub(crate) async fn sync_dlna_discovered(ctx: &LibraryContext) {
+    let path = evo_dlna::default_discovered_path();
+    let file = match evo_dlna::read_discovered(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "library: dlna discovered sidecar unreadable"
+            );
+            return;
+        }
+    };
+    let existing = ctx.registry.snapshot().await;
+    let mut changed = false;
+    for server in file.servers {
+        let kind = SourceKind::NetworkDlna {
+            service_id: server.service_id.clone(),
+            control_url: server.control_url.clone(),
+            base_url: server.base_url.clone(),
+        };
+        if let Some(rec) = existing.iter().find(|r| {
+            matches!(
+                &r.kind,
+                SourceKind::NetworkDlna { service_id, .. }
+                    if service_id == &server.service_id
+            )
+        }) {
+            let needs_update =
+                rec.display_name != server.friendly_name || rec.kind != kind;
+            if needs_update {
+                let mut updated = rec.clone();
+                updated.display_name = server.friendly_name.clone();
+                updated.kind = kind;
+                ctx.registry.upsert(updated).await;
+                changed = true;
+            }
+            continue;
+        }
+        let id = format!("dlna-{}", sanitise_id(&server.service_id));
+        let mount = std::path::PathBuf::from(format!(
+            "/var/lib/evo/dlna/{}",
+            server.service_id
+        ));
+        let record = SourceRecord {
+            id,
+            display_name: server.friendly_name.clone(),
+            kind: kind.clone(),
+            mount_path: mount,
+            mpd_storage_name: None,
+            state: SourceState::Probing,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: default_probe_cadence_for(&kind),
+            scan_policy: ScanPolicy::BrowseOnly,
+            track_count: 0,
+            track_count_available: 0,
+            last_scan_at_ms: None,
+        };
+        ctx.registry.upsert(record).await;
+        changed = true;
+    }
+    if changed {
+        let _ = ctx.registry.persist().await;
+        publish_subjects(ctx).await;
+    }
+}
+
+/// Handle for the DLNA discovery-sync + probe background task.
+pub(crate) struct DlnaSyncHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl DlnaSyncHandle {
+    /// Signal shutdown + await task completion.
+    pub(crate) async fn stop(self) {
+        self.shutdown.notify_one();
+        let _ = self.task.await;
+    }
+}
+
+/// Cadence for reading `discovered.json` and re-probing
+/// `NetworkDlna` sources. Source.dlna writes the sidecar on a
+/// ~60s discover loop; syncing twice per discovery period keeps
+/// the library subject within one probe of a new server.
+const DLNA_SYNC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Spawn the background task that upserts discovered DLNA
+/// servers into the source registry and probes their
+/// ContentDirectory reachability.
+pub(crate) fn spawn_dlna_sync(ctx: LibraryContext) -> DlnaSyncHandle {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let task_shutdown = Arc::clone(&shutdown);
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(DLNA_SYNC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = task_shutdown.notified() => break,
+                _ = ticker.tick() => {
+                    sync_dlna_discovered(&ctx).await;
+                    let snapshot = ctx.registry.snapshot().await;
+                    for record in snapshot {
+                        if !matches!(
+                            record.kind,
+                            SourceKind::NetworkDlna { .. }
+                        ) {
+                            continue;
+                        }
+                        let budget = std::time::Duration::from_millis(3_000);
+                        let outcome =
+                            probe_source(&record, budget).await;
+                        if let Err(e) = ctx
+                            .registry
+                            .transition(&record.id, outcome.new_state)
+                            .await
+                        {
+                            tracing::debug!(
+                                plugin = PLUGIN_NAME,
+                                source_id = %record.id,
+                                error = %e,
+                                "dlna sync: probe transition failed"
+                            );
+                        }
+                    }
+                    publish_subjects(&ctx).await;
+                }
+            }
+        }
+    });
+    DlnaSyncHandle { task, shutdown }
 }
 
 // ----- verb handlers -----
@@ -771,14 +1139,23 @@ pub(crate) async fn handle_browse_library(
     let path = payload.path.clone().unwrap_or_default();
 
     // Resolve pagination. Both fields optional; when absent
-    // the endpoint returns the first BROWSE_HARD_CAP entries
-    // with `truncated: true` if the underlying listing
-    // exceeds the cap. `page_size` is clamped to
-    // BROWSE_HARD_CAP silently — an operator asking for more
-    // still gets a page, just at the hard-cap size.
+    // the endpoint returns the first page at the kind-specific
+    // default with `truncated: true` / `next_page` when more
+    // remain. Local/NAS hard-cap is BROWSE_HARD_CAP; DLNA is
+    // bounded to the ContentDirectory SOAP caps published on
+    // evo-dlna (`DLNA_PAGE_DEFAULT` / `DLNA_PAGE_HARD_CAP`).
     let page = payload.page.unwrap_or(0);
-    let requested_size = payload.page_size.unwrap_or(BROWSE_HARD_CAP);
-    let page_size = requested_size.clamp(1, BROWSE_HARD_CAP);
+    let (default_size, hard_cap) =
+        if matches!(record.kind, SourceKind::NetworkDlna { .. }) {
+            (
+                evo_dlna::DLNA_PAGE_DEFAULT as usize,
+                evo_dlna::DLNA_PAGE_HARD_CAP as usize,
+            )
+        } else {
+            (BROWSE_HARD_CAP, BROWSE_HARD_CAP)
+        };
+    let requested_size = payload.page_size.unwrap_or(default_size);
+    let page_size = requested_size.clamp(1, hard_cap);
     let range_start = page.saturating_mul(page_size);
 
     // Serve from cache on Offline; refresh on Online/Degraded.
@@ -809,6 +1186,36 @@ pub(crate) async fn handle_browse_library(
             "next_page":    next_page,
         }));
     }
+    // NetworkDlna: paged ContentDirectory Browse via
+    // source.dlna's peer-shelf verb. playback.mpd is no longer a
+    // UPnP SOAP client — that transport ownership belongs to the
+    // plugin whose manifest declares the `dlna:` URI scheme.
+    if let SourceKind::NetworkDlna { service_id, .. } = &record.kind {
+        let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+            return Err(VerbError::Mpd {
+                verb: "browse_library".into(),
+                reason: format!(
+                    "browse_library: dlna source {} requires the peer-shelf \
+                     dispatcher, but LoadContext.shelf_request_dispatcher was \
+                     None at admission — the plugin was loaded without a \
+                     dispatcher wired (steward has not seeded one on this \
+                     transport)",
+                    payload.source_id
+                ),
+            });
+        };
+        return browse_dlna_via_source_dlna(
+            dispatcher,
+            &payload.source_id,
+            service_id,
+            &path,
+            page,
+            page_size,
+            &record.state,
+        )
+        .await;
+    }
+
     // Online / Degraded / Probing: read from MPD.
     //
     // MPD's `lsinfo` takes a **database-relative path** rooted at
@@ -2645,6 +3052,7 @@ mod tests {
             PathBuf::from("/var/lib/evo/music"),
             SourceRegistry::new(),
             Arc::new(NullAnn),
+            None,
         )
     }
 
@@ -2691,6 +3099,8 @@ mod tests {
         }));
         assert!(!is_cloud(&SourceKind::LocalInternal));
         assert!(!is_cloud(&SourceKind::NetworkDlna {
+            control_url: String::new(),
+            base_url: String::new(),
             service_id: "x".into()
         }));
     }
@@ -2701,6 +3111,337 @@ mod tests {
         let env = handle_list_sources(&ctx).await;
         assert_eq!(env["v"], 1);
         assert_eq!(env["total"], 0);
+    }
+
+    // --- render_source_row: per-kind wire shape ------------------
+
+    fn local_source_fixture() -> SourceRecord {
+        SourceRecord {
+            id: "local-42".into(),
+            display_name: "Local".into(),
+            kind: SourceKind::LocalInternal,
+            mount_path: PathBuf::from("/var/lib/evo/music/INTERNAL"),
+            mpd_storage_name: Some("internal".into()),
+            state: SourceState::Online,
+            last_seen_online_at_ms: Some(1_000),
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 123,
+            track_count_available: 100,
+            last_scan_at_ms: Some(2_000),
+        }
+    }
+
+    fn dlna_source_fixture() -> SourceRecord {
+        SourceRecord {
+            id: "dlna-uuid-abc".into(),
+            display_name: "MediaServer".into(),
+            kind: SourceKind::NetworkDlna {
+                service_id: "uuid:abc".into(),
+                control_url: "http://192.0.2.10:8096/dlna/cd/control".into(),
+                base_url: "http://192.0.2.10:8096".into(),
+            },
+            mount_path: PathBuf::from("/var/lib/evo/dlna/uuid:abc"),
+            mpd_storage_name: None,
+            state: SourceState::Online,
+            last_seen_online_at_ms: Some(1_000),
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::BrowseOnly,
+            track_count: 0,
+            track_count_available: 0,
+            last_scan_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn render_source_row_local_includes_filesystem_fields() {
+        let row = render_source_row(&local_source_fixture());
+        assert_eq!(row["id"], "local-42");
+        assert_eq!(row["display_name"], "Local");
+        assert_eq!(row["mount_path"], "/var/lib/evo/music/INTERNAL");
+        assert_eq!(row["mpd_storage_name"], "internal");
+        assert_eq!(row["track_count"], 123);
+        assert_eq!(row["track_count_available"], 100);
+        assert_eq!(row["last_scan_at_ms"], 2_000);
+    }
+
+    #[test]
+    fn render_source_row_dlna_omits_filesystem_fields() {
+        let row = render_source_row(&dlna_source_fixture());
+        assert_eq!(row["id"], "dlna-uuid-abc");
+        assert_eq!(row["display_name"], "MediaServer");
+        // A MediaServer is not a filesystem: mount_path,
+        // track_count, track_count_available, last_scan_at_ms,
+        // and mpd_storage_name are not emitted on the wire.
+        assert!(
+            !row.as_object().unwrap().contains_key("mount_path"),
+            "row = {row}"
+        );
+        assert!(!row.as_object().unwrap().contains_key("track_count"));
+        assert!(!row
+            .as_object()
+            .unwrap()
+            .contains_key("track_count_available"));
+        assert!(!row.as_object().unwrap().contains_key("last_scan_at_ms"));
+        assert!(!row.as_object().unwrap().contains_key("mpd_storage_name"));
+        // The MediaServer identity remains present.
+        assert_eq!(row["kind"]["kind"], "network_dlna");
+        assert_eq!(row["kind"]["service_id"], "uuid:abc");
+    }
+
+    // --- render_dlna_browse_entry: dlna:<sid>/<oid> identity -----
+
+    #[test]
+    fn render_dlna_browse_entry_container_carries_stable_uri() {
+        let src = json!({
+            "kind":        "directory",
+            "name":        "Rock",
+            "path":        "12$34",
+            "child_count": 200,
+        });
+        let out = render_dlna_browse_entry(&src, "uuid:server-1");
+        assert_eq!(out["kind"], "directory");
+        assert_eq!(out["name"], "Rock");
+        // `uri` = objectId so the UI drills into it via
+        // library.browse_library with `path = uri` (same contract
+        // local-folder browses use).
+        assert_eq!(out["uri"], "12$34");
+        // `stable_uri` = dlna:<service_id>/<objectId>.
+        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$34");
+    }
+
+    #[test]
+    fn render_dlna_browse_entry_item_carries_stream_and_stable() {
+        let src = json!({
+            "kind":         "file",
+            "name":         "Song.flac",
+            "path":         "12$99",
+            "title":        "Song",
+            "artist":       "Artist",
+            "album":        "Album",
+            "artwork_url":  "http://192.0.2.10:8096/art/xyz",
+            "uri":          "http://192.0.2.10:8096/stream/xyz.flac",
+            "playable":     true,
+        });
+        let out = render_dlna_browse_entry(&src, "uuid:server-1");
+        assert_eq!(out["kind"], "file");
+        assert_eq!(out["name"], "Song.flac");
+        assert_eq!(out["title"], "Song");
+        assert_eq!(out["artist"], "Artist");
+        // Stream URL is the enqueue-time uri (unchanged until the
+        // dlna: stored-identity switch on the favourite +
+        // playlist path lands).
+        assert_eq!(out["uri"], "http://192.0.2.10:8096/stream/xyz.flac");
+        // stable_uri is the storage-safe identity.
+        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$99");
+    }
+
+    #[test]
+    fn render_dlna_browse_entry_item_drops_null_optional_fields() {
+        let src = json!({
+            "kind":   "file",
+            "name":   "Song.flac",
+            "path":   "12$99",
+            "uri":    "http://192.0.2.10:8096/stream/xyz.flac",
+            // no title / artist / album / artwork_url present
+        });
+        let out = render_dlna_browse_entry(&src, "uuid:server-1");
+        // Nulls stripped so the wire carries only real values.
+        let obj = out.as_object().unwrap();
+        assert!(!obj.contains_key("title"));
+        assert!(!obj.contains_key("artist"));
+        assert!(!obj.contains_key("album"));
+        assert!(!obj.contains_key("artwork_url"));
+        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$99");
+    }
+
+    // --- shelf_error_reason: classified strings ------------------
+
+    #[test]
+    fn shelf_error_reason_covers_every_variant() {
+        assert!(shelf_error_reason(&ShelfDispatchError::NoPluginOnShelf {
+            shelf: "audio.dlna".into()
+        })
+        .contains("no plugin on shelf"));
+        assert!(shelf_error_reason(
+            &ShelfDispatchError::VerbNotStockedOnShelf {
+                shelf: "audio.dlna".into(),
+                request_type: "source.dlna.browse".into(),
+            }
+        )
+        .contains("not stocked"));
+        assert!(shelf_error_reason(&ShelfDispatchError::Permanent {
+            detail: "bad request".into()
+        })
+        .starts_with("permanent"));
+        assert!(shelf_error_reason(&ShelfDispatchError::Transient {
+            detail: "server offline".into()
+        })
+        .starts_with("transient"));
+        assert!(shelf_error_reason(&ShelfDispatchError::DeadlineExceeded {
+            budget_ms: 15_000
+        })
+        .contains("15000ms"));
+        assert!(shelf_error_reason(&ShelfDispatchError::SubstrateFailure {
+            detail: "router down".into()
+        })
+        .starts_with("substrate"));
+    }
+
+    // --- browse_dlna_via_source_dlna: peer-dispatch plumbing -----
+
+    /// One captured `dispatch` invocation from the fake below.
+    type CapturedCall = (String, String, Vec<u8>);
+    type CapturedSlot = Arc<Mutex<Option<CapturedCall>>>;
+
+    struct FakeDispatcher {
+        response: Vec<u8>,
+        error: Option<ShelfDispatchError>,
+        captured: CapturedSlot,
+    }
+
+    impl ShelfRequestDispatcher for FakeDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<u8>, ShelfDispatchError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let captured = Arc::clone(&self.captured);
+            let response = self.response.clone();
+            let error = self.error.clone();
+            Box::pin(async move {
+                let mut g = captured.lock().await;
+                *g = Some((
+                    shelf.to_string(),
+                    request_type.to_string(),
+                    payload,
+                ));
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                Ok(response)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_dlna_dispatches_to_audio_dlna_shelf_and_shapes_envelope() {
+        // Canned response from source.dlna.browse — the shape it
+        // actually emits (with a container + item entry).
+        let canned = json!({
+            "v":          1,
+            "status":     "ok",
+            "service_id": "uuid:server-1",
+            "path":       "0",
+            "entries":    [
+                {
+                    "kind":        "directory",
+                    "name":        "Music",
+                    "path":        "12$0",
+                    "child_count": 50,
+                },
+                {
+                    "kind":     "file",
+                    "name":     "Track.flac",
+                    "path":     "12$1",
+                    "title":    "Track",
+                    "artist":   "Artist",
+                    "album":    "Album",
+                    "uri":      "http://192.0.2.10:8096/stream/1.flac",
+                    "playable": true,
+                },
+            ],
+            "page":       0,
+            "page_size":  50,
+            "total":      2,
+            "truncated":  false,
+            "next_page":  serde_json::Value::Null,
+        });
+        let captured = Arc::new(Mutex::new(None));
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: serde_json::to_vec(&canned).unwrap(),
+            error: None,
+            captured: Arc::clone(&captured),
+        });
+        let env = browse_dlna_via_source_dlna(
+            &disp,
+            "dlna-uuid-server-1",
+            "uuid:server-1",
+            "",
+            0,
+            50,
+            &SourceState::Online,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // The dispatcher saw the right shelf + verb.
+        let g = captured.lock().await;
+        let (shelf, verb, req_bytes) =
+            g.as_ref().expect("dispatch invoked").clone();
+        assert_eq!(shelf, "audio.dlna");
+        assert_eq!(verb, "source.dlna.browse");
+        let req: serde_json::Value =
+            serde_json::from_slice(&req_bytes).unwrap();
+        assert_eq!(req["service_id"], "uuid:server-1");
+        assert_eq!(req["object_id"], "0"); // empty path → root
+
+        // Response envelope: library.browse_library shape.
+        assert_eq!(env["v"], 1);
+        assert_eq!(env["source_id"], "dlna-uuid-server-1");
+        assert_eq!(env["service_id"], "uuid:server-1");
+        assert_eq!(env["stale"], false);
+
+        // Each entry carries the stable_uri identity.
+        let entries = env["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["kind"], "directory");
+        assert_eq!(entries[0]["uri"], "12$0");
+        assert_eq!(entries[0]["stable_uri"], "dlna:uuid:server-1/12$0");
+        assert_eq!(entries[1]["kind"], "file");
+        assert_eq!(entries[1]["uri"], "http://192.0.2.10:8096/stream/1.flac");
+        assert_eq!(entries[1]["stable_uri"], "dlna:uuid:server-1/12$1");
+    }
+
+    #[tokio::test]
+    async fn browse_dlna_maps_shelf_dispatch_error_to_verb_error() {
+        let captured = Arc::new(Mutex::new(None));
+        let disp: Arc<dyn ShelfRequestDispatcher> = Arc::new(FakeDispatcher {
+            response: Vec::new(),
+            error: Some(ShelfDispatchError::Transient {
+                detail: "MediaServer unreachable".into(),
+            }),
+            captured,
+        });
+        let err = browse_dlna_via_source_dlna(
+            &disp,
+            "dlna-uuid-server-1",
+            "uuid:server-1",
+            "",
+            0,
+            50,
+            &SourceState::Online,
+        )
+        .await
+        .expect_err("transient must surface");
+        let reason = match err {
+            VerbError::Mpd { reason, .. } => reason,
+            other => panic!("expected VerbError::Mpd, got {other:?}"),
+        };
+        assert!(reason.contains("transient"));
+        assert!(reason.contains("MediaServer unreachable"));
     }
 
     #[tokio::test]

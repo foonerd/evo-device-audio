@@ -52,7 +52,7 @@ use evo_plugin_sdk::contract::{
 use crate::disposition_emitter::DispositionEmitter;
 use crate::favourites::{self, FavouritesContext};
 use crate::idle_observer::{self, IdleObserverHandle};
-use crate::library::{self, LibraryContext};
+use crate::library::{self, DlnaSyncHandle, LibraryContext};
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
 use crate::playlist::{
     self, PlaylistContext, DEFAULT_FAVOURITES_PLAYLIST_NAME,
@@ -94,24 +94,12 @@ pub(crate) struct ShelfBundle {
     /// plugin's verbs. The handle is held here so plugin
     /// unload can stop the observer cleanly.
     pub(crate) idle_observer: Option<IdleObserverHandle>,
+    /// Upserts NetworkDlna sources from source.dlna's
+    /// discovered.json sidecar and probes them on a fixed
+    /// cadence. Held so unload can stop the task cleanly.
+    pub(crate) dlna_sync: Option<DlnaSyncHandle>,
     pub(crate) endpoint: MpdEndpoint,
     pub(crate) timeouts: ConnectTimeouts,
-    /// Cross-plugin shelf dispatcher, threaded from
-    /// [`LoadContext::shelf_request_dispatcher`]. `None` on
-    /// OOP admission today — the framework's plugin-subprocess
-    /// wire protocol does not yet propagate the dispatcher
-    /// handle across the boundary. Held on the bundle so a
-    /// future in-process composition path can consume it
-    /// without further threading. Currently unused;
-    /// `library.browse_by_recording_type` lives on the shelf's
-    /// metadata.online co-tenant instead of dispatching from
-    /// here.
-    #[allow(dead_code)]
-    pub(crate) shelf_dispatcher: Option<
-        Arc<
-            dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
-        >,
-    >,
 }
 
 impl ShelfBundle {
@@ -195,6 +183,7 @@ impl ShelfBundle {
             music_directory.clone(),
             registry.clone(),
             subjects.clone(),
+            shelf_dispatcher.clone(),
         );
 
         // Ensure the local-internal floor source is registered.
@@ -208,6 +197,13 @@ impl ShelfBundle {
                  floor library source unavailable until next plugin load"
             );
         }
+
+        // Pull any DLNA servers already written by
+        // source.dlna before warm-start probes so newly
+        // discovered MediaServers participate in the probe
+        // pass (and appear Online rather than stuck Probing
+        // until the first 30s sync tick).
+        library::sync_dlna_discovered(&library).await;
 
         // Announce every subject at load. The announcement
         // seeds the subject_states mirror with a wire-shape
@@ -293,6 +289,8 @@ impl ShelfBundle {
             library.clone(),
         ));
 
+        let dlna_sync = Some(library::spawn_dlna_sync(library.clone()));
+
         tracing::info!(
             plugin = PLUGIN_NAME,
             music_directory = %music_directory.display(),
@@ -311,9 +309,9 @@ impl ShelfBundle {
             library,
             sticker_reconciler,
             idle_observer,
+            dlna_sync,
             endpoint,
             timeouts,
-            shelf_dispatcher,
         }
     }
 
@@ -441,6 +439,9 @@ impl ShelfBundle {
     /// needed.
     pub(crate) async fn shutdown(mut self) {
         if let Some(handle) = self.idle_observer.take() {
+            handle.stop().await;
+        }
+        if let Some(handle) = self.dlna_sync.take() {
             handle.stop().await;
         }
         if let Some(handle) = self.sticker_reconciler.take() {

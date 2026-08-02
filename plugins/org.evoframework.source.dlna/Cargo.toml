@@ -1,0 +1,36 @@
+[package]
+name = "org-evoframework-source-dlna"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UPnP/DLNA MediaServer client: SSDP discovery, paged ContentDirectory browse, HTTP stream resolve. Stocks audio.dlna; syncs NetworkDlna sources into playback.mpd via discovered.json sidecar."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "source-dlna-wire"
+path = "src/bin/source-dlna-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-dlna = { path = "../../crates/evo-dlna" }
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["time", "sync", "macros", "rt-multi-thread"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

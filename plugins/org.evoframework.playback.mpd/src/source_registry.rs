@@ -178,11 +178,18 @@ pub(crate) enum SourceKind {
         /// owns.
         account_ref: String,
     },
-    /// DLNA / UPnP server discovered via mDNS / SSDP. Browse-only
-    /// — the device walks the ContentDirectory tree on demand.
+    /// DLNA / UPnP server discovered via SSDP. Browse-only —
+    /// ContentDirectory walks on demand (paged SOAP).
     NetworkDlna {
-        /// DLNA service id (UPnP device UUID).
+        /// DLNA service id (UPnP device UUID / UDN).
         service_id: String,
+        /// Absolute ContentDirectory control URL. Empty until
+        /// discovery sync (or operator add) fills it.
+        #[serde(default)]
+        control_url: String,
+        /// Device origin `scheme://host[:port]` for relative res.
+        #[serde(default)]
+        base_url: String,
     },
 }
 
@@ -399,6 +406,12 @@ impl SourceRegistry {
         }
         guard.insert(record.id.clone(), record);
         Ok(())
+    }
+
+    /// Insert or replace a source by id (discovery sync).
+    pub(crate) async fn upsert(&self, record: SourceRecord) {
+        let mut guard = self.inner.sources.write().await;
+        guard.insert(record.id.clone(), record);
     }
 
     /// Transition a source's state. Returns the previous state
@@ -723,12 +736,10 @@ pub(crate) struct ProbeOutcome {
 /// - `NetworkNasSmb` / `NetworkNasNfs`: directory exists + readable
 ///   (the mount is OS-managed; the probe asserts the mount is
 ///   currently usable; mount-down surfaces as Offline).
-/// - `CloudGdrive` / `CloudOnedrive` / `NetworkDlna`: not
-///   probable from the framework today (the cloud-account and
-///   DLNA-discovery substrate is a follow-on primitive). For
-///   these kinds the probe returns Probing until that substrate
-///   lands — acceptance row honesty over fabricated "probably
-///   online" claims.
+/// - `CloudGdrive` / `CloudOnedrive`: not probable until the
+///   cloud-account substrate lands — returns Probing.
+/// - `NetworkDlna`: ContentDirectory Browse root with
+///   `RequestedCount=1` via `evo-dlna` (requires `control_url`).
 ///
 /// `budget` bounds the wall-clock time spent in the probe; on
 /// budget exhaustion the result is Degraded.
@@ -744,12 +755,42 @@ pub(crate) async fn probe_source(
         SourceKind::NetworkNasSmb { .. } | SourceKind::NetworkNasNfs { .. } => {
             probe_local_directory(&record.mount_path, budget).await
         }
-        SourceKind::CloudGdrive { .. }
-        | SourceKind::CloudOnedrive { .. }
-        | SourceKind::NetworkDlna { .. } => SourceState::Probing,
+        SourceKind::NetworkDlna { control_url, .. } => {
+            probe_dlna(control_url, budget).await
+        }
+        SourceKind::CloudGdrive { .. } | SourceKind::CloudOnedrive { .. } => {
+            SourceState::Probing
+        }
     };
     let elapsed = start.elapsed();
     ProbeOutcome { new_state, elapsed }
+}
+
+async fn probe_dlna(control_url: &str, budget: Duration) -> SourceState {
+    if control_url.is_empty() {
+        return SourceState::Probing;
+    }
+    let control_url = control_url.to_string();
+    let work = async {
+        evo_dlna::browse_page(evo_dlna::BrowseParams {
+            control_url,
+            object_id: "0".into(),
+            page: 0,
+            page_size: 1,
+        })
+        .await
+    };
+    match tokio::time::timeout(budget, work).await {
+        Ok(Ok(_)) => SourceState::Online,
+        Ok(Err(e)) => SourceState::Offline {
+            reason: format!("dlna probe: {e}"),
+            since_ms: now_ms(),
+        },
+        Err(_) => SourceState::Degraded {
+            reason: "dlna probe exceeded budget".into(),
+            since_ms: now_ms(),
+        },
+    }
 }
 
 /// Probe a local filesystem directory for reachability + budget.
@@ -1105,6 +1146,8 @@ mod tests {
     fn default_scan_policy_for_dlna_is_browse_only() {
         let p = default_scan_policy_for(&SourceKind::NetworkDlna {
             service_id: "uuid:abc".into(),
+            control_url: String::new(),
+            base_url: String::new(),
         });
         assert!(matches!(p, ScanPolicy::BrowseOnly));
     }

@@ -1,0 +1,25 @@
+[package]
+name = "evo-dlna"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UPnP/DLNA MediaServer client primitives: SSDP discovery, device description parse, paged ContentDirectory Browse, DIDL-Lite decode. Used by org.evoframework.source.dlna and (browse/probe only) playback.mpd NetworkDlna paths."
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+roxmltree = "0.20"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "io-util", "sync", "macros", "rt"] }
+tracing = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

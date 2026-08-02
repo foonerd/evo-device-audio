@@ -2907,7 +2907,14 @@ impl MpdPlaybackPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: PlayNowPayload = parse_versioned_payload(req, "play_now")?;
-        let path = parse_mpd_path_uri(&payload.uri)?;
+        // Own scheme `mpd-path:` strips to a library-relative
+        // path. Absolute `http(s):` URIs (DLNA / radio / remote
+        // streams) pass through to MPD `add` unchanged — the
+        // audio.queue schema explicitly puts HTTP(S) in the
+        // play/enqueue path. Opaque `dlna:` URIs must be
+        // resolved by source.dlna before anything reaches this
+        // verb.
+        let path = parse_play_now_uri(&payload.uri)?;
         let supervisor = self.active_supervisor("play_now")?;
         supervisor
             .command(PlaybackCommand::LoadAndPlay(path.to_string()))
@@ -3794,12 +3801,42 @@ struct SimpleResponse {
     status: &'static str,
 }
 
-/// Strip the `mpd-path:` URI scheme prefix and return the
-/// remaining library path. Refuses URIs that don't bear
-/// the expected scheme — those routed here through a
-/// framework-side URI-routing mistake; surface the
-/// problem rather than silently treating the URI as a
-/// library path.
+/// Resolve a `play_now` URI into the string MPD's `add` /
+/// `LoadAndPlay` accepts.
+///
+/// - `mpd-path:<library-relative>` → library-relative path
+/// - `http://…` / `https://…` → absolute URL unchanged
+///
+/// Opaque schemes (`dlna:`, `file:`, …) are refused — the
+/// owning source plugin must resolve them before they reach
+/// the playback warden.
+fn parse_play_now_uri(uri: &str) -> Result<&str, PluginError> {
+    let prefix = format!("{URI_SCHEME_MPD_PATH}:");
+    if let Some(path) = uri.strip_prefix(&prefix) {
+        if path.is_empty() {
+            return Err(PluginError::Permanent(format!(
+                "play_now URI {uri:?} has empty path component after scheme"
+            )));
+        }
+        return Ok(path);
+    }
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        if uri.len() <= "http://".len() {
+            return Err(PluginError::Permanent(format!(
+                "play_now URI {uri:?} is an empty http(s) URL"
+            )));
+        }
+        return Ok(uri);
+    }
+    Err(PluginError::Permanent(format!(
+        "play_now URI {uri:?} is not {URI_SCHEME_MPD_PATH:?} or http(s); \
+         opaque schemes must be resolved by their owning source plugin \
+         before reaching playback.mpd"
+    )))
+}
+
+/// Legacy test helper: `mpd-path:` only (rejects http(s)).
+#[cfg(test)]
 fn parse_mpd_path_uri(uri: &str) -> Result<&str, PluginError> {
     let prefix = format!("{URI_SCHEME_MPD_PATH}:");
     if let Some(path) = uri.strip_prefix(&prefix) {
@@ -3808,14 +3845,13 @@ fn parse_mpd_path_uri(uri: &str) -> Result<&str, PluginError> {
                 "play_now URI {uri:?} has empty path component after scheme"
             )));
         }
-        Ok(path)
-    } else {
-        Err(PluginError::Permanent(format!(
-            "play_now URI {uri:?} does not bear the {URI_SCHEME_MPD_PATH:?} \
-             scheme this plugin owns; framework's URI router should not \
-             have dispatched it here"
-        )))
+        return Ok(path);
     }
+    Err(PluginError::Permanent(format!(
+        "play_now URI {uri:?} does not bear the {URI_SCHEME_MPD_PATH:?} \
+         scheme this plugin owns; framework's URI router should not \
+         have dispatched it here"
+    )))
 }
 
 #[cfg(test)]
@@ -4334,6 +4370,25 @@ mod tests {
             }
             other => panic!("expected Permanent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_play_now_uri_accepts_http_and_https() {
+        assert_eq!(
+            parse_play_now_uri("http://media.lan/track.flac").unwrap(),
+            "http://media.lan/track.flac"
+        );
+        assert_eq!(
+            parse_play_now_uri("https://media.lan/track.flac").unwrap(),
+            "https://media.lan/track.flac"
+        );
+    }
+
+    #[test]
+    fn parse_play_now_uri_refuses_opaque_dlna() {
+        let err = parse_play_now_uri("dlna:uuid:abc/0$1")
+            .expect_err("opaque dlna must resolve first");
+        assert!(matches!(err, PluginError::Permanent(_)));
     }
 
     // ===== parse_correction tests (pure) =====
