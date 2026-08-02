@@ -173,6 +173,7 @@ impl ShelfBundle {
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+            shelf_dispatcher.clone(),
         );
         let favourites = FavouritesContext::new(
             music_directory.clone(),

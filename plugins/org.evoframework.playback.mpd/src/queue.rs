@@ -707,12 +707,22 @@ pub(crate) async fn handle_enqueue(
     if payload.uris.is_empty() {
         return Err(VerbError::EmptyUris);
     }
+    // Resolve every `dlna:<service_id>/<objectId>` in the batch
+    // to `http(s)` via peer-dispatch to source.dlna.resolve;
+    // MPD's `add` / `addid` only speak library-relative paths
+    // and `http(s)`. Non-`dlna:` URIs pass through unchanged.
+    // Resolve BEFORE any MPD write so a mid-batch resolve
+    // failure leaves the queue intact (all-or-nothing).
+    let mut resolved: Vec<String> = Vec::with_capacity(payload.uris.len());
+    for uri in &payload.uris {
+        resolved.push(resolve_uri_for_mpd(ctx, "enqueue", uri).await?);
+    }
     // MPD's `addid` accepts a position. For multi-URI enqueue
     // at position P, we add each URI at position P, P+1, P+2.
     // When position is None, addid without position appends.
     if let Some(start_pos) = payload.position {
         let mut current = start_pos;
-        for uri in &payload.uris {
+        for uri in &resolved {
             conn.addid(uri, Some(current)).await.map_err(|e| {
                 VerbError::Mpd {
                     verb: "enqueue".to_string(),
@@ -722,7 +732,7 @@ pub(crate) async fn handle_enqueue(
             current = current.saturating_add(1);
         }
     } else {
-        for uri in &payload.uris {
+        for uri in &resolved {
             conn.addid(uri, None).await.map_err(|e| VerbError::Mpd {
                 verb: "enqueue".to_string(),
                 reason: e.to_string(),
@@ -901,8 +911,8 @@ async fn handle_enqueue_selection_criteria(
 
 // --- Container selection ---------------------------------------
 
-const AUDIO_DLNA_SHELF: &str = "audio.dlna";
-const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
+pub(crate) const AUDIO_DLNA_SHELF: &str = "audio.dlna";
+pub(crate) const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
 
 /// Container-shape handler: peer-dispatches `source.dlna.browse`
 /// on `audio.dlna` for the requested `(service_id, objectId)` at
@@ -1095,7 +1105,7 @@ async fn handle_enqueue_selection_container(
     }))
 }
 
-fn shelf_error_reason(
+pub(crate) fn shelf_error_reason(
     e: &evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError,
 ) -> String {
     use evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError as E;
@@ -1118,6 +1128,117 @@ fn shelf_error_reason(
             format!("substrate failure: {detail}")
         }
     }
+}
+
+// --- dlna: → http resolve at MPD-add boundary -----------------
+
+const URI_SCHEME_DLNA: &str = "dlna:";
+const SOURCE_DLNA_RESOLVE_VERB: &str = "source.dlna.resolve";
+
+/// Resolve a stored URI into a form MPD's `add` / `addid` will
+/// accept, translating `dlna:<service_id>/<objectId>` into the
+/// concrete `http(s)` stream URL via peer-shelf dispatch to
+/// `source.dlna.resolve`. Non-`dlna:` URIs pass through
+/// unchanged; MPD itself gates on scheme at add time.
+///
+/// Favourites and stored playlists keep their `dlna:` stable
+/// identity on disk across MediaServer IP / token churn; the
+/// resolve only happens at the enqueue-to-MPD boundary. A
+/// Transient reply from the source plugin (MediaServer offline,
+/// cache empty) reaches the caller as
+/// [`VerbError::Mpd`] with the underlying classification word
+/// preserved in the reason string so operator UI can
+/// distinguish "retry when server is back" from "this entry is
+/// gone."
+pub(crate) async fn resolve_uri_for_mpd(
+    ctx: &QueueContext,
+    verb: &str,
+    uri: &str,
+) -> Result<String, VerbError> {
+    if !uri.starts_with(URI_SCHEME_DLNA) {
+        return Ok(uri.to_string());
+    }
+    let (service_id, object_id) =
+        parse_dlna_uri(uri).ok_or_else(|| VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: format!(
+                "stored dlna: URI {uri:?} does not match \
+                 `dlna:<service_id>/<objectId>`; the favourite or playlist \
+                 entry was written by a caller that does not agree with the \
+                 source.dlna URI-scheme owner"
+            ),
+        })?;
+    let dispatcher =
+        ctx.shelf_dispatcher
+            .as_ref()
+            .ok_or_else(|| VerbError::Mpd {
+                verb: verb.to_string(),
+                reason: format!(
+                    "dlna: URI {uri:?} requires the peer-shelf dispatcher to \
+                 resolve, but LoadContext.shelf_request_dispatcher was None \
+                 at admission"
+                ),
+            })?;
+    let request = json!({
+        "v":          1,
+        "service_id": service_id,
+        "object_id":  object_id,
+    });
+    let request_bytes =
+        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: format!("dlna resolve: serialise request: {e}"),
+        })?;
+    let response_bytes = dispatcher
+        .dispatch(
+            AUDIO_DLNA_SHELF,
+            SOURCE_DLNA_RESOLVE_VERB,
+            request_bytes,
+            None,
+        )
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: format!("dlna resolve {uri:?}: {}", shelf_error_reason(&e)),
+        })?;
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VerbError::Mpd {
+        verb: verb.to_string(),
+        reason: format!("dlna resolve: parse response: {e}"),
+    })?;
+    let http_uri =
+        response
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VerbError::Mpd {
+                verb: verb.to_string(),
+                reason: format!(
+                    "dlna resolve {uri:?}: source.dlna.resolve response \
+                     missing `uri` field"
+                ),
+            })?;
+    if !(http_uri.starts_with("http://") || http_uri.starts_with("https://")) {
+        return Err(VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: format!(
+                "dlna resolve {uri:?}: resolved URI {http_uri:?} is not \
+                 http(s) — refusing to hand a non-MPD scheme to `add`"
+            ),
+        });
+    }
+    Ok(http_uri.to_string())
+}
+
+/// Split `dlna:<service_id>/<objectId>` into its parts. Service
+/// IDs may themselves contain colons (`uuid:aaaaaaaa-…`); the
+/// split is on the first `/` after the scheme.
+fn parse_dlna_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix(URI_SCHEME_DLNA)?;
+    let (service_id, object_id) = rest.split_once('/')?;
+    if service_id.is_empty() || object_id.is_empty() {
+        return None;
+    }
+    Some((service_id.to_string(), object_id.to_string()))
 }
 
 async fn apply_append(
@@ -1312,12 +1433,13 @@ pub(crate) async fn handle_load_playlist_to_queue(
         verb: "load_playlist_to_queue".to_string(),
         reason: e.to_string(),
     })?;
-    conn.load_playlist(&payload.playlist_name)
-        .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "load_playlist_to_queue".to_string(),
-            reason: e.to_string(),
-        })?;
+    load_playlist_with_dlna_resolve(
+        ctx,
+        conn,
+        "load_playlist_to_queue",
+        &payload.playlist_name,
+    )
+    .await?;
     if let Some(start) = payload.start_position {
         if let Err(e) = conn.play_position(start).await {
             // Non-fatal: queue loaded but auto-start failed. The
@@ -1344,13 +1466,54 @@ pub(crate) async fn handle_append_playlist_to_queue(
     payload: AppendPlaylistPayload,
 ) -> Result<(), VerbError> {
     check_version(payload.v, "queue.append_playlist_to_queue")?;
-    conn.load_playlist(&payload.playlist_name)
-        .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "append_playlist_to_queue".to_string(),
+    load_playlist_with_dlna_resolve(
+        ctx,
+        conn,
+        "append_playlist_to_queue",
+        &payload.playlist_name,
+    )
+    .await?;
+    publish_queue(ctx, conn).await;
+    Ok(())
+}
+
+/// Read a stored playlist's entries via `listplaylistinfo`,
+/// resolve any `dlna:` URIs to concrete `http(s)` streams via
+/// peer-shelf dispatch, and add each to the queue. Replaces
+/// MPD's own `load` verb on the `queue.load_playlist_to_queue`
+/// and `queue.append_playlist_to_queue` paths so a favourites
+/// or playlist entry carrying the stable
+/// `dlna:<service_id>/<objectId>` identity can round-trip
+/// through the queue without MPD refusing the scheme it does
+/// not know.
+///
+/// Resolve is per-entry so a single unresolvable entry (a
+/// MediaServer offline, an objectId no longer valid) refuses
+/// the whole load atomically before any MPD write — the queue
+/// starts intact and stays intact. This matches the
+/// `queue.enqueue` all-or-nothing invariant.
+async fn load_playlist_with_dlna_resolve(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    verb: &str,
+    playlist_name: &str,
+) -> Result<(), VerbError> {
+    let entries = conn.listplaylistinfo(playlist_name).await.map_err(|e| {
+        VerbError::Mpd {
+            verb: verb.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    let mut resolved: Vec<String> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        resolved.push(resolve_uri_for_mpd(ctx, verb, &e.file_path).await?);
+    }
+    for uri in &resolved {
+        conn.addid(uri, None).await.map_err(|e| VerbError::Mpd {
+            verb: verb.to_string(),
             reason: e.to_string(),
         })?;
-    publish_queue(ctx, conn).await;
+    }
     Ok(())
 }
 
@@ -1673,6 +1836,214 @@ mod tests {
                 assert_eq!(sel.uri, "0/objects/12$34:56/x");
             }
             SelectionInput::Criteria(_) => panic!("container variant expected"),
+        }
+    }
+
+    // ----- dlna: URI parse -----
+
+    #[test]
+    fn parse_dlna_uri_splits_on_first_slash_after_scheme() {
+        let (sid, oid) = parse_dlna_uri("dlna:uuid:abc/12$34").unwrap();
+        assert_eq!(sid, "uuid:abc");
+        assert_eq!(oid, "12$34");
+    }
+
+    #[test]
+    fn parse_dlna_uri_preserves_slashes_within_object_id() {
+        // ContentDirectory objectIds may themselves contain `/`;
+        // only the FIRST `/` after the scheme separates
+        // service_id from objectId.
+        let (sid, oid) =
+            parse_dlna_uri("dlna:uuid:aaaa-bbbb/0/objects/12$34").unwrap();
+        assert_eq!(sid, "uuid:aaaa-bbbb");
+        assert_eq!(oid, "0/objects/12$34");
+    }
+
+    #[test]
+    fn parse_dlna_uri_refuses_missing_scheme() {
+        assert!(parse_dlna_uri("uuid:abc/12$34").is_none());
+        assert!(parse_dlna_uri("http://example.com").is_none());
+    }
+
+    #[test]
+    fn parse_dlna_uri_refuses_empty_components() {
+        assert!(parse_dlna_uri("dlna:").is_none());
+        assert!(parse_dlna_uri("dlna:/").is_none());
+        assert!(parse_dlna_uri("dlna:uuid:abc").is_none());
+        assert!(parse_dlna_uri("dlna:uuid:abc/").is_none());
+        assert!(parse_dlna_uri("dlna:/12$34").is_none());
+    }
+
+    // ----- resolve_uri_for_mpd: pass-through for non-dlna -----
+
+    #[tokio::test]
+    async fn resolve_uri_for_mpd_passes_through_non_dlna_unchanged() {
+        // Http / library-relative URIs must not consult the
+        // dispatcher — MPD's `add` gates on scheme itself.
+        // Constructing a ctx without a dispatcher exposes the
+        // non-consultation via the fact that a dispatcher-
+        // requiring path would trip on the None handle.
+        struct NullAnn;
+        impl SubjectAnnouncer for NullAnn {
+            fn announce<'a>(
+                &'a self,
+                _a: SubjectAnnouncement,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn retract<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _reason: Option<String>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn update_state<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _state: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::new(NullAnn) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::new(NullAnn),
+            skip,
+            None,
+        );
+
+        for uri in [
+            "http://example.com/track.flac",
+            "https://example.com/track.flac",
+            "INTERNAL/album/track.flac",
+            "",
+        ] {
+            let out = resolve_uri_for_mpd(&ctx, "test", uri).await.unwrap();
+            assert_eq!(out, uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_uri_for_mpd_refuses_malformed_dlna() {
+        struct NullAnn;
+        impl SubjectAnnouncer for NullAnn {
+            fn announce<'a>(
+                &'a self,
+                _a: SubjectAnnouncement,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn retract<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _reason: Option<String>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn update_state<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _state: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::new(NullAnn) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::new(NullAnn),
+            skip,
+            None,
+        );
+
+        // Missing objectId after `dlna:<sid>/`.
+        let err = resolve_uri_for_mpd(&ctx, "test", "dlna:uuid:abc/")
+            .await
+            .expect_err("malformed must refuse");
+        match err {
+            VerbError::Mpd { reason, .. } => {
+                assert!(reason.contains("dlna:"));
+                assert!(reason.contains("does not match"));
+            }
+            other => panic!("expected VerbError::Mpd, got {other:?}"),
         }
     }
 

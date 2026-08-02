@@ -120,6 +120,17 @@ pub(crate) struct PlaylistContext {
     /// authoritative source for the wire shape; the upstream
     /// MPD query refreshes it, never the other way around.
     item_count_cache: Arc<Mutex<HashMap<String, Option<u32>>>>,
+    /// Peer-shelf dispatcher. Populated from
+    /// [`evo_plugin_sdk::contract::LoadContext::shelf_request_dispatcher`]
+    /// at plugin admission. `playlist.save_selection` uses
+    /// this to peer-dispatch to `source.dlna.browse` on the
+    /// `audio.dlna` shelf for the Container-shape selection
+    /// input.
+    pub(crate) shelf_dispatcher: Option<
+        Arc<
+            dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+        >,
+    >,
 }
 
 impl PlaylistContext {
@@ -129,6 +140,11 @@ impl PlaylistContext {
         registry: SourceRegistry,
         subjects: Arc<dyn SubjectAnnouncer>,
         favourites_name: String,
+        shelf_dispatcher: Option<
+            Arc<
+                dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+            >,
+        >,
     ) -> Self {
         Self {
             music_directory,
@@ -138,6 +154,7 @@ impl PlaylistContext {
             favourites_name,
             mirror: Arc::new(Mutex::new(None)),
             item_count_cache: Arc::new(Mutex::new(HashMap::new())),
+            shelf_dispatcher,
         }
     }
 }
@@ -711,20 +728,34 @@ pub(crate) async fn handle_add_to_playlist(
 /// `playlist.save_selection` request payload — server-side
 /// resolve + write into a stored playlist. Mirrors the
 /// `queue.enqueue_selection` contract for the playlist
-/// surface.
+/// surface (including the Container-shape selection input).
 #[derive(Debug, Deserialize)]
 pub(crate) struct SaveSelectionPayload {
     /// Envelope version.
     pub(crate) v: u32,
     /// Stored playlist name to write into.
     pub(crate) playlist_name: String,
-    /// Selection criteria.
-    pub(crate) selection: crate::selection::SelectionCriteria,
+    /// Source-registry id the selection applies to. Required
+    /// for the Container shape; ignored (may be absent) for
+    /// the Criteria shape.
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    /// Selection input — Criteria (MPD-native) or Container
+    /// (source-plugin-owned opaque identifier).
+    pub(crate) selection: crate::queue::SelectionInput,
     /// Mode: `create` clears the playlist before adding
     /// (creates it if absent); `append` adds to the existing
     /// playlist (creates it if absent).
     #[serde(default)]
     pub(crate) mode: SaveSelectionMode,
+    /// Container-shape only: zero-based page index. Defaults
+    /// to 0.
+    #[serde(default)]
+    pub(crate) page: Option<u32>,
+    /// Container-shape only: page size. Defaults to 50; hard-
+    /// capped at 100 by the owning source plugin.
+    #[serde(default)]
+    pub(crate) page_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -764,16 +795,53 @@ pub(crate) async fn handle_save_selection(
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "playlist.save_selection")?;
     validate_playlist_name(&payload.playlist_name)?;
-    let dimension_label = payload.selection.dimension.as_str().to_string();
-    let mode_label = payload.mode.as_str().to_string();
-    let resolved =
-        resolver
-            .resolve(conn, &payload.selection)
+    match payload.selection {
+        crate::queue::SelectionInput::Container(sel) => {
+            handle_save_selection_container(
+                ctx,
+                conn,
+                payload.playlist_name,
+                payload.source_id,
+                sel,
+                payload.mode,
+                payload.page,
+                payload.page_size,
+            )
             .await
-            .map_err(|e| VerbError::Mpd {
-                verb: "save_selection".to_string(),
-                reason: e.to_string(),
-            })?;
+        }
+        crate::queue::SelectionInput::Criteria(criteria) => {
+            handle_save_selection_criteria(
+                ctx,
+                conn,
+                resolver,
+                payload.playlist_name,
+                criteria,
+                payload.mode,
+            )
+            .await
+        }
+    }
+}
+
+/// The existing MPD-native Criteria path, factored out of the
+/// verb entrypoint so the Container path can live alongside
+/// without reshaping the top-level signature.
+async fn handle_save_selection_criteria(
+    _ctx: &PlaylistContext,
+    conn: &mut MpdConnection,
+    resolver: &dyn crate::selection::SelectionResolver,
+    playlist_name: String,
+    criteria: crate::selection::SelectionCriteria,
+    mode: SaveSelectionMode,
+) -> Result<serde_json::Value, VerbError> {
+    let dimension_label = criteria.dimension.as_str().to_string();
+    let mode_label = mode.as_str().to_string();
+    let resolved = resolver.resolve(conn, &criteria).await.map_err(|e| {
+        VerbError::Mpd {
+            verb: "save_selection".to_string(),
+            reason: e.to_string(),
+        }
+    })?;
     // Same pattern as `queue.enqueue_selection`: Filter's
     // `is_empty` misses the actual match count, so a one-
     // roundtrip MPD `count` confirms whether the selection
@@ -798,8 +866,9 @@ pub(crate) async fn handle_save_selection(
             "v":                1,
             "status":           "empty",
             "mode":             mode_label,
+            "kind":             "criteria",
             "dimension":        dimension_label,
-            "playlist_name":    payload.playlist_name,
+            "playlist_name":    playlist_name,
             "added_uris_count": 0,
             "detail":           "selection matched zero tracks; playlist unchanged",
         }));
@@ -810,8 +879,8 @@ pub(crate) async fn handle_save_selection(
     // trap the whole command list. Fire it as a standalone
     // pre-op and swallow the "no such playlist" ack — every
     // other error propagates.
-    if matches!(payload.mode, SaveSelectionMode::Create) {
-        if let Err(e) = conn.playlistclear(&payload.playlist_name).await {
+    if matches!(mode, SaveSelectionMode::Create) {
+        if let Err(e) = conn.playlistclear(&playlist_name).await {
             let msg = e.to_string().to_lowercase();
             let is_absent = msg.contains("no such playlist")
                 || msg.contains("no such file");
@@ -840,7 +909,7 @@ pub(crate) async fn handle_save_selection(
             // clean album title) and does the right thing for
             // year (`1996-*` matches on substring).
             let _ = substring;
-            let mut args: Vec<String> = vec![payload.playlist_name.clone()];
+            let mut args: Vec<String> = vec![playlist_name.clone()];
             for (t, v) in pairs {
                 args.push(t.clone());
                 args.push(v.clone());
@@ -851,7 +920,7 @@ pub(crate) async fn handle_save_selection(
             for uri in list {
                 commands.push((
                     "playlistadd",
-                    vec![payload.playlist_name.clone(), uri.clone()],
+                    vec![playlist_name.clone(), uri.clone()],
                 ));
             }
         }
@@ -862,7 +931,7 @@ pub(crate) async fn handle_save_selection(
             verb: "save_selection".to_string(),
             reason: e.to_string(),
         })?;
-    publish_index(ctx, conn).await;
+    publish_index(_ctx, conn).await;
     let added = if uris.is_empty() {
         serde_json::Value::Null
     } else {
@@ -872,9 +941,178 @@ pub(crate) async fn handle_save_selection(
         "v":                1,
         "status":           "ok",
         "mode":             mode_label,
+        "kind":             "criteria",
         "dimension":        dimension_label,
-        "playlist_name":    payload.playlist_name,
+        "playlist_name":    playlist_name,
         "added_uris_count": added,
+    }))
+}
+
+/// Container-shape handler: peer-dispatches `source.dlna.browse`
+/// on `audio.dlna` for the requested `(service_id, objectId)` at
+/// the caller's page + page_size, extracts each leaf item's
+/// `dlna:<service_id>/<objectId>` stable identity, and stores
+/// those URIs (not the resolved http streams) in the target
+/// playlist so subsequent enqueue-from-playlist resolves fresh
+/// via source.dlna.resolve — server IP / token churn does not
+/// invalidate the stored playlist.
+#[allow(clippy::too_many_arguments)]
+async fn handle_save_selection_container(
+    ctx: &PlaylistContext,
+    conn: &mut MpdConnection,
+    playlist_name: String,
+    source_id: Option<String>,
+    selection: crate::queue::ContainerSelection,
+    mode: SaveSelectionMode,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<serde_json::Value, VerbError> {
+    let mode_label = mode.as_str().to_string();
+    let source_id = source_id.ok_or_else(|| VerbError::Mpd {
+        verb: "save_selection".into(),
+        reason: "container selection requires source_id at top level".into(),
+    })?;
+    let record =
+        ctx.registry
+            .get(&source_id)
+            .await
+            .ok_or_else(|| VerbError::Mpd {
+                verb: "save_selection".into(),
+                reason: format!("unknown source_id {source_id:?}"),
+            })?;
+    let service_id = match &record.kind {
+        crate::source_registry::SourceKind::NetworkDlna {
+            service_id, ..
+        } => service_id.clone(),
+        other => {
+            return Err(VerbError::Mpd {
+                verb: "save_selection".into(),
+                reason: format!(
+                    "container selection against source {source_id:?} \
+                     of kind {other:?}: only network_dlna sources \
+                     resolve containers today"
+                ),
+            });
+        }
+    };
+    let dispatcher =
+        ctx.shelf_dispatcher
+            .as_ref()
+            .ok_or_else(|| VerbError::Mpd {
+                verb: "save_selection".into(),
+                reason: "container selection requires the peer-shelf \
+                     dispatcher, but LoadContext.shelf_request_dispatcher \
+                     was None at admission"
+                    .into(),
+            })?;
+    let request = serde_json::json!({
+        "v":          1,
+        "service_id": service_id,
+        "object_id":  selection.uri,
+        "page":       page.unwrap_or(0),
+        "page_size":  page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT),
+    });
+    let request_bytes =
+        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+            verb: "save_selection".into(),
+            reason: format!("dlna container: serialise request: {e}"),
+        })?;
+    let response_bytes = dispatcher
+        .dispatch(
+            crate::queue::AUDIO_DLNA_SHELF,
+            crate::queue::SOURCE_DLNA_BROWSE_VERB,
+            request_bytes,
+            None,
+        )
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "save_selection".into(),
+            reason: format!(
+                "dlna container: {}",
+                crate::queue::shelf_error_reason(&e)
+            ),
+        })?;
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VerbError::Mpd {
+        verb: "save_selection".into(),
+        reason: format!("dlna container: parse response: {e}"),
+    })?;
+    let entries = response
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // Compose the stable-identity URI for each leaf item. The
+    // source.dlna.browse response carries the objectId in `path`
+    // (per source.dlna's own wire shape); we ignore its `uri`
+    // (stream URL) and store `dlna:<service_id>/<objectId>`
+    // instead so the stored playlist survives server IP / token
+    // churn.
+    let stable_uris: Vec<String> = entries
+        .iter()
+        .filter_map(|e| {
+            if e.get("kind").and_then(|v| v.as_str()) != Some("file") {
+                return None;
+            }
+            let object_id = e.get("path").and_then(|v| v.as_str())?;
+            if object_id.is_empty() {
+                return None;
+            }
+            Some(format!("dlna:{service_id}/{object_id}"))
+        })
+        .collect();
+    let truncated = response
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let next_page = response.get("next_page").cloned();
+
+    if stable_uris.is_empty() {
+        return Ok(serde_json::json!({
+            "v":             1,
+            "status":        "empty",
+            "mode":          mode_label,
+            "kind":          "container",
+            "playlist_name": playlist_name,
+            "added":         0,
+            "truncated":     truncated,
+            "next_page":     next_page,
+            "detail":        "container page carried no playable leaf items; playlist unchanged",
+        }));
+    }
+    if matches!(mode, SaveSelectionMode::Create) {
+        if let Err(e) = conn.playlistclear(&playlist_name).await {
+            let msg = e.to_string().to_lowercase();
+            let is_absent = msg.contains("no such playlist")
+                || msg.contains("no such file");
+            if !is_absent {
+                return Err(VerbError::Mpd {
+                    verb: "save_selection".into(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    let commands: Vec<(&str, Vec<String>)> = stable_uris
+        .iter()
+        .map(|uri| ("playlistadd", vec![playlist_name.clone(), uri.clone()]))
+        .collect();
+    conn.command_list(&commands)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "save_selection".into(),
+            reason: e.to_string(),
+        })?;
+    publish_index(ctx, conn).await;
+    Ok(serde_json::json!({
+        "v":             1,
+        "status":        "ok",
+        "mode":          mode_label,
+        "kind":          "container",
+        "playlist_name": playlist_name,
+        "added":         stable_uris.len(),
+        "truncated":     truncated,
+        "next_page":     next_page,
     }))
 }
 
