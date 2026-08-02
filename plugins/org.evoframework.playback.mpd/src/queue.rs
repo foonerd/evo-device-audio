@@ -1017,15 +1017,15 @@ async fn handle_enqueue_selection_container(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let stream_uris: Vec<String> = entries
+    // Extract the stable-identity `dlna:` URI each leaf item
+    // carries. source.dlna.browse emits `uri: dlna:<sid>/<oid>`
+    // as the entry's identity post-follow-up. Sub-containers
+    // are silently skipped: only leaf items enqueue in one
+    // call (the UI drills into subcontainers via a fresh
+    // browse_library + enqueue_selection pair).
+    let stable_uris: Vec<String> = entries
         .iter()
         .filter_map(|e| {
-            // Only leaf items enqueue; containers are silently
-            // skipped. `uri` is source.dlna's picked stream URL
-            // (already resolved during Browse); the fallback to
-            // objectId is defensive against a source that
-            // returns an item with no stream — MPD would refuse
-            // that anyway.
             if e.get("kind").and_then(|v| v.as_str()) != Some("file") {
                 return None;
             }
@@ -1035,13 +1035,22 @@ async fn handle_enqueue_selection_container(
                 .map(String::from)
         })
         .collect();
+    // Resolve each stable identity to a concrete `http(s)` at
+    // MPD-add time via the shared boundary helper. Resolve
+    // BEFORE any MPD write so a mid-page resolve failure
+    // leaves the queue intact (all-or-nothing).
+    let mut mpd_uris: Vec<String> = Vec::with_capacity(stable_uris.len());
+    for uri in &stable_uris {
+        mpd_uris
+            .push(resolve_uri_for_mpd(ctx, "enqueue_selection", uri).await?);
+    }
     let truncated = response
         .get("truncated")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let next_page = response.get("next_page").cloned();
 
-    if stream_uris.is_empty() {
+    if mpd_uris.is_empty() {
         return Ok(serde_json::json!({
             "v":         LIBRARY_PAYLOAD_VERSION,
             "status":    "empty",
@@ -1056,7 +1065,7 @@ async fn handle_enqueue_selection_container(
 
     match mode {
         EnqueueSelectionMode::Append => {
-            for uri in &stream_uris {
+            for uri in &mpd_uris {
                 conn.add(uri).await.map_err(|e| VerbError::Mpd {
                     verb: "enqueue_selection".into(),
                     reason: e.to_string(),
@@ -1066,7 +1075,7 @@ async fn handle_enqueue_selection_container(
         EnqueueSelectionMode::Next => {
             let start_pos = current_song_position(conn).await? + 1;
             let mut current = start_pos;
-            for uri in &stream_uris {
+            for uri in &mpd_uris {
                 conn.addid(uri, Some(current)).await.map_err(|e| {
                     VerbError::Mpd {
                         verb: "enqueue_selection".into(),
@@ -1081,7 +1090,7 @@ async fn handle_enqueue_selection_container(
                 verb: "enqueue_selection".into(),
                 reason: e.to_string(),
             })?;
-            for uri in &stream_uris {
+            for uri in &mpd_uris {
                 conn.add(uri).await.map_err(|e| VerbError::Mpd {
                     verb: "enqueue_selection".into(),
                     reason: e.to_string(),
@@ -1099,7 +1108,7 @@ async fn handle_enqueue_selection_container(
         "status":    "ok",
         "mode":      mode_label,
         "kind":      "container",
-        "enqueued":  stream_uris.len(),
+        "enqueued":  mpd_uris.len(),
         "truncated": truncated,
         "next_page": next_page,
     }))

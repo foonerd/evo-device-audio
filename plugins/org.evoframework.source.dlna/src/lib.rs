@@ -535,7 +535,18 @@ async fn handle_browse(
                 "artist": i.artist,
                 "album": i.album,
                 "artwork_url": i.album_art_uri,
-                "uri": pick_stream_uri(i),
+                // The stable identity — `dlna:<service_id>/<objectId>`
+                // — is the only URI form the operator glass ever
+                // sees or stores for a DLNA item. The concrete
+                // `http(s)` stream is an internal detail of
+                // resolve/play_now and NEVER leaves this plugin
+                // through the browse surface: putting it on the
+                // wire would force favourites and playlists to
+                // persist an identity that churns with the
+                // MediaServer's IP and session token, which is
+                // exactly the bug the stable-identity design was
+                // introduced to close.
+                "uri": format!("{URI_SCHEME_DLNA}:{}/{}", body.service_id, i.id),
                 "playable": pick_stream_uri(i).is_some(),
             }),
         })

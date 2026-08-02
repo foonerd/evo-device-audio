@@ -664,15 +664,24 @@ fn shelf_error_reason(e: &ShelfDispatchError) -> String {
 }
 
 /// Translate one `source.dlna.browse` entry into the
-/// `library.browse_library` entry shape. Container entries carry the
-/// ContentDirectory objectId as the browse `uri` so the UI drills
-/// into it via `library.browse_library` with `path = uri` (the same
-/// contract local-folder browses use). Item entries carry the picked
-/// stream URL as `uri` so the queue-enqueue path reaches MPD `add`
-/// unchanged. Both shapes also carry `stable_uri =
-/// dlna:<service_id>/<objectId>` — the identity the favourite +
-/// playlist stores round-trip so an operator's saved selection
-/// survives a server IP or token churn.
+/// `library.browse_library` entry shape.
+///
+/// Container entries carry the ContentDirectory objectId as
+/// the browse `uri` so the UI drills into the container via
+/// `library.browse_library` with `path = uri` (the same
+/// contract local-folder browses use).
+///
+/// Item entries carry the stable identity
+/// `dlna:<service_id>/<objectId>` as `uri` — the ONLY URI form
+/// the operator glass sees or stores for a DLNA item. The
+/// concrete `http(s)` stream url is an internal resolve detail
+/// (the queue's [`resolve_uri_for_mpd`] boundary consults
+/// `source.dlna.resolve` at MPD-add time) and never crosses
+/// the browse surface. `source.dlna.browse` already emits the
+/// stable form as its own entry `uri`; this mapping is a
+/// pass-through with a defensive fall-back to a compose from
+/// the entry's `path` + the response's `service_id` when a
+/// legacy caller returns the raw stream.
 fn render_dlna_browse_entry(
     entry: &serde_json::Value,
     service_id: &str,
@@ -680,25 +689,33 @@ fn render_dlna_browse_entry(
     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let object_id = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let stable_uri = format!("dlna:{service_id}/{object_id}");
+    let source_uri = entry.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+    // Prefer source.dlna's own emitted `uri` when it already
+    // carries the `dlna:` stable scheme. If a legacy
+    // source.dlna build emits an `http(s)` stream URL,
+    // defensively compose the stable identity from
+    // `service_id + object_id` so the browse wire never
+    // surfaces `http(s)` on a file entry.
+    let stable_uri = if source_uri.starts_with("dlna:") {
+        source_uri.to_string()
+    } else {
+        format!("dlna:{service_id}/{object_id}")
+    };
     match kind {
         "directory" => json!({
             "kind": "directory",
             "name": name,
             "uri":  object_id,
-            "stable_uri": stable_uri,
         }),
         _ => {
-            let stream = entry.get("uri").and_then(|v| v.as_str());
             let mut out = json!({
-                "kind": "file",
-                "name": name,
-                "title": entry.get("title").cloned(),
-                "artist": entry.get("artist").cloned(),
-                "album": entry.get("album").cloned(),
+                "kind":        "file",
+                "name":        name,
+                "title":       entry.get("title").cloned(),
+                "artist":      entry.get("artist").cloned(),
+                "album":       entry.get("album").cloned(),
                 "artwork_url": entry.get("artwork_url").cloned(),
-                "uri": stream.unwrap_or(object_id),
-                "stable_uri": stable_uri,
+                "uri":         stable_uri,
             });
             if let Some(obj) = out.as_object_mut() {
                 obj.retain(|_, v| !v.is_null());
@@ -3192,10 +3209,16 @@ mod tests {
         assert_eq!(row["kind"]["service_id"], "uuid:abc");
     }
 
-    // --- render_dlna_browse_entry: dlna:<sid>/<oid> identity -----
+    // --- render_dlna_browse_entry: single-field dlna: identity --
 
     #[test]
-    fn render_dlna_browse_entry_container_carries_stable_uri() {
+    fn render_dlna_browse_entry_container_uri_is_object_id() {
+        // Containers keep the ContentDirectory objectId as
+        // `uri` so the UI drills via `library.browse_library`
+        // with `path = uri` (same contract as local folders).
+        // No `stable_uri` field on containers — containers are
+        // not stored in favourites / playlists; the identity
+        // is only meaningful for leaf items.
         let src = json!({
             "kind":        "directory",
             "name":        "Rock",
@@ -3205,47 +3228,63 @@ mod tests {
         let out = render_dlna_browse_entry(&src, "uuid:server-1");
         assert_eq!(out["kind"], "directory");
         assert_eq!(out["name"], "Rock");
-        // `uri` = objectId so the UI drills into it via
-        // library.browse_library with `path = uri` (same contract
-        // local-folder browses use).
         assert_eq!(out["uri"], "12$34");
-        // `stable_uri` = dlna:<service_id>/<objectId>.
-        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$34");
+        // No leaked auxiliary fields.
+        assert!(!out.as_object().unwrap().contains_key("stable_uri"));
+        assert!(!out.as_object().unwrap().contains_key("stream_uri"));
     }
 
     #[test]
-    fn render_dlna_browse_entry_item_carries_stream_and_stable() {
+    fn render_dlna_browse_entry_item_uri_is_dlna_scheme_verbatim() {
+        // source.dlna.browse emits
+        // `uri: dlna:<service_id>/<objectId>` on file entries;
+        // the mapping passes it through unchanged.
         let src = json!({
-            "kind":         "file",
-            "name":         "Song.flac",
-            "path":         "12$99",
-            "title":        "Song",
-            "artist":       "Artist",
-            "album":        "Album",
-            "artwork_url":  "http://192.0.2.10:8096/art/xyz",
-            "uri":          "http://192.0.2.10:8096/stream/xyz.flac",
-            "playable":     true,
+            "kind":        "file",
+            "name":        "Song.flac",
+            "path":        "12$99",
+            "title":       "Song",
+            "artist":      "Artist",
+            "album":       "Album",
+            "artwork_url": "http://192.0.2.10:8096/art/xyz",
+            "uri":         "dlna:uuid:server-1/12$99",
+            "playable":    true,
         });
         let out = render_dlna_browse_entry(&src, "uuid:server-1");
         assert_eq!(out["kind"], "file");
-        assert_eq!(out["name"], "Song.flac");
-        assert_eq!(out["title"], "Song");
-        assert_eq!(out["artist"], "Artist");
-        // Stream URL is the enqueue-time uri (unchanged until the
-        // dlna: stored-identity switch on the favourite +
-        // playlist path lands).
-        assert_eq!(out["uri"], "http://192.0.2.10:8096/stream/xyz.flac");
-        // stable_uri is the storage-safe identity.
-        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$99");
+        assert_eq!(out["uri"], "dlna:uuid:server-1/12$99");
+        // No `http(s)` stream URL surfaces on the browse wire.
+        assert!(!out.as_object().unwrap().values().any(|v| {
+            v.as_str().is_some_and(|s| {
+                s.starts_with("http://") && s.contains("stream")
+            })
+        }));
+    }
+
+    #[test]
+    fn render_dlna_browse_entry_defensive_dlna_compose_on_legacy_stream_url() {
+        // If a legacy source.dlna build emits `uri` as an
+        // `http(s)` stream URL (pre-follow-up shape), the
+        // mapping defensively composes `dlna:<sid>/<oid>` from
+        // the entry's `path` + the response's `service_id` so
+        // the operator glass NEVER sees `http(s)` from browse.
+        let src = json!({
+            "kind": "file",
+            "name": "Legacy.flac",
+            "path": "12$77",
+            "uri":  "http://192.0.2.10:8096/stream/legacy.flac",
+        });
+        let out = render_dlna_browse_entry(&src, "uuid:server-1");
+        assert_eq!(out["uri"], "dlna:uuid:server-1/12$77");
     }
 
     #[test]
     fn render_dlna_browse_entry_item_drops_null_optional_fields() {
         let src = json!({
-            "kind":   "file",
-            "name":   "Song.flac",
-            "path":   "12$99",
-            "uri":    "http://192.0.2.10:8096/stream/xyz.flac",
+            "kind": "file",
+            "name": "Song.flac",
+            "path": "12$99",
+            "uri":  "dlna:uuid:server-1/12$99",
             // no title / artist / album / artwork_url present
         });
         let out = render_dlna_browse_entry(&src, "uuid:server-1");
@@ -3255,7 +3294,7 @@ mod tests {
         assert!(!obj.contains_key("artist"));
         assert!(!obj.contains_key("album"));
         assert!(!obj.contains_key("artwork_url"));
-        assert_eq!(out["stable_uri"], "dlna:uuid:server-1/12$99");
+        assert_eq!(out["uri"], "dlna:uuid:server-1/12$99");
     }
 
     // --- shelf_error_reason: classified strings ------------------
@@ -3339,7 +3378,8 @@ mod tests {
     #[tokio::test]
     async fn browse_dlna_dispatches_to_audio_dlna_shelf_and_shapes_envelope() {
         // Canned response from source.dlna.browse — the shape it
-        // actually emits (with a container + item entry).
+        // emits post-follow-up: file entries carry the stable
+        // `dlna:<service_id>/<objectId>` identity as `uri`.
         let canned = json!({
             "v":          1,
             "status":     "ok",
@@ -3359,7 +3399,7 @@ mod tests {
                     "title":    "Track",
                     "artist":   "Artist",
                     "album":    "Album",
-                    "uri":      "http://192.0.2.10:8096/stream/1.flac",
+                    "uri":      "dlna:uuid:server-1/12$1",
                     "playable": true,
                 },
             ],
@@ -3404,15 +3444,18 @@ mod tests {
         assert_eq!(env["service_id"], "uuid:server-1");
         assert_eq!(env["stale"], false);
 
-        // Each entry carries the stable_uri identity.
+        // File entries carry the stable `dlna:` identity as the
+        // single `uri` field. Containers carry the objectId as
+        // `uri` for drill-in via library.browse_library. No
+        // `stable_uri` / `stream_uri` auxiliary fields on either.
         let entries = env["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["kind"], "directory");
         assert_eq!(entries[0]["uri"], "12$0");
-        assert_eq!(entries[0]["stable_uri"], "dlna:uuid:server-1/12$0");
+        assert!(!entries[0].as_object().unwrap().contains_key("stable_uri"));
         assert_eq!(entries[1]["kind"], "file");
-        assert_eq!(entries[1]["uri"], "http://192.0.2.10:8096/stream/1.flac");
-        assert_eq!(entries[1]["stable_uri"], "dlna:uuid:server-1/12$1");
+        assert_eq!(entries[1]["uri"], "dlna:uuid:server-1/12$1");
+        assert!(!entries[1].as_object().unwrap().contains_key("stable_uri"));
     }
 
     #[tokio::test]
