@@ -696,7 +696,7 @@ echo "  [ok]  evo.service active"
 # yielding "0\n0" and breaking the numeric comparison below.
 READY_HITS="$(ssh "${SSH_TARGET}" \
     'sudo -n journalctl -u evo --since "30 seconds ago" --no-pager 2>&1 \
-        | grep -cE "evo ready|server listening|fast path listening" \
+        | grep -cE "evo [a-z0-9-]+ listener ready|runtime: ready|OOP (plugin|warden\+respondent) server bound|evo ready|server listening|fast path listening" \
         || true')"
 if [[ "${READY_HITS}" -ge 1 ]]; then
     echo "  [ok]  steward emitted ready / listening signals (${READY_HITS} matching lines)"
