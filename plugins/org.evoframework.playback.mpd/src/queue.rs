@@ -117,6 +117,17 @@ pub(crate) struct QueueContext {
     /// without round-tripping through the framework's subject
     /// querier.
     mirror: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Peer-shelf dispatcher. Populated from
+    /// [`evo_plugin_sdk::contract::LoadContext::shelf_request_dispatcher`]
+    /// at plugin admission. `queue.enqueue_selection` uses this
+    /// to peer-dispatch to `source.dlna.browse` on `audio.dlna`
+    /// for the Container-shape selection input; the Criteria
+    /// shape never consults the dispatcher.
+    pub(crate) shelf_dispatcher: Option<
+        Arc<
+            dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+        >,
+    >,
 }
 
 impl QueueContext {
@@ -127,6 +138,11 @@ impl QueueContext {
         registry: SourceRegistry,
         subjects: Arc<dyn SubjectAnnouncer>,
         skip: SkipTraversal,
+        shelf_dispatcher: Option<
+            Arc<
+                dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+            >,
+        >,
     ) -> Self {
         Self {
             music_directory,
@@ -134,6 +150,7 @@ impl QueueContext {
             subjects,
             skip,
             mirror: Arc::new(Mutex::new(None)),
+            shelf_dispatcher,
         }
     }
 }
@@ -410,23 +427,73 @@ pub(crate) struct EnqueuePayload {
 
 /// `queue.enqueue_selection` request payload — multi-
 /// dimensional server-side resolution. The UI passes a
-/// selection criteria + mode; the plugin resolves via the
-/// [`crate::selection::SelectionResolver`] seam and applies
-/// the resulting URI set atomically. No URI list crosses the
-/// wire from UI to plugin.
+/// selection input + mode; the plugin resolves via the
+/// [`crate::selection::SelectionResolver`] seam (Criteria
+/// shape) or via peer-shelf dispatch to the owning source
+/// plugin (Container shape) and applies the resulting URI
+/// set atomically. No URI list crosses the wire from UI to
+/// plugin.
 #[derive(Debug, Deserialize)]
 pub(crate) struct EnqueueSelectionPayload {
     /// Envelope version.
     pub(crate) v: u32,
-    /// Selection criteria (dimension + value + optional
-    /// parent context). Same shape as the browse drill's
-    /// `BrowseSelector`.
-    pub(crate) selection: crate::selection::SelectionCriteria,
+    /// Source-registry id the selection applies to. Required
+    /// for the Container shape; ignored (may be absent) for
+    /// the Criteria shape.
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    /// Selection input — Criteria (MPD-native) or Container
+    /// (source-plugin-owned opaque identifier).
+    pub(crate) selection: SelectionInput,
     /// Mode: `replace` clears + adds + plays atomically;
     /// `next` inserts after the currently-playing item;
     /// `append` adds to the tail.
     #[serde(default)]
     pub(crate) mode: EnqueueSelectionMode,
+    /// Container-shape only: zero-based page index. Defaults
+    /// to 0.
+    #[serde(default)]
+    pub(crate) page: Option<u32>,
+    /// Container-shape only: page size. Defaults to 50; hard-
+    /// capped at 100 by the owning source plugin.
+    #[serde(default)]
+    pub(crate) page_size: Option<u32>,
+}
+
+/// Selection input — either the existing MPD-native Criteria
+/// shape or the new source-plugin-owned Container shape.
+///
+/// Serde-untagged so the two shapes discriminate on field
+/// presence: Container carries `kind: "container"` and `uri`;
+/// Criteria carries `dimension` (and `value`). Old callers
+/// sending the pre-existing `{ dimension, value, parent }`
+/// shape continue to deserialise into the Criteria variant.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum SelectionInput {
+    /// New source-plugin-owned container reference.
+    Container(ContainerSelection),
+    /// Existing MPD-native tag/facet selection.
+    Criteria(crate::selection::SelectionCriteria),
+}
+
+/// The Container-shape selection body.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ContainerSelection {
+    /// Discriminator. Must be `"container"`.
+    #[allow(dead_code)]
+    pub(crate) kind: ContainerSelectionKind,
+    /// The container's opaque identifier. For DLNA this is the
+    /// ContentDirectory objectId; other sources define their
+    /// own shape.
+    pub(crate) uri: String,
+}
+
+/// Discriminator enum for [`ContainerSelection`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContainerSelectionKind {
+    Container,
 }
 
 /// Mode for [`EnqueueSelectionPayload`].
@@ -696,16 +763,52 @@ pub(crate) async fn handle_enqueue_selection(
     payload: EnqueueSelectionPayload,
 ) -> Result<serde_json::Value, VerbError> {
     check_version(payload.v, "queue.enqueue_selection")?;
-    let dimension_label = payload.selection.dimension.as_str().to_string();
-    let mode_label = payload.mode.as_str().to_string();
-    let resolved =
-        resolver
-            .resolve(conn, &payload.selection)
+    match payload.selection {
+        SelectionInput::Container(sel) => {
+            handle_enqueue_selection_container(
+                ctx,
+                conn,
+                payload.source_id,
+                sel,
+                payload.mode,
+                payload.page,
+                payload.page_size,
+            )
             .await
-            .map_err(|e| VerbError::Mpd {
-                verb: "enqueue_selection".to_string(),
-                reason: e.to_string(),
-            })?;
+        }
+        SelectionInput::Criteria(criteria) => {
+            handle_enqueue_selection_criteria(
+                ctx,
+                conn,
+                resolver,
+                criteria,
+                payload.mode,
+            )
+            .await
+        }
+    }
+}
+
+/// The existing MPD-native Criteria path, factored out of the
+/// verb entrypoint so the Container path can share the
+/// enqueue-apply logic (`apply_append` / `apply_replace` /
+/// `Next` positional add) without reshaping the top-level
+/// signature.
+async fn handle_enqueue_selection_criteria(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    resolver: &dyn crate::selection::SelectionResolver,
+    criteria: crate::selection::SelectionCriteria,
+    mode: EnqueueSelectionMode,
+) -> Result<serde_json::Value, VerbError> {
+    let dimension_label = criteria.dimension.as_str().to_string();
+    let mode_label = mode.as_str().to_string();
+    let resolved = resolver.resolve(conn, &criteria).await.map_err(|e| {
+        VerbError::Mpd {
+            verb: "enqueue_selection".to_string(),
+            reason: e.to_string(),
+        }
+    })?;
     // Zero-match short-circuit — explicit empty, queue left
     // intact, no atomic clear. For `Filter` selections the
     // resolver's `is_empty` only catches the "no pairs"
@@ -731,6 +834,7 @@ pub(crate) async fn handle_enqueue_selection(
             "v":                LIBRARY_PAYLOAD_VERSION,
             "status":           "empty",
             "mode":             mode_label,
+            "kind":             "criteria",
             "dimension":        dimension_label,
             "added_uris_count": 0,
             "detail":           "selection matched zero tracks; queue unchanged",
@@ -740,7 +844,7 @@ pub(crate) async fn handle_enqueue_selection(
     // added-count) — MPD's `findadd` cannot target a
     // position. For `Append` / `Replace` a Filter runs
     // as-is via findadd/searchadd for a single roundtrip.
-    let materialise_needed = matches!(payload.mode, EnqueueSelectionMode::Next);
+    let materialise_needed = matches!(mode, EnqueueSelectionMode::Next);
     let uris: Vec<String> = if materialise_needed {
         materialise_to_uris(conn, &resolved).await.map_err(|e| {
             VerbError::Mpd {
@@ -754,7 +858,7 @@ pub(crate) async fn handle_enqueue_selection(
             crate::selection::ResolvedSelection::Filter { .. } => Vec::new(),
         }
     };
-    match payload.mode {
+    match mode {
         EnqueueSelectionMode::Append => {
             apply_append(conn, &resolved, &uris).await?;
         }
@@ -789,9 +893,231 @@ pub(crate) async fn handle_enqueue_selection(
         "v":                LIBRARY_PAYLOAD_VERSION,
         "status":           "ok",
         "mode":             mode_label,
+        "kind":             "criteria",
         "dimension":        dimension_label,
         "added_uris_count": added,
     }))
+}
+
+// --- Container selection ---------------------------------------
+
+const AUDIO_DLNA_SHELF: &str = "audio.dlna";
+const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
+
+/// Container-shape handler: peer-dispatches `source.dlna.browse`
+/// on `audio.dlna` for the requested `(service_id, objectId)` at
+/// the caller's page + page_size (or the source-plugin-owned
+/// defaults), extracts the leaf items' stream URIs, and enqueues
+/// them with mode semantics identical to the Criteria path.
+///
+/// Subcontainers in the response entry list are ignored: only
+/// leaf items are enqueued in one call. The UI drills into a
+/// subcontainer via `library.browse_library` and issues a fresh
+/// `queue.enqueue_selection` against the drilled objectId — no
+/// recursive descent inside a single verb call.
+///
+/// Paging is honoured verbatim: the response envelope's
+/// `truncated` + `next_page` come straight from
+/// `source.dlna.browse` so the caller drives the next page by
+/// re-issuing the verb with `page = next_page` and the same
+/// mode.
+async fn handle_enqueue_selection_container(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    source_id: Option<String>,
+    selection: ContainerSelection,
+    mode: EnqueueSelectionMode,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<serde_json::Value, VerbError> {
+    let mode_label = mode.as_str().to_string();
+    let source_id = source_id.ok_or_else(|| VerbError::Mpd {
+        verb: "enqueue_selection".into(),
+        reason:
+            "container selection requires source_id at top level of payload"
+                .into(),
+    })?;
+    let record =
+        ctx.registry
+            .get(&source_id)
+            .await
+            .ok_or_else(|| VerbError::Mpd {
+                verb: "enqueue_selection".into(),
+                reason: format!("unknown source_id {source_id:?}"),
+            })?;
+    let service_id = match &record.kind {
+        crate::source_registry::SourceKind::NetworkDlna {
+            service_id, ..
+        } => service_id.clone(),
+        other => {
+            return Err(VerbError::Mpd {
+                verb: "enqueue_selection".into(),
+                reason: format!(
+                    "container selection against source {source_id:?} \
+                     of kind {other:?}: only network_dlna sources \
+                     resolve containers today"
+                ),
+            });
+        }
+    };
+    let dispatcher =
+        ctx.shelf_dispatcher
+            .as_ref()
+            .ok_or_else(|| VerbError::Mpd {
+                verb: "enqueue_selection".into(),
+                reason: "container selection requires the peer-shelf \
+                     dispatcher, but LoadContext.shelf_request_dispatcher \
+                     was None at admission — the plugin was loaded \
+                     without a dispatcher wired"
+                    .into(),
+            })?;
+
+    let request = serde_json::json!({
+        "v":          1,
+        "service_id": service_id,
+        "object_id":  selection.uri,
+        "page":       page.unwrap_or(0),
+        "page_size":  page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT),
+    });
+    let request_bytes =
+        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+            verb: "enqueue_selection".into(),
+            reason: format!("dlna container: serialise request: {e}"),
+        })?;
+    let response_bytes = dispatcher
+        .dispatch(
+            AUDIO_DLNA_SHELF,
+            SOURCE_DLNA_BROWSE_VERB,
+            request_bytes,
+            None,
+        )
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "enqueue_selection".into(),
+            reason: format!("dlna container: {}", shelf_error_reason(&e)),
+        })?;
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VerbError::Mpd {
+        verb: "enqueue_selection".into(),
+        reason: format!("dlna container: parse response: {e}"),
+    })?;
+
+    let entries = response
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stream_uris: Vec<String> = entries
+        .iter()
+        .filter_map(|e| {
+            // Only leaf items enqueue; containers are silently
+            // skipped. `uri` is source.dlna's picked stream URL
+            // (already resolved during Browse); the fallback to
+            // objectId is defensive against a source that
+            // returns an item with no stream — MPD would refuse
+            // that anyway.
+            if e.get("kind").and_then(|v| v.as_str()) != Some("file") {
+                return None;
+            }
+            e.get("uri")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .collect();
+    let truncated = response
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let next_page = response.get("next_page").cloned();
+
+    if stream_uris.is_empty() {
+        return Ok(serde_json::json!({
+            "v":         LIBRARY_PAYLOAD_VERSION,
+            "status":    "empty",
+            "mode":      mode_label,
+            "kind":      "container",
+            "enqueued":  0,
+            "truncated": truncated,
+            "next_page": next_page,
+            "detail":    "container page carried no playable leaf items; queue unchanged",
+        }));
+    }
+
+    match mode {
+        EnqueueSelectionMode::Append => {
+            for uri in &stream_uris {
+                conn.add(uri).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: e.to_string(),
+                })?;
+            }
+        }
+        EnqueueSelectionMode::Next => {
+            let start_pos = current_song_position(conn).await? + 1;
+            let mut current = start_pos;
+            for uri in &stream_uris {
+                conn.addid(uri, Some(current)).await.map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                current = current.saturating_add(1);
+            }
+        }
+        EnqueueSelectionMode::Replace => {
+            conn.clear().await.map_err(|e| VerbError::Mpd {
+                verb: "enqueue_selection".into(),
+                reason: e.to_string(),
+            })?;
+            for uri in &stream_uris {
+                conn.add(uri).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: e.to_string(),
+                })?;
+            }
+            conn.play().await.map_err(|e| VerbError::Mpd {
+                verb: "enqueue_selection".into(),
+                reason: e.to_string(),
+            })?;
+        }
+    }
+    publish_queue(ctx, conn).await;
+    Ok(serde_json::json!({
+        "v":         LIBRARY_PAYLOAD_VERSION,
+        "status":    "ok",
+        "mode":      mode_label,
+        "kind":      "container",
+        "enqueued":  stream_uris.len(),
+        "truncated": truncated,
+        "next_page": next_page,
+    }))
+}
+
+fn shelf_error_reason(
+    e: &evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError,
+) -> String {
+    use evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError as E;
+    match e {
+        E::NoPluginOnShelf { shelf } => {
+            format!("no plugin on shelf {shelf:?}")
+        }
+        E::VerbNotStockedOnShelf {
+            shelf,
+            request_type,
+        } => {
+            format!("verb {request_type:?} not stocked on shelf {shelf:?}")
+        }
+        E::Permanent { detail } => format!("permanent: {detail}"),
+        E::Transient { detail } => format!("transient: {detail}"),
+        E::DeadlineExceeded { budget_ms } => {
+            format!("deadline exceeded ({budget_ms}ms)")
+        }
+        E::SubstrateFailure { detail } => {
+            format!("substrate failure: {detail}")
+        }
+    }
 }
 
 async fn apply_append(
@@ -1271,6 +1597,83 @@ mod tests {
         let err = VerbError::EmptyUris;
         let msg = format!("{err}");
         assert!(msg.contains("must not be empty"));
+    }
+
+    // ----- SelectionInput deserialisation -----
+
+    #[test]
+    fn selection_input_container_parses_from_kind_field() {
+        let payload = serde_json::json!({
+            "v":         1,
+            "source_id": "dlna-uuid-server-1",
+            "selection": { "kind": "container", "uri": "12$0" },
+            "mode":      "append",
+        });
+        let parsed: EnqueueSelectionPayload =
+            serde_json::from_value(payload).unwrap();
+        assert_eq!(parsed.source_id.as_deref(), Some("dlna-uuid-server-1"));
+        match parsed.selection {
+            SelectionInput::Container(sel) => assert_eq!(sel.uri, "12$0"),
+            SelectionInput::Criteria(_) => {
+                panic!("container JSON parsed as Criteria")
+            }
+        }
+    }
+
+    #[test]
+    fn selection_input_criteria_parses_without_kind_field() {
+        // Existing wire shape from pre-container callers: no
+        // `kind`, `dimension` present. Must continue to
+        // deserialise into the Criteria variant so pre-existing
+        // callers keep working.
+        let payload = serde_json::json!({
+            "v": 1,
+            "selection": {
+                "dimension": "artist",
+                "value":     "Beethoven",
+            },
+            "mode": "replace",
+        });
+        let parsed: EnqueueSelectionPayload =
+            serde_json::from_value(payload).unwrap();
+        assert!(parsed.source_id.is_none());
+        match parsed.selection {
+            SelectionInput::Criteria(c) => {
+                assert_eq!(c.value, "Beethoven");
+            }
+            SelectionInput::Container(_) => {
+                panic!("criteria JSON parsed as Container")
+            }
+        }
+    }
+
+    // ----- Container-shape helpers (pure) -----
+
+    #[test]
+    fn container_selection_kind_serde_only_accepts_container() {
+        let ok: ContainerSelectionKind =
+            serde_json::from_str("\"container\"").expect("container variant");
+        matches!(ok, ContainerSelectionKind::Container);
+        let err: Result<ContainerSelectionKind, _> =
+            serde_json::from_str("\"other\"");
+        assert!(err.is_err(), "unknown discriminator must refuse");
+    }
+
+    #[test]
+    fn selection_input_container_carries_uri_verbatim() {
+        // ContentDirectory objectIds routinely contain `$`,
+        // `:`, and `/` — the parser MUST pass them through.
+        let raw = serde_json::json!({
+            "kind": "container",
+            "uri":  "0/objects/12$34:56/x",
+        });
+        let parsed: SelectionInput = serde_json::from_value(raw).unwrap();
+        match parsed {
+            SelectionInput::Container(sel) => {
+                assert_eq!(sel.uri, "0/objects/12$34:56/x");
+            }
+            SelectionInput::Criteria(_) => panic!("container variant expected"),
+        }
     }
 
     // ----- play_from_position validation -----

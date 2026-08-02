@@ -165,6 +165,7 @@ impl ShelfBundle {
             registry.clone(),
             subjects.clone(),
             skip_traversal.clone(),
+            shelf_dispatcher.clone(),
         );
         let playlist = PlaylistContext::new(
             music_directory.clone(),
