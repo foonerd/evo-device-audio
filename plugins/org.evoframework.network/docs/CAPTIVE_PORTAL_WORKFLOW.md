@@ -97,18 +97,37 @@ Device-proxied session (three verbs, all
    - Drops `Set-Cookie` — plugin owns the jar; the browser
      has no cookies to send back (it is not the party the
      portal is tracking).
-   - Rewrites `Location` when it points at `upstream_host` into
-     a same-origin `/api/v1/network/captive/session/{sid}...`
-     URL.
+   - Rewrites `Location` two ways: absolute URL whose
+     authority matches `upstream_host` gets stripped +
+     prepended with the session prefix; a path-absolute
+     value (`/portal-path/…`, NOT `//…`) also gets prepended
+     with the session prefix. Protocol-relative and foreign
+     hosts pass through untouched.
    - For `text/html` / `text/css` / `text/plain` /
-     `application/xhtml` responses, byte-substitutes every
-     occurrence of `upstream_host` in the body with the session
-     prefix. Relative URLs (`./static/js/main.js`) resolve
-     against the browser's current location, which IS the
-     session URL, so most portal HTML needs no rewrite at all.
-   - Drops `Content-Length` + `Content-Encoding` from the
-     upstream response and re-emits the correct
-     `Content-Length` for the rewritten body.
+     `application/xhtml` responses, runs two passes: (a)
+     byte-substitute every occurrence of `upstream_host`
+     with the session prefix; (b) prepend the session prefix
+     to every path-absolute URL in a URL-carrying context
+     (HTML `href`/`src`/`action`/etc., CSS `url()`).
+     Relative URLs (`./static/js/main.js`) resolve against
+     the browser's current location — the session URL — so
+     the common case still needs no rewrite.
+   - Deliberately does NOT rewrite `application/javascript`,
+     `text/javascript`, or `application/json` bodies — a
+     byte-scan cannot AST-distinguish `/foo` (URL) from
+     `/foo/` (regex) from `+"/pending"` (Redux action
+     suffix) from `x /= 2` (division). Modern SPAs derive
+     request URLs from `window.location.pathname` and ride
+     the session prefix naturally.
+   - Decodes upstream `Content-Encoding` (`gzip`,
+     `x-gzip`, `deflate` with zlib wrapper or raw, magic
+     sniff `1f 8b` when the header is absent) to identity
+     BEFORE rewrite or handoff. `br` (brotli) and unknown
+     encodings fail closed with a 502 rather than pass
+     compressed bytes through. Never forwards the browser's
+     `Accept-Encoding` upstream, and always emits identity
+     to the browser (Content-Encoding stripped,
+     Content-Length recomputed).
 8. Browser receives same-origin bytes; portal HTML/JS/CSS
    renders. JS in the browser resolves fetches relative to
    `session_url` — every XHR / `fetch` / navigation the SPA
@@ -146,9 +165,13 @@ Device-proxied session (three verbs, all
   operator connect scope; matches
   `network.nm.captive.submit` and the plugin's session verbs
   so the bearer chain carries end-to-end.
-- Header filtering (hop-by-hop drop, Set-Cookie strip, Location
-  rewrite).
-- Body byte-substitution for HTML/CSS/plain-text content types.
+- Header filtering (hop-by-hop drop, Set-Cookie strip,
+  Location absolute-upstream + path-absolute rewrite).
+- Content-Encoding decode (gzip / deflate / magic-sniff;
+  brotli fail-closed) + Accept-Encoding strip upstream.
+- Body byte-substitution + path-absolute prefix in URL
+  contexts for HTML / CSS / plain-text / xhtml content
+  types. JS / JSON are deliberately excluded.
 
 ## What the UI owns
 
@@ -191,7 +214,7 @@ Recovery scenarios:
 
 Every scenario is a rig property, not a CI green.
 
-- Open network + JS-SPA captive portal (UniFi Guest Spot,
+- Open network + JS-SPA captive portal (common controllers,
   Meraki, similar) — iframe renders portal, operator completes
   voucher, connectivity flips to `full`.
 - Open network + static-HTML captive portal (cafe / hotel) —

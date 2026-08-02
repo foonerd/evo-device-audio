@@ -816,7 +816,7 @@ fn netdev_mac_last4_lower() -> Option<String> {
 /// Parse an `IP4.ROUTE[N]` value from `nmcli device show`
 /// into a structured `Ip4Route`. nmcli emits routes in the
 /// form:
-///   `dst = 0.0.0.0/0, nh = 192.168.30.254, mt = 100`
+///   `dst = 0.0.0.0/0, nh = 192.0.2.1, mt = 100`
 /// Fields may be re-ordered by NM version; we scan for `dst =`
 /// / `nh =` / `mt =` regardless of position. Empty next-hop
 /// means the route is on-link. `metric` absent when NM does
@@ -907,7 +907,7 @@ fn enrich_link_from_sysfs(ifname: &str, link: &mut LinkInfo) {
 ///
 /// ```text
 /// Connected to 00:11:22:33:44:55 (on wlan0)
-///         SSID: G(uest) Spot
+///         SSID: example-network
 ///         freq: 5180
 ///         signal: -58 dBm
 ///         tx bitrate: 173.3 MBit/s
@@ -1028,8 +1028,8 @@ fn nm_state_text(raw: &str) -> String {
 }
 
 /// Last two octets of a MAC address, lowercase hex, no
-/// separator. `d8:3a:dd:b8:d6:74` → `d674`. Short-form MAC
-/// input (`d674` already) is returned as-is (lower-cased,
+/// separator. `02:00:00:00:12:34` → `1234`. Short-form MAC
+/// input (`1234` already) is returned as-is (lower-cased,
 /// stripped of colons).
 fn mac_last_two_octets_hex_lower(addr: &str) -> String {
     let p: Vec<&str> =
@@ -1705,7 +1705,7 @@ impl Default for CaptiveStateEnvelope {
 ///   under `getrandom` so a rogue LAN client cannot hijack an
 ///   open session by URL enumeration.
 /// * `upstream_host` — scheme + authority (e.g.
-///   `http://172.30.0.1:8880`), NO trailing slash. This is the
+///   `http://198.51.100.1:8080`), NO trailing slash. This is the
 ///   byte-substitution needle: framework rewrites every
 ///   occurrence in `Location`, HTML, CSS to
 ///   `/api/v1/network/captive/session/{session_id}` so absolute
@@ -1792,7 +1792,7 @@ struct CaptiveUpstreamFetchRequest {
     method: String,
     /// Path portion of the browser's URL relative to
     /// `session_url` root — leading `/` is optional, plugin
-    /// normalises. E.g. `/guest/s/default/static/js/main.js`.
+    /// normalises. E.g. `/portal/session/default/static/js/main.js`.
     #[serde(default)]
     path: String,
     /// Query string without the leading `?`. Empty when the
@@ -2979,9 +2979,9 @@ impl NmInner {
         // * `Clean204` (any probe returned a clean 204 to its
         //   own URL) → internet reachable; not captive.
         // * `AllTimedOut` (every probe wrapper-errored) →
-        //   OFFLINE, NOT captive. This is Andrew's audit item:
-        //   curl-28 timeouts must not be interpreted as
-        //   "portal detected".
+        //   OFFLINE, NOT captive. curl exit 28 (timeout)
+        //   must NEVER be interpreted as "portal detected" —
+        //   offline is a distinct verdict.
         //
         // A single-probe strategy would confuse offline (no
         // route to the internet at all) with captive (route
@@ -3998,7 +3998,7 @@ impl NmInner {
         //   GENERAL.TYPE:ethernet
         //   GENERAL.STATE:100 (connected)
         //   GENERAL.CONNECTION:evo-network-ethernet
-        //   IP4.ADDRESS[1]:192.168.30.24/24
+        //   IP4.ADDRESS[1]:192.0.2.10/24
         //   <blank line>
         //   GENERAL.DEVICE:wlan0
         //   ...
@@ -5987,7 +5987,7 @@ impl NmInner {
                 // is in progress (session open, or `is_captive`
                 // + active phase), the apply path must NOT
                 // bring the hotspot up alongside the STA. On
-                // Pi5 / brcmfmac and other single-radio chips
+                // constrained single-radio wifi chipsets (e.g. brcmfmac) and other single-radio chips
                 // an AP raise on the same PHY tears down the
                 // STA association the operator needs for the
                 // portal round-trip. Force any existing
@@ -7797,7 +7797,7 @@ fn generate_captive_session_id() -> Result<String, PluginError> {
 }
 
 /// Split a portal URL like
-/// `http://172.30.0.1:8880/guest/s/default/?ap=xx&id=yy` into
+/// `http://198.51.100.1:8080/portal/session/default/?ap=xx&id=yy` into
 /// `(upstream_host, initial_path, initial_query)`. The host
 /// portion carries scheme + authority (no trailing slash); the
 /// path is everything from the first `/` after the authority
@@ -9906,7 +9906,7 @@ exit 0\n",
     #[test]
     fn mac_last_two_octets_hex_lower_full_mac() {
         // Standard 6-octet MAC: last two → 4 hex chars, lower.
-        assert_eq!(mac_last_two_octets_hex_lower("d8:3a:dd:b8:d6:74"), "d674");
+        assert_eq!(mac_last_two_octets_hex_lower("02:00:00:00:12:34"), "1234");
         // Upper-case input → lowercased.
         assert_eq!(mac_last_two_octets_hex_lower("00:11:22:33:AA:BB"), "aabb");
     }
@@ -9915,8 +9915,8 @@ exit 0\n",
     fn mac_last_two_octets_hex_lower_ignores_whitespace() {
         // sysfs reads carry a trailing newline.
         assert_eq!(
-            mac_last_two_octets_hex_lower("d8:3a:dd:b8:d6:74\n"),
-            "d674"
+            mac_last_two_octets_hex_lower("02:00:00:00:12:34\n"),
+            "1234"
         );
     }
 
@@ -9924,8 +9924,8 @@ exit 0\n",
     fn mac_last_two_octets_hex_lower_short_input_falls_back() {
         // If someone hands us fewer than 2 octets, we still
         // produce a stable derived string — not a panic.
-        assert_eq!(mac_last_two_octets_hex_lower("d674"), "d674");
-        assert_eq!(mac_last_two_octets_hex_lower("D6:74"), "d674");
+        assert_eq!(mac_last_two_octets_hex_lower("1234"), "1234");
+        assert_eq!(mac_last_two_octets_hex_lower("12:34"), "1234");
     }
 
     // -----------------------------------------------------------
@@ -9968,20 +9968,18 @@ exit 0\n",
 
     #[test]
     fn parse_nm_route4_full_form() {
-        let r =
-            parse_nm_route4("dst = 0.0.0.0/0, nh = 192.168.30.254, mt = 100")
-                .expect("route");
+        let r = parse_nm_route4("dst = 0.0.0.0/0, nh = 192.0.2.1, mt = 100")
+            .expect("route");
         assert_eq!(r.dst, "0.0.0.0/0");
-        assert_eq!(r.next_hop, "192.168.30.254");
+        assert_eq!(r.next_hop, "192.0.2.1");
         assert_eq!(r.metric, Some(100));
     }
 
     #[test]
     fn parse_nm_route4_on_link_no_next_hop() {
-        let r =
-            parse_nm_route4("dst = 192.168.30.0/24, nh = 0.0.0.0, mt = 100")
-                .expect("route");
-        assert_eq!(r.dst, "192.168.30.0/24");
+        let r = parse_nm_route4("dst = 192.0.2.0/24, nh = 0.0.0.0, mt = 100")
+            .expect("route");
+        assert_eq!(r.dst, "192.0.2.0/24");
         // "0.0.0.0" is retained verbatim from nmcli; the wire
         // consumer distinguishes on-link vs remote by dst
         // prefix, not by treating 0.0.0.0 specially.
@@ -9996,13 +9994,13 @@ exit 0\n",
     #[test]
     fn parse_iw_link_full_associated() {
         let raw = "Connected to aa:11:22:33:44:55 (on wlan0)\n\
-                   \tSSID: G(uest) Spot\n\
+                   \tSSID: example-network\n\
                    \tfreq: 5180\n\
                    \tsignal: -58 dBm\n\
                    \ttx bitrate: 173.3 MBit/s\n";
         let w = parse_iw_link(raw);
         assert_eq!(w.bssid, "aa:11:22:33:44:55");
-        assert_eq!(w.ssid, "G(uest) Spot");
+        assert_eq!(w.ssid, "example-network");
         assert_eq!(w.freq_mhz, Some(5180));
         assert_eq!(w.channel, Some(36));
         assert_eq!(w.band, "5ghz");
@@ -10354,9 +10352,9 @@ exit 0\n",
 
     /// Multi-probe verdict: three probes ALL failing must
     /// surface as `is_captive: None / phase: Idle` — offline,
-    /// not stuck-at-captive. This is Andrew's audit item
-    /// (curl exit 28 timeouts previously appeared as captive
-    /// detection when they should be honest "no uplink").
+    /// not stuck-at-captive. Regression against the class of
+    /// curl exit 28 timeouts previously appearing as captive
+    /// detection when they should be honest "no uplink".
     ///
     /// The predicate is the interpretation logic captive_detect
     /// applies to (redirect_target, any_clean, failure_count)
@@ -10590,7 +10588,7 @@ exit 0\n",
              GENERAL.TYPE:wifi\n\
              GENERAL.STATE:100 (${EVO_TEST_STATE:-disconnected})\n\
              GENERAL.CONNECTION:--\n\
-             GENERAL.HWADDR:D8:3A:DD:B8:D6:74\n\
+             GENERAL.HWADDR:02:00:00:00:12:34\n\
              GENERAL.MTU:1500\n\
              EOF\n",
         )

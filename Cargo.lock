@@ -1702,6 +1702,7 @@ dependencies = [
  "evo-projection-ws",
  "evo-tls-certs",
  "evo-witness",
+ "flate2",
  "futures",
  "http",
  "http-body-util",
