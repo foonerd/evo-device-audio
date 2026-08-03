@@ -9998,8 +9998,8 @@ exit 0\n",
             Some("portal.example.com".to_string())
         );
         assert_eq!(
-            hostname_of("http://192.168.1.1:8080/login"),
-            Some("192.168.1.1".to_string())
+            hostname_of("http://192.0.2.1:8080/login"),
+            Some("192.0.2.1".to_string())
         );
     }
 
@@ -10178,7 +10178,7 @@ exit 0\n",
 
     #[test]
     fn parse_nm_route4_reject_empty_dst() {
-        assert!(parse_nm_route4("nh = 192.168.1.1").is_none());
+        assert!(parse_nm_route4("nh = 192.0.2.1").is_none());
     }
 
     #[test]

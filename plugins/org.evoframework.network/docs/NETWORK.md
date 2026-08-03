@@ -40,7 +40,7 @@ version = 1
   enabled = true
   device = ""              # empty: first ethernet device NM reports
   ipv4_mode = "dhcp"       # "dhcp" or "static"
-  ipv4_address = ""        # CIDR when static, e.g. "192.168.1.10/24"
+  ipv4_address = ""        # CIDR when static, e.g. "192.0.2.10/24"
   ipv4_gateway = ""
   ipv4_dns = []
 
