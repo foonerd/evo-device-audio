@@ -286,6 +286,10 @@ echo
 # [2/7] Stop the steward; preserve previous binary.
 # ----------------------------------------------------------
 echo "[2/7] stop steward + preserve previous binary as evo-device-audio.prev ..."
+# Client-side expansion of ${TARGET_BIN_PATH} / ${TARGET_BIN_PREV} is intentional:
+# both are resolved from this dev-box script's env and passed as literals to the
+# target's shell so the operator sees the actual paths in the executed command.
+# shellcheck disable=SC2029
 if ! ssh "${SSH_TARGET}" "
     set -e
     sudo -n systemctl stop evo || true
@@ -328,6 +332,11 @@ for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ _ <<< "${entry}"
     EXPECTED_DIRS="${EXPECTED_DIRS} ${p_name}"
 done
+# Client-side expansion of ${EXPECTED_DIRS} is intentional: the deploy script
+# assembles the expected plugin-directory list on the dev box and passes it as a
+# literal to the target's `case` construct. Escaped `\$d` / `\$name` remain for
+# the remote shell.
+# shellcheck disable=SC2029
 if ! ssh "${SSH_TARGET}" "
     set -e
     if [ -d /opt/evo/plugins ]; then
@@ -349,6 +358,10 @@ if ! scp -q "${LOCAL_BIN}" "${SSH_TARGET}:${TMP_REMOTE}"; then
     echo "FAIL: scp steward binary to target failed" >&2
     exit 3
 fi
+# Client-side expansion of ${TMP_REMOTE} / ${TARGET_BIN_PATH} is intentional:
+# the deploy script owns both paths and passes them as literals for the target's
+# install(1) invocation.
+# shellcheck disable=SC2029
 if ! ssh "${SSH_TARGET}" "
     set -e
     sudo -n install -m 0755 -o root -g root ${TMP_REMOTE} ${TARGET_BIN_PATH}
@@ -416,6 +429,10 @@ for entry in "${OOP_PLUGINS[@]}"; do
         echo "FAIL: scp ${p_name} bundle to target failed" >&2
         exit 3
     fi
+    # Client-side expansion of ${p_name} / ${p_remote_tmp} is intentional: the
+    # deploy loop owns both values and passes them as literals so the target
+    # shell installs each bundle under its own /opt/evo/plugins/<p_name>/ dir.
+    # shellcheck disable=SC2029
     if ! ssh "${SSH_TARGET}" "
         set -e
         sudo -n mkdir -p /opt/evo/plugins/${p_name}
@@ -512,6 +529,10 @@ if ! scp -q "${CATALOGUE_COMPOSED}" \
     exit 3
 fi
 rm -f "${CATALOGUE_COMPOSED}"
+# Client-side expansion of ${CATALOGUE_REMOTE_TMP} is intentional: this script
+# owns the tmp path and passes it as a literal so the target's cmp / install
+# operate against a fixed known name.
+# shellcheck disable=SC2029
 if ! ssh "${SSH_TARGET}" "
     set -e
     sudo -n install -d -m 0755 -o root -g root /opt/evo/catalogue
@@ -599,6 +620,10 @@ if ! scp -q "${ASOUND_COMPOSED}" \
     exit 3
 fi
 rm -f "${ASOUND_COMPOSED}"
+# Client-side expansion of ${ASOUND_REMOTE_TMP} is intentional: this script
+# owns the tmp path and passes it as a literal so the target's cmp / install
+# operate against a fixed known name.
+# shellcheck disable=SC2029
 if ! ssh "${SSH_TARGET}" "
     set -e
     if [[ -f /etc/asound.conf ]] && \
@@ -642,9 +667,14 @@ for entry in "${OOP_PLUGINS[@]}"; do
         [[ -n "${unit}" ]] || continue
         [[ -n "${UNITS_SEEN[$unit]:-}" ]] && continue
         UNITS_SEEN[$unit]=1
+        # Client-side expansion of ${unit} is intentional: the loop assembles
+        # the unit name from the plugin's privileges.yaml on the dev box and
+        # passes it as a literal so the target sees a concrete systemctl arg.
+        # shellcheck disable=SC2029
         if ! ssh "${SSH_TARGET}" "sudo -n systemctl enable --now ${unit}" \
                 >/dev/null 2>&1; then
             echo "FAIL: plugin ${p_name} declares required_system_service ${unit} but enable --now failed on target" >&2
+            # shellcheck disable=SC2029
             ssh "${SSH_TARGET}" "sudo -n systemctl status --no-pager ${unit}" \
                 >&2 || true
             exit 4
@@ -716,6 +746,10 @@ fi
 # verify step under `set -e`.
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ <<< "${entry}"
+    # Client-side expansion of ${p_name} is intentional: the deploy script owns
+    # the plugin name (a reverse-DNS literal from OOP_PLUGINS) and inlines it
+    # into the target's grep pattern so we can count admission hits per plugin.
+    # shellcheck disable=SC2029
     PLUGIN_HITS="$(ssh "${SSH_TARGET}" \
         "sudo -n journalctl -u evo --since '30 seconds ago' --no-pager 2>&1 \
             | grep -cE 'plugin.*${p_name}|${p_name}.*admit' \
@@ -749,6 +783,10 @@ fi
 if ! python3 "${SMOKE_SCRIPT}" "${TARGET_HOST}" "${TARGET_USER}"; then
     echo
     echo "FAIL: track_detail smoke refused the deploy — restoring \`.prev\` on ${TARGET_HOST}" >&2
+    # Client-side expansion of ${TARGET_BIN_PREV} / ${TARGET_BIN_PATH} is
+    # intentional: the deploy script owns both paths and inlines them so the
+    # rollback executes against the exact same paths used at install time.
+    # shellcheck disable=SC2029
     ssh "${SSH_TARGET}" "
         set -e
         sudo -n systemctl stop evo
