@@ -34,15 +34,26 @@ autostart = true
 restart_on_crash = true
 restart_budget = 5
 
+[capabilities]
+subscribe_subjects = true
+
 [capabilities.respondent]
 request_types = [
   "set_display_rotation",
   "set_touch_calibration",
   "launch_touch_calibration",
+  "set_enabled",
+  "set_brightness",
+  "set_sleep_timeout",
+  "set_sleep_inhibit_while_playing",
 ]
-response_budget_ms = 3000
+response_budget_ms = 5000
 
 [capabilities.respondent.verb_capabilities]
 "set_display_rotation" = { kind = "write", scope = "system_admin" }
 "set_touch_calibration" = { kind = "write", scope = "system_admin" }
 "launch_touch_calibration" = { kind = "write", scope = "system_admin" }
+"set_enabled" = { kind = "write", scope = "system_admin" }
+"set_brightness" = { kind = "write", scope = "system_admin" }
+"set_sleep_timeout" = { kind = "write", scope = "system_admin" }
+"set_sleep_inhibit_while_playing" = { kind = "write", scope = "system_admin" }

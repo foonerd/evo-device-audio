@@ -82,6 +82,19 @@ pub const VERB_SET_TOUCH_CALIBRATION: &str = "set_touch_calibration";
 /// Verb name — signal the on-glass browser to open the wizard.
 pub const VERB_LAUNCH_TOUCH_CALIBRATION: &str = "launch_touch_calibration";
 
+/// Verb name — enable or disable the evo-kiosk.service unit.
+pub const VERB_SET_ENABLED: &str = "set_enabled";
+
+/// Verb name — set the compositor display brightness percent.
+pub const VERB_SET_BRIGHTNESS: &str = "set_brightness";
+
+/// Verb name — set the idle sleep timeout in seconds.
+pub const VERB_SET_SLEEP_TIMEOUT: &str = "set_sleep_timeout";
+
+/// Verb name — toggle "keep the screen awake while playing."
+pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
+    "set_sleep_inhibit_while_playing";
+
 /// Trigger file the plugin touches when the operator asks for
 /// the wizard from a remote browser. Kiosk-browser polls this
 /// file's mtime and dispatches an in-page CustomEvent on
@@ -101,16 +114,29 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
-/// The plugin singleton. Stateless beyond the loaded flag; every
-/// verb call is fresh reads + writes against the overlay dir.
+/// Canonical id for the audio-playback now_playing subject the
+/// MPD warden publishes. We subscribe to this at load to drive
+/// the sleep_inhibit_active overlay: transport_state=="playing"
+/// → active=true; otherwise → active=false. Kiosk-side apply
+/// merges this with the operator's sleep_inhibit_while_playing
+/// toggle.
+const MPD_NOW_PLAYING_CANONICAL_ID: &str = "evo.audio.playback:now_playing";
+
+/// The plugin singleton. Holds a load flag + a JoinHandle for
+/// the background MPD-state subscriber (so `unload` can cancel
+/// it cleanly).
 pub struct SystemKioskPlugin {
     loaded: bool,
+    inhibit_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SystemKioskPlugin {
     /// New instance; call [`Plugin::load`] before handling requests.
     pub fn new() -> Self {
-        Self { loaded: false }
+        Self {
+            loaded: false,
+            inhibit_task: None,
+        }
     }
 }
 
@@ -134,6 +160,10 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_DISPLAY_ROTATION.to_string(),
                         VERB_SET_TOUCH_CALIBRATION.to_string(),
                         VERB_LAUNCH_TOUCH_CALIBRATION.to_string(),
+                        VERB_SET_ENABLED.to_string(),
+                        VERB_SET_BRIGHTNESS.to_string(),
+                        VERB_SET_SLEEP_TIMEOUT.to_string(),
+                        VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -151,10 +181,97 @@ impl Plugin for SystemKioskPlugin {
 
     fn load<'a>(
         &'a mut self,
-        _ctx: &'a LoadContext,
+        ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
             tracing::info!(plugin = PLUGIN_NAME, "system.kiosk plugin load");
+
+            // Spawn the MPD-state subscriber if the framework
+            // wired it. The overlay this task writes
+            // (`sleep_inhibit_active`) is honoured only when
+            // the operator's `sleep_inhibit_while_playing`
+            // toggle is true, so this task runs
+            // unconditionally — cheap when the toggle is off,
+            // immediate when the operator flips it on.
+            if let Some(sub) = ctx.subject_state_subscriber.clone() {
+                let handle = tokio::spawn(async move {
+                    let mut stream = match sub
+                        .subscribe_subject(
+                            MPD_NOW_PLAYING_CANONICAL_ID.to_string(),
+                        )
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "MPD subject subscribe failed; sleep-inhibit-\
+                                 while-playing will not react to playback state \
+                                 until next plugin reload"
+                            );
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        canonical_id = MPD_NOW_PLAYING_CANONICAL_ID,
+                        "MPD state subscriber running"
+                    );
+                    // Seed inhibit_active=false so a fresh install
+                    // without any prior state has a deterministic
+                    // overlay value.
+                    let _ = evo_kiosk_config::set_sleep_inhibit_active(false);
+
+                    loop {
+                        match stream.recv().await {
+                            Ok(update) => {
+                                let is_playing = update
+                                    .state
+                                    .as_ref()
+                                    .and_then(|v| v.get("transport_state"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == "playing")
+                                    .unwrap_or(false);
+                                match evo_kiosk_config::set_sleep_inhibit_active(
+                                    is_playing,
+                                ) {
+                                    Ok(_) => tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        is_playing,
+                                        "sleep_inhibit_active updated"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %e,
+                                        "failed to write sleep_inhibit_active overlay"
+                                    ),
+                                }
+                            }
+                            Err(_) => {
+                                // Stream closed or fatal recv error — the
+                                // framework's registry is going down or the
+                                // subject was removed; exit gracefully.
+                                tracing::info!(
+                                    plugin = PLUGIN_NAME,
+                                    "MPD state stream closed; subscriber exiting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+                self.inhibit_task = Some(handle);
+            } else {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "subject_state_subscriber not wired by framework — \
+                     sleep-inhibit-while-playing will not react to playback \
+                     state (manifest declares capabilities.subscribe_subjects=true; \
+                     verify framework binding)"
+                );
+            }
+
             self.loaded = true;
             Ok(())
         }
@@ -165,6 +282,12 @@ impl Plugin for SystemKioskPlugin {
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
             self.loaded = false;
+            if let Some(handle) = self.inhibit_task.take() {
+                handle.abort();
+                // Not awaiting the abort — the task's only
+                // side effect is the overlay write which is
+                // idempotent.
+            }
             Ok(())
         }
     }
@@ -208,6 +331,12 @@ impl Respondent for SystemKioskPlugin {
                 VERB_SET_TOUCH_CALIBRATION => handle_set_touch_calibration(req),
                 VERB_LAUNCH_TOUCH_CALIBRATION => {
                     handle_launch_touch_calibration(req)
+                }
+                VERB_SET_ENABLED => handle_set_enabled(req).await,
+                VERB_SET_BRIGHTNESS => handle_set_brightness(req),
+                VERB_SET_SLEEP_TIMEOUT => handle_set_sleep_timeout(req),
+                VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING => {
+                    handle_set_sleep_inhibit_while_playing(req)
                 }
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
@@ -369,6 +498,134 @@ fn handle_launch_touch_calibration(
 /// diagnostics).
 pub fn calibrate_trigger_path() -> PathBuf {
     PathBuf::from(OVERLAY_DIR).join(CALIBRATE_TRIGGER_FILE)
+}
+
+// ------------------------------ set_enabled ---------------------------
+
+#[derive(Deserialize)]
+struct SetEnabledReq {
+    enabled: bool,
+}
+
+async fn handle_set_enabled(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetEnabledReq = parse_payload(req, VERB_SET_ENABLED)?;
+    // Persist the operator-visible flag first so a subsequent
+    // UI read reflects the intended state even if the systemctl
+    // call is slow. The subsequent systemctl call is the
+    // authority — if it fails we roll back the overlay.
+    evo_kiosk_config::set_kiosk_enabled(parsed.enabled)
+        .map_err(|e| kiosk_config_error(VERB_SET_ENABLED, e))?;
+
+    // Sudo grant is enumerated by the paired
+    // /etc/sudoers.d/evo-system-kiosk drop-in: one Cmnd_Alias
+    // per (enable | disable) with `--now` baked in. Argv must
+    // match the alias exactly; no shell interpolation.
+    let sudo_cmd = if parsed.enabled { "enable" } else { "disable" };
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .arg("-n")
+        .arg("/usr/bin/systemctl")
+        .arg(sudo_cmd)
+        .arg("--now")
+        .arg("evo-kiosk.service")
+        .output()
+        .await
+        .map_err(|e| {
+            PluginError::Transient(format!(
+                "set_enabled: spawning sudo systemctl failed: {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        // Roll back overlay so UI reflects the actual on-disk
+        // reality (nothing changed).
+        let _ = evo_kiosk_config::set_kiosk_enabled(!parsed.enabled);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PluginError::Transient(format!(
+            "set_enabled: systemctl {sudo_cmd} --now evo-kiosk.service exited {:?}: {stderr}",
+            output.status.code()
+        )));
+    }
+    let body = serde_json::json!({
+        "ok": true,
+        "enabled": parsed.enabled,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+// ------------------------------ set_brightness ------------------------
+
+#[derive(Deserialize)]
+struct SetBrightnessReq {
+    percent: u8,
+}
+
+fn handle_set_brightness(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetBrightnessReq = parse_payload(req, VERB_SET_BRIGHTNESS)?;
+    let applied = evo_kiosk_config::set_brightness(parsed.percent)
+        .map_err(|e| kiosk_config_error(VERB_SET_BRIGHTNESS, e))?;
+    let body = serde_json::json!({
+        "ok": true,
+        "brightness_percent": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+// ------------------------------ set_sleep_timeout ---------------------
+
+#[derive(Deserialize)]
+struct SetSleepTimeoutReq {
+    seconds: u32,
+}
+
+fn handle_set_sleep_timeout(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetSleepTimeoutReq =
+        parse_payload(req, VERB_SET_SLEEP_TIMEOUT)?;
+    let applied = evo_kiosk_config::set_sleep_timeout(parsed.seconds)
+        .map_err(|e| kiosk_config_error(VERB_SET_SLEEP_TIMEOUT, e))?;
+    let body = serde_json::json!({
+        "ok": true,
+        "sleep_timeout_seconds": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+// ------------------------------ set_sleep_inhibit_while_playing -------
+
+#[derive(Deserialize)]
+struct SetSleepInhibitWhilePlayingReq {
+    enabled: bool,
+}
+
+fn handle_set_sleep_inhibit_while_playing(
+    req: &Request,
+) -> Result<Response, PluginError> {
+    let parsed: SetSleepInhibitWhilePlayingReq =
+        parse_payload(req, VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING)?;
+    let applied =
+        evo_kiosk_config::set_sleep_inhibit_while_playing(parsed.enabled)
+            .map_err(|e| {
+                kiosk_config_error(VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING, e)
+            })?;
+    let body = serde_json::json!({
+        "ok": true,
+        "sleep_inhibit_while_playing": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
 }
 
 /// Silence the compiler about the `TouchSample` re-import

@@ -47,22 +47,41 @@ autostart = true
 restart_on_crash = true
 restart_budget = 5
 
+[capabilities]
+# Plugin subscribes to `audio_playback_now_playing` (published
+# by org.evoframework.playback.mpd) so the sleep-inhibit-while-
+# playing policy can flip an overlay flag on every MPD state
+# transition. Read-only, framework-mediated; no direct plugin-
+# to-plugin dependency.
+subscribe_subjects = true
+
 [capabilities.respondent]
 request_types = [
   "set_display_rotation",
   "set_touch_calibration",
   "launch_touch_calibration",
+  "set_enabled",
+  "set_brightness",
+  "set_sleep_timeout",
+  "set_sleep_inhibit_while_playing",
 ]
-response_budget_ms = 3000
+response_budget_ms = 5000
 
 [capabilities.respondent.verb_capabilities]
-# system_admin write scope; no step-up. Rationale: rotation is
-# a cosmetic-visible change, not a credential mint. Step-up on
-# a mis-calibrated screen would require the operator to enter
-# the kiosk password on the very glass they are trying to fix
-# (recursive breakage). Bootstrap-alignment case is served
-# without step-up by paired-device bearer minted via the
-# ADR-0148 preseed-pair headless first-pair path.
+# system_admin write scope; no step-up. Rationale (for display +
+# touch): rotation is a cosmetic-visible change, not a
+# credential mint. A step-up gate would require entering the
+# kiosk password on the mis-calibrated glass — recursive
+# breakage. Bootstrap-alignment case is served by ADR-0148
+# preseed-pair headless first-pair. The same scope covers
+# enable / brightness / sleep / sleep-inhibit for the same
+# operator flow; each of these is a per-device physical
+# setting where the operator holding a paired-device bearer
+# is authoritative.
 "set_display_rotation" = { kind = "write", scope = "system_admin" }
 "set_touch_calibration" = { kind = "write", scope = "system_admin" }
 "launch_touch_calibration" = { kind = "write", scope = "system_admin" }
+"set_enabled" = { kind = "write", scope = "system_admin" }
+"set_brightness" = { kind = "write", scope = "system_admin" }
+"set_sleep_timeout" = { kind = "write", scope = "system_admin" }
+"set_sleep_inhibit_while_playing" = { kind = "write", scope = "system_admin" }

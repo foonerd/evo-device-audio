@@ -28,7 +28,7 @@ evo-kiosk-config = { path = "../../../evo-kiosk-eng/crates/evo-kiosk-config", ve
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "process"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

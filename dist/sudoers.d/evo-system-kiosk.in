@@ -1,0 +1,53 @@
+# sudoers drop-in template — installed by the bootstrap
+# script at /etc/sudoers.d/evo-system-kiosk with mode 0440,
+# owned root:root.
+#
+# Grants the steward service user (substituted at install
+# time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
+# access to exactly two commands the
+# `org.evoframework.system.kiosk` plugin invokes for the
+# operator-gestured `set_enabled` verb:
+#
+# 1. `EVO_SYSTEM_KIOSK_ENABLE` — `/usr/bin/systemctl enable
+#    --now evo-kiosk.service`. Turns the kiosk session on
+#    persistently + starts it now.
+#
+# 2. `EVO_SYSTEM_KIOSK_DISABLE` — `/usr/bin/systemctl disable
+#    --now evo-kiosk.service`. Turns the kiosk session off
+#    persistently + stops it now.
+#
+# Both aliases are EXACT-MATCH. The framework dispatcher's
+# per-verb capability gate (`write:system_admin`) is the FIRST
+# layer of defence; sudoers is the LAST. A principal without
+# system_admin never reaches this sudo invocation.
+#
+# The `--now` combines the enable/disable state change with the
+# immediate start/stop so the operator's toggle is single-shot.
+# Split invocations would double the sudo audit noise and add
+# a partial-apply window (unit enabled but not started, or
+# vice-versa) that surfaces as UI/reality drift.
+#
+# Defaults!... !pam_session, !syslog quiets per-invocation PAM
+# session lines + syslog records the journal already captures
+# via the parent steward's structured log.
+#
+# Apply via the bootstrap script:
+#   scripts/bootstrap.sh
+#
+# Or manually (substitute the placeholder):
+#   sed 's/@EVO_SERVICE_USER@/<your-service-user>/' \
+#       dist/sudoers.d/evo-system-kiosk.in \
+#       | sudo install -m 0440 -o root -g root /dev/stdin \
+#         /etc/sudoers.d/evo-system-kiosk
+#
+# `visudo -c -f /etc/sudoers.d/evo-system-kiosk` verifies
+# syntactically valid sudoers.
+
+Cmnd_Alias EVO_SYSTEM_KIOSK_ENABLE = /usr/bin/systemctl enable --now evo-kiosk.service
+Cmnd_Alias EVO_SYSTEM_KIOSK_DISABLE = /usr/bin/systemctl disable --now evo-kiosk.service
+
+Defaults!EVO_SYSTEM_KIOSK_ENABLE !pam_session, !syslog
+Defaults!EVO_SYSTEM_KIOSK_DISABLE !pam_session, !syslog
+
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_KIOSK_ENABLE
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_KIOSK_DISABLE

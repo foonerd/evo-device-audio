@@ -85,6 +85,7 @@ CAPTIVE_PROBE_WRAPPER_SRC=""
 CAPTIVE_PROBE_WRAPPER_DST="/usr/local/bin/evo-captive-probe"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
 SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
+SYSTEM_KIOSK_SUDOERS_FILE="/etc/sudoers.d/evo-system-kiosk"
 NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
 SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
@@ -509,6 +510,38 @@ if [[ "${EVO_INSTALL_SYSTEM_POWER_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $SYSTEM_POWER_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_SYSTEM_POWER_SUDOERS=0 — skipping system-power sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1d.k: /etc/sudoers.d/evo-system-kiosk (narrow NOPASSWD)
+# ----------------------------------------------------------
+# Path-scoped grant for the org.evoframework.system.kiosk plugin's
+# `set_enabled` verb which toggles the evo-kiosk.service systemd
+# unit on / off. Two exact-match Cmnd_Aliases; the framework
+# dispatcher's `write:system_admin` gate is the FIRST line of
+# defence, sudoers the LAST.
+if [[ "${EVO_INSTALL_SYSTEM_KIOSK_SUDOERS:-1}" != "0" ]]; then
+    TEMPLATE="$DIST_DIR/sudoers.d/evo-system-kiosk.in"
+    if [[ ! -f "$TEMPLATE" ]]; then
+        echo "sudoers template not found at $TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$TEMPLATE" > "$TMP"
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "rendered sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+    install -m 0440 -o root -g root "$TMP" "$SYSTEM_KIOSK_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $SYSTEM_KIOSK_SUDOERS_FILE"
+else
+    echo "[bootstrap] EVO_INSTALL_SYSTEM_KIOSK_SUDOERS=0 — skipping system-kiosk sudoers drop-in"
 fi
 
 # ----------------------------------------------------------
