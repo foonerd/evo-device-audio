@@ -60,9 +60,9 @@ use std::time::SystemTime;
 
 use evo_kiosk_config::{TouchSample, OVERLAY_DIR};
 use evo_plugin_sdk::contract::{
-    BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
+    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities,
 };
 use evo_plugin_sdk::Manifest;
 use serde::Deserialize;
@@ -114,13 +114,26 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
-/// Canonical id for the audio-playback now_playing subject the
-/// MPD warden publishes. We subscribe to this at load to drive
-/// the sleep_inhibit_active overlay: transport_state=="playing"
-/// → active=true; otherwise → active=false. Kiosk-side apply
-/// merges this with the operator's sleep_inhibit_while_playing
-/// toggle.
-const MPD_NOW_PLAYING_CANONICAL_ID: &str = "evo.audio.playback:now_playing";
+/// External-addressing scheme for the audio-playback now_playing
+/// subject the MPD warden publishes. Matches the playback plugin's
+/// `SCHEME_STREAM_FORMAT` literal; the two plugins agree on the
+/// wire-side addressing constants without cross-plugin coupling.
+///
+/// The subject registry keys off a UUID canonical id, NOT this
+/// string. We use [`ExternalAddressing`] via [`SubjectQuerier::
+/// resolve_addressing`] to obtain the UUID, then subscribe /
+/// current_state on the UUID.
+const NOW_PLAYING_SCHEME: &str = "evo.audio.playback";
+
+/// External-addressing value for the audio-playback now_playing
+/// subject.
+const NOW_PLAYING_VALUE: &str = "now_playing";
+
+/// Backoff for the resolve-addressing retry loop. The playback
+/// plugin's `announce_now_playing` may not have landed by the
+/// time this subscriber spawns; the loop polls at this cadence
+/// until resolution succeeds.
+const RESOLVE_RETRY_INTERVAL_MS: u64 = 500;
 
 /// The plugin singleton. Holds a load flag + a JoinHandle for
 /// the background MPD-state subscriber (so `unload` can cancel
@@ -193,35 +206,131 @@ impl Plugin for SystemKioskPlugin {
             // toggle is true, so this task runs
             // unconditionally — cheap when the toggle is off,
             // immediate when the operator flips it on.
-            if let Some(sub) = ctx.subject_state_subscriber.clone() {
+            if let (Some(sub), Some(querier)) = (
+                ctx.subject_state_subscriber.clone(),
+                ctx.subject_querier.clone(),
+            ) {
                 let handle = tokio::spawn(async move {
+                    // The subject registry keys off a UUID canonical
+                    // id. The playback plugin publishes on
+                    // (scheme="evo.audio.playback", value="now_playing"),
+                    // which resolves via SubjectQuerier to that UUID.
+                    // Passing the raw string `"evo.audio.playback:
+                    // now_playing"` as canonical_id was silently
+                    // accepted by `subscribe_subject` in earlier cuts
+                    // but delivered ZERO updates — that path is a
+                    // no-op. Model matches audio.terminus's
+                    // `now_playing_subscriber`.
+                    let addressing = ExternalAddressing::new(
+                        NOW_PLAYING_SCHEME,
+                        NOW_PLAYING_VALUE,
+                    );
+
+                    // 1. Resolve canonical id with bounded backoff.
+                    //    The playback plugin's announce may not have
+                    //    landed yet when this plugin loads.
+                    let canonical_id = loop {
+                        match querier
+                            .resolve_addressing(addressing.clone())
+                            .await
+                        {
+                            Ok(Some(id)) => break id,
+                            Ok(None) => {
+                                tokio::time::sleep(
+                                    tokio::time::Duration::from_millis(
+                                        RESOLVE_RETRY_INTERVAL_MS,
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    error = %e,
+                                    "resolve_addressing for now_playing errored; \
+                                     retrying"
+                                );
+                                tokio::time::sleep(
+                                    tokio::time::Duration::from_millis(
+                                        RESOLVE_RETRY_INTERVAL_MS,
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    };
+
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        canonical_id = %canonical_id,
+                        "now_playing canonical id resolved"
+                    );
+
+                    // 2. Subscribe FIRST (no race window vs step 3).
                     let mut stream = match sub
-                        .subscribe_subject(
-                            MPD_NOW_PLAYING_CANONICAL_ID.to_string(),
-                        )
+                        .subscribe_subject(canonical_id.clone())
                         .await
                     {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::warn!(
                                 plugin = PLUGIN_NAME,
+                                canonical_id = %canonical_id,
                                 error = %e,
                                 "MPD subject subscribe failed; sleep-inhibit-\
-                                 while-playing will not react to playback state \
-                                 until next plugin reload"
+                                 while-playing will not react to playback \
+                                 state until next plugin reload"
                             );
                             return;
                         }
                     };
                     tracing::info!(
                         plugin = PLUGIN_NAME,
-                        canonical_id = MPD_NOW_PLAYING_CANONICAL_ID,
+                        canonical_id = %canonical_id,
                         "MPD state subscriber running"
                     );
-                    // Seed inhibit_active=false so a fresh install
-                    // without any prior state has a deterministic
-                    // overlay value.
-                    let _ = evo_kiosk_config::set_sleep_inhibit_active(false);
+
+                    // 3. Seed from current_state. If MPD was already
+                    //    playing at plugin load, the broadcast will
+                    //    never fire a "playing" event until the next
+                    //    pause/play cycle; the seed covers that.
+                    //    The warden publishes `transport_state` as
+                    //    one of "playing" | "paused" | "stopped"
+                    //    (playback_supervisor/subject_emitter::
+                    //    render_now_playing_state).
+                    let seed_is_playing =
+                        match sub.current_state(canonical_id.clone()).await {
+                            Ok(Some(state)) => state
+                                .get("transport_state")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == "playing")
+                                .unwrap_or(false),
+                            Ok(None) => false,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    canonical_id = %canonical_id,
+                                    error = %e,
+                                    "current_state read for MPD seed failed; \
+                                     defaulting sleep_inhibit_active=false"
+                                );
+                                false
+                            }
+                        };
+                    match evo_kiosk_config::set_sleep_inhibit_active(
+                        seed_is_playing,
+                    ) {
+                        Ok(_) => tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            is_playing = seed_is_playing,
+                            "sleep_inhibit_active seeded from current MPD state"
+                        ),
+                        Err(e) => tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "failed to seed sleep_inhibit_active"
+                        ),
+                    }
 
                     loop {
                         match stream.recv().await {
@@ -236,10 +345,11 @@ impl Plugin for SystemKioskPlugin {
                                 match evo_kiosk_config::set_sleep_inhibit_active(
                                     is_playing,
                                 ) {
-                                    Ok(_) => tracing::debug!(
+                                    Ok(_) => tracing::info!(
                                         plugin = PLUGIN_NAME,
                                         is_playing,
-                                        "sleep_inhibit_active updated"
+                                        "sleep_inhibit_active updated from \
+                                         MPD state change"
                                     ),
                                     Err(e) => tracing::warn!(
                                         plugin = PLUGIN_NAME,
