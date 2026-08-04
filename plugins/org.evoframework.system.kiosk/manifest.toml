@@ -1,0 +1,68 @@
+[plugin]
+name = "org.evoframework.system.kiosk"
+# Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "system.kiosk"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+# Framework provides the per-verb capability gate this plugin's
+# verb_capabilities declarations require; pinned to the current
+# framework version so admission against an older steward (where
+# the gate substrate is absent) refuses cleanly.
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+# Reads + writes /var/lib/evo/settings/kiosk/*. Framework's own
+# state area — no additional filesystem_scopes negotiation needed
+# beyond the steward's default write-access to its own state dir.
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+# Reactive-only: no state machine, no background work. Operator
+# gestures (rotation change, calibration change, launch wizard)
+# flow through the respondent surface; the verb writes an
+# overlay file and returns. Kiosk-side machinery (systemd path
+# unit + in-session watcher) picks up the writes and applies.
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+  "set_display_rotation",
+  "set_touch_calibration",
+  "launch_touch_calibration",
+]
+response_budget_ms = 3000
+
+[capabilities.respondent.verb_capabilities]
+# system_admin write scope; no step-up. Rationale: rotation is
+# a cosmetic-visible change, not a credential mint. Step-up on
+# a mis-calibrated screen would require the operator to enter
+# the kiosk password on the very glass they are trying to fix
+# (recursive breakage). Bootstrap-alignment case is served
+# without step-up by paired-device bearer minted via the
+# ADR-0148 preseed-pair headless first-pair path.
+"set_display_rotation" = { kind = "write", scope = "system_admin" }
+"set_touch_calibration" = { kind = "write", scope = "system_admin" }
+"launch_touch_calibration" = { kind = "write", scope = "system_admin" }

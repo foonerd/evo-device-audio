@@ -1558,6 +1558,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-kiosk-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "evo-mpd-shared"
 version = "0.1.0"
 dependencies = [
@@ -3890,6 +3898,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "org-evoframework-system-kiosk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evo-kiosk-config",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",

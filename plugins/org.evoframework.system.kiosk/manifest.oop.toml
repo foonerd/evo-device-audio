@@ -1,0 +1,48 @@
+[plugin]
+name = "org.evoframework.system.kiosk"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "system.kiosk"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 8
+max_cpu_percent = 1
+
+[lifecycle]
+mode = "reactive-only"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+  "set_display_rotation",
+  "set_touch_calibration",
+  "launch_touch_calibration",
+]
+response_budget_ms = 3000
+
+[capabilities.respondent.verb_capabilities]
+"set_display_rotation" = { kind = "write", scope = "system_admin" }
+"set_touch_calibration" = { kind = "write", scope = "system_admin" }
+"launch_touch_calibration" = { kind = "write", scope = "system_admin" }

@@ -1,0 +1,40 @@
+[package]
+name = "org-evoframework-system-kiosk"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Framework-reserved system.kiosk plugin. Stocks the system.kiosk shelf with operator verbs for display rotation and touch calibration, reachable from a remote paired browser (the recovery path when a mis-calibrated on-glass touch cannot be tapped). Writes the SAME overlay files under /var/lib/evo/settings/kiosk/ that the on-device WebKit handlers write, via the shared evo-kiosk-config crate — one source of truth for atomic overlay writes + calibration wizard math."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary cross-built by dist/scripts/deploy-distribution.sh
+# and staged under /opt/evo/plugins/org.evoframework.system.kiosk/; framework's
+# Phase-2 discovery walks the search root at boot and admits the bundle.
+[[bin]]
+name = "system-kiosk-wire"
+path = "src/bin/system-kiosk-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+# Shared kiosk-settings write path + calibration wizard math. Same
+# crate the kiosk-browser depends on for its local WebKit handlers;
+# both paths write byte-identical bytes to the same overlay files.
+evo-kiosk-config = { path = "../../../evo-kiosk-eng/crates/evo-kiosk-config", version = "0.1.0" }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -358,6 +358,36 @@ ship a vendor-namespace replacement under the same verb shape.
 """
 
 [[racks.shelves]]
+name = "kiosk"
+shape = 1
+description = """
+On-device kiosk operator-settings respondent: answers \
+`set_display_rotation`, `set_touch_calibration`, and \
+`launch_touch_calibration` for the operator who needs to \
+align the physical display + touchscreen from either the \
+on-glass UI or a paired remote browser. All three verbs are \
+write-gated at the framework dispatcher (scope `system_admin`, \
+no step-up — a step-up card on a mis-calibrated glass would \
+be un-tappable, defeating the recovery path this shelf \
+exists for). Reference implementation is the \
+`org.evoframework.system.kiosk` plugin, which writes plain \
+text overlay files under `/var/lib/evo/settings/kiosk/`. The \
+same overlay files are also written from within the \
+on-device kiosk-browser via WebKit script-message handlers; \
+the shared `evo-kiosk-config` crate is the single source of \
+truth for the write bytes + wizard math so remote and \
+on-glass paths never drift. Kiosk-side apply machinery \
+(inotify watcher on the compositor session + systemd \
+`evo-kiosk-touch-calibrate.path` for the touch overlays) \
+picks up the writes and re-runs `wlr-randr --transform` / \
+regenerates the LIBINPUT_CALIBRATION_MATRIX udev rule. \
+Vendor distributions that ship an alternate kiosk stack \
+replace the plugin under their vendor namespace; the verb \
+names + capability scope are stable across vendor \
+replacements, as is the on-disk overlay contract.
+"""
+
+[[racks.shelves]]
 name = "notifications"
 shape = 1
 description = """

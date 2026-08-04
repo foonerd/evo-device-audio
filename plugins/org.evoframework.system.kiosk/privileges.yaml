@@ -1,0 +1,78 @@
+schema_version: "1.0"
+plugin: org.evoframework.system.kiosk
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: false
+
+# Framework-reserved kiosk operator-settings plugin. Stocks the
+# `system.kiosk` shelf with three operator-gestured verbs
+# (set_display_rotation + set_touch_calibration +
+# launch_touch_calibration) gated by the framework dispatcher's
+# per-verb capability gate as write:system_admin (no step-up).
+#
+# The verbs write plain text overlay files under
+# `/var/lib/evo/settings/kiosk/` — the same overlay files the
+# on-glass kiosk-browser writes via its WebKit script-message
+# handlers, via the shared evo-kiosk-config crate. Kiosk-side
+# apply machinery (systemd path unit + in-session watcher) picks
+# up the writes and re-runs wlr-randr / regenerates the
+# LIBINPUT_CALIBRATION_MATRIX udev rule. This plugin does not
+# invoke systemctl, does not shell out, does not talk to udev
+# directly — it only writes files. That means:
+#
+#   - no sudoers grant needed (writes land in the framework's
+#     own state directory, which the runtime user owns)
+#   - no host binaries beyond the ones the steward itself
+#     already requires
+#   - has_os_dependencies: false — the plugin is self-contained
+#     against the shared crate's std::fs primitives
+#
+# Vendor distributions that layer an alternate kiosk stack (a
+# different compositor, a different touch stack) ship their own
+# replacement plugin under their vendor namespace. The verb
+# names (set_display_rotation, set_touch_calibration,
+# launch_touch_calibration) and the capability scope
+# (system_admin) are stable across vendor replacements; the
+# on-disk overlay contract (files at /var/lib/evo/settings/kiosk/
+# with the documented single-line values) is stable too.
+
+capability_intent:
+  - id: kiosk_overlay_write
+    need: >-
+      atomic write to /var/lib/evo/settings/kiosk/{display_rotation,
+      touch_rotation, touch_hflip, touch_vflip}. Write pattern is
+      write-to-tmp + fsync + rename (POSIX-atomic within the same
+      filesystem). The framework runtime user owns the state
+      directory tree; no elevation is required.
+    access_path: filesystem/write
+    failure_mode: >-
+      the verb responds with PluginError::Transient carrying the
+      underlying I/O error; the steward keeps running; the
+      operator sees the structured error and can retry.
+  - id: kiosk_calibration_trigger_write
+    need: >-
+      atomic write to /var/lib/evo/settings/kiosk/calibrate_trigger
+      as the operator-visible signal that a remote paired
+      browser has requested the on-glass calibration wizard.
+      Contents are a wall-clock millisecond token for
+      correlation; the on-glass kiosk-browser reacts to mtime
+      changes and dispatches an in-page CustomEvent to the local
+      UI. Same access path as the overlay writes; no elevation.
+    access_path: filesystem/write
+    failure_mode: >-
+      the verb responds with PluginError::Transient carrying the
+      underlying I/O error; on-glass behaviour is unchanged.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo/settings/kiosk || mkdir -p /var/lib/evo/settings/kiosk"
+  expected:
+    - operator-writable state directory present (or creatable) under the framework state area
+
+host_provisioning: {}

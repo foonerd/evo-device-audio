@@ -141,6 +141,7 @@ OOP_PLUGINS=(
     "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
     "org.evoframework.multiroom.evo-native:org-evoframework-multiroom-evo-native:multiroom-evo-native-wire:alsa-substrate"
     "org.evoframework.system.power:org-evoframework-system-power:system-power-wire:"
+    "org.evoframework.system.kiosk:org-evoframework-system-kiosk:system-kiosk-wire:"
     "org.evoframework.source.dlna:org-evoframework-source-dlna:source-dlna-wire:"
 )
 
