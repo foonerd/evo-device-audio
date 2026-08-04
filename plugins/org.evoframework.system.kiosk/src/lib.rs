@@ -27,7 +27,7 @@
 //! operator to enter the kiosk password on the very glass they
 //! are trying to fix — recursive breakage. The bootstrap-
 //! alignment case (operator not yet paired) is served by the
-//! ADR-0148 preseed-pair headless first-pair path.
+//! headless preseed-pair path documented in the kiosk-eng repo.
 //!
 //! ## Why this plugin exists
 //!
@@ -100,7 +100,7 @@ pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
 /// file's mtime and dispatches an in-page CustomEvent on
 /// change. Path is per-file rather than a signal channel
 /// because the browser's polling loop is trivial and no
-/// framework happening plumbing is required for the first cut.
+/// framework happening plumbing is required at this layer.
 pub const CALIBRATE_TRIGGER_FILE: &str = "calibrate_trigger";
 
 /// Parse the embedded [`Manifest`].

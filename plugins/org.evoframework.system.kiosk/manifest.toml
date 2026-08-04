@@ -72,8 +72,8 @@ response_budget_ms = 5000
 # touch): rotation is a cosmetic-visible change, not a
 # credential mint. A step-up gate would require entering the
 # kiosk password on the mis-calibrated glass — recursive
-# breakage. Bootstrap-alignment case is served by ADR-0148
-# preseed-pair headless first-pair. The same scope covers
+# breakage. Bootstrap-alignment case is served by the
+# headless preseed-pair path (see kiosk-eng docs). The same scope covers
 # enable / brightness / sleep / sleep-inhibit for the same
 # operator flow; each of these is a per-device physical
 # setting where the operator holding a paired-device bearer
