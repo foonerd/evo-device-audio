@@ -713,30 +713,40 @@ pub(crate) async fn handle_enqueue(
     // and `http(s)`. Non-`dlna:` URIs pass through unchanged.
     // Resolve BEFORE any MPD write so a mid-batch resolve
     // failure leaves the queue intact (all-or-nothing).
-    let mut resolved: Vec<String> = Vec::with_capacity(payload.uris.len());
+    //
+    // The resolver returns `ResolvedTrack` carrying the MPD URI
+    // AND any DIDL tags the source-plugin harvested. We hand the
+    // URI to `addid` (as before) then follow up with `addtagid`
+    // per non-empty tag so DLNA queue entries carry title /
+    // artist / album on the projection instead of a raw URL. MPD
+    // does not extract ID3 tags from arbitrary HTTP streams, so
+    // this side-channel is the only way title/artist/album ever
+    // land on the queue for a DLNA-resolved track.
+    let mut resolved: Vec<ResolvedTrack> =
+        Vec::with_capacity(payload.uris.len());
     for uri in &payload.uris {
         resolved.push(resolve_uri_for_mpd(ctx, "enqueue", uri).await?);
     }
-    // MPD's `addid` accepts a position. For multi-URI enqueue
-    // at position P, we add each URI at position P, P+1, P+2.
-    // When position is None, addid without position appends.
     if let Some(start_pos) = payload.position {
         let mut current = start_pos;
-        for uri in &resolved {
-            conn.addid(uri, Some(current)).await.map_err(|e| {
+        for r in &resolved {
+            let id = conn.addid(&r.uri, Some(current)).await.map_err(|e| {
                 VerbError::Mpd {
                     verb: "enqueue".to_string(),
                     reason: e.to_string(),
                 }
             })?;
+            apply_resolved_tags(conn, id, r).await;
             current = current.saturating_add(1);
         }
     } else {
-        for uri in &resolved {
-            conn.addid(uri, None).await.map_err(|e| VerbError::Mpd {
-                verb: "enqueue".to_string(),
-                reason: e.to_string(),
-            })?;
+        for r in &resolved {
+            let id =
+                conn.addid(&r.uri, None).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue".to_string(),
+                    reason: e.to_string(),
+                })?;
+            apply_resolved_tags(conn, id, r).await;
         }
     }
     publish_queue(ctx, conn).await;
@@ -1038,10 +1048,16 @@ async fn handle_enqueue_selection_container(
     // Resolve each stable identity to a concrete `http(s)` at
     // MPD-add time via the shared boundary helper. Resolve
     // BEFORE any MPD write so a mid-page resolve failure
-    // leaves the queue intact (all-or-nothing).
-    let mut mpd_uris: Vec<String> = Vec::with_capacity(stable_uris.len());
+    // leaves the queue intact (all-or-nothing). The resolver
+    // returns the full `ResolvedTrack` so the enqueue paths
+    // below can `addtagid` DIDL tags onto MPD immediately after
+    // `addid` (MPD does not extract ID3 from arbitrary HTTP
+    // streams, so the queue would otherwise show empty
+    // title/artist/album for DLNA-resolved entries).
+    let mut resolved: Vec<ResolvedTrack> =
+        Vec::with_capacity(stable_uris.len());
     for uri in &stable_uris {
-        mpd_uris
+        resolved
             .push(resolve_uri_for_mpd(ctx, "enqueue_selection", uri).await?);
     }
     let truncated = response
@@ -1050,7 +1066,7 @@ async fn handle_enqueue_selection_container(
         .unwrap_or(false);
     let next_page = response.get("next_page").cloned();
 
-    if mpd_uris.is_empty() {
+    if resolved.is_empty() {
         return Ok(serde_json::json!({
             "v":         LIBRARY_PAYLOAD_VERSION,
             "status":    "empty",
@@ -1063,25 +1079,34 @@ async fn handle_enqueue_selection_container(
         }));
     }
 
+    // All three modes now go through `addid` (returns song id)
+    // so we can attach tags. Append + Replace previously used
+    // bare `add` (silent, no id); switched to `addid` so the
+    // addtagid burst can run.
     match mode {
         EnqueueSelectionMode::Append => {
-            for uri in &mpd_uris {
-                conn.add(uri).await.map_err(|e| VerbError::Mpd {
-                    verb: "enqueue_selection".into(),
-                    reason: e.to_string(),
-                })?;
-            }
-        }
-        EnqueueSelectionMode::Next => {
-            let start_pos = current_song_position(conn).await? + 1;
-            let mut current = start_pos;
-            for uri in &mpd_uris {
-                conn.addid(uri, Some(current)).await.map_err(|e| {
+            for r in &resolved {
+                let id = conn.addid(&r.uri, None).await.map_err(|e| {
                     VerbError::Mpd {
                         verb: "enqueue_selection".into(),
                         reason: e.to_string(),
                     }
                 })?;
+                apply_resolved_tags(conn, id, r).await;
+            }
+        }
+        EnqueueSelectionMode::Next => {
+            let start_pos = current_song_position(conn).await? + 1;
+            let mut current = start_pos;
+            for r in &resolved {
+                let id =
+                    conn.addid(&r.uri, Some(current)).await.map_err(|e| {
+                        VerbError::Mpd {
+                            verb: "enqueue_selection".into(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                apply_resolved_tags(conn, id, r).await;
                 current = current.saturating_add(1);
             }
         }
@@ -1090,11 +1115,14 @@ async fn handle_enqueue_selection_container(
                 verb: "enqueue_selection".into(),
                 reason: e.to_string(),
             })?;
-            for uri in &mpd_uris {
-                conn.add(uri).await.map_err(|e| VerbError::Mpd {
-                    verb: "enqueue_selection".into(),
-                    reason: e.to_string(),
+            for r in &resolved {
+                let id = conn.addid(&r.uri, None).await.map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: e.to_string(),
+                    }
                 })?;
+                apply_resolved_tags(conn, id, r).await;
             }
             conn.play().await.map_err(|e| VerbError::Mpd {
                 verb: "enqueue_selection".into(),
@@ -1108,7 +1136,7 @@ async fn handle_enqueue_selection_container(
         "status":    "ok",
         "mode":      mode_label,
         "kind":      "container",
-        "enqueued":  mpd_uris.len(),
+        "enqueued":  resolved.len(),
         "truncated": truncated,
         "next_page": next_page,
     }))
@@ -1144,11 +1172,107 @@ pub(crate) fn shelf_error_reason(
 const URI_SCHEME_DLNA: &str = "dlna:";
 const SOURCE_DLNA_RESOLVE_VERB: &str = "source.dlna.resolve";
 
+/// A resolved queue-add candidate: the MPD-acceptable URI plus
+/// any operator-visible tags the resolver was able to attach.
+///
+/// For non-`dlna:` URIs (local FS path, direct http(s) stream)
+/// every tag field is `None` — the caller hands MPD the URI and
+/// MPD extracts what it can (ID3 on local files; nothing on
+/// arbitrary HTTP streams). For `dlna:` URIs the resolver
+/// harvests the DIDL fields from `source.dlna.resolve`'s
+/// response so the enqueue path can `addtagid` them onto MPD
+/// immediately after the `addid`, closing the "DLNA queue
+/// entry shows raw URL and no tags" gap.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTrack {
+    pub uri: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    // artwork_url is carried across the resolve boundary but not
+    // yet threaded into the MPD projection — MPD tag names are a
+    // fixed set (Title / Artist / Album / …) with no `AlbumArt`
+    // tag that gets picked up as artwork; the queue projection
+    // synthesises its `artwork_url` from (file_path, artist,
+    // album) via `artwork_target_url_for_track_sized`. Threading
+    // this explicit URL into the projection needs a separate
+    // side-channel (per-song sticker or a shelf-scoped cache
+    // keyed by song id) — tracked as a follow-on to the DIDL
+    // tags landing.
+    #[allow(dead_code)]
+    pub artwork_url: Option<String>,
+    #[allow(dead_code)]
+    pub duration: Option<String>,
+}
+
+impl ResolvedTrack {
+    fn passthrough(uri: &str) -> Self {
+        Self {
+            uri: uri.to_string(),
+            title: None,
+            artist: None,
+            album: None,
+            artwork_url: None,
+            duration: None,
+        }
+    }
+
+    /// True when at least one metadata tag is present. Enqueue
+    /// paths use this to decide whether the follow-up
+    /// `addtagid` burst is needed at all.
+    fn has_tags(&self) -> bool {
+        self.title.is_some() || self.artist.is_some() || self.album.is_some()
+    }
+}
+
+/// Apply the resolved track's DIDL tags to a queued songid via
+/// `addtagid`. Fire-and-forget: a per-tag MPD failure logs at
+/// debug and continues (tags are operator-visible polish, not
+/// a correctness invariant — the track still plays with an
+/// empty title). Returns unconditionally so a slow MPD does
+/// not block the enqueue verb's response.
+pub(crate) async fn apply_resolved_tags(
+    conn: &mut MpdConnection,
+    song_id: u32,
+    resolved: &ResolvedTrack,
+) {
+    if !resolved.has_tags() {
+        return;
+    }
+    for (tag, value) in [
+        ("Title", resolved.title.as_deref()),
+        ("Artist", resolved.artist.as_deref()),
+        ("Album", resolved.album.as_deref()),
+    ] {
+        let Some(v) = value else {
+            continue;
+        };
+        if v.is_empty() {
+            continue;
+        }
+        if let Err(e) = conn.addtagid(song_id, tag, v).await {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                song_id,
+                tag,
+                error = %e,
+                "addtagid failed; queue projection may show empty tag \
+                 (track still plays)"
+            );
+        }
+    }
+}
+
 /// Resolve a stored URI into a form MPD's `add` / `addid` will
 /// accept, translating `dlna:<service_id>/<objectId>` into the
 /// concrete `http(s)` stream URL via peer-shelf dispatch to
 /// `source.dlna.resolve`. Non-`dlna:` URIs pass through
 /// unchanged; MPD itself gates on scheme at add time.
+///
+/// Returns a [`ResolvedTrack`] carrying the MPD URI plus any
+/// DIDL tags the resolver harvested (title / artist / album /
+/// artwork_url / duration). Non-DLNA URIs return an all-None
+/// tag set — MPD's own extraction handles them.
 ///
 /// Favourites and stored playlists keep their `dlna:` stable
 /// identity on disk across MediaServer IP / token churn; the
@@ -1163,9 +1287,9 @@ pub(crate) async fn resolve_uri_for_mpd(
     ctx: &QueueContext,
     verb: &str,
     uri: &str,
-) -> Result<String, VerbError> {
+) -> Result<ResolvedTrack, VerbError> {
     if !uri.starts_with(URI_SCHEME_DLNA) {
-        return Ok(uri.to_string());
+        return Ok(ResolvedTrack::passthrough(uri));
     }
     let (service_id, object_id) =
         parse_dlna_uri(uri).ok_or_else(|| VerbError::Mpd {
@@ -1235,7 +1359,28 @@ pub(crate) async fn resolve_uri_for_mpd(
             ),
         });
     }
-    Ok(http_uri.to_string())
+    // Harvest the DIDL tags the resolve response carries so the
+    // enqueue path can `addtagid` them onto MPD after the `addid`.
+    // Missing fields collapse to `None`; the resolver never
+    // fabricates a tag from other fields (e.g. does not derive a
+    // title from the path). Empty strings are collapsed to `None`
+    // so the follow-up `addtagid` skips them rather than
+    // installing an empty tag.
+    let opt_str = |key: &str| -> Option<String> {
+        response
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    Ok(ResolvedTrack {
+        uri: http_uri.to_string(),
+        title: opt_str("title"),
+        artist: opt_str("artist"),
+        album: opt_str("album"),
+        artwork_url: opt_str("artwork_url"),
+        duration: opt_str("duration"),
+    })
 }
 
 /// Split `dlna:<service_id>/<objectId>` into its parts. Service
@@ -1513,15 +1658,17 @@ async fn load_playlist_with_dlna_resolve(
             reason: e.to_string(),
         }
     })?;
-    let mut resolved: Vec<String> = Vec::with_capacity(entries.len());
+    let mut resolved: Vec<ResolvedTrack> = Vec::with_capacity(entries.len());
     for e in &entries {
         resolved.push(resolve_uri_for_mpd(ctx, verb, &e.file_path).await?);
     }
-    for uri in &resolved {
-        conn.addid(uri, None).await.map_err(|e| VerbError::Mpd {
-            verb: verb.to_string(),
-            reason: e.to_string(),
-        })?;
+    for r in &resolved {
+        let id =
+            conn.addid(&r.uri, None).await.map_err(|e| VerbError::Mpd {
+                verb: verb.to_string(),
+                reason: e.to_string(),
+            })?;
+        apply_resolved_tags(conn, id, r).await;
     }
     Ok(())
 }
@@ -1968,7 +2115,10 @@ mod tests {
             "",
         ] {
             let out = resolve_uri_for_mpd(&ctx, "test", uri).await.unwrap();
-            assert_eq!(out, uri);
+            assert_eq!(out.uri, uri);
+            assert!(out.title.is_none());
+            assert!(out.artist.is_none());
+            assert!(out.album.is_none());
         }
     }
 

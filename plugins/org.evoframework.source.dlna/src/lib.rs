@@ -572,15 +572,36 @@ async fn handle_resolve(
     body: ResolveBody,
 ) -> Result<Vec<u8>, PluginError> {
     let control_url = lookup_control(servers, &body.service_id).await?;
-    let uri = browse_metadata_uri(&control_url, &body.object_id)
+    // Parse the full DIDL item so we can carry DIDL tags across the
+    // resolve boundary. Historically this hop returned only the
+    // stream `uri`; that left the enqueue path with no way to hand
+    // MPD tags for HTTP streams, so `mpc playlistinfo` returned
+    // empty title/artist/album for DLNA queue entries even though
+    // browse had the metadata in hand. Preserving the DIDL fields
+    // here — no extra SOAP round-trip, the BrowseMetadata call
+    // already returned them — closes that gap.
+    let item = browse_metadata_item(&control_url, &body.object_id)
         .await
         .map_err(|e| PluginError::Transient(e.to_string()))?;
+    let uri = pick_stream_uri(&item).ok_or_else(|| {
+        PluginError::Transient(
+            "BrowseMetadata returned no playable res".to_string(),
+        )
+    })?;
     Ok(serde_json::to_vec(&json!({
         "v": 1,
         "status": "ok",
         "service_id": body.service_id,
         "object_id": body.object_id,
         "uri": uri,
+        "title": item.title,
+        "artist": item.artist,
+        "album": item.album,
+        "artwork_url": item.album_art_uri,
+        // DIDL duration is `HH:MM:SS[.f]`; downstream consumers
+        // that want milliseconds re-parse. Leave as the DIDL
+        // wire shape so nothing lossy happens here.
+        "duration": item.duration,
     }))
     .unwrap_or_default())
 }
@@ -600,7 +621,36 @@ async fn lookup_control(
         })
 }
 
-async fn browse_metadata_uri(
+/// Full-item variant of [`browse_metadata_uri`] used by
+/// [`handle_resolve`] so DIDL tags (title, artist, album,
+/// albumArtURI, duration) cross the resolve boundary alongside
+/// the stream URI. The BrowseMetadata SOAP call already returns
+/// every field parsed into a [`DidlItem`]; returning the item
+/// instead of just its `res` URI is a strict superset.
+///
+/// Kept alongside `browse_metadata_uri` (URI-only) so callers
+/// that don't need the tags — none today post-2026-08-05 —
+/// still have the minimal path available if a future consumer
+/// wants it.
+async fn browse_metadata_item(
+    control_url: &str,
+    object_id: &str,
+) -> Result<evo_dlna::DidlItem, evo_dlna::DlnaError> {
+    let didl = browse_metadata_didl(control_url, object_id).await?;
+    let objs = parse_didl(&didl)?;
+    for o in objs {
+        if let DidlObject::Item(i) = o {
+            return Ok(i);
+        }
+    }
+    Err(evo_dlna::DlnaError::Soap(
+        "BrowseMetadata returned no <item>".into(),
+    ))
+}
+
+/// Shared SOAP-envelope send + DIDL-Result extract. Factored out
+/// so the URI-only and full-item paths agree on the wire shape.
+async fn browse_metadata_didl(
     control_url: &str,
     object_id: &str,
 ) -> Result<String, evo_dlna::DlnaError> {
@@ -656,6 +706,18 @@ async fn browse_metadata_uri(
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&");
+    Ok(didl)
+}
+
+/// URI-only wrapper that composes `browse_metadata_didl` with
+/// `pick_stream_uri`. Kept for callers wanting only the URI —
+/// none today, but the seam stays open.
+#[allow(dead_code)]
+async fn browse_metadata_uri(
+    control_url: &str,
+    object_id: &str,
+) -> Result<String, evo_dlna::DlnaError> {
+    let didl = browse_metadata_didl(control_url, object_id).await?;
     let objs = parse_didl(&didl)?;
     for o in objs {
         if let DidlObject::Item(i) = o {

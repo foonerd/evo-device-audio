@@ -611,6 +611,34 @@ impl MpdConnection {
         }))
     }
 
+    /// Attach a metadata tag to a queue item by songid.
+    ///
+    /// Used by the enqueue path for HTTP streams (DLNA-resolved
+    /// `http(s)://…` URIs) so `playlistinfo` / `currentsong`
+    /// report the tag on the queue projection. MPD does not
+    /// extract ID3 tags from arbitrary HTTP streams on `add`, so
+    /// the plugin has to hand the DIDL-derived tags in via
+    /// `addtagid` immediately after the `addid`.
+    ///
+    /// `tag` is a case-insensitive tag name — `Title`, `Artist`,
+    /// `Album`, `AlbumArtist`, `Composer`, `Date`, etc. — the
+    /// MPD tag-name set. `value` is the operator-visible string.
+    ///
+    /// Wire form: `addtagid "<id>" "<tag>" "<value>"\n`. Same
+    /// silent-drop semantics as `addid` for the leading `Id`
+    /// field: MPD acknowledges with an empty response on success.
+    pub async fn addtagid(
+        &mut self,
+        id: u32,
+        tag: &str,
+        value: &str,
+    ) -> Result<(), MpdError> {
+        let id_str = id.to_string();
+        self.dispatch("addtagid", &[id_str.as_str(), tag, value])
+            .await?;
+        Ok(())
+    }
+
     /// Remove a queue item by songid.
     ///
     /// Wire form: `deleteid "<id>"\n`.
