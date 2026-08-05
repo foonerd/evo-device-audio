@@ -272,7 +272,8 @@ verb-aware routing lands each verb on its declaring \
 plugin. Both plugins publish reactive subjects the \
 operator UI consumes for read-then-subscribe: \
 system_network_shares_configured / _discovered / \
-network_share_state (per share) / system_smb_server. \
+network_share_state (per share) / network_share_events / \
+system_smb_server. \
 Distributions shipping local-storage-only can omit either \
 or both plugins; the shelf declaration remains so the \
 UI's subject-subscribe path resolves.
@@ -728,6 +729,15 @@ name = "system_network_shares_discovered"
 # on every mount / unmount transition.
 [[subjects]]
 name = "network_share_state"
+
+# Published by `org.evoframework.network.shares`: singleton
+# `network_share_events` carrying the bounded lifecycle-event
+# ring (mount / unmount / mount_failed / unmount_failed).
+# Must be declared here — without it, subject-publisher attach
+# fails and the publisher slot is never set, so later
+# network_share_state transitions are not republished.
+[[subjects]]
+name = "network_share_events"
 
 # Published by `org.evoframework.network.smb-server`:
 # singleton `system_smb_server` carrying evo-as-SMB-server
