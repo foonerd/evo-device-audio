@@ -963,6 +963,30 @@ fn resolve_mpd_path(
     }
 
     let Some(track_path) = resolve_audio_path(library_roots, value) else {
+        // Path resolution failed. For remote streams (DLNA-
+        // resolved `http(s)://…`, ICY radio, etc.) there is no
+        // on-disk file to read tags from, but the enqueue path
+        // has already stamped `addtagid Artist/Album/…` on the
+        // MPD queue entry (see the `apply_resolved_tags` helper
+        // in `playback.mpd`), so `playlistfind file <uri>`
+        // recovers the identity pair that the framework's
+        // artwork cascade needs to synthesise an mpd-album
+        // request against `artwork.online`. Same recovery
+        // primitive `metadata.local` uses for the equivalent
+        // metadata cascade — one wire round-trip, bounded
+        // budget, no-op when MPD is unreachable.
+        let identity = if is_remote_stream_uri(value) {
+            identity_from_mpd_queue(value)
+        } else {
+            None
+        };
+        let detail = if identity.is_some() {
+            "audio file not found for mpd_path; \
+             identity recovered from MPD queue tags"
+                .to_string()
+        } else {
+            "audio file not found for mpd_path".to_string()
+        };
         return Ok(ArtworkResolveResponse {
             v: 1,
             status: ResponseStatus::NotFound,
@@ -971,12 +995,73 @@ fn resolve_mpd_path(
             mime: None,
             size: None,
             provider_id: None,
-            identity: None,
-            detail: Some("audio file not found for mpd_path".to_string()),
+            identity,
+            detail: Some(detail),
         });
     };
 
     resolve_cover_for_audio_file(state_dir, &track_path, None)
+}
+
+/// True for `http://` / `https://` URIs (case-insensitive
+/// scheme). Same predicate `playback.mpd::availability` uses
+/// to skip sticker probes on remote streams — sharing the
+/// exact shape keeps operator mental model consistent across
+/// the two plugins.
+fn is_remote_stream_uri(path: &str) -> bool {
+    path.get(..7)
+        .map(|p| p.eq_ignore_ascii_case("http://"))
+        .unwrap_or(false)
+        || path
+            .get(..8)
+            .map(|p| p.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
+}
+
+/// Best-effort recovery of the `(artist, album)` identity pair
+/// from MPD's play-queue for a remote-stream URI. Runs a
+/// bounded `playlistfind file <uri>` against local MPD via the
+/// same async-in-sync bridge [`try_mpd_index_hint`] uses;
+/// returns `None` on any of: no tokio runtime available, MPD
+/// unreachable, budget exhausted, no matching queue entry, or
+/// missing Artist/Album tag. The framework artwork cascade
+/// treats a missing identity as "skip online" and falls back
+/// to the placeholder floor, so a silent None here degrades
+/// exactly the same way an untagged file did before.
+fn identity_from_mpd_queue(uri: &str) -> Option<Identity> {
+    use evo_mpd_shared::{MpdConnection, MpdEndpoint};
+
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let endpoint = MpdEndpoint::tcp(MPD_HOST, MPD_PORT).ok()?;
+    let uri_owned = uri.to_string();
+    let items = handle
+        .block_on(async {
+            tokio::time::timeout(MPD_INDEX_HINT_BUDGET, async {
+                let mut conn = MpdConnection::connect(endpoint).await.ok()?;
+                conn.playlistfind("file", uri_owned.as_str()).await.ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default();
+    for item in items {
+        // The framework cascade needs BOTH artist AND album
+        // to synthesise an mpd-album request; a partial pair
+        // is not useful. Skip queue entries that carry only
+        // one.
+        if let (Some(artist), Some(album)) = (item.artist, item.album) {
+            let artist = artist.trim();
+            let album = album.trim();
+            if !artist.is_empty() && !album.is_empty() {
+                return Some(Identity {
+                    artist: artist.to_string(),
+                    album: album.to_string(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// MIME inference from file extension for sidecar covers.
@@ -1253,6 +1338,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.response.status, ResponseStatus::NotFound);
+        // Test runs outside any tokio runtime; the queue-tag
+        // recovery bridge returns `None`, so identity remains
+        // absent and the framework cascade will degrade to the
+        // placeholder floor (exactly the shape a genuine
+        // "MPD is down" runtime would also see). This is the
+        // controlled-degrade acceptance for the branch.
+        assert!(r.response.identity.is_none());
+        assert_eq!(
+            r.response.detail.as_deref(),
+            Some("audio file not found for mpd_path")
+        );
+    }
+
+    #[test]
+    fn is_remote_stream_uri_detects_http_and_https_and_rejects_local() {
+        // The predicate gates whether the `identity_from_mpd_queue`
+        // MPD round-trip fires. False positives here (a local
+        // path misclassified) would waste one MPD call per
+        // resolve miss; false negatives (a remote URI missed)
+        // would silently skip the recovery. Explicit tests keep
+        // the boundary honest.
+        assert!(is_remote_stream_uri("http://plex.lan/object/abc/file.mp3"));
+        assert!(is_remote_stream_uri("HTTP://plex.lan/object/abc/file.mp3"));
+        assert!(is_remote_stream_uri("https://cdn.example/a.flac"));
+        assert!(is_remote_stream_uri("HTTPS://cdn.example/a.flac"));
+        assert!(!is_remote_stream_uri("Artist/Album/01.flac"));
+        assert!(!is_remote_stream_uri("/absolute/path/file.mp3"));
+        assert!(!is_remote_stream_uri("http"));
+        assert!(!is_remote_stream_uri("ftp://legacy/nope.flac"));
     }
 
     #[test]
