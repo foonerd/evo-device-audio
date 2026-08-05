@@ -38,7 +38,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Base64 encode/decode for the artwork.resolve verb's
 # wire-shape response: the plugin writes bytes to the asset
 # cache and returns the content_hash; legacy in-process

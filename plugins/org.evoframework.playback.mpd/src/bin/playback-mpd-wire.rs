@@ -26,10 +26,9 @@ use evo_plugin_sdk::host::{
 };
 use org_evoframework_playback_mpd::{MpdPlaybackPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
-use tracing_subscriber::EnvFilter;
 
 fn main() -> ! {
-    init_logging();
+    evo_plugin_sdk::wire_logging::init();
     let socket_path = match parse_args() {
         Ok(p) => p,
         Err(e) => {
@@ -50,16 +49,6 @@ fn main() -> ! {
         &socket_path,
         "playback-mpd-wire",
     )
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .init();
 }
 
 fn parse_args() -> Result<PathBuf> {

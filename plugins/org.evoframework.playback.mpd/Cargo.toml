@@ -60,7 +60,6 @@ hex = { workspace = true }
 toml = "0.8"
 # Wire-binary stderr logging. Matches the artwork-local-wire +
 # network-wire + metadata-local-wire sibling plugins.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # Extra tokio features only needed by tests (duplex streams, test-util utilities).

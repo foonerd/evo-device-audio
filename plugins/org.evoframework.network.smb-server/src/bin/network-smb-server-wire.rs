@@ -12,10 +12,9 @@ use anyhow::{anyhow, Result};
 use evo_plugin_sdk::host::{run_oop_and_exit, HostConfig};
 use org_evoframework_network_smb_server::{SmbServerPlugin, PLUGIN_NAME};
 use std::path::PathBuf;
-use tracing_subscriber::EnvFilter;
 
 fn main() -> ! {
-    init_logging();
+    evo_plugin_sdk::wire_logging::init();
     let socket_path = match parse_args() {
         Ok(p) => p,
         Err(e) => {
@@ -31,16 +30,6 @@ fn main() -> ! {
     let plugin = SmbServerPlugin::new();
     let config = HostConfig::new(PLUGIN_NAME);
     run_oop_and_exit(plugin, config, &socket_path, "network-smb-server-wire")
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .init();
 }
 
 fn parse_args() -> Result<PathBuf> {

@@ -30,7 +30,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

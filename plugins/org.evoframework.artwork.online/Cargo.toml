@@ -31,7 +31,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Outbound HTTPS for online artwork providers. rustls backend
 # matches the framework's existing TLS posture (no system OpenSSL
 # dependency on cross-build targets).

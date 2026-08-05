@@ -30,7 +30,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

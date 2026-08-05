@@ -57,7 +57,6 @@ thiserror = { workspace = true }
 # reactor + byte-flow worker tasks.
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Optional: ALSA PCM substrate. Linked only when the
 # `alsa-substrate` feature is on — see [features] above.
 alsa = { version = "0.10", optional = true }
