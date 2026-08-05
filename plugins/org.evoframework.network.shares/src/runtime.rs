@@ -2924,15 +2924,32 @@ fn trigger_mpd_stop_and_prune_best_effort(mount_root: &std::path::Path) {
 pub(crate) const SHARE_EVENTS_SUBJECT_TYPE: &str = "network_share_events";
 pub(crate) const SHARE_EVENTS_RING_CAPACITY: usize = 32;
 
-/// One entry in the share-events ring.
+/// One entry in the share-events ring. Pub so the `list_events`
+/// verb's response type and the subject seed announce speak the
+/// same shape end-to-end — a single UI decoder handles both
+/// surfaces.
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ShareEvent {
+pub struct ShareEvent {
+    /// Reverse-lookup id of the share the event describes.
+    /// Matches [`ShareRecord::share_id`]'s inner string.
     pub share_id: String,
+    /// One of `"mounted"`, `"mount_failed"`, `"unmounted"`,
+    /// `"unmount_failed"`. Static string so the payload does
+    /// not carry a heap allocation for the discriminator.
     pub kind: &'static str,
+    /// Failure reason on `mount_failed` / `unmount_failed`
+    /// (the classified journal stderr from the mount ladder);
+    /// `None` on the success shapes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// CIFS dialect negotiated on a successful mount (e.g.
+    /// `"2.0"`, `"3.0"`); `None` on failure shapes and on
+    /// non-CIFS success shapes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negotiated_version: Option<String>,
+    /// Wall-clock instant the event happened, in milliseconds
+    /// since the UNIX epoch (unaffected by monotonic clock
+    /// drift — this is a display timestamp, not a duration).
     pub at_ms: u64,
 }
 
@@ -2991,11 +3008,23 @@ impl ShareEvent {
 }
 
 /// Snapshot envelope published as the `network_share_events`
-/// subject state. Latest N events in insertion order (oldest
-/// first).
+/// subject state AND returned by the `network.share.list_events`
+/// read verb. Latest N events in insertion order (oldest
+/// first). Pub so the read verb's [`ListEventsResponse`] and
+/// the subject seed announce speak the same shape end-to-end;
+/// a single UI decoder handles both surfaces.
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ShareEventsEnvelope {
+pub struct ShareEventsEnvelope {
+    /// Last N lifecycle events in insertion order (oldest
+    /// first). Empty at boot until the first mount / unmount
+    /// attempt completes; bounded by [`SHARE_EVENTS_RING_CAPACITY`]
+    /// so a long-lived runtime does not grow the payload
+    /// without bound.
     pub events: Vec<ShareEvent>,
+    /// Wall-clock instant the snapshot was taken (independent
+    /// of the newest event's `at_ms` — this timestamp reflects
+    /// when the read verb / subject announce ran, useful for
+    /// clock-drift diagnostics against consumer displays).
     pub last_update_at: std::time::SystemTime,
 }
 
@@ -4440,21 +4469,14 @@ impl NetworkSharesRuntime {
         // Announce the (initially-empty) share-events ring so
         // subscribers can attach before the first lifecycle event
         // and get a consistent seed on `current_state`. Snapshot
-        // the ring under its mutex to include any events the
+        // the ring via the same helper the `list_events` read
+        // verb calls (so seed shape and read-verb shape are
+        // bit-identical). The snapshot includes any events the
         // runtime buffered before attach (mount attempts started
         // by the boot-sweep can complete before the announcer is
         // wired if the framework's plugin-load ordering differs
         // from the shares plugin's expectation).
-        let initial_events_envelope = {
-            let guard = self
-                .share_events_ring
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            ShareEventsEnvelope {
-                events: guard.iter().cloned().collect(),
-                last_update_at: SystemTime::now(),
-            }
-        };
+        let initial_events_envelope = self.compose_share_events_envelope();
         announcer
             .announce(SubjectAnnouncement {
                 subject_type: SHARE_EVENTS_SUBJECT_TYPE.to_string(),
@@ -4493,6 +4515,28 @@ impl NetworkSharesRuntime {
     ) -> Vec<ShareStateEnvelope> {
         let g = self.share_states.lock().await;
         g.iter().map(|(id, e)| e.to_envelope(id)).collect()
+    }
+
+    /// Snapshot the `network_share_events` ring into a
+    /// [`ShareEventsEnvelope`]. Shared by the initial subject
+    /// announce (so subscribers get a seed on `current_state`)
+    /// AND by the `network.share.list_events` read verb (so a
+    /// freshly-loaded UI page sees the historical ring before
+    /// its subscribe callback fires the first live event).
+    ///
+    /// The ring is bounded (32 entries at construction — see
+    /// [`SHARE_EVENTS_RING_CAPACITY`]), so the clone is cheap.
+    /// The snapshot is taken under the ring's mutex so a
+    /// concurrent `publish_share_event` does not interleave.
+    pub(crate) fn compose_share_events_envelope(&self) -> ShareEventsEnvelope {
+        let guard = self
+            .share_events_ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ShareEventsEnvelope {
+            events: guard.iter().cloned().collect(),
+            last_update_at: SystemTime::now(),
+        }
     }
 
     fn take_publisher(&self) -> Option<Arc<dyn SubjectAnnouncer>> {
@@ -5112,6 +5156,15 @@ pub const NETWORK_SHARES_VERBS: &[&str] = &[
     "network.share.list_configured",
     "network.discovery.list",
     "network.share.get_state",
+    // The `network_share_events` subject is delta-only —
+    // subscribers see events that fire after `subscribe`, not
+    // the historical ring. The Sources Activity panel needs a
+    // read-then-subscribe path so a freshly-loaded page shows
+    // the last N mount/unmount/failed events without waiting
+    // for a live transition; every other shares subject pairs
+    // a subscribe with a matching read (list_configured,
+    // get_state) and events should not be the exception.
+    "network.share.list_events",
 ];
 
 /// Response payload for `network.share.list_configured`.
@@ -5144,6 +5197,21 @@ pub struct GetShareStateResponse {
     /// Snapshot of the per-share state envelope, or `None` when
     /// no share exists with the requested id.
     pub envelope: Option<ShareStateEnvelope>,
+}
+
+/// Response payload for `network.share.list_events`. Carries
+/// the same [`ShareEventsEnvelope`] shape the subject seed
+/// announce publishes on the `network_share_events` singleton
+/// — read-then-subscribe consumers can decode the read verb's
+/// response and the subject's `current_state` through one
+/// decoder path.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListEventsResponse {
+    /// Snapshot of the bounded event ring at the moment the
+    /// verb was dispatched. Empty at boot until the first
+    /// lifecycle event lands; ordered oldest-first per the
+    /// ring's insertion order.
+    pub envelope: ShareEventsEnvelope,
 }
 
 /// Whether the runtime dispatches this request_type.
@@ -5283,6 +5351,10 @@ impl NetworkSharesRuntime {
                     request_type,
                     &GetShareStateResponse { envelope },
                 )
+            }
+            "network.share.list_events" => {
+                let envelope = self.compose_share_events_envelope();
+                encode_response(request_type, &ListEventsResponse { envelope })
             }
             other => Err(VerbDispatchError::UnknownRequestType {
                 request_type: other.to_string(),
@@ -8549,5 +8621,119 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response.nas.len(), 1);
         assert_eq!(response.nas[0].name, "NAS-VD");
+    }
+
+    #[tokio::test]
+    async fn dispatch_verb_list_events_empty_ring_returns_empty_envelope() {
+        // A freshly-built runtime has no lifecycle events yet.
+        // The read verb must still succeed and return an empty
+        // events list — a UI that seeds from this call and then
+        // subscribes must see zero history followed by zero live
+        // events without special-casing "verb succeeded but no
+        // envelope".
+        //
+        // Wire decode goes through `serde_json::Value` rather
+        // than a typed `ListEventsResponse`: `ShareEvent.kind` is
+        // `&'static str` (a static-string discriminant), which
+        // does not round-trip through `Deserialize` — the
+        // envelope is a producer-only type.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let bytes = rt
+            .dispatch_verb("network.share.list_events", b"")
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let events = response
+            .get("envelope")
+            .and_then(|e| e.get("events"))
+            .and_then(|e| e.as_array())
+            .expect("envelope.events array");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_verb_list_events_returns_ring_snapshot_after_lifecycle_events(
+    ) {
+        // After a successful mount followed by an unmount, the
+        // read verb must return the events in insertion order
+        // (oldest first) with the same shape the subject seed
+        // announce publishes. This is the load-bearing property
+        // the Sources Activity panel depends on: read-then-
+        // subscribe with byte-identical decoder for both surfaces.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            ok_mount_output(), // mount call
+            ok_mount_output(), // unmount call
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let record = built_record("VerbEvents", "192.0.2.50");
+        let id = rt.add_share(record).await.unwrap();
+
+        let mount_req = MountShareRequest {
+            share_id: id.clone(),
+        };
+        let mount_payload = serde_json::to_vec(&mount_req).unwrap();
+        rt.dispatch_verb("network.share.mount", &mount_payload)
+            .await
+            .unwrap();
+
+        let unmount_req = UnmountShareRequest {
+            share_id: id.clone(),
+        };
+        let unmount_payload = serde_json::to_vec(&unmount_req).unwrap();
+        rt.dispatch_verb("network.share.unmount", &unmount_payload)
+            .await
+            .unwrap();
+
+        let bytes = rt
+            .dispatch_verb("network.share.list_events", b"")
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let events = response
+            .get("envelope")
+            .and_then(|e| e.get("events"))
+            .and_then(|e| e.as_array())
+            .expect("envelope.events array");
+        // add_share performs an implicit mount too, so the ring
+        // carries the whole lifecycle burst — the assertion is on
+        // the shape (non-empty, insertion order, matching share)
+        // rather than an exact count, so a future add-time /
+        // mount-time refactor does not break this test.
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|e| e.get("share_id").and_then(|v| v.as_str())
+                == Some(id.0.as_str())));
+        // Chronological order preserved by the ring.
+        let ats: Vec<u64> = events
+            .iter()
+            .filter_map(|e| e.get("at_ms").and_then(|v| v.as_u64()))
+            .collect();
+        let mut sorted = ats.clone();
+        sorted.sort();
+        assert_eq!(ats, sorted, "ring must be oldest-first");
+        // The final event on this ring is an unmount success.
+        assert_eq!(
+            events
+                .last()
+                .and_then(|e| e.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("unmounted")
+        );
     }
 }

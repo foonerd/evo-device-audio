@@ -66,6 +66,7 @@ request_types = [
     "network.share.list_configured",
     "network.discovery.list",
     "network.share.get_state",
+    "network.share.list_events",
 ]
 # CIFS dialect probe ladder worst-case is 5 attempts × 30 s each;
 # discovery avahi-browse + per-host smbclient adds another ~30 s
@@ -77,6 +78,7 @@ response_budget_ms = 180000
 "network.share.list_configured" = { kind = "none" }
 "network.discovery.list" = { kind = "none" }
 "network.share.get_state" = { kind = "none" }
+"network.share.list_events" = { kind = "none" }
 # Mutating + probing verbs step-up-gated against network_admin.
 "network.share.add" = { kind = "step_up", scope = "network_admin" }
 "network.share.edit" = { kind = "step_up", scope = "network_admin" }
