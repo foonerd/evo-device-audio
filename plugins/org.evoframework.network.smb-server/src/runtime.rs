@@ -1225,6 +1225,23 @@ pub struct SmbServerApplyRequest {
     pub min_protocol: MinProtocol,
     /// New extra_shares list (full replacement, not a delta).
     pub extra_shares: Vec<ExtraShare>,
+    /// New system hostname. When `Some`, the runtime runs
+    /// `sudo -n /usr/bin/hostnamectl set-hostname <value>` before
+    /// re-rendering smb.conf so both the OS hostname and the SMB
+    /// netbios advertisement update in one operator gesture. When
+    /// `None` (default for callers that pre-date the field), the
+    /// existing hostname stays put.
+    ///
+    /// avahi-daemon subscribes to hostnamed's D-Bus signals on
+    /// standard Debian and re-advertises mDNS automatically on
+    /// hostname change; no explicit avahi reload is issued here.
+    ///
+    /// Refused when the string is empty or contains chars outside
+    /// the RFC 1123 hostname set (letters / digits / `-`, must
+    /// start + end with letter/digit) — hostnamectl would reject
+    /// anyway; refusing early gives the operator a clearer error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_hostname: Option<String>,
 }
 
 /// Response payload for `network.smb_server.apply`.
@@ -1319,6 +1336,89 @@ pub fn is_smb_server_verb(request_type: &str) -> bool {
     SMB_SERVER_VERBS.contains(&request_type)
 }
 
+/// Change the OS hostname via `sudo -n /usr/bin/hostnamectl
+/// set-hostname <name>`. Best-effort:
+///
+///   - Refuses empty / RFC-1123-invalid names early with a
+///     WARN log; the sudoers grant would refuse the same value
+///     but the early check gives the operator a clearer error.
+///   - Non-zero exit from hostnamectl logs at WARN and returns
+///     (the caller continues with the rest of the apply).
+///   - Missing sudo grant / hostnamectl surfaces as non-zero
+///     exit with stderr in the log.
+///
+/// avahi-daemon picks up the hostname change via its D-Bus
+/// subscription to systemd-hostnamed on standard Debian and
+/// re-advertises mDNS without explicit reload. No SMB restart
+/// is issued here — `SambaServerRuntime::apply` re-renders
+/// smb.conf after this call and, if `enabled = true`, restarts
+/// smbd on the render change.
+async fn apply_system_hostname_best_effort(name: &str) {
+    if !is_rfc1123_hostname(name) {
+        tracing::warn!(
+            plugin = crate::PLUGIN_NAME,
+            hostname = %name,
+            "system_hostname refused: not a valid RFC-1123 hostname \
+             (letters / digits / hyphens; must start + end with letter/digit; \
+             1..=63 chars per label)"
+        );
+        return;
+    }
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .arg("-n")
+        .arg("/usr/bin/hostnamectl")
+        .arg("set-hostname")
+        .arg(name)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                hostname = %name,
+                "system hostname set via hostnamectl; avahi re-advertises \
+                 mDNS on hostnamed D-Bus signal"
+            );
+        }
+        Ok(o) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                hostname = %name,
+                exit_code = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "hostnamectl set-hostname exited non-zero (check sudoers \
+                 grant for /usr/bin/hostnamectl set-hostname *)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                hostname = %name,
+                error = %e,
+                "hostnamectl dispatch failed"
+            );
+        }
+    }
+}
+
+/// RFC 1123 hostname validator (single label — hostnamectl
+/// accepts a single label, not an FQDN, for `set-hostname`).
+/// Rules: 1..=63 chars, letters/digits/hyphens, must start and
+/// end with letter/digit.
+fn is_rfc1123_hostname(name: &str) -> bool {
+    let len = name.len();
+    if !(1..=63).contains(&len) {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
+    let is_alnum_or_hyphen = |b: u8| is_alnum(b) || b == b'-';
+    if !is_alnum(bytes[0]) || !is_alnum(bytes[len - 1]) {
+        return false;
+    }
+    bytes.iter().all(|&b| is_alnum_or_hyphen(b))
+}
+
 impl SambaServerRuntime {
     /// Route an operator wire verb to the appropriate handle
     /// method.
@@ -1331,6 +1431,18 @@ impl SambaServerRuntime {
             "network.smb_server.apply" => {
                 let req: SmbServerApplyRequest =
                     decode_payload(request_type, payload_bytes)?;
+                // Hostname change lands FIRST so the smb.conf
+                // render below (via `apply`) picks up any
+                // netbios-follows-hostname convention on the
+                // operator's chosen name. Best-effort — failure
+                // to change hostname does not block the rest of
+                // the apply (extra_shares / enabled / min_
+                // protocol still commit). The operator sees a
+                // clear log line if the sudoers grant is missing
+                // or hostnamectl refuses the value.
+                if let Some(name) = req.system_hostname.as_deref() {
+                    apply_system_hostname_best_effort(name).await;
+                }
                 let report = self
                     .apply(req.enabled, req.min_protocol, req.extra_shares)
                     .await?;
@@ -2067,6 +2179,7 @@ mod tests {
                 path: "/mnt/NAS/uploads".to_string(),
                 guest_ok: true,
             }],
+            system_hostname: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
         let bytes = rt

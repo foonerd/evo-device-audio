@@ -339,6 +339,23 @@ pub struct ShareEdits {
 }
 
 impl ShareEdits {
+    /// Whether this edit set, applied to `record`, would change
+    /// any field that affects the mount itself (fstype / host /
+    /// path / credentials / advanced_options) — i.e. would require
+    /// a remount for the change to take effect at the OS layer.
+    /// `alias` is operator-visible only and does not require a
+    /// remount.
+    pub fn is_material_against(&self, record: &ShareRecord) -> bool {
+        matches!(&self.fstype, Some(v) if v != &record.fstype)
+            || matches!(&self.host, Some(v) if v != &record.host)
+            || matches!(&self.path, Some(v) if v != &record.path)
+            || matches!(&self.credentials, Some(v) if v != &record.credentials)
+            || matches!(
+                &self.advanced_options,
+                Some(v) if v != &record.advanced_options
+            )
+    }
+
     /// Apply this edit set to `record` in-place. Returns whether
     /// any field actually changed, so the caller can skip the
     /// atomic save when the operator submits a no-op edit.
@@ -2090,6 +2107,9 @@ pub const DISCOVERED_SUBJECT_SCHEME: &str = "evo.network.shares.discovered";
 /// [`ShareId`] as the addressing value.
 pub const SHARE_STATE_SUBJECT_SCHEME: &str = "evo.network.share.state";
 
+/// Addressing scheme for the share-events ring singleton.
+pub const SHARE_EVENTS_SUBJECT_SCHEME: &str = "evo.network.shares.events";
+
 /// Fixed addressing value for singleton subjects.
 pub const SINGLETON_ADDRESSING_VALUE: &str = "local";
 
@@ -2117,6 +2137,15 @@ pub fn share_state_addressing(share_id: &ShareId) -> ExternalAddressing {
     ExternalAddressing {
         scheme: SHARE_STATE_SUBJECT_SCHEME.to_string(),
         value: share_id.0.clone(),
+    }
+}
+
+/// Compose the singleton addressing for the share-events ring
+/// subject instance.
+pub fn share_events_singleton_addressing() -> ExternalAddressing {
+    ExternalAddressing {
+        scheme: SHARE_EVENTS_SUBJECT_SCHEME.to_string(),
+        value: SINGLETON_ADDRESSING_VALUE.to_string(),
     }
 }
 
@@ -2290,6 +2319,17 @@ pub struct NetworkSharesRuntime {
     ///   spinning, no re-entry.
     pending_credential_prompts:
         Arc<std::sync::Mutex<HashMap<String, PromptCell>>>,
+    /// Bounded ring of the most recent share-lifecycle events
+    /// (mount / unmount / mount-failed / unmount-failed).
+    /// Published as the `network_share_events` singleton on
+    /// every push so a status pane can render "what just
+    /// happened" without polling per-share state. Capacity is
+    /// [`SHARE_EVENTS_RING_CAPACITY`]; older events roll off
+    /// as new events land. `StdMutex` (blocking) chosen to
+    /// match the `publisher` slot — pushes are trivial and
+    /// hold the mutex for nanoseconds; no tokio primitive
+    /// needed.
+    share_events_ring: Arc<StdMutex<std::collections::VecDeque<ShareEvent>>>,
 }
 
 /// Cloneable outcome the first prompt-caller broadcasts to
@@ -2374,6 +2414,11 @@ impl NetworkSharesRuntime {
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
+            share_events_ring: Arc::new(StdMutex::new(
+                std::collections::VecDeque::with_capacity(
+                    SHARE_EVENTS_RING_CAPACITY,
+                ),
+            )),
         })
     }
 
@@ -2434,6 +2479,11 @@ impl NetworkSharesRuntime {
             now_fn: Arc::new(default_now_ms),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
+            )),
+            share_events_ring: Arc::new(StdMutex::new(
+                std::collections::VecDeque::with_capacity(
+                    SHARE_EVENTS_RING_CAPACITY,
+                ),
             )),
         }
     }
@@ -2660,6 +2710,197 @@ fn trigger_mpd_update_best_effort(mount_root: &std::path::Path) {
             }
         }
     });
+}
+
+/// MPD queue safety: called BEFORE a share is unmounted (or
+/// after mount-loss is detected) so the operator does not end up
+/// with a stuck queue full of "No such song" errors when the
+/// share drops mid-playback. Volumio-evo lesson (`mpd.rs`
+/// unreachable-mitigation).
+///
+/// Two steps:
+///   1. `mpc status --format '%file%'` — if the currently-playing
+///      file is under `mount_root`, `mpc stop` before the mount
+///      goes away.
+///   2. `mpc playlist -f '%position% %file%'` — enumerate the
+///      queue, `mpc del <position>` every entry pointing under
+///      `mount_root`. Deletions are processed high-to-low so
+///      positions do not shift under the enumerate.
+///
+/// Fire-and-forget spawn_blocking; the caller does not wait.
+/// Failures log at debug — a hung mpc must not block unmount.
+/// Empty `mount_root` short-circuits.
+fn trigger_mpd_stop_and_prune_best_effort(mount_root: &std::path::Path) {
+    if mount_root.as_os_str().is_empty() {
+        return;
+    }
+    let root_display = mount_root.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        // Step 1 — stop playback if current URI is under the
+        // vanishing prefix. `mpc status --format '%file%'` prints
+        // the currently-playing file on its own line when
+        // something is loaded; empty when stopped.
+        let status = std::process::Command::new("/usr/bin/mpc")
+            .arg("--format")
+            .arg("%file%")
+            .arg("status")
+            .output();
+        if let Ok(o) = status {
+            if o.status.success() {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let current = stdout.lines().next().unwrap_or("").trim();
+                if !current.is_empty() && current.starts_with(&root_display) {
+                    let _ = std::process::Command::new("/usr/bin/mpc")
+                        .arg("stop")
+                        .output();
+                    tracing::info!(
+                        mount_root = %root_display,
+                        current = %current,
+                        "mpc stop dispatched — currently-playing file was under vanishing share prefix"
+                    );
+                }
+            }
+        }
+
+        // Step 2 — enumerate the queue and delete entries under
+        // the vanishing prefix. `mpc playlist -f '%position% %file%'`
+        // prints `<pos> <file>` one per line.
+        let pl = std::process::Command::new("/usr/bin/mpc")
+            .arg("-f")
+            .arg("%position% %file%")
+            .arg("playlist")
+            .output();
+        let Ok(pl_out) = pl else {
+            return;
+        };
+        if !pl_out.status.success() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&pl_out.stdout);
+        // Collect positions (high-to-low) whose file is under the
+        // vanishing prefix. High-to-low so a subsequent delete does
+        // not shift the positions of yet-to-be-deleted entries.
+        let mut positions: Vec<u32> = text
+            .lines()
+            .filter_map(|line| {
+                let (pos_str, file) = line.split_once(' ')?;
+                if file.starts_with(&root_display) {
+                    pos_str.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if positions.is_empty() {
+            return;
+        }
+        positions.sort_unstable();
+        positions.reverse();
+        let deleted = positions.len();
+        for pos in &positions {
+            let _ = std::process::Command::new("/usr/bin/mpc")
+                .arg("del")
+                .arg(pos.to_string())
+                .output();
+        }
+        tracing::info!(
+            mount_root = %root_display,
+            deleted,
+            "mpc del pruned queue entries under vanishing share prefix"
+        );
+    });
+}
+
+// ------------------------------ event ring ---------------------------
+//
+// `network_share_events` subject — one instance per plugin load.
+// Publishes a bounded ring of the most recent share-lifecycle
+// events (mount / unmount / mount-failed / unmount-failed /
+// dialect-probe outcomes) so an operator status pane can show
+// "what just happened" without polling the mount-state subject.
+//
+// Ring capacity matches the widget contract expectation
+// (`SHARE_EVENTS_RING_CAPACITY`); older events roll off as new
+// events land. The publisher is `Option<...>` so a runtime
+// constructed without an event-publisher (unit tests) skips
+// publication cleanly.
+
+pub(crate) const SHARE_EVENTS_SUBJECT_TYPE: &str = "network_share_events";
+pub(crate) const SHARE_EVENTS_RING_CAPACITY: usize = 32;
+
+/// One entry in the share-events ring.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ShareEvent {
+    pub share_id: String,
+    pub kind: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_version: Option<String>,
+    pub at_ms: u64,
+}
+
+impl ShareEvent {
+    pub(crate) fn mounted(
+        share_id: ShareId,
+        negotiated_version: Option<String>,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            share_id: share_id.0,
+            kind: "mounted",
+            detail: None,
+            negotiated_version,
+            at_ms,
+        }
+    }
+
+    pub(crate) fn mount_failed(
+        share_id: ShareId,
+        detail: String,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            share_id: share_id.0,
+            kind: "mount_failed",
+            detail: Some(detail),
+            negotiated_version: None,
+            at_ms,
+        }
+    }
+
+    pub(crate) fn unmounted(share_id: ShareId, at_ms: u64) -> Self {
+        Self {
+            share_id: share_id.0,
+            kind: "unmounted",
+            detail: None,
+            negotiated_version: None,
+            at_ms,
+        }
+    }
+
+    pub(crate) fn unmount_failed(
+        share_id: ShareId,
+        detail: String,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            share_id: share_id.0,
+            kind: "unmount_failed",
+            detail: Some(detail),
+            negotiated_version: None,
+            at_ms,
+        }
+    }
+}
+
+/// Snapshot envelope published as the `network_share_events`
+/// subject state. Latest N events in insertion order (oldest
+/// first).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ShareEventsEnvelope {
+    pub events: Vec<ShareEvent>,
+    pub last_update_at: std::time::SystemTime,
 }
 
 /// Wall-clock in milliseconds since UNIX epoch. Used as the
@@ -2895,6 +3136,11 @@ impl NetworkSharesRuntimeBuilder {
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
+            share_events_ring: Arc::new(StdMutex::new(
+                std::collections::VecDeque::with_capacity(
+                    SHARE_EVENTS_RING_CAPACITY,
+                ),
+            )),
         }
     }
 }
@@ -2968,13 +3214,18 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         share_id: &ShareId,
         edits: ShareEdits,
     ) -> Result<bool, SharesStateError> {
-        let (changed, alias, configured_envelope) = {
+        let (changed, material, alias, configured_envelope) = {
             let mut g = self.inner.lock().await;
             let record = g.state.find_mut(share_id).ok_or_else(|| {
                 SharesStateError::ShareNotFound {
                     id: share_id.clone(),
                 }
             })?;
+            // Snapshot material intent BEFORE the mutation so the
+            // caller can decide whether to cycle the mount. Cosmetic
+            // edits (alias only) do not need a remount; material
+            // edits (host / path / fstype / creds / options) do.
+            let material = edits.is_material_against(record);
             let changed = edits.apply_to(record);
             let alias = record.alias.clone();
             if changed {
@@ -2984,11 +3235,47 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 shares: g.state.shares.clone(),
                 last_update_at: SystemTime::now(),
             };
-            (changed, alias, envelope)
+            (changed, material, alias, envelope)
         };
         if changed {
             self.update_share_state_alias(share_id, &alias).await;
             self.schedule_republish_configured(configured_envelope);
+        }
+        // Material change on a currently-mounted share: unmount +
+        // remount so the OS-side mount reflects the edited record.
+        // Silent no-op when the share is not currently mounted;
+        // the next mount attempt naturally picks up the new record.
+        // Errors from the cycle are logged but do NOT fail the
+        // edit — the persisted state is authoritative and the
+        // operator can retry mount from the UI. Fire the cycle
+        // via `mount_share` / `unmount_share` so the F1.1 / F1.2
+        // hooks (MPD library update + queue safety + event ring)
+        // apply uniformly.
+        if changed && material {
+            let is_mounted = {
+                let g = self.share_states.lock().await;
+                matches!(
+                    g.get(share_id).map(|e| &e.state),
+                    Some(MountState::Mounted)
+                )
+            };
+            if is_mounted {
+                if let Err(e) = self.unmount_share(share_id).await {
+                    tracing::warn!(
+                        share_id = %share_id,
+                        error = %e,
+                        "edit_share: pre-remount unmount failed; leaving \
+                         share in prior mount state"
+                    );
+                } else if let Err(e) = self.mount_share(share_id).await {
+                    tracing::warn!(
+                        share_id = %share_id,
+                        error = %e,
+                        "edit_share: post-edit remount failed; share is \
+                         now in Failed state per set_share_state"
+                    );
+                }
+            }
         }
         Ok(changed)
     }
@@ -3120,8 +3407,27 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                     report.negotiated_version.clone(),
                 )
                 .await;
+                // Kick MPD to walk the freshly-mounted tree so the
+                // Library projection shows the NAS content without
+                // an operator "rescan" ritual. Fire-and-forget: a
+                // hung `mpc update` never blocks the mount response;
+                // failure logs at debug. Same helper the remove path
+                // uses so the plugin has one MPD-side coupling point.
+                trigger_mpd_update_best_effort(&record.mount_root);
+                self.publish_share_event(ShareEvent::mounted(
+                    share_id.clone(),
+                    report.negotiated_version.clone(),
+                    (self.now_fn)(),
+                ))
+                .await;
             }
             Err(e) => {
+                self.publish_share_event(ShareEvent::mount_failed(
+                    share_id.clone(),
+                    format!("{e}"),
+                    (self.now_fn)(),
+                ))
+                .await;
                 // Password refresh on auth-refusal (NETWORK-
                 // SOURCES-DESIGN.md §5.6.5): delete the vault
                 // entry so the next mount attempt re-prompts.
@@ -3201,12 +3507,28 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         };
         match &result {
             Ok(()) => {
+                // MPD queue safety BEFORE we tell MPD to walk the
+                // (now-vanished) tree. Volumio-evo lesson: without
+                // this the operator sees "No such song" storms +
+                // an unresponsive queue when a share drops mid-
+                // playback. Best-effort — a hung mpc does not
+                // block the unmount response.
+                trigger_mpd_stop_and_prune_best_effort(&record.mount_root);
                 self.set_share_state(
                     share_id,
                     MountState::Unmounted,
                     None,
                     None,
                 )
+                .await;
+                // Prune MPD's database rows under the vanished
+                // path so the Library projection does not surface
+                // dead entries until the next mount / restart.
+                trigger_mpd_update_best_effort(&record.mount_root);
+                self.publish_share_event(ShareEvent::unmounted(
+                    share_id.clone(),
+                    (self.now_fn)(),
+                ))
                 .await;
             }
             Err(e) => {
@@ -3216,6 +3538,12 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                     Some(format!("{e}")),
                     None,
                 )
+                .await;
+                self.publish_share_event(ShareEvent::unmount_failed(
+                    share_id.clone(),
+                    format!("{e}"),
+                    (self.now_fn)(),
+                ))
                 .await;
             }
         }
@@ -3789,6 +4117,33 @@ impl NetworkSharesRuntime {
                 })
                 .await?;
         }
+        // Announce the (initially-empty) share-events ring so
+        // subscribers can attach before the first lifecycle event
+        // and get a consistent seed on `current_state`. Snapshot
+        // the ring under its mutex to include any events the
+        // runtime buffered before attach (mount attempts started
+        // by the boot-sweep can complete before the announcer is
+        // wired if the framework's plugin-load ordering differs
+        // from the shares plugin's expectation).
+        let initial_events_envelope = {
+            let guard = self
+                .share_events_ring
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ShareEventsEnvelope {
+                events: guard.iter().cloned().collect(),
+                last_update_at: SystemTime::now(),
+            }
+        };
+        announcer
+            .announce(SubjectAnnouncement {
+                subject_type: SHARE_EVENTS_SUBJECT_TYPE.to_string(),
+                addressings: vec![share_events_singleton_addressing()],
+                claims: Vec::new(),
+                state: envelope_to_json(&initial_events_envelope),
+                announced_at: SystemTime::now(),
+            })
+            .await?;
 
         let mut slot = self.publisher.lock().expect(
             "NetworkSharesRuntime publisher slot mutex poisoned at attach",
@@ -3825,6 +4180,55 @@ impl NetworkSharesRuntime {
             "NetworkSharesRuntime publisher slot mutex poisoned at read",
         );
         slot.as_ref().map(|p| Arc::clone(&p.announcer))
+    }
+
+    /// Push a share-lifecycle event onto the bounded ring and
+    /// schedule a republish of the `network_share_events`
+    /// singleton. Best-effort: the ring push is synchronous
+    /// (nanoseconds); the republish is fire-and-forget so a slow
+    /// steward never stalls the caller.
+    ///
+    /// Async because it composes cleanly with the mount / unmount
+    /// call sites (already async) and lets a future test path
+    /// await the publish without introducing a second event
+    /// channel. The current body performs no `.await` beyond the
+    /// tokio spawn but retaining `async` keeps the seam open.
+    pub(crate) async fn publish_share_event(&self, event: ShareEvent) {
+        let snapshot: Vec<ShareEvent> = {
+            let mut guard = self.share_events_ring.lock().unwrap_or_else(|e| {
+                // Poison recovery: keep the ring semantically
+                // useful even if a prior push panicked; the
+                // events themselves are best-effort telemetry.
+                e.into_inner()
+            });
+            while guard.len() >= SHARE_EVENTS_RING_CAPACITY {
+                guard.pop_front();
+            }
+            guard.push_back(event);
+            guard.iter().cloned().collect()
+        };
+        let envelope = ShareEventsEnvelope {
+            events: snapshot,
+            last_update_at: SystemTime::now(),
+        };
+        let Some(announcer) = self.take_publisher() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let state = envelope_to_json(&envelope);
+            if let Err(e) = announcer
+                .update_state(share_events_singleton_addressing(), state)
+                .await
+            {
+                tracing::debug!(
+                    error = %e,
+                    "network_share_events republish failed"
+                );
+            }
+        });
     }
 
     fn schedule_republish_configured(

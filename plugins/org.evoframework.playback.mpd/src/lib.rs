@@ -117,6 +117,7 @@ mod library;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
+mod network_shares_sync;
 mod playback_supervisor;
 mod playlist;
 mod queue;
@@ -556,6 +557,13 @@ pub struct MpdPlaybackPlugin {
     /// dispatcher's per-shelf request_types route through
     /// [`shelves::ShelfBundle::dispatch_request`].
     shelves: Option<shelves::ShelfBundle>,
+    /// Background task that subscribes to the shares plugin's
+    /// `system_network_shares_configured` subject and upserts a
+    /// `SourceRecord` per mounted NAS/CIFS/NFS share into the
+    /// registry. `None` when subject-subscription plumbing is
+    /// unavailable (OOP transport pre-wire-surface) or before
+    /// first load. Stopped in `Plugin::unload`.
+    network_shares_sync: Option<network_shares_sync::SharesSyncHandle>,
 }
 
 /// Operator-selected MPD-protocol settings carried on the
@@ -679,6 +687,7 @@ impl MpdPlaybackPlugin {
             custodies_taken: 0,
             active_command_sender: Arc::new(tokio::sync::Mutex::new(None)),
             envelope_subscriber: None,
+            network_shares_sync: None,
             ambient_observer: None,
             asound_watcher: None,
             test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -2419,6 +2428,46 @@ impl Plugin for MpdPlaybackPlugin {
             .await;
             self.shelves = Some(shelves);
 
+            // Spawn the network-shares → source_registry sync so
+            // every share the operator has configured (mounted or
+            // not) becomes a first-class `SourceKind::NetworkNasSmb`
+            // / `NetworkNasNfs` record. Subject subscription needs
+            // subject_state_subscriber + subject_querier from the
+            // load context; when either is absent (OOP transport
+            // pre-wire-surface) the sync is skipped and mounted
+            // shares still browse+play via the shares plugin's
+            // own MPD-update hook (F1.1), just without source-
+            // aware library labelling.
+            match (
+                ctx.subject_state_subscriber.as_ref(),
+                ctx.subject_querier.as_ref(),
+                self.shelves.as_ref(),
+            ) {
+                (Some(sub), Some(q), Some(shelves)) => {
+                    self.network_shares_sync =
+                        Some(network_shares_sync::spawn_shares_sync(
+                            Arc::clone(sub),
+                            Arc::clone(q),
+                            shelves.registry.clone(),
+                        ));
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "network-shares source-registry sync spawned"
+                    );
+                }
+                (sub, q, _) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        subscriber_present = sub.is_some(),
+                        querier_present = q.is_some(),
+                        "network-shares source-registry sync NOT spawned; \
+                         subject substrate not populated (mounted shares \
+                         will still browse+play via the shares plugin's \
+                         MPD-update hook)"
+                    );
+                }
+            }
+
             self.loaded = true;
 
             tracing::info!(
@@ -2504,6 +2553,14 @@ impl Plugin for MpdPlaybackPlugin {
                 // supervisor before unload tears the custody
                 // down.
                 if let Some(handle) = self.envelope_subscriber.take() {
+                    handle.stop().await;
+                }
+                // Stop the network-shares source-registry sync.
+                // Detached tokio task; stop signals shutdown and
+                // awaits deterministic exit before we tear down
+                // the shelves (which owns the registry the sync
+                // upserts into).
+                if let Some(handle) = self.network_shares_sync.take() {
                     handle.stop().await;
                 }
                 // Stop the ambient now-playing observer.

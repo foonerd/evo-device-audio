@@ -207,10 +207,28 @@ impl Plugin for NetworkSharesPlugin {
                              continuing with vault-only store"
                         );
                     }
+                    tracing::info!(
+                        plugin = crate::PLUGIN_NAME,
+                        credential_store = "vault",
+                        "credential store bound: framework vault \
+                         (single-substrate path)"
+                    );
                     Arc::new(crate::runtime::VaultCredentialStore::new(
                         Arc::clone(vault),
                     ))
                 } else {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        credential_store = "file-fallback",
+                        credentials_dir = %ctx.credentials_dir.display(),
+                        "credential store bound: file fallback \
+                         (ctx.credential_vault=None). This is the pre-vault- \
+                         substrate path and should not fire on a current \
+                         steward — indicates the framework did not populate \
+                         the vault handle for this plugin. Operator secrets \
+                         end up on disk under credentials_dir, not in the \
+                         framework vault."
+                    );
                     Arc::new(crate::runtime::FileCredentialStore::new(
                         ctx.credentials_dir.clone(),
                     ))

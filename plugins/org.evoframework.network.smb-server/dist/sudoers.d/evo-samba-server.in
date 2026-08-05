@@ -25,6 +25,17 @@
 # 3. `EVO_SAMBA_SERVER_RESTART` — `systemctl restart smbd`.
 #    Fires on every successful apply where enabled=true.
 #
+# 4. `EVO_SAMBA_SERVER_HOSTNAME` — `hostnamectl set-hostname
+#    <name>`. Fires when the operator supplies `system_hostname`
+#    on `network.smb_server.apply`; the runtime pre-validates
+#    the name against RFC 1123 before invoking sudo so the
+#    argv wildcard only ever carries operator-visible clean
+#    strings. avahi-daemon subscribes to hostnamed's D-Bus
+#    change signal and re-advertises mDNS automatically on
+#    standard Debian; smb.conf re-renders on the same apply,
+#    so a single UI gesture updates OS hostname + mDNS + SMB
+#    NetBIOS advertisement together.
+#
 # Path discipline: the testparm, smbpasswd, systemctl paths
 # MUST match the runtime builder's defaults
 # (`with_testparm_program` / `with_smbpasswd_program` /
@@ -62,10 +73,15 @@ Cmnd_Alias EVO_SAMBA_SERVER_USERS = \
 Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
     /usr/bin/systemctl restart smbd
 
+Cmnd_Alias EVO_SAMBA_SERVER_HOSTNAME = \
+    /usr/bin/hostnamectl set-hostname *
+
 Defaults!EVO_SAMBA_SERVER_CONFIG !pam_session, !syslog
 Defaults!EVO_SAMBA_SERVER_USERS !pam_session, !syslog
 Defaults!EVO_SAMBA_SERVER_RESTART !pam_session, !syslog
+Defaults!EVO_SAMBA_SERVER_HOSTNAME !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_CONFIG
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_USERS
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_RESTART
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_HOSTNAME
