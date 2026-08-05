@@ -95,6 +95,13 @@ pub const VERB_SET_SLEEP_TIMEOUT: &str = "set_sleep_timeout";
 pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
     "set_sleep_inhibit_while_playing";
 
+/// Verb name — read the complete persisted operator-visible state
+/// (display rotation, touch triple, brightness, sleep, inhibit-
+/// while-playing, kiosk enabled). Companion to the `set_*` surface
+/// so the paired-browser Display & Touch panel opens showing the
+/// device's real state on mount instead of a stale browser cache.
+pub const VERB_GET_DISPLAY_STATE: &str = "get_display_state";
+
 /// Trigger file the plugin touches when the operator asks for
 /// the wizard from a remote browser. Kiosk-browser polls this
 /// file's mtime and dispatches an in-page CustomEvent on
@@ -177,6 +184,7 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_BRIGHTNESS.to_string(),
                         VERB_SET_SLEEP_TIMEOUT.to_string(),
                         VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING.to_string(),
+                        VERB_GET_DISPLAY_STATE.to_string(),
                     ],
                     accepts_custody: false,
                     flags: Default::default(),
@@ -448,6 +456,7 @@ impl Respondent for SystemKioskPlugin {
                 VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING => {
                     handle_set_sleep_inhibit_while_playing(req)
                 }
+                VERB_GET_DISPLAY_STATE => handle_get_display_state(req),
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
                 ))),
@@ -730,6 +739,53 @@ fn handle_set_sleep_inhibit_while_playing(
     let body = serde_json::json!({
         "ok": true,
         "sleep_inhibit_while_playing": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+// ------------------------------ get_display_state ---------------------
+
+fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
+    // Read verb, no payload accepted (empty object per the UI-team
+    // contract). Anything non-empty is refused so a future writer
+    // adding query params cannot silently degrade to an unfiltered
+    // read.
+    if !req.payload.is_empty() {
+        let parsed: serde_json::Value = serde_json::from_slice(&req.payload)
+            .map_err(|e| {
+                PluginError::Permanent(format!(
+                    "{VERB_GET_DISPLAY_STATE}: payload JSON invalid: {e}"
+                ))
+            })?;
+        if !matches!(&parsed, serde_json::Value::Object(m) if m.is_empty()) {
+            return Err(PluginError::Permanent(format!(
+                "{VERB_GET_DISPLAY_STATE}: payload must be an empty object; got {parsed}"
+            )));
+        }
+    }
+
+    // Compose the full state — each field falls back to its
+    // apply-time default when the overlay is absent, so a paired
+    // browser mounting on a fresh boot with no operator changes
+    // yet made sees the system's actual defaults (see
+    // evo_kiosk_config::read_display_state for the fallback ladder).
+    let state = evo_kiosk_config::read_display_state();
+    let body = serde_json::json!({
+        "ok": true,
+        "display_rotation": state.display_rotation,
+        "touch": {
+            "rotation": state.touch.rotation,
+            "hflip": state.touch.hflip,
+            "vflip": state.touch.vflip,
+        },
+        "brightness_percent": state.brightness_percent,
+        "sleep_timeout_seconds": state.sleep_timeout_seconds,
+        "sleep_inhibit_while_playing": state.sleep_inhibit_while_playing,
+        "enabled": state.enabled,
     });
     Ok(Response::for_request(
         req,
