@@ -638,9 +638,19 @@ pub(crate) fn render_now_playing_state(
             "artist":          song.artist,
             "album":           song.album,
             "mpd_path":        song.file_path,
-            "artwork_url":     evo_device_audio_shared::artwork_target_url_sized(
-                "mpd-path",
+            // Same track-aware artwork helper the queue projection
+            // uses — feeds (artist, album) into the cascade so an
+            // HTTP-streamed track (DLNA-resolved http://…/file.mp3)
+            // with tags attached via `addtagid` gets its cover
+            // resolved by the same artwork.online / artwork.local
+            // path a local-FS track hits. Previously used
+            // `artwork_target_url_sized("mpd-path", …)` which keyed
+            // only on the URL and missed the artist+album cover
+            // cascade for DLNA-resolved streams.
+            "artwork_url":     evo_device_audio_shared::artwork_target_url_for_track_sized(
                 &song.file_path,
+                song.artist.as_deref(),
+                song.album.as_deref(),
                 // Now-playing is the hero surface; render at
                 // full source resolution rather than the
                 // list-scale small variant.
