@@ -844,7 +844,14 @@ pub enum MountError {
     /// [`MountError::AuthenticationRefused`] to avoid the
     /// operator-confusing mislabelling ("dialect probe exhausted"
     /// when the credential was actually wrong).
-    #[error("CIFS dialect probe exhausted; attempted: {attempted:?}")]
+    ///
+    /// `last_error` is part of the Display string so the operator
+    /// UI never shows a bare ladder list without the underlying
+    /// helper reason (journal-classified stderr when available).
+    #[error(
+        "CIFS dialect probe exhausted; attempted: {attempted:?}; \
+         last_error: {last_error}"
+    )]
     DialectProbeExhausted {
         /// The dialects that were tried, in order.
         attempted: Vec<String>,
@@ -1676,9 +1683,12 @@ pub fn is_mount_directory_missing(stderr: &str) -> bool {
 /// The canonical CIFS auth-refusal signals:
 /// - Exit 13 (EACCES) — mount.cifs returns errno 13 when the
 ///   server refused the credential at tree-connect.
-/// - `NT_STATUS_LOGON_FAILURE` — the Samba client's stderr
-///   render of the wire-level SMB status when the username /
-///   password / domain triplet is refused.
+/// - `mount error(13)` — systemd-mount / mount.cifs often wrap
+///   the errno in stderr while the process exit code is 32.
+/// - `NT_STATUS_LOGON_FAILURE` / `NT_STATUS_ACCESS_DENIED` —
+///   Samba client's stderr render of the wire-level SMB status
+///   when the username / password / domain triplet is refused
+///   or the identity has no share permission.
 /// - `Permission denied` — the human-readable rendering
 ///   mount.cifs emits alongside the exit code.
 pub fn is_cifs_auth_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
@@ -1686,12 +1696,86 @@ pub fn is_cifs_auth_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
         return true;
     }
     let s = stderr.to_ascii_uppercase();
-    s.contains("NT_STATUS_LOGON_FAILURE")
+    s.contains("MOUNT ERROR(13)")
+        || s.contains("NT_STATUS_LOGON_FAILURE")
+        || s.contains("NT_STATUS_ACCESS_DENIED")
         || s.contains("PERMISSION DENIED")
         || s.contains("STATUS_ACCOUNT_DISABLED")
         || s.contains("STATUS_LOGON_FAILURE")
         || s.contains("STATUS_ACCOUNT_LOCKED_OUT")
         || s.contains("STATUS_PASSWORD_EXPIRED")
+}
+
+/// Pure check: does `proc_mounts` contents list `mount_root` as
+/// an active mount target (column 2 of `/proc/mounts`)?
+///
+/// Used by production (host-namespace truth via `/proc/1/mounts`)
+/// and by unit tests that supply fixture contents.
+pub fn is_path_mounted_in_proc_mounts(
+    proc_mounts: &str,
+    mount_root: &Path,
+) -> bool {
+    let target = mount_root.to_string_lossy();
+    for line in proc_mounts.lines() {
+        let mut cols = line.split_whitespace();
+        let _source = match cols.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let mp = match cols.next() {
+            Some(m) => m,
+            None => continue,
+        };
+        if mp == target.as_ref() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse the CIFS `vers=` option for `mount_root` from
+/// `/proc/mounts` contents. Returns `None` when the target is
+/// absent or is not a `cifs`/`smb3` fstype.
+pub fn parse_cifs_version_from_proc_mounts(
+    proc_mounts: &str,
+    mount_root: &Path,
+) -> Option<String> {
+    let target = mount_root.to_string_lossy();
+    for line in proc_mounts.lines() {
+        let mut cols = line.split_whitespace();
+        let _source = cols.next()?;
+        let mp = cols.next()?;
+        let fstype = cols.next()?;
+        let opts = cols.next()?;
+        if mp != target.as_ref() {
+            continue;
+        }
+        if !matches!(fstype, "cifs" | "smb3") {
+            continue;
+        }
+        for opt in opts.split(',') {
+            if let Some(v) = opt.strip_prefix("vers=") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read host-namespace mount table. Prefer `/proc/1/mounts`
+/// (PID 1 = host mount namespace where `systemd-mount` lands
+/// shares per NETWORK-SOURCES-DESIGN.md §5.6.1); fall back to
+/// `/proc/mounts` when `/proc/1/mounts` is unreadable.
+pub fn read_host_proc_mounts() -> String {
+    fs::read_to_string("/proc/1/mounts")
+        .or_else(|_| fs::read_to_string("/proc/mounts"))
+        .unwrap_or_default()
+}
+
+/// Production mount-point probe: true when `mount_root` is an
+/// active mount target in the host mount table.
+pub fn is_path_mounted(mount_root: &Path) -> bool {
+    is_path_mounted_in_proc_mounts(&read_host_proc_mounts(), mount_root)
 }
 
 /// Compose the body of a `mount.cifs` credentials file. Contains
@@ -2284,6 +2368,12 @@ pub struct NetworkSharesRuntime {
     share_states: Arc<Mutex<HashMap<ShareId, ShareStateEntry>>>,
     publisher: StdMutex<Option<SharesPublisher>>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Mount-point probe. Production uses [`is_path_mounted`]
+    /// (host `/proc/1/mounts`); tests inject a fixture so unit
+    /// suites never touch the real mount table. Decides whether
+    /// `mount_share` adopts an already-active host mount instead
+    /// of re-running the dialect probe.
+    mount_point_check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
     /// Deduplication map for in-flight credential prompts. Keyed
     /// on `credential_key` so multiple concurrent mount / add
     /// attempts against the same missing credential collapse to
@@ -2411,6 +2501,7 @@ impl NetworkSharesRuntime {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
+            mount_point_check: Arc::new(|p: &Path| is_path_mounted(p)),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -2447,6 +2538,7 @@ impl NetworkSharesRuntime {
             smbclient_program: None,
             smbclient_timeout_ms: None,
             now_fn: None,
+            mount_point_check: None,
         })
     }
 
@@ -2477,6 +2569,10 @@ impl NetworkSharesRuntime {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
+            // Test fixtures default to "never mounted" so unit
+            // suites cannot accidentally adopt a host mount from
+            // the machine running `cargo test`.
+            mount_point_check: Arc::new(|_: &Path| false),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -2933,6 +3029,16 @@ pub struct NetworkSharesRuntimeBuilder {
     smbclient_program: Option<String>,
     smbclient_timeout_ms: Option<u64>,
     now_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    // Same shape as the runtime struct's `mount_point_check`
+    // field: `Arc<dyn Fn(&Path) -> bool + Send + Sync>`. The
+    // `Option<...>` wrapper crosses clippy's type_complexity
+    // score threshold here (adding `Option` adds enough to
+    // trip the check even though the same inner type is used
+    // uncomplained-of elsewhere in the file). Keeping the
+    // shape consistent with the runtime struct beats
+    // factoring a one-off type alias.
+    #[allow(clippy::type_complexity)]
+    mount_point_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
 }
 
 impl NetworkSharesRuntimeBuilder {
@@ -3041,6 +3147,18 @@ impl NetworkSharesRuntimeBuilder {
         self
     }
 
+    /// Override the mount-point probe (test path). Production
+    /// defaults to [`is_path_mounted`]. Tests that exercise the
+    /// already-mounted adopt path inject a closure returning
+    /// true for the fixture mount root.
+    pub fn with_mount_point_check(
+        mut self,
+        check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    ) -> Self {
+        self.mount_point_check = Some(check);
+        self
+    }
+
     /// Wrap mount + umount with `sudo -n` so the plugin can
     /// invoke the mount helper as root even when running under a
     /// non-root service identity. Sets `mount_program = "sudo"`
@@ -3133,6 +3251,21 @@ impl NetworkSharesRuntimeBuilder {
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
             now_fn,
+            // Production default = host-table probe (lib.rs uses
+            // builder()). Under `cfg(test)` default to never-
+            // mounted so the crate's unit suite stays hermetic on
+            // machines with a live NAS mount; adopt-path tests
+            // inject `with_mount_point_check` explicitly.
+            mount_point_check: self.mount_point_check.unwrap_or_else(|| {
+                #[cfg(test)]
+                {
+                    Arc::new(|_: &Path| false)
+                }
+                #[cfg(not(test))]
+                {
+                    Arc::new(|p: &Path| is_path_mounted(p))
+                }
+            }),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -3365,6 +3498,44 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 }
             })?
         };
+
+        // OS-truth short-circuit. `systemd-mount` lands shares in
+        // the host namespace; those mounts survive steward /
+        // plugin restart. Re-probing an already-active mount
+        // walks the dialect ladder, clears persisted_vers, and
+        // publishes Failed while the mount is healthy — the
+        // exact "Audio" tile bug. Adopt before credential prompt
+        // or mkdir so a live mount never triggers a password
+        // prompt or a destructive remount attempt.
+        if (self.mount_point_check)(&record.mount_root) {
+            let start_ms = (self.now_fn)();
+            let was_mounted = {
+                let g = self.share_states.lock().await;
+                matches!(
+                    g.get(share_id).map(|e| &e.state),
+                    Some(MountState::Mounted)
+                )
+            };
+            let report =
+                self.adopt_existing_os_mount(&record, start_ms).await?;
+            self.set_share_state(
+                share_id,
+                MountState::Mounted,
+                None,
+                report.negotiated_version.clone(),
+            )
+            .await;
+            if !was_mounted {
+                trigger_mpd_update_best_effort(&record.mount_root);
+                self.publish_share_event(ShareEvent::mounted(
+                    share_id.clone(),
+                    report.negotiated_version.clone(),
+                    (self.now_fn)(),
+                ))
+                .await;
+            }
+            return Ok(report);
+        }
 
         // Prompt-on-mount: for UserPassword shares whose
         // credential_key is not in the vault, raise a password
@@ -3673,6 +3844,21 @@ impl NetworkSharesRuntime {
         start_ms: u64,
         creds_path: Option<&Path>,
     ) -> Result<MountReport, MountError> {
+        // Credentials invariant: UserPassword mounts MUST carry a
+        // staged credentials file. Falling through without one
+        // makes mount.cifs attempt anonymous/guest auth and
+        // mislabels the resulting ACCESS_DENIED as dialect
+        // exhaustion. Fail closed before any helper invocation.
+        if let Credentials::UserPassword { credential_key, .. } =
+            &record.credentials
+        {
+            if creds_path.is_none() {
+                return Err(MountError::CredentialMissing {
+                    key: credential_key.clone(),
+                });
+            }
+        }
+
         // Determine which dialect(s) to try.
         let ladder: Vec<&str> =
             if let Some(persisted) = record.persisted_vers.as_deref() {
@@ -3685,60 +3871,30 @@ impl NetworkSharesRuntime {
             };
 
         let mut attempted: Vec<String> = Vec::new();
-        let mut last_stderr = String::new();
+        // Operator-facing last error must be the classified
+        // (journal) stderr when available — not systemd-mount's
+        // opaque "Job failed" text.
+        let mut last_error = String::new();
         for dialect in &ladder {
-            attempted.push(dialect.to_string());
-            let args = self.wrap_mount_args(build_cifs_mount_args(
-                record, dialect, creds_path,
-            ));
-            let output = self
-                .executor
-                .run(&self.mount_program, &args, self.mount_timeout_ms)
-                .await?;
-            if output.exit_code == Some(0) {
-                return self
-                    .finalise_mount_success(record, dialect, start_ms)
-                    .await;
-            }
-            // Fetch the transient .mount unit's journal for the
-            // real mount helper stderr, then classify. See
-            // `fetch_mount_unit_stderr` — systemd-mount itself
-            // returns opaque "Job failed" text.
-            let unit_stderr =
-                self.fetch_mount_unit_stderr(&record.mount_root).await;
-            last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let classify_stderr = if unit_stderr.is_empty() {
-                &last_stderr
-            } else {
-                &unit_stderr
-            };
-            // Directory-missing short-circuits: the mount
-            // never reaches the wire, so every dialect will
-            // report the same ENOENT. Report as
-            // MountDirectoryMissing so the operator UI names
-            // the real cause instead of a protocol diagnosis.
-            if is_mount_directory_missing(classify_stderr) {
-                return Err(MountError::MountDirectoryMissing {
-                    id: record.share_id.clone(),
-                    mount_root: record.mount_root.clone(),
-                    reason: classify_stderr.clone(),
-                });
-            }
-            // Auth-refusal short-circuits: no point trying more
-            // dialects when the credential itself is being
-            // refused. The operator UI renders "check
-            // credentials", not "unsupported protocol version".
-            if is_cifs_auth_refusal(output.exit_code, classify_stderr) {
-                return Err(MountError::AuthenticationRefused {
-                    id: record.share_id.clone(),
-                    exit_code: output.exit_code,
-                    stderr: classify_stderr.clone(),
-                });
+            if let Some(report) = self
+                .attempt_cifs_dialect_tracked(
+                    record,
+                    dialect,
+                    creds_path,
+                    start_ms,
+                    &mut attempted,
+                    &mut last_error,
+                )
+                .await?
+            {
+                return Ok(report);
             }
         }
 
         // Fast-path exhausted with a persisted dialect that no
         // longer works — clear it and rerun the full ladder.
+        // Do NOT clear persisted_vers when the OS mount is still
+        // active (adopt path returns above before we get here).
         if record.persisted_vers.is_some() {
             self.clear_persisted_vers(&record.share_id).await?;
             for dialect in CIFS_VERS_PROBE_LADDER {
@@ -3746,42 +3902,90 @@ impl NetworkSharesRuntime {
                 if Some(*dialect) == record.persisted_vers.as_deref() {
                     continue;
                 }
-                attempted.push(dialect.to_string());
-                let args = self.wrap_mount_args(build_cifs_mount_args(
-                    record, dialect, creds_path,
-                ));
-                let output = self
-                    .executor
-                    .run(&self.mount_program, &args, self.mount_timeout_ms)
-                    .await?;
-                if output.exit_code == Some(0) {
-                    return self
-                        .finalise_mount_success(record, dialect, start_ms)
-                        .await;
-                }
-                let unit_stderr =
-                    self.fetch_mount_unit_stderr(&record.mount_root).await;
-                last_stderr =
-                    String::from_utf8_lossy(&output.stderr).into_owned();
-                let classify_stderr = if unit_stderr.is_empty() {
-                    &last_stderr
-                } else {
-                    &unit_stderr
-                };
-                if is_cifs_auth_refusal(output.exit_code, classify_stderr) {
-                    return Err(MountError::AuthenticationRefused {
-                        id: record.share_id.clone(),
-                        exit_code: output.exit_code,
-                        stderr: classify_stderr.clone(),
-                    });
+                if let Some(report) = self
+                    .attempt_cifs_dialect_tracked(
+                        record,
+                        dialect,
+                        creds_path,
+                        start_ms,
+                        &mut attempted,
+                        &mut last_error,
+                    )
+                    .await?
+                {
+                    return Ok(report);
                 }
             }
         }
 
         Err(MountError::DialectProbeExhausted {
             attempted,
-            last_error: last_stderr,
+            last_error,
         })
+    }
+
+    /// One CIFS dialect attempt. Returns `Ok(Some(report))` on
+    /// success or OS-mount adopt, `Ok(None)` when the attempt
+    /// failed with a non-short-circuit reason (caller continues
+    /// the ladder), or `Err` for short-circuit failures
+    /// (auth-refusal / directory-missing).
+    async fn attempt_cifs_dialect_tracked(
+        &self,
+        record: &ShareRecord,
+        dialect: &str,
+        creds_path: Option<&Path>,
+        start_ms: u64,
+        attempted: &mut Vec<String>,
+        last_error: &mut String,
+    ) -> Result<Option<MountReport>, MountError> {
+        attempted.push(dialect.to_string());
+        let args = self.wrap_mount_args(build_cifs_mount_args(
+            record, dialect, creds_path,
+        ));
+        let output = self
+            .executor
+            .run(&self.mount_program, &args, self.mount_timeout_ms)
+            .await?;
+        if output.exit_code == Some(0) {
+            return Ok(Some(
+                self.finalise_mount_success(record, dialect, start_ms)
+                    .await?,
+            ));
+        }
+        // A concurrent / prior host mount may already be active
+        // (systemd-mount survives steward restart). Prefer OS
+        // truth over continuing the ladder — never clear
+        // persisted_vers or publish Failed over a live mount.
+        if (self.mount_point_check)(&record.mount_root) {
+            return Ok(Some(
+                self.adopt_existing_os_mount(record, start_ms).await?,
+            ));
+        }
+        let unit_stderr =
+            self.fetch_mount_unit_stderr(&record.mount_root).await;
+        let helper_stderr =
+            String::from_utf8_lossy(&output.stderr).into_owned();
+        let classify_stderr = if unit_stderr.is_empty() {
+            helper_stderr
+        } else {
+            unit_stderr
+        };
+        *last_error = classify_stderr.clone();
+        if is_mount_directory_missing(&classify_stderr) {
+            return Err(MountError::MountDirectoryMissing {
+                id: record.share_id.clone(),
+                mount_root: record.mount_root.clone(),
+                reason: classify_stderr,
+            });
+        }
+        if is_cifs_auth_refusal(output.exit_code, &classify_stderr) {
+            return Err(MountError::AuthenticationRefused {
+                id: record.share_id.clone(),
+                exit_code: output.exit_code,
+                stderr: classify_stderr,
+            });
+        }
+        Ok(None)
     }
 
     /// Read the transient systemd .mount unit's recent journal
@@ -3970,6 +4174,117 @@ impl NetworkSharesRuntime {
         })
     }
 
+    /// Adopt a host-namespace mount that is already active for
+    /// `record.mount_root` (typically a `systemd-mount` unit that
+    /// survived steward restart). Restores `persisted_vers` from
+    /// the live mount options when the on-disk record lost it
+    /// (e.g. a prior false-Failed ladder cleared it).
+    ///
+    /// Does not invoke the mount helper.
+    async fn adopt_existing_os_mount(
+        &self,
+        record: &ShareRecord,
+        start_ms: u64,
+    ) -> Result<MountReport, MountError> {
+        let proc = read_host_proc_mounts();
+        let vers = match record.fstype {
+            FsType::Cifs => {
+                parse_cifs_version_from_proc_mounts(&proc, &record.mount_root)
+            }
+            FsType::Nfs => {
+                parse_nfs_version_from_proc_mounts(&proc, &record.mount_root)
+            }
+        }
+        .or_else(|| record.persisted_vers.clone());
+
+        let now_ms = (self.now_fn)();
+        if record.fstype == FsType::Cifs {
+            if let Some(ref v) = vers {
+                let mut g = self.inner.lock().await;
+                if let Some(r) = g.state.find_mut(&record.share_id) {
+                    if r.persisted_vers.as_deref() != Some(v.as_str()) {
+                        r.persisted_vers = Some(v.clone());
+                    }
+                    r.last_mounted_at_ms = Some(now_ms as i64);
+                }
+                if let Err(e) = g.state.save(&g.path) {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        share_id = %record.share_id,
+                        error = %e,
+                        "adopt_existing_os_mount: persisted_vers save failed; \
+                         subject state will still report Mounted"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            share_id = %record.share_id,
+            mount_root = %record.mount_root.display(),
+            negotiated_vers = ?vers,
+            "adopted existing host-namespace mount as Mounted"
+        );
+
+        Ok(MountReport {
+            share_id: record.share_id.clone(),
+            mount_root: record.mount_root.clone(),
+            negotiated_version: vers,
+            elapsed_ms: now_ms.saturating_sub(start_ms),
+        })
+    }
+
+    /// Walk configured shares and adopt any whose mount_root is
+    /// already active in the host mount table. Upward-only:
+    /// never marks a share Unmounted/Failed based on a missing
+    /// OS mount (that needs reachability gating — follow-on).
+    ///
+    /// Safe to call before the subject publisher is attached
+    /// (updates the in-memory state map so the initial announce
+    /// carries OS truth).
+    pub async fn reconcile_os_mount_states(&self) {
+        let records: Vec<ShareRecord> = {
+            let g = self.inner.lock().await;
+            g.state.shares.clone()
+        };
+        for record in records {
+            if !(self.mount_point_check)(&record.mount_root) {
+                continue;
+            }
+            let already_mounted = {
+                let g = self.share_states.lock().await;
+                matches!(
+                    g.get(&record.share_id).map(|e| &e.state),
+                    Some(MountState::Mounted)
+                )
+            };
+            if already_mounted {
+                continue;
+            }
+            let start_ms = (self.now_fn)();
+            match self.adopt_existing_os_mount(&record, start_ms).await {
+                Ok(report) => {
+                    self.set_share_state(
+                        &record.share_id,
+                        MountState::Mounted,
+                        None,
+                        report.negotiated_version,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = crate::PLUGIN_NAME,
+                        share_id = %record.share_id,
+                        error = %e,
+                        "reconcile_os_mount_states: adopt failed"
+                    );
+                }
+            }
+        }
+    }
+
     async fn clear_persisted_vers(
         &self,
         share_id: &ShareId,
@@ -4081,6 +4396,11 @@ impl NetworkSharesRuntime {
         &self,
         announcer: Arc<dyn SubjectAnnouncer>,
     ) -> Result<(), evo_plugin_sdk::contract::ReportError> {
+        // Adopt host-namespace mounts that survived steward
+        // restart BEFORE the initial subject announce so the UI
+        // never flashes Failed/Unmounted over a live mount.
+        self.reconcile_os_mount_states().await;
+
         let configured_envelope = self.compose_configured_envelope().await;
         let discovered_envelope = self.compose_discovered_envelope().await;
         let per_share_envelopes =
@@ -4475,12 +4795,47 @@ impl NetworkSharesRuntime {
     /// cleaner. Publishes per-share state transitions via the
     /// Ship 2f subject substrate.
     pub async fn boot_mount_all(&self) -> BootMountReport {
+        // Reconcile first so already-active host mounts become
+        // Mounted before we spend probe-ladder budget on them.
+        self.reconcile_os_mount_states().await;
+
         let ids: Vec<ShareId> = {
             let g = self.inner.lock().await;
             g.state.shares.iter().map(|r| r.share_id.clone()).collect()
         };
         let mut outcomes = Vec::with_capacity(ids.len());
         for share_id in ids {
+            // Skip shares reconcile (or a prior boot attempt)
+            // already marked Mounted — mount_share would also
+            // short-circuit, but avoiding the call keeps the
+            // boot report honest about "attempted".
+            let already_mounted = {
+                let g = self.share_states.lock().await;
+                matches!(
+                    g.get(&share_id).map(|e| &e.state),
+                    Some(MountState::Mounted)
+                )
+            };
+            if already_mounted {
+                let report = {
+                    let g = self.inner.lock().await;
+                    let record = g.state.find(&share_id);
+                    MountReport {
+                        share_id: share_id.clone(),
+                        mount_root: record
+                            .map(|r| r.mount_root.clone())
+                            .unwrap_or_default(),
+                        negotiated_version: record
+                            .and_then(|r| r.persisted_vers.clone()),
+                        elapsed_ms: 0,
+                    }
+                };
+                outcomes.push(BootMountOutcome {
+                    share_id,
+                    result: Ok(report),
+                });
+                continue;
+            }
             let result = self.mount_share(&share_id).await;
             outcomes.push(BootMountOutcome { share_id, result });
         }
@@ -4492,6 +4847,12 @@ impl NetworkSharesRuntime {
     /// remount task and directly by tests to exercise the retry
     /// path without spawning a task.
     pub async fn remount_retry_pass(&self) -> Vec<BootMountOutcome> {
+        // Adopt any host mounts that came back (or survived)
+        // before selecting Failed/Unmounted candidates — a share
+        // whose OS mount is live must not stay in the Failed
+        // retry set.
+        self.reconcile_os_mount_states().await;
+
         let candidates: Vec<ShareId> = {
             let g = self.share_states.lock().await;
             g.iter()
@@ -5534,8 +5895,17 @@ mod tests {
         ));
         assert!(is_cifs_auth_refusal(Some(32), "Permission denied"));
         assert!(is_cifs_auth_refusal(
+            Some(32),
+            "mount error(13): NT_STATUS_ACCESS_DENIED"
+        ));
+        assert!(is_cifs_auth_refusal(
             Some(1),
             "Status: STATUS_ACCOUNT_LOCKED_OUT"
+        ));
+        // systemd-mount exit 32 + errno in stderr body only
+        assert!(is_cifs_auth_refusal(
+            Some(32),
+            "Job failed.\nmount error(13): Permission denied"
         ));
     }
 
@@ -5546,6 +5916,47 @@ mod tests {
             "cifs: bad option 'vers=1.0'"
         ));
         assert!(!is_cifs_auth_refusal(Some(2), "No such device"));
+        // Opaque systemd-mount text alone is NOT auth refusal —
+        // classification needs journal fragments or exit 13.
+        assert!(!is_cifs_auth_refusal(
+            Some(32),
+            "Job failed. See \"journalctl -xe\" for details."
+        ));
+    }
+
+    #[test]
+    fn is_path_mounted_in_proc_mounts_matches_target_column() {
+        let proc = "\
+//192.0.2.1/share /var/lib/evo/music/NAS/Audio cifs ro,vers=2.0 0 0\n\
+tmpfs /tmp tmpfs rw 0 0\n";
+        assert!(is_path_mounted_in_proc_mounts(
+            proc,
+            Path::new("/var/lib/evo/music/NAS/Audio")
+        ));
+        assert!(!is_path_mounted_in_proc_mounts(
+            proc,
+            Path::new("/var/lib/evo/music/NAS/Other")
+        ));
+    }
+
+    #[test]
+    fn parse_cifs_version_from_proc_mounts_reads_vers() {
+        let proc = "//h/p /var/lib/evo/music/NAS/Audio cifs ro,vers=2.0,cache=strict 0 0\n";
+        assert_eq!(
+            parse_cifs_version_from_proc_mounts(
+                proc,
+                Path::new("/var/lib/evo/music/NAS/Audio")
+            )
+            .as_deref(),
+            Some("2.0")
+        );
+        assert_eq!(
+            parse_cifs_version_from_proc_mounts(
+                proc,
+                Path::new("/var/lib/evo/music/NAS/Missing")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -5872,6 +6283,105 @@ mod tests {
             calls.len(),
             1,
             "auth-refusal must short-circuit before the second dialect",
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_cifs_access_denied_short_circuits_as_auth_refusal() {
+        // The live "Audio" failure mode: systemd-mount exit 32
+        // with NT_STATUS_ACCESS_DENIED in the journal/stderr —
+        // must NOT walk the ladder or surface DialectProbeExhausted.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_ACCESS_DENIED",
+        )]);
+        let store = Arc::new(FileCredentialStore::new(dir.clone()));
+        store.store_password("audio_key", b"wrong").await.unwrap();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .build();
+        let mut record = built_record("Audio", "192.0.2.30");
+        record.credentials = Credentials::UserPassword {
+            username: "testuser".to_string(),
+            credential_key: "audio_key".to_string(),
+            domain: Some("TESTGROUP".to_string()),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::AuthenticationRefused { .. } => {}
+            other => panic!("expected AuthenticationRefused, got {:?}", other),
+        }
+        assert_eq!(executor.calls.lock().await.len(), 1);
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("dialect probe exhausted"),
+            "auth refusal must not be mislabelled as dialect exhaustion: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_share_adopts_already_mounted_without_executor() {
+        // Host mount already active (survived steward restart):
+        // mount_share must report Mounted, invoke the executor
+        // zero times, and never prompt for credentials.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let mount_root = dir.join("NAS").join("Audio");
+        std::fs::create_dir_all(&mount_root).unwrap();
+        let root_for_check = mount_root.clone();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_point_check(Arc::new(move |p: &Path| {
+                p == root_for_check
+            }))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_200_000))
+            .build();
+        let mut record = built_record("Audio", "192.0.2.30");
+        record.mount_root = mount_root;
+        record.persisted_vers = Some("2.0".to_string());
+        record.credentials = Credentials::UserPassword {
+            username: "testuser".to_string(),
+            credential_key: "missing_key_must_not_be_fetched".to_string(),
+            domain: Some("TESTGROUP".to_string()),
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let report = rt.mount_share(&id).await.expect("adopt must succeed");
+        assert_eq!(report.negotiated_version.as_deref(), Some("2.0"));
+        assert!(
+            executor.calls.lock().await.is_empty(),
+            "already-mounted adopt must not invoke the mount helper"
+        );
+        let state = {
+            let g = rt.share_states.lock().await;
+            g.get(&id).map(|e| e.state).expect("state entry")
+        };
+        assert_eq!(state, MountState::Mounted);
+    }
+
+    #[tokio::test]
+    async fn dialect_probe_exhausted_display_includes_last_error() {
+        let err = MountError::DialectProbeExhausted {
+            attempted: vec!["2.0".into(), "2.1".into()],
+            last_error: "cifs: bad option 'vers=2.1'".into(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("dialect probe exhausted"));
+        assert!(
+            msg.contains("bad option"),
+            "Display must carry last_error for operator UI: {msg}"
         );
     }
 
@@ -7537,14 +8047,15 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     #[tokio::test]
     async fn mount_share_publishes_failed_on_probe_exhausted() {
         let dir = tempdir();
-        // Every mount attempt fails so the CIFS probe ladder
-        // exhausts and mount_share returns Err.
+        // Every mount attempt fails with a NON-auth signature so
+        // the ladder exhausts (auth-refusal would short-circuit
+        // to AuthenticationRefused after one attempt).
         let mut outputs = Vec::new();
         for _ in 0..CIFS_VERS_PROBE_LADDER.len() {
             outputs.push(CommandOutput {
                 exit_code: Some(32),
                 stdout: Vec::new(),
-                stderr: b"permission denied".to_vec(),
+                stderr: b"cifs: bad option".to_vec(),
             });
         }
         let executor = ScriptedExecutor::new(outputs);
