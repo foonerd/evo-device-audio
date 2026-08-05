@@ -1,7 +1,7 @@
 [plugin]
 name = "org.evoframework.metadata.local"
 # Keep in sync with this crate's Cargo.toml [package].version (PluginIdentity + packaging).
-version = "0.1.1"
+version = "0.1.2"
 contract = 1
 
 [target]

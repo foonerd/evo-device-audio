@@ -61,8 +61,8 @@ There is no per-request override in v1; a future request version could add one.
 |---------|--------|----------|-------------|
 | `v`     | number | yes      | Must be `1`. |
 | `target`| object | yes      | Subject selector (same shape as `artwork.resolve`). |
-| `target.scheme` | string | yes | `mpd-path` (MPD `file` relative to `[library] roots` or absolute) or `mpd-album` (see below). |
-| `target.value`  | string | yes | MPD `file` path, or for `mpd-album` the compound `artist|album` (only the first pipe splits; the album part may contain further pipes). |
+| `target.scheme` | string | yes | `mpd-path` (MPD `file` — library-relative path, absolute library path, **or** a stream URI present in the MPD queue) or `mpd-album` (see below). |
+| `target.value`  | string | yes | MPD `file` path / stream URI, or for `mpd-album` the compound `artist|album` (only the first pipe splits; the album part may contain further pipes). |
 
 **Example**
 
@@ -86,8 +86,16 @@ There is no per-request override in v1; a future request version could add one.
 | `status`  | string | `ok` · `not_found` · `unsupported` · `bad_request` |
 | `detail`  | string? | Human-readable reason (errors; optional on `ok`). |
 | `active_profile` | string? | On **`ok` only:** `"standard"` or `"extended"` — mirrors operator `[metadata] profile` after filtering. |
+| `provider_id` | string? | On **`ok` only:** which tag source satisfied the query — `"file_tags"` (on-disk lofty read), `"mpd_lsinfo"` (MPD library/DB fallback when lofty refuses the container), `"mpd_queue_tags"` (MPD queue via `playlistfind` — recovers `addtagid` tags for HTTP/DLNA streams). Consumers must ignore unknown values. |
 
 On non-`ok` outcomes, only `v`, `status`, and usually `detail` are set; all other fields are absent.
+
+### `mpd-path` resolution order
+
+1. Resolve `target.value` to an on-disk audio file under `[library] roots` and read tags with lofty (`provider_id = file_tags`).
+2. If lofty cannot decode the container, ask MPD's library tag cache via `lsinfo` (`provider_id = mpd_lsinfo`).
+3. If there is no on-disk file (HTTP/HTTPS stream URI, missing/unmounted path) **or** the file read failed entirely, ask MPD's **queue** via `playlistfind file "<uri>"` (`provider_id = mpd_queue_tags`). This is the path that surfaces DIDL tags previously attached with `addtagid`.
+4. Otherwise `not_found` — the URI is neither a readable library file nor present (with tags) in the current queue.
 
 ---
 
@@ -286,9 +294,11 @@ Known first-class `ItemKey` values are **not** duplicated in `extras`; they appe
 {
   "v": 1,
   "status": "not_found",
-  "detail": "audio file not found for mpd_path"
+  "detail": "audio file not found for mpd_path; queue tags unavailable: MPD connect localhost:6600: Connection refused"
 }
 ```
+
+A stream URI that **is** queued with `addtagid` tags returns `status: "ok"` with `provider_id: "mpd_queue_tags"` and the usual flat identity fields.
 
 ---
 

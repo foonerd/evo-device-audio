@@ -53,6 +53,11 @@ pub(crate) struct MetadataQueryResponse {
     /// (`[metadata] profile` in the plugin TOML).
     #[serde(skip_serializing_if = "Option::is_none")]
     active_profile: Option<String>,
+    /// Which tag source satisfied this query. Present on `ok` only.
+    /// `file_tags` · `mpd_lsinfo` · `mpd_queue_tags`. Additive; consumers
+    /// must ignore unknown values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
 
     // —— common flat fields (backward compatible) ——
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,6 +314,7 @@ impl MetadataQueryResponse {
             status,
             detail,
             active_profile: None,
+            provider_id: None,
             title: None,
             artist: None,
             album: None,
@@ -672,6 +678,7 @@ fn ok_response(
         status: ResponseStatus::Ok,
         detail: extra_detail,
         active_profile: None,
+        provider_id: None,
         title: opt_cow(tag.title()),
         artist: opt_cow(tag.artist()),
         album: opt_cow(tag.album()),
@@ -799,16 +806,18 @@ fn read_file_metadata(
             if let Some(t) = tagged.primary_tag().or_else(|| tagged.first_tag())
             {
                 let mut r = ok_response(t, props, None);
+                r.provider_id = Some("file_tags".to_string());
                 apply_metadata_profile(&mut r, profile);
                 return Ok(r);
             }
             let mut m = ok_from_properties_only(props);
+            m.provider_id = Some("file_tags".to_string());
             apply_metadata_profile(&mut m, profile);
             Ok(m)
         }
         Err(lofty_err) => {
             // Lofty could not decode the container. Fall back to
-            // MPD's tag cache when we know the MPD-relative form.
+            // MPD's library tag cache when we know the MPD-relative form.
             if let Some(mpd_path) = mpd_relative {
                 match read_from_mpd_lsinfo(mpd_path) {
                     Ok(mut r) => {
@@ -836,24 +845,22 @@ fn read_file_metadata(
     }
 }
 
-/// Read tags for one library-relative path from MPD's tag cache
-/// via the MPD text protocol (localhost:6600 by default, or
-/// `MPD_HOST` / `MPD_PORT` when the operator has overridden).
+/// Escape a value for an MPD quoted argument.
+fn mpd_escape_arg(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Open a short-lived MPD text-protocol session, run one command,
+/// return the first-wins field map. Synchronous by design:
+/// `query_metadata` is sync end-to-end; connect/read timeouts keep
+/// the unresponsive window bounded.
 ///
-/// Synchronous by design: metadata_local's `query_metadata` is
-/// synchronous end-to-end and this fallback is on a rare error
-/// path. A short connect + I/O timeout keeps the plugin
-/// unresponsive-window bounded; MPD's tag cache is always in-
-/// process and returns within milliseconds.
-///
-/// Wire form: `lsinfo "<path>"\n`. MPD's response is a
-/// newline-terminated key: value stream followed by `OK\n` (or
-/// `ACK\n` on failure). We parse Artist / Album / Title /
-/// AlbumArtist / Track / Time / Duration into a
-/// [`MetadataQueryResponse`].
-fn read_from_mpd_lsinfo(
-    mpd_relative: &str,
-) -> Result<MetadataQueryResponse, String> {
+/// Loopback only (`MPD_HOST`/`MPD_PORT`, default `localhost:6600`).
+/// This is not outbound WAN traffic — it talks to the local MPD
+/// the playback plugin already owns.
+fn mpd_run_command(
+    command_line: &str,
+) -> Result<HashMap<String, String>, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration as StdDuration;
@@ -869,8 +876,6 @@ fn read_from_mpd_lsinfo(
     // `TcpStream::connect_timeout` takes a `SocketAddr` (IP
     // literal), not a hostname — `"localhost:6600".parse()`
     // fails. Resolve `host:port` through `ToSocketAddrs` first.
-    // MPD is single-socket per install; the first resolved
-    // address is authoritative.
     let sock = addr
         .to_socket_addrs()
         .map_err(|e| format!("MPD resolve {addr}: {e}"))?
@@ -887,7 +892,6 @@ fn read_from_mpd_lsinfo(
         .set_write_timeout(Some(StdDuration::from_millis(500)))
         .map_err(|e| format!("MPD set write timeout: {e}"))?;
 
-    // Consume the MPD greeting line ("OK MPD <version>\n").
     let mut reader = BufReader::new(
         stream.try_clone().map_err(|e| format!("MPD clone: {e}"))?,
     );
@@ -899,19 +903,11 @@ fn read_from_mpd_lsinfo(
         return Err(format!("MPD greeting unexpected: {greeting:?}"));
     }
 
-    // Send lsinfo. Path is quoted for MPD's command parser;
-    // internal double-quotes are escaped by backslash.
-    let escaped = mpd_relative.replace('\\', "\\\\").replace('"', "\\\"");
-    let cmd = format!("lsinfo \"{escaped}\"\n");
     stream
-        .write_all(cmd.as_bytes())
+        .write_all(command_line.as_bytes())
         .map_err(|e| format!("MPD write: {e}"))?;
 
-    // Collect Artist / Album / Title / AlbumArtist / Track /
-    // Time into a HashMap. MPD's response ends on `OK\n` or
-    // `ACK\n`.
-    let mut fields: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut fields: HashMap<String, String> = HashMap::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -926,16 +922,23 @@ fn read_from_mpd_lsinfo(
             break;
         }
         if trimmed.starts_with("ACK") {
-            return Err(format!("MPD lsinfo refused: {trimmed}"));
+            return Err(format!("MPD refused: {trimmed}"));
         }
         if let Some((k, v)) = trimmed.split_once(": ") {
-            // MPD may repeat tag keys (e.g. multiple Artist).
-            // First-wins matches the operator UI conventions;
-            // additional values collapse.
+            // First-wins for repeated tags (e.g. multiple Artist).
             fields.entry(k.to_string()).or_insert_with(|| v.to_string());
         }
     }
+    Ok(fields)
+}
 
+/// Map an MPD field bag into a minimal ok response. Errors when
+/// no identity tags are present.
+fn response_from_mpd_fields(
+    fields: &HashMap<String, String>,
+    context: &str,
+    provider_id: &str,
+) -> Result<MetadataQueryResponse, String> {
     let artist = fields.get("Artist").cloned();
     let album = fields.get("Album").cloned();
     let title = fields.get("Title").cloned();
@@ -956,13 +959,12 @@ fn read_from_mpd_lsinfo(
         });
 
     if artist.is_none() && album.is_none() && title.is_none() {
-        return Err(format!(
-            "MPD lsinfo returned no tags for path {mpd_relative:?}"
-        ));
+        return Err(format!("MPD {context} returned no tags"));
     }
 
     let mut r = MetadataQueryResponse::v1_error(ResponseStatus::Ok, None);
     r.status = ResponseStatus::Ok;
+    r.provider_id = Some(provider_id.to_string());
     r.title = title;
     r.artist = artist;
     r.album = album;
@@ -970,6 +972,43 @@ fn read_from_mpd_lsinfo(
     r.track = track;
     r.duration_ms = duration_ms;
     Ok(r)
+}
+
+/// Read tags for one library-relative path from MPD's **library**
+/// tag cache via `lsinfo`. Used when lofty refuses a local
+/// container. Does **not** see `addtagid` tags (those are
+/// queue-scoped — use [`read_from_mpd_playlistfind`]).
+///
+/// Wire form: `lsinfo "<path>"\n`.
+fn read_from_mpd_lsinfo(
+    mpd_relative: &str,
+) -> Result<MetadataQueryResponse, String> {
+    let escaped = mpd_escape_arg(mpd_relative);
+    let fields = mpd_run_command(&format!("lsinfo \"{escaped}\"\n"))?;
+    response_from_mpd_fields(
+        &fields,
+        &format!("lsinfo for {mpd_relative:?}"),
+        "mpd_lsinfo",
+    )
+}
+
+/// Read tags for a URI currently in MPD's **queue** via
+/// `playlistfind file`. This is the path that recovers DIDL /
+/// `addtagid` tags for HTTP/DLNA streams that have no on-disk
+/// audio file — `lsinfo` cannot see those tags.
+///
+/// Wire form: `playlistfind file "<uri>"\n`.
+fn read_from_mpd_playlistfind(
+    uri: &str,
+) -> Result<MetadataQueryResponse, String> {
+    let escaped = mpd_escape_arg(uri);
+    let fields =
+        mpd_run_command(&format!("playlistfind file \"{escaped}\"\n"))?;
+    response_from_mpd_fields(
+        &fields,
+        &format!("playlistfind for {uri:?}"),
+        "mpd_queue_tags",
+    )
 }
 
 /// Strips fields not present in the operator’s [`MetadataProfile`]. For `ok` responses, sets
@@ -1119,25 +1158,46 @@ pub(crate) fn query_metadata(
             let Some(path) =
                 resolve_audio_path(library_roots, &req.target.value)
             else {
-                return Ok(MetadataQueryResponse::v1_error(
-                    ResponseStatus::NotFound,
-                    Some("audio file not found for mpd_path".to_string()),
-                ));
+                // No on-disk file (HTTP/DLNA stream, unmounted
+                // NAS path, etc.). Identity for those URIs lives
+                // on the MPD queue song via `addtagid` — consult
+                // `playlistfind` before declaring not_found.
+                return match read_from_mpd_playlistfind(&req.target.value) {
+                    Ok(mut r) => {
+                        apply_metadata_profile(&mut r, profile);
+                        Ok(r)
+                    }
+                    Err(e) => Ok(MetadataQueryResponse::v1_error(
+                        ResponseStatus::NotFound,
+                        Some(format!(
+                            "audio file not found for mpd_path; \
+                             queue tags unavailable: {e}"
+                        )),
+                    )),
+                };
             };
             // req.target.value is the mpd-relative path by the
             // scheme's contract; pass it through so the MPD
-            // lsinfo fallback can query MPD's tag cache when
-            // lofty refuses the container.
+            // lsinfo fallback can query MPD's library tag cache
+            // when lofty refuses the container.
             let r = read_file_metadata(
                 &path,
                 Some(req.target.value.as_str()),
                 profile,
             )
             .unwrap_or_else(|e| {
-                MetadataQueryResponse::v1_error(
-                    ResponseStatus::NotFound,
-                    Some(e),
-                )
+                // File path resolved but read failed. Last chance:
+                // the URI may still be in the queue with tags.
+                match read_from_mpd_playlistfind(&req.target.value) {
+                    Ok(mut q) => {
+                        apply_metadata_profile(&mut q, profile);
+                        q
+                    }
+                    Err(_) => MetadataQueryResponse::v1_error(
+                        ResponseStatus::NotFound,
+                        Some(e),
+                    ),
+                }
             });
             Ok(r)
         }
@@ -1153,9 +1213,9 @@ pub(crate) fn query_metadata(
 ///
 /// Confinement rules:
 ///
-/// - HTTP(S) schemes return `None` (this resolver handles
-///   on-disk files only; remote URIs flow through a separate
-///   path).
+/// - HTTP(S) schemes return `None` — this resolver handles
+///   on-disk files only. Callers must fall through to the
+///   MPD queue (`playlistfind`) path for remote stream URIs.
 /// - Absolute paths are accepted **only** when, after
 ///   `canonicalize`, the result is a descendant of one of
 ///   the canonicalised library roots. An absolute path
@@ -1171,8 +1231,8 @@ pub(crate) fn query_metadata(
 ///   the top level are admissible).
 ///
 /// Returns the canonicalised absolute path on success;
-/// `None` on any refusal (missing file, escape attempt,
-/// I/O error during canonicalize).
+/// `None` on any refusal (HTTP URI, missing file, escape
+/// attempt, I/O error during canonicalize).
 fn resolve_audio_path(
     library_roots: &[PathBuf],
     value: &str,
@@ -1285,7 +1345,11 @@ mod tests {
     }
 
     #[test]
-    fn not_found_for_http_url() {
+    fn http_url_without_queue_match_is_not_found() {
+        // HTTP targets skip the on-disk resolver and consult
+        // MPD `playlistfind`. With no MPD / no matching queue
+        // entry the outcome remains not_found (detail mentions
+        // the queue miss). Unit tests do not require a live MPD.
         let r = query_metadata(
             MetadataProfile::default(),
             &[],
@@ -1293,6 +1357,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.status, ResponseStatus::NotFound);
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("queue tags unavailable"),
+            "expected queue-miss detail, got {detail:?}"
+        );
     }
 
     #[test]

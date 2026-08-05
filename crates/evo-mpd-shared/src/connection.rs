@@ -579,6 +579,23 @@ impl MpdConnection {
         Ok(parse_queue_items(&fields))
     }
 
+    /// Find queue items whose tag `TYPE` equals `WHAT`.
+    ///
+    /// Wire form: `playlistfind "<type>" "<what>"\n`. Unlike
+    /// [`Self::find`] (library/DB), this searches the **current
+    /// queue** — the only place `addtagid` tags for HTTP/DLNA
+    /// streams are visible. Typical call: `playlistfind("file",
+    /// "http://…/file.mp3")` to recover Title/Artist/Album for a
+    /// remote URI that is not in MPD's database.
+    pub async fn playlistfind(
+        &mut self,
+        tag: &str,
+        value: &str,
+    ) -> Result<Vec<MpdQueueItem>, MpdError> {
+        let fields = self.dispatch("playlistfind", &[tag, value]).await?;
+        Ok(parse_queue_items(&fields))
+    }
+
     /// Add a URI to the queue and return its assigned songid.
     /// Distinct from [`Self::add`] which does not return the
     /// songid (and is consequently fine for `play_now`-shape

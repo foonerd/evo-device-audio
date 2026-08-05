@@ -23,7 +23,7 @@
 name = "org.evoframework.metadata.local"
 # Keep in sync with this crate's Cargo.toml [package].version and
 # manifest.toml [plugin].version. All three update together.
-version = "0.1.1"
+version = "0.1.2"
 contract = 1
 
 [target]

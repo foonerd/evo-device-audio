@@ -1,7 +1,7 @@
 [package]
 name = "org-evoframework-metadata-local"
 # Kept in sync with manifest.toml [plugin].version and PluginIdentity in describe().
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
