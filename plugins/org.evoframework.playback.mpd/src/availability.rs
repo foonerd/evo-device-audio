@@ -76,6 +76,15 @@ pub(crate) async fn compute_item_available(
     source_id: Option<&str>,
     registry: &SourceRegistry,
 ) -> Option<bool> {
+    // Remote stream URIs (DLNA-resolved `http(s)://…`, ICY radio,
+    // etc.) are not in MPD's song database. `sticker get` on them
+    // ACKs `No such song` and floods the journal on every queue
+    // republish after a player idle wake. A URI already sitting
+    // in the play queue is playable — report available and skip
+    // the sticker round-trip.
+    if is_remote_stream_uri(file_path) {
+        return Some(true);
+    }
     // Step 1: explicit sticker truth wins.
     if let Ok(Some(value)) =
         conn.sticker_get(file_path, EVO_AVAILABLE_STICKER).await
@@ -90,6 +99,17 @@ pub(crate) async fn compute_item_available(
     }
     // Step 3: no source registered, no sticker — truly unknown.
     None
+}
+
+/// True for `http://` / `https://` URIs (case-insensitive scheme).
+fn is_remote_stream_uri(path: &str) -> bool {
+    path.get(..7)
+        .map(|p| p.eq_ignore_ascii_case("http://"))
+        .unwrap_or(false)
+        || path
+            .get(..8)
+            .map(|p| p.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
 }
 
 /// Per-cascade-step 2 mapping. Pure function of source state
@@ -159,5 +179,13 @@ mod tests {
         // for any future optimisation. The async layer is only
         // the sticker_get round-trip.
         let _ = Duration::from_secs(0); // ensure tokio not pulled in implicitly
+    }
+
+    #[test]
+    fn remote_stream_uri_detects_http_and_https() {
+        assert!(is_remote_stream_uri("http://192.0.2.1:32469/file.mp3"));
+        assert!(is_remote_stream_uri("HTTPS://cdn.example/a.flac"));
+        assert!(!is_remote_stream_uri("Music/Album/01.flac"));
+        assert!(!is_remote_stream_uri("http"));
     }
 }
