@@ -39,6 +39,14 @@ pub struct DidlItem {
     pub artist: Option<String>,
     /// Album when present.
     pub album: Option<String>,
+    /// Genre when present (`upnp:genre`).
+    pub genre: Option<String>,
+    /// Date when present (`dc:date`) — often ISO-8601 or a bare year.
+    pub date: Option<String>,
+    /// Composer when present — `upnp:composer`, or
+    /// `upnp:author` / `upnp:artist` with `role="Composer"`
+    /// (common on classical ContentDirectory trees).
+    pub composer: Option<String>,
     /// Album art URI when present.
     pub album_art_uri: Option<String>,
     /// Duration string from DIDL (raw).
@@ -91,6 +99,9 @@ pub fn parse_didl(xml: &str) -> Result<Vec<DidlObject>, DlnaError> {
                 artist: child_text(node, "artist")
                     .or_else(|| child_text(node, "creator")),
                 album: child_text(node, "album"),
+                genre: child_text(node, "genre"),
+                date: child_text(node, "date"),
+                composer: extract_composer(node),
                 album_art_uri: child_text(node, "albumArtURI"),
                 duration: node
                     .children()
@@ -145,6 +156,32 @@ fn child_text(node: roxmltree::Node<'_, '_>, local: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Composer extraction order for classical ContentDirectory trees:
+/// 1. dedicated `composer` element (some servers emit it),
+/// 2. `author` / `artist` whose `role` attribute is `Composer`
+///    (UPnP ContentDirectory convention).
+fn extract_composer(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    child_text(node, "composer")
+        .or_else(|| child_text_with_role(node, "author", "Composer"))
+        .or_else(|| child_text_with_role(node, "artist", "Composer"))
+}
+
+fn child_text_with_role(
+    node: roxmltree::Node<'_, '_>,
+    local: &str,
+    role: &str,
+) -> Option<String> {
+    node.children()
+        .find(|c| {
+            c.has_tag_name(local)
+                && c.attribute("role")
+                    .is_some_and(|r| r.eq_ignore_ascii_case(role))
+        })
+        .and_then(|c| c.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +199,9 @@ mod tests {
     <dc:title>Song</dc:title>
     <upnp:artist>Artist</upnp:artist>
     <upnp:album>Album</upnp:album>
+    <upnp:genre>Classical</upnp:genre>
+    <dc:date>1997-01-01</dc:date>
+    <upnp:author role="Composer">Ludwig van Beethoven</upnp:author>
     <res protocolInfo="http-get:*:audio/flac:*">http://x/a.flac</res>
     <res protocolInfo="http-get:*:audio/mpeg:*">http://x/a.mp3</res>
   </item>
@@ -182,6 +222,9 @@ mod tests {
                     pick_stream_uri(i).as_deref(),
                     Some("http://x/a.flac")
                 );
+                assert_eq!(i.genre.as_deref(), Some("Classical"));
+                assert_eq!(i.date.as_deref(), Some("1997-01-01"));
+                assert_eq!(i.composer.as_deref(), Some("Ludwig van Beethoven"));
             }
             _ => panic!("expected item"),
         }

@@ -714,6 +714,9 @@ fn render_dlna_browse_entry(
                 "title":       entry.get("title").cloned(),
                 "artist":      entry.get("artist").cloned(),
                 "album":       entry.get("album").cloned(),
+                "genre":       entry.get("genre").cloned(),
+                "date":        entry.get("date").cloned(),
+                "composer":    entry.get("composer").cloned(),
                 "artwork_url": entry.get("artwork_url").cloned(),
                 "uri":         stable_uri,
             });

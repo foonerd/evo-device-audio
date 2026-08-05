@@ -943,6 +943,9 @@ fn response_from_mpd_fields(
     let album = fields.get("Album").cloned();
     let title = fields.get("Title").cloned();
     let album_artist = fields.get("AlbumArtist").cloned();
+    let genre = fields.get("Genre").cloned();
+    let date = fields.get("Date").cloned();
+    let composer = fields.get("Composer").cloned();
     let track = fields
         .get("Track")
         .and_then(|s| s.split('/').next())
@@ -957,6 +960,10 @@ fn response_from_mpd_fields(
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(|s| s * 1000)
         });
+    // MPD `Date` is often a bare year or an ISO string; take the
+    // leading four digits when present so the flat `year` field
+    // lights up under the default `standard` profile.
+    let year = date.as_deref().and_then(parse_leading_year);
 
     if artist.is_none() && album.is_none() && title.is_none() {
         return Err(format!("MPD {context} returned no tags"));
@@ -969,9 +976,51 @@ fn response_from_mpd_fields(
     r.artist = artist;
     r.album = album;
     r.album_artist = album_artist;
+    r.genre = genre;
+    r.year = year;
     r.track = track;
     r.duration_ms = duration_ms;
+    if let Some(composer) = composer {
+        r.credits = Some(CreditsMetadata {
+            composer: Some(composer),
+            conductor: None,
+            lyricist: None,
+            arranger: None,
+            writer: None,
+            performer: None,
+            performers: None,
+            producer: None,
+            mix_engineer: None,
+            engineer: None,
+            label: None,
+            publisher: None,
+            remixer: None,
+            director: None,
+        });
+    }
+    if let Some(date) = date {
+        r.dates = Some(DatesMetadata {
+            recording: None,
+            release: Some(date),
+            original_release: None,
+        });
+    }
     Ok(r)
+}
+
+/// Leading four-digit year from an MPD/DIDL date string
+/// (`"1997"`, `"1997-01-01"`, …). Non-digit prefix → `None`.
+fn parse_leading_year(date: &str) -> Option<u32> {
+    let digits: String = date
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .take(4)
+        .collect();
+    if digits.len() == 4 {
+        digits.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Read tags for one library-relative path from MPD's **library**

@@ -534,6 +534,9 @@ async fn handle_browse(
                 "title": i.title,
                 "artist": i.artist,
                 "album": i.album,
+                "genre": i.genre,
+                "date": i.date,
+                "composer": i.composer,
                 "artwork_url": i.album_art_uri,
                 // The stable identity — `dlna:<service_id>/<objectId>`
                 // — is the only URI form the operator glass ever
@@ -597,6 +600,9 @@ async fn handle_resolve(
         "title": item.title,
         "artist": item.artist,
         "album": item.album,
+        "genre": item.genre,
+        "date": item.date,
+        "composer": item.composer,
         "artwork_url": item.album_art_uri,
         // DIDL duration is `HH:MM:SS[.f]`; downstream consumers
         // that want milliseconds re-parse. Leave as the DIDL
@@ -623,10 +629,11 @@ async fn lookup_control(
 
 /// Full-item variant of [`browse_metadata_uri`] used by
 /// [`handle_resolve`] so DIDL tags (title, artist, album,
-/// albumArtURI, duration) cross the resolve boundary alongside
-/// the stream URI. The BrowseMetadata SOAP call already returns
-/// every field parsed into a [`DidlItem`]; returning the item
-/// instead of just its `res` URI is a strict superset.
+/// genre, date, composer, albumArtURI, duration) cross the
+/// resolve boundary alongside the stream URI. The BrowseMetadata
+/// SOAP call already returns every field parsed into a
+/// [`DidlItem`]; returning the item instead of just its `res`
+/// URI is a strict superset.
 ///
 /// Kept alongside `browse_metadata_uri` (URI-only) so callers
 /// that don't need the tags — none today post-2026-08-05 —

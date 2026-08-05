@@ -1189,6 +1189,10 @@ pub(crate) struct ResolvedTrack {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub genre: Option<String>,
+    /// DIDL `dc:date` — handed to MPD as `Date` (year or ISO).
+    pub date: Option<String>,
+    pub composer: Option<String>,
     // artwork_url is carried across the resolve boundary but not
     // yet threaded into the MPD projection — MPD tag names are a
     // fixed set (Title / Artist / Album / …) with no `AlbumArt`
@@ -1212,6 +1216,9 @@ impl ResolvedTrack {
             title: None,
             artist: None,
             album: None,
+            genre: None,
+            date: None,
+            composer: None,
             artwork_url: None,
             duration: None,
         }
@@ -1221,7 +1228,12 @@ impl ResolvedTrack {
     /// paths use this to decide whether the follow-up
     /// `addtagid` burst is needed at all.
     fn has_tags(&self) -> bool {
-        self.title.is_some() || self.artist.is_some() || self.album.is_some()
+        self.title.is_some()
+            || self.artist.is_some()
+            || self.album.is_some()
+            || self.genre.is_some()
+            || self.date.is_some()
+            || self.composer.is_some()
     }
 }
 
@@ -1231,6 +1243,12 @@ impl ResolvedTrack {
 /// a correctness invariant — the track still plays with an
 /// empty title). Returns unconditionally so a slow MPD does
 /// not block the enqueue verb's response.
+///
+/// Tag set covers the classical / audiophile fields ContentDirectory
+/// commonly emits: Genre, Date (year), Composer — in addition to
+/// Title / Artist / Album. MPD's queue projection already flattens
+/// `Composer` and `Date` into the classical block on every
+/// track-bearing envelope.
 pub(crate) async fn apply_resolved_tags(
     conn: &mut MpdConnection,
     song_id: u32,
@@ -1243,6 +1261,9 @@ pub(crate) async fn apply_resolved_tags(
         ("Title", resolved.title.as_deref()),
         ("Artist", resolved.artist.as_deref()),
         ("Album", resolved.album.as_deref()),
+        ("Genre", resolved.genre.as_deref()),
+        ("Date", resolved.date.as_deref()),
+        ("Composer", resolved.composer.as_deref()),
     ] {
         let Some(v) = value else {
             continue;
@@ -1378,6 +1399,9 @@ pub(crate) async fn resolve_uri_for_mpd(
         title: opt_str("title"),
         artist: opt_str("artist"),
         album: opt_str("album"),
+        genre: opt_str("genre"),
+        date: opt_str("date"),
+        composer: opt_str("composer"),
         artwork_url: opt_str("artwork_url"),
         duration: opt_str("duration"),
     })
