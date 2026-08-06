@@ -802,27 +802,102 @@ fn matched_denylist_prefix<'a>(
     None
 }
 
-/// Build the argv for `testparm -s` (silent mode — prints the
-/// canonicalised config to stdout so the runtime can verify
-/// smbd will accept it).
+/// Sudo binary path the plugin invokes to reach each of the
+/// four privileged subprocesses (testparm / smbpasswd /
+/// systemctl restart smbd / install → /etc/samba/smb.conf).
+/// The distribution's `dist/sudoers.d/evo-samba-server.in`
+/// grants `NOPASSWD` on the exact absolute command paths, so
+/// every arg builder below emits `["-n", "<absolute-path>",
+/// …]` — `-n` refuses any password prompt and the absolute
+/// path matches the sudoers alias byte-for-byte.
+pub const DEFAULT_SUDO_PROGRAM: &str = "/usr/bin/sudo";
+
+/// Absolute path to `testparm` on Debian/Ubuntu-family hosts.
+pub const DEFAULT_TESTPARM_PATH: &str = "/usr/bin/testparm";
+
+/// Absolute path to `smbpasswd` on Debian/Ubuntu-family hosts.
+pub const DEFAULT_SMBPASSWD_PATH: &str = "/usr/bin/smbpasswd";
+
+/// Absolute path to `systemctl` on Debian/Ubuntu-family hosts.
+pub const DEFAULT_SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+
+/// Absolute path to `install` on Debian/Ubuntu-family hosts.
+pub const DEFAULT_INSTALL_PATH: &str = "/usr/bin/install";
+
+/// Service-user-writable candidate path the runtime renders the
+/// smb.conf into BEFORE the `sudo install` step drops it
+/// atomically into `/etc/samba/smb.conf`. Living in `/var/tmp`
+/// so the service user (evoproto by default) can write without
+/// sudo AND the sudoers alias below can name the exact source
+/// path.
+pub const DEFAULT_SMB_CONF_CANDIDATE_PATH: &str =
+    "/var/tmp/evo-smb.conf.candidate";
+
+/// Build the argv for `sudo -n testparm -s <candidate>`.
+/// The path is passed to `testparm` in silent mode so the
+/// runtime can verify smbd will accept the candidate before
+/// the install step moves it into place.
 pub fn build_testparm_args(config_path: &Path) -> Vec<String> {
-    vec!["-s".to_string(), config_path.display().to_string()]
+    vec![
+        "-n".to_string(),
+        DEFAULT_TESTPARM_PATH.to_string(),
+        "-s".to_string(),
+        config_path.display().to_string(),
+    ]
 }
 
-/// Build the argv for `smbpasswd -a -s <user>` (add + read
-/// password from stdin).
+/// Build the argv for `sudo -n smbpasswd -a -s <user>` (add +
+/// read password from stdin).
 pub fn build_smbpasswd_add_args(username: &str) -> Vec<String> {
-    vec!["-a".to_string(), "-s".to_string(), username.to_string()]
+    vec![
+        "-n".to_string(),
+        DEFAULT_SMBPASSWD_PATH.to_string(),
+        "-a".to_string(),
+        "-s".to_string(),
+        username.to_string(),
+    ]
 }
 
-/// Build the argv for `smbpasswd -x <user>` (delete).
+/// Build the argv for `sudo -n smbpasswd -x <user>` (delete).
 pub fn build_smbpasswd_delete_args(username: &str) -> Vec<String> {
-    vec!["-x".to_string(), username.to_string()]
+    vec![
+        "-n".to_string(),
+        DEFAULT_SMBPASSWD_PATH.to_string(),
+        "-x".to_string(),
+        username.to_string(),
+    ]
 }
 
-/// Build the argv for `systemctl restart smbd`.
+/// Build the argv for `sudo -n systemctl restart smbd`.
 pub fn build_systemctl_restart_args() -> Vec<String> {
-    vec!["restart".to_string(), "smbd".to_string()]
+    vec![
+        "-n".to_string(),
+        DEFAULT_SYSTEMCTL_PATH.to_string(),
+        "restart".to_string(),
+        "smbd".to_string(),
+    ]
+}
+
+/// Build the argv for `sudo -n install -m 0644 -o root -g root
+/// <candidate> <target>` — the atomic drop of the validated
+/// candidate over `/etc/samba/smb.conf`. `install` copies to a
+/// temp file adjacent to the target, fsyncs, then renames —
+/// the operating system never observes a partial rewrite.
+/// Both paths are passed as literal strings so the sudoers
+/// alias can name them exactly (bounded grant).
+pub fn build_install_conf_args(candidate: &Path, target: &Path) -> Vec<String> {
+    vec![
+        "-n".to_string(),
+        DEFAULT_INSTALL_PATH.to_string(),
+        "-m".to_string(),
+        "0644".to_string(),
+        "-o".to_string(),
+        "root".to_string(),
+        "-g".to_string(),
+        "root".to_string(),
+        candidate.display().to_string(),
+        target.display().to_string(),
+    ]
 }
 
 // --------------------------------------------------------------
@@ -877,10 +952,19 @@ pub struct SambaServerRuntime {
     inner: Arc<Mutex<SambaServerInner>>,
     executor: Arc<dyn SambaExecutor>,
     credentials: Arc<dyn SmbCredentialFetcher>,
-    testparm_program: String,
-    smbpasswd_program: String,
-    systemctl_program: String,
+    /// Absolute path to `sudo` — every privileged subprocess
+    /// (testparm / smbpasswd / systemctl / install) shells
+    /// out through this so the sudoers alias grants match
+    /// byte-for-byte. Overridable for tests + hosts with
+    /// non-standard sudo locations.
+    sudo_program: String,
     smb_conf_path: PathBuf,
+    /// Service-user-writable candidate path the runtime
+    /// renders smb.conf into BEFORE the `sudo install` step
+    /// drops it atomically over `smb_conf_path`. Default
+    /// [`DEFAULT_SMB_CONF_CANDIDATE_PATH`] (`/var/tmp/…`) so
+    /// the service user can write without sudo.
+    candidate_path: PathBuf,
     netbios_name: String,
     workgroup: String,
     path_allowlist: Vec<String>,
@@ -920,10 +1004,9 @@ impl SambaServerRuntime {
             inner: Arc::new(Mutex::new(SambaServerInner { state, path })),
             executor: Arc::new(SubprocessSambaExecutor),
             credentials: Arc::new(NoSmbCredentialFetcher),
-            testparm_program: "/usr/bin/testparm".to_string(),
-            smbpasswd_program: "/usr/bin/smbpasswd".to_string(),
-            systemctl_program: "/usr/bin/systemctl".to_string(),
+            sudo_program: DEFAULT_SUDO_PROGRAM.to_string(),
             smb_conf_path: PathBuf::from(DEFAULT_SMB_CONF_PATH),
+            candidate_path: PathBuf::from(DEFAULT_SMB_CONF_CANDIDATE_PATH),
             netbios_name: DEFAULT_NETBIOS_NAME.to_string(),
             workgroup: DEFAULT_WORKGROUP.to_string(),
             path_allowlist: DEFAULT_SHARE_PATH_ALLOWLIST
@@ -953,10 +1036,9 @@ impl SambaServerRuntime {
             path,
             executor: None,
             credentials: None,
-            testparm_program: None,
-            smbpasswd_program: None,
-            systemctl_program: None,
+            sudo_program: None,
             smb_conf_path: None,
+            candidate_path: None,
             netbios_name: None,
             workgroup: None,
             path_allowlist: None,
@@ -1000,19 +1082,22 @@ impl SambaServerRuntime {
             )
         };
 
-        // Write to a temp path adjacent to the target so
-        // testparm reads exactly what will land on the target.
-        let candidate_path =
-            self.smb_conf_path.with_extension("conf.candidate");
+        // Write the rendered conf to the service-user-writable
+        // candidate path (default `/var/tmp/evo-smb.conf.candidate`)
+        // so the plugin process — which runs as the service user,
+        // not root — can produce the bytes without sudo. The
+        // subsequent `install` step (bounded via sudoers) drops
+        // the candidate atomically over `smb_conf_path` with
+        // root ownership + mode 0644.
         self.executor
-            .write_file(&candidate_path, rendered.as_bytes())
+            .write_file(&self.candidate_path, rendered.as_bytes())
             .await?;
 
-        let testparm_args = build_testparm_args(&candidate_path);
+        let testparm_args = build_testparm_args(&self.candidate_path);
         let testparm_out = self
             .executor
             .run(
-                &self.testparm_program,
+                &self.sudo_program,
                 &testparm_args,
                 self.subprocess_timeout_ms,
                 b"",
@@ -1026,16 +1111,39 @@ impl SambaServerRuntime {
             });
         }
 
-        self.executor
-            .write_file(&self.smb_conf_path, rendered.as_bytes())
+        // Install the validated candidate atomically over the
+        // target smb.conf. `install(1)` copies to a temp file
+        // adjacent to the target, fsyncs, then renames — smbd
+        // never observes a partial rewrite. The sudoers alias
+        // names both source and target verbatim so operators
+        // can audit the exact grant.
+        let install_args =
+            build_install_conf_args(&self.candidate_path, &self.smb_conf_path);
+        let install_out = self
+            .executor
+            .run(
+                &self.sudo_program,
+                &install_args,
+                self.subprocess_timeout_ms,
+                b"",
+            )
             .await?;
+        if install_out.exit_code != Some(0) {
+            return Err(ApplyError::ConfigInstall {
+                detail: format!(
+                    "sudo install returned exit code {:?}: {}",
+                    install_out.exit_code,
+                    String::from_utf8_lossy(&install_out.stderr),
+                ),
+            });
+        }
 
         let smbd_restarted = if new_enabled {
             let systemctl_args = build_systemctl_restart_args();
             let restart_out = self
                 .executor
                 .run(
-                    &self.systemctl_program,
+                    &self.sudo_program,
                     &systemctl_args,
                     self.subprocess_timeout_ms,
                     b"",
@@ -1105,7 +1213,7 @@ impl SambaServerRuntime {
         let out = self
             .executor
             .run(
-                &self.smbpasswd_program,
+                &self.sudo_program,
                 &args,
                 self.subprocess_timeout_ms,
                 &stdin,
@@ -1152,12 +1260,7 @@ impl SambaServerRuntime {
         let args = build_smbpasswd_delete_args(username);
         let out = self
             .executor
-            .run(
-                &self.smbpasswd_program,
-                &args,
-                self.subprocess_timeout_ms,
-                b"",
-            )
+            .run(&self.sudo_program, &args, self.subprocess_timeout_ms, b"")
             .await?;
         if out.exit_code != Some(0) {
             return Err(ApplyError::SmbpasswdFailed {
@@ -1184,10 +1287,9 @@ pub struct SambaServerRuntimeBuilder {
     path: PathBuf,
     executor: Option<Arc<dyn SambaExecutor>>,
     credentials: Option<Arc<dyn SmbCredentialFetcher>>,
-    testparm_program: Option<String>,
-    smbpasswd_program: Option<String>,
-    systemctl_program: Option<String>,
+    sudo_program: Option<String>,
     smb_conf_path: Option<PathBuf>,
+    candidate_path: Option<PathBuf>,
     netbios_name: Option<String>,
     workgroup: Option<String>,
     path_allowlist: Option<Vec<String>>,
@@ -1212,27 +1314,29 @@ impl SambaServerRuntimeBuilder {
         self
     }
 
-    /// Override the testparm program path (default `/usr/bin/testparm`).
-    pub fn with_testparm_program(mut self, program: String) -> Self {
-        self.testparm_program = Some(program);
-        self
-    }
-
-    /// Override the smbpasswd program path (default `/usr/bin/smbpasswd`).
-    pub fn with_smbpasswd_program(mut self, program: String) -> Self {
-        self.smbpasswd_program = Some(program);
-        self
-    }
-
-    /// Override the systemctl program path (default `/usr/bin/systemctl`).
-    pub fn with_systemctl_program(mut self, program: String) -> Self {
-        self.systemctl_program = Some(program);
+    /// Override the sudo binary path (default
+    /// [`DEFAULT_SUDO_PROGRAM`] = `/usr/bin/sudo`). Every
+    /// privileged subprocess (testparm / smbpasswd / systemctl
+    /// / install) shells through this program with the
+    /// underlying command's absolute path as the first arg so
+    /// the sudoers alias grants match byte-for-byte.
+    pub fn with_sudo_program(mut self, program: String) -> Self {
+        self.sudo_program = Some(program);
         self
     }
 
     /// Override the smb.conf path (default `/etc/samba/smb.conf`).
     pub fn with_smb_conf_path(mut self, path: PathBuf) -> Self {
         self.smb_conf_path = Some(path);
+        self
+    }
+
+    /// Override the candidate path — the service-user-writable
+    /// location the runtime renders smb.conf into BEFORE the
+    /// sudo install step drops it atomically over
+    /// `smb_conf_path`. Tests inject a tempdir path here.
+    pub fn with_candidate_path(mut self, path: PathBuf) -> Self {
+        self.candidate_path = Some(path);
         self
     }
 
@@ -1295,18 +1399,15 @@ impl SambaServerRuntimeBuilder {
             credentials: self
                 .credentials
                 .unwrap_or_else(|| Arc::new(NoSmbCredentialFetcher)),
-            testparm_program: self
-                .testparm_program
-                .unwrap_or_else(|| "/usr/bin/testparm".to_string()),
-            smbpasswd_program: self
-                .smbpasswd_program
-                .unwrap_or_else(|| "/usr/bin/smbpasswd".to_string()),
-            systemctl_program: self
-                .systemctl_program
-                .unwrap_or_else(|| "/usr/bin/systemctl".to_string()),
+            sudo_program: self
+                .sudo_program
+                .unwrap_or_else(|| DEFAULT_SUDO_PROGRAM.to_string()),
             smb_conf_path: self
                 .smb_conf_path
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_SMB_CONF_PATH)),
+            candidate_path: self.candidate_path.unwrap_or_else(|| {
+                PathBuf::from(DEFAULT_SMB_CONF_CANDIDATE_PATH)
+            }),
             netbios_name: self
                 .netbios_name
                 .unwrap_or_else(|| DEFAULT_NETBIOS_NAME.to_string()),
@@ -2161,12 +2262,23 @@ mod tests {
     }
 
     // ----- argv builder tests -----
+    //
+    // Every privileged subprocess shells out through `sudo -n
+    // <absolute-path> …`; the sudoers alias grants match
+    // byte-for-byte. Assertions include the `sudo -n` prefix +
+    // the absolute path so a future author reading a test sees
+    // the exact grant contract.
 
     #[test]
     fn testparm_args_shape() {
         assert_eq!(
             build_testparm_args(Path::new("/tmp/smb.conf.candidate")),
-            vec!["-s".to_string(), "/tmp/smb.conf.candidate".to_string()]
+            vec![
+                "-n".to_string(),
+                "/usr/bin/testparm".to_string(),
+                "-s".to_string(),
+                "/tmp/smb.conf.candidate".to_string(),
+            ]
         );
     }
 
@@ -2174,7 +2286,13 @@ mod tests {
     fn smbpasswd_add_args_shape() {
         assert_eq!(
             build_smbpasswd_add_args("producer"),
-            vec!["-a".to_string(), "-s".to_string(), "producer".to_string(),]
+            vec![
+                "-n".to_string(),
+                "/usr/bin/smbpasswd".to_string(),
+                "-a".to_string(),
+                "-s".to_string(),
+                "producer".to_string(),
+            ]
         );
     }
 
@@ -2182,7 +2300,12 @@ mod tests {
     fn smbpasswd_delete_args_shape() {
         assert_eq!(
             build_smbpasswd_delete_args("producer"),
-            vec!["-x".to_string(), "producer".to_string()]
+            vec![
+                "-n".to_string(),
+                "/usr/bin/smbpasswd".to_string(),
+                "-x".to_string(),
+                "producer".to_string(),
+            ]
         );
     }
 
@@ -2190,7 +2313,41 @@ mod tests {
     fn systemctl_restart_args_shape() {
         assert_eq!(
             build_systemctl_restart_args(),
-            vec!["restart".to_string(), "smbd".to_string()]
+            vec![
+                "-n".to_string(),
+                "/usr/bin/systemctl".to_string(),
+                "restart".to_string(),
+                "smbd".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_conf_args_shape() {
+        // The install argv MUST name every knob the sudoers
+        // alias pins — mode 0644, owner root, group root,
+        // and both source + target paths as literal strings.
+        // Any deviation here mismatches the sudoers alias and
+        // apply hard-fails with "sudo: a password is required"
+        // (because the operator's sudo config falls back to
+        // password-required for un-aliased commands).
+        assert_eq!(
+            build_install_conf_args(
+                Path::new("/var/tmp/evo-smb.conf.candidate"),
+                Path::new("/etc/samba/smb.conf")
+            ),
+            vec![
+                "-n".to_string(),
+                "/usr/bin/install".to_string(),
+                "-m".to_string(),
+                "0644".to_string(),
+                "-o".to_string(),
+                "root".to_string(),
+                "-g".to_string(),
+                "root".to_string(),
+                "/var/tmp/evo-smb.conf.candidate".to_string(),
+                "/etc/samba/smb.conf".to_string(),
+            ]
         );
     }
 
@@ -2291,10 +2448,9 @@ mod tests {
             .unwrap()
             .with_executor(executor.clone())
             .with_credentials(Arc::new(StubCredentials { map: creds }))
-            .with_testparm_program("testparm".to_string())
-            .with_smbpasswd_program("smbpasswd".to_string())
-            .with_systemctl_program("systemctl".to_string())
+            .with_sudo_program("sudo".to_string())
             .with_smb_conf_path(dir.join("smb.conf"))
+            .with_candidate_path(dir.join("smb.conf.candidate"))
             .with_path_allowlist(vec![
                 "/var/lib/evo/music".to_string(),
                 "/var/lib/evo/uploads".to_string(),
@@ -2315,7 +2471,9 @@ mod tests {
         let dir = tempdir();
         let (rt, executor) = built_runtime(
             &dir,
-            vec![ok(), ok()], // testparm + systemctl
+            // testparm + install (sudo install candidate →
+            // smb.conf) + systemctl restart smbd
+            vec![ok(), ok(), ok()],
             HashMap::new(),
         );
         let report = rt
@@ -2332,8 +2490,7 @@ mod tests {
             .unwrap();
         // Post-inventory: the applied list carries stock +
         // delivery shares alongside the operator's `Music`
-        // extra. Assertion switches from "sole entry" to
-        // "contains the operator share and the stock triad".
+        // extra.
         assert!(report.applied_shares.contains(&"Music".to_string()));
         assert!(report
             .applied_shares
@@ -2347,24 +2504,49 @@ mod tests {
         assert!(report.refused_settings.is_empty());
         assert!(report.smbd_restarted);
         let calls = executor.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].0.ends_with("testparm"));
-        assert!(calls[1].0.ends_with("systemctl"));
+        // Three subprocess invocations — all through the same
+        // sudo wrapper program string, distinguished by their
+        // first arg (`-n` + the underlying binary path).
+        assert_eq!(calls.len(), 3);
+        // Every call goes through sudo — first argv element is
+        // `-n`, second is the underlying binary path.
+        for c in calls.iter() {
+            assert_eq!(c.1[0], "-n");
+        }
+        assert!(calls[0].1[1].ends_with("/testparm"));
+        assert!(calls[1].1[1].ends_with("/install"));
+        assert!(calls[2].1[1].ends_with("/systemctl"));
+        // One filesystem write — the candidate. The install
+        // step (subprocess) handles the atomic drop to the
+        // target so there is no second write_file call.
         let writes = executor.writes.lock().await;
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0]
+            .0
+            .to_string_lossy()
+            .ends_with("smb.conf.candidate"));
     }
 
     #[tokio::test]
     async fn apply_when_disabled_skips_systemctl_restart() {
         let dir = tempdir();
-        let (rt, executor) = built_runtime(&dir, vec![ok()], HashMap::new()); // testparm only
+        let (rt, executor) = built_runtime(
+            &dir,
+            // testparm + install — no systemctl (server
+            // disabled → conf still rewritten, but smbd
+            // does not restart)
+            vec![ok(), ok()],
+            HashMap::new(),
+        );
         let report = rt
             .apply(false, MinProtocol::Default, Vec::new())
             .await
             .unwrap();
         assert!(!report.smbd_restarted);
         let calls = executor.calls.lock().await;
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1[1].ends_with("/testparm"));
+        assert!(calls[1].1[1].ends_with("/install"));
     }
 
     #[tokio::test]
@@ -2379,11 +2561,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_install_failure_returns_config_install_error() {
+        let dir = tempdir();
+        let (rt, _) = built_runtime(
+            &dir,
+            // testparm ok, install err
+            vec![ok(), err_output()],
+            HashMap::new(),
+        );
+        let err = rt
+            .apply(true, MinProtocol::Default, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::ConfigInstall { .. }));
+    }
+
+    #[tokio::test]
     async fn apply_restart_failure_returns_restart_error() {
         let dir = tempdir();
         let (rt, _) = built_runtime(
             &dir,
-            vec![ok(), err_output()], // testparm ok, restart fail
+            // testparm ok, install ok, restart fail
+            vec![ok(), ok(), err_output()],
             HashMap::new(),
         );
         let err = rt
@@ -2397,7 +2596,7 @@ mod tests {
     async fn apply_refuses_path_outside_allowlist_but_still_writes_config() {
         let dir = tempdir();
         let (rt, executor) =
-            built_runtime(&dir, vec![ok(), ok()], HashMap::new());
+            built_runtime(&dir, vec![ok(), ok(), ok()], HashMap::new());
         let report = rt
             .apply(
                 true,
@@ -2611,7 +2810,8 @@ mod tests {
     #[tokio::test]
     async fn apply_republishes_subject_with_new_state() {
         let dir = tempdir();
-        let (rt, _) = built_runtime(&dir, vec![ok(), ok()], HashMap::new());
+        let (rt, _) =
+            built_runtime(&dir, vec![ok(), ok(), ok()], HashMap::new());
         let announcer = RecordingAnnouncer::new();
         rt.attach_subject_publisher(announcer.clone())
             .await
@@ -2685,7 +2885,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_verb_apply_round_trips() {
         let dir = tempdir();
-        let (rt, _) = built_runtime(&dir, vec![ok(), ok()], HashMap::new());
+        let (rt, _) =
+            built_runtime(&dir, vec![ok(), ok(), ok()], HashMap::new());
         let req = SmbServerApplyRequest {
             enabled: true,
             min_protocol: MinProtocol::Smb3_02,

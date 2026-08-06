@@ -36,6 +36,20 @@
 #    so a single UI gesture updates OS hostname + mDNS + SMB
 #    NetBIOS advertisement together.
 #
+# 5. `EVO_SAMBA_SERVER_INSTALL` — `install -m 0644 -o root -g
+#    root /var/tmp/evo-smb.conf.candidate /etc/samba/smb.conf`.
+#    The runtime renders the smb.conf into
+#    `/var/tmp/evo-smb.conf.candidate` (service-user-writable,
+#    no sudo needed to produce the bytes), runs testparm
+#    against the candidate, and — on success — invokes
+#    `install(1)` under this alias to drop the validated
+#    candidate atomically over `/etc/samba/smb.conf`.
+#    `install(1)` copies to a temp file adjacent to the
+#    target, fsyncs, then renames — smbd never observes a
+#    partial rewrite. Both source and target paths are named
+#    verbatim so the alias grant matches byte-for-byte and no
+#    other install invocation can slip through.
+#
 # Path discipline: the testparm, smbpasswd, systemctl paths
 # MUST match the runtime builder's defaults
 # (`with_testparm_program` / `with_smbpasswd_program` /
@@ -76,12 +90,17 @@ Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
 Cmnd_Alias EVO_SAMBA_SERVER_HOSTNAME = \
     /usr/bin/hostnamectl set-hostname *
 
+Cmnd_Alias EVO_SAMBA_SERVER_INSTALL = \
+    /usr/bin/install -m 0644 -o root -g root /var/tmp/evo-smb.conf.candidate /etc/samba/smb.conf
+
 Defaults!EVO_SAMBA_SERVER_CONFIG !pam_session, !syslog
 Defaults!EVO_SAMBA_SERVER_USERS !pam_session, !syslog
 Defaults!EVO_SAMBA_SERVER_RESTART !pam_session, !syslog
 Defaults!EVO_SAMBA_SERVER_HOSTNAME !pam_session, !syslog
+Defaults!EVO_SAMBA_SERVER_INSTALL !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_CONFIG
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_USERS
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_RESTART
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_HOSTNAME
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SAMBA_SERVER_INSTALL
