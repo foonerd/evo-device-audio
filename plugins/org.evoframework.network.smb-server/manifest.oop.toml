@@ -30,7 +30,7 @@ evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 # Writes /etc/samba/smb.conf; sudoers-scoped writes + smbd
-# restart happen via testparm/smbpasswd/systemctl.
+# restart happen via testparm/evo-smb-user-sync/systemctl.
 filesystem_scopes = ["/etc/samba"]
 
 [resources]
@@ -50,8 +50,8 @@ request_types = [
     "network.smb_server.user_revoke",
     "network.smb_server.get_state",
 ]
-# testparm + smbpasswd + systemctl restart smbd; conservative
-# budget for a full apply cycle.
+# testparm + evo-smb-user-sync + systemctl restart smbd;
+# conservative budget for a full apply cycle.
 response_budget_ms = 10000
 
 [capabilities.respondent.verb_capabilities]

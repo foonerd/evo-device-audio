@@ -88,6 +88,7 @@ SYSTEM_POWER_SUDOERS_FILE="/etc/sudoers.d/evo-system-power"
 SYSTEM_KIOSK_SUDOERS_FILE="/etc/sudoers.d/evo-system-kiosk"
 NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
 SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
+SMB_USER_SYNC_WRAPPER_DST="/usr/local/bin/evo-smb-user-sync"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
@@ -587,18 +588,41 @@ else
 fi
 
 # ----------------------------------------------------------
-# Step 1f: /etc/sudoers.d/evo-samba-server (narrow NOPASSWD)
+# Step 1f: /usr/local/bin/evo-smb-user-sync +
+#          /etc/sudoers.d/evo-samba-server (narrow NOPASSWD)
 # ----------------------------------------------------------
-# NOPASSWD grant for the
-# org.evoframework.network.smb-server plugin's testparm +
-# smbpasswd + systemctl-restart-smbd surface. The plugin
-# invokes `testparm -s <candidate>` to validate the rendered
-# smb.conf before installing over /etc/samba/smb.conf, then
-# `smbpasswd -a -s <user>` / `-x <user>` to add / revoke
-# SMB users (password piped through stdin from the vault; argv
-# never carries it), and `systemctl restart smbd` on every
-# successful apply where enabled=true.
+# Install the narrow root-elevated SMB user provisioner used by
+# org.evoframework.network.smb-server, then the NOPASSWD grant
+# for testparm + that wrapper + systemctl-restart-smbd +
+# hostnamectl + atomic smb.conf install.
+#
+# The wrapper is the trust boundary for user provisioning: it
+# creates a non-login system account (nologin, no home) then
+# runs smbpasswd. The steward MUST NOT receive raw useradd /
+# userdel / smbpasswd grants — only this wrapper. See
+# plugins/org.evoframework.network.smb-server/docs/SAMBA-SHARES.md
+# § SMB users.
+#
+# Both artefacts install together — an installed sudoers grant
+# without the wrapper would break every user_add / user_revoke;
+# an installed wrapper without the sudoers grant would leave
+# every user op hung on a password prompt.
 if [[ "${EVO_INSTALL_SAMBA_SERVER_SUDOERS:-1}" != "0" ]]; then
+    SMB_USER_SYNC_WRAPPER_SRC="$DIST_DIR/../plugins/org.evoframework.network.smb-server/dist/bin/evo-smb-user-sync"
+    if [[ ! -f "$SMB_USER_SYNC_WRAPPER_SRC" ]]; then
+        echo "smb-user-sync wrapper not found at $SMB_USER_SYNC_WRAPPER_SRC" >&2
+        exit 2
+    fi
+    TMP_WRAPPER="$(mktemp)"
+    trap 'rm -f "$TMP_WRAPPER"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$SMB_USER_SYNC_WRAPPER_SRC" > "$TMP_WRAPPER"
+    install -m 0755 -o root -g root \
+        "$TMP_WRAPPER" "$SMB_USER_SYNC_WRAPPER_DST"
+    rm -f "$TMP_WRAPPER"
+    trap - EXIT
+    echo "[bootstrap] installed $SMB_USER_SYNC_WRAPPER_DST"
+
     # Sudoers drop-in lives with the plugin that consumes it
     # (each plugin ships its own narrow sudoers scope in its
     # plugin directory).
@@ -624,7 +648,7 @@ if [[ "${EVO_INSTALL_SAMBA_SERVER_SUDOERS:-1}" != "0" ]]; then
     trap - EXIT
     echo "[bootstrap] installed $SAMBA_SERVER_SUDOERS_FILE"
 else
-    echo "[bootstrap] EVO_INSTALL_SAMBA_SERVER_SUDOERS=0 — skipping samba-server sudoers drop-in"
+    echo "[bootstrap] EVO_INSTALL_SAMBA_SERVER_SUDOERS=0 — skipping smb-user-sync wrapper + samba-server sudoers drop-in"
 fi
 
 # ----------------------------------------------------------
@@ -1621,15 +1645,16 @@ else
 fi
 
 # samba-server sudoers drop-in present + the service user can
-# dry-run testparm + smbpasswd + systemctl restart smbd.
+# dry-run testparm + evo-smb-user-sync + systemctl restart smbd.
 if [[ -f "$SAMBA_SERVER_SUDOERS_FILE" ]]; then
-    if sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/testparm >/dev/null 2>&1 \
-        && sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/smbpasswd >/dev/null 2>&1 \
+    if [[ -x "$SMB_USER_SYNC_WRAPPER_DST" ]] \
+        && sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/testparm >/dev/null 2>&1 \
+        && sudo -u "$SERVICE_USER" sudo -n -l -- "$SMB_USER_SYNC_WRAPPER_DST" add check >/dev/null 2>&1 \
         && sudo -u "$SERVICE_USER" sudo -n -l -- /usr/bin/systemctl restart smbd >/dev/null 2>&1; then
-        echo "  [ok]    $SERVICE_USER permitted to run \`testparm\` + \`smbpasswd\` + \`systemctl restart smbd\` via NOPASSWD"
+        echo "  [ok]    $SERVICE_USER permitted to run \`testparm\` + \`evo-smb-user-sync\` + \`systemctl restart smbd\` via NOPASSWD"
     else
-        echo "  [WARN]  one of testparm / smbpasswd / systemctl restart smbd did not match for $SERVICE_USER"
-        echo "          (review $SAMBA_SERVER_SUDOERS_FILE; ensure binary paths match the plugin's defaults)"
+        echo "  [WARN]  one of testparm / evo-smb-user-sync / systemctl restart smbd did not match for $SERVICE_USER"
+        echo "          (review $SAMBA_SERVER_SUDOERS_FILE + $SMB_USER_SYNC_WRAPPER_DST; ensure paths match the plugin's defaults)"
     fi
 else
     echo "  [skip]  samba-server sudoers drop-in not installed"

@@ -12,10 +12,10 @@ has_os_dependencies: true
 # share exports over the LAN so paired devices can upload to the
 # host running evo. Every mutating verb requires out-of-plugin
 # host binaries (`smbd` runtime, `testparm` for config
-# validation, `smbpasswd` for user provisioning, `systemctl` for
-# smbd lifecycle); their absence makes the plugin non-functional
-# and admission MUST refuse or degrade to `Unhealthy` with the
-# missing binary named.
+# validation, `evo-smb-user-sync` for user provisioning,
+# `systemctl` for smbd lifecycle); their absence makes the
+# plugin non-functional and admission MUST refuse or degrade to
+# `Unhealthy` with the missing binary named.
 
 capability_intent:
   - id: smbd_config_validate
@@ -27,9 +27,9 @@ capability_intent:
     access_path: sudoers/command
     failure_mode: absent smbd-restart privilege leaves the newly-rendered fragment on disk but not in effect; the apply verb returns `PluginError::Transient` naming the sudo strategy + the underlying stderr; the operator UI's remedy string names the missing sudoers entry.
   - id: smb_user_provision
-    need: invoke `smbpasswd -a <user>` (add) and `smbpasswd -x <user>` (remove) to provision the Samba TDB entries the plugin's user_add / user_revoke verbs manage. Runs as root because smbpasswd's TDB write requires root; non-root service identity dispatches via `sudo -n /usr/bin/smbpasswd` against a narrow NOPASSWD drop-in.
+    need: invoke `/usr/local/bin/evo-smb-user-sync add <user>` (create non-login NSS account + Samba passdb) and `… delete <user>` (remove passdb + provisioned NSS entry) for the plugin's user_add / user_revoke verbs. Runs as root because account create/delete and smbpasswd TDB write require root; non-root service identity dispatches via `sudo -n /usr/local/bin/evo-smb-user-sync` against a narrow NOPASSWD drop-in. The steward MUST NOT be granted raw useradd / userdel / smbpasswd.
     access_path: sudoers/command
-    failure_mode: absent smbpasswd or its sudoers surface makes user_add / user_revoke return `PluginError::Permanent` naming the missing binary or privilege; existing users remain functional; smbd continues to serve.
+    failure_mode: absent evo-smb-user-sync or its sudoers surface makes user_add / user_revoke return `PluginError::Permanent` naming the missing binary or privilege; existing users remain functional; smbd continues to serve.
 
 required_binaries:
   - name: smbd
@@ -40,7 +40,10 @@ required_binaries:
     failure_mode: refuse to admit; without config validation the plugin cannot safely mutate `smb.conf`. Ships in the same `samba` (Debian) / `samba-common-tools` (Fedora) / `samba` (Alpine, Arch) package as smbd.
   - name: smbpasswd
     min_version: "4.10"
-    failure_mode: warn at admission and mark the plugin degraded with reason `smbpasswd_missing`; existing users continue to work; user_add / user_revoke verbs refuse at boundary. The `samba-common-bin` (Debian) / `samba-common-tools` (Fedora) / `samba` (Alpine, Arch) package provides this.
+    failure_mode: warn at admission and mark the plugin degraded with reason `smbpasswd_missing`; existing users continue to work; user_add / user_revoke verbs refuse at boundary. Invoked only inside `evo-smb-user-sync` (not directly by the steward). The `samba-common-bin` (Debian) / `samba-common-tools` (Fedora) / `samba` (Alpine, Arch) package provides this.
+  - name: evo-smb-user-sync
+    min_version: "0"
+    failure_mode: warn at admission and mark the plugin degraded with reason `smb_user_sync_missing`; user_add / user_revoke refuse at boundary. Installed by the distribution bootstrap to `/usr/local/bin/evo-smb-user-sync` from this plugin's `dist/bin/`.
   - name: systemctl
     min_version: "245"
     failure_mode: warn at admission and mark the plugin degraded with reason `systemctl_missing`; smbd cannot be restarted after a config change; the fragment is written but not applied. Debian bookworm and every supported distribution ship systemd 245+.

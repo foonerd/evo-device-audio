@@ -26,11 +26,12 @@
 //! * Validates the rendered config with `testparm -s` before
 //!   installing over `/etc/samba/smb.conf` and restarting
 //!   `smbd.service`.
-//! * Adds / revokes SMB users via `smbpasswd -a` / `smbpasswd
-//!   -x`. Passwords never appear on the persistence surface —
-//!   the record carries a `credential_key` into the evo
-//!   credential vault; the vault issues bytes at `smbpasswd -a`
-//!   time and the runtime pipes them into stdin.
+//! * Adds / revokes SMB users via the narrow
+//!   `evo-smb-user-sync` wrapper (non-login NSS account +
+//!   Samba passdb). Passwords never appear on the persistence
+//!   surface — the record carries a `credential_key` into the
+//!   evo credential vault; the vault issues bytes at add time
+//!   and the runtime pipes them once into the wrapper's stdin.
 //! * Publishes the reactive `system_smb_server` subject on
 //!   every successful apply so operator surfaces reflect the
 //!   current server state.
@@ -80,7 +81,7 @@ pub const SMB_SERVER_FILE: &str = "smb_server.toml";
 pub const DEFAULT_SMB_CONF_PATH: &str = "/etc/samba/smb.conf";
 
 /// Default per-subprocess timeout in milliseconds (10 s covers
-/// testparm + smbpasswd + systemctl restart on the reference
+/// testparm + user-sync + systemctl restart on the reference
 /// Pi 5).
 pub const DEFAULT_SAMBA_SUBPROCESS_TIMEOUT_MS: u64 = 10_000;
 
@@ -196,7 +197,7 @@ pub struct SmbUserRecord {
     pub created_at_ms: i64,
     /// Opaque credential-vault key. Never on the reactive
     /// subject envelope; used at apply time to fetch the
-    /// password bytes for `smbpasswd -a` stdin.
+    /// password bytes for `evo-smb-user-sync add` stdin.
     pub credential_key: String,
 }
 
@@ -403,15 +404,14 @@ pub enum ApplyError {
         /// verbatim stderr snippet.
         stderr: String,
     },
-    /// `smbpasswd -a <user>` (add) or `smbpasswd -x <user>`
-    /// (revoke) returned non-zero.
+    /// `evo-smb-user-sync add|delete` returned non-zero.
     #[error(
-        "smbpasswd failed for {username}: exit={exit_code:?}, stderr={stderr}"
+        "smb user sync failed for {username}: exit={exit_code:?}, stderr={stderr}"
     )]
-    SmbpasswdFailed {
-        /// The user the smbpasswd command targeted.
+    UserSyncFailed {
+        /// The user the sync wrapper targeted.
         username: String,
-        /// smbpasswd exit code.
+        /// wrapper exit code.
         exit_code: Option<i32>,
         /// verbatim stderr snippet.
         stderr: String,
@@ -441,6 +441,19 @@ pub enum ApplyError {
         /// The username the caller asked to add.
         username: String,
     },
+    /// Username failed the inventory pattern
+    /// (`^[a-z_][a-z0-9_-]{0,31}$` after lowercasing).
+    #[error("invalid smb username {username}")]
+    InvalidUsername {
+        /// The username the caller supplied.
+        username: String,
+    },
+    /// Username is reserved (OS / steward / system identity).
+    #[error("smb username {username} is reserved")]
+    BlockedUsername {
+        /// The username the caller supplied.
+        username: String,
+    },
 }
 
 /// Rendered subprocess output shape (mirrors
@@ -462,7 +475,7 @@ pub trait SambaExecutor: Send + Sync {
     /// Invoke a program with the supplied argv and a
     /// per-call timeout budget in milliseconds. If
     /// `stdin_bytes` is non-empty, feed it into the child's
-    /// stdin (used for `smbpasswd -a` password entry).
+    /// stdin (used for `evo-smb-user-sync add` password entry).
     async fn run(
         &self,
         program: &str,
@@ -803,7 +816,7 @@ fn matched_denylist_prefix<'a>(
 }
 
 /// Sudo binary path the plugin invokes to reach each of the
-/// four privileged subprocesses (testparm / smbpasswd /
+/// four privileged subprocesses (testparm / evo-smb-user-sync /
 /// systemctl restart smbd / install → /etc/samba/smb.conf).
 /// The distribution's `dist/sudoers.d/evo-samba-server.in`
 /// grants `NOPASSWD` on the exact absolute command paths, so
@@ -815,8 +828,10 @@ pub const DEFAULT_SUDO_PROGRAM: &str = "/usr/bin/sudo";
 /// Absolute path to `testparm` on Debian/Ubuntu-family hosts.
 pub const DEFAULT_TESTPARM_PATH: &str = "/usr/bin/testparm";
 
-/// Absolute path to `smbpasswd` on Debian/Ubuntu-family hosts.
-pub const DEFAULT_SMBPASSWD_PATH: &str = "/usr/bin/smbpasswd";
+/// Absolute path to the SMB user provisioner wrapper installed
+/// by bootstrap (`dist/bin/evo-smb-user-sync` →
+/// `/usr/local/bin/evo-smb-user-sync`).
+pub const DEFAULT_SMB_USER_SYNC_PATH: &str = "/usr/local/bin/evo-smb-user-sync";
 
 /// Absolute path to `systemctl` on Debian/Ubuntu-family hosts.
 pub const DEFAULT_SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
@@ -827,9 +842,9 @@ pub const DEFAULT_INSTALL_PATH: &str = "/usr/bin/install";
 /// Service-user-writable candidate path the runtime renders the
 /// smb.conf into BEFORE the `sudo install` step drops it
 /// atomically into `/etc/samba/smb.conf`. Living in `/var/tmp`
-/// so the service user (evoproto by default) can write without
-/// sudo AND the sudoers alias below can name the exact source
-/// path.
+/// so the distribution's steward service user can write
+/// without sudo AND the sudoers alias below can name the
+/// exact source path.
 pub const DEFAULT_SMB_CONF_CANDIDATE_PATH: &str =
     "/var/tmp/evo-smb.conf.candidate";
 
@@ -846,26 +861,120 @@ pub fn build_testparm_args(config_path: &Path) -> Vec<String> {
     ]
 }
 
-/// Build the argv for `sudo -n smbpasswd -a -s <user>` (add +
-/// read password from stdin).
-pub fn build_smbpasswd_add_args(username: &str) -> Vec<String> {
+/// Build the argv for `sudo -n evo-smb-user-sync add <user>`
+/// (password once on stdin; wrapper doubles for smbpasswd -s).
+pub fn build_smb_user_sync_add_args(username: &str) -> Vec<String> {
     vec![
         "-n".to_string(),
-        DEFAULT_SMBPASSWD_PATH.to_string(),
-        "-a".to_string(),
-        "-s".to_string(),
+        DEFAULT_SMB_USER_SYNC_PATH.to_string(),
+        "add".to_string(),
         username.to_string(),
     ]
 }
 
-/// Build the argv for `sudo -n smbpasswd -x <user>` (delete).
-pub fn build_smbpasswd_delete_args(username: &str) -> Vec<String> {
+/// Build the argv for `sudo -n evo-smb-user-sync delete <user>`.
+pub fn build_smb_user_sync_delete_args(username: &str) -> Vec<String> {
     vec![
         "-n".to_string(),
-        DEFAULT_SMBPASSWD_PATH.to_string(),
-        "-x".to_string(),
+        DEFAULT_SMB_USER_SYNC_PATH.to_string(),
+        "delete".to_string(),
         username.to_string(),
     ]
+}
+
+/// Fixed blocklist for SMB login names — generic OS + Samba +
+/// audio-plane identities that MUST NOT become LAN
+/// file-share credentials on any distribution. The live
+/// steward service user (whatever the distribution configured
+/// it as) is added dynamically at validation time by
+/// [`blocked_smb_usernames`] reading `EVO_SERVICE_USER` and
+/// `USER`, so a vendor distribution with a non-audio-reference
+/// service-user name inherits the protection without editing
+/// this array.
+pub const SMB_USERNAME_BLOCKLIST: &[&str] = &[
+    "root",
+    "nobody",
+    "nfsnobody",
+    "daemon",
+    "bin",
+    "sys",
+    "sync",
+    "games",
+    "man",
+    "lp",
+    "mail",
+    "news",
+    "uucp",
+    "proxy",
+    "www-data",
+    "backup",
+    "list",
+    "irc",
+    "gnats",
+    "systemd-network",
+    "systemd-resolve",
+    "messagebus",
+    "sshd",
+    "smbd",
+    "nmbd",
+    "avahi",
+    "mpd",
+];
+
+/// Lowercase + shape-check an SMB username
+/// (`^[a-z_][a-z0-9_-]{0,31}$`). Used by revoke so a
+/// previously-persisted name can still be removed even if it
+/// later became blocklisted.
+pub fn normalize_smb_username(raw: &str) -> Result<String, ApplyError> {
+    let username = raw.trim().to_ascii_lowercase();
+    if !is_valid_smb_username_shape(&username) {
+        return Err(ApplyError::InvalidUsername { username });
+    }
+    Ok(username)
+}
+
+/// Normalise + refuse blocklisted names per
+/// `docs/SAMBA-SHARES.md` § Username rules. Used by add.
+pub fn validate_smb_username(raw: &str) -> Result<String, ApplyError> {
+    let username = normalize_smb_username(raw)?;
+    if blocked_smb_usernames().iter().any(|b| b == &username) {
+        return Err(ApplyError::BlockedUsername { username });
+    }
+    Ok(username)
+}
+
+fn is_valid_smb_username_shape(username: &str) -> bool {
+    // `^[a-z_][a-z0-9_-]{0,31}$`
+    let bytes = username.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first == b'_') {
+        return false;
+    }
+    bytes[1..].iter().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-'
+    })
+}
+
+fn blocked_smb_usernames() -> Vec<String> {
+    let mut out: Vec<String> = SMB_USERNAME_BLOCKLIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // Live steward identity — USER is set when the wire binary
+    // runs as the service account; EVO_SERVICE_USER is an
+    // optional override for distributions that set it.
+    for key in ["EVO_SERVICE_USER", "USER"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_ascii_lowercase();
+            if !v.is_empty() && !out.iter().any(|b| b == &v) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 /// Build the argv for `sudo -n systemctl restart smbd`.
@@ -953,9 +1062,9 @@ pub struct SambaServerRuntime {
     executor: Arc<dyn SambaExecutor>,
     credentials: Arc<dyn SmbCredentialFetcher>,
     /// Absolute path to `sudo` — every privileged subprocess
-    /// (testparm / smbpasswd / systemctl / install) shells
-    /// out through this so the sudoers alias grants match
-    /// byte-for-byte. Overridable for tests + hosts with
+    /// (testparm / evo-smb-user-sync / systemctl / install)
+    /// shells out through this so the sudoers alias grants
+    /// match byte-for-byte. Overridable for tests + hosts with
     /// non-standard sudo locations.
     sudo_program: String,
     smb_conf_path: PathBuf,
@@ -1176,18 +1285,20 @@ impl SambaServerRuntime {
         })
     }
 
-    /// Add an SMB user. Fetches password bytes from the vault
-    /// via [`SmbCredentialFetcher::fetch_password`] and pipes
-    /// them into `smbpasswd -a -s <user>` twice (the tool
-    /// prompts for the password twice for confirmation). On
-    /// success, persists the [`SmbUserRecord`] and republishes
-    /// the reactive subject.
+    /// Add an SMB user. Validates the username, fetches
+    /// password bytes from the vault via
+    /// [`SmbCredentialFetcher::fetch_password`], and pipes
+    /// them once into `evo-smb-user-sync add <user>` (the
+    /// wrapper creates the nologin NSS account and doubles the
+    /// password for `smbpasswd -s`). On success, persists the
+    /// [`SmbUserRecord`] and republishes the reactive subject.
     pub async fn add_user(
         &self,
         username: String,
         credential_key: String,
         mapped_domain_identity: Option<String>,
     ) -> Result<SmbUserRecord, ApplyError> {
+        let username = validate_smb_username(&username)?;
         {
             let g = self.inner.lock().await;
             if g.state.smb_users.iter().any(|u| u.username == username) {
@@ -1203,13 +1314,11 @@ impl SambaServerRuntime {
             key: credential_key.clone(),
         })?;
 
-        // smbpasswd -a prompts for the password twice.
-        let mut stdin = password.clone();
-        stdin.push(b'\n');
-        stdin.extend_from_slice(&password);
+        // Wrapper reads password once; it doubles for smbpasswd -s.
+        let mut stdin = password;
         stdin.push(b'\n');
 
-        let args = build_smbpasswd_add_args(&username);
+        let args = build_smb_user_sync_add_args(&username);
         let out = self
             .executor
             .run(
@@ -1220,7 +1329,7 @@ impl SambaServerRuntime {
             )
             .await?;
         if out.exit_code != Some(0) {
-            return Err(ApplyError::SmbpasswdFailed {
+            return Err(ApplyError::UserSyncFailed {
                 username,
                 exit_code: out.exit_code,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -1243,28 +1352,29 @@ impl SambaServerRuntime {
         Ok(record)
     }
 
-    /// Revoke an SMB user via `smbpasswd -x <user>` and
-    /// remove the persisted record. Republishes the reactive
-    /// subject.
+    /// Revoke an SMB user via `evo-smb-user-sync delete <user>`
+    /// and remove the persisted record. Republishes the
+    /// reactive subject.
     pub async fn revoke_user(&self, username: &str) -> Result<(), ApplyError> {
+        let username = normalize_smb_username(username)?;
         let found = {
             let g = self.inner.lock().await;
             g.state.smb_users.iter().any(|u| u.username == username)
         };
         if !found {
             return Err(ApplyError::UserNotFound {
-                username: username.to_string(),
+                username: username.clone(),
             });
         }
 
-        let args = build_smbpasswd_delete_args(username);
+        let args = build_smb_user_sync_delete_args(&username);
         let out = self
             .executor
             .run(&self.sudo_program, &args, self.subprocess_timeout_ms, b"")
             .await?;
         if out.exit_code != Some(0) {
-            return Err(ApplyError::SmbpasswdFailed {
-                username: username.to_string(),
+            return Err(ApplyError::UserSyncFailed {
+                username: username.clone(),
                 exit_code: out.exit_code,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
@@ -1316,10 +1426,10 @@ impl SambaServerRuntimeBuilder {
 
     /// Override the sudo binary path (default
     /// [`DEFAULT_SUDO_PROGRAM`] = `/usr/bin/sudo`). Every
-    /// privileged subprocess (testparm / smbpasswd / systemctl
-    /// / install) shells through this program with the
-    /// underlying command's absolute path as the first arg so
-    /// the sudoers alias grants match byte-for-byte.
+    /// privileged subprocess (testparm / evo-smb-user-sync /
+    /// systemctl / install) shells through this program with
+    /// the underlying command's absolute path as the first arg
+    /// so the sudoers alias grants match byte-for-byte.
     pub fn with_sudo_program(mut self, program: String) -> Self {
         self.sudo_program = Some(program);
         self
@@ -2283,29 +2393,116 @@ mod tests {
     }
 
     #[test]
-    fn smbpasswd_add_args_shape() {
+    fn smb_user_sync_add_args_shape() {
         assert_eq!(
-            build_smbpasswd_add_args("producer"),
+            build_smb_user_sync_add_args("producer"),
             vec![
                 "-n".to_string(),
-                "/usr/bin/smbpasswd".to_string(),
-                "-a".to_string(),
-                "-s".to_string(),
+                "/usr/local/bin/evo-smb-user-sync".to_string(),
+                "add".to_string(),
                 "producer".to_string(),
             ]
         );
     }
 
     #[test]
-    fn smbpasswd_delete_args_shape() {
+    fn smb_user_sync_delete_args_shape() {
         assert_eq!(
-            build_smbpasswd_delete_args("producer"),
+            build_smb_user_sync_delete_args("producer"),
             vec![
                 "-n".to_string(),
-                "/usr/bin/smbpasswd".to_string(),
-                "-x".to_string(),
+                "/usr/local/bin/evo-smb-user-sync".to_string(),
+                "delete".to_string(),
                 "producer".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn validate_smb_username_accepts_canonical_names() {
+        assert_eq!(validate_smb_username("Producer").unwrap(), "producer");
+        assert_eq!(validate_smb_username("a").unwrap(), "a");
+        assert_eq!(
+            validate_smb_username("user_name-1").unwrap(),
+            "user_name-1"
+        );
+    }
+
+    #[test]
+    fn validate_smb_username_rejects_invalid_shape() {
+        assert!(matches!(
+            validate_smb_username("Bad Name"),
+            Err(ApplyError::InvalidUsername { .. })
+        ));
+        assert!(matches!(
+            validate_smb_username("9bad"),
+            Err(ApplyError::InvalidUsername { .. })
+        ));
+        assert!(matches!(
+            validate_smb_username(""),
+            Err(ApplyError::InvalidUsername { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_smb_username_rejects_blocklist() {
+        // Fixed-array blocklist — generic OS + Samba
+        // identities that MUST NOT become SMB logins on any
+        // distribution.
+        assert!(matches!(
+            validate_smb_username("root"),
+            Err(ApplyError::BlockedUsername { .. })
+        ));
+        assert!(matches!(
+            validate_smb_username("nobody"),
+            Err(ApplyError::BlockedUsername { .. })
+        ));
+        assert!(matches!(
+            validate_smb_username("smbd"),
+            Err(ApplyError::BlockedUsername { .. })
+        ));
+        assert!(matches!(
+            validate_smb_username("mpd"),
+            Err(ApplyError::BlockedUsername { .. })
+        ));
+        // The distribution-configured service user is added
+        // dynamically at validation time via env-var pickup
+        // in `blocked_smb_usernames`; asserted separately in
+        // `validate_smb_username_rejects_env_service_user`
+        // where the env var is injected under test scope.
+    }
+
+    /// The runtime picks up the live steward service user from
+    /// `EVO_SERVICE_USER` (or `USER` as fallback) and blocks
+    /// that name from becoming an SMB login. This test injects
+    /// a synthetic service-user name into `EVO_SERVICE_USER`
+    /// so the assertion does not depend on the ambient test
+    /// process's `$USER`.
+    ///
+    /// Uses `serial_test`'s serial marker if present; here we
+    /// unset the env var immediately after the assertion so a
+    /// parallel test cannot observe the injected value beyond
+    /// this scope. The window is small enough that concurrent
+    /// tests reading `blocked_smb_usernames()` at exactly the
+    /// wrong instant would still pass their own assertions
+    /// (they check for their own hardcoded names, not this
+    /// synthetic one).
+    #[test]
+    fn validate_smb_username_rejects_env_service_user() {
+        const SENTINEL: &str = "test-injected-service-user";
+        // SAFETY: env-var mutation is unsound in multi-threaded
+        // tests. Rust 1.86+ marks `set_var`/`remove_var`
+        // `unsafe` for that reason; older toolchains hide the
+        // marker but the discipline is the same. We accept the
+        // small window because the sentinel string does not
+        // collide with any other test's assertions and the
+        // scope of the injection is bounded to this function.
+        std::env::set_var("EVO_SERVICE_USER", SENTINEL);
+        let outcome = validate_smb_username(SENTINEL);
+        std::env::remove_var("EVO_SERVICE_USER");
+        assert!(
+            matches!(outcome, Err(ApplyError::BlockedUsername { .. })),
+            "expected env-var-detected service user to be blocked, got: {outcome:?}"
         );
     }
 
@@ -2633,7 +2830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_user_pipes_password_twice_and_persists_record() {
+    async fn add_user_pipes_password_once_and_persists_record() {
         let dir = tempdir();
         let mut creds = HashMap::new();
         creds.insert("vault:smb:producer".to_string(), b"s3cret".to_vec());
@@ -2650,12 +2847,26 @@ mod tests {
         assert_eq!(record.credential_key, "vault:smb:producer");
         let calls = executor.calls.lock().await;
         assert_eq!(calls.len(), 1);
-        // Password piped twice separated by newlines.
-        assert_eq!(calls[0].2, b"s3cret\ns3cret\n".to_vec());
+        assert_eq!(calls[0].1, build_smb_user_sync_add_args("producer"));
+        // Password piped once; wrapper doubles for smbpasswd -s.
+        assert_eq!(calls[0].2, b"s3cret\n".to_vec());
         // Persisted.
         let state = rt.get_state().await;
         assert_eq!(state.smb_users.len(), 1);
         assert_eq!(state.smb_users[0].username, "producer");
+    }
+
+    #[tokio::test]
+    async fn add_user_blocklisted_returns_blocked_username() {
+        let dir = tempdir();
+        let mut creds = HashMap::new();
+        creds.insert("k".to_string(), b"pw".to_vec());
+        let (rt, _) = built_runtime(&dir, Vec::new(), creds);
+        let err = rt
+            .add_user("root".to_string(), "k".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::BlockedUsername { .. }));
     }
 
     #[tokio::test]

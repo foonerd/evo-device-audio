@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# evo-smb-user-sync — narrow root-only SMB user provisioner.
+#
+# Invoked as:
+#   sudo -n /usr/local/bin/evo-smb-user-sync add <username>
+#     password on the first line of stdin
+#   sudo -n /usr/local/bin/evo-smb-user-sync delete <username>
+#
+# Normative contract:
+#   plugins/org.evoframework.network.smb-server/docs/SAMBA-SHARES.md
+#   § SMB users (authenticated access)
+#
+# Add: ensure a non-login system account (nologin, no home), then
+#      smbpasswd -a -s. Never creates a login shell.
+# Delete: smbpasswd -x, then userdel ONLY when the NSS entry
+#         matches the provisioned shape (nologin + /nonexistent).
+#
+# This script is the trust boundary for user provisioning. The
+# steward must NOT be granted raw useradd / userdel / smbpasswd
+# via sudoers — only this wrapper.
+
+set -euo pipefail
+
+ACTION="${1:-}"
+USERN="${2:-}"
+
+die() {
+  echo "evo-smb-user-sync: $*" >&2
+  exit 1
+}
+
+[[ -n "${USERN}" ]] || die "missing username"
+
+# Username discipline — matches SAMBA-SHARES.md / volumio-evo.
+[[ "${USERN}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+  || die "invalid username — use [a-z_][a-z0-9_-]{0,31}"
+
+# Steward service user is substituted at install time for
+# `@EVO_SERVICE_USER@` (see bootstrap Step 1f). Hardcoded so
+# sudo's env_reset cannot strip the check.
+SERVICE_USER="@EVO_SERVICE_USER@"
+
+# Hard blocklist — never promote OS / steward identities to SMB logins.
+is_blocked() {
+  local n="$1"
+  case "${n}" in
+    root|nobody|nfsnobody|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|systemd-network|systemd-resolve|messagebus|sshd|smbd|nmbd|avahi|mpd)
+      return 0
+      ;;
+  esac
+  if [[ -n "${SERVICE_USER}" && "${SERVICE_USER}" != "@EVO_SERVICE_USER@" && "${n}" == "${SERVICE_USER}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+if is_blocked "${USERN}"; then
+  die "username '${USERN}' is reserved — refuse to use as SMB login"
+fi
+
+nologin_path() {
+  local p
+  p="$(command -v nologin 2>/dev/null || true)"
+  if [[ -n "${p}" && -x "${p}" ]]; then
+    echo "${p}"
+    return
+  fi
+  echo "/usr/sbin/nologin"
+}
+
+is_provisioned_shape() {
+  # True when NSS entry looks like one we created: nologin/false shell
+  # and home /nonexistent (or empty).
+  local n="$1"
+  id -u "${n}" &>/dev/null || return 1
+  local shell home
+  shell="$(getent passwd "${n}" | awk -F: '{print $7}')"
+  home="$(getent passwd "${n}" | awk -F: '{print $6}')"
+  case "${shell}" in
+    */nologin|/bin/false|/usr/bin/false) ;;
+    *) return 1 ;;
+  esac
+  case "${home}" in
+    /nonexistent|"") ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+case "${ACTION}" in
+  add)
+    IFS= read -r PASS || true
+    [[ -n "${PASS}" ]] || die "empty password on stdin"
+
+    if id -u "${USERN}" &>/dev/null; then
+      # Existing account: only reuse if it is already our
+      # non-login shape. Never attach Samba credentials to a
+      # login shell account.
+      if ! is_provisioned_shape "${USERN}"; then
+        die "username '${USERN}' already exists as a non-SMB system account — refuse"
+      fi
+    else
+      NOLOGIN="$(nologin_path)"
+      useradd -r -s "${NOLOGIN}" -d /nonexistent "${USERN}" \
+        || die "useradd failed for ${USERN}"
+    fi
+
+    # smbpasswd -s reads password twice from stdin.
+    if ! printf '%s\n%s\n' "${PASS}" "${PASS}" \
+      | smbpasswd -a -s "${USERN}"; then
+      die "smbpasswd -a failed for ${USERN}"
+    fi
+    ;;
+
+  delete)
+    smbpasswd -x "${USERN}" 2>/dev/null || true
+    if id -u "${USERN}" &>/dev/null; then
+      if is_provisioned_shape "${USERN}"; then
+        userdel "${USERN}" 2>/dev/null \
+          || die "userdel failed for ${USERN}"
+      else
+        # Leave foreign NSS accounts alone; passdb row already cleared.
+        echo "evo-smb-user-sync: leaving non-provisioned NSS account '${USERN}' in place" >&2
+      fi
+    fi
+    ;;
+
+  *)
+    die "usage: $0 <add|delete> <username> (password on stdin for add)"
+    ;;
+esac

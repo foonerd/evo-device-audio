@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Framework-reference SMB-server plugin. Stocks the networking.shares shelf's SMB-server verb subset (network.smb_server.apply / user_add / user_revoke / get_state). Owns the persisted SMB-server configuration (enabled + min_protocol + extra_shares + smb_users), renders smb.conf with path-allowlist enforcement, validates via testparm, restarts smbd, adds/revokes SMB users via smbpasswd (password piped through stdin from the vault; never on argv), and publishes the reactive system_smb_server subject. Independent of the shares mount client — a distribution shipping mount-only omits this plugin."
+description = "Framework-reference SMB-server plugin. Stocks the networking.shares shelf's SMB-server verb subset (network.smb_server.apply / user_add / user_revoke / get_state). Owns the persisted SMB-server configuration (enabled + min_protocol + extra_shares + smb_users), renders smb.conf with path-allowlist enforcement, validates via testparm, restarts smbd, adds/revokes SMB users via evo-smb-user-sync (nologin NSS + smbpasswd; password piped through stdin from the vault; never on argv), and publishes the reactive system_smb_server subject. Independent of the shares mount client — a distribution shipping mount-only omits this plugin."
 
 [lib]
 path = "src/lib.rs"

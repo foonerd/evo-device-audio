@@ -8,9 +8,10 @@
 //! protocol` selector + operator-defined `extra_shares` + SMB
 //! users), renders `smb.conf` from that state, validates via
 //! `testparm -s`, installs over `/etc/samba/smb.conf`, restarts
-//! `smbd`, and manages SMB users via `smbpasswd`. Publishes the
-//! reactive `system_smb_server` subject on every apply /
-//! user_add / user_revoke transition.
+//! `smbd`, and manages SMB users via `evo-smb-user-sync`
+//! (nologin NSS + Samba passdb). Publishes the reactive
+//! `system_smb_server` subject on every apply / user_add /
+//! user_revoke transition.
 //!
 //! Sibling plugin `org.evoframework.network.shares` stocks the
 //! share-management + discovery verb subset on the same shelf;
@@ -39,13 +40,13 @@
 //!
 //! ## Sudoers grant
 //!
-//! testparm + smbpasswd + `systemctl restart smbd` are invoked
-//! under the narrow `EVO_SAMBA_SERVER_CONFIG` +
+//! testparm + `evo-smb-user-sync` + `systemctl restart smbd`
+//! are invoked under the narrow `EVO_SAMBA_SERVER_CONFIG` +
 //! `EVO_SAMBA_SERVER_USERS` + `EVO_SAMBA_SERVER_RESTART`
 //! Cmnd_Aliases shipped in
-//! `dist/sudoers.d/evo-samba-server.in`. The distribution's
-//! bootstrap script renders + installs the drop-in at mode
-//! 0440 root:root.
+//! `dist/sudoers.d/evo-samba-server.in`. Bootstrap installs
+//! the wrapper to `/usr/local/bin/evo-smb-user-sync` and the
+//! sudoers drop-in at mode 0440 root:root.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

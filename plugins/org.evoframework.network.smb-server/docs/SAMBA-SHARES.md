@@ -130,6 +130,159 @@ match this table.
 
 ---
 
+## SMB users (authenticated access)
+
+Named SMB users are how an operator authenticates to
+non-guest shares (today: `evo-plugins-stage`) without ever
+using a shell on the device. Guest-ok stock shares
+(`Internal Storage`, `USB`, `NAS`, `Uploads`) do not require
+a named user; authenticated shares do.
+
+The File Sharing UI (`network.smb_server.user_add` /
+`user_revoke`) is the only supported management path.
+Requiring `useradd` / `smbpasswd` by hand on the device is a
+defect — the UI exists so the operator never needs a shell.
+
+### Samba constraint (why a Unix name still appears)
+
+This distribution runs Samba with `security = user` and the
+default `tdbsam` passdb. Under that mode:
+
+1. `smbpasswd -a <name>` (and `pdbedit -a`) requires `<name>`
+   to resolve via NSS (`getpwnam`) **before** a passdb row can
+   be created. Calling `smbpasswd -a` alone for a name that
+   does not exist fails (`Failed to add entry for user …`).
+2. Share sections set `force user` / `force group` (see
+   renderer) so **file ownership on disk does not follow the
+   SMB login**. Authenticated and guest writers land under the
+   forced identity. The NSS entry exists for Samba's auth
+   machinery, not to give the operator a login or a home
+   directory.
+
+Therefore: each named SMB user has a **non-login system
+account** plus a Samba passdb entry. That is not a “shell
+account” in the product sense — no interactive shell, no
+home, no SSH grant. It is the appliance pattern volumio-evo
+already ships (`useradd -r -s nologin -d /nonexistent`).
+
+**Out of scope / rejected:** inventing a passdb-only username
+with zero NSS entry while staying on stock `security = user`
++ `tdbsam`. That combination does not work on the Debian
+Samba this distribution runs. Changing Samba security mode
+or passdb backend is a separate design decision, not a silent
+shortcut in `user_add`.
+
+**Rejected:** adding the distribution-configured steward
+service user, `root`, `nobody`, or other system identities as
+SMB logins. Those accounts exist for the OS / steward; they
+MUST NOT be promoted to LAN file-share credentials. The live
+service-user name is picked up dynamically from
+`EVO_SERVICE_USER` (or `USER`) at validation time so the
+protection travels with every distribution regardless of the
+name it chose.
+
+### Provisioning lifecycle (normative)
+
+All steps run elevated via a **narrow wrapper** (sudoers grants
+the wrapper only — not free-form `useradd` / `userdel` argv).
+Password bytes come from the credential vault and are piped on
+stdin; they NEVER appear on argv or in plugin state TOML.
+
+**Add** (`network.smb_server.user_add`):
+
+1. Validate username (see below) and refuse blocklisted names.
+2. Refuse if the name is already in persisted `smb_users`.
+3. Resolve password bytes from the vault via `credential_key`.
+4. If NSS has no user for that name: create a system account
+   with **no login shell**, **no home**, system/UID range, e.g.
+   `useradd -r -s /usr/sbin/nologin -d /nonexistent <name>`
+   (distro-equivalent). Do **not** use a login shell
+   (`/bin/bash`, `/bin/sh`, …).
+5. `smbpasswd -a -s <name>` with password on stdin (twice, as
+   `smbpasswd -s` requires).
+6. Persist `SmbUserRecord` (username, optional
+   `mapped_domain_identity`, `created_at_ms`, `credential_key`)
+   and republish `system_smb_server`.
+
+**Revoke** (`network.smb_server.user_revoke`):
+
+1. Refuse if the name is not in persisted `smb_users`.
+2. `smbpasswd -x <name>` (ignore already-absent passdb).
+3. Remove the NSS account created for this SMB user
+   (`userdel <name>`), only when it matches the provisioned
+   shape (nologin + nonexistent home). Do **not** `userdel`
+   accounts the plugin did not create (blocklist / pre-existing
+   system users).
+4. Drop the persisted record and republish.
+
+An implementation that only calls `smbpasswd` and never
+creates/removes the non-login NSS entry is **non-compliant**
+with this inventory — that is the 2026-08-06 File Sharing
+failure mode (UI Add user cannot mint a new name).
+
+### Username rules
+
+| Rule | Value |
+|------|--------|
+| Pattern | `^[a-z_][a-z0-9_-]{0,31}$` (same discipline as volumio-evo sync) |
+| Case | Store and pass to Samba in lowercase |
+| Blocklist | At minimum: `root`, `nobody`, `nfsnobody`, the configured steward service user, `smbd`, `sshd`, `www-data`. Extensible in code; must include the live service user at runtime. |
+
+### Password rules
+
+| Rule | Detail |
+|------|--------|
+| Wire | UI never sends password bytes on `user_add`; it sends `credential_key` only. |
+| Device | Plugin fetches bytes from the vault at provision time; pipes to the wrapper / `smbpasswd -s`. |
+| Persistence | Plugin state TOML holds usernames + vault key refs only — never password material. |
+
+### File ownership (already decided on shares)
+
+Stock, delivery, and extra share sections render
+`force user` / `force group` so writes do not depend on a
+per-SMB-user UID. Provisioned nologin accounts therefore do
+not need group membership on the music / uploads / stage
+trees for basic RW via `force user`. If a future share drops
+`force user`, this section must be revisited before ship.
+
+### Domain link (optional field)
+
+`SmbUserRecord.mapped_domain_identity` may link an SMB user to
+a domain member. Visitor accounts leave it unset. Revoking
+domain membership MUST eventually revoke the linked SMB user
+(cascade per the network file-source contract). Cascade wiring
+is separate from the provision/revoke primitive above; both
+must remain consistent.
+
+### Privileges / sudoers
+
+| Grant | Purpose |
+|-------|---------|
+| Wrapper script only (`/usr/local/bin/evo-smb-user-sync`) | `add` / `delete` actions; password on stdin for add |
+| Not granted | Raw `useradd`, `userdel`, or unrestricted `smbpasswd` argv from the steward |
+
+The wrapper is distribution-owned (ships at
+`dist/bin/evo-smb-user-sync`, installed by bootstrap),
+analogous to volumio-evo's `volumio-evo-smb-user-sync.sh`.
+`privileges.yaml` capability `smb_user_provision` covers this
+surface and names account create/delete, not `smbpasswd`
+alone.
+
+### Acceptance (users)
+
+1. From File Sharing UI, add a **new** username that does not
+   exist on the device → succeeds; `getent passwd <name>`
+   shows nologin / nonexistent home; `pdbedit -L` lists the
+   name; login to `evo-plugins-stage` with that password works.
+2. Same name cannot be added twice (structured already-exists).
+3. Blocklisted names (steward user, `root`, …) refuse with a
+   clear error — no shell workaround suggested.
+4. Revoke removes passdb + the nologin NSS entry + persisted
+   record; SMB auth with that password fails.
+5. Operator never needs SSH/`useradd` for the happy path.
+
+---
+
 ## Forbidden on the LAN (never advertise)
 
 After a successful enable/apply, a browse of the device MUST NOT
@@ -156,8 +309,9 @@ With SMB enabled on a cold or warm apply:
 1. Browse `\\<device>` / `smb://<device>/`.
 2. **Must** list: `Internal Storage`, `USB`, `NAS`, `evo-plugins-stage`, `Uploads`.
 3. **Must not** list: `print$`, `nobody`, `homes`, `printers`, or any share not in this inventory / operator extras.
-4. Drop a signed plugin bundle on `evo-plugins-stage` → stage watcher admits (or rejects into `rejected/` with reason).
+4. Drop a signed plugin bundle on `evo-plugins-stage` → stage watcher admits (or rejects into `rejected/` with reason). Authenticated drop requires an SMB user provisioned per **SMB users** above.
 5. Drop a music file on `Internal Storage` → visible under INTERNAL in the library after MPD update.
+6. SMB user add/revoke acceptance: see **SMB users → Acceptance**.
 
 ---
 
@@ -167,7 +321,8 @@ With SMB enabled on a cold or warm apply:
 |---------|-----------|
 | Stock + delivery shares | Shown as fixed (not editable path/name); clarify guest vs auth for `evo-plugins-stage`. |
 | Extra shares | List editor (name, path, guest_ok) per `shares.v1.toml`. |
-| Enable / min_protocol / SMB users | Existing File Sharing controls. |
+| Enable / min_protocol | Existing File Sharing controls. |
+| SMB users | Add/list/revoke by username; password via device vault prompt only. UI does not create Unix accounts — the device provision path does. No need to “pick a running system user.” |
 
 Copy that claims “share this device's library” is true only while
 the stock music shares exist in the rendered conf.
@@ -186,6 +341,6 @@ the stock music shares exist in the rendered conf.
 ## Change discipline
 
 1. Edit this file.
-2. Update renderer + allow/deny constants + bootstrap mkdirs in the same change set.
-3. If the inventory gains/removes a stock or delivery share, update the companion design record only when the *invariant* changes; do not duplicate the table into that record.
-4. Schema (`extra_shares` “beyond shipped defaults”) stays aligned with the stock/delivery sections above.
+2. Update renderer + allow/deny constants + bootstrap mkdirs + user-provision wrapper/sudoers in the same change set.
+3. If the inventory gains/removes a stock or delivery share, or changes the SMB-user provision model, update the companion design record only when the *invariant* changes; do not duplicate tables into that record.
+4. Schema (`extra_shares` “beyond shipped defaults”; `smb_users`) stays aligned with the stock/delivery and **SMB users** sections above.

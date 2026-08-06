@@ -17,10 +17,13 @@
 #    the target if the operator's candidate path is under
 #    a privileged directory.
 #
-# 2. `EVO_SAMBA_SERVER_USERS` — `smbpasswd -a -s <user>` +
-#    `smbpasswd -x <user>` add + revoke SMB users. Passwords
-#    are piped through the child's stdin from the evo
-#    credential vault; the argv itself never carries them.
+# 2. `EVO_SAMBA_SERVER_USERS` — narrow wrapper
+#    `/usr/local/bin/evo-smb-user-sync {add|delete} <user>`.
+#    The wrapper creates a non-login system account (nologin,
+#    no home) then runs `smbpasswd`; passwords are piped on
+#    stdin for `add` (never on argv). The steward MUST NOT be
+#    granted raw `useradd` / `userdel` / `smbpasswd` — only
+#    this wrapper. See docs/SAMBA-SHARES.md § SMB users.
 #
 # 3. `EVO_SAMBA_SERVER_RESTART` — `systemctl restart smbd`.
 #    Fires on every successful apply where enabled=true.
@@ -50,21 +53,18 @@
 #    verbatim so the alias grant matches byte-for-byte and no
 #    other install invocation can slip through.
 #
-# Path discipline: the testparm, smbpasswd, systemctl paths
-# MUST match the runtime builder's defaults
-# (`with_testparm_program` / `with_smbpasswd_program` /
-# `with_systemctl_program` — default `/usr/bin/testparm`,
-# `/usr/bin/smbpasswd`, `/usr/bin/systemctl`). Distributions
-# with non-standard paths override via the builder and add new
-# substitutions to the bootstrap script.
+# Path discipline: the testparm, evo-smb-user-sync, systemctl
+# paths MUST match the runtime builder's defaults
+# (`DEFAULT_TESTPARM_PATH` / `DEFAULT_SMB_USER_SYNC_PATH` /
+# `DEFAULT_SYSTEMCTL_PATH`). Distributions with non-standard
+# paths override via the builder and add new substitutions to
+# the bootstrap script.
 #
 # Argv scoping: the runtime's argv builders emit fixed shapes
-# — `testparm -s <path>`, `smbpasswd -a -s <user>`,
-# `smbpasswd -x <user>`, `systemctl restart smbd`. Argv
-# wildcarding at the sudoers layer is intentionally not
-# applied on the smbpasswd surface (usernames vary at
-# operator control); the runtime's builder is the trust
-# boundary. `systemctl restart` is scoped exactly to `smbd`.
+# — `testparm -s <path>`, `evo-smb-user-sync add|delete
+# <user>`, `systemctl restart smbd`. The user-sync wrapper is
+# the trust boundary for provisioning (username validation +
+# blocklist + nologin account shape).
 #
 # Apply via the bootstrap script:
 #   scripts/bootstrap.sh --install-samba-server-sudoers
@@ -82,7 +82,8 @@ Cmnd_Alias EVO_SAMBA_SERVER_CONFIG = \
     /usr/bin/testparm
 
 Cmnd_Alias EVO_SAMBA_SERVER_USERS = \
-    /usr/bin/smbpasswd
+    /usr/local/bin/evo-smb-user-sync add *, \
+    /usr/local/bin/evo-smb-user-sync delete *
 
 Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
     /usr/bin/systemctl restart smbd
