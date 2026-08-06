@@ -1158,6 +1158,42 @@ if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
             /var/lib/evo/music/NAS
     fi
     echo "[bootstrap] /var/lib/evo/music/{INTERNAL,USB,NAS} ensured (owner $SERVICE_USER, mode 0755)"
+
+    # SMB delivery / upload roots. Same evo state parent so the
+    # music, uploads, and plugin-stage planes live under one
+    # `/var/lib/evo` tree. Mode 0777 on /var/lib/evo/uploads is
+    # deliberate — the smb-server plugin's rendered stanza for
+    # Uploads sets `force user = root` + `force group = root`,
+    # but the directory is created before the plugin has admitted
+    # its state, and a subsequent non-Samba write path (curl
+    # upload; UI drag-and-drop) needs the same guest-shape write
+    # permission. Directory sticky bit stays off — uploaded
+    # files are not privileged and the plugin's `create mask =
+    # 0664` renders them world-readable but owner-writable so
+    # a downstream cleanup verb can prune without escalation.
+    install -d -m 0777 -o root -g root /var/lib/evo/uploads
+    echo "[bootstrap] /var/lib/evo/uploads ensured (mode 0777, root:root)"
+
+    # Plugin stage — the framework's stage watcher already
+    # creates this dir on first admission, but bootstrap
+    # provisioning is idempotent and precedes the first
+    # steward start so the SMB share (`evo-plugins-stage` in
+    # the smb-server plugin's rendered conf) has an
+    # advertise-ready target even before the framework
+    # touches it. Mode 0775 owner root, group SERVICE_USER
+    # (or SERVICE_USER:SERVICE_USER when the group does not
+    # exist) so the steward can write while the smb-server's
+    # `force user = root` translation keeps SMB writes under
+    # root.
+    if ! install -d -m 0775 -o root -g "$SERVICE_USER" \
+            /var/lib/evo/plugins \
+            /var/lib/evo/plugins/stage 2>/dev/null; then
+        install -d -m 0775 -o root -g root \
+            /var/lib/evo/plugins \
+            /var/lib/evo/plugins/stage
+    fi
+    echo "[bootstrap] /var/lib/evo/plugins/stage ensured (mode 0775, group $SERVICE_USER)"
+
     # mpd's music_directory must point at /var/lib/evo/music
     # before the restart later in this script. The line is
     # in /etc/mpd.conf (Debian shape: top-level

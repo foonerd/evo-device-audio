@@ -17,10 +17,12 @@
 //!   the operator-created SMB users.
 //! * Renders `smb.conf` from the persisted state + a pair of
 //!   distribution-supplied identity strings (`netbios_name` +
-//!   `workgroup`) and a path allowlist that refuses shares
-//!   outside the framework's expected paths (`/mnt/NAS`,
-//!   `/data/INTERNAL`, `/mnt/USB`, `/var/lib/evo/uploads` by
-//!   default).
+//!   `workgroup`) and a path allow/deny pair. Stock music
+//!   shares + delivery shares render whenever the server is
+//!   enabled; operator `extra_shares` render only when they
+//!   satisfy the allowlist AND do not trip the denylist.
+//!   Denylist beats allowlist. See the normative inventory
+//!   at `docs/SAMBA-SHARES.md`.
 //! * Validates the rendered config with `testparm -s` before
 //!   installing over `/etc/samba/smb.conf` and restarting
 //!   `smbd.service`.
@@ -82,15 +84,35 @@ pub const DEFAULT_SMB_CONF_PATH: &str = "/etc/samba/smb.conf";
 /// Pi 5).
 pub const DEFAULT_SAMBA_SUBPROCESS_TIMEOUT_MS: u64 = 10_000;
 
-/// Default extra_share path allowlist. Paths outside these
-/// prefixes are refused at apply time. Distributions with
-/// different filesystem conventions override via
+/// Default extra_share path allowlist for the audio
+/// distribution. Paths outside these prefixes are refused at
+/// apply time. Matches the normative inventory in
+/// `docs/SAMBA-SHARES.md` — the evo music plane, the uploads
+/// root, and the plugin stage. Classic Volumio prefixes
+/// (`/data/INTERNAL`, `/mnt/USB`, `/mnt/NAS`) are deliberately
+/// absent — the audio distribution's music plane is
+/// `/var/lib/evo/music/{INTERNAL,USB,NAS}`. Vendor
+/// distributions with a different layout override via
 /// [`SambaServerRuntimeBuilder::with_path_allowlist`].
 pub const DEFAULT_SHARE_PATH_ALLOWLIST: &[&str] = &[
-    "/mnt/NAS",
-    "/data/INTERNAL",
-    "/mnt/USB",
+    "/var/lib/evo/music",
     "/var/lib/evo/uploads",
+    "/var/lib/evo/plugins/stage",
+];
+
+/// Default extra_share path DENYlist. Paths matched here are
+/// refused at apply time even when they sit under an
+/// allowlisted root — the operator cannot expose the
+/// steward's secrets directory or the plugin-stage rejection
+/// dumping ground as an SMB share. Matches the denylist table
+/// in `docs/SAMBA-SHARES.md`.
+///
+/// Denylist wins over allowlist: refusal fires the moment any
+/// prefix here matches, even when the same path also matches
+/// an allowlist prefix.
+pub const DEFAULT_SHARE_PATH_DENYLIST: &[&str] = &[
+    "/var/lib/evo/settings",
+    "/var/lib/evo/plugins/stage/rejected",
 ];
 
 /// Default netbios name the framework advertises when the
@@ -558,6 +580,7 @@ pub fn render_smb_conf(
     netbios_name: &str,
     workgroup: &str,
     path_allowlist: &[String],
+    path_denylist: &[String],
 ) -> (String, Vec<String>, Vec<RefusedSetting>) {
     let mut out = String::new();
     out.push_str("[global]\n");
@@ -573,12 +596,109 @@ pub fn render_smb_conf(
     if let Some(min) = state.min_protocol.as_smbd_value() {
         out.push_str(&format!("server min protocol = {min}\n"));
     }
+    // Debian's default Samba persona surfaces a printer share
+    // (`print$`) driven by CUPS, a `[homes]` section that
+    // exposes per-user $HOME (often visible as `nobody` after
+    // guest mapping), and a `[printers]` share advertising
+    // print queues. None of them are product surfaces on this
+    // audio distribution. The `[global]` directives below
+    // disable the printer plane wholesale; the plugin's
+    // rendered conf omits any `[homes]` / `[printers]`
+    // section so Samba does not synthesise them. The
+    // `usershare max shares = 0` line disables the parallel
+    // per-user share database (`net usershare`) so an
+    // operator without root cannot backdoor a share into the
+    // running server.
+    out.push_str("load printers = no\n");
+    out.push_str("printing = bsd\n");
+    out.push_str("printcap name = /dev/null\n");
+    out.push_str("disable spoolss = yes\n");
+    out.push_str("usershare max shares = 0\n");
+    // Guest shares below rely on `force user = root` +
+    // `force group = root` so writes land under a stable
+    // identity regardless of which client (guest or
+    // authenticated) sent them. Files land under the music /
+    // uploads plane; the steward + MPD run under the service
+    // user which is either root or in the file group by
+    // bootstrap contract.
     out.push('\n');
 
     let mut applied: Vec<String> = Vec::new();
     let mut refused: Vec<RefusedSetting> = Vec::new();
 
+    // Stock shares — always rendered when the server is
+    // enabled. Order matches `docs/SAMBA-SHARES.md`. Section
+    // names carry the operator-facing capitalisation the
+    // inventory pins (`Internal Storage`, not
+    // `internal-storage`); Samba is case-insensitive on
+    // section names but the LAN browse displays the section
+    // string verbatim.
+    push_stock_share(
+        &mut out,
+        &mut applied,
+        "Internal Storage",
+        "/var/lib/evo/music/INTERNAL",
+        "evo local music library",
+        true,
+    );
+    push_stock_share(
+        &mut out,
+        &mut applied,
+        "USB",
+        "/var/lib/evo/music/USB",
+        "evo removable-media library",
+        true,
+    );
+    push_stock_share(
+        &mut out,
+        &mut applied,
+        "NAS",
+        "/var/lib/evo/music/NAS",
+        "evo NAS mount parent",
+        true,
+    );
+
+    // Delivery shares — `Uploads` (guest) + `evo-plugins-stage`
+    // (authenticated). The authenticated share does not set
+    // `guest ok = yes`; smb clients that do not present
+    // credentials are refused at the SMB layer and the share
+    // does not accept anonymous writes.
+    push_stock_share(
+        &mut out,
+        &mut applied,
+        "Uploads",
+        "/var/lib/evo/uploads",
+        "evo generic upload target",
+        true,
+    );
+    push_stock_share(
+        &mut out,
+        &mut applied,
+        "evo-plugins-stage",
+        "/var/lib/evo/plugins/stage",
+        "evo plugin bundle stage (framework stage watcher)",
+        false,
+    );
+
+    // Operator `extra_shares` render after the stock +
+    // delivery set. Deny-list beats allow-list: even a path
+    // that matches an allowlist root is refused when it also
+    // matches a denylist prefix (e.g. an operator trying to
+    // expose `/var/lib/evo/settings/` via an `extra_share`).
     for share in &state.extra_shares {
+        if let Some(deny) = matched_denylist_prefix(&share.path, path_denylist)
+        {
+            refused.push(RefusedSetting {
+                setting: share.name.clone(),
+                reason: format!(
+                    "path {} is under a framework denylist prefix ({}) — \
+                     shares under secrets / rejected-bundle paths are \
+                     never exported",
+                    share.path, deny,
+                ),
+            });
+            continue;
+        }
         if !path_matches_allowlist(&share.path, path_allowlist) {
             refused.push(RefusedSetting {
                 setting: share.name.clone(),
@@ -601,11 +721,46 @@ pub fn render_smb_conf(
             "        guest ok = {}\n",
             if share.guest_ok { "yes" } else { "no" },
         ));
+        out.push_str("        force user = root\n");
+        out.push_str("        force group = root\n");
+        out.push_str("        create mask = 0664\n");
+        out.push_str("        directory mask = 0775\n");
         out.push('\n');
         applied.push(share.name.clone());
     }
 
     (out, applied, refused)
+}
+
+/// Emit one stock or delivery share section into the rendered
+/// conf. Shape is identical across every share the inventory
+/// pins: `read only = no`, `force user = root`, `force group =
+/// root`, `create mask = 0664`, `directory mask = 0775`.
+/// `guest ok` is the per-share knob — stock music shares +
+/// Uploads are guest-writable; `evo-plugins-stage` is
+/// authenticated.
+fn push_stock_share(
+    out: &mut String,
+    applied: &mut Vec<String>,
+    name: &str,
+    path: &str,
+    comment: &str,
+    guest_ok: bool,
+) {
+    out.push_str(&format!("[{name}]\n"));
+    out.push_str(&format!("        comment = {comment}\n"));
+    out.push_str(&format!("        path = {path}\n"));
+    out.push_str("        read only = no\n");
+    out.push_str(&format!(
+        "        guest ok = {}\n",
+        if guest_ok { "yes" } else { "no" },
+    ));
+    out.push_str("        force user = root\n");
+    out.push_str("        force group = root\n");
+    out.push_str("        create mask = 0664\n");
+    out.push_str("        directory mask = 0775\n");
+    out.push('\n');
+    applied.push(name.to_string());
 }
 
 fn path_matches_allowlist(candidate: &str, allowlist: &[String]) -> bool {
@@ -622,6 +777,29 @@ fn path_matches_allowlist(candidate: &str, allowlist: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Returns `Some(prefix)` for the FIRST denylist prefix the
+/// candidate path matches. Prefix match rules mirror
+/// [`path_matches_allowlist`] — exact match or a slash-bounded
+/// subpath.
+fn matched_denylist_prefix<'a>(
+    candidate: &str,
+    denylist: &'a [String],
+) -> Option<&'a str> {
+    let normalised = candidate.trim_end_matches('/');
+    for prefix in denylist {
+        let p = prefix.trim_end_matches('/');
+        if normalised == p {
+            return Some(p);
+        }
+        if let Some(rest) = normalised.strip_prefix(p) {
+            if rest.starts_with('/') {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Build the argv for `testparm -s` (silent mode — prints the
@@ -706,6 +884,7 @@ pub struct SambaServerRuntime {
     netbios_name: String,
     workgroup: String,
     path_allowlist: Vec<String>,
+    path_denylist: Vec<String>,
     subprocess_timeout_ms: u64,
     publisher: StdMutex<Option<SambaPublisher>>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -751,6 +930,10 @@ impl SambaServerRuntime {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            path_denylist: DEFAULT_SHARE_PATH_DENYLIST
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             subprocess_timeout_ms: DEFAULT_SAMBA_SUBPROCESS_TIMEOUT_MS,
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
@@ -777,6 +960,7 @@ impl SambaServerRuntime {
             netbios_name: None,
             workgroup: None,
             path_allowlist: None,
+            path_denylist: None,
             subprocess_timeout_ms: None,
             now_fn: None,
         })
@@ -812,6 +996,7 @@ impl SambaServerRuntime {
                 &self.netbios_name,
                 &self.workgroup,
                 &self.path_allowlist,
+                &self.path_denylist,
             )
         };
 
@@ -1006,6 +1191,7 @@ pub struct SambaServerRuntimeBuilder {
     netbios_name: Option<String>,
     workgroup: Option<String>,
     path_allowlist: Option<Vec<String>>,
+    path_denylist: Option<Vec<String>>,
     subprocess_timeout_ms: Option<u64>,
     now_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -1069,6 +1255,18 @@ impl SambaServerRuntimeBuilder {
         self
     }
 
+    /// Override the extra_share path denylist. Any path that
+    /// matches a denylist prefix is refused at apply time
+    /// even when it would otherwise satisfy the allowlist —
+    /// denylist beats allowlist (secrets under
+    /// `/var/lib/evo/settings` cannot be exposed via an
+    /// `extra_share`, even though `/var/lib/evo/settings`
+    /// sits under an allowlisted root in a vendor override).
+    pub fn with_path_denylist(mut self, list: Vec<String>) -> Self {
+        self.path_denylist = Some(list);
+        self
+    }
+
     /// Override the per-subprocess timeout in milliseconds.
     pub fn with_subprocess_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.subprocess_timeout_ms = Some(timeout_ms);
@@ -1117,6 +1315,12 @@ impl SambaServerRuntimeBuilder {
                 .unwrap_or_else(|| DEFAULT_WORKGROUP.to_string()),
             path_allowlist: self.path_allowlist.unwrap_or_else(|| {
                 DEFAULT_SHARE_PATH_ALLOWLIST
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            }),
+            path_denylist: self.path_denylist.unwrap_or_else(|| {
+                DEFAULT_SHARE_PATH_DENYLIST
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect()
@@ -1545,7 +1749,7 @@ mod tests {
             min_protocol: MinProtocol::Smb3_02,
             extra_shares: vec![ExtraShare {
                 name: "Studio".to_string(),
-                path: "/mnt/NAS/studio".to_string(),
+                path: "/var/lib/evo/music/NAS/studio".to_string(),
                 guest_ok: false,
             }],
             smb_users: vec![SmbUserRecord {
@@ -1587,6 +1791,26 @@ mod tests {
 
     // ----- Renderer tests -----
 
+    /// Reference default allowlist + denylist for tests. Paths
+    /// under `/tmp` are added to keep unit tests hermetic when
+    /// they want to exercise operator `extra_shares` against a
+    /// tempdir rather than the on-target evo music plane.
+    fn test_allowlist() -> Vec<String> {
+        let mut v: Vec<String> = DEFAULT_SHARE_PATH_ALLOWLIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        v.push("/tmp".to_string());
+        v
+    }
+
+    fn test_denylist() -> Vec<String> {
+        DEFAULT_SHARE_PATH_DENYLIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
     #[test]
     fn render_smb_conf_emits_global_stanza_and_extra_share() {
         let state = SmbServerState {
@@ -1594,27 +1818,42 @@ mod tests {
             enabled: true,
             min_protocol: MinProtocol::Smb3_02,
             extra_shares: vec![ExtraShare {
-                name: "Uploads".to_string(),
-                path: "/var/lib/evo/uploads".to_string(),
+                name: "Studio".to_string(),
+                path: "/var/lib/evo/music/NAS/studio".to_string(),
                 guest_ok: true,
             }],
             smb_users: Vec::new(),
             last_apply_at_ms: None,
         };
-        let allowlist: Vec<String> = DEFAULT_SHARE_PATH_ALLOWLIST
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let (rendered, applied, refused) =
-            render_smb_conf(&state, "EvoTest", "STUDIO", &allowlist);
+        let (rendered, applied, refused) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "STUDIO",
+            &test_allowlist(),
+            &test_denylist(),
+        );
         assert!(rendered.contains("[global]"));
         assert!(rendered.contains("netbios name = EvoTest"));
         assert!(rendered.contains("workgroup = STUDIO"));
         assert!(rendered.contains("server min protocol = SMB3_02"));
+        // Stock + delivery shares are ALWAYS present.
+        assert!(rendered.contains("[Internal Storage]"));
+        assert!(rendered.contains("[USB]"));
+        assert!(rendered.contains("[NAS]"));
         assert!(rendered.contains("[Uploads]"));
-        assert!(rendered.contains("path = /var/lib/evo/uploads"));
-        assert!(rendered.contains("guest ok = yes"));
-        assert_eq!(applied, vec!["Uploads".to_string()]);
+        assert!(rendered.contains("[evo-plugins-stage]"));
+        // Operator extra share also rendered.
+        assert!(rendered.contains("[Studio]"));
+        assert!(rendered.contains("path = /var/lib/evo/music/NAS/studio"));
+        // `applied` carries every share the caller can inspect
+        // for the wire response — stock + delivery + operator
+        // extras.
+        assert!(applied.contains(&"Internal Storage".to_string()));
+        assert!(applied.contains(&"USB".to_string()));
+        assert!(applied.contains(&"NAS".to_string()));
+        assert!(applied.contains(&"Uploads".to_string()));
+        assert!(applied.contains(&"evo-plugins-stage".to_string()));
+        assert!(applied.contains(&"Studio".to_string()));
         assert!(refused.is_empty());
     }
 
@@ -1627,7 +1866,7 @@ mod tests {
             extra_shares: vec![
                 ExtraShare {
                     name: "Ok".to_string(),
-                    path: "/mnt/NAS/family".to_string(),
+                    path: "/var/lib/evo/music/NAS/family".to_string(),
                     guest_ok: false,
                 },
                 ExtraShare {
@@ -1639,33 +1878,286 @@ mod tests {
             smb_users: Vec::new(),
             last_apply_at_ms: None,
         };
-        let allowlist = vec!["/mnt/NAS".to_string()];
-        let (rendered, applied, refused) =
-            render_smb_conf(&state, "EvoTest", "WG", &allowlist);
+        let (rendered, applied, refused) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
         assert!(rendered.contains("[Ok]"));
         assert!(!rendered.contains("[Nope]"));
-        assert_eq!(applied, vec!["Ok".to_string()]);
+        assert!(applied.contains(&"Ok".to_string()));
+        assert!(!applied.contains(&"Nope".to_string()));
         assert_eq!(refused.len(), 1);
         assert_eq!(refused[0].setting, "Nope");
+        assert!(refused[0].reason.contains("not in framework allowlist"));
     }
 
     #[test]
     fn render_smb_conf_default_min_protocol_suppresses_directive() {
         let state = SmbServerState::empty();
-        let (rendered, _, _) =
-            render_smb_conf(&state, "EvoTest", "WG", &["/mnt/NAS".to_string()]);
+        let (rendered, _, _) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
         assert!(!rendered.contains("server min protocol"));
     }
 
     #[test]
     fn path_matches_allowlist_handles_trailing_slashes_and_exact() {
-        let allow = vec!["/mnt/NAS/".to_string(), "/data/INTERNAL".to_string()];
-        assert!(path_matches_allowlist("/mnt/NAS", &allow));
-        assert!(path_matches_allowlist("/mnt/NAS/family", &allow));
-        assert!(path_matches_allowlist("/data/INTERNAL", &allow));
-        assert!(path_matches_allowlist("/data/INTERNAL/x", &allow));
-        assert!(!path_matches_allowlist("/mnt/NASfoo", &allow));
+        let allow = vec![
+            "/var/lib/evo/music/".to_string(),
+            "/var/lib/evo/uploads".to_string(),
+        ];
+        assert!(path_matches_allowlist("/var/lib/evo/music", &allow));
+        assert!(path_matches_allowlist("/var/lib/evo/music/NAS", &allow));
+        assert!(path_matches_allowlist("/var/lib/evo/uploads", &allow));
+        assert!(path_matches_allowlist("/var/lib/evo/uploads/inbox", &allow));
+        // The suffix `foo` sits at the same nesting level as
+        // `music`; must not be admitted as a subpath.
+        assert!(!path_matches_allowlist("/var/lib/evo/musicfoo", &allow));
         assert!(!path_matches_allowlist("/etc/shadow", &allow));
+    }
+
+    // ----- Inventory-invariant tests (see docs/SAMBA-SHARES.md) -----
+
+    #[test]
+    fn render_emits_stock_music_triad_on_evo_music_plane_paths() {
+        // Every rendered conf carries the three stock music
+        // shares pointing at the evo music plane
+        // (`/var/lib/evo/music/{INTERNAL,USB,NAS}`) — NOT the
+        // classic Volumio `/data/INTERNAL`, `/mnt/USB`,
+        // `/mnt/NAS` layout. This test is the load-bearing
+        // check that the inventory paths reach the wire.
+        let (rendered, applied, _) = render_smb_conf(
+            &SmbServerState::empty(),
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        assert!(rendered.contains("[Internal Storage]"));
+        assert!(rendered.contains("path = /var/lib/evo/music/INTERNAL"));
+        assert!(rendered.contains("[USB]"));
+        assert!(rendered.contains("path = /var/lib/evo/music/USB"));
+        assert!(rendered.contains("[NAS]"));
+        assert!(rendered.contains("path = /var/lib/evo/music/NAS"));
+        // Classic Volumio prefixes MUST NOT surface in the
+        // rendered conf.
+        assert!(!rendered.contains("/data/INTERNAL"));
+        assert!(!rendered.contains("/mnt/USB"));
+        assert!(!rendered.contains("/mnt/NAS"));
+        assert!(applied.contains(&"Internal Storage".to_string()));
+        assert!(applied.contains(&"USB".to_string()));
+        assert!(applied.contains(&"NAS".to_string()));
+    }
+
+    #[test]
+    fn render_emits_delivery_shares_with_correct_guest_split() {
+        // Uploads is guest-writable; evo-plugins-stage is
+        // authenticated. Both always rendered when enabled.
+        let (rendered, applied, _) = render_smb_conf(
+            &SmbServerState::empty(),
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        assert!(rendered.contains("[Uploads]"));
+        assert!(rendered.contains("path = /var/lib/evo/uploads"));
+        assert!(rendered.contains("[evo-plugins-stage]"));
+        assert!(rendered.contains("path = /var/lib/evo/plugins/stage"));
+        // Split assertion: after the [Uploads] header the next
+        // `guest ok = yes` is expected; after
+        // [evo-plugins-stage] we expect `guest ok = no`. Slice
+        // the rendered text at each section to check.
+        let uploads_section =
+            rendered.split("[Uploads]").nth(1).unwrap_or_default();
+        let uploads_section = uploads_section
+            .split("[evo-plugins-stage]")
+            .next()
+            .unwrap_or_default();
+        assert!(uploads_section.contains("guest ok = yes"));
+        let stage_section = rendered
+            .split("[evo-plugins-stage]")
+            .nth(1)
+            .unwrap_or_default();
+        // The stage section is the last stock section — take
+        // everything after its header. `guest ok = no` MUST
+        // appear before the next section (if any).
+        assert!(stage_section.contains("guest ok = no"));
+        assert!(applied.contains(&"Uploads".to_string()));
+        assert!(applied.contains(&"evo-plugins-stage".to_string()));
+    }
+
+    #[test]
+    fn render_disables_debian_printer_persona_in_global() {
+        // Debian's default Samba surfaces `print$`,
+        // `[printers]`, and — via CUPS — a printer stanza the
+        // operator sees as `nobody` after guest mapping.
+        // `[global]` MUST contain the printer-lockout knobs so
+        // Samba does not synthesise the printer plane on this
+        // device.
+        let (rendered, _, _) = render_smb_conf(
+            &SmbServerState::empty(),
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        assert!(rendered.contains("load printers = no"));
+        assert!(rendered.contains("printing = bsd"));
+        assert!(rendered.contains("printcap name = /dev/null"));
+        assert!(rendered.contains("disable spoolss = yes"));
+        assert!(rendered.contains("usershare max shares = 0"));
+    }
+
+    #[test]
+    fn render_never_emits_debian_default_share_sections() {
+        // The plugin's rendered conf is the sole writer of
+        // /etc/samba/smb.conf on this distribution — a
+        // successful apply overwrites the Debian default
+        // persona. Assertion: no `[homes]`, `[printers]`,
+        // `[print$]`, or `[nobody]` section header appears in
+        // the render, regardless of extra_shares.
+        let state = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: vec![ExtraShare {
+                name: "Studio".to_string(),
+                path: "/var/lib/evo/music/NAS/studio".to_string(),
+                guest_ok: false,
+            }],
+            smb_users: Vec::new(),
+            last_apply_at_ms: None,
+        };
+        let (rendered, _, _) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        for forbidden in &["[homes]", "[printers]", "[print$]", "[nobody]"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "rendered conf must not contain {forbidden}; \
+                 got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_refuses_extra_share_under_denylist_secrets_root() {
+        // An operator attempting to expose secrets under
+        // `/var/lib/evo/settings/*` must be refused even
+        // though a vendor override could allowlist
+        // `/var/lib/evo` (the parent). Denylist beats
+        // allowlist.
+        let state = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: vec![ExtraShare {
+                name: "SecretsLeak".to_string(),
+                path: "/var/lib/evo/settings/vault".to_string(),
+                guest_ok: false,
+            }],
+            smb_users: Vec::new(),
+            last_apply_at_ms: None,
+        };
+        // Deliberately widen the allowlist to match `/var/lib/evo`
+        // so the ONLY thing stopping the share is the denylist.
+        let widened = vec!["/var/lib/evo".to_string()];
+        let (rendered, applied, refused) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "WG",
+            &widened,
+            &test_denylist(),
+        );
+        assert!(!rendered.contains("[SecretsLeak]"));
+        assert!(!applied.contains(&"SecretsLeak".to_string()));
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].setting, "SecretsLeak");
+        assert!(refused[0]
+            .reason
+            .contains("under a framework denylist prefix"));
+    }
+
+    #[test]
+    fn render_refuses_extra_share_under_denylist_rejected_bundles_dir() {
+        // The plugin stage's `rejected/` subdirectory is a
+        // dumping ground for bundles that failed admission —
+        // not a re-drop target. Operator extras there are
+        // refused.
+        let state = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: vec![ExtraShare {
+                name: "RejectedRedrop".to_string(),
+                path: "/var/lib/evo/plugins/stage/rejected".to_string(),
+                guest_ok: false,
+            }],
+            smb_users: Vec::new(),
+            last_apply_at_ms: None,
+        };
+        // The rejected/ path is UNDER an allowlisted root
+        // (`/var/lib/evo/plugins/stage`), so denylist is the
+        // only thing that can catch it.
+        let (_, applied, refused) = render_smb_conf(
+            &state,
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        assert!(!applied.contains(&"RejectedRedrop".to_string()));
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0]
+            .reason
+            .contains("under a framework denylist prefix"));
+    }
+
+    #[test]
+    fn matched_denylist_prefix_recognises_exact_and_subpath() {
+        let deny = vec![
+            "/var/lib/evo/settings".to_string(),
+            "/var/lib/evo/plugins/stage/rejected".to_string(),
+        ];
+        assert_eq!(
+            matched_denylist_prefix("/var/lib/evo/settings", &deny),
+            Some("/var/lib/evo/settings")
+        );
+        assert_eq!(
+            matched_denylist_prefix("/var/lib/evo/settings/vault", &deny),
+            Some("/var/lib/evo/settings")
+        );
+        // Sibling directories at the same nesting level MUST
+        // NOT match a denylist prefix.
+        assert_eq!(
+            matched_denylist_prefix("/var/lib/evo/settingsfoo", &deny),
+            None
+        );
+        // The plugin-stage rejected/ dir matches; the
+        // top-level stage/ does not.
+        assert_eq!(
+            matched_denylist_prefix(
+                "/var/lib/evo/plugins/stage/rejected/bundle.tar.gz",
+                &deny
+            ),
+            Some("/var/lib/evo/plugins/stage/rejected")
+        );
+        assert_eq!(
+            matched_denylist_prefix("/var/lib/evo/plugins/stage", &deny),
+            None
+        );
     }
 
     // ----- argv builder tests -----
@@ -1803,7 +2295,11 @@ mod tests {
             .with_smbpasswd_program("smbpasswd".to_string())
             .with_systemctl_program("systemctl".to_string())
             .with_smb_conf_path(dir.join("smb.conf"))
-            .with_path_allowlist(vec!["/mnt/NAS".to_string()])
+            .with_path_allowlist(vec![
+                "/var/lib/evo/music".to_string(),
+                "/var/lib/evo/uploads".to_string(),
+                "/var/lib/evo/plugins/stage".to_string(),
+            ])
             .with_netbios_name("EvoTest".to_string())
             .with_workgroup("STUDIO".to_string())
             .with_subprocess_timeout_ms(1_000)
@@ -1828,13 +2324,26 @@ mod tests {
                 MinProtocol::Smb3_02,
                 vec![ExtraShare {
                     name: "Music".to_string(),
-                    path: "/mnt/NAS/music".to_string(),
+                    path: "/var/lib/evo/music/NAS/music".to_string(),
                     guest_ok: false,
                 }],
             )
             .await
             .unwrap();
-        assert_eq!(report.applied_shares, vec!["Music".to_string()]);
+        // Post-inventory: the applied list carries stock +
+        // delivery shares alongside the operator's `Music`
+        // extra. Assertion switches from "sole entry" to
+        // "contains the operator share and the stock triad".
+        assert!(report.applied_shares.contains(&"Music".to_string()));
+        assert!(report
+            .applied_shares
+            .contains(&"Internal Storage".to_string()));
+        assert!(report.applied_shares.contains(&"USB".to_string()));
+        assert!(report.applied_shares.contains(&"NAS".to_string()));
+        assert!(report.applied_shares.contains(&"Uploads".to_string()));
+        assert!(report
+            .applied_shares
+            .contains(&"evo-plugins-stage".to_string()));
         assert!(report.refused_settings.is_empty());
         assert!(report.smbd_restarted);
         let calls = executor.calls.lock().await;
@@ -1896,7 +2405,7 @@ mod tests {
                 vec![
                     ExtraShare {
                         name: "Ok".to_string(),
-                        path: "/mnt/NAS/x".to_string(),
+                        path: "/var/lib/evo/music/NAS/x".to_string(),
                         guest_ok: false,
                     },
                     ExtraShare {
@@ -1908,7 +2417,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(report.applied_shares, vec!["Ok".to_string()]);
+        // Post-inventory: the applied list carries stock +
+        // delivery + the operator's `Ok` extra. `Nope` remains
+        // the sole refusal.
+        assert!(report.applied_shares.contains(&"Ok".to_string()));
+        assert!(report
+            .applied_shares
+            .contains(&"Internal Storage".to_string()));
         assert_eq!(report.refused_settings.len(), 1);
         assert_eq!(report.refused_settings[0].setting, "Nope");
         let writes = executor.writes.lock().await;
@@ -2106,7 +2621,7 @@ mod tests {
             MinProtocol::Smb3_02,
             vec![ExtraShare {
                 name: "Music".to_string(),
-                path: "/mnt/NAS/music".to_string(),
+                path: "/var/lib/evo/music/NAS/music".to_string(),
                 guest_ok: false,
             }],
         )
@@ -2176,7 +2691,7 @@ mod tests {
             min_protocol: MinProtocol::Smb3_02,
             extra_shares: vec![ExtraShare {
                 name: "Uploads".to_string(),
-                path: "/mnt/NAS/uploads".to_string(),
+                path: "/var/lib/evo/uploads/incoming".to_string(),
                 guest_ok: true,
             }],
             system_hostname: None,

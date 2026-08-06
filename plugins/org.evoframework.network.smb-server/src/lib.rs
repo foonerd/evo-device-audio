@@ -17,6 +17,15 @@
 //! the framework's multi-occupant router partitions verbs
 //! across the two plugins.
 //!
+//! ## Share inventory (normative)
+//!
+//! Stock music shares, delivery shares (`evo-plugins-stage`,
+//! `Uploads`), allow/deny prefixes, forbidden LAN names, and
+//! sole-ownership of `/etc/samba/smb.conf` are pinned in
+//! [`docs/SAMBA-SHARES.md`](../docs/SAMBA-SHARES.md), which
+//! carries the audio-distribution binding. Do not re-derive
+//! the share list from comments or chat.
+//!
 //! ## Path allowlist
 //!
 //! Every `extra_share` whose `path` does not begin with a
@@ -24,8 +33,9 @@
 //! structured [`runtime::RefusedSetting`] surfaced on the
 //! [`runtime::ApplyReport`] response — the operator UI renders
 //! the refusal inline against the row rather than as a generic
-//! form-level error. Default allowlist covers `/mnt/NAS`,
-//! `/data/INTERNAL`, `/mnt/USB`, and `/var/lib/evo/uploads`.
+//! form-level error. Default prefixes MUST match
+//! `docs/SAMBA-SHARES.md` (evo music plane + uploads + plugin
+//! stage — not classic Volumio `/data` / `/mnt` paths).
 //!
 //! ## Sudoers grant
 //!
