@@ -1789,6 +1789,111 @@ else
 fi
 
 echo
+# ----------------------------------------------------------
+# Step 4: sibling layer installers (Plymouth + kiosk session)
+# ----------------------------------------------------------
+# The audio distribution's install-time contract is composed of
+# three layers: the audio distribution itself (everything above
+# this block), the boot theme (Plymouth splash + framebuffer +
+# cmdline patching, owned by evo-device-boot), and the kiosk
+# session (labwc + evo-kiosk-browser + systemd unit, owned by
+# evo-kiosk-eng). Each layer is delivered as a self-contained
+# idempotent installer in its own repository; the bundle
+# composer (`dist/scripts/build-bundle.sh`) stages each layer
+# under `${DIST_DIR}/../layers/<layer-name>/` at bundle-build
+# time so a single `evo-install.sh` run installs the whole
+# stack. Every layer honours a distribution-level opt-out env
+# var; vendor distributions that admit the audio reference but
+# do NOT want the boot theme or the kiosk session set the
+# corresponding toggle to 0 and get a headless install.
+#
+# The invariant here is: every layer's installer is invoked
+# exactly once per bootstrap run, in a deterministic order, and
+# each failure is surfaced without silently swallowing the exit
+# code — a WARN-and-continue posture would let a broken boot
+# splash or a missing kiosk shell reach the operator as a
+# fleet-Q&A regression rather than as a bootstrap failure.
+
+BOOT_LAYER_DIR="${DIST_DIR}/../layers/evo-device-boot"
+KIOSK_LAYER_DIR="${DIST_DIR}/../layers/evo-kiosk-eng"
+
+if [[ "${EVO_INSTALL_BOOT_LAYER:-1}" != "0" ]]; then
+    if [[ -x "${BOOT_LAYER_DIR}/scripts/install.sh" ]]; then
+        echo
+        echo "[bootstrap] Step 4a: evo-device-boot (Plymouth splash)"
+        EVO_BOOT_AUTO_APT="${EVO_BOOT_AUTO_APT:-1}" \
+            bash "${BOOT_LAYER_DIR}/scripts/install.sh"
+        echo "[bootstrap] evo-device-boot installer complete"
+    else
+        echo "[bootstrap] Step 4a: evo-device-boot layer not staged in bundle at ${BOOT_LAYER_DIR}; skipping (this bundle was built without the boot layer)"
+    fi
+else
+    echo "[bootstrap] Step 4a: EVO_INSTALL_BOOT_LAYER=0 — skipping Plymouth splash install"
+fi
+
+if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
+    if [[ -x "${KIOSK_LAYER_DIR}/scripts/install/install.sh" ]]; then
+        echo
+        echo "[bootstrap] Step 4b: evo-kiosk-eng (labwc + WebKit browser)"
+        # Auto-select browser source: layer mode if a prebuilt
+        # exists for this host's triple, cargo mode otherwise.
+        # Layer mode is fast (install a pre-built binary); cargo
+        # mode is slow (apt-installs GTK4/webkit dev deps + builds
+        # from source on target) but reliable across every triple
+        # the reference platform supports.
+        HOST_TRIPLE=""
+        case "$(uname -m)" in
+            aarch64|arm64) HOST_TRIPLE="aarch64-unknown-linux-gnu" ;;
+            armv7l)        HOST_TRIPLE="armv7-unknown-linux-gnueabihf" ;;
+            x86_64|amd64)  HOST_TRIPLE="x86_64-unknown-linux-gnu" ;;
+        esac
+        KIOSK_SRC="${KIOSK_BROWSER_SOURCE:-}"
+        if [[ -z "${KIOSK_SRC}" ]]; then
+            if [[ -n "${HOST_TRIPLE}" ]] \
+               && [[ -x "${KIOSK_LAYER_DIR}/layer/binaries/${HOST_TRIPLE}/evo-kiosk-browser" ]]; then
+                KIOSK_SRC="layer"
+                echo "[bootstrap] kiosk-browser prebuilt found for ${HOST_TRIPLE} — using layer mode"
+            else
+                KIOSK_SRC="cargo"
+                echo "[bootstrap] no kiosk-browser prebuilt for ${HOST_TRIPLE:-unknown} — falling back to cargo mode (will apt-install cargo + GTK4/webkit dev packages + build from source)"
+            fi
+        fi
+        # Cargo mode needs a modern rust toolchain. Debian
+        # Trixie's `cargo` package ships rustc 1.85.0, but the
+        # kiosk browser's transitive dependency graph (via url →
+        # idna → idna_adapter → icu_*) requires rustc >= 1.86.
+        # Rather than pin every transitive dep to an older
+        # version (fragile — breaks the next time any upstream
+        # bumps its MSRV) or force operators to hand-manage
+        # cargo overrides, install the official rustup-managed
+        # stable toolchain to a distribution-controlled path
+        # (`/usr/local/rustup` + `/usr/local/cargo`). The kiosk
+        # installer already looks for cargo at
+        # `/usr/local/cargo/bin/cargo` as its fallback path, so
+        # the toolchain lands where the installer expects.
+        if [[ "${KIOSK_SRC}" == "cargo" ]]; then
+            if ! command -v cargo >/dev/null 2>&1 \
+               && [[ ! -x /usr/local/cargo/bin/cargo ]]; then
+                echo "[bootstrap] cargo mode requested but no cargo on PATH — installing rustup stable toolchain to /usr/local/{rustup,cargo}"
+                RUSTUP_HOME=/usr/local/rustup \
+                CARGO_HOME=/usr/local/cargo \
+                    sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path' \
+                    || echo "[bootstrap] WARN: rustup install failed; kiosk installer will refuse cargo mode" >&2
+            fi
+        fi
+        KIOSK_INSTALL_PACKAGES="${KIOSK_INSTALL_PACKAGES:-1}" \
+        KIOSK_BROWSER_SOURCE="${KIOSK_SRC}" \
+        KIOSK_FORCE_ENABLE="${KIOSK_FORCE_ENABLE:-1}" \
+            bash "${KIOSK_LAYER_DIR}/scripts/install/install.sh"
+        echo "[bootstrap] evo-kiosk-eng installer complete"
+    else
+        echo "[bootstrap] Step 4b: evo-kiosk-eng layer not staged in bundle at ${KIOSK_LAYER_DIR}; skipping (this bundle was built without the kiosk layer)"
+    fi
+else
+    echo "[bootstrap] Step 4b: EVO_INSTALL_KIOSK_LAYER=0 — skipping kiosk session install"
+fi
+
+echo
 # HL-001 rule 8: /opt/evo/* is the operator's install tree,
 # tenant-owned end to end. Chown runs at the very end of the
 # script so it catches every prior `install -o root` step under

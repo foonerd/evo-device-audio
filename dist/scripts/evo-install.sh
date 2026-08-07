@@ -388,6 +388,17 @@ ensure_system_packages() {
     if [[ -d "${STAGE_DIR}/plugins" ]]; then
         for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
             [[ -d "${plugin_dir}" ]] || continue
+            # Skip non-bundle plugin subtrees: some in-process
+            # plugins (network.shares, network.smb-server) live
+            # under `plugins/<id>/dist/` for their distribution-
+            # tier artefacts (wrappers + sudoers templates) but
+            # do NOT ship an OOP bundle (no manifest.toml + no
+            # plugin.bin at the plugin dir root). Only walk
+            # directories that carry a manifest — those are the
+            # OOP bundles the preflight is meant to enforce.
+            if [[ ! -f "${plugin_dir}manifest.toml" ]]; then
+                continue
+            fi
             yaml_path="${plugin_dir}privileges.yaml"
             plugin_id="$(basename "${plugin_dir%/}")"
             if [[ ! -f "${yaml_path}" ]]; then
@@ -437,6 +448,10 @@ ensure_system_packages() {
     if [[ -d "${STAGE_DIR}/plugins" ]]; then
         for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
             [[ -d "${plugin_dir}" ]] || continue
+            # Skip non-bundle plugin subtrees (in-process plugins
+            # whose only bundle-side presence is a `dist/`
+            # sub-tree with wrappers + sudoers templates).
+            [[ -f "${plugin_dir}manifest.toml" ]] || continue
             yaml_path="${plugin_dir}privileges.yaml"
             plugin_id="$(basename "${plugin_dir%/}")"
             has_deps="$(extract_has_os_dependencies "${yaml_path}")"
@@ -462,6 +477,7 @@ ensure_system_packages() {
     if [[ -d "${STAGE_DIR}/plugins" ]]; then
         for plugin_dir in "${STAGE_DIR}/plugins/"*/; do
             [[ -d "${plugin_dir}" ]] || continue
+            [[ -f "${plugin_dir}manifest.toml" ]] || continue
             yaml_path="${plugin_dir}privileges.yaml"
             plugin_id="$(basename "${plugin_dir%/}")"
             has_deps="$(extract_has_os_dependencies "${yaml_path}")"
@@ -610,6 +626,16 @@ stop_prior_steward() {
 
 wipe_full() {
     stop_prior_steward
+    # Unmount every mount under /var/lib/evo before rm -rf.
+    # The network.shares plugin mounts remote CIFS/NFS shares at
+    # /var/lib/evo/music/NAS/<alias>; those mounts are typically
+    # read-only from the remote side so rm -rf on the mount
+    # itself fails with EROFS and, under `set -e`, aborts the
+    # whole wipe. Explicit umount-first is idempotent (no-op when
+    # nothing is mounted) and closes the failure class before it
+    # can strand the device between "old evo gone" and "new evo
+    # not yet installed".
+    unmount_under_evo_state
     rm -rf /opt/evo
     rm -rf /etc/evo
     rm -f /etc/sudoers.d/evo-* 2>/dev/null || true
@@ -619,6 +645,31 @@ wipe_full() {
     restore_pre_evo_asound_conf
     strip_evo_include_from_mpd_conf
     systemctl daemon-reload
+}
+
+# Unmount every mount whose target sits under /var/lib/evo,
+# deepest first (so nested mounts unmount before their parents).
+# Idempotent: no-op when /var/lib/evo has no mounts.
+unmount_under_evo_state() {
+    local mounts
+    mounts="$(findmnt -rno TARGET | grep '^/var/lib/evo' || true)"
+    if [[ -z "${mounts}" ]]; then
+        return 0
+    fi
+    # Sort by path depth desc so children unmount before parents.
+    while IFS= read -r mnt; do
+        [[ -n "${mnt}" ]] || continue
+        # umount -R handles nested mounts atomically per subtree.
+        # Fall back to lazy unmount on EBUSY — the wipe is the
+        # last thing this process does with the tree, so
+        # deferred cleanup of open descriptors is acceptable.
+        umount -R "${mnt}" 2>/dev/null \
+            || umount -l "${mnt}" 2>/dev/null \
+            || true
+    done < <(printf '%s\n' "${mounts}" \
+                 | awk '{ print length($0), $0 }' \
+                 | sort -nr \
+                 | awk '{ $1=""; sub(/^ /,""); print }')
 }
 
 wipe_config() {
@@ -671,6 +722,12 @@ place_opt_evo() {
         install -m 0644 -o root -g root "${p}/manifest.toml" "/opt/evo/plugins/${p_name}/manifest.toml"
         install -m 0644 -o root -g root "${p}/manifest.sig" "/opt/evo/plugins/${p_name}/manifest.sig"
         install -m 0755 -o root -g root "${p}/plugin.bin" "/opt/evo/plugins/${p_name}/plugin.bin"
+        # Privileges contract — runtime admission engine reads
+        # this file at /opt/evo/plugins/<id>/privileges.yaml.
+        # Every functional plugin bundle MUST ship it; the
+        # bundle-build step enforces presence on the stage side,
+        # so the file is always present here.
+        install -m 0644 -o root -g root "${p}/privileges.yaml" "/opt/evo/plugins/${p_name}/privileges.yaml"
         # Per-plugin data files (e.g. DAC catalogue source).
         if [[ -d "${p}/data" ]]; then
             install -d -m 0755 -o root -g root "/opt/evo/plugins/${p_name}/data"

@@ -187,6 +187,22 @@ for entry in "${OOP_PLUGINS[@]}"; do
     install -d -m 0755 "${p_dir}"
     install -m 0644 "${p_manifest_src}" "${p_dir}/manifest.toml"
     install -m 0755 "${p_bin_path}" "${p_dir}/plugin.bin"
+    # Privileges contract — every bundled plugin MUST ship its
+    # privileges.yaml alongside the manifest and binary. The
+    # bundle's install-time preflight (`evo-install.sh` +
+    # `evo-plugin-tool install`) reads this file for the
+    # `has_os_dependencies` flag and the `required_binaries`
+    # list, and refuses to promote the bundle if it is absent.
+    # Not signed (evo-plugin-tool's `sign` covers manifest +
+    # binary only per `signing_message`); this is a runtime-
+    # readable declaration whose integrity comes from being
+    # inside the signature-covered tarball.
+    p_privileges_src="${REPO_ROOT}/plugins/${p_name}/privileges.yaml"
+    if [[ ! -f "${p_privileges_src}" ]]; then
+        echo "FAIL: ${p_name} privileges.yaml missing at ${p_privileges_src}" >&2
+        exit 2
+    fi
+    install -m 0644 "${p_privileges_src}" "${p_dir}/privileges.yaml"
     # Per-plugin signing via evo-plugin-tool.
     if ! cargo run --quiet --release \
             --manifest-path "${ENG_ROOT}/Cargo.toml" \
@@ -288,11 +304,127 @@ cp -a "${REPO_ROOT}/dist/keys/." "${STAGE_DIR}/dist/keys/"
 install -d -m 0755 "${STAGE_DIR}/plugins/org.evoframework.hardware.audio-config/data"
 cp -a "${REPO_ROOT}/plugins/org.evoframework.hardware.audio-config/data/." \
     "${STAGE_DIR}/plugins/org.evoframework.hardware.audio-config/data/"
+# Distribution-tier binaries (evo-captive-probe wrapper). bootstrap.sh
+# reads these from `$DIST_DIR/bin/*` at install time; without staging
+# here, Step 1b2 (captive-probe wrapper install) fails.
+if [[ -d "${REPO_ROOT}/dist/bin" ]]; then
+    install -d -m 0755 "${STAGE_DIR}/dist/bin"
+    cp -a "${REPO_ROOT}/dist/bin/." "${STAGE_DIR}/dist/bin/"
+fi
+# Plugin-adjacent dist trees. bootstrap.sh references narrow
+# wrappers + sudoers templates that live INSIDE each plugin's
+# repo directory (each plugin owns its own privilege surface):
+#   - network.smb-server: evo-smb-user-sync wrapper + evo-samba-server
+#     sudoers template
+#   - network.shares: evo-network-shares sudoers template
+# The bundle stages each plugin's `dist/` subtree next to its
+# binary + manifest so the bootstrap's `$DIST_DIR/../plugins/*/dist/*`
+# paths resolve inside the stage.
+for plugin_with_dist in \
+    "org.evoframework.network.smb-server" \
+    "org.evoframework.network.shares" ; do
+    p_dist_src="${REPO_ROOT}/plugins/${plugin_with_dist}/dist"
+    if [[ -d "${p_dist_src}" ]]; then
+        install -d -m 0755 "${STAGE_DIR}/plugins/${plugin_with_dist}/dist"
+        cp -a "${p_dist_src}/." "${STAGE_DIR}/plugins/${plugin_with_dist}/dist/"
+    fi
+done
 # README (operator-readable narrative; the installer prints
 # the bring-up procedure section as part of its summary).
 install -m 0644 "${REPO_ROOT}/dist/README.md" \
     "${STAGE_DIR}/dist/README.md"
 echo "  ok"
+
+# --------------------------------------------------------------
+# Sibling layers: evo-device-boot (Plymouth splash) + evo-kiosk-eng
+# (labwc session + WebKit browser).
+# --------------------------------------------------------------
+# The bundle is the operator's single source of truth for a
+# fresh install. A device that
+# receives the bundle and runs `evo-install.sh` must come up
+# with the full stack: boot splash, audio distribution, kiosk
+# session. Vendor distributions that want a headless variant
+# opt out by setting `EVO_INSTALL_BOOT_LAYER=0` and/or
+# `EVO_INSTALL_KIOSK_LAYER=0` on the target — see bootstrap.sh
+# Step 4.
+#
+# Layer trees are staged under `${STAGE_DIR}/layers/<name>/` so
+# bootstrap.sh reads them at `${DIST_DIR}/../layers/<name>/`.
+# Each layer's own installer is idempotent and self-contained
+# per its owning repo's contract; no vendorization — the bundle
+# just copies the tree byte-for-byte at build time.
+#
+# Sibling repos are resolved relative to REPO_ROOT (checked-out
+# `evo-device-audio`); dev-box layout has all three side-by-side.
+echo "[3b/5] stage sibling layers (evo-device-boot + evo-kiosk-eng) ..."
+BOOT_ROOT="$(cd "${REPO_ROOT}/../evo-device-boot" 2>/dev/null && pwd)" || {
+    echo "FAIL: evo-device-boot repo not found at ${REPO_ROOT}/../evo-device-boot" >&2
+    echo "      (the audio distribution's bundle composes the boot theme" >&2
+    echo "       layer — check out https://github.com/foonerd/evo-device-boot" >&2
+    echo "       adjacent to evo-device-audio, or set EVO_BUNDLE_SKIP_BOOT_LAYER=1)" >&2
+    if [[ "${EVO_BUNDLE_SKIP_BOOT_LAYER:-0}" != "1" ]]; then exit 2; fi
+    BOOT_ROOT=""
+}
+KIOSK_ROOT="$(cd "${REPO_ROOT}/../evo-kiosk-eng" 2>/dev/null && pwd)" || {
+    echo "FAIL: evo-kiosk-eng repo not found at ${REPO_ROOT}/../evo-kiosk-eng" >&2
+    echo "      (the audio distribution's bundle composes the kiosk session" >&2
+    echo "       layer — check out foonerd/evo-kiosk-eng adjacent to" >&2
+    echo "       evo-device-audio, or set EVO_BUNDLE_SKIP_KIOSK_LAYER=1)" >&2
+    if [[ "${EVO_BUNDLE_SKIP_KIOSK_LAYER:-0}" != "1" ]]; then exit 2; fi
+    KIOSK_ROOT=""
+}
+
+if [[ -n "${BOOT_ROOT}" ]]; then
+    install -d -m 0755 "${STAGE_DIR}/layers/evo-device-boot"
+    for sub in scripts plymouth fbcon-logo grub-theme systemd tools; do
+        if [[ -d "${BOOT_ROOT}/${sub}" ]]; then
+            cp -a "${BOOT_ROOT}/${sub}" "${STAGE_DIR}/layers/evo-device-boot/"
+        fi
+    done
+    if [[ -f "${BOOT_ROOT}/DESIGN.md" ]]; then
+        install -m 0644 "${BOOT_ROOT}/DESIGN.md" \
+            "${STAGE_DIR}/layers/evo-device-boot/DESIGN.md"
+    fi
+    if [[ -f "${BOOT_ROOT}/README.md" ]]; then
+        install -m 0644 "${BOOT_ROOT}/README.md" \
+            "${STAGE_DIR}/layers/evo-device-boot/README.md"
+    fi
+    echo "  ok evo-device-boot (from ${BOOT_ROOT})"
+fi
+
+if [[ -n "${KIOSK_ROOT}" ]]; then
+    install -d -m 0755 "${STAGE_DIR}/layers/evo-kiosk-eng"
+    # scripts/ + layer/ carry the installer + the runtime
+    # assets (labwc config, systemd unit, kiosk.privileges.toml,
+    # trust root, helper binaries, prebuilt browser binaries
+    # per triple).
+    for sub in scripts layer; do
+        if [[ -d "${KIOSK_ROOT}/${sub}" ]]; then
+            cp -a "${KIOSK_ROOT}/${sub}" "${STAGE_DIR}/layers/evo-kiosk-eng/"
+        fi
+    done
+    # crates/ carries the kiosk-browser source tree; bundled so
+    # `cargo` mode works on target triples with no prebuilt.
+    # Excludes target/ (build artefacts) via cp -a on the src
+    # subtree only. Cargo.toml + Cargo.lock at repo root are
+    # required to resolve the workspace member.
+    if [[ -d "${KIOSK_ROOT}/crates" ]]; then
+        cp -a "${KIOSK_ROOT}/crates" "${STAGE_DIR}/layers/evo-kiosk-eng/"
+    fi
+    for f in Cargo.toml Cargo.lock README.md DEVELOPING.md; do
+        if [[ -f "${KIOSK_ROOT}/${f}" ]]; then
+            install -m 0644 "${KIOSK_ROOT}/${f}" \
+                "${STAGE_DIR}/layers/evo-kiosk-eng/${f}"
+        fi
+    done
+    # Cross.toml is dev-tooling; bundle it so anyone rebuilding
+    # inside the bundle stage has the same cross-arch shape.
+    if [[ -f "${KIOSK_ROOT}/Cross.toml" ]]; then
+        install -m 0644 "${KIOSK_ROOT}/Cross.toml" \
+            "${STAGE_DIR}/layers/evo-kiosk-eng/Cross.toml"
+    fi
+    echo "  ok evo-kiosk-eng (from ${KIOSK_ROOT})"
+fi
 
 echo "[4/5] compose bundle-manifest.toml ..."
 {
