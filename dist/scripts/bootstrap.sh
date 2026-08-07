@@ -720,6 +720,11 @@ UCONF
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/mpd-restart-privileges.conf"
 
     install -m 0644 -o root -g root \
+        "$DIST_DIR/systemd/evo.service.d/samba-server-privileges.conf" \
+        "$SYSTEMD_DROPIN_DIR/samba-server-privileges.conf"
+    echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/samba-server-privileges.conf"
+
+    install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/hardware-audio-privileges.conf" \
         "$SYSTEMD_DROPIN_DIR/hardware-audio-privileges.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/hardware-audio-privileges.conf"

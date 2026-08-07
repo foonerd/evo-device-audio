@@ -111,7 +111,12 @@ case "${ACTION}" in
     useradd -r -s "${NOLOGIN}" -d /nonexistent "${USERN}" \
       || die "useradd failed for ${USERN}"
 
-    # smbpasswd -s reads password twice from stdin.
+    # smbpasswd -s reads password twice from stdin. The
+    # distribution's `evo.service.d/samba-server-privileges.conf`
+    # drop-in carves `/var/lib/samba` out of the framework's
+    # `ProtectSystem=strict` posture; without it smbpasswd's
+    # write to `passdb.tdb` / `secrets.tdb` fails with EROFS
+    # regardless of euid.
     if ! printf '%s\n%s\n' "${PASS}" "${PASS}" \
       | smbpasswd -a -s "${USERN}"; then
       die "smbpasswd -a failed for ${USERN}"
