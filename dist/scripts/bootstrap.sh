@@ -1834,15 +1834,14 @@ fi
 if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
     # Boot dependency chain (evo → evo-ui → evo-kiosk).
     #
-    # Symptom before this landed (verified on pi5target
-    # 2026-08-07 timestamps): evo-kiosk.service started at
-    # 16:43:04, evo.service at 16:45:25, evo-ui.service at
-    # 16:46:46 — the kiosk browser hit http://127.0.0.1/
-    # against a port nothing was yet bound to, and stayed
-    # there indefinitely (no auto-reload from a connection-
-    # refused error page). Operator had to
-    # `systemctl restart evo-ui` and then `evo-kiosk` for the
-    # UI to appear on glass.
+    # Without this chain the three units can start in any
+    # order at boot: the kiosk browser can reach
+    # `http://127.0.0.1/` before `evo-ui-runtime` has bound
+    # its listen socket, and stay on the browser-default
+    # connection-refused page indefinitely (no auto-reload).
+    # Operator recovery is a manual
+    # `systemctl restart evo-ui evo-kiosk` after every boot,
+    # which is unacceptable for a reference device.
     #
     # The chain enforced here (three drop-ins):
     #
