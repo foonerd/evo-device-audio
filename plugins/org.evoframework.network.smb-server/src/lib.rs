@@ -55,6 +55,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use evo_plugin_sdk::contract::context::CredentialVaultHandle;
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -65,8 +67,49 @@ use evo_plugin_sdk::Manifest;
 pub mod runtime;
 
 use runtime::{
-    is_smb_server_verb, SambaServerRuntime, VerbDispatchError, SMB_SERVER_VERBS,
+    is_smb_server_verb, NoSmbCredentialFetcher, SambaServerRuntime,
+    SmbCredentialFetcher, VerbDispatchError, SMB_SERVER_VERBS,
 };
+
+/// Vault-backed credential fetcher — the production wiring for
+/// [`SmbCredentialFetcher`]. Adapts the plugin's
+/// [`CredentialVaultHandle`] (namespaced per-plugin by the
+/// framework at load) into the smb-server runtime's read +
+/// delete surface. The `credential_key` the operator UI staged
+/// via the framework `credential_put` wire op is the same key
+/// passed to `user_add`; this fetcher reads it back verbatim.
+struct VaultBackedSmbFetcher {
+    vault: Arc<dyn CredentialVaultHandle>,
+}
+
+#[async_trait]
+impl SmbCredentialFetcher for VaultBackedSmbFetcher {
+    async fn fetch_password(&self, key: &str) -> Option<Vec<u8>> {
+        match self.vault.fetch(key.to_string()).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    key = %key,
+                    error = %e,
+                    "credential vault fetch failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn delete_password(&self, key: &str) -> Result<(), String> {
+        self.vault
+            .delete(key.to_string())
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    fn is_operator_wired(&self) -> bool {
+        true
+    }
+}
 
 /// Embedded manifest source.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -155,12 +198,48 @@ impl Plugin for SmbServerPlugin {
                 ))
             })?;
 
+            // Credential-vault binding: prefer the framework
+            // credential vault via LoadContext when populated —
+            // that is the single credential substrate the
+            // operator UI writes to via `credential_put`. When
+            // the framework did not populate the vault handle,
+            // install a placeholder fetcher so `add_user`
+            // refuses with the distinct
+            // `CredentialVaultUnavailable` error class rather
+            // than silently returning `CredentialMissing` on
+            // every operator gesture.
+            let credentials: Arc<dyn SmbCredentialFetcher> =
+                if let Some(vault) = ctx.credential_vault.as_ref() {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        credential_fetcher = "vault",
+                        "credential fetcher bound: framework vault"
+                    );
+                    Arc::new(VaultBackedSmbFetcher {
+                        vault: Arc::clone(vault),
+                    })
+                } else {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        credential_fetcher = "unwired",
+                        "credential fetcher bound: unwired placeholder \
+                         (ctx.credential_vault=None) — SMB user_add will \
+                         return CredentialVaultUnavailable until the \
+                         framework populates the vault handle for this \
+                         plugin"
+                    );
+                    Arc::new(NoSmbCredentialFetcher)
+                };
+
             let rt = Arc::new(
-                SambaServerRuntime::open(&ctx.state_dir).map_err(|e| {
-                    PluginError::Permanent(format!(
-                        "network.smb-server runtime open failed: {e}"
-                    ))
-                })?,
+                SambaServerRuntime::builder(&ctx.state_dir)
+                    .map_err(|e| {
+                        PluginError::Permanent(format!(
+                            "network.smb-server runtime open failed: {e}"
+                        ))
+                    })?
+                    .with_credentials(credentials)
+                    .build(),
             );
 
             // Attach the plugin's subject-announcer handle so

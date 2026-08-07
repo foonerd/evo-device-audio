@@ -92,18 +92,24 @@ case "${ACTION}" in
     IFS= read -r PASS || true
     [[ -n "${PASS}" ]] || die "empty password on stdin"
 
+    # Strict: refuse ANY pre-existing NSS entry. The plugin
+    # runtime's in-memory smb_users list catches legitimate
+    # duplicate adds BEFORE this wrapper fires — reaching here
+    # with an existing NSS entry means the account was created
+    # outside plugin control (manual `useradd`, prior distro
+    # install, or a knowledgeable operator forging the
+    # "provisioned shape"). We do NOT adopt it: the plugin
+    # must own every NSS entry it attaches Samba credentials
+    # to. If the operator legitimately wants to re-provision
+    # a stale entry, they revoke first (which removes NSS +
+    # passdb) and then re-add.
     if id -u "${USERN}" &>/dev/null; then
-      # Existing account: only reuse if it is already our
-      # non-login shape. Never attach Samba credentials to a
-      # login shell account.
-      if ! is_provisioned_shape "${USERN}"; then
-        die "username '${USERN}' already exists as a non-SMB system account — refuse"
-      fi
-    else
-      NOLOGIN="$(nologin_path)"
-      useradd -r -s "${NOLOGIN}" -d /nonexistent "${USERN}" \
-        || die "useradd failed for ${USERN}"
+      die "username '${USERN}' already exists on this host — cannot attach. Revoke first if this is an evo-managed user."
     fi
+
+    NOLOGIN="$(nologin_path)"
+    useradd -r -s "${NOLOGIN}" -d /nonexistent "${USERN}" \
+      || die "useradd failed for ${USERN}"
 
     # smbpasswd -s reads password twice from stdin.
     if ! printf '%s\n%s\n' "${PASS}" "${PASS}" \

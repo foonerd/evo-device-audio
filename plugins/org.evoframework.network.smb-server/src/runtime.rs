@@ -423,6 +423,29 @@ pub enum ApplyError {
         /// The credential-vault key.
         key: String,
     },
+    /// The runtime was constructed with a placeholder fetcher
+    /// because `LoadContext::credential_vault` was `None` at
+    /// plugin load. `add_user` cannot fetch operator-supplied
+    /// passwords in this state; the operator UI renders "SMB
+    /// user provisioning unavailable — the framework did not
+    /// wire the credential vault for this plugin" rather
+    /// than the more ambiguous `CredentialMissing`.
+    #[error(
+        "SMB user provisioning unavailable: framework credential vault not wired to this plugin"
+    )]
+    CredentialVaultUnavailable,
+    /// The vault-delete step during `revoke_user` failed. The
+    /// SMB user (passdb + NSS) has already been revoked
+    /// successfully at this point; the vault row is dangling
+    /// and requires operator remediation via the credential
+    /// admin UI or wire op.
+    #[error("credential vault delete failed for key {key}: {detail}")]
+    CredentialDeleteFailed {
+        /// The credential-vault key the delete targeted.
+        key: String,
+        /// Human-readable failure text from the vault handle.
+        detail: String,
+    },
     /// Subprocess invocation failed at the process layer.
     #[error("subprocess I/O error: {detail}")]
     SubprocessIo {
@@ -557,27 +580,70 @@ impl SambaExecutor for SubprocessSambaExecutor {
     }
 }
 
-/// Credential-fetch abstraction so tests can inject a stub.
-/// Production impl reaches into the framework credential
-/// vault; the default [`NoSmbCredentialFetcher`] always
-/// returns `None`.
+/// Credential store abstraction — the runtime's read + delete
+/// surface over whatever backing the distribution's plugin
+/// load supplies (framework credential vault in production,
+/// stub for tests). `add_user` calls `fetch_password` to read
+/// the password bytes the UI staged; `revoke_user` calls
+/// `delete_password` so a revoked user's vault row does not
+/// linger with a dangling reference.
+///
+/// The framework vault's own contract on the
+/// `CredentialVaultHandle` handle is namespaced per-plugin —
+/// the vault-backed impl in production wires the plugin's
+/// handle at plugin-load and every read/delete stays scoped
+/// to this plugin's rows only.
 #[async_trait]
 pub trait SmbCredentialFetcher: Send + Sync {
     /// Return the vault entry for `key` (typically the SMB
     /// user's canonical key), or `None` if the vault has no
     /// record.
     async fn fetch_password(&self, key: &str) -> Option<Vec<u8>>;
+
+    /// Remove the vault entry for `key`. Called by
+    /// `revoke_user` after a successful passdb delete so the
+    /// vault row does not outlive the SMB user. Idempotent by
+    /// the vault contract (deleting an already-absent row
+    /// succeeds silently).
+    ///
+    /// Default no-op so tests using the older `StubCredentials`
+    /// shape do not need an explicit implementation; production
+    /// impls MUST override with the vault's delete call.
+    async fn delete_password(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether this fetcher is backed by an operator-visible
+    /// credential store. Returns `false` for the placeholder
+    /// fetcher installed when `ctx.credential_vault` is
+    /// `None`; runtime `add_user` refuses with
+    /// [`ApplyError::CredentialVaultUnavailable`] rather than
+    /// the more ambiguous `CredentialMissing` in that case,
+    /// so the operator UI can render "vault not wired to
+    /// this plugin" instead of "your password did not save".
+    fn is_operator_wired(&self) -> bool {
+        true
+    }
 }
 
-/// Default fetcher — returns `None` for every key. Callers
-/// that need vault access wire a real fetcher via
-/// [`SambaServerRuntimeBuilder::with_credentials`].
+/// Placeholder fetcher installed by the plugin's
+/// [`crate::SmbServerPlugin::load`] when the LoadContext does
+/// not carry a credential vault handle. Every fetch returns
+/// `None` and [`Self::is_operator_wired`] is `false` so the
+/// runtime's `add_user` path fails with a distinct error class
+/// (`CredentialVaultUnavailable`) rather than the generic
+/// `CredentialMissing`. Test suites keep using this shape
+/// when they exercise the runtime with no vault.
 pub struct NoSmbCredentialFetcher;
 
 #[async_trait]
 impl SmbCredentialFetcher for NoSmbCredentialFetcher {
     async fn fetch_password(&self, _key: &str) -> Option<Vec<u8>> {
         None
+    }
+
+    fn is_operator_wired(&self) -> bool {
+        false
     }
 }
 
@@ -963,9 +1029,24 @@ fn blocked_smb_usernames() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    // Live steward identity — USER is set when the wire binary
-    // runs as the service account; EVO_SERVICE_USER is an
-    // optional override for distributions that set it.
+    // Live steward identity, in defence-in-depth order:
+    //   1. `/proc/self/status` effective UID → `/etc/passwd`
+    //      lookup. Independent of env vars — a distribution
+    //      whose service manager does NOT set `$USER` still
+    //      protects the steward identity. This is the
+    //      load-bearing check.
+    //   2. `EVO_SERVICE_USER` env var — explicit vendor
+    //      override for distributions that publish the name
+    //      out-of-band.
+    //   3. `USER` env var — systemd sets this from `User=`;
+    //      belt-and-braces for the case where the passwd
+    //      lookup returns nothing but the shell env is
+    //      populated.
+    if let Some(uid_derived) = detect_service_user_from_procfs() {
+        if !out.iter().any(|b| b == &uid_derived) {
+            out.push(uid_derived);
+        }
+    }
     for key in ["EVO_SERVICE_USER", "USER"] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_ascii_lowercase();
@@ -975,6 +1056,44 @@ fn blocked_smb_usernames() -> Vec<String> {
         }
     }
     out
+}
+
+/// Read the effective UID from `/proc/self/status`, then
+/// resolve the matching username by scanning `/etc/passwd`.
+/// Returns `None` on any I/O error, malformed input, or when
+/// the UID has no `/etc/passwd` entry.
+///
+/// The plugin crate forbids `unsafe_code` (blocks a direct
+/// libc `geteuid` call) and does NOT carry `nix` / `rustix` as
+/// a dependency; the sibling `network.shares` plugin uses the
+/// same `/proc/self/status` pattern for its
+/// service-user-detection path.
+fn detect_service_user_from_procfs() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    // /proc/self/status Uid: line is `Uid:\tRUID\tEUID\tSUID\tFSUID`.
+    // Take the EUID (third whitespace-separated field).
+    let effective_uid: u32 = status
+        .lines()
+        .find(|l| l.starts_with("Uid:"))?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()?;
+    // /etc/passwd rows are `name:x:uid:gid:gecos:home:shell`.
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut it = line.splitn(7, ':');
+        let name = it.next()?;
+        let _x = it.next()?;
+        let uid: u32 = it.next()?.parse().ok()?;
+        if uid == effective_uid {
+            let name = name.trim().to_ascii_lowercase();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 /// Build the argv for `sudo -n systemctl restart smbd`.
@@ -1299,6 +1418,15 @@ impl SambaServerRuntime {
         mapped_domain_identity: Option<String>,
     ) -> Result<SmbUserRecord, ApplyError> {
         let username = validate_smb_username(&username)?;
+        // Fail fast when the plugin's load path did not receive
+        // a real credential vault handle. The wrapper's useradd
+        // + smbpasswd path is unreachable without operator
+        // password bytes; better to refuse with an
+        // operator-visible explanation than to always return
+        // the ambiguous `CredentialMissing`.
+        if !self.credentials.is_operator_wired() {
+            return Err(ApplyError::CredentialVaultUnavailable);
+        }
         {
             let g = self.inner.lock().await;
             if g.state.smb_users.iter().any(|u| u.username == username) {
@@ -1357,15 +1485,20 @@ impl SambaServerRuntime {
     /// reactive subject.
     pub async fn revoke_user(&self, username: &str) -> Result<(), ApplyError> {
         let username = normalize_smb_username(username)?;
-        let found = {
+        // Snapshot the record's credential_key before we delete
+        // the row — need it to retract the vault entry after
+        // the passdb + NSS removal succeeds.
+        let credential_key = {
             let g = self.inner.lock().await;
-            g.state.smb_users.iter().any(|u| u.username == username)
+            g.state
+                .smb_users
+                .iter()
+                .find(|u| u.username == username)
+                .map(|u| u.credential_key.clone())
+                .ok_or_else(|| ApplyError::UserNotFound {
+                    username: username.clone(),
+                })?
         };
-        if !found {
-            return Err(ApplyError::UserNotFound {
-                username: username.clone(),
-            });
-        }
 
         let args = build_smb_user_sync_delete_args(&username);
         let out = self
@@ -1377,6 +1510,23 @@ impl SambaServerRuntime {
                 username: username.clone(),
                 exit_code: out.exit_code,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+
+        // Retract the vault row. Ordered AFTER the wrapper
+        // delete: if the wrapper failed above, the vault entry
+        // stays and a subsequent revoke retries. A vault
+        // delete failure here surfaces as
+        // `CredentialDeleteFailed`; the SMB user is already
+        // gone at this point so the operator UI must show a
+        // "vault row dangling" state and offer manual
+        // remediation via the credential-admin surface.
+        if let Err(detail) =
+            self.credentials.delete_password(&credential_key).await
+        {
+            return Err(ApplyError::CredentialDeleteFailed {
+                key: credential_key,
+                detail,
             });
         }
 
@@ -2608,14 +2758,35 @@ mod tests {
         }
     }
 
+    /// Test stub. Records every `delete_password` call so a
+    /// revoke test can assert the vault-retract step fires
+    /// against the correct key.
     struct StubCredentials {
         map: HashMap<String, Vec<u8>>,
+        deletes: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StubCredentials {
+        fn new(
+            map: HashMap<String, Vec<u8>>,
+        ) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let deletes = Arc::new(Mutex::new(Vec::new()));
+            let stub = Arc::new(Self {
+                map,
+                deletes: Arc::clone(&deletes),
+            });
+            (stub, deletes)
+        }
     }
 
     #[async_trait]
     impl SmbCredentialFetcher for StubCredentials {
         async fn fetch_password(&self, key: &str) -> Option<Vec<u8>> {
             self.map.get(key).cloned()
+        }
+        async fn delete_password(&self, key: &str) -> Result<(), String> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
         }
     }
 
@@ -2644,7 +2815,7 @@ mod tests {
         let rt = SambaServerRuntime::builder(dir)
             .unwrap()
             .with_executor(executor.clone())
-            .with_credentials(Arc::new(StubCredentials { map: creds }))
+            .with_credentials(StubCredentials::new(creds).0)
             .with_sudo_program("sudo".to_string())
             .with_smb_conf_path(dir.join("smb.conf"))
             .with_candidate_path(dir.join("smb.conf.candidate"))
@@ -2919,6 +3090,106 @@ mod tests {
         let (rt, _) = built_runtime(&dir, Vec::new(), HashMap::new());
         let err = rt.revoke_user("ghost").await.unwrap_err();
         assert!(matches!(err, ApplyError::UserNotFound { .. }));
+    }
+
+    /// The runtime's `add_user` path MUST refuse with a
+    /// distinct [`ApplyError::CredentialVaultUnavailable`]
+    /// when the fetcher is not operator-wired — that is the
+    /// production shape when `LoadContext::credential_vault`
+    /// is `None` at plugin load and the plugin installed the
+    /// [`NoSmbCredentialFetcher`] placeholder. Distinct from
+    /// `CredentialMissing` (which fires when the fetcher IS
+    /// wired but the operator did not stage the specific
+    /// credential key).
+    #[tokio::test]
+    async fn add_user_refuses_when_vault_unwired() {
+        let dir = tempdir();
+        // Build a runtime whose credential fetcher is the
+        // unwired placeholder. Bypasses `built_runtime` which
+        // wires the recording stub.
+        let executor = ScriptedSamba::new(Vec::new());
+        let rt = SambaServerRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credentials(Arc::new(NoSmbCredentialFetcher))
+            .with_sudo_program("sudo".to_string())
+            .with_smb_conf_path(dir.join("smb.conf"))
+            .with_candidate_path(dir.join("smb.conf.candidate"))
+            .with_netbios_name("EvoTest".to_string())
+            .with_workgroup("STUDIO".to_string())
+            .with_subprocess_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let err = rt
+            .add_user("alice".to_string(), "vault:smb:alice".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::CredentialVaultUnavailable),
+            "expected CredentialVaultUnavailable, got: {err:?}"
+        );
+    }
+
+    /// `revoke_user` MUST call `delete_password` on the
+    /// credential fetcher after the wrapper delete succeeds
+    /// so the vault row is retracted alongside the SMB user.
+    /// A dangling vault row after revoke leaves the operator
+    /// UI showing "credential exists" for a user who no
+    /// longer authenticates.
+    #[tokio::test]
+    async fn revoke_user_deletes_vault_credential() {
+        let dir = tempdir();
+        // Build the runtime by hand so we can hold a reference
+        // to the deletes recorder — `built_runtime` swallows
+        // the second `StubCredentials::new` return value.
+        let mut creds_map = HashMap::new();
+        creds_map.insert("vault:smb:target".to_string(), b"pw".to_vec());
+        let (stub, deletes) = StubCredentials::new(creds_map);
+        let executor = ScriptedSamba::new(vec![ok(), ok()]); // add + delete
+        let rt = SambaServerRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credentials(stub)
+            .with_sudo_program("sudo".to_string())
+            .with_smb_conf_path(dir.join("smb.conf"))
+            .with_candidate_path(dir.join("smb.conf.candidate"))
+            .with_netbios_name("EvoTest".to_string())
+            .with_workgroup("STUDIO".to_string())
+            .with_subprocess_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        rt.add_user("target".to_string(), "vault:smb:target".to_string(), None)
+            .await
+            .unwrap();
+        rt.revoke_user("target").await.unwrap();
+        // Vault-delete fired exactly once with the record's
+        // credential_key.
+        let deleted = deletes.lock().await;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0], "vault:smb:target");
+    }
+
+    /// The euid-derived service-user detection MUST return
+    /// SOME string when the test process is running under a
+    /// real Linux uid with a `/etc/passwd` row. Guards against
+    /// regressing the `/proc/self/status` + `/etc/passwd`
+    /// parsers used by [`blocked_smb_usernames`].
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detect_service_user_from_procfs_returns_a_name() {
+        let name = detect_service_user_from_procfs();
+        assert!(
+            name.is_some(),
+            "expected /proc/self/status + /etc/passwd to resolve a name; \
+             this test runs on the host that ran the test, whose uid \
+             should have a passwd row"
+        );
+        let name = name.unwrap();
+        assert!(!name.is_empty());
+        // Confirm lowercasing — the blocklist compares
+        // case-insensitively via lowercased-normalised names,
+        // so the euid-derived entry MUST already be lowercase.
+        assert_eq!(name, name.to_ascii_lowercase());
     }
 
     // ----- Subject publisher tests -----
