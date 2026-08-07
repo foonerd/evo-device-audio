@@ -1859,20 +1859,41 @@ EOF
 
     # Kiosk unit User= drop-in. evo-kiosk-eng's install.sh
     # deliberately does not set User= on evo-kiosk.service —
-    # the target user is a distribution concern. Without this
-    # drop-in the unit runs as root, which the framework's
-    # kiosk-socket allowlist correctly rejects (UID 0 is not
-    # the service user).
+    # the target user is a distribution concern (per
+    # install.sh line 340 comment). Without this drop-in the
+    # unit runs as root, which the framework's kiosk-socket
+    # allowlist correctly rejects (UID 0 is not the service
+    # user). Filename `10-user.conf` matches the convention
+    # named in the evo-kiosk.service unit body comment.
     install -d -m 0755 -o root -g root /etc/systemd/system/evo-kiosk.service.d
-    cat > /etc/systemd/system/evo-kiosk.service.d/user.conf <<EOF
+    # Remove any legacy `user.conf` from an earlier composed
+    # install so only one User= drop-in is authoritative.
+    rm -f /etc/systemd/system/evo-kiosk.service.d/user.conf
+    # SupplementaryGroups=evo-kiosk-cal grants read/write on
+    # `/var/lib/evo/settings/kiosk/*` (calibration overlay
+    # directory owned by the evo-kiosk-cal group so both the
+    # kiosk unit and the touch-calibration one-shot can share
+    # it). Skipped when the group is absent (e.g. a bootstrap
+    # run before Step 1i creates the group).
+    SUPPLEMENTARY_GROUPS=""
+    if getent group evo-kiosk-cal >/dev/null 2>&1; then
+        SUPPLEMENTARY_GROUPS="SupplementaryGroups=evo-kiosk-cal"
+    fi
+    cat > /etc/systemd/system/evo-kiosk.service.d/10-user.conf <<EOF
 # Kiosk unit runs as the service user so the mint peer UID
 # matches EVO_KIOSK_UIDS (evo.service.d/kiosk-uids.conf).
+# HOME= is required for GTK / wlroots / labwc cache + config
+# resolution under a systemd unit (default HOME= is empty for
+# non-user units). SupplementaryGroups= grants the kiosk unit
+# access to the shared calibration overlay directory.
 [Service]
 User=$SERVICE_USER
 Group=$SERVICE_USER
+Environment=HOME=/home/$SERVICE_USER
+$SUPPLEMENTARY_GROUPS
 EOF
-    chmod 0644 /etc/systemd/system/evo-kiosk.service.d/user.conf
-    echo "[bootstrap] installed /etc/systemd/system/evo-kiosk.service.d/user.conf (User=$SERVICE_USER)"
+    chmod 0644 /etc/systemd/system/evo-kiosk.service.d/10-user.conf
+    echo "[bootstrap] installed /etc/systemd/system/evo-kiosk.service.d/10-user.conf (User=$SERVICE_USER HOME=/home/$SERVICE_USER${SUPPLEMENTARY_GROUPS:+ $SUPPLEMENTARY_GROUPS})"
 
     # WLR renderer selection. Hardware-accelerated rendering
     # (the default GBM path) fails on hypervisor GPUs whose
