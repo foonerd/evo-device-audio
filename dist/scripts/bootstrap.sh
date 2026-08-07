@@ -1832,6 +1832,71 @@ else
 fi
 
 if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
+    # Boot dependency chain (evo → evo-ui → evo-kiosk).
+    #
+    # Symptom before this landed (verified on pi5target
+    # 2026-08-07 timestamps): evo-kiosk.service started at
+    # 16:43:04, evo.service at 16:45:25, evo-ui.service at
+    # 16:46:46 — the kiosk browser hit http://127.0.0.1/
+    # against a port nothing was yet bound to, and stayed
+    # there indefinitely (no auto-reload from a connection-
+    # refused error page). Operator had to
+    # `systemctl restart evo-ui` and then `evo-kiosk` for the
+    # UI to appear on glass.
+    #
+    # The chain enforced here (three drop-ins):
+    #
+    # 1. `evo-ui.service` — depends on `evo.service` (it
+    #    reverse-proxies to the framework's :8443). Without
+    #    the framework wire up, evo-ui-runtime binds :80/:443
+    #    but every request that reaches its `/api/*` reverse
+    #    proxy path fails.
+    #
+    # 2. `evo-kiosk.service` — depends on `evo-ui.service`
+    #    (the browser loads http://127.0.0.1/ from it).
+    #    Without evo-ui up, the browser loads a browser-
+    #    default "connection refused" page and never retries.
+    #
+    # 3. `evo-kiosk.service` also carries an ExecStartPre that
+    #    waits for `http://127.0.0.1/` to return HTTP 200 (up
+    #    to 30 seconds) — belt-and-braces guarantee that the
+    #    URL is actually reachable, not just that
+    #    `evo-ui.service` is systemd-active. Handles the rare
+    #    case where evo-ui-runtime is `active running` but has
+    #    not yet completed its TCP bind (bounded startup
+    #    race).
+    install -d -m 0755 -o root -g root /etc/systemd/system/evo-ui.service.d
+    cat > /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf <<'EOF'
+# Framework wire must be up before the UI runtime binds — the
+# runtime reverse-proxies /api to /wss/ against 127.0.0.1:8443.
+[Unit]
+After=evo.service
+Wants=evo.service
+Requires=evo.service
+EOF
+    chmod 0644 /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf
+    echo "[bootstrap] installed evo-ui.service.d/depends-on-evo.conf (After+Wants+Requires evo.service)"
+
+    install -d -m 0755 -o root -g root /etc/systemd/system/evo-kiosk.service.d
+    cat > /etc/systemd/system/evo-kiosk.service.d/depends-on-evo-ui.conf <<'EOF'
+# UI runtime must be listening on http://127.0.0.1/ before the
+# kiosk browser launches. Without this, the browser loads
+# connection-refused and stays there (no auto-retry).
+[Unit]
+After=evo-ui.service
+Wants=evo-ui.service
+
+[Service]
+# Belt-and-braces: even after evo-ui.service is `active`,
+# there is a bounded window before the TCP bind completes.
+# Poll the URL for up to 30 seconds; refuse to launch the
+# browser if it never comes up (Restart=always brings the
+# kiosk back, and by then evo-ui is ready).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do curl -fsS -o /dev/null --max-time 1 http://127.0.0.1/ && exit 0; sleep 1; done; echo "[kiosk-wait] http://127.0.0.1/ never came up after 30s" >&2; exit 1'
+EOF
+    chmod 0644 /etc/systemd/system/evo-kiosk.service.d/depends-on-evo-ui.conf
+    echo "[bootstrap] installed evo-kiosk.service.d/depends-on-evo-ui.conf (After+Wants evo-ui + ExecStartPre URL wait)"
+
     # Kiosk mint UID allowlist. The framework's kiosk-socket
     # (`/run/evo/kiosk.sock`) refuses every mint until the
     # distribution declares which UID(s) may connect. Without
