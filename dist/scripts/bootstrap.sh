@@ -1874,6 +1874,45 @@ EOF
     chmod 0644 /etc/systemd/system/evo-kiosk.service.d/user.conf
     echo "[bootstrap] installed /etc/systemd/system/evo-kiosk.service.d/user.conf (User=$SERVICE_USER)"
 
+    # WLR renderer selection. Hardware-accelerated rendering
+    # (the default GBM path) fails on hypervisor GPUs whose
+    # DRM driver returns errors on `drmCloseBufferHandle` —
+    # observed under VMware SVGA (vmwgfx) 2026-08-07. labwc's
+    # own startup error output names the fallback:
+    #
+    #     If the above does not work, try running with
+    #     `WLR_RENDERER=pixman labwc` in order to use the
+    #     software rendering fallback
+    #
+    # Detect the class of substrate by DRM driver name and drop
+    # a `WLR_RENDERER=pixman` environment override for the known-
+    # broken drivers. Physical GPUs (i915, amdgpu, nouveau,
+    # nvidia, drm-rp1-dsi/v3d/vc4-drm on Pi 5, etc.) stay on the
+    # default GBM path.
+    KIOSK_DRM_DRIVERS=""
+    for d in /sys/class/drm/card*/device/driver; do
+        [[ -L "$d" ]] || continue
+        KIOSK_DRM_DRIVERS="$KIOSK_DRM_DRIVERS $(basename "$(readlink -f "$d")")"
+    done
+    case " $KIOSK_DRM_DRIVERS " in
+        *" vmwgfx "*|*" qxl "*|*" virtio "*|*" virtio_gpu "*)
+            cat > /etc/systemd/system/evo-kiosk.service.d/wlr-renderer.conf <<EOF
+# Software renderer override — the DRM driver on this host
+# (detected at bootstrap time:$KIOSK_DRM_DRIVERS) returns
+# errors on drmCloseBufferHandle under the GBM accelerated
+# path. Fallback documented by labwc itself in its startup
+# error message.
+[Service]
+Environment=WLR_RENDERER=pixman
+EOF
+            chmod 0644 /etc/systemd/system/evo-kiosk.service.d/wlr-renderer.conf
+            echo "[bootstrap] installed evo-kiosk.service.d/wlr-renderer.conf (WLR_RENDERER=pixman) for drivers:$KIOSK_DRM_DRIVERS"
+            ;;
+        *)
+            echo "[bootstrap] DRM driver(s):$KIOSK_DRM_DRIVERS — using default GBM renderer"
+            ;;
+    esac
+
     if [[ -x "${KIOSK_LAYER_DIR}/scripts/install/install.sh" ]]; then
         echo
         echo "[bootstrap] Step 4b: evo-kiosk-eng (labwc + WebKit browser)"
