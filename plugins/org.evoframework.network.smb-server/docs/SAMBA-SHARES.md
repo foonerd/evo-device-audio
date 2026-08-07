@@ -188,37 +188,108 @@ the wrapper only — not free-form `useradd` / `userdel` argv).
 Password bytes come from the credential vault and are piped on
 stdin; they NEVER appear on argv or in plugin state TOML.
 
+The plugin's `add_user` + `revoke_user` verbs straddle three
+substrates: (a) plugin persisted state (`smb_server.toml`), (b)
+the framework credential vault, (c) the OS NSS + Samba passdb
+(reached via the wrapper). A partial commit across those three
+leaves an operator-visible-inconsistent state that only manual
+sudo recovers from, so both verbs implement atomic-commit
+semantics with idempotent-recovery contracts stated here.
+
+**Prerequisite: privileges drop-in.** The framework's reference
+`evo.service` bakes `ProtectSystem=strict`, which mounts the
+entire filesystem read-only for every descendant regardless of
+euid. Samba's `security = user` + `tdbsam` passdb opens
+`/var/lib/samba/private/{passdb,secrets}.tdb` for R+W on every
+`smbpasswd -a` and returns EROFS without a distribution-scope
+carve-out. The distribution ships
+`dist/systemd/evo.service.d/samba-server-privileges.conf` with
+the narrowest possible relaxation:
+
+```ini
+[Service]
+ReadWritePaths=/var/lib/samba
+```
+
+installed by `dist/scripts/bootstrap.sh` alongside every other
+`evo.service.d/*.conf`. Vendor distributions that admit the
+smb-server plugin but prefer the unrelaxed posture drop the
+file and accept that user provisioning surfaces `smbpasswd -a
+failed`; share management (`network.smb_server.apply`) is
+unaffected.
+
 **Add** (`network.smb_server.user_add`):
 
 1. Validate username (see below) and refuse blocklisted names.
-2. Refuse if the name is already in persisted `smb_users`.
-3. Resolve password bytes from the vault via `credential_key`.
-4. If NSS has no user for that name: create a system account
-   with **no login shell**, **no home**, system/UID range, e.g.
+2. Refuse `CredentialVaultUnavailable` if the plugin's
+   `LoadContext.credential_vault` was `None` at load time
+   (distinct class from `CredentialMissing` so the operator UI
+   renders "vault not wired to this plugin" rather than
+   "your password did not save").
+3. Refuse `UserAlreadyExists` if the name is already in
+   persisted `smb_users`.
+4. **Speculatively persist** the record into `smb_users` and
+   `state.save` under a single lock scope (closes the race
+   window between the duplicate check and the mutation). If
+   save fails: discard the in-memory push, surface
+   `Persistence` — no side effect has run, operator retries
+   cleanly.
+5. Fetch password bytes from the vault via `credential_key`.
+   On absent entry: roll back the speculative row +
+   `state.save`, surface `CredentialMissing`. On rollback save
+   failure: surface `AddRollbackFailed` carrying both errors.
+6. Fire the wrapper: it **refuses ANY pre-existing NSS entry**
+   (strict-refuse-any-NSS gate — the plugin must own every
+   NSS entry it attaches Samba credentials to), then
    `useradd -r -s /usr/sbin/nologin -d /nonexistent <name>`
-   (distro-equivalent). Do **not** use a login shell
-   (`/bin/bash`, `/bin/sh`, …).
-5. `smbpasswd -a -s <name>` with password on stdin (twice, as
-   `smbpasswd -s` requires).
-6. Persist `SmbUserRecord` (username, optional
-   `mapped_domain_identity`, `created_at_ms`, `credential_key`)
-   and republish `system_smb_server`.
+   (system UID range, no login shell, no home), then
+   `smbpasswd -a -s <name>` with password piped once on stdin
+   (wrapper doubles for `smbpasswd -s`). On wrapper failure or
+   subprocess I/O error: roll back the speculative row +
+   `state.save`, surface `UserSyncFailed` (or the underlying
+   `SubprocessIo`). On rollback save failure: surface
+   `AddRollbackFailed` carrying both stderr strings so the
+   operator UI can render composite failure and point at
+   `user_revoke` as the idempotent recovery gesture.
+7. On success: republish `system_smb_server`.
+
+A plugin crash between step 4's save-success and step 6's
+wrapper-success leaves a phantom row in state. Recovery: the
+operator's next `user_revoke` for that name converges
+idempotently (wrapper delete is no-op-safe against an absent
+NSS entry and an absent passdb row; vault delete is
+idempotent per the vault contract; `state.retain` removes the
+plugin row).
 
 **Revoke** (`network.smb_server.user_revoke`):
 
-1. Refuse if the name is not in persisted `smb_users`.
-2. `smbpasswd -x <name>` (ignore already-absent passdb).
-3. Remove the NSS account created for this SMB user
-   (`userdel <name>`), only when it matches the provisioned
-   shape (nologin + nonexistent home). Do **not** `userdel`
-   accounts the plugin did not create (blocklist / pre-existing
-   system users).
-4. Drop the persisted record and republish.
+1. Refuse `UserNotFound` if the name is not in persisted
+   `smb_users`.
+2. Snapshot `credential_key` from the record before mutating.
+3. Fire the wrapper: `smbpasswd -x <name>` (ignore
+   already-absent passdb) + `userdel <name>` ONLY when the NSS
+   entry matches the provisioned shape (nologin + nonexistent
+   home) — foreign NSS accounts are left in place to avoid
+   nuking what the plugin does not own.
+4. Retract the vault row via `credentials.delete_password`
+   (idempotent per the vault contract). On failure surface
+   `CredentialDeleteFailed`; the SMB user is already gone at
+   this point so the operator UI renders "vault row dangling"
+   and offers manual remediation via the credential admin
+   surface.
+5. In-memory `smb_users.retain(...)` + `state.save`. On save
+   failure: re-hydrate the in-memory state from disk via
+   `SmbServerState::load(&path)` so memory matches persistence
+   (WARN log names the class); return `Persistence`. The
+   operator's next `user_revoke` is idempotent across all
+   three substrates and converges on the first successful save.
+6. On success: republish `system_smb_server`.
 
 An implementation that only calls `smbpasswd` and never
-creates/removes the non-login NSS entry is **non-compliant**
-with this inventory — that is the 2026-08-06 File Sharing
-failure mode (UI Add user cannot mint a new name).
+creates/removes the non-login NSS entry, or that skips the
+vault-delete step, or that mutates in-memory state without
+persisting the same delta, is **non-compliant** with this
+inventory.
 
 ### Username rules
 
@@ -322,9 +393,10 @@ With SMB enabled on a cold or warm apply:
 | Stock + delivery shares | Shown as fixed (not editable path/name); clarify guest vs auth for `evo-plugins-stage`. |
 | Extra shares | List editor (name, path, guest_ok) per `shares.v1.toml`. |
 | Enable / min_protocol | Existing File Sharing controls. |
-| SMB users | Add/list/revoke by username; password via device vault prompt only. UI does not create Unix accounts — the device provision path does. No need to “pick a running system user.” |
+| Device name | Read `envelope.hostname` from `network.smb_server.get_state` on load; refresh on every `system_smb_server` subject update. Write via `network.smb_server.apply(system_hostname = <new>)`. Reader and writer share one substrate — the kernel — so a fresh read after an apply reflects the new name immediately. Empty string on the envelope is a diagnostic signal (procfs I/O failure) — render the field placeholder, never the empty value. |
+| SMB users | Add/list/revoke by username; password via device vault prompt only. UI does not create Unix accounts — the device provision path does. No need to "pick a running system user." |
 
-Copy that claims “share this device's library” is true only while
+Copy that claims "share this device's library" is true only while
 the stock music shares exist in the rendered conf.
 
 ---
