@@ -718,14 +718,60 @@ place_opt_evo() {
     # the built SPA at `<bundle>/ui/`; install it verbatim to
     # the STATIC_DIR target.
     if [[ -d "${STAGE_DIR}/ui" ]]; then
+        # UI SPA lands under a release-timestamped subdirectory,
+        # then `current` becomes a symlink to it. The framework's
+        # own HTTPS listener reads from `/opt/evo/ui` per
+        # https.conf, so also stage a top-level copy for the
+        # framework-side static-asset serving. evo-ui-runtime
+        # (the operator-facing HTTP/HTTPS listener on 80/443)
+        # resolves `active_release=/opt/evo/ui/current`.
         install -d -m 0755 -o root -g root /opt/evo/ui
-        # rsync semantics via cp -a on the contents (no leading
-        # dir name); --preserve keeps the tree byte-equal.
+        install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+            /opt/evo/ui/releases /opt/evo/ui/data /opt/evo/ui/logs
+        local release_id
+        release_id="$(date -u +%Y%m%dT%H%M%SZ)"
+        local release_dir="/opt/evo/ui/releases/${release_id}"
+        install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+            "${release_dir}"
+        cp -a "${STAGE_DIR}/ui/." "${release_dir}/"
+        # Point `current` at this release atomically. Idempotent
+        # under repeated install runs — ln -sfn replaces an
+        # existing symlink in place without leaving a stale dir.
+        ln -sfn "${release_dir}" /opt/evo/ui/current
+        # Top-level copy for the framework's `EVO_HTTPS_STATIC_DIR=/opt/evo/ui`
+        # static-asset serving path. Both surfaces resolve to
+        # the same content, from one bundled source.
         cp -a "${STAGE_DIR}/ui/." /opt/evo/ui/
-        # Ensure the tree is service-user-readable at least; the
-        # steward runs under the service user and needs to open
-        # every asset for the router.
         chown -R "${SERVICE_USER}:${SERVICE_USER}" /opt/evo/ui
+    fi
+
+    # evo-ui-runtime binary + evo-ui.service unit. The runtime
+    # is what the operator's browser hits on ports 80/443; the
+    # framework's own :8443 wire surface is what the runtime
+    # reverse-proxies to. Without the binary, `evo-ui.service`
+    # fail-loops with `status=209/STDOUT` and the operator UI
+    # is unreachable on the default ports — the state seen on
+    # the fleet before this composition landed.
+    if [[ -x "${STAGE_DIR}/ui-runtime/evo-ui-runtime" ]]; then
+        install -m 0755 -o root -g root \
+            "${STAGE_DIR}/ui-runtime/evo-ui-runtime" \
+            /opt/evo/bin/evo-ui-runtime
+    fi
+    if [[ -f "${STAGE_DIR}/ui-runtime/evo-ui.service.in" ]]; then
+        local unit_tmp
+        unit_tmp="$(mktemp)"
+        sed -e "s|@SERVICE_USER@|${SERVICE_USER}|g" \
+            "${STAGE_DIR}/ui-runtime/evo-ui.service.in" > "${unit_tmp}"
+        if grep -qE '@[A-Z_]+@' "${unit_tmp}"; then
+            echo "FAIL: evo-ui.service unit still carries unresolved @TOKEN@ placeholders" >&2
+            rm -f "${unit_tmp}"
+            exit 4
+        fi
+        install -m 0644 -o root -g root "${unit_tmp}" \
+            /etc/systemd/system/evo-ui.service
+        rm -f "${unit_tmp}"
+        systemctl daemon-reload
+        systemctl enable evo-ui.service >/dev/null 2>&1 || true
     fi
     # Sweep stale plugin bundles + install fresh.
     local d p p_name

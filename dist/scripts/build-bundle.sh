@@ -428,6 +428,39 @@ if [[ -n "${UI_SHELL_ROOT}" ]]; then
         echo "      ${UI_SHELL_ROOT} before building the audio bundle." >&2
         exit 2
     fi
+
+    # evo-ui-runtime — the operator-facing HTTP/HTTPS listener
+    # on ports 80/443 that serves the SPA and reverse-proxies
+    # the framework's :8443 wire surface at the same origin.
+    # Distinct from the framework's own HTTPS listener (which
+    # only speaks the wire, does not serve static assets in a
+    # release-layout shape). The runtime binary is what the
+    # `evo-ui.service` systemd unit executes; without it the
+    # unit fail-loops with `status=209/STDOUT` and the operator
+    # UI is unreachable on the default ports.
+    #
+    # Prebuilt binaries live at
+    # `apps/evo-ui-runtime/target/<triple>/release/evo-ui-runtime`
+    # under evo-ui-eng. Match the current TARGET_TRIPLE; the
+    # UI team builds x86_64 + aarch64 prebuilts alongside every
+    # release.
+    UI_RUNTIME_BIN="${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-runtime/target/${TARGET_TRIPLE}/release/evo-ui-runtime"
+    UI_SERVICE_TEMPLATE="${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-runtime/scripts/device/evo-ui.service.in"
+    if [[ -x "${UI_RUNTIME_BIN}" && -f "${UI_SERVICE_TEMPLATE}" ]]; then
+        install -d -m 0755 "${STAGE_DIR}/ui-runtime"
+        install -m 0755 "${UI_RUNTIME_BIN}" \
+            "${STAGE_DIR}/ui-runtime/evo-ui-runtime"
+        install -m 0644 "${UI_SERVICE_TEMPLATE}" \
+            "${STAGE_DIR}/ui-runtime/evo-ui.service.in"
+        echo "  ok evo-ui-runtime ($(basename "${UI_RUNTIME_BIN}") + evo-ui.service.in for ${TARGET_TRIPLE})"
+    else
+        echo "FAIL: evo-ui-runtime prebuilt missing for ${TARGET_TRIPLE}" >&2
+        echo "      Expected binary: ${UI_RUNTIME_BIN}" >&2
+        echo "      Expected unit template: ${UI_SERVICE_TEMPLATE}" >&2
+        echo "      Build with \`cargo build --release --target ${TARGET_TRIPLE}\` inside" >&2
+        echo "      \$(dirname \"${UI_RUNTIME_BIN}\")/../../.." >&2
+        exit 2
+    fi
 fi
 
 if [[ -n "${KIOSK_ROOT}" ]]; then
