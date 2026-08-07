@@ -1198,8 +1198,48 @@ pub struct SystemSmbServerEnvelope {
     pub smb_users: Vec<SmbUserPublic>,
     /// Wall-clock ms of the last successful apply, or `None`.
     pub last_apply_at_ms: Option<i64>,
+    /// Live OS hostname, read from the kernel at envelope-
+    /// compose time via [`read_live_hostname`]. This is the
+    /// same value `apply`'s `system_hostname` path writes via
+    /// `hostnamectl set-hostname`: `hostnamectl` sets both
+    /// `/etc/hostname` and calls `sethostname(2)`, and the
+    /// kernel-live value is what shows up in
+    /// `/proc/sys/kernel/hostname`, in `uname -n`, and on the
+    /// wire when SMB / mDNS advertise the node. The operator
+    /// UI's "Device name" field reads this so a fresh page
+    /// pre-fills the current name and a live subject update
+    /// reflects an `apply` that changed it — one source of
+    /// truth across `get_state` and the subject snapshot.
+    ///
+    /// Empty string when the kernel-hostname read fails
+    /// (`/proc/sys/kernel/hostname` missing or unreadable) —
+    /// diagnostic surface for the UI, not a fabricated value.
+    pub hostname: String,
     /// Envelope composition time.
     pub last_update_at: SystemTime,
+}
+
+/// Read the live OS hostname from the kernel.
+///
+/// Reads `/proc/sys/kernel/hostname` — the kernel-authoritative
+/// value that reflects the last `sethostname(2)` call. This is
+/// what `hostnamectl set-hostname <name>` (used by
+/// [`apply_system_hostname_best_effort`]) causes systemd-hostnamed
+/// to write, so the reader and the writer agree on the same
+/// substrate without a config-file round-trip that could go
+/// stale. Trailing newline stripped.
+///
+/// Returns an empty string on I/O failure (missing procfs, a
+/// non-Linux target under test, permissions surprise) — the
+/// envelope carries the empty value as a diagnostic signal
+/// rather than a fabricated default. `#![forbid(unsafe_code)]`
+/// in this crate rules out a direct `libc::gethostname` FFI
+/// call; procfs is the same fact through a safe path.
+pub fn read_live_hostname() -> String {
+    match std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 struct SambaPublisher {
@@ -1889,6 +1929,11 @@ impl SambaServerRuntime {
     }
 
     async fn compose_envelope(&self) -> SystemSmbServerEnvelope {
+        // Read the live hostname OUTSIDE the state lock so a
+        // slow procfs read (unlikely on a healthy system, but
+        // possible under I/O pressure) cannot block concurrent
+        // add / revoke / apply serialisation.
+        let hostname = read_live_hostname();
         let g = self.inner.lock().await;
         SystemSmbServerEnvelope {
             enabled: g.state.enabled,
@@ -1901,6 +1946,7 @@ impl SambaServerRuntime {
                 .map(SmbUserPublic::from)
                 .collect(),
             last_apply_at_ms: g.state.last_apply_at_ms,
+            hostname,
             last_update_at: SystemTime::now(),
         }
     }
@@ -3599,6 +3645,52 @@ mod tests {
         assert_eq!(
             latest["extra_shares"][0]["name"],
             serde_json::json!("Music")
+        );
+    }
+
+    /// The subject envelope MUST carry the OS live hostname
+    /// (procfs kernel-hostname) so operator UI's "Device name"
+    /// surface pre-fills the current name from a single source
+    /// of truth. The same value MUST appear in the
+    /// `get_state` verb response (via `compose_envelope`) so a
+    /// fresh page and a live subject update agree.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn subject_envelope_carries_live_hostname() {
+        let dir = tempdir();
+        let (rt, _) =
+            built_runtime(&dir, vec![ok(), ok(), ok()], HashMap::new());
+        let announcer = RecordingAnnouncer::new();
+        rt.attach_subject_publisher(announcer.clone())
+            .await
+            .unwrap();
+        // Baseline: read the same value the envelope helper
+        // reads. If procfs is somehow empty (containerised
+        // test host without procfs mount), the assertion is
+        // still meaningful — envelope MUST match the helper.
+        let expected = read_live_hostname();
+        // From the initial announce path (fires during
+        // `attach_subject_publisher`).
+        let latest = announcer
+            .latest_of(&system_smb_server_addressing())
+            .unwrap();
+        assert_eq!(
+            latest["hostname"],
+            serde_json::json!(expected),
+            "subject envelope hostname MUST match \
+             /proc/sys/kernel/hostname"
+        );
+        // From the `get_state`-shape path (compose_envelope
+        // called synchronously by dispatch_verb).
+        let payload = rt
+            .dispatch_verb("network.smb_server.get_state", b"{}")
+            .await
+            .unwrap();
+        let text = String::from_utf8(payload).unwrap();
+        assert!(
+            text.contains(&format!("\"hostname\":\"{expected}\"")),
+            "get_state envelope MUST carry the same live \
+             hostname as the subject; got: {text}"
         );
     }
 
