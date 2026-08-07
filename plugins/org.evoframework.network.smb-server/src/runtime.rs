@@ -289,7 +289,12 @@ impl SmbServerState {
     }
 
     /// Serialise + atomic-save. Writes to `<path>.tmp` then
-    /// renames.
+    /// renames. Sets file mode `0o600` after the rename — the
+    /// state file carries per-user `credential_key` fields that
+    /// name entries in the framework credential vault. The
+    /// steward's plugin state directory is already `0o700`, so
+    /// the file mode is defence-in-depth against a hypothetical
+    /// perm-widen on the parent, not the sole barrier.
     pub fn save(&self, path: &Path) -> Result<(), SmbServerStateError> {
         let text = toml::to_string_pretty(self).map_err(|e| {
             SmbServerStateError::TomlRender {
@@ -312,6 +317,16 @@ impl SmbServerState {
         fs::rename(&tmp, path).map_err(|e| SmbServerStateError::Io {
             detail: e.to_string(),
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            fs::set_permissions(path, perms).map_err(|e| {
+                SmbServerStateError::Io {
+                    detail: e.to_string(),
+                }
+            })?;
+        }
         Ok(())
     }
 }
@@ -463,6 +478,26 @@ pub enum ApplyError {
     UserAlreadyExists {
         /// The username the caller asked to add.
         username: String,
+    },
+    /// `add_user` speculatively persisted the record, then the
+    /// wrapper subprocess failed, AND the rollback attempt to
+    /// remove the speculative row from `smb_server.toml` also
+    /// failed. Both failures are surfaced verbatim so operator
+    /// UI can render "add failed AND rollback failed — the
+    /// plugin state now carries a phantom row; run `user_revoke`
+    /// to reconcile (the wrapper delete + vault delete paths
+    /// are idempotent and safe against an absent NSS entry).
+    #[error(
+        "smb user_add rollback failed for {username}: wrapper stderr={wrapper_stderr}; \
+         rollback save error={rollback_detail}"
+    )]
+    AddRollbackFailed {
+        /// The username the caller asked to add.
+        username: String,
+        /// The wrapper subprocess's stderr (the primary cause).
+        wrapper_stderr: String,
+        /// The state-save rollback's failure text.
+        rollback_detail: String,
     },
     /// Username failed the inventory pattern
     /// (`^[a-z_][a-z0-9_-]{0,31}$` after lowercasing).
@@ -1221,39 +1256,14 @@ fn default_now_ms() -> u64 {
 }
 
 impl SambaServerRuntime {
-    /// Convenience constructor: opens the persistence file
-    /// under `state_dir` with production defaults for every
-    /// pluggable field. For tests + vendor wiring use
-    /// [`Self::builder`].
-    pub fn open(state_dir: &Path) -> Result<Self, SmbServerStateError> {
-        let path = state_dir.join(SMB_SERVER_FILE);
-        let state = SmbServerState::load(&path)?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(SambaServerInner { state, path })),
-            executor: Arc::new(SubprocessSambaExecutor),
-            credentials: Arc::new(NoSmbCredentialFetcher),
-            sudo_program: DEFAULT_SUDO_PROGRAM.to_string(),
-            smb_conf_path: PathBuf::from(DEFAULT_SMB_CONF_PATH),
-            candidate_path: PathBuf::from(DEFAULT_SMB_CONF_CANDIDATE_PATH),
-            netbios_name: DEFAULT_NETBIOS_NAME.to_string(),
-            workgroup: DEFAULT_WORKGROUP.to_string(),
-            path_allowlist: DEFAULT_SHARE_PATH_ALLOWLIST
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            path_denylist: DEFAULT_SHARE_PATH_DENYLIST
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            subprocess_timeout_ms: DEFAULT_SAMBA_SUBPROCESS_TIMEOUT_MS,
-            publisher: StdMutex::new(None),
-            now_fn: Arc::new(default_now_ms),
-        })
-    }
-
-    /// Start a builder for constructing a runtime with custom
-    /// executor / credential fetcher / program paths / identity
-    /// strings / path allowlist / clock.
+    /// Start a builder for constructing a runtime. The plugin's
+    /// `load` path wires it up with the framework credential
+    /// vault handle from [`LoadContext`]; test suites use the
+    /// same builder with an in-process fetcher. There is no
+    /// convenience `open()` constructor — a runtime with no
+    /// explicit credential fetcher would silently return
+    /// `CredentialVaultUnavailable` on every `add_user`, which
+    /// is worse than making the call site declare its intent.
     pub fn builder(
         state_dir: &Path,
     ) -> Result<SambaServerRuntimeBuilder, SmbServerStateError> {
@@ -1404,13 +1414,40 @@ impl SambaServerRuntime {
         })
     }
 
-    /// Add an SMB user. Validates the username, fetches
-    /// password bytes from the vault via
-    /// [`SmbCredentialFetcher::fetch_password`], and pipes
-    /// them once into `evo-smb-user-sync add <user>` (the
-    /// wrapper creates the nologin NSS account and doubles the
-    /// password for `smbpasswd -s`). On success, persists the
-    /// [`SmbUserRecord`] and republishes the reactive subject.
+    /// Add an SMB user with three-substrate atomic-commit
+    /// semantics.
+    ///
+    /// The verb straddles three substrates: the plugin's on-disk
+    /// state file, the framework credential vault, and the OS
+    /// (NSS entry + Samba passdb via the sudo-elevated wrapper).
+    /// A partial commit across those substrates leaves the
+    /// device in an operator-visible-inconsistent state that
+    /// only manual sudo can recover from, so the sequence is:
+    ///
+    /// 1. Validate the username, refuse if the credential vault
+    ///    handle was never wired at load time, and reject
+    ///    duplicates against the current in-memory `smb_users`.
+    /// 2. Speculatively push the record into `smb_users` and
+    ///    `state.save`. If the save fails, discard the in-memory
+    ///    push and surface `Persistence` — no other substrate
+    ///    has been touched, so the operator can retry cleanly.
+    /// 3. Fetch the password bytes from the vault. On absent
+    ///    entry, roll back the speculative row + save; surface
+    ///    `CredentialMissing`.
+    /// 4. Fire the wrapper subprocess. On any subprocess or
+    ///    non-zero-exit failure, roll back the speculative row +
+    ///    save; surface `UserSyncFailed` (or the underlying
+    ///    `SubprocessIo`). If the rollback save itself also
+    ///    fails, surface `AddRollbackFailed` carrying both
+    ///    stderr strings so the operator sees the composite
+    ///    failure — the wrapper's `add` gate refuses any
+    ///    pre-existing NSS entry, and `revoke_user` is idempotent
+    ///    against absent NSS + passdb, so recovering from a
+    ///    phantom row is one operator `user_revoke` call.
+    ///
+    /// A plugin crash between step 2's save-success and step 4's
+    /// wrapper-success leaves a phantom row; the same recovery
+    /// path (operator `user_revoke`) reconciles it.
     pub async fn add_user(
         &self,
         username: String,
@@ -1427,27 +1464,73 @@ impl SambaServerRuntime {
         if !self.credentials.is_operator_wired() {
             return Err(ApplyError::CredentialVaultUnavailable);
         }
+
+        let created_at_ms = (self.now_fn)() as i64;
+        let record = SmbUserRecord {
+            username: username.clone(),
+            mapped_domain_identity,
+            created_at_ms,
+            credential_key: credential_key.clone(),
+        };
+
+        // Step 2: duplicate check + speculative persist in ONE
+        // lock scope. Doing both under the same guard closes the
+        // race window in which two concurrent adds could both
+        // pass the "already exists" check.
         {
-            let g = self.inner.lock().await;
+            let mut g = self.inner.lock().await;
             if g.state.smb_users.iter().any(|u| u.username == username) {
                 return Err(ApplyError::UserAlreadyExists { username });
             }
+            g.state.smb_users.push(record.clone());
+            if let Err(e) = g.state.save(&g.path) {
+                // Save failed before any side effect. Roll back
+                // the in-memory push so subsequent calls in this
+                // process see the original state, then surface
+                // the persistence error.
+                g.state.smb_users.retain(|u| u.username != username);
+                return Err(e.into());
+            }
         }
 
-        let password = self
+        // Step 3: fetch the vault password. On failure, roll
+        // back the speculative row so the plugin state stays
+        // consistent with "user not added". Best-effort rollback
+        // save; on rollback failure we return `AddRollbackFailed`
+        // carrying both stderr strings.
+        let password = match self
             .credentials
             .fetch_password(&credential_key)
             .await
-            .ok_or_else(|| ApplyError::CredentialMissing {
-            key: credential_key.clone(),
-        })?;
+        {
+            Some(p) => p,
+            None => {
+                let rollback = {
+                    let mut g = self.inner.lock().await;
+                    g.state.smb_users.retain(|u| u.username != username);
+                    g.state.save(&g.path)
+                };
+                if let Err(rb) = rollback {
+                    return Err(ApplyError::AddRollbackFailed {
+                        username,
+                        wrapper_stderr: format!(
+                            "credential vault has no entry for key {credential_key}"
+                        ),
+                        rollback_detail: rb.to_string(),
+                    });
+                }
+                return Err(ApplyError::CredentialMissing {
+                    key: credential_key,
+                });
+            }
+        };
 
-        // Wrapper reads password once; it doubles for smbpasswd -s.
+        // Step 4: fire the wrapper. Wrapper reads password once;
+        // it doubles for `smbpasswd -s`.
         let mut stdin = password;
         stdin.push(b'\n');
-
         let args = build_smb_user_sync_add_args(&username);
-        let out = self
+        let outcome = self
             .executor
             .run(
                 &self.sudo_program,
@@ -1455,34 +1538,69 @@ impl SambaServerRuntime {
                 self.subprocess_timeout_ms,
                 &stdin,
             )
-            .await?;
-        if out.exit_code != Some(0) {
-            return Err(ApplyError::UserSyncFailed {
-                username,
-                exit_code: out.exit_code,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
-        }
+            .await;
 
-        let created_at_ms = (self.now_fn)() as i64;
-        let record = SmbUserRecord {
-            username,
-            mapped_domain_identity,
-            created_at_ms,
-            credential_key,
-        };
-        {
-            let mut g = self.inner.lock().await;
-            g.state.smb_users.push(record.clone());
-            g.state.save(&g.path)?;
+        match outcome {
+            Ok(out) if out.exit_code == Some(0) => {
+                self.schedule_republish().await;
+                Ok(record)
+            }
+            Ok(out) => {
+                let wrapper_stderr =
+                    String::from_utf8_lossy(&out.stderr).into_owned();
+                let exit_code = out.exit_code;
+                let rollback = {
+                    let mut g = self.inner.lock().await;
+                    g.state.smb_users.retain(|u| u.username != username);
+                    g.state.save(&g.path)
+                };
+                if let Err(rb) = rollback {
+                    return Err(ApplyError::AddRollbackFailed {
+                        username,
+                        wrapper_stderr,
+                        rollback_detail: rb.to_string(),
+                    });
+                }
+                Err(ApplyError::UserSyncFailed {
+                    username,
+                    exit_code,
+                    stderr: wrapper_stderr,
+                })
+            }
+            Err(io_err) => {
+                let io_msg = io_err.to_string();
+                let rollback = {
+                    let mut g = self.inner.lock().await;
+                    g.state.smb_users.retain(|u| u.username != username);
+                    g.state.save(&g.path)
+                };
+                if let Err(rb) = rollback {
+                    return Err(ApplyError::AddRollbackFailed {
+                        username,
+                        wrapper_stderr: format!(
+                            "subprocess I/O error: {io_msg}"
+                        ),
+                        rollback_detail: rb.to_string(),
+                    });
+                }
+                Err(io_err)
+            }
         }
-        self.schedule_republish().await;
-        Ok(record)
     }
 
-    /// Revoke an SMB user via `evo-smb-user-sync delete <user>`
-    /// and remove the persisted record. Republishes the
-    /// reactive subject.
+    /// Revoke an SMB user with three-substrate reconciliation.
+    ///
+    /// The order is (a) wrapper delete (idempotent against
+    /// absent NSS + absent passdb), (b) vault delete
+    /// (idempotent per the vault contract), (c) in-memory
+    /// mutation + state.save. If (c) fails after (a) + (b)
+    /// succeed, the plugin's in-memory state is re-hydrated
+    /// from the on-disk state file so memory matches disk —
+    /// the operator sees the row still present via `get_state`,
+    /// consistent with what a plugin restart would show. The
+    /// operator retries `user_revoke`, which is idempotent
+    /// across all three substrates and converges on the next
+    /// successful save.
     pub async fn revoke_user(&self, username: &str) -> Result<(), ApplyError> {
         let username = normalize_smb_username(username)?;
         // Snapshot the record's credential_key before we delete
@@ -1530,10 +1648,53 @@ impl SambaServerRuntime {
             });
         }
 
-        {
+        // In-memory mutation + save. On save failure, re-hydrate
+        // in-memory state from disk so the plugin's memory
+        // matches its persistence — otherwise a subsequent
+        // `get_state` would report the user as revoked while
+        // the on-disk record still names them, and a plugin
+        // restart would resurrect the row against the operator's
+        // last observation. The wrapper + vault deletes are
+        // both idempotent, so the operator's next `user_revoke`
+        // will converge cleanly on any subsequent save-success.
+        let save_result = {
             let mut g = self.inner.lock().await;
             g.state.smb_users.retain(|u| u.username != username);
-            g.state.save(&g.path)?;
+            g.state.save(&g.path)
+        };
+        if let Err(e) = save_result {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                username = %username,
+                error = %e,
+                "revoke_user: state.save failed after wrapper + vault \
+                 delete succeeded; re-hydrating in-memory state from disk \
+                 so the plugin's memory matches persistence — the operator's \
+                 next `user_revoke` will converge (wrapper + vault deletes \
+                 are idempotent)"
+            );
+            let rehydrated = {
+                let g = self.inner.lock().await;
+                SmbServerState::load(&g.path)
+            };
+            match rehydrated {
+                Ok(loaded) => {
+                    let mut g = self.inner.lock().await;
+                    g.state = loaded;
+                }
+                Err(reload_err) => {
+                    tracing::error!(
+                        plugin = crate::PLUGIN_NAME,
+                        username = %username,
+                        save_error = %e,
+                        reload_error = %reload_err,
+                        "revoke_user: state.save failed AND the follow-up \
+                         disk re-read also failed; in-memory state now \
+                         drifts from disk until the next successful save"
+                    );
+                }
+            }
+            return Err(e.into());
         }
         self.schedule_republish().await;
         Ok(())
@@ -3167,6 +3328,126 @@ mod tests {
         let deleted = deletes.lock().await;
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0], "vault:smb:target");
+    }
+
+    /// State-file persistence MUST set mode 0o600 so the
+    /// `credential_key` fields (which name entries in the
+    /// framework credential vault) are not world-readable.
+    /// The steward's plugin state directory is already 0o700
+    /// in production; this is defence-in-depth against a
+    /// hypothetical perm-widen on the parent.
+    #[test]
+    #[cfg(unix)]
+    fn state_save_sets_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let path = dir.join(SMB_SERVER_FILE);
+        SmbServerState::empty().save(&path).unwrap();
+        let mode =
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "state file must be 0o600, got 0o{mode:o}");
+    }
+
+    /// `add_user` MUST roll back the speculative `smb_users`
+    /// push when the wrapper subprocess exits non-zero. Without
+    /// rollback, an operator seeing a spurious wrapper failure
+    /// would end up with a plugin state row that does not
+    /// correspond to a real NSS + passdb entry — the next add
+    /// would refuse "already exists" from the plugin's
+    /// in-memory state, and the next revoke would issue a
+    /// wrapper delete against an absent user. Rollback keeps
+    /// the plugin's admitted-user list authoritative.
+    #[tokio::test]
+    async fn add_user_rolls_back_state_when_wrapper_fails() {
+        let dir = tempdir();
+        let mut creds = HashMap::new();
+        creds.insert("k".to_string(), b"pw".to_vec());
+        // ScriptedSamba is scripted to return a non-zero exit on
+        // the single wrapper call — the wrapper add failure path.
+        let (rt, _executor) = built_runtime(&dir, vec![err_output()], creds);
+        let err = rt
+            .add_user("scrubme".to_string(), "k".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::UserSyncFailed { .. }),
+            "expected UserSyncFailed, got: {err:?}"
+        );
+        // The rollback ran: in-memory smb_users MUST be empty.
+        let state = rt.get_state().await;
+        assert!(
+            state.smb_users.is_empty(),
+            "expected empty smb_users after rollback, got: {:?}",
+            state.smb_users
+        );
+        // Disk state MUST match — otherwise a plugin restart
+        // would resurrect the phantom row.
+        let on_disk = SmbServerState::load(&dir.join(SMB_SERVER_FILE)).unwrap();
+        assert!(
+            on_disk.smb_users.is_empty(),
+            "expected empty smb_users on disk after rollback, got: {:?}",
+            on_disk.smb_users
+        );
+    }
+
+    /// When `fetch_password` returns None AFTER the speculative
+    /// persist has committed to disk, `add_user` MUST roll back
+    /// the row so a subsequent `credential_put` + `user_add`
+    /// retry finds a clean slate. This is the same shape as
+    /// `add_user_missing_credential_key_returns_credential_missing`
+    /// but with an explicit rollback assertion on top.
+    #[tokio::test]
+    async fn add_user_rolls_back_state_when_credential_missing() {
+        let dir = tempdir();
+        let (rt, _executor) = built_runtime(&dir, Vec::new(), HashMap::new());
+        let err = rt
+            .add_user(
+                "scrubme".to_string(),
+                "vault:smb:scrubme".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::CredentialMissing { .. }),
+            "expected CredentialMissing, got: {err:?}"
+        );
+        // In-memory + on-disk state must both be empty.
+        assert!(rt.get_state().await.smb_users.is_empty());
+        let on_disk = SmbServerState::load(&dir.join(SMB_SERVER_FILE)).unwrap();
+        assert!(on_disk.smb_users.is_empty());
+    }
+
+    /// A successful `add_user` immediately followed by a
+    /// `add_user` for the SAME username must refuse via the
+    /// plugin's in-memory dup check (`UserAlreadyExists`) —
+    /// this proves the speculative-persist path still commits
+    /// to in-memory state on success (not just to disk).
+    #[tokio::test]
+    async fn add_user_dedup_survives_speculative_persist_ordering() {
+        let dir = tempdir();
+        let mut creds = HashMap::new();
+        creds.insert("k".to_string(), b"pw".to_vec());
+        // One successful wrapper call, then no more scripted
+        // outputs (the second add should be refused before it
+        // reaches the wrapper).
+        let (rt, executor) = built_runtime(&dir, vec![ok()], creds);
+        rt.add_user("keep".to_string(), "k".to_string(), None)
+            .await
+            .unwrap();
+        let err = rt
+            .add_user("keep".to_string(), "k".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::UserAlreadyExists { .. }));
+        // Wrapper was called exactly once — the second add's
+        // in-memory dup check must fire BEFORE any subprocess.
+        let calls = executor.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "wrapper must not be invoked on the duplicate add"
+        );
     }
 
     /// The euid-derived service-user detection MUST return
