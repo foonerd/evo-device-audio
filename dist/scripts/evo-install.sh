@@ -610,6 +610,15 @@ strip_evo_include_from_mpd_conf() {
 }
 
 stop_prior_steward() {
+    # Stop the whole operator surface before any wipe of
+    # /opt/evo. evo-ui.service writes StandardOutput to
+    # /opt/evo/ui/logs/runtime.log; if the unit stays enabled
+    # while wipe_full removes that directory, systemd
+    # restart-loops with status=209/STDOUT (hundreds of
+    # failures per minute — the 2026-08-07 fleet incident).
+    # Same class for evo-kiosk which depends on evo-ui.
+    systemctl stop evo-kiosk 2>/dev/null || true
+    systemctl stop evo-ui 2>/dev/null || true
     systemctl stop evo 2>/dev/null || true
     # Reset any auto-restart-pending state from a previously
     # broken unit (e.g. an earlier install attempt that left
@@ -617,11 +626,12 @@ stop_prior_steward() {
     # this, systemd keeps logging "Service has no ExecStart=,
     # ExecStop=, or SuccessAction=. Refusing." while it
     # auto-retries during the install transition.
-    systemctl reset-failed evo 2>/dev/null || true
+    systemctl reset-failed evo evo-ui evo-kiosk 2>/dev/null || true
     # Kill any evo-device-audio process not under systemd's
     # control (manual sudo launches survive systemctl stop).
     pkill -KILL -f '/opt/evo/bin/evo-device-audio' 2>/dev/null || true
     pkill -KILL -f '/opt/evo/plugins/.*/plugin\.bin' 2>/dev/null || true
+    pkill -KILL -f '/opt/evo/bin/evo-ui-runtime' 2>/dev/null || true
 }
 
 wipe_full() {
@@ -641,6 +651,14 @@ wipe_full() {
     rm -f /etc/sudoers.d/evo-* 2>/dev/null || true
     rm -f /etc/systemd/system/evo.service
     rm -rf /etc/systemd/system/evo.service.d
+    # Companion units also own paths under /opt/evo and
+    # /var/lib/evo. Drop them with the wipe so a half-applied
+    # previous install cannot restart into a missing tree.
+    rm -f /etc/systemd/system/evo-ui.service
+    rm -rf /etc/systemd/system/evo-ui.service.d
+    rm -f /etc/systemd/system/evo-kiosk.service
+    rm -rf /etc/systemd/system/evo-kiosk.service.d
+    systemctl disable evo-ui.service evo-kiosk.service 2>/dev/null || true
     rm -rf /var/lib/evo
     restore_pre_evo_asound_conf
     strip_evo_include_from_mpd_conf
@@ -758,6 +776,13 @@ place_opt_evo() {
             /opt/evo/bin/evo-ui-runtime
     fi
     if [[ -f "${STAGE_DIR}/ui-runtime/evo-ui.service.in" ]]; then
+        # Guarantee the StandardOutput directory exists BEFORE
+        # the unit is enabled. evo-ui.service fails with
+        # status=209/STDOUT when /opt/evo/ui/logs is absent;
+        # enable+daemon-reload can race a start if the unit
+        # was previously WantedBy=multi-user.target.
+        install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+            /opt/evo/ui /opt/evo/ui/logs /opt/evo/ui/data /opt/evo/ui/releases
         local unit_tmp
         unit_tmp="$(mktemp)"
         sed -e "s|@SERVICE_USER@|${SERVICE_USER}|g" \
@@ -912,6 +937,7 @@ start_steward() {
 # -------- Post-condition verification --------
 ACTIVE_STATE=""
 PLUGINS_ADMITTED=0
+PLUGINS_EXPECTED=0
 ADMISSION_FAILURES=0
 NOT_DECLARED=0
 CATALOGUE_SOURCE=""
@@ -924,6 +950,23 @@ JOURNAL_FAIL_COUNT=0
 # gating; `busy` is evidence the chain works (MPD has the
 # device).
 PCM_PLAYBACK_PROBE="not_run"
+
+# Count functional plugin bundles staged in the extracted
+# bundle (directories under plugins/ that carry a
+# manifest.toml). Dist-only template trees (sudoers wrappers
+# without a wire binary) are excluded. This is the post-
+# condition bar for "reinstall recreated the full operator
+# surface" — a subset bundle must hard-fail, not greenwash.
+count_expected_plugins_from_stage() {
+    local p count=0
+    [[ -d "${STAGE_DIR}/plugins" ]] || { echo 0; return; }
+    for p in "${STAGE_DIR}/plugins/"*/; do
+        [[ -f "${p}/manifest.toml" ]] || continue
+        [[ -f "${p}/plugin.bin" ]] || continue
+        count=$((count + 1))
+    done
+    echo "${count}"
+}
 
 verify_post_condition() {
     local deadline
@@ -947,6 +990,7 @@ verify_post_condition() {
     else
         PLUGINS_ADMITTED=0
     fi
+    PLUGINS_EXPECTED="$(count_expected_plugins_from_stage)"
     ADMISSION_FAILURES=$(journalctl -u evo --since "60 seconds ago" --no-pager -o cat 2>/dev/null | grep -c '^skipping plugin: admission failed$' || true)
     NOT_DECLARED=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -c 'not declared in the catalogue' || true)
     CATALOGUE_SOURCE=$(journalctl -u evo --since "60 seconds ago" --no-pager -o json 2>/dev/null | grep 'catalogue loaded' 2>/dev/null | grep -oE '"F_SOURCE":"[a-z]+"' 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//' || true)
@@ -1077,6 +1121,7 @@ bundle_size_bytes = ${BUNDLE_SIZE}
 [post_condition]
 service_active = ${service_active_bool}
 plugins_admitted_count = ${PLUGINS_ADMITTED}
+plugins_expected_count = ${PLUGINS_EXPECTED}
 admission_failures = ${ADMISSION_FAILURES}
 subject_not_declared = ${NOT_DECLARED}
 catalogue_source = "${CATALOGUE_SOURCE:-unknown}"
@@ -1176,7 +1221,7 @@ esac
 
 echo ""
 echo "  service:               ${ACTIVE_STATE}"
-echo "  plugins admitted:      ${PLUGINS_ADMITTED}"
+echo "  plugins admitted:      ${PLUGINS_ADMITTED} (expected ${PLUGINS_EXPECTED})"
 echo "  admission failures:    ${ADMISSION_FAILURES}"
 echo "  not-declared warnings: ${NOT_DECLARED}"
 echo "  catalogue source:      ${CATALOGUE_SOURCE:-unknown}"
@@ -1195,6 +1240,12 @@ echo ""
 POST_OK=1
 if [[ "${ACTIVE_STATE}" != "active" ]]; then POST_OK=0; fi
 if [[ "${PLUGINS_ADMITTED}" -lt 1 ]]; then POST_OK=0; fi
+# Bundle-declared plugin set must fully admit. A green
+# "9 of 18" post-condition is how --mode=reinstall previously
+# wiped shares/smb-server/notifications and left UI shelves
+# dead while still exiting 0.
+if [[ "${PLUGINS_EXPECTED}" -lt 1 ]]; then POST_OK=0; fi
+if [[ "${PLUGINS_ADMITTED}" -lt "${PLUGINS_EXPECTED}" ]]; then POST_OK=0; fi
 if [[ "${ADMISSION_FAILURES}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${NOT_DECLARED}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi

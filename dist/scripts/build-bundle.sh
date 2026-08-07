@@ -126,24 +126,12 @@ if [[ -z "${DIST_VERSION}" ]]; then
     exit 2
 fi
 
-# Plugin manifest tuples mirror deploy-distribution.sh's
-# OOP_PLUGINS. Format:
-#   <plugin-name>:<plugin-crate>:<wire-binary-name>:<features>
-OOP_PLUGINS=(
-    "org.evoframework.artwork.local:org-evoframework-artwork-local:artwork-local-wire:"
-    "org.evoframework.artwork.online:org-evoframework-artwork-online:artwork-online-wire:"
-    "org.evoframework.network:org-evoframework-network:network-wire:"
-    "org.evoframework.metadata.local:org-evoframework-metadata-local:metadata-local-wire:"
-    "org.evoframework.hardware.audio-config:org-evoframework-hardware-audio-config:hardware-audio-config-wire:"
-    "org.evoframework.playback.options:org-evoframework-playback-options:playback-options-wire:"
-    "org.evoframework.composition.alsa:org-evoframework-composition-alsa:composition-alsa-wire:alsa-substrate"
-    "org.evoframework.delivery.alsa:org-evoframework-delivery-alsa:delivery-alsa-wire:"
-    "org.evoframework.playback.mpd:org-evoframework-playback-mpd:playback-mpd-wire:"
-    "org.evoframework.multiroom.evo-native:org-evoframework-multiroom-evo-native:multiroom-evo-native-wire:alsa-substrate"
-    "org.evoframework.system.power:org-evoframework-system-power:system-power-wire:"
-    "org.evoframework.system.kiosk:org-evoframework-system-kiosk:system-kiosk-wire:"
-    "org.evoframework.source.dlna:org-evoframework-source-dlna:source-dlna-wire:"
-)
+# Shared OOP plugin list — MUST stay identical to
+# deploy-distribution.sh. Sourced from one file so a reinstall
+# bundle cannot silently ship a subset of the deploy path.
+# Format: <plugin-name>:<plugin-crate>:<wire-binary-name>:<features>
+# shellcheck source=lib/oop-plugins.sh
+source "${REPO_ROOT}/dist/scripts/lib/oop-plugins.sh"
 
 DIST_BIN="evo-device-audio"
 DIST_BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/${DIST_BIN}"

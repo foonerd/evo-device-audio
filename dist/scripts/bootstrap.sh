@@ -734,6 +734,30 @@ UCONF
         "$SYSTEMD_DROPIN_DIR/https.conf"
     echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/https.conf"
 
+    # session-trust.conf wires EVO_PAIR_PRESEED_FILE (headless
+    # first-pair after wipe/reinstall), shadow SupplementaryGroups
+    # for step-up auth, and the /etc ReadWritePaths carve for
+    # chpasswd. Without this drop-in, pair_complete{bootstrap}
+    # returns pair_unknown even when /boot/evo/pair-preseed.txt
+    # exists — the 2026-08-07 fleet symptom after p2 wipe.
+    # Rewrite the template's hardcoded UID 1000 to the resolved
+    # service-user UID so it cannot override kiosk-uids.conf
+    # with a wrong value on non-1000 images.
+    if [[ -f "$DIST_DIR/systemd/evo.service.d/session-trust.conf" ]]; then
+        SERVICE_USER_UID="$(id -u "$SERVICE_USER")"
+        SESSION_TRUST_TMP="$(mktemp)"
+        sed -e "s|EVO_KIOSK_UIDS=1000|EVO_KIOSK_UIDS=${SERVICE_USER_UID}|g" \
+            "$DIST_DIR/systemd/evo.service.d/session-trust.conf" \
+            > "$SESSION_TRUST_TMP"
+        install -m 0644 -o root -g root \
+            "$SESSION_TRUST_TMP" \
+            "$SYSTEMD_DROPIN_DIR/session-trust.conf"
+        rm -f "$SESSION_TRUST_TMP"
+        echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/session-trust.conf (EVO_PAIR_PRESEED_FILE + EVO_KIOSK_UIDS=${SERVICE_USER_UID})"
+    else
+        echo "[bootstrap] WARN: session-trust.conf missing from dist — bootstrap pairing will not seed"
+    fi
+
     install -m 0644 -o root -g root \
         "$DIST_DIR/systemd/evo.service.d/asound-dropin-write.conf" \
         "$SYSTEMD_DROPIN_DIR/asound-dropin-write.conf"
@@ -1705,6 +1729,23 @@ if [[ -f "$SYSTEMD_DROPIN_DIR/https.conf" ]]; then
     fi
 else
     echo "  [WARN]  evo HTTPS drop-in absent — operator browser cannot reach the device; bootstrap should install $SYSTEMD_DROPIN_DIR/https.conf"
+fi
+
+# session-trust / bootstrap pairing: without EVO_PAIR_PRESEED_FILE
+# in the unit environment, /boot/evo/pair-preseed.txt is inert and
+# pair_complete{bootstrap} returns pair_unknown — remote UI auth
+# and deploy smoke gates both die after a wipe.
+if [[ -f "$SYSTEMD_DROPIN_DIR/session-trust.conf" ]]; then
+    PRESEED_ENV="$("$SYSTEMCTL_BIN" show evo --no-pager -p Environment \
+        2>/dev/null | tr ' ' '\n' | grep -oE 'EVO_PAIR_PRESEED_FILE=[^[:space:]]+' \
+        | head -1 | cut -d= -f2)"
+    if [[ -n "$PRESEED_ENV" ]]; then
+        echo "  [ok]    session-trust drop-in installed; EVO_PAIR_PRESEED_FILE=$PRESEED_ENV"
+    else
+        echo "  [WARN]  session-trust.conf present but EVO_PAIR_PRESEED_FILE not resolved from unit env"
+    fi
+else
+    echo "  [WARN]  session-trust drop-in absent — bootstrap pairing will not seed; install $SYSTEMD_DROPIN_DIR/session-trust.conf"
 fi
 
 # Audio chain probe: confirm the rendered `ctl.evo` opens
