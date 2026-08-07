@@ -1832,6 +1832,48 @@ else
 fi
 
 if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
+    # Kiosk mint UID allowlist. The framework's kiosk-socket
+    # (`/run/evo/kiosk.sock`) refuses every mint until the
+    # distribution declares which UID(s) may connect. Without
+    # this drop-in, `evo-kiosk-browser` receives
+    # `mint refused: allowlist_empty: mint_local_kiosk_session:
+    # kiosk allowlist is empty; distribution boot did not
+    # declare a compositor UID` and the operator UI cannot
+    # complete first-run authentication. The compositor runs as
+    # the service user (see the evo-kiosk.service.d/user.conf
+    # below), so the UID matches SERVICE_USER's numeric id.
+    SERVICE_USER_UID="$(id -u "$SERVICE_USER" 2>/dev/null)"
+    if [[ -n "$SERVICE_USER_UID" ]]; then
+        install -d -m 0755 -o root -g root "$SYSTEMD_DROPIN_DIR"
+        cat > "$SYSTEMD_DROPIN_DIR/kiosk-uids.conf" <<EOF
+# Kiosk mint allowlist. Composed at bootstrap install time
+# from the service user's numeric UID. The framework reads
+# EVO_KIOSK_UIDS at startup and refuses every kiosk-socket
+# connection whose peer UID is not on this list.
+[Service]
+Environment=EVO_KIOSK_UIDS=$SERVICE_USER_UID
+EOF
+        chmod 0644 "$SYSTEMD_DROPIN_DIR/kiosk-uids.conf"
+        echo "[bootstrap] installed $SYSTEMD_DROPIN_DIR/kiosk-uids.conf (EVO_KIOSK_UIDS=$SERVICE_USER_UID)"
+    fi
+
+    # Kiosk unit User= drop-in. evo-kiosk-eng's install.sh
+    # deliberately does not set User= on evo-kiosk.service —
+    # the target user is a distribution concern. Without this
+    # drop-in the unit runs as root, which the framework's
+    # kiosk-socket allowlist correctly rejects (UID 0 is not
+    # the service user).
+    install -d -m 0755 -o root -g root /etc/systemd/system/evo-kiosk.service.d
+    cat > /etc/systemd/system/evo-kiosk.service.d/user.conf <<EOF
+# Kiosk unit runs as the service user so the mint peer UID
+# matches EVO_KIOSK_UIDS (evo.service.d/kiosk-uids.conf).
+[Service]
+User=$SERVICE_USER
+Group=$SERVICE_USER
+EOF
+    chmod 0644 /etc/systemd/system/evo-kiosk.service.d/user.conf
+    echo "[bootstrap] installed /etc/systemd/system/evo-kiosk.service.d/user.conf (User=$SERVICE_USER)"
+
     if [[ -x "${KIOSK_LAYER_DIR}/scripts/install/install.sh" ]]; then
         echo
         echo "[bootstrap] Step 4b: evo-kiosk-eng (labwc + WebKit browser)"
