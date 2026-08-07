@@ -707,6 +707,26 @@ place_opt_evo() {
     install -m 0755 -o root -g root \
         "${STAGE_DIR}/bin/evo-device-audio" \
         /opt/evo/bin/evo-device-audio
+    # UI shell + first-run setup overlay. The framework's HTTPS
+    # substrate reads static assets from `EVO_HTTPS_STATIC_DIR`
+    # (pinned to `/opt/evo/ui` by
+    # `dist/systemd/evo.service.d/https.conf`). Without the SPA
+    # here, the steward logs "EVO_HTTPS_STATIC_DIR points at a
+    # path that does not exist or is not a directory;
+    # static-asset serving disabled" and the operator UI is
+    # unreachable at https://<device>:8443/. The bundle stages
+    # the built SPA at `<bundle>/ui/`; install it verbatim to
+    # the STATIC_DIR target.
+    if [[ -d "${STAGE_DIR}/ui" ]]; then
+        install -d -m 0755 -o root -g root /opt/evo/ui
+        # rsync semantics via cp -a on the contents (no leading
+        # dir name); --preserve keeps the tree byte-equal.
+        cp -a "${STAGE_DIR}/ui/." /opt/evo/ui/
+        # Ensure the tree is service-user-readable at least; the
+        # steward runs under the service user and needs to open
+        # every asset for the router.
+        chown -R "${SERVICE_USER}:${SERVICE_USER}" /opt/evo/ui
+    fi
     # Sweep stale plugin bundles + install fresh.
     local d p p_name
     for d in /opt/evo/plugins/*/; do

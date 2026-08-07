@@ -392,6 +392,44 @@ if [[ -n "${BOOT_ROOT}" ]]; then
     echo "  ok evo-device-boot (from ${BOOT_ROOT})"
 fi
 
+UI_SHELL_ROOT="$(cd "${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-shell" 2>/dev/null && pwd)" || {
+    echo "FAIL: evo-ui-eng/apps/evo-ui-shell not found at ${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-shell" >&2
+    echo "      (the audio distribution's bundle composes the UI shell — " >&2
+    echo "       check out foonerd/evo-ui-eng adjacent to evo-device-audio, or" >&2
+    echo "       set EVO_BUNDLE_SKIP_UI_SHELL=1)" >&2
+    if [[ "${EVO_BUNDLE_SKIP_UI_SHELL:-0}" != "1" ]]; then exit 2; fi
+    UI_SHELL_ROOT=""
+}
+
+if [[ -n "${UI_SHELL_ROOT}" ]]; then
+    # UI SPA build output goes at bundle root as `ui/` — the
+    # installer places it at /opt/evo/ui/, which is what
+    # `dist/systemd/evo.service.d/https.conf` pins in
+    # `EVO_HTTPS_STATIC_DIR`. Without this, the steward logs
+    # "EVO_HTTPS_STATIC_DIR points at a path that does not
+    # exist or is not a directory; static-asset serving
+    # disabled" and every browser hit to https://<device>:8443/
+    # returns nothing but the API surface — the operator UI is
+    # unreachable.
+    if [[ -d "${UI_SHELL_ROOT}/dist" ]]; then
+        install -d -m 0755 "${STAGE_DIR}/ui"
+        cp -a "${UI_SHELL_ROOT}/dist/." "${STAGE_DIR}/ui/"
+        # The distribution's setup.html overlay lands next to
+        # the SPA so the first-run pair page shares an origin
+        # with the shell.
+        if [[ -f "${REPO_ROOT}/dist/ui-overlay/setup.html" ]]; then
+            install -m 0644 "${REPO_ROOT}/dist/ui-overlay/setup.html" \
+                "${STAGE_DIR}/ui/setup.html"
+        fi
+        echo "  ok evo-ui-shell (from ${UI_SHELL_ROOT}/dist)"
+    else
+        echo "FAIL: evo-ui-shell has no built dist/ tree at ${UI_SHELL_ROOT}/dist" >&2
+        echo "      Run \`bun run build\` (or the UI team's equivalent) inside" >&2
+        echo "      ${UI_SHELL_ROOT} before building the audio bundle." >&2
+        exit 2
+    fi
+fi
+
 if [[ -n "${KIOSK_ROOT}" ]]; then
     install -d -m 0755 "${STAGE_DIR}/layers/evo-kiosk-eng"
     # scripts/ + layer/ carry the installer + the runtime
