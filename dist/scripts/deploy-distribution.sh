@@ -685,6 +685,23 @@ if ! ssh "${SSH_TARGET}" 'sudo -n systemctl start evo'; then
 fi
 # Brief settle window before the verify probe.
 sleep 3
+# Companion units (evo-ui, evo-kiosk) inherit `Requires=evo`
+# via the depends-on-evo drop-in, so systemd stops them
+# automatically when this deploy stopped evo above. On evo
+# restart, systemd does NOT auto-start them (no reverse
+# `Wants=` from evo). Restart them explicitly here so the
+# operator surface returns to service in the same deploy
+# cycle. Each is best-effort: a target without the unit
+# installed (evo-ui was optional in earlier builds) skips
+# cleanly; `restart` semantics start-if-inactive.
+if ssh "${SSH_TARGET}" 'systemctl cat evo-ui.service >/dev/null 2>&1'; then
+    ssh "${SSH_TARGET}" 'sudo -n systemctl restart evo-ui.service' \
+        || echo "WARN: evo-ui.service restart returned non-zero (operator UI may be down until manual restart)" >&2
+fi
+if ssh "${SSH_TARGET}" 'systemctl cat evo-kiosk.service >/dev/null 2>&1'; then
+    ssh "${SSH_TARGET}" 'sudo -n systemctl restart evo-kiosk.service' \
+        || echo "WARN: evo-kiosk.service restart returned non-zero (kiosk display may be blank until manual restart)" >&2
+fi
 echo "  ok"
 echo
 
@@ -778,6 +795,19 @@ if ! python3 "${SMOKE_SCRIPT}" "${TARGET_HOST}" "${TARGET_USER}"; then
         sudo -n cp ${TARGET_BIN_PREV} ${TARGET_BIN_PATH}
         sudo -n systemctl start evo
     " || echo "WARN: rollback to .prev on ${TARGET_HOST} also failed — operator intervention required" >&2
+    # Same companion-unit restart as the happy path — rollback
+    # ALSO takes evo down, so evo-ui and evo-kiosk need to be
+    # brought back with the restored steward or the operator
+    # sees a blank UI after a failed deploy on top of the
+    # smoke-refuse itself.
+    if ssh "${SSH_TARGET}" 'systemctl cat evo-ui.service >/dev/null 2>&1'; then
+        ssh "${SSH_TARGET}" 'sudo -n systemctl restart evo-ui.service' \
+            || echo "WARN: evo-ui.service restart on rollback also failed" >&2
+    fi
+    if ssh "${SSH_TARGET}" 'systemctl cat evo-kiosk.service >/dev/null 2>&1'; then
+        ssh "${SSH_TARGET}" 'sudo -n systemctl restart evo-kiosk.service' \
+            || echo "WARN: evo-kiosk.service restart on rollback also failed" >&2
+    fi
     exit 5
 fi
 echo
