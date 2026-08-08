@@ -308,7 +308,7 @@ Consumer-stop-before-mutation is normative — mirrors the
 | `org.evoframework.storage.usb` | **Owner** — block hotplug, classify, mount, umount, fsck, eject; cross-plugin dispatch to library. |
 | `org.evoframework.playback.mpd` | **Consumer** — `SourceKind::LocalUsb` on-mount-event trigger; MPD update on library-mutation; disposition-stop before mount-mutation. |
 | `org.evoframework.network.smb-server` | **Consumer** — Samba parent `[USB]` share exports the tree. Storage.usb NEVER writes `smb.conf`. |
-| `evo-core-eng` (framework) | **Nothing** — no storage / block / mount knowledge. Repeats R-028 anti-precedent avoidance. |
+| `evo-core-eng` (framework) | **Nothing** — no storage / block / mount knowledge. Framework-hosted storage substrate was extracted to plugins on 2026-07-17 (`NetworkSharesRuntime` / `SambaServerRuntime`) and MUST NOT recur here. |
 
 ---
 
