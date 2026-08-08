@@ -55,12 +55,26 @@ output. See § "Test fixtures" below.
 
 ## 2 Filesystem support matrix (P0)
 
-| FS family | Mount option string | Dirty detection | Repair tool | Package (Debian Trixie) |
-|---|---|---|---|---|
-| `vfat` (FAT12/16/32) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.vfat -n <dev>` exit code 1 = dirty | `fsck.vfat -a <dev>` | `dosfstools` |
-| `exfat` | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.exfat -n <dev>` exit code non-zero = dirty | `fsck.exfat -a <dev>` | `exfatprogs` |
-| `ntfs` | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` |
-| `ext2` / `ext3` / `ext4` | `noatime` | `dumpe2fs -h <dev>` needs_recovery flag OR feature-flag inspection | `e2fsck -p <dev>` (auto-repair; escalate to `-y` on operator confirm) | `e2fsprogs` |
+| FS family | Max volume size (this plugin) | Mount option string | Dirty detection | Repair tool | Package (Debian Trixie) |
+|---|---|---|---|---|---|
+| `vfat` (FAT16 / FAT32) | **2 TiB** (FAT32 on-disk cap; refuse at mount when device size > 2 TiB with a copy-string surfaced to the operator recommending exFAT / ext4 reformat) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.vfat -n <dev>` exit code 1 = dirty | `fsck.vfat -a <dev>` | `dosfstools` |
+| `exfat` | no practical limit (128 PiB spec ceiling; plugin does not cap) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.exfat -n <dev>` exit code non-zero = dirty | `fsck.exfat -a <dev>` | `exfatprogs` |
+| `ntfs` | no practical limit (256 TiB per volume; plugin does not cap) | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` |
+| `ext2` / `ext3` / `ext4` | no practical limit (1 EiB on ext4; plugin does not cap) | `noatime` | `dumpe2fs -h <dev>` needs_recovery flag OR feature-flag inspection | `e2fsck -p <dev>` (auto-repair; escalate to `-y` on operator confirm) | `e2fsprogs` |
+
+**Volume-size handling (large drives — > 2 TiB).** The
+plugin queries `blockdev --getsize64 <device>` at classify
+time and stores the byte size on `DriveRecord.size_bytes`
+(§5). On mount attempt for FAT32 volumes reporting a device
+size above 2 TiB, the mounter refuses with `class:
+"mount-failed-oversized-vfat"` and surfaces an operator-visible
+copy string ("This drive is larger than 2 TB and formatted as
+FAT32; reformat as exFAT (Windows / macOS-compatible) or ext4
+(Linux-native) to mount"). The refuse path is a normative
+mount-decision; do not silently truncate, silently switch FS
+driver, or silently fail without the operator hint. exFAT,
+NTFS, and ext4 have no plugin-enforced ceiling — they mount
+at whatever `blockdev` reports.
 
 Support-matrix additions require an edit to this file. The
 plugin's runtime uses the FS family key to select the option
@@ -96,24 +110,119 @@ plugin's `SAMBA-SHARES.md` inventory) exports via
 `force user = SERVICE_USER`, so mounts appear on the LAN
 automatically without `smb.conf` churn.
 
-**Stable-id derivation** (first match wins):
+**Stable-id derivation — user-friendly first, technical fallback last, deterministic enumeration on collision.**
 
-1. Filesystem UUID via `/dev/disk/by-uuid/<uuid>` symlink →
-   stable-id = `<uuid>` (lowercase, no braces).
-2. Filesystem label (sanitised: `^[A-Za-z0-9_-]{1,32}$`; other
-   chars → `_`) → stable-id = `label-<sanitised-label>`.
-3. Synthesized fallback → stable-id =
-   `unlabelled-<disk-serial>-<partition-index>`.
+The stable-id must be:
 
-Rules:
+- **Readable on glass** — the operator sees the id in the
+  Sources UI, in the Samba path (`\\<host>\USB\<stable-id>`),
+  and in the mount path they may `cd` into over SSH. A hex
+  UUID is not a name; a manufacturer + model is.
+- **Stable across replug** of the same volume — same physical
+  volume attached to any port must resolve to the same id.
+- **Unique across concurrent mounts** — two volumes plugged
+  in at the same time must never collide on the mount path.
+- **Deterministic on repeated collision** — plugging the same
+  two "Music" sticks in the same order must produce the same
+  suffixes each session.
 
-- Stable-id MUST be stable across replug of the SAME volume.
-- Stable-id MUST NOT collide across concurrent mounts. On
-  collision (two volumes with the same label, no UUID), the
-  fallback synthesizer disambiguates via `<disk-serial>`.
-- The mount-point directory `create_dir_all` at mount time;
-  `rm_dir` (empty-only) at unmount time. Empty check prevents
-  destroying operator files if unmount races a mid-write.
+### Derivation ladder (first match wins for the base id)
+
+Base id sourced from the first rule that yields a non-empty
+sanitised token:
+
+0. **Operator alias** (highest precedence). If the plugin's
+   persisted state has a `(vendor, model, serial_short, partuuid)`
+   → alias entry for this volume, base id = `<sanitised-alias>`.
+   Set via the `storage.usb.rename` verb (§4); survives replug on
+   the same rig; travels with the physical volume, not the port.
+   See §7 ("Alias persistence") for the state file shape.
+1. **Filesystem label** — udev `ID_FS_LABEL`. Sanitised per
+   the token rule below. Base id = `<sanitised-label>`.
+   Reflects the operator's or manufacturer's chosen name at
+   format time; user-friendly when set.
+2. **Vendor + model** — udev `ID_VENDOR` + `ID_MODEL`
+   composite (e.g. `SanDisk-Cruzer-Blade`, `WD-Elements-25A2`,
+   `Samsung-T7`). Sanitised. Base id =
+   `<sanitised-vendor>-<sanitised-model>`. Reflects the
+   manufacturer name printed on the enclosure; the operator's
+   next-best mental handle after a label.
+3. **Model-only** — `ID_MODEL` only when `ID_VENDOR` is
+   empty or "USB" (common on white-label sticks). Base id =
+   `<sanitised-model>`.
+4. **Synthesized fallback** — `unlabelled-<sanitised-vendor-or-usb>-<serial-short-6>`
+   where `serial-short-6` is the last 6 characters of
+   `ID_SERIAL_SHORT` (lowercased, alphanumeric only). Only
+   reached when a drive exposes neither label nor a model
+   readable by udev — rare, mostly antique or intentionally
+   generic devices.
+
+### Sanitisation
+
+Sanitised tokens match `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`:
+letters + digits + underscore + hyphen; first char alphanumeric;
+1..=32 chars. Any other char → `-`; runs of `-` collapse; leading
+`-` stripped. Empty result after sanitisation → skip the rule
+and fall to the next one. Case preserved (Samba is
+case-insensitive so `Music` and `music` resolve the same on
+the LAN; the UI shows the case the operator chose).
+
+### Partition suffix (when a base id needs multiple partitions)
+
+Some sticks / SSDs carry multiple partitions the plugin would
+mount. The base id names the DISK; each mounted partition gets
+`-p<N>` where `N` is the partition number (`sda1` → `-p1`,
+`sda2` → `-p2`). Skipped for the common single-partition case:
+`SanDisk-Cruzer-Blade` (one partition) vs
+`SanDisk-Cruzer-Blade-p2` (second partition on the same
+physical stick).
+
+### Collision handling — enumeration + disambiguation
+
+For every mount, the plugin computes the candidate id then
+resolves collision against existing mounts at
+`/var/lib/evo/music/USB/*`:
+
+- **Same base id, DIFFERENT physical volume** (two "Music"
+  sticks plugged in simultaneously; two identical
+  `SanDisk-Cruzer-Blade` sticks): append `-2`, `-3`, …
+  Enumeration follows udev event order — first-arriving keeps
+  the bare base id; second gets `-2`; third gets `-3`.
+  Enumeration is DETERMINISTIC within a boot: cold-plug
+  reconcile at plugin load sorts by `/sys/class/block/<dev>/dev`
+  major:minor to give a stable ordering that survives across
+  boots on the same rig with the same drives.
+- **Same base id, SAME physical volume replugged** (drive
+  unplugged then replugged): the same base id resolves again;
+  no `-2` suffix. Detection: match on
+  `(ID_VENDOR, ID_MODEL, ID_SERIAL_SHORT, PARTUUID)` tuple —
+  if any prior mount session under this base id had the
+  same tuple, reuse that id.
+- **Base id would collide with a system-disk stub row** (§1
+  §system-disk entries carry no mount but appear in
+  `list_drives`): the media volume wins the base id; system
+  rows are display-only.
+
+### Stability contract summary
+
+| Scenario | Behaviour |
+|---|---|
+| Same volume replugged (same port) | Same stable-id (label-source rules 1-3 stable per volume; enumeration re-derives to the same suffix if any) |
+| Same volume replugged (different port) | Same stable-id (id is disk-property-derived, not port-property-derived) |
+| Two identical drives simultaneously | Deterministic enumeration `-2`, `-3`, … in udev event order (or by major:minor at cold-plug) |
+| Operator relabels the drive | New stable-id (intentional — the new label IS the new logical name) |
+| Drive with no label + no vendor/model | `unlabelled-<vendor-or-usb>-<serial-short-6>` — stable across replug; hex-free enough to be identifiable |
+| Volume > 2 TiB formatted FAT32 | No stable-id assigned (mount refuses at classify); row surfaces as `class: mount-failed-oversized-vfat` with the refuse-copy string from §2 |
+
+### Mount-point lifecycle
+
+- `create_dir_all(/var/lib/evo/music/USB/<stable-id>/)` at
+  mount time with `SERVICE_USER` ownership.
+- Empty-only `rmdir` at unmount time — prevents destroying
+  operator files if the unmount races a mid-write.
+- Enumeration suffix rows (`Music-2`, `SanDisk-Cruzer-Blade-3`)
+  get the same lifecycle; no shared parent dir with the
+  first-arriving id.
 
 ---
 
@@ -122,15 +231,37 @@ Rules:
 | Verb | Payload | Response | Auth | Failure classes |
 |---|---|---|---|---|
 | `storage.usb.list_drives` | `{}` | `{ drives: [DriveRecord] }` — see §5 | none | never fails |
-| `storage.usb.mount` | `{ stable_id }` | `{ mounted_at, class }` | operator | `system_disk_refused`, `unsupported_fs`, `mount_failed_dirty`, `subprocess_io` |
+| `storage.usb.mount` | `{ stable_id }` | `{ mounted_at, class }` | operator | `system_disk_refused`, `unsupported_fs`, `mount_failed_dirty`, `mount_failed_oversized_vfat`, `subprocess_io` |
 | `storage.usb.safe_remove` | `{ stable_id, force?: bool }` | `{ removed: true }` | operator | `system_disk_refused`, `busy`, `subprocess_io` |
 | `storage.usb.repair_filesystem` | `{ stable_id, escalate?: bool }` | `{ repaired: true, before_class, after_class }` | operator + step-up | `system_disk_refused`, `unsupported_fs`, `repair_failed`, `subprocess_io` |
+| `storage.usb.rename` | `{ stable_id, alias }` — `alias` sanitised per §3 token rule (`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`), empty alias clears the operator alias and falls back to the next rule in the derivation ladder | `{ new_stable_id, class }` — new_stable_id may equal current stable_id when the alias resolves to the same sanitised token after enumeration | operator | `system_disk_refused`, `invalid_alias`, `alias_would_collide` (only when the operator's requested alias collides with a foreign physical volume and enumeration cannot resolve — rare), `subprocess_io` (from the required unmount + remount cycle) |
+
+**Rename semantics.** Alias write flows through a full
+remount cycle because the mount path IS the friendly id
+(operator `cd`s to it, Samba serves at it):
+
+1. Alias sanitised + validated (empty → clear).
+2. Persist `(vendor, model, serial_short, partuuid) → alias`
+   to plugin state (`/var/lib/evo/plugins/org.evoframework.storage.usb/state/aliases.toml`).
+3. Recompute stable-id per §3 with the new alias at rule 0.
+4. Consumer-stop for the current `library_source_id`
+   (identical to safe-remove step 3).
+5. `sync` + clean `umount` from the OLD mount path.
+6. Empty-only `rmdir` on the OLD `/var/lib/evo/music/USB/<old-id>`.
+7. Mount at the NEW mount path.
+8. `library.add_source local_usb` under the new id.
+9. Republish subject with the new DriveRecord.
+
+The operator experiences: "Rename" → brief spinner while
+playback pauses if the drive is playing → new name on glass
+→ Samba path reflects new name on next browse. Files never
+touched.
 
 Read-only subject: `storage_usb_drives`, singleton addressing
 scheme `evo.storage.usb.drives:local` — carries the same
 `DriveRecord[]` payload as `list_drives`. Republished on every
-hotplug attach, hotplug detach, mount, umount, repair-complete.
-UI subscribes at Sources page mount.
+hotplug attach, hotplug detach, mount, umount, rename, and
+repair-complete. UI subscribes at Sources page mount.
 
 ---
 
@@ -138,18 +269,34 @@ UI subscribes at Sources page mount.
 
 ```
 DriveRecord {
-    stable_id:            string           // §3 derivation
+    stable_id:            string           // §3 derivation (with alias precedence)
+    display_name:         string           // sanitised display token = stable_id sans partition suffix
+    id_source:            IdSource         // enum: which rule in §3 produced the base id
     device_node:          string           // e.g. "/dev/sda1"
     parent_disk:          string           // e.g. "/dev/sda"
+    partition_index:      u32              // 1-based partition number within parent_disk
+    partition_count:      u32              // total partitions on parent_disk
     label:                Option<string>   // fs label if present
     uuid:                 Option<string>   // fs uuid if present
+    partuuid:             Option<string>   // GPT PARTUUID if present (alias-key component)
+    vendor:               Option<string>   // udev ID_VENDOR (e.g. "SanDisk", "WD", "Samsung")
+    model:                Option<string>   // udev ID_MODEL (e.g. "Cruzer-Blade", "Elements-25A2", "T7")
+    serial_short:         Option<string>   // udev ID_SERIAL_SHORT (alias-key component)
     fs_type:              string           // "vfat" | "exfat" | "ntfs" | "ext4" | "unsupported"
-    size_bytes:           u64
+    size_bytes:           u64              // blockdev --getsize64; drives the >2TiB FAT32 refuse (§2)
     class:                DriveClass       // enum below
     mount_root:           Option<string>   // "/var/lib/evo/music/USB/<stable_id>" when mounted
-    library_source_id:   Option<string>   // library.add_source result when class=mounted-*
+    library_source_id:    Option<string>   // library.add_source result when class=mounted-*
+    alias_set:            bool             // true when this drive has an operator-set alias (rule 0 fired)
     last_transition_at:   i64              // wall-clock ms of last state change
 }
+
+IdSource =
+  | "operator_alias"                       // rule 0 (§3)
+  | "fs_label"                             // rule 1
+  | "vendor_model"                         // rule 2
+  | "model_only"                           // rule 3
+  | "synthesized"                          // rule 4
 
 DriveClass =
   | "system-disk"                          // §1 hard-refuse
@@ -159,13 +306,19 @@ DriveClass =
   | "mounted-dirty"                        // mounted, dirty flag on
   | "mounted-dirty-hiberfile"              // NTFS hiberfile present
   | "mount-failed-dirty"                   // mount refused due to dirty state
-  | "mount-failed-other"                   // mount errno other than dirty
+  | "mount-failed-oversized-vfat"          // >2TiB FAT32 refuse per §2
+  | "mount-failed-other"                   // mount errno other than dirty / oversized
 ```
 
 `class` transitions on the subject drive the UI state (Safe
 remove offered when `mounted-*`; Repair offered when
-`mounted-dirty` or `mount-failed-dirty`; nothing actionable
-when `system-disk` / `unsupported`).
+`mounted-dirty` or `mount-failed-dirty`; Rename offered when
+class is not `system-disk`; reformat-copy shown when class is
+`mount-failed-oversized-vfat`; nothing actionable when
+`system-disk` / `unsupported`). `id_source` drives the "how
+did I get this name?" hint in the row's tooltip — operators
+seeing `synthesized` know the drive has no label or model and
+should consider renaming it.
 
 ---
 
@@ -216,29 +369,101 @@ matching `SUBSYSTEM=block`, `DEVTYPE=partition`, and
 `ID_BUS=usb` (or `TRAN=usb` via `lsblk` lookup):
 
 1. Classifier resolves the parent disk and every partition.
+   Reads udev attributes `ID_VENDOR`, `ID_MODEL`,
+   `ID_SERIAL_SHORT`, `ID_FS_LABEL`, `ID_FS_UUID`,
+   `ID_PART_UUID` from `/run/udev/data/b<major>:<minor>` (or
+   equivalent). Populates `DriveRecord` §5.
 2. System-disk check per §1 — if hit, publish subject with
    `class: system-disk` and stop (no mount).
 3. FS-type check per §2 — if unsupported, publish with
    `class: unsupported` and stop.
-4. Mount attempt via wrapper. On success, republish subject
+4. **Alias resolve.** Look up
+   `(vendor, model, serial_short, partuuid)` in the plugin
+   state file (§ "Alias persistence" below). If a hit,
+   set `id_source = operator_alias` and use the alias as the
+   base id (rule 0). Otherwise fall through §3 rules 1-4.
+5. **Volume-size check.** For `vfat`, if `size_bytes` > 2 TiB,
+   publish `class: mount-failed-oversized-vfat` and stop. Do
+   not attempt the mount. See §2 for the operator copy string.
+6. Compute stable-id per §3 (base id + partition suffix if
+   parent_disk has multiple mountable partitions + enumeration
+   `-2`/`-3`/… on collision). Persist the id-source enum on
+   the DriveRecord for the UI tooltip hint.
+7. Mount attempt via wrapper. On success, republish subject
    with `class: mounted-clean` / `mounted-dirty`. On failure,
    `mount-failed-dirty` / `mount-failed-other`.
-5. When `mounted-*`: cross-plugin dispatch to
+8. When `mounted-*`: cross-plugin dispatch to
    `library.add_source` with `local_usb` record shape (per
    `library.v1.toml:92`). Record the returned
    `library_source_id` on the DriveRecord.
 
 **Coldplug (at plugin load):** enumerate every `SUBSYSTEM=block
-TRAN=usb` device via `lsblk`, run the same pipeline steps 1-5.
-Mount-truth reconcile per `/proc/self/mountinfo`: if a volume
-is already mounted at `/var/lib/evo/music/USB/<stable-id>/`
-(operator-mounted before plugin load, or leftover from a
-previous plugin instance), adopt without remounting — same
-adopt discipline as `network.shares::adopt_existing_os_mount`.
+TRAN=usb` device via `lsblk -J -o NAME,PKNAME,MOUNTPOINT,TRAN,TYPE,UUID,LABEL,FSTYPE,PARTUUID,VENDOR,MODEL,SERIAL,SIZE`.
+Sort by `/sys/class/block/<dev>/dev` major:minor before
+processing — this gives DETERMINISTIC enumeration order
+across boots (§3 stability contract). Then run the same
+pipeline steps 1-8 per partition. Mount-truth reconcile per
+`/proc/self/mountinfo`: if a volume is already mounted at
+`/var/lib/evo/music/USB/<stable-id>/` (operator-mounted
+before plugin load, or leftover from a previous plugin
+instance), adopt without remounting — same adopt discipline
+as `network.shares::adopt_existing_os_mount`.
 
 **Detach:** on `remove` udev event, retract `library.remove_source`,
 best-effort `umount`, republish subject with drive removed
-from the list.
+from the list. Alias state is NOT retracted on detach — the
+alias persists so replug of the same physical volume resolves
+to the same operator-chosen name.
+
+### Alias persistence
+
+State file: `/var/lib/evo/plugins/org.evoframework.storage.usb/state/aliases.toml`
+
+Mode `0600`, owned by `SERVICE_USER`. Same
+`state.save`-with-mode-0600 discipline the smb-server plugin
+uses for its `smb_server.toml`.
+
+Shape (TOML):
+
+```toml
+schema_version = 1
+
+[[alias]]
+vendor        = "SanDisk"
+model         = "Cruzer-Blade"
+serial_short  = "4C530"
+partuuid      = "a1b2c3d4-01"
+alias         = "My-Vinyl-Rip"
+set_at_ms     = 1786100000000
+
+[[alias]]
+vendor        = "WD"
+model         = "Elements-25A2"
+serial_short  = "WCC7K1"
+partuuid      = "e5f6a7b8-02"
+alias         = "Backup-2026"
+set_at_ms     = 1786100005000
+```
+
+The `(vendor, model, serial_short, partuuid)` tuple is the
+identity key. Match rules:
+
+- **Exact tuple match** → alias applies.
+- **Partial tuple match** (e.g. `partuuid` absent because the
+  drive is MBR-partitioned) → the plugin degrades to
+  `(vendor, model, serial_short, partition_index)` and matches
+  on that. Documented in the alias-set flow so operators
+  understand the identity is a bit coarser on MBR sticks.
+- **No match** → no alias; derivation falls through to rule 1
+  (fs label) and below.
+
+The state file is written atomically (tmp + rename) on every
+`storage.usb.rename` verb success. Ownership and mode enforced
+per write.
+
+Clearing an alias: `storage.usb.rename { stable_id, alias: "" }`
+removes the matching entry. Drive re-mounts under the next
+rule in the ladder (fs label / vendor-model / etc.).
 
 ---
 
@@ -293,11 +518,18 @@ Consumer-stop-before-mutation is normative — mirrors the
 | Surface | Behaviour |
 |---|---|
 | Sources page | New "USB drives" section under existing SMB / NAS sections. Rows sourced from `storage_usb_drives` subject. |
-| Row display | Label / stable-id + FS type + size + `class`-driven affordances |
-| Row affordances by class | `mounted-clean`: Safe remove. `mounted-dirty`: Safe remove + **Repair**. `mounted-dirty-hiberfile`: Safe remove + copy string ("resume + shut down cleanly before repair") + no repair. `mount-failed-dirty`: **Repair**. `unsupported`: greyed row + copy string ("FS type <x> not supported"). `system-disk`: hidden by default; visible under a "System storage (read-only)" collapsed section. |
-| Repair confirm | Modal: "This will unmount and check <label>. Files must be unopened; playback stops. Continue?" |
+| Row primary line | `display_name` (from `DriveRecord.display_name` — stable-id sans partition suffix; matches what the operator sees at `\\<host>\USB\<display_name>` on the LAN). |
+| Row secondary line | `vendor + model + size` (e.g. "SanDisk Cruzer Blade · 32 GB"), plus `fs_type` (uppercased: FAT32 / exFAT / NTFS / ext4). Size shown human-friendly per SI unit (KB / MB / GB / TB). |
+| Row tooltip / info popover | Shows `id_source` explanation: e.g. `operator_alias` → "Named by you", `fs_label` → "Named at format time", `vendor_model` → "Named from device model — Rename to give it a friendlier name", `synthesized` → "No label or model — Rename recommended". |
+| Row affordances by class | `mounted-clean`: **Rename** + Safe remove. `mounted-dirty`: **Rename** + Safe remove + **Repair**. `mounted-dirty-hiberfile`: **Rename** + Safe remove + copy string ("resume + shut down cleanly before repair") + no repair. `mount-failed-dirty`: **Rename** + **Repair**. `mount-failed-oversized-vfat`: no actions + copy string ("This drive is larger than 2 TB and formatted as FAT32; reformat as exFAT or ext4 to mount"). `unsupported`: greyed row + copy string ("FS type <x> not supported"). `system-disk`: hidden by default; visible under a "System storage (read-only)" collapsed section; NO Rename (invariant). |
+| Rename affordance | Inline text field (or modal on small screens). Client-side sanitises per §3 token rule as the operator types; disables submit on invalid input; shows preview of resulting `\\<host>\USB\<new-name>` path. On submit: fires `storage.usb.rename`, shows brief spinner while the plugin runs the remount cycle (§4), refreshes on subject republish. Empty input = "Reset name" (clears the operator alias — falls back to fs label / vendor+model). |
+| Rename validation | Live inline: min 1 / max 32 chars; first char alphanumeric; subsequent chars alphanumeric / underscore / hyphen. Reserved names refused with copy string ("This name conflicts with another drive currently plugged in — pick another"): tests against current mount roots + system-disk stub rows. |
+| Rename confirm | Only when the drive currently has a `library_source_id` (i.e. is mounted and in the library): "Renaming will briefly stop playback if this drive is playing. The name change reflects immediately on the network share and file browser. Continue?" |
+| Repair confirm | Modal: "This will unmount and check <display_name>. Files must be unopened; playback stops. Continue?" |
 | Force remove | Only offered on `Busy` response; second modal: "Files are still open. Force eject may cause data loss. Continue?" |
 | `remount_usb` recovery hint | Wired to `storage.usb.mount` retry against the drive's stable-id. Consumed by disposition renderer per `playback.v1.toml:602`. |
+| Multiple identical drives | Enumeration suffixes (`Music`, `Music-2`, `Music-3`) render as distinct rows with a "1 of 3" / "2 of 3" / "3 of 3" subscript when the operator has not renamed any of them. Rename encouraged via the tooltip hint. |
+| Oversized-FAT32 copy | Modal (dismissable, non-actionable): "This drive is <size> — larger than the 2 TB FAT32 limit. To use it as a music source, reformat as exFAT (Windows / macOS compatible) or ext4 (Linux native). Formatting is not offered in the operator UI — use your desktop's disk utility."|
 
 ---
 
