@@ -1909,13 +1909,34 @@ if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
     cat > /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf <<'EOF'
 # Framework wire must be up before the UI runtime binds — the
 # runtime reverse-proxies /api to /wss/ against 127.0.0.1:8443.
+#
+# Systemd-level dependency is insufficient on its own: even
+# after `evo.service` reports `active`, there is a bounded
+# window before the framework's HTTPS listener is accepting
+# TLS on :8443 AND before its `ca.crt` (which evo-ui-runtime
+# reads to trust the framework's self-signed cert) has been
+# written under `/var/lib/evo/https/https/`. If evo-ui-runtime
+# starts inside that window it initialises with
+# `framework_proxy=false` and stays there for the rest of the
+# session — every operator API call 502s until the runtime is
+# manually restarted.
+#
+# The ExecStartPre below polls for BOTH conditions with a
+# 60-second bounded budget. It exits 0 as soon as ca.crt is
+# present AND :8443 accepts a TLS handshake; exits 1 with a
+# diagnostic if neither shows within budget so
+# Restart=on-failure brings the unit back cleanly instead of
+# starting into a broken state.
 [Unit]
 After=evo.service
 Wants=evo.service
 Requires=evo.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -f /var/lib/evo/https/https/ca.crt ] && curl -k -sS --max-time 1 -o /dev/null https://127.0.0.1:8443/ 2>/dev/null && exit 0; sleep 1; done; echo "[evo-ui-wait] framework ca.crt or :8443 accept never came up after 60s" >&2; exit 1'
 EOF
     chmod 0644 /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf
-    echo "[bootstrap] installed evo-ui.service.d/depends-on-evo.conf (After+Wants+Requires evo.service)"
+    echo "[bootstrap] installed evo-ui.service.d/depends-on-evo.conf (After+Wants+Requires evo.service + ExecStartPre ca.crt+:8443 readiness gate)"
 
     install -d -m 0755 -o root -g root /etc/systemd/system/evo-kiosk.service.d
     cat > /etc/systemd/system/evo-kiosk.service.d/depends-on-evo-ui.conf <<'EOF'
