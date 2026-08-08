@@ -123,6 +123,7 @@ mod network_shares_sync;
 mod playback_supervisor;
 mod playlist;
 mod queue;
+mod scan_progress;
 mod selection;
 mod shelves;
 mod skip_traversal;

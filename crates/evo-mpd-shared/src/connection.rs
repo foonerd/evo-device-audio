@@ -1701,6 +1701,7 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
     let mut single = false;
     let mut consume = false;
     let mut crossfade_seconds: u32 = 0;
+    let mut updating_db: Option<u32> = None;
 
     for f in fields {
         match f.key.as_str() {
@@ -1755,6 +1756,14 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
                 crossfade_seconds =
                     parse_u32_field("xfade", &f.value).unwrap_or(0);
             }
+            "updating_db" => {
+                // MPD emits `updating_db: <job_id>` while a scan
+                // (update / rescan) is in flight; the field is
+                // absent when idle. Parse best-effort — a
+                // malformed value keeps the scan-progress
+                // watcher from misreading a bogus job id.
+                updating_db = parse_u32_field("updating_db", &f.value).ok();
+            }
             _ => {}
         }
     }
@@ -1775,6 +1784,7 @@ fn parse_status(fields: &[Field]) -> Result<MpdStatus, MpdError> {
         single,
         consume,
         crossfade_seconds,
+        updating_db,
     })
 }
 
@@ -3345,6 +3355,57 @@ mod tests {
         ];
         let s = parse_status(&fields).unwrap();
         assert_eq!(s.state, PlayState::Playing);
+    }
+
+    #[test]
+    fn parse_status_updating_db_absent_yields_none() {
+        // Idle MPD (no scan in flight) omits the field
+        // entirely — the scan-progress watcher keys on `None`
+        // for its terminal-frame transition, so this MUST
+        // parse as `None`, not zero.
+        let fields = vec![Field {
+            key: "state".into(),
+            value: "stop".into(),
+        }];
+        let s = parse_status(&fields).unwrap();
+        assert!(s.updating_db.is_none());
+    }
+
+    #[test]
+    fn parse_status_updating_db_present_yields_job_id() {
+        // MPD in the middle of a scan reports the job id.
+        let fields = vec![
+            Field {
+                key: "state".into(),
+                value: "stop".into(),
+            },
+            Field {
+                key: "updating_db".into(),
+                value: "42".into(),
+            },
+        ];
+        let s = parse_status(&fields).unwrap();
+        assert_eq!(s.updating_db, Some(42));
+    }
+
+    #[test]
+    fn parse_status_updating_db_malformed_yields_none() {
+        // A malformed value (server bug, protocol drift)
+        // MUST NOT crash the parser; the field falls back to
+        // `None` so the watcher's next poll picks up the
+        // correct state.
+        let fields = vec![
+            Field {
+                key: "state".into(),
+                value: "stop".into(),
+            },
+            Field {
+                key: "updating_db".into(),
+                value: "not-a-number".into(),
+            },
+        ];
+        let s = parse_status(&fields).unwrap();
+        assert!(s.updating_db.is_none());
     }
 
     #[test]

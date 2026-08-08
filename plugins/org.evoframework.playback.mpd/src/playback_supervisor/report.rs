@@ -266,6 +266,7 @@ mod tests {
             single: false,
             consume: false,
             crossfade_seconds: 0,
+            updating_db: None,
         }
     }
 
@@ -291,6 +292,7 @@ mod tests {
             single: false,
             consume: false,
             crossfade_seconds: 0,
+            updating_db: None,
         };
         let song = MpdSong {
             file_path: "INTERNAL/Artist/Album/track.flac".to_string(),
@@ -333,6 +335,7 @@ mod tests {
             single: false,
             consume: false,
             crossfade_seconds: 0,
+            updating_db: None,
         };
         let r = PlaybackStateReport::from_mpd(status, None, false);
         let out = r.serialise();
@@ -354,6 +357,7 @@ mod tests {
             single: false,
             consume: false,
             crossfade_seconds: 0,
+            updating_db: None,
         };
         let song = MpdSong {
             file_path: "some/file.flac".to_string(),
@@ -469,6 +473,7 @@ mod tests {
             single: false,
             consume: false,
             crossfade_seconds: 0,
+            updating_db: None,
         };
         let song = MpdSong {
             file_path: "a/b.flac".to_string(),

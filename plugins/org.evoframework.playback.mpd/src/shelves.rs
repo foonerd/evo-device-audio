@@ -1081,11 +1081,37 @@ impl ShelfBundle {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: library::UpdateSourcePayload = parse_json(req)?;
+        let source_id = payload.source_id.clone();
+        let force_rescan = payload.force_rescan;
         let mut conn = self.open_conn().await?;
         let res =
             library::handle_update_source(&self.library, &mut conn, payload)
                 .await
                 .map_err(library_verb_to_plugin_error)?;
+        // Spawn a scan-progress watcher so the operator UI can
+        // render live "Indexing N of M" without polling. The
+        // watcher runs until MPD's `updating_db` field returns
+        // to `None` (scan complete) or the safety ceiling; a
+        // process-wide gate prevents double-fanout when two
+        // update_source gestures fire concurrently.
+        let kind = if force_rescan {
+            crate::scan_progress::ScanKind::Rescan
+        } else {
+            crate::scan_progress::ScanKind::Update
+        };
+        // Fire-and-forget: the watcher owns its own lifecycle
+        // (terminal frame + subject republish on completion).
+        // Explicit `drop` on the JoinHandle detaches the task
+        // cleanly and is the clippy-preferred shape over
+        // `let _ = <future>`, which lints as
+        // `let_underscore_future`.
+        drop(crate::scan_progress::spawn(
+            self.library.clone(),
+            self.endpoint.clone(),
+            self.timeouts,
+            source_id,
+            kind,
+        ));
         encode_json_response(req, &res)
     }
 

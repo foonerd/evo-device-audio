@@ -249,6 +249,13 @@ pub struct MpdStatus {
     /// `emit_test_tone` for the same reason as
     /// [`Self::repeat`].
     pub crossfade_seconds: u32,
+    /// MPD's `updating_db` field — the scan job id currently
+    /// in flight. `Some(<job_id>)` when a scan (either
+    /// `update` or `rescan`) is running; `None` when idle.
+    /// The scan-progress emission task polls this to
+    /// distinguish "scan still running" from "scan
+    /// complete" without needing a second protocol query.
+    pub updating_db: Option<u32>,
 }
 
 /// Narrow view of MPD's `stats` response.
