@@ -280,6 +280,8 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.browse_by_album",
     "library.browse_by_genre",
     "library.browse_by_year",
+    "library.get_triage",
+    "library.reconcile_triage",
 ];
 
 /// Wire-protocol payload version every source-verb request
