@@ -94,7 +94,27 @@ pub(crate) async fn compute_item_available(
     // Step 2: derive from source state.
     if let Some(sid) = source_id {
         if let Some(record) = registry.get(sid).await {
-            return derive_from_source_state(&record.state);
+            let derived = derive_from_source_state(&record.state);
+            // Gone guard: under a reachable source, a local file
+            // with no sticker that is also absent from MPD's song
+            // DB is permanently Gone — never project `true` from
+            // source Online alone (the wipe / delete false-positive
+            // class). Offline/Probing keep the derived value so
+            // temporary unreachability still retains curation.
+            if matches!(derived, Some(true))
+                && crate::gone_curation::is_local_mpd_file_uri(file_path)
+            {
+                match crate::gone_curation::local_uri_in_song_db(
+                    conn, file_path,
+                )
+                .await
+                {
+                    Ok(true) => return Some(true),
+                    Ok(false) => return Some(false),
+                    Err(_) => return derived,
+                }
+            }
+            return derived;
         }
     }
     // Step 3: no source registered, no sticker — truly unknown.
@@ -102,7 +122,7 @@ pub(crate) async fn compute_item_available(
 }
 
 /// True for `http://` / `https://` URIs (case-insensitive scheme).
-fn is_remote_stream_uri(path: &str) -> bool {
+pub(crate) fn is_remote_stream_uri(path: &str) -> bool {
     path.get(..7)
         .map(|p| p.eq_ignore_ascii_case("http://"))
         .unwrap_or(false)

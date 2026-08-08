@@ -53,6 +53,7 @@ use crate::disposition_emitter::DispositionEmitter;
 use crate::favourites::{self, FavouritesContext};
 use crate::idle_observer::{self, IdleObserverHandle};
 use crate::library::{self, DlnaSyncHandle, LibraryContext};
+use crate::library_triage::{self, TriageContext};
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint};
 use crate::playlist::{
     self, PlaylistContext, DEFAULT_FAVOURITES_PLAYLIST_NAME,
@@ -88,6 +89,12 @@ pub(crate) struct ShelfBundle {
     pub(crate) playlist: PlaylistContext,
     pub(crate) favourites: FavouritesContext,
     pub(crate) library: LibraryContext,
+    /// Operator-visible drift-detection + auto-reconcile
+    /// substrate. Owns the `audio_library_triage` subject and
+    /// the `library.get_triage` / `library.reconcile_triage`
+    /// verbs. Runs on warm-start rehydrate and on every idle
+    /// `Database` / `Update` burst; see `library_triage.rs`.
+    pub(crate) triage: TriageContext,
     pub(crate) sticker_reconciler: Option<StickerReconcilerHandle>,
     /// Reactive sync — MPD's idle subprotocol drives the four
     /// shelf subjects when MPD-side state mutates outside this
@@ -187,6 +194,18 @@ impl ShelfBundle {
             subjects.clone(),
             shelf_dispatcher.clone(),
         );
+        // The triage context clones the library, registry, and
+        // subject announcer — every field is Arc-wrapped, so
+        // the clone shares state rather than duplicating it.
+        // Constructed here so the announce sequence below can
+        // publish the initial empty envelope alongside the
+        // other shelf subjects.
+        let triage = TriageContext::new(
+            subjects.clone(),
+            music_directory.clone(),
+            registry.clone(),
+            library.clone(),
+        );
 
         // Ensure the local-internal floor source is registered.
         if let Err(e) =
@@ -217,6 +236,7 @@ impl ShelfBundle {
         playlist::announce_index(&playlist).await;
         favourites::announce_favourites(&favourites).await;
         library::announce_subjects(&library).await;
+        library_triage::announce_triage(&triage).await;
 
         // Spawn the sticker reconciler against the registry's
         // broadcast BEFORE the warm-start probes fire so it is
@@ -276,6 +296,7 @@ impl ShelfBundle {
             &playlist,
             &favourites,
             &library,
+            &triage,
         )
         .await;
 
@@ -289,6 +310,7 @@ impl ShelfBundle {
             playlist.clone(),
             favourites.clone(),
             library.clone(),
+            triage.clone(),
         ));
 
         let dlna_sync = Some(library::spawn_dlna_sync(library.clone()));
@@ -309,6 +331,7 @@ impl ShelfBundle {
             playlist,
             favourites,
             library,
+            triage,
             sticker_reconciler,
             idle_observer,
             dlna_sync,
@@ -331,6 +354,7 @@ impl ShelfBundle {
         playlist: &PlaylistContext,
         favourites: &FavouritesContext,
         library: &LibraryContext,
+        triage: &TriageContext,
     ) {
         let mut conn = match MpdConnection::connect_with_timeouts(
             endpoint.clone(),
@@ -362,6 +386,17 @@ impl ShelfBundle {
         playlist::publish_index(playlist, &mut conn).await;
         favourites::refresh_favourites(favourites, &mut conn).await;
         library::rehydrate_from_mpd(library, &mut conn).await;
+        // Boot into a wiped / partially deleted library must not
+        // leave ghost favourites/playlists/queue rows and must
+        // catch every measurable drift class in one place. The
+        // triage sweep is the single umbrella: it runs the gone-
+        // curation prune AND the mpd-db + registry-count checks,
+        // publishes the operator-visible `audio_library_triage`
+        // subject, and records which classes it reconciled.
+        library_triage::run_triage(
+            triage, &mut conn, queue, playlist, favourites,
+        )
+        .await;
     }
 
     /// Kick a background probe for every source the registry
@@ -639,6 +674,12 @@ impl ShelfBundle {
                 )
                 .await?,
             )),
+            "library.get_triage" => {
+                Ok(Some(self.dispatch_library_get_triage(req).await?))
+            }
+            "library.reconcile_triage" => {
+                Ok(Some(self.dispatch_library_reconcile_triage(req).await?))
+            }
             _ => Ok(None),
         }
     }
@@ -1122,6 +1163,36 @@ impl ShelfBundle {
         let env = library::handle_get_work_recordings(&self.library, payload)
             .await
             .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &env)
+    }
+
+    /// `library.get_triage` — read-only snapshot of the last
+    /// triage sweep. No MPD I/O; returns the same envelope
+    /// shape the `audio_library_triage` subject publishes.
+    async fn dispatch_library_get_triage(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let env = library_triage::handle_get_triage(&self.triage).await;
+        encode_json_response(req, &env)
+    }
+
+    /// `library.reconcile_triage` — re-run the full sweep, fire
+    /// every reconcile action, republish the subject, and
+    /// return the resulting envelope.
+    async fn dispatch_library_reconcile_triage(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let mut conn = self.open_conn().await?;
+        let env = library_triage::handle_reconcile_triage(
+            &self.triage,
+            &mut conn,
+            &self.queue,
+            &self.playlist,
+            &self.favourites,
+        )
+        .await;
         encode_json_response(req, &env)
     }
 }

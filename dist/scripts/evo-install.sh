@@ -660,9 +660,35 @@ wipe_full() {
     rm -rf /etc/systemd/system/evo-kiosk.service.d
     systemctl disable evo-ui.service evo-kiosk.service 2>/dev/null || true
     rm -rf /var/lib/evo
+    # Music destruction must clear MPD durable curation that
+    # lives OUTSIDE /var/lib/evo. Otherwise favourites /
+    # playlists / tag_cache / queue state survive p2 and the
+    # UI shows ghost library rows (2026-08-08 Gone-parity gap).
+    reset_mpd_curation_after_music_wipe
     restore_pre_evo_asound_conf
     strip_evo_include_from_mpd_conf
     systemctl daemon-reload
+}
+
+# Reset MPD state that references wiped local music.
+# Idempotent. Leaves mpd stopped — bootstrap recreates the
+# music triad then restarts mpd against a clean DB.
+reset_mpd_curation_after_music_wipe() {
+    systemctl stop mpd 2>/dev/null || true
+    systemctl reset-failed mpd 2>/dev/null || true
+    # Song index + player state.
+    rm -f /var/lib/mpd/tag_cache \
+          /var/lib/mpd/state \
+          /var/lib/mpd/sticker.sql \
+          /var/lib/mpd/sticker.sql-journal \
+          /var/lib/mpd/sticker.sql-wal \
+          /var/lib/mpd/sticker.sql-shm 2>/dev/null || true
+    # Stored playlists including __favourites__.
+    if [[ -d /var/lib/mpd/playlists ]]; then
+        find /var/lib/mpd/playlists -mindepth 1 -maxdepth 1 \
+            -exec rm -rf -- {} + 2>/dev/null || true
+    fi
+    echo "[wipe] reset /var/lib/mpd curation (tag_cache/state/stickers/playlists)"
 }
 
 # Unmount every mount whose target sits under /var/lib/evo,

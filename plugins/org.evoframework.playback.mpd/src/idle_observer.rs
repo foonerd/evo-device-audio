@@ -27,7 +27,12 @@
 //! - [`IdleSubsystem::Database`] / [`IdleSubsystem::Update`] —
 //!   the music database was scanned / updated. Dispatches
 //!   `library::rehydrate_from_mpd` so the library counts +
-//!   last-scan timestamp track MPD's `stats`.
+//!   last-scan timestamp track MPD's `stats`, then
+//!   [`crate::library_triage::run_triage`] — the operator-
+//!   visible drift-detection substrate that runs the Gone
+//!   prune, the registry-count reconcile, and the
+//!   music-tree-populated-but-MPD-DB-empty class in one place,
+//!   publishing the `audio_library_triage` subject.
 //! - [`IdleSubsystem::Player`] — playback state / position
 //!   changed. Dispatches `queue::publish_queue` so the queue
 //!   envelope's `current_position` reflects MPD's truth.
@@ -64,6 +69,7 @@ use tokio::task::JoinHandle;
 
 use crate::favourites::{self, FavouritesContext};
 use crate::library::{self, LibraryContext};
+use crate::library_triage::{self, TriageContext};
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdError,
 };
@@ -139,6 +145,7 @@ pub(crate) fn spawn(
     playlist: PlaylistContext,
     favourites: FavouritesContext,
     library: LibraryContext,
+    triage: TriageContext,
 ) -> IdleObserverHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
@@ -150,6 +157,7 @@ pub(crate) fn spawn(
             playlist,
             favourites,
             library,
+            triage,
             task_shutdown,
         )
         .await;
@@ -157,6 +165,13 @@ pub(crate) fn spawn(
     IdleObserverHandle { task, shutdown }
 }
 
+// Five shelf contexts + endpoint + timeouts + shutdown notifier
+// is above the clippy default (7). Every argument here is a
+// distinct collaborator the observer must own for its lifetime;
+// bundling into a synthetic struct would move the plumbing one
+// hop away without changing the number of moving parts the
+// reader has to follow. Prefer the explicit signature.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
@@ -164,6 +179,7 @@ async fn run(
     playlist: PlaylistContext,
     favourites: FavouritesContext,
     library: LibraryContext,
+    triage: TriageContext,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -280,6 +296,7 @@ async fn run(
             &playlist,
             &favourites,
             &library,
+            &triage,
             &changed,
         )
         .await;
@@ -292,6 +309,10 @@ async fn run(
 /// (the same calls the shelf verbs and the warm-start path
 /// already use, so the wire envelopes converge on a single
 /// build pipeline).
+// Same rationale as `run`: five shelf contexts + endpoint +
+// timeouts + the changed set is above the clippy default (7).
+// Explicit signature keeps the wire clear.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_refresh(
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
@@ -299,6 +320,7 @@ async fn dispatch_refresh(
     playlist: &PlaylistContext,
     favourites: &FavouritesContext,
     library: &LibraryContext,
+    triage: &TriageContext,
     changed: &[IdleSubsystem],
 ) {
     let mut conn =
@@ -342,6 +364,18 @@ async fn dispatch_refresh(
                 if !database_rehydrated =>
             {
                 library::rehydrate_from_mpd(library, &mut conn).await;
+                // After MPD's song DB reconciles, run the full
+                // triage sweep so every drift class the operator
+                // needs to see (Gone URIs, stale registry count,
+                // empty MPD-DB-vs-populated-music-tree) is
+                // detected, auto-reconciled where safe, and
+                // published on the `audio_library_triage`
+                // subject. Triage is the single umbrella that
+                // used to be a bare gone_curation call here.
+                library_triage::run_triage(
+                    triage, &mut conn, queue, playlist, favourites,
+                )
+                .await;
                 database_rehydrated = true;
             }
             _ => {

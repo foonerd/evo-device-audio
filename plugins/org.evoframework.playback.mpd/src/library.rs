@@ -2761,6 +2761,21 @@ pub(crate) async fn rehydrate_from_mpd(
         );
         return;
     }
+    // Persist so the wire truth survives the next boot. Without
+    // this, `sources.toml` keeps its stale track_count from the
+    // last persist point — a p2 wipe that empties the music
+    // plane would still show thousands of ghost tracks on the
+    // next start, because the in-memory apply above never
+    // reached disk. Audit ref:
+    // `audits/2026-08-08-library-mountpoints-continuous-deploy-audit.md` (F4).
+    if let Err(e) = ctx.registry.persist().await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "library rehydrate: registry persist after MPD-stats \
+             apply failed; next boot may reload stale track_count"
+        );
+    }
     // Compute the works aggregate from MPD's full database
     // walk so the library_state counters + the
     // library.list_works / library.get_work_recordings verb
