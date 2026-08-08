@@ -99,6 +99,8 @@ request_types = [
     "library.browse_by_album",
     "library.browse_by_genre",
     "library.browse_by_year",
+    "library.get_triage",
+    "library.reconcile_triage",
 ]
 
 [kind]
@@ -274,5 +276,7 @@ request_types = [
     "library.browse_by_album",
     "library.browse_by_genre",
     "library.browse_by_year",
+    "library.get_triage",
+    "library.reconcile_triage",
 ]
 response_budget_ms = 2000

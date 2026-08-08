@@ -544,6 +544,20 @@ name = "audio_library_state"
 [[subjects]]
 name = "audio_library_scan_progress"
 
+# Operator-facing library-triage projection on the
+# audio.library.v1 shelf. Carries the list of drift findings
+# from the plugin's reactive drift-detector (empty triad
+# roots, registry track-count divergence, gone URIs still
+# referenced by curation stores). Each finding declares its
+# class, severity, human-readable description, auto-
+# reconcile flag with the reconcile timestamp when the sweep
+# fired the safe action, and a class-specific evidence blob
+# for diagnostics. Republished on every warm-start rehydrate
+# and every idle `Database` / `Update` burst; also on the
+# operator-triggered `library.reconcile_triage` verb.
+[[subjects]]
+name = "audio_library_triage"
+
 # Subject type the playback.options plugin announces as a
 # durable projection of the operator's audiophile-grade
 # settings (resampling / mixer_type / dop / output_device /
