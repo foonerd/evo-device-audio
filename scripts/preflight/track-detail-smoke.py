@@ -295,6 +295,7 @@ async def main():
         return 2
 
     fails = []
+    external_transients = []
     for name in GATED_SOURCES:
         sub = sources.get(name)
         if sub is None:
@@ -310,11 +311,76 @@ async def main():
             f"  {name:20s} status={status!r} detail={detail!r}"
         )
         if status == "error":
-            fails.append(
-                f"{name}: status=error, detail={detail!r} — this is the "
-                f"exact regression class UI called out (dropped "
-                f"payload_b64 / half-landed wire codec)"
+            # Discriminate substrate regressions from external-
+            # service transients. Substrate regressions (missing
+            # payload_b64, half-landed wire codec, plugin
+            # response JSON parse failure, plugin admission
+            # failure) MUST block the deploy — they mean the
+            # binary this deploy just shipped is broken in a way
+            # rollback protects against. External transients
+            # (upstream 503s / rate-limits from MusicBrainz /
+            # LRCLIB / cover_art_archive, `plugin error:`
+            # framework wraps of PluginError) are NOT deploy
+            # regressions — the shipped binary is fine, the
+            # upstream is down. Downgrading them to a warning
+            # keeps the deploy gate honest about what it
+            # actually gates.
+            detail_str = str(detail or "").lower()
+            substrate_defect_markers = (
+                "missing payload_b64",
+                "wire codec",
+                "dispatch failed",
+                "plugin response json parse",
+                "admission failed",
+                "admission error",
+                "response is not a json object",
             )
+            external_transient_markers = (
+                "plugin error:",
+                "http 503",
+                "http 502",
+                "http 504",
+                "http 429",
+                "musicbrainz",
+                "lrclib",
+                "cover_art_archive",
+                "read operation timed out",
+                "connection refused",
+                "temporarily unavailable",
+            )
+            is_substrate = any(m in detail_str for m in substrate_defect_markers)
+            is_transient = any(
+                m in detail_str for m in external_transient_markers
+            )
+            # Order matters: substrate markers take precedence.
+            # A detail carrying both means the framework mis-
+            # classified an upstream error as substrate-shape;
+            # treat as substrate so the operator sees the more
+            # serious class.
+            if is_substrate:
+                fails.append(
+                    f"{name}: status=error, detail={detail!r} — SUBSTRATE "
+                    f"REGRESSION CLASS (dropped payload_b64 / half-landed "
+                    f"wire codec / dispatch failure / admission failure)"
+                )
+            elif is_transient:
+                external_transients.append(
+                    f"{name}: status=error, detail={detail!r} — external "
+                    f"upstream transient (not a deploy regression)"
+                )
+            else:
+                # Uncategorised error — treat as fail so a novel
+                # failure shape does not slip through silently.
+                fails.append(
+                    f"{name}: status=error, detail={detail!r} — "
+                    f"uncategorised error class; deploy gate defaults to "
+                    f"refuse pending classification"
+                )
+    if external_transients:
+        print()
+        print("--- external upstream transients (non-blocking) ---")
+        for t in external_transients:
+            print(f"  {t}")
 
     # ---- Step 5 — lyrics cache-hit shape parity ------------------
     #
