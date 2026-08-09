@@ -75,6 +75,7 @@ use evo_plugin_sdk::Manifest;
 use serde::Deserialize;
 
 mod demand;
+mod emit_throttle;
 mod fft;
 mod local_role;
 #[cfg(any(test, feature = "alsa-substrate"))]

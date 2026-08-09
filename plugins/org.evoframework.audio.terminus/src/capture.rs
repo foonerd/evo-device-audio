@@ -53,6 +53,7 @@ use evo_plugin_sdk::contract::SubjectAnnouncer;
 use tokio::sync::{watch, Notify};
 
 use crate::demand::SpectrumDemand;
+use crate::emit_throttle::EmitThrottle;
 use crate::fft::{PerceptualFrame, SpectrumAnalyser, FFT_SIZE, INPUT_CHANNELS};
 use crate::local_role::LocalRole;
 use crate::read_fail_class::{classify_read_failure, ReadFailClass};
@@ -117,10 +118,13 @@ fn run_capture_loop(
     let mut analyser: Option<SpectrumAnalyser> = None;
     let mut analyser_bins: u32 = 0;
     let mut analyser_channels: u32 = 0;
-    // Single source of truth for the wire `rate_hz` field. Derived
-    // once at loop construction since neither sample_rate_hz nor
-    // FFT_SIZE change within a capture lifetime.
-    let rate_hz = crate::fft::frame_rate_hz(config.sample_rate_hz);
+    // Note: the wire `rate_hz` field is populated from
+    // `current_demand.rate_hz_target` at emit time (F2C —
+    // wall-clock throttle target), not from the ALSA hop rate.
+    // The compute cadence (ALSA hop) is derivable from
+    // `fft::frame_rate_hz(config.sample_rate_hz)` if a
+    // subscriber ever needs it — nothing on the wire currently
+    // carries it.
     let mut consecutive_failures: u32 = 0;
     let mut backoff = RECONNECT_INITIAL;
 
@@ -247,9 +251,13 @@ fn run_capture_loop(
             // Republish the empty-frame envelope at the new
             // shape so consumers see the shape change on the
             // wire immediately — the first live frame will
-            // carry the same shape as this seed.
+            // carry the same shape as this seed. The wire
+            // `rate_hz` field carries the demand's governed
+            // emit target (not the ALSA hop rate) so
+            // subscribers drive their render loop off the
+            // true wire cadence.
             let seed_addr = crate::spectrum_subject::render_empty_frame(
-                rate_hz,
+                current_demand.rate_hz_target,
                 current_demand.bins,
                 current_demand.channels,
             );
@@ -289,7 +297,6 @@ fn run_capture_loop(
             &latest_frame,
             &announcer,
             &shutdown,
-            rate_hz,
             &transport_gate,
             &local_role,
             &demand,
@@ -345,7 +352,6 @@ fn run_fft_loop(
     latest_frame: &Arc<Mutex<Option<PerceptualFrame>>>,
     announcer: &Arc<dyn SubjectAnnouncer>,
     shutdown: &Arc<Notify>,
-    rate_hz: u32,
     transport_gate: &watch::Receiver<TransportGate>,
     local_role: &watch::Receiver<LocalRole>,
     demand: &watch::Receiver<SpectrumDemand>,
@@ -365,12 +371,15 @@ fn run_fft_loop(
     // F2C — wall-clock emit throttle. The inner FFT compute
     // runs at ALSA hop rate (~47 Hz at 48 kHz / 1024-point);
     // the wire emit is throttled independently to
-    // `demand.rate_hz_target` (typical 30). The compute keeps
+    // `demand.rate_hz_target` (typical 30). Compute keeps
     // running for peak-hold + onset detection continuity; only
     // the announcer.update_state call is gated. `get_spectrum_frame`
     // still returns the latest frame regardless of throttle
     // — the read verb serves the shared latest_frame slot.
-    let mut last_emit_at: Option<std::time::Instant> = None;
+    //
+    // Scheme details + regression-guarding tests live in the
+    // `emit_throttle` module.
+    let mut throttle = EmitThrottle::new();
 
     // tokio runtime handle for the announcer emit (which is async).
     // The capture loop runs on a blocking thread but the announcer
@@ -476,29 +485,20 @@ fn run_fft_loop(
                 // F2C emit throttle. The FFT compute above
                 // updates `latest_frame` and refreshes peak-hold
                 // + onset history on every ALSA hop; the wire
-                // emit fires only when the wall-clock elapsed
-                // since the last emit exceeds
-                // `1000 / demand.rate_hz_target` ms. Decouples
-                // wire cadence from compute cadence so a fast
-                // ALSA chain doesn't flood the happenings bus
-                // and a slow one still emits at the operator's
-                // requested cadence when frames are available.
+                // emit fires only at the demand's governed rate.
                 let target_hz = current_demand.rate_hz_target.max(1);
                 let min_gap =
                     std::time::Duration::from_millis(1_000 / target_hz as u64);
-                let now = std::time::Instant::now();
-                if let Some(prev) = last_emit_at {
-                    if now.duration_since(prev) < min_gap {
-                        continue;
-                    }
+                if !throttle.should_emit(std::time::Instant::now(), min_gap) {
+                    continue;
                 }
-                last_emit_at = Some(now);
                 let announcer = Arc::clone(announcer);
+                let wire_rate_hz = target_hz;
                 tokio_handle.spawn(async move {
                     spectrum_subject::emit_frame(
                         &announcer,
                         &frame_clone,
-                        rate_hz,
+                        wire_rate_hz,
                     )
                     .await;
                 });
