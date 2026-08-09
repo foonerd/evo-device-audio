@@ -85,7 +85,7 @@ mod transport_gate;
 pub use fft::{PerceptualFrame, SpectrumAnalyser};
 pub use local_role::LocalRole;
 pub use spectrum_subject::{
-    render_spectrum_frame, SpectrumEmitter, SPECTRUM_PAYLOAD_VERSION,
+    render_spectrum_frame, SPECTRUM_PAYLOAD_VERSION,
     SPECTRUM_SUBJECT_ADDRESSING_SCHEME, SPECTRUM_SUBJECT_ADDRESSING_VALUE,
     SPECTRUM_SUBJECT_TYPE,
 };
@@ -336,11 +336,18 @@ impl Plugin for AudioTerminusPlugin {
             // compute see the wire shape immediately. After the
             // capture loop's first frame the empty-frame state is
             // replaced by real spectra via `emit_frame`.
+            // Seed shape mirrors the disabled-default demand.
+            // Consumers subscribing before the first
+            // set_demand write see the shape they'll get on the
+            // first live frame after the operator opts in.
+            let seed_demand = demand::SpectrumDemand::disabled_default();
             spectrum_subject::announce_initial_state(
                 self.subject_announcer
                     .as_ref()
                     .expect("subject_announcer set above"),
                 fft::frame_rate_hz(self.config.sample_rate_hz),
+                seed_demand.bins,
+                seed_demand.channels,
             )
             .await;
 
@@ -628,9 +635,25 @@ impl AudioTerminusPlugin {
         // of truth via `fft::frame_rate_hz` so the read-verb path
         // and the subject-emit path never disagree on the wire.
         let rate_hz = fft::frame_rate_hz(self.config.sample_rate_hz);
+        // Empty-frame shape mirrors the current demand — so a
+        // consumer calling `get_spectrum_frame` on a disabled
+        // (or freshly-loaded) device sees the shape the first
+        // live frame will carry after the operator opts in.
+        // Fall back to the disabled-default if the demand store
+        // is not yet constructed (transient at load; unlikely
+        // in steady state).
+        let seed_demand = self
+            .demand_store
+            .as_ref()
+            .map(|s| s.current())
+            .unwrap_or_else(demand::SpectrumDemand::disabled_default);
         let payload = match frame_guard.as_ref() {
             Some(frame) => render_spectrum_frame(frame, rate_hz),
-            None => spectrum_subject::render_empty_frame(rate_hz),
+            None => spectrum_subject::render_empty_frame(
+                rate_hz,
+                seed_demand.bins,
+                seed_demand.channels,
+            ),
         };
         let body = serde_json::to_vec(&payload).map_err(|e| {
             PluginError::Permanent(format!(

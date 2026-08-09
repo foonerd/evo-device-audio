@@ -53,7 +53,7 @@ use evo_plugin_sdk::contract::SubjectAnnouncer;
 use tokio::sync::{watch, Notify};
 
 use crate::demand::SpectrumDemand;
-use crate::fft::{PerceptualFrame, SpectrumAnalyser, CHANNEL_COUNT, FFT_SIZE};
+use crate::fft::{PerceptualFrame, SpectrumAnalyser, FFT_SIZE, INPUT_CHANNELS};
 use crate::local_role::LocalRole;
 use crate::read_fail_class::{classify_read_failure, ReadFailClass};
 use crate::spectrum_subject;
@@ -110,7 +110,13 @@ fn run_capture_loop(
     local_role: watch::Receiver<LocalRole>,
     demand: watch::Receiver<SpectrumDemand>,
 ) {
-    let mut analyser = SpectrumAnalyser::new(config.sample_rate_hz);
+    // Analyser is (re)built lazily on entry to the inner FFT
+    // loop from the demand's current bins/channels. A demand
+    // change mid-play breaks out of the inner loop and the
+    // outer loop rebuilds the analyser with the new shape.
+    let mut analyser: Option<SpectrumAnalyser> = None;
+    let mut analyser_bins: u32 = 0;
+    let mut analyser_channels: u32 = 0;
     // Single source of truth for the wire `rate_hz` field. Derived
     // once at loop construction since neither sample_rate_hz nor
     // FFT_SIZE change within a capture lifetime.
@@ -219,15 +225,67 @@ fn run_capture_loop(
             "ALSA capture opened; entering FFT loop"
         );
 
+        // (Re)build the analyser to match the current demand's
+        // bins + channels. First open after a fresh plugin
+        // admit constructs from the disabled-default (or the
+        // last enabled-then-disabled shape). A demand change
+        // that arrives while the inner loop is running exits
+        // via `InnerExit::DemandShapeChanged` and the outer
+        // loop rebuilds here with the new shape.
+        let current_demand = *demand.borrow();
+        if analyser.is_none()
+            || analyser_bins != current_demand.bins
+            || analyser_channels != current_demand.channels
+        {
+            analyser = Some(SpectrumAnalyser::new(
+                config.sample_rate_hz,
+                current_demand.bins as usize,
+                current_demand.channels as usize,
+            ));
+            analyser_bins = current_demand.bins;
+            analyser_channels = current_demand.channels;
+            // Republish the empty-frame envelope at the new
+            // shape so consumers see the shape change on the
+            // wire immediately — the first live frame will
+            // carry the same shape as this seed.
+            let seed_addr = crate::spectrum_subject::render_empty_frame(
+                rate_hz,
+                current_demand.bins,
+                current_demand.channels,
+            );
+            use evo_plugin_sdk::contract::ExternalAddressing;
+            let addressing = ExternalAddressing::new(
+                crate::spectrum_subject::SPECTRUM_SUBJECT_ADDRESSING_SCHEME,
+                crate::spectrum_subject::SPECTRUM_SUBJECT_ADDRESSING_VALUE,
+            );
+            let announcer_clone = Arc::clone(&announcer);
+            match tokio::runtime::Handle::try_current() {
+                Ok(h) => {
+                    h.spawn(async move {
+                        let _ = announcer_clone
+                            .update_state(addressing, seed_addr)
+                            .await;
+                    });
+                }
+                Err(_) => {
+                    // No tokio runtime — the async announce
+                    // would fail in `run_fft_loop` too. Skip
+                    // the seed publish; the first live frame
+                    // still carries the new shape.
+                }
+            }
+        }
+
         // Inner loop: read frames, compute FFT, emit subject.
         // Exits on shutdown OR on a read error severe enough
         // that recover() fails — bubbles back to the outer loop
         // which retries the open. Also exits on demand.enabled
         // → false so the outer loop re-checks the gate + parks
-        // (dropping the PCM handle).
+        // (dropping the PCM handle), OR on a demand shape
+        // change so the outer loop rebuilds the analyser.
         let exit_inner = run_fft_loop(
             &pcm,
-            &mut analyser,
+            analyser.as_mut().expect("analyser constructed above"),
             &latest_frame,
             &announcer,
             &shutdown,
@@ -254,6 +312,21 @@ fn run_capture_loop(
                 );
                 // Fall through to outer-loop retry.
             }
+            InnerExit::DemandShapeChanged => {
+                // Operator changed `bins` or `channels` on the
+                // demand subject mid-play. Rebuild the analyser
+                // at the new shape (outer-loop head does this
+                // when the current demand differs from
+                // `analyser_bins` / `analyser_channels`) and
+                // re-open PCM. Info-class because the operator
+                // gesture is worth journal-visible; the
+                // subsequent PCM re-open is normal + expected.
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    "capture inner loop bailed on demand shape change; \
+                     rebuilding analyser + re-opening capture"
+                );
+            }
         }
     }
 }
@@ -262,6 +335,7 @@ fn run_capture_loop(
 enum InnerExit {
     Shutdown,
     TransportFailed,
+    DemandShapeChanged,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -277,10 +351,26 @@ fn run_fft_loop(
     demand: &watch::Receiver<SpectrumDemand>,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
-    // -> FFT_SIZE * 2 i32s per frame.
-    let frame_samples: usize = FFT_SIZE * CHANNEL_COUNT;
+    // -> FFT_SIZE * INPUT_CHANNELS i32s per frame.
+    let frame_samples: usize = FFT_SIZE * INPUT_CHANNELS;
     let mut raw_buf = vec![0i32; frame_samples];
     let mut f32_buf = vec![0.0f32; frame_samples];
+
+    // Snapshot the analyser shape at inner-loop entry. A demand
+    // change to bins or channels triggers `DemandShapeChanged`
+    // exit and the outer loop rebuilds the analyser + re-enters.
+    let entry_bins = analyser.bins() as u32;
+    let entry_channels = analyser.channels() as u32;
+
+    // F2C — wall-clock emit throttle. The inner FFT compute
+    // runs at ALSA hop rate (~47 Hz at 48 kHz / 1024-point);
+    // the wire emit is throttled independently to
+    // `demand.rate_hz_target` (typical 30). The compute keeps
+    // running for peak-hold + onset detection continuity; only
+    // the announcer.update_state call is gated. `get_spectrum_frame`
+    // still returns the latest frame regardless of throttle
+    // — the read verb serves the shared latest_frame slot.
+    let mut last_emit_at: Option<std::time::Instant> = None;
 
     // tokio runtime handle for the announcer emit (which is async).
     // The capture loop runs on a blocking thread but the announcer
@@ -353,8 +443,8 @@ fn run_fft_loop(
                 // when we exit this scope). Same class as the
                 // transport half above — release the ALSA
                 // handle rather than spin an idle read cycle.
-                let demand_open = demand.borrow().enabled;
-                if !demand_open {
+                let current_demand = *demand.borrow();
+                if !current_demand.enabled {
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         "demand.enabled closed mid-capture; releasing PCM \
@@ -362,10 +452,47 @@ fn run_fft_loop(
                     );
                     return InnerExit::TransportFailed;
                 }
+                // Demand shape change (bins or channels) mid-play.
+                // Bail out so the outer loop rebuilds the analyser
+                // at the new shape + republishes the seed envelope.
+                if current_demand.bins != entry_bins
+                    || current_demand.channels != entry_channels
+                {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        entry_bins,
+                        entry_channels,
+                        new_bins = current_demand.bins,
+                        new_channels = current_demand.channels,
+                        "demand shape changed mid-capture; bailing inner loop \
+                         for analyser rebuild"
+                    );
+                    return InnerExit::DemandShapeChanged;
+                }
                 let role_open = local_role.borrow().should_emit();
                 if !role_open {
                     continue;
                 }
+                // F2C emit throttle. The FFT compute above
+                // updates `latest_frame` and refreshes peak-hold
+                // + onset history on every ALSA hop; the wire
+                // emit fires only when the wall-clock elapsed
+                // since the last emit exceeds
+                // `1000 / demand.rate_hz_target` ms. Decouples
+                // wire cadence from compute cadence so a fast
+                // ALSA chain doesn't flood the happenings bus
+                // and a slow one still emits at the operator's
+                // requested cadence when frames are available.
+                let target_hz = current_demand.rate_hz_target.max(1);
+                let min_gap =
+                    std::time::Duration::from_millis(1_000 / target_hz as u64);
+                let now = std::time::Instant::now();
+                if let Some(prev) = last_emit_at {
+                    if now.duration_since(prev) < min_gap {
+                        continue;
+                    }
+                }
+                last_emit_at = Some(now);
                 let announcer = Arc::clone(announcer);
                 tokio_handle.spawn(async move {
                     spectrum_subject::emit_frame(
@@ -459,7 +586,7 @@ fn open_capture(
     let pcm = PCM::new(pcm_name, Direction::Capture, false)?;
     {
         let hwp = HwParams::any(&pcm)?;
-        hwp.set_channels(CHANNEL_COUNT as u32)?;
+        hwp.set_channels(INPUT_CHANNELS as u32)?;
         hwp.set_rate(sample_rate_hz, ValueOr::Nearest)?;
         hwp.set_format(Format::s32())?;
         hwp.set_access(Access::RWInterleaved)?;
@@ -556,12 +683,10 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// `PerceptualFrame` now derives `Clone` on its variable-shape
+// Vec-backed fields, so the previous bespoke `clone_frame`
+// helper is unused. `frame.clone()` at the call site is the
+// direct replacement.
 fn clone_frame(frame: &PerceptualFrame) -> PerceptualFrame {
-    PerceptualFrame {
-        magnitudes: Box::new(*frame.magnitudes),
-        peak_hold: Box::new(*frame.peak_hold),
-        onsets: frame.onsets,
-        correlation: Box::new(*frame.correlation),
-        at_ms: frame.at_ms,
-    }
+    frame.clone()
 }

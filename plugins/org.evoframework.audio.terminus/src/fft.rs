@@ -11,12 +11,25 @@
 //!
 //! Pure compute, no I/O. Takes interleaved stereo S32_LE PCM samples
 //! at the configured sample rate, runs a 1024-point real-input FFT
-//! per channel, projects the magnitude spectrum onto 256 mel-scale
-//! bins covering [20 Hz, 20 kHz], normalises to [0, 1] against a
+//! per channel, projects the magnitude spectrum onto an
+//! operator-demand-driven mel-bin count (32 / 64 / 128 / 256)
+//! covering [20 Hz, 20 kHz], normalises to [0, 1] against a
 //! rolling peak, and computes the three forward-decade perceptual
 //! signals the spectrum-frame wire contract defines:
 //! peak-hold per bin, per-band onset events, per-bin L/R
-//! correlation coefficient.
+//! correlation coefficient (populated only when the operator's
+//! `channels` demand is 2 — a mono-collapsed output has no L/R
+//! discrimination to expose).
+//!
+//! The analyser is parameterised at construction by
+//! `(sample_rate_hz, bins, channels)`. Bins mirror the operator's
+//! `ui.visualizer.bin_count` demand; channels mirror
+//! `ui.visualizer.channel_mode` (`1` = mono collapse — L+R
+//! averaged at the mel stage; `2` = stereo — L and R emitted
+//! separately). A demand change mid-play rebuilds the analyser
+//! (peak-hold state resets; onset history resets — small visual
+//! flicker on the frame boundary is preferable to fabricating
+//! per-bin state that never corresponded to the new shape).
 //!
 //! Mel scale is the perceptually-meaningful frequency mapping (a
 //! pitch ratio that doubles at every octave on the human cochlea).
@@ -29,7 +42,8 @@
 //! Onsets fire when a band's spectral flux crosses an
 //! adaptive threshold (recent-mean + k * recent-std). Correlation
 //! is the normalised cross-product of L and R magnitudes per bin
-//! (Pearson r restricted to non-negative inputs).
+//! (Pearson r restricted to non-negative inputs); zero-length on
+//! mono-collapsed output.
 //!
 //! The module is tested against synthesised sine + white-noise
 //! inputs (see `tests` at the bottom): a 1 kHz sine concentrates
@@ -42,18 +56,17 @@ use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
-/// Bin count on the wire. Pinned to 256 by the spectrum-frame
-/// payload v1 contract. Renderers downsample to operator-chosen
-/// `bin_count` (32 / 64 / 128 / 256).
-pub const BIN_COUNT: usize = 256;
+/// The ALSA loopback capture is always stereo (S32_LE, 2
+/// channels). The demand-driven `channels` output is a
+/// downstream reduction (mono = average L+R at the mel stage;
+/// stereo = emit both); this constant names the INPUT channel
+/// count that the capture loop hands to `process_frame`, not
+/// the output channel count on the wire.
+pub const INPUT_CHANNELS: usize = 2;
 
-/// Channel count on the wire. Pinned to 2 (stereo L+R) by the
-/// spectrum-frame payload v1 contract.
-pub const CHANNEL_COUNT: usize = 2;
-
-/// FFT window size. 1024 points at 48 kHz gives ~47 Hz bin
-/// resolution which more than covers the perceptual range
-/// the mel projection collapses anyway.
+/// FFT window size. 1024 points at 48 kHz gives ~47 Hz raw-bin
+/// resolution which more than covers the perceptual range the
+/// mel projection collapses anyway.
 pub const FFT_SIZE: usize = 1024;
 
 /// Derive the frame cadence the capture loop runs at, given the
@@ -64,11 +77,11 @@ pub const FFT_SIZE: usize = 1024;
 /// `audio_playback_spectrum_frame.rate_hz` is a `u32`. At 48 kHz
 /// the canonical reference rig sees `48000 / 1024 = 46.875` → 47.
 ///
-/// This is the single source of truth for the wire `rate_hz`
-/// field; both the capture loop's emit path and the
-/// `get_spectrum_frame` read handler call this so the value the
-/// renderer reads always matches the cadence it actually receives
-/// frames at.
+/// NOTE: this is the compute cadence, NOT the wire emit cadence.
+/// The capture loop's F2C emit throttle governs the wire cadence
+/// separately (default 30 Hz via `demand.rate_hz_target`); this
+/// value is the ring-buffer refresh rate, not the frame-rate
+/// consumers see on the subject.
 pub fn frame_rate_hz(sample_rate_hz: u32) -> u32 {
     (sample_rate_hz as f64 / FFT_SIZE as f64).round() as u32
 }
@@ -110,22 +123,37 @@ pub struct BandRanges {
 }
 
 /// Per-frame perceptual signals emitted alongside the magnitudes.
+///
+/// Shape is demand-driven — `bins` and `channels` on the frame
+/// reflect the analyser's actual state at the moment of compute.
+/// The wire reads these fields as shape authority; a demand
+/// change may lead the analyser rebuild by one or two frames and
+/// the intermediate frames carry the pre-rebuild shape rather
+/// than fabricating post-rebuild dimensions.
 #[derive(Debug, Clone)]
 pub struct PerceptualFrame {
-    /// 2 * BIN_COUNT Float32 magnitudes in [0, 1]: channel-
-    /// interleaved as `[L_bin0..L_bin255, R_bin0..R_bin255]`. The
-    /// wire form is two arrays-of-256; the in-memory form here
-    /// keeps both channels in one allocation for cache locality.
-    pub magnitudes: Box<[f32; BIN_COUNT * CHANNEL_COUNT]>,
+    /// Number of mel bins per channel. One of `{32, 64, 128, 256}`.
+    pub bins: u32,
+    /// Number of output channels. `1` for mono-collapsed output
+    /// (L+R averaged at the mel stage; `magnitudes.len() == bins`);
+    /// `2` for stereo (L then R; `magnitudes.len() == 2 * bins`).
+    pub channels: u32,
+    /// Magnitudes in [0, 1]. Layout: for `channels = 1`, one
+    /// contiguous run of `bins` values (the mono-collapsed
+    /// channel). For `channels = 2`, `bins` L values followed by
+    /// `bins` R values (channel-major). Total length always
+    /// `bins * channels`.
+    pub magnitudes: Box<[f32]>,
     /// Peak-hold per bin, per channel. Same layout as `magnitudes`.
-    pub peak_hold: Box<[f32; BIN_COUNT * CHANNEL_COUNT]>,
-    /// Onset booleans, four-band.
+    pub peak_hold: Box<[f32]>,
+    /// Onset booleans, four-band (fixed independent of `bins`).
     pub onsets: OnsetFrame,
-    /// L/R correlation per bin. Pearson r restricted to
-    /// non-negative inputs; -1 = anti-correlated (out of phase),
-    /// 0 = uncorrelated (mono content in one channel only),
-    /// +1 = perfectly correlated (true stereo).
-    pub correlation: Box<[f32; BIN_COUNT]>,
+    /// L/R correlation per bin. Length `bins` when `channels = 2`
+    /// (per-bin Pearson-restricted correlation of L vs R at that
+    /// mel bin); length `0` when `channels = 1` (mono output
+    /// carries no L/R discrimination). Never used to fabricate
+    /// stereo information on mono demand.
+    pub correlation: Box<[f32]>,
     /// Frame timestamp in milliseconds since UNIX epoch. Set by
     /// the caller (the capture loop) at frame emit time.
     pub at_ms: u64,
@@ -140,54 +168,83 @@ pub struct OnsetFrame {
     pub high: bool,
 }
 
-/// Stateful spectrum analyser. One instance per terminus; reused
-/// across frames so the rolling onset window + peak-hold decay
-/// state persist correctly.
+/// Stateful spectrum analyser. One instance per (sample_rate,
+/// bins, channels) tuple; rebuilt when the operator's demand
+/// changes bins or channels mid-play (peak-hold + onset history
+/// reset on rebuild — one-frame visual discontinuity preferable
+/// to fabricated post-rebuild state).
 pub struct SpectrumAnalyser {
     sample_rate_hz: u32,
+    /// Output bin count. Mirrors demand.bins. Sized `∈ {32, 64,
+    /// 128, 256}` in practice but the analyser accepts any
+    /// runtime value; validation happens at the verb parse
+    /// stage in `demand.rs`.
+    bins: usize,
+    /// Output channel count. Mirrors demand.channels. `1` =
+    /// mono-collapse at the mel stage; `2` = stereo pass-through.
+    channels: usize,
     fft: Arc<dyn Fft<f32>>,
     /// FFT scratch buffer, reused across `process_frame` calls.
     scratch: Vec<Complex32>,
-    /// Mel-bin frequency bounds (low/high Hz), index by output bin.
-    /// Used to map FFT bins onto mel bins.
-    mel_bounds_hz: [(f32, f32); BIN_COUNT],
+    /// Mel-bin frequency bounds (low/high Hz), one entry per
+    /// output bin.
+    mel_bounds_hz: Vec<(f32, f32)>,
     /// Hann window coefficients applied to the input PCM before
     /// FFT. Reduces spectral leakage from the rectangular
     /// implicit-windowing FFT does by default.
     hann_window: [f32; FFT_SIZE],
-    /// Per-channel peak-hold state.
-    peak_hold: [[f32; BIN_COUNT]; CHANNEL_COUNT],
+    /// Per-output-channel peak-hold state. Outer length =
+    /// `channels`, inner length = `bins`.
+    peak_hold: Vec<Vec<f32>>,
     /// Per-band spectral-flux history for onset detection. Index
-    /// by band (sub_bass=0, bass=1, mid=2, high=3).
+    /// by band (sub_bass=0, bass=1, mid=2, high=3). Bands are
+    /// fixed-count (4); their WIDTHS depend on the mel bank
+    /// which depends on `bins`, but the count is always 4.
     flux_history: [[f32; ONSET_WINDOW_FRAMES]; 4],
     /// Rolling write cursor into `flux_history`.
     flux_cursor: usize,
     /// Previous frame's per-band magnitude (for flux delta).
     /// Index by band.
     prev_band_magnitude: [f32; 4],
-    /// Cached band ranges (in mel-bin index space).
+    /// Cached band ranges (in mel-bin index space, i.e. `[0, bins)`).
     bands: BandRanges,
 }
 
 impl SpectrumAnalyser {
-    /// Construct an analyser pinned to the supplied sample rate.
-    /// `sample_rate_hz` MUST match the rate the input PCM is
-    /// captured at; passing a wrong rate produces an off-by-N
-    /// mel-bin mapping. Typical value: 48000.
-    pub fn new(sample_rate_hz: u32) -> Self {
+    /// Construct an analyser for a specific demand shape.
+    ///
+    /// - `sample_rate_hz` MUST match the rate the input PCM is
+    ///   captured at; passing a wrong rate produces an off-by-N
+    ///   mel-bin mapping. Typical value: 48000.
+    /// - `bins` is the operator's demanded output-bin count.
+    ///   Enum-validated at the demand parse stage
+    ///   (`demand::validate_bins`); the analyser accepts any
+    ///   positive value.
+    /// - `channels` is the operator's demanded output-channel
+    ///   count. `1` (mono-collapse) or `2` (stereo). Values
+    ///   outside `{1, 2}` are refused at the demand parse
+    ///   stage.
+    pub fn new(sample_rate_hz: u32, bins: usize, channels: usize) -> Self {
+        assert!(bins > 0, "analyser bins must be positive");
+        assert!(
+            channels == 1 || channels == 2,
+            "analyser channels must be 1 or 2, got {channels}"
+        );
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
-        let mel_centres_hz = compute_mel_centres();
-        let mel_bounds_hz = compute_mel_bounds();
+        let mel_centres_hz = compute_mel_centres(bins);
+        let mel_bounds_hz = compute_mel_bounds(bins);
         let hann_window = compute_hann_window();
-        let bands = compute_band_ranges(&mel_centres_hz);
+        let bands = compute_band_ranges(&mel_centres_hz, bins);
         Self {
             sample_rate_hz,
+            bins,
+            channels,
             fft,
             scratch: vec![Complex32::default(); FFT_SIZE],
             mel_bounds_hz,
             hann_window,
-            peak_hold: [[0.0; BIN_COUNT]; CHANNEL_COUNT],
+            peak_hold: vec![vec![0.0; bins]; channels],
             flux_history: [[0.0; ONSET_WINDOW_FRAMES]; 4],
             flux_cursor: 0,
             prev_band_magnitude: [0.0; 4],
@@ -195,46 +252,73 @@ impl SpectrumAnalyser {
         }
     }
 
+    /// Return the operator-visible bin count this analyser
+    /// carries. Frame payloads report this as the wire's
+    /// authoritative shape.
+    pub fn bins(&self) -> usize {
+        self.bins
+    }
+
+    /// Return the operator-visible channel count this analyser
+    /// carries.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
     /// Return the precomputed FFT-bin band ranges this analyser
-    /// uses to project the BIN_COUNT-wide magnitude vector onto
-    /// the four perceptual bands published on the spectrum
-    /// subject. The ranges are sample-rate-derived at
-    /// construction and stable for the lifetime of this
-    /// instance.
+    /// uses to project the mel-bin magnitude vector onto the
+    /// four perceptual bands published on the spectrum subject.
+    #[allow(dead_code)]
     pub fn band_ranges(&self) -> BandRanges {
         self.bands
     }
 
-    /// Process one frame of FFT_SIZE samples per channel. The
-    /// input is interleaved stereo: `[L0, R0, L1, R1, ...,
-    /// L1023, R1023]`. Each sample is a normalised f32 in [-1, 1].
-    /// Returns the per-frame perceptual signals; `at_ms` is left
-    /// at 0 for the caller to stamp.
+    /// Process one frame of `FFT_SIZE` samples per INPUT channel
+    /// (always 2 — the ALSA loopback is stereo regardless of
+    /// output demand). The input is interleaved stereo: `[L0, R0,
+    /// L1, R1, ..., L_{FFT_SIZE-1}, R_{FFT_SIZE-1}]`. Each sample
+    /// is a normalised f32 in [-1, 1]. Returns the per-frame
+    /// perceptual signals in the analyser's current output shape;
+    /// `at_ms` is left at 0 for the caller to stamp.
+    ///
+    /// Mono collapse: when the analyser was constructed with
+    /// `channels = 1`, the returned frame carries `bins` output
+    /// magnitudes (one per mel bin) computed as the average of
+    /// the L and R channels' per-bin magnitudes. Two FFTs still
+    /// run (one per input channel) — the collapse happens at the
+    /// mel-magnitude stage. Optimising to a summed-input single
+    /// FFT is a future refinement.
     pub fn process_frame(
         &mut self,
         interleaved_pcm: &[f32],
     ) -> PerceptualFrame {
         assert_eq!(
             interleaved_pcm.len(),
-            FFT_SIZE * CHANNEL_COUNT,
-            "input PCM length must be FFT_SIZE * CHANNEL_COUNT"
+            FFT_SIZE * INPUT_CHANNELS,
+            "input PCM length must be FFT_SIZE * INPUT_CHANNELS"
         );
 
-        let mut magnitudes = Box::new([0.0f32; BIN_COUNT * CHANNEL_COUNT]);
-        let mut peak_hold = Box::new([0.0f32; BIN_COUNT * CHANNEL_COUNT]);
-        let mut correlation = Box::new([0.0f32; BIN_COUNT]);
-        // Per-channel mel-binned magnitudes, used both for the
-        // output and for the cross-channel correlation computation
-        // (which needs the raw mel magnitudes from both channels
-        // before either is normalised).
-        let mut mel_mags: [[f32; BIN_COUNT]; CHANNEL_COUNT] =
-            [[0.0; BIN_COUNT]; CHANNEL_COUNT];
+        let output_len = self.bins * self.channels;
+        let mut magnitudes = vec![0.0f32; output_len].into_boxed_slice();
+        let mut peak_hold = vec![0.0f32; output_len].into_boxed_slice();
+        // Correlation array is emitted only for stereo; mono
+        // collapse produces zero-length correlation.
+        let mut correlation =
+            vec![0.0f32; if self.channels == 2 { self.bins } else { 0 }]
+                .into_boxed_slice();
 
-        for ch in 0..CHANNEL_COUNT {
+        // Per-input-channel mel-binned magnitudes. Always sized
+        // `INPUT_CHANNELS × bins` (compute stays symmetric across
+        // both PCM channels; downstream collapse decides how many
+        // survive to the wire).
+        let mut mel_mags: Vec<Vec<f32>> =
+            vec![vec![0.0; self.bins]; INPUT_CHANNELS];
+
+        for ch in 0..INPUT_CHANNELS {
             // De-interleave + Hann-window into the FFT scratch
             // buffer. Imaginary parts are zero (real input).
             for i in 0..FFT_SIZE {
-                let sample = interleaved_pcm[i * CHANNEL_COUNT + ch];
+                let sample = interleaved_pcm[i * INPUT_CHANNELS + ch];
                 self.scratch[i] =
                     Complex32::new(sample * self.hann_window[i], 0.0);
             }
@@ -250,7 +334,7 @@ impl SpectrumAnalyser {
             // range. Squared magnitude divided by FFT_SIZE
             // gives unit power per bin; sqrt converts back to
             // amplitude scale.
-            for mel_idx in 0..BIN_COUNT {
+            for mel_idx in 0..self.bins {
                 let (mel_low, mel_high) = self.mel_bounds_hz[mel_idx];
                 let fft_lo = (mel_low / bin_width_hz).floor() as usize;
                 let fft_hi = ((mel_high / bin_width_hz).ceil() as usize)
@@ -264,10 +348,6 @@ impl SpectrumAnalyser {
                     let c = self.scratch[fft_idx];
                     accum += (c.re * c.re + c.im * c.im).sqrt();
                 }
-                // Normalise by the count of FFT bins folded into
-                // this mel bin so the per-bin value is an
-                // amplitude-average, not a sum (otherwise
-                // wider mel bins dominate purely by counting).
                 let count = (fft_hi - fft_lo) as f32;
                 let amp = accum / count;
                 // Hann-window gain compensation (factor of 2 for
@@ -280,48 +360,62 @@ impl SpectrumAnalyser {
 
         // Compute spectral flux per band and update onset history
         // (must happen before per-bin normalisation since flux is
-        // on raw magnitudes).
-        let raw_mono: [f32; BIN_COUNT] =
-            std::array::from_fn(|i| (mel_mags[0][i] + mel_mags[1][i]) * 0.5);
+        // on raw magnitudes). Uses the mono-collapsed magnitudes
+        // regardless of output channel count — onsets are a
+        // per-band scalar, not a per-channel thing.
+        let raw_mono: Vec<f32> = (0..self.bins)
+            .map(|i| (mel_mags[0][i] + mel_mags[1][i]) * 0.5)
+            .collect();
         let band_mags = compute_band_magnitudes(&raw_mono, self.bands);
         let onsets = self.update_onsets(band_mags);
 
-        // Per-bin L/R correlation. Pearson-style normalised
-        // cross-product on non-negative inputs:
-        //   r_i = (L_i * R_i) / sqrt(L_i^2 * R_i^2) = sign(L_i,R_i)
-        // — collapses to a boolean of "both bins have energy".
-        // The actually-useful correlation needs windowed history;
-        // for v1 we ship the simpler per-bin sign-aligned product
-        // normalised to [0, 1] which discriminates "true stereo
-        // content in this bin" (~1) from "energy in one channel
-        // only" (~0). Sufficient for stereo-imaging visualisations
-        // that distinguish centre-image from side-image bins.
-        for i in 0..BIN_COUNT {
-            let l = mel_mags[0][i];
-            let r = mel_mags[1][i];
-            let denom = (l * l + r * r).sqrt();
-            correlation[i] = if denom > 1e-6 {
-                (2.0 * l * r) / (l * l + r * r)
-            } else {
-                0.0
-            };
-        }
+        if self.channels == 2 {
+            // Per-bin L/R correlation. Pearson-style normalised
+            // cross-product on non-negative inputs. Only meaningful
+            // on stereo demand; mono demand emits a zero-length
+            // correlation array (see `correlation` init above).
+            for i in 0..self.bins {
+                let l = mel_mags[0][i];
+                let r = mel_mags[1][i];
+                let denom = (l * l + r * r).sqrt();
+                correlation[i] = if denom > 1e-6 {
+                    (2.0 * l * r) / (l * l + r * r)
+                } else {
+                    0.0
+                };
+            }
 
-        // Update peak-hold and copy magnitudes into the output
-        // buffer.
-        for ch in 0..CHANNEL_COUNT {
-            for i in 0..BIN_COUNT {
-                let mag = mel_mags[ch][i];
+            // Stereo output: write L then R (channel-major layout).
+            for ch in 0..2 {
+                for i in 0..self.bins {
+                    let mag = mel_mags[ch][i];
+                    let decayed =
+                        self.peak_hold[ch][i] * PEAK_HOLD_DECAY_PER_FRAME_30HZ;
+                    let new_peak = mag.max(decayed);
+                    self.peak_hold[ch][i] = new_peak;
+                    let off = ch * self.bins + i;
+                    magnitudes[off] = mag;
+                    peak_hold[off] = new_peak;
+                }
+            }
+        } else {
+            // Mono output: average L+R at each mel bin. One
+            // output channel; peak-hold state lives on
+            // `self.peak_hold[0]`.
+            for i in 0..self.bins {
+                let mono_mag = (mel_mags[0][i] + mel_mags[1][i]) * 0.5;
                 let decayed =
-                    self.peak_hold[ch][i] * PEAK_HOLD_DECAY_PER_FRAME_30HZ;
-                let new_peak = mag.max(decayed);
-                self.peak_hold[ch][i] = new_peak;
-                magnitudes[ch * BIN_COUNT + i] = mag;
-                peak_hold[ch * BIN_COUNT + i] = new_peak;
+                    self.peak_hold[0][i] * PEAK_HOLD_DECAY_PER_FRAME_30HZ;
+                let new_peak = mono_mag.max(decayed);
+                self.peak_hold[0][i] = new_peak;
+                magnitudes[i] = mono_mag;
+                peak_hold[i] = new_peak;
             }
         }
 
         PerceptualFrame {
+            bins: self.bins as u32,
+            channels: self.channels as u32,
             magnitudes,
             peak_hold,
             onsets,
@@ -385,29 +479,29 @@ fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
 }
 
-fn compute_mel_centres() -> [f32; BIN_COUNT] {
+fn compute_mel_centres(bins: usize) -> Vec<f32> {
     let mel_low = hz_to_mel(MEL_LOW_HZ);
     let mel_high = hz_to_mel(MEL_HIGH_HZ);
-    let mel_step = (mel_high - mel_low) / (BIN_COUNT as f32);
-    let mut centres = [0.0f32; BIN_COUNT];
-    for i in 0..BIN_COUNT {
-        let mel = mel_low + mel_step * ((i as f32) + 0.5);
-        centres[i] = mel_to_hz(mel);
-    }
-    centres
+    let mel_step = (mel_high - mel_low) / (bins as f32);
+    (0..bins)
+        .map(|i| {
+            let mel = mel_low + mel_step * ((i as f32) + 0.5);
+            mel_to_hz(mel)
+        })
+        .collect()
 }
 
-fn compute_mel_bounds() -> [(f32, f32); BIN_COUNT] {
+fn compute_mel_bounds(bins: usize) -> Vec<(f32, f32)> {
     let mel_low = hz_to_mel(MEL_LOW_HZ);
     let mel_high = hz_to_mel(MEL_HIGH_HZ);
-    let mel_step = (mel_high - mel_low) / (BIN_COUNT as f32);
-    let mut bounds = [(0.0f32, 0.0f32); BIN_COUNT];
-    for i in 0..BIN_COUNT {
-        let lo = mel_to_hz(mel_low + mel_step * (i as f32));
-        let hi = mel_to_hz(mel_low + mel_step * ((i + 1) as f32));
-        bounds[i] = (lo, hi);
-    }
-    bounds
+    let mel_step = (mel_high - mel_low) / (bins as f32);
+    (0..bins)
+        .map(|i| {
+            let lo = mel_to_hz(mel_low + mel_step * (i as f32));
+            let hi = mel_to_hz(mel_low + mel_step * ((i + 1) as f32));
+            (lo, hi)
+        })
+        .collect()
 }
 
 fn compute_hann_window() -> [f32; FFT_SIZE] {
@@ -420,12 +514,9 @@ fn compute_hann_window() -> [f32; FFT_SIZE] {
     w
 }
 
-fn compute_band_ranges(mel_centres_hz: &[f32; BIN_COUNT]) -> BandRanges {
+fn compute_band_ranges(mel_centres_hz: &[f32], bins: usize) -> BandRanges {
     let find_first_at_or_above = |hz: f32| -> usize {
-        mel_centres_hz
-            .iter()
-            .position(|&c| c >= hz)
-            .unwrap_or(BIN_COUNT)
+        mel_centres_hz.iter().position(|&c| c >= hz).unwrap_or(bins)
     };
     let sub_bass_lo = find_first_at_or_above(MEL_LOW_HZ);
     let sub_bass_hi = find_first_at_or_above(60.0);
@@ -434,7 +525,7 @@ fn compute_band_ranges(mel_centres_hz: &[f32; BIN_COUNT]) -> BandRanges {
     let mid_lo = bass_hi;
     let mid_hi = find_first_at_or_above(2_000.0);
     let high_lo = mid_hi;
-    let high_hi = BIN_COUNT;
+    let high_hi = bins;
     BandRanges {
         sub_bass: (sub_bass_lo, sub_bass_hi),
         bass: (bass_lo, bass_hi),
@@ -443,10 +534,7 @@ fn compute_band_ranges(mel_centres_hz: &[f32; BIN_COUNT]) -> BandRanges {
     }
 }
 
-fn compute_band_magnitudes(
-    mono: &[f32; BIN_COUNT],
-    bands: BandRanges,
-) -> [f32; 4] {
+fn compute_band_magnitudes(mono: &[f32], bands: BandRanges) -> [f32; 4] {
     let mean_over = |lo: usize, hi: usize| -> f32 {
         if hi <= lo {
             return 0.0;
@@ -485,10 +573,14 @@ mod tests {
         assert_eq!(frame_rate_hz(500), 0);
     }
 
+    fn make_stereo_silence(len_samples: usize) -> Vec<f32> {
+        vec![0.0; len_samples]
+    }
+
     fn make_sine(freq_hz: f32, sample_rate_hz: u32, len: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(len);
         for i in 0..len {
-            let t = (i / CHANNEL_COUNT) as f32 / sample_rate_hz as f32;
+            let t = (i / INPUT_CHANNELS) as f32 / sample_rate_hz as f32;
             let v = (2.0 * std::f32::consts::PI * freq_hz * t).sin();
             out.push(v);
         }
@@ -500,192 +592,136 @@ mod tests {
         let mut best_v = a[0];
         for (i, &v) in a.iter().enumerate() {
             if v > best_v {
-                best = i;
                 best_v = v;
+                best = i;
             }
         }
         best
     }
 
     #[test]
-    fn mel_centres_are_monotonically_increasing() {
-        let centres = compute_mel_centres();
-        for i in 1..BIN_COUNT {
+    fn analyser_output_shape_matches_demand_stereo_256() {
+        let mut a = SpectrumAnalyser::new(48_000, 256, 2);
+        assert_eq!(a.bins(), 256);
+        assert_eq!(a.channels(), 2);
+        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        assert_eq!(f.bins, 256);
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.magnitudes.len(), 512);
+        assert_eq!(f.peak_hold.len(), 512);
+        assert_eq!(f.correlation.len(), 256);
+    }
+
+    #[test]
+    fn analyser_output_shape_matches_demand_mono_64() {
+        let mut a = SpectrumAnalyser::new(48_000, 64, 1);
+        assert_eq!(a.bins(), 64);
+        assert_eq!(a.channels(), 1);
+        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        assert_eq!(f.bins, 64);
+        assert_eq!(f.channels, 1);
+        assert_eq!(f.magnitudes.len(), 64);
+        assert_eq!(f.peak_hold.len(), 64);
+        // Mono demand → zero-length correlation (no L/R
+        // discrimination to expose).
+        assert_eq!(f.correlation.len(), 0);
+    }
+
+    #[test]
+    fn analyser_output_shape_matches_demand_stereo_32() {
+        let mut a = SpectrumAnalyser::new(48_000, 32, 2);
+        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        assert_eq!(f.bins, 32);
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.magnitudes.len(), 64);
+        assert_eq!(f.correlation.len(), 32);
+    }
+
+    #[test]
+    fn silence_frames_produce_zero_magnitudes() {
+        for (bins, channels) in [(32usize, 1usize), (64, 2), (128, 1), (256, 2)]
+        {
+            let mut a = SpectrumAnalyser::new(48_000, bins, channels);
+            let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+            let f = a.process_frame(&pcm);
             assert!(
-                centres[i] > centres[i - 1],
-                "centre[{}] = {} not greater than centre[{}] = {}",
-                i,
-                centres[i],
-                i - 1,
-                centres[i - 1]
+                f.magnitudes.iter().all(|&m| m.abs() < 1e-6),
+                "silence should produce zero magnitudes at bins={bins} channels={channels}"
             );
         }
     }
 
     #[test]
-    fn mel_centres_span_audible_band() {
-        let centres = compute_mel_centres();
-        assert!(centres[0] >= MEL_LOW_HZ * 0.99);
-        assert!(centres[BIN_COUNT - 1] <= MEL_HIGH_HZ * 1.01);
-        assert!(centres[BIN_COUNT - 1] >= MEL_HIGH_HZ * 0.99);
-    }
-
-    #[test]
-    fn mel_bounds_are_contiguous() {
-        let bounds = compute_mel_bounds();
-        for i in 1..BIN_COUNT {
-            assert!((bounds[i].0 - bounds[i - 1].1).abs() < 0.5);
-        }
-    }
-
-    #[test]
-    fn band_ranges_are_non_empty_and_ordered() {
-        let centres = compute_mel_centres();
-        let bands = compute_band_ranges(&centres);
-        assert!(bands.sub_bass.1 > bands.sub_bass.0);
-        assert!(bands.bass.0 == bands.sub_bass.1);
-        assert!(bands.bass.1 > bands.bass.0);
-        assert!(bands.mid.0 == bands.bass.1);
-        assert!(bands.mid.1 > bands.mid.0);
-        assert!(bands.high.0 == bands.mid.1);
-        assert!(bands.high.1 == BIN_COUNT);
-    }
-
-    #[test]
-    fn sine_at_1khz_concentrates_in_mid_band() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * CHANNEL_COUNT);
-        let frame = a.process_frame(&pcm);
-        // The argmax bin for a 1 kHz sine should fall inside the
-        // mid band's mel-bin range.
-        let mono: [f32; BIN_COUNT] = std::array::from_fn(|i| {
-            (frame.magnitudes[i] + frame.magnitudes[i + BIN_COUNT]) * 0.5
-        });
-        let peak_bin = argmax(&mono);
-        let bands = a.band_ranges();
+    fn sine_energy_concentrates_at_expected_bin_stereo_256() {
+        // A 1 kHz sine should peak in the mel bin whose centre
+        // falls closest to 1 kHz. On the [20 Hz, 20 kHz] mel
+        // scale with 256 bins, hz_to_mel(1000) ≈ 1000, which
+        // maps to roughly bin 65 (mel_step ≈ 14.8, offset from
+        // mel_low ≈ 31). Assert a window around it that
+        // tolerates FFT-bin granularity + rounding.
+        let mut a = SpectrumAnalyser::new(48_000, 256, 2);
+        let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        // Channel-L slice.
+        let l = &f.magnitudes[0..256];
+        let peak_bin = argmax(l);
         assert!(
-            peak_bin >= bands.mid.0 && peak_bin < bands.mid.1,
-            "peak bin {} not in mid band [{}, {})",
-            peak_bin,
-            bands.mid.0,
-            bands.mid.1
+            (55..75).contains(&peak_bin),
+            "1 kHz sine on 256-bin mel should peak in bins [55, 75), got {peak_bin}"
         );
     }
 
     #[test]
-    fn sine_at_60hz_concentrates_in_bass_band() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        let pcm = make_sine(60.0, 48_000, FFT_SIZE * CHANNEL_COUNT);
-        let frame = a.process_frame(&pcm);
-        let mono: [f32; BIN_COUNT] = std::array::from_fn(|i| {
-            (frame.magnitudes[i] + frame.magnitudes[i + BIN_COUNT]) * 0.5
-        });
-        let peak_bin = argmax(&mono);
-        let bands = a.band_ranges();
-        // 60 Hz is the sub-bass/bass boundary; either band is
-        // acceptable at the bin-resolution available here.
+    fn sine_energy_concentrates_at_expected_bin_mono_64() {
+        // Same sine, mono-collapsed 64-bin analyser: peak lands
+        // in the bin covering 1 kHz. 64-bin mel-scale between
+        // 20 Hz and 20 kHz → mel_step ≈ 59; 1 kHz → mel ~1000
+        // → bin index ≈ (1000 - 31) / 59 ≈ 16.
+        let mut a = SpectrumAnalyser::new(48_000, 64, 1);
+        let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        let peak_bin = argmax(&f.magnitudes);
         assert!(
-            (peak_bin >= bands.sub_bass.0 && peak_bin < bands.bass.1),
-            "peak bin {} not in sub_bass+bass range [{}, {})",
-            peak_bin,
-            bands.sub_bass.0,
-            bands.bass.1
+            (12..22).contains(&peak_bin),
+            "1 kHz sine on 64-bin mono should peak in bins [12, 22), got {peak_bin}"
         );
     }
 
     #[test]
-    fn silence_produces_zero_magnitudes() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        let pcm = vec![0.0f32; FFT_SIZE * CHANNEL_COUNT];
-        let frame = a.process_frame(&pcm);
-        for m in frame.magnitudes.iter() {
-            assert!(*m < 1e-6, "silence produced non-zero magnitude {}", m);
+    fn mel_bounds_length_matches_requested_bins() {
+        for bins in [32, 64, 128, 256] {
+            let bounds = compute_mel_bounds(bins);
+            assert_eq!(bounds.len(), bins);
+            let centres = compute_mel_centres(bins);
+            assert_eq!(centres.len(), bins);
         }
     }
 
     #[test]
-    fn peak_hold_decays_over_silence_frames() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        // First frame: 1 kHz sine — establishes a peak.
-        let pcm_sine = make_sine(1_000.0, 48_000, FFT_SIZE * CHANNEL_COUNT);
-        let first = a.process_frame(&pcm_sine);
-        let initial_peak_l = *first.peak_hold[..BIN_COUNT]
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
-        assert!(initial_peak_l > 0.0);
-        // Subsequent frames: silence. Peak should decay
-        // multiplicatively at PEAK_HOLD_DECAY_PER_FRAME_30HZ per
-        // frame; after 30 silence frames at 30 Hz cadence (1 s of
-        // silence) it should be visibly lower but not zero.
-        let silence = vec![0.0f32; FFT_SIZE * CHANNEL_COUNT];
-        let mut last_peak = initial_peak_l;
-        for _ in 0..30 {
-            let f = a.process_frame(&silence);
-            let p = *f.peak_hold[..BIN_COUNT]
-                .iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
-            assert!(
-                p <= last_peak + 1e-6,
-                "peak should decay monotonically over silence; was {}, now {}",
-                last_peak,
-                p
+    fn band_ranges_cover_full_bin_span() {
+        for bins in [32, 64, 128, 256] {
+            let centres = compute_mel_centres(bins);
+            let br = compute_band_ranges(&centres, bins);
+            assert_eq!(
+                br.sub_bass.0, 0,
+                "sub_bass starts at 0 for bins={bins}"
             );
-            last_peak = p;
+            assert_eq!(br.high.1, bins, "high ends at bins for bins={bins}");
         }
-        // After ~30 frames of geometric decay at 0.933 / frame,
-        // peak should be ~0.933^30 = ~0.124 of initial.
-        assert!(last_peak < initial_peak_l * 0.25);
-        assert!(last_peak > initial_peak_l * 0.05);
     }
 
     #[test]
-    fn correlation_high_for_stereo_identical_signal() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        let mono = make_sine(1_000.0, 48_000, FFT_SIZE);
-        // Build interleaved stereo where both channels are the
-        // same mono signal.
-        let mut pcm = vec![0.0f32; FFT_SIZE * CHANNEL_COUNT];
-        for i in 0..FFT_SIZE {
-            pcm[i * CHANNEL_COUNT] = mono[i];
-            pcm[i * CHANNEL_COUNT + 1] = mono[i];
-        }
-        let frame = a.process_frame(&pcm);
-        // Bins with significant energy should correlate near 1.
-        let bands = a.band_ranges();
-        let mid_corr_avg: f32 = (bands.mid.0..bands.mid.1)
-            .map(|i| frame.correlation[i])
-            .sum::<f32>()
-            / (bands.mid.1 - bands.mid.0) as f32;
-        assert!(
-            mid_corr_avg > 0.5,
-            "expected high correlation for identical-stereo content, got {}",
-            mid_corr_avg
-        );
+    #[should_panic]
+    fn zero_bins_panics_at_construction() {
+        let _ = SpectrumAnalyser::new(48_000, 0, 2);
     }
 
     #[test]
-    fn correlation_low_for_stereo_disjoint_signal() {
-        let mut a = SpectrumAnalyser::new(48_000);
-        // L channel: 1 kHz sine; R channel: silence.
-        let mut pcm = vec![0.0f32; FFT_SIZE * CHANNEL_COUNT];
-        for i in 0..FFT_SIZE {
-            let t = i as f32 / 48_000.0;
-            pcm[i * CHANNEL_COUNT] =
-                (2.0 * std::f32::consts::PI * 1_000.0 * t).sin();
-            pcm[i * CHANNEL_COUNT + 1] = 0.0;
-        }
-        let frame = a.process_frame(&pcm);
-        let bands = a.band_ranges();
-        let mid_corr_avg: f32 = (bands.mid.0..bands.mid.1)
-            .map(|i| frame.correlation[i])
-            .sum::<f32>()
-            / (bands.mid.1 - bands.mid.0) as f32;
-        assert!(
-            mid_corr_avg < 0.3,
-            "expected low correlation for L-only content, got {}",
-            mid_corr_avg
-        );
+    #[should_panic]
+    fn three_channels_panics_at_construction() {
+        let _ = SpectrumAnalyser::new(48_000, 64, 3);
     }
 }

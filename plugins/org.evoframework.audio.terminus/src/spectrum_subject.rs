@@ -37,7 +37,7 @@ use evo_plugin_sdk::contract::{
 };
 use serde_json::json;
 
-use crate::fft::{PerceptualFrame, BIN_COUNT, CHANNEL_COUNT};
+use crate::fft::PerceptualFrame;
 
 const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
 
@@ -83,6 +83,8 @@ pub const SPECTRUM_PAYLOAD_VERSION: u32 = 1;
 pub async fn announce_initial_state(
     announcer: &Arc<dyn SubjectAnnouncer>,
     rate_hz: u32,
+    bins: u32,
+    channels: u32,
 ) {
     let addressing = ExternalAddressing::new(
         SPECTRUM_SUBJECT_ADDRESSING_SCHEME,
@@ -90,7 +92,7 @@ pub async fn announce_initial_state(
     );
     let announcement =
         SubjectAnnouncement::new(SPECTRUM_SUBJECT_TYPE, vec![addressing])
-            .with_state(render_empty_frame(rate_hz));
+            .with_state(render_empty_frame(rate_hz, bins, channels));
     if let Err(e) = announcer.announce(announcement).await {
         tracing::warn!(
             plugin = PLUGIN_NAME,
@@ -110,6 +112,7 @@ pub async fn announce_initial_state(
 /// at loop construction via `fft::frame_rate_hz`); it threads
 /// through to the wire `rate_hz` field so subscribers see the
 /// cadence they actually receive frames at.
+#[cfg_attr(not(feature = "alsa-substrate"), allow(dead_code))]
 pub async fn emit_frame(
     announcer: &Arc<dyn SubjectAnnouncer>,
     frame: &PerceptualFrame,
@@ -141,111 +144,111 @@ pub fn render_spectrum_frame(
     frame: &PerceptualFrame,
     rate_hz: u32,
 ) -> serde_json::Value {
-    // Split the channel-interleaved magnitudes / peak_hold back
-    // into the two-arrays-of-256 wire shape the renderer expects.
-    let mut mags_l = Vec::with_capacity(BIN_COUNT);
-    let mut mags_r = Vec::with_capacity(BIN_COUNT);
-    let mut peak_l = Vec::with_capacity(BIN_COUNT);
-    let mut peak_r = Vec::with_capacity(BIN_COUNT);
-    for i in 0..BIN_COUNT {
-        mags_l.push(frame.magnitudes[i]);
-        mags_r.push(frame.magnitudes[i + BIN_COUNT]);
-        peak_l.push(frame.peak_hold[i]);
-        peak_r.push(frame.peak_hold[i + BIN_COUNT]);
-    }
+    // Frame shape is the analyser's actual state at compute
+    // time — bins + channels come from the frame itself, not
+    // from any external constant. This is the payload-truth
+    // invariant: consumers read shape per-frame, not from the
+    // demand subject.
+    let bins = frame.bins as usize;
+    let channels = frame.channels as usize;
+    let mags = split_channels(&frame.magnitudes, bins, channels);
+    let peaks = split_channels(&frame.peak_hold, bins, channels);
     let correlation: Vec<f32> = frame.correlation.to_vec();
 
     json!({
-        "v": SPECTRUM_PAYLOAD_VERSION,
-        "bins": BIN_COUNT,
-        "channels": CHANNEL_COUNT,
-        "rate_hz": rate_hz,
-        "magnitudes": [mags_l, mags_r],
-        "peak_hold": [peak_l, peak_r],
+        "v":          SPECTRUM_PAYLOAD_VERSION,
+        "bins":       frame.bins,
+        "channels":   frame.channels,
+        "rate_hz":    rate_hz,
+        "magnitudes": mags,
+        "peak_hold":  peaks,
         "onsets": {
             "sub_bass": frame.onsets.sub_bass,
-            "bass": frame.onsets.bass,
-            "mid": frame.onsets.mid,
-            "high": frame.onsets.high,
+            "bass":     frame.onsets.bass,
+            "mid":      frame.onsets.mid,
+            "high":     frame.onsets.high,
         },
         "correlation": correlation,
-        "at_ms": frame.at_ms,
+        "at_ms":       frame.at_ms,
     })
+}
+
+/// Slice a flat channel-major buffer into a `[channel][bin]`
+/// nested array. For `channels = 1` this returns `[[bins...]]`;
+/// for `channels = 2` this returns `[[L...], [R...]]`. Matches
+/// the wire shape UI consumers parse for the `magnitudes` /
+/// `peak_hold` fields.
+fn split_channels(flat: &[f32], bins: usize, channels: usize) -> Vec<Vec<f32>> {
+    (0..channels)
+        .map(|ch| {
+            let start = ch * bins;
+            let end = start + bins;
+            flat[start..end].to_vec()
+        })
+        .collect()
 }
 
 /// Render the empty-frame shape returned by `get_spectrum_frame`
 /// before the capture loop has computed its first frame. Same
-/// wire shape, all-zero magnitudes + peak_hold, all-false
-/// onsets, zero correlation, `at_ms: 0`. Renderers handle this
-/// as "silent" — the visual renders idle.
+/// wire shape as a real frame, sized to the current analyser
+/// demand (`bins` + `channels`) so consumers subscribing before
+/// the first FFT compute learn the shape immediately from the
+/// seeded state.
 ///
 /// `rate_hz` matches the value `render_spectrum_frame` would
 /// emit once the capture loop computes its first frame — single
 /// source of truth via `fft::frame_rate_hz`.
-pub fn render_empty_frame(rate_hz: u32) -> serde_json::Value {
-    let zero_bins: Vec<f32> = vec![0.0; BIN_COUNT];
-    let zero_corr: Vec<f32> = vec![0.0; BIN_COUNT];
+///
+/// `bins` and `channels` are the current demand's output shape;
+/// consumers subscribing between an announce and the first live
+/// frame see this shape and can size their decoder buffers
+/// without waiting for a live frame.
+pub fn render_empty_frame(
+    rate_hz: u32,
+    bins: u32,
+    channels: u32,
+) -> serde_json::Value {
+    let bins_us = bins as usize;
+    let channels_us = channels as usize;
+    let zero_per_channel: Vec<f32> = vec![0.0; bins_us];
+    let per_channel: Vec<Vec<f32>> =
+        (0..channels_us).map(|_| zero_per_channel.clone()).collect();
+    // Correlation is only meaningful for stereo output; mono
+    // demand carries a zero-length correlation array (matches
+    // the live-frame shape).
+    let zero_corr: Vec<f32> = if channels_us == 2 {
+        vec![0.0; bins_us]
+    } else {
+        Vec::new()
+    };
     json!({
-        "v": SPECTRUM_PAYLOAD_VERSION,
-        "bins": BIN_COUNT,
-        "channels": CHANNEL_COUNT,
-        "rate_hz": rate_hz,
-        "magnitudes": [zero_bins.clone(), zero_bins.clone()],
-        "peak_hold": [zero_bins.clone(), zero_bins],
+        "v":          SPECTRUM_PAYLOAD_VERSION,
+        "bins":       bins,
+        "channels":   channels,
+        "rate_hz":    rate_hz,
+        "magnitudes": per_channel.clone(),
+        "peak_hold":  per_channel,
         "onsets": {
             "sub_bass": false,
-            "bass": false,
-            "mid": false,
-            "high": false,
+            "bass":     false,
+            "mid":      false,
+            "high":     false,
         },
         "correlation": zero_corr,
-        "at_ms": 0u64,
+        "at_ms":       0u64,
     })
 }
 
-/// Thin wrapper bundling the announcer, a stable addressing,
-/// and the wire `rate_hz` so callers don't re-construct any of
-/// them on every emit. Mirrors the playback.mpd `SubjectEmitter`
-/// shape.
-#[allow(dead_code)]
-pub struct SpectrumEmitter {
-    announcer: Arc<dyn SubjectAnnouncer>,
-    rate_hz: u32,
-}
-
-impl SpectrumEmitter {
-    /// Construct an emitter bound to the supplied announcer.
-    /// The announcer is the plugin's `LoadContext.subject_announcer`
-    /// clone; cheap to wrap since SpectrumEmitter holds an Arc.
-    /// `rate_hz` is the value the wire field carries on every emit
-    /// — derived once via `fft::frame_rate_hz(sample_rate_hz)` at
-    /// emitter construction.
-    pub fn new(announcer: Arc<dyn SubjectAnnouncer>, rate_hz: u32) -> Self {
-        Self { announcer, rate_hz }
-    }
-
-    /// Announce the spectrum subject and seed its initial state.
-    /// Called once at plugin load; subsequent state changes go
-    /// through `emit`. The emitter's cached `rate_hz` threads
-    /// into the initial empty-frame envelope so subscribers
-    /// connecting before the first FFT compute see the wire
-    /// shape immediately.
-    pub async fn announce(&self) {
-        announce_initial_state(&self.announcer, self.rate_hz).await;
-    }
-
-    /// Publish a fresh spectrum frame on the subject. Best
-    /// effort: announcer errors log at debug and do not fail
-    /// the capture loop.
-    pub async fn emit(&self, frame: &PerceptualFrame) {
-        emit_frame(&self.announcer, frame, self.rate_hz).await;
-    }
-}
+// `SpectrumEmitter` previously wrapped the announcer + rate for
+// a shorter emit call-site; the capture loop calls `emit_frame`
+// directly with the demand-driven shape now, so the wrapper is
+// unused. Reintroduce when the API stabilises around a shape
+// worth wrapping.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fft::{OnsetFrame, BIN_COUNT, CHANNEL_COUNT};
+    use crate::fft::OnsetFrame;
     use evo_plugin_sdk::contract::ReportError;
     use std::future::Future;
     use std::pin::Pin;
@@ -301,23 +304,31 @@ mod tests {
         }
     }
 
+    /// Build a synthetic PerceptualFrame at the given
+    /// (bins, channels) shape with every magnitude/peak/corr
+    /// value set uniformly. Used by the render-shape tests to
+    /// pin the wire projection for the operator-visible enums.
     fn make_frame(
+        bins: u32,
+        channels: u32,
         magnitude_value: f32,
         peak_value: f32,
         onsets: OnsetFrame,
         at_ms: u64,
     ) -> PerceptualFrame {
-        let mut mags = Box::new([0.0f32; BIN_COUNT * CHANNEL_COUNT]);
-        let mut peak = Box::new([0.0f32; BIN_COUNT * CHANNEL_COUNT]);
-        let mut corr = Box::new([0.0f32; BIN_COUNT]);
-        for i in 0..BIN_COUNT * CHANNEL_COUNT {
-            mags[i] = magnitude_value;
-            peak[i] = peak_value;
-        }
-        for i in 0..BIN_COUNT {
-            corr[i] = 0.5;
-        }
+        let output_len = (bins as usize) * (channels as usize);
+        let mags: Box<[f32]> =
+            vec![magnitude_value; output_len].into_boxed_slice();
+        let peak: Box<[f32]> = vec![peak_value; output_len].into_boxed_slice();
+        // Correlation only when channels==2 (mirrors the analyser).
+        let corr: Box<[f32]> = if channels == 2 {
+            vec![0.5; bins as usize].into_boxed_slice()
+        } else {
+            Vec::new().into_boxed_slice()
+        };
         PerceptualFrame {
+            bins,
+            channels,
             magnitudes: mags,
             peak_hold: peak,
             onsets,
@@ -333,60 +344,77 @@ mod tests {
     const TEST_RATE_HZ: u32 = 47;
 
     #[test]
-    fn render_spectrum_frame_emits_v1_envelope() {
-        let frame = make_frame(0.5, 0.7, OnsetFrame::default(), 1_000);
+    fn render_spectrum_frame_emits_v1_envelope_stereo_256() {
+        let frame = make_frame(256, 2, 0.5, 0.7, OnsetFrame::default(), 1_000);
         let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(v["v"], SPECTRUM_PAYLOAD_VERSION);
-        assert_eq!(v["bins"], BIN_COUNT);
-        assert_eq!(v["channels"], CHANNEL_COUNT);
+        assert_eq!(v["bins"], 256);
+        assert_eq!(v["channels"], 2);
         assert_eq!(v["rate_hz"], TEST_RATE_HZ);
         assert_eq!(v["at_ms"], 1_000);
+    }
+
+    #[test]
+    fn render_spectrum_frame_emits_shape_matching_frame_mono_64() {
+        // Frame at demand.bins=64, channels=1 — the wire MUST
+        // reflect the frame's shape, not any hardcoded constant.
+        let frame = make_frame(64, 1, 0.3, 0.4, OnsetFrame::default(), 500);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
+        assert_eq!(v["bins"], 64);
+        assert_eq!(v["channels"], 1);
+        let mags = v["magnitudes"].as_array().unwrap();
+        assert_eq!(mags.len(), 1, "mono → one channel");
+        let mono = mags[0].as_array().unwrap();
+        assert_eq!(mono.len(), 64);
+        // Correlation array is empty on mono demand.
+        assert_eq!(v["correlation"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn render_spectrum_frame_emits_shape_matching_frame_stereo_32() {
+        let frame = make_frame(32, 2, 0.1, 0.2, OnsetFrame::default(), 0);
+        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
+        assert_eq!(v["bins"], 32);
+        assert_eq!(v["channels"], 2);
+        let mags = v["magnitudes"].as_array().unwrap();
+        assert_eq!(mags.len(), 2);
+        assert_eq!(mags[0].as_array().unwrap().len(), 32);
+        assert_eq!(mags[1].as_array().unwrap().len(), 32);
+        assert_eq!(v["correlation"].as_array().unwrap().len(), 32);
     }
 
     #[test]
     fn render_spectrum_frame_rate_hz_reflects_parameter() {
         // The wire `rate_hz` field MUST be parameter-driven — not
         // a hardcoded literal. Three distinct rates, three
-        // distinct wire values; would have failed under the
-        // hardcoded-30 form regardless of input.
-        let frame = make_frame(0.0, 0.0, OnsetFrame::default(), 0);
+        // distinct wire values.
+        let frame = make_frame(64, 1, 0.0, 0.0, OnsetFrame::default(), 0);
         assert_eq!(render_spectrum_frame(&frame, 30)["rate_hz"], 30);
         assert_eq!(render_spectrum_frame(&frame, 47)["rate_hz"], 47);
         assert_eq!(render_spectrum_frame(&frame, 94)["rate_hz"], 94);
     }
 
     #[test]
-    fn render_empty_frame_rate_hz_reflects_parameter() {
-        assert_eq!(render_empty_frame(30)["rate_hz"], 30);
-        assert_eq!(render_empty_frame(47)["rate_hz"], 47);
-        assert_eq!(render_empty_frame(94)["rate_hz"], 94);
-    }
+    fn render_empty_frame_carries_requested_shape() {
+        // Empty frame at 32×2:
+        let v = render_empty_frame(30, 32, 2);
+        assert_eq!(v["bins"], 32);
+        assert_eq!(v["channels"], 2);
+        assert_eq!(v["rate_hz"], 30);
+        let mags = v["magnitudes"].as_array().unwrap();
+        assert_eq!(mags.len(), 2);
+        assert_eq!(mags[0].as_array().unwrap().len(), 32);
+        assert_eq!(v["correlation"].as_array().unwrap().len(), 32);
 
-    #[test]
-    fn render_spectrum_frame_splits_channels_into_two_arrays() {
-        let frame = make_frame(0.5, 0.7, OnsetFrame::default(), 2_000);
-        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
-        let mags = v["magnitudes"].as_array().expect("magnitudes is array");
-        assert_eq!(mags.len(), 2, "two channels");
-        let l = mags[0].as_array().expect("L is array");
-        let r = mags[1].as_array().expect("R is array");
-        assert_eq!(l.len(), BIN_COUNT);
-        assert_eq!(r.len(), BIN_COUNT);
-        for i in 0..BIN_COUNT {
-            assert_eq!(l[i].as_f64(), Some(0.5));
-            assert_eq!(r[i].as_f64(), Some(0.5));
-        }
-    }
-
-    #[test]
-    fn render_spectrum_frame_carries_peak_hold() {
-        let frame = make_frame(0.0, 0.9, OnsetFrame::default(), 0);
-        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
-        let peak = v["peak_hold"].as_array().expect("peak_hold is array");
-        assert_eq!(peak.len(), 2);
-        let l = peak[0].as_array().unwrap();
-        assert_eq!(l.len(), BIN_COUNT);
-        assert!((l[0].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        // Empty frame at 128×1 (mono):
+        let v = render_empty_frame(30, 128, 1);
+        assert_eq!(v["bins"], 128);
+        assert_eq!(v["channels"], 1);
+        let mags = v["magnitudes"].as_array().unwrap();
+        assert_eq!(mags.len(), 1);
+        assert_eq!(mags[0].as_array().unwrap().len(), 128);
+        // Mono → zero-length correlation.
+        assert_eq!(v["correlation"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -397,7 +425,7 @@ mod tests {
             mid: true,
             high: false,
         };
-        let frame = make_frame(0.0, 0.0, onsets, 0);
+        let frame = make_frame(64, 2, 0.0, 0.0, onsets, 0);
         let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(v["onsets"]["sub_bass"], true);
         assert_eq!(v["onsets"]["bass"], false);
@@ -406,49 +434,28 @@ mod tests {
     }
 
     #[test]
-    fn render_spectrum_frame_carries_correlation() {
-        let frame = make_frame(0.0, 0.0, OnsetFrame::default(), 0);
-        let v = render_spectrum_frame(&frame, TEST_RATE_HZ);
-        let corr = v["correlation"].as_array().expect("correlation is array");
-        assert_eq!(corr.len(), BIN_COUNT);
-        for sample in corr.iter().take(BIN_COUNT) {
-            assert!((sample.as_f64().unwrap() - 0.5).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn render_empty_frame_matches_v1_shape() {
-        let v = render_empty_frame(TEST_RATE_HZ);
-        assert_eq!(v["v"], SPECTRUM_PAYLOAD_VERSION);
-        assert_eq!(v["bins"], BIN_COUNT);
-        assert_eq!(v["channels"], CHANNEL_COUNT);
-        assert_eq!(v["rate_hz"], TEST_RATE_HZ);
-        assert_eq!(v["at_ms"], 0);
-        let mags = v["magnitudes"].as_array().unwrap();
-        assert_eq!(mags.len(), 2);
-        let l = mags[0].as_array().unwrap();
-        assert!(l.iter().all(|x| x.as_f64() == Some(0.0)));
-    }
-
-    #[test]
     fn render_is_deterministic_for_identical_input() {
-        let frame = make_frame(0.3, 0.4, OnsetFrame::default(), 12345);
+        let frame = make_frame(128, 2, 0.3, 0.4, OnsetFrame::default(), 12345);
         let a = render_spectrum_frame(&frame, TEST_RATE_HZ);
         let b = render_spectrum_frame(&frame, TEST_RATE_HZ);
         assert_eq!(a, b);
     }
 
     #[tokio::test]
-    async fn announce_initial_state_seeds_full_envelope_in_announcement() {
-        // Subscribers connecting between plugin load and first
-        // FFT compute must see the full wire shape immediately —
-        // no separate `get_spectrum_frame` round-trip required.
-        // The announcement carries the empty-frame envelope via
-        // SubjectAnnouncement::with_state; the framework stores
-        // non-null announcement state on the subject record.
+    async fn announce_initial_state_seeds_envelope_at_requested_shape() {
+        // Subscribers connecting between plugin load and the
+        // first FFT compute must see the full wire shape
+        // immediately — no separate `get_spectrum_frame`
+        // round-trip required. The announcement carries the
+        // empty-frame envelope via SubjectAnnouncement::with_state;
+        // the framework stores non-null announcement state on
+        // the subject record.
         let cap = Arc::new(CapturingAnnouncer::new());
         let announcer: Arc<dyn SubjectAnnouncer> = cap.clone();
-        announce_initial_state(&announcer, TEST_RATE_HZ).await;
+        // Seed at the disabled-default demand (64 bins, mono) so
+        // the announced envelope reflects what the first live
+        // frame will carry after the operator opts in.
+        announce_initial_state(&announcer, TEST_RATE_HZ, 64, 1).await;
 
         let announced = cap.announced();
         assert_eq!(announced.len(), 1, "exactly one announce call");
@@ -458,30 +465,19 @@ mod tests {
         let state = &a.state;
         assert!(!state.is_null(), "announcement state MUST be non-null");
         assert_eq!(state["v"], SPECTRUM_PAYLOAD_VERSION);
-        assert_eq!(state["bins"], BIN_COUNT);
-        assert_eq!(state["channels"], CHANNEL_COUNT);
+        assert_eq!(state["bins"], 64);
+        assert_eq!(state["channels"], 1);
         assert_eq!(state["rate_hz"], TEST_RATE_HZ);
         assert_eq!(state["at_ms"], 0);
 
         let mags = state["magnitudes"].as_array().unwrap();
-        assert_eq!(mags.len(), 2, "stereo magnitudes");
-        let l = mags[0].as_array().unwrap();
-        assert_eq!(l.len(), BIN_COUNT);
-        assert!(l.iter().all(|v| v.as_f64() == Some(0.0)));
+        assert_eq!(mags.len(), 1, "mono seed → one channel");
+        let mono = mags[0].as_array().unwrap();
+        assert_eq!(mono.len(), 64);
+        assert!(mono.iter().all(|v| v.as_f64() == Some(0.0)));
 
-        let peak = state["peak_hold"].as_array().unwrap();
-        assert_eq!(peak.len(), 2);
-        let pl = peak[0].as_array().unwrap();
-        assert_eq!(pl.len(), BIN_COUNT);
-        assert!(pl.iter().all(|v| v.as_f64() == Some(0.0)));
-
-        assert_eq!(state["onsets"]["sub_bass"], false);
-        assert_eq!(state["onsets"]["bass"], false);
-        assert_eq!(state["onsets"]["mid"], false);
-        assert_eq!(state["onsets"]["high"], false);
-
-        let corr = state["correlation"].as_array().unwrap();
-        assert_eq!(corr.len(), BIN_COUNT);
-        assert!(corr.iter().all(|v| v.as_f64() == Some(0.0)));
+        // Correlation empty on mono seed (matches the live-frame
+        // shape on mono demand).
+        assert_eq!(state["correlation"].as_array().unwrap().len(), 0);
     }
 }
