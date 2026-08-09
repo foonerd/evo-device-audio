@@ -52,6 +52,7 @@ use alsa::{Direction, ValueOr};
 use evo_plugin_sdk::contract::SubjectAnnouncer;
 use tokio::sync::{watch, Notify};
 
+use crate::demand::SpectrumDemand;
 use crate::fft::{PerceptualFrame, SpectrumAnalyser, CHANNEL_COUNT, FFT_SIZE};
 use crate::local_role::LocalRole;
 use crate::read_fail_class::{classify_read_failure, ReadFailClass};
@@ -72,6 +73,11 @@ const RECONNECT_MAX_ATTEMPTS: u32 = 12;
 /// Spawn the capture task. Returns the JoinHandle the plugin
 /// awaits in `unload`. The task respects the `shutdown` Notify
 /// and exits cleanly within one read budget when notified.
+// Signature carries five collaborators plus config + latest-frame
+// slot + shutdown notifier. Bundling into a struct would move the
+// plumbing one hop away without changing the number of moving parts
+// the reader has to follow.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     config: PluginConfig,
     latest_frame: Arc<Mutex<Option<PerceptualFrame>>>,
@@ -79,6 +85,7 @@ pub fn spawn(
     shutdown: Arc<Notify>,
     transport_gate: watch::Receiver<TransportGate>,
     local_role: watch::Receiver<LocalRole>,
+    demand: watch::Receiver<SpectrumDemand>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         run_capture_loop(
@@ -88,10 +95,12 @@ pub fn spawn(
             shutdown,
             transport_gate,
             local_role,
+            demand,
         );
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     config: PluginConfig,
     latest_frame: Arc<Mutex<Option<PerceptualFrame>>>,
@@ -99,6 +108,7 @@ fn run_capture_loop(
     shutdown: Arc<Notify>,
     transport_gate: watch::Receiver<TransportGate>,
     local_role: watch::Receiver<LocalRole>,
+    demand: watch::Receiver<SpectrumDemand>,
 ) {
     let mut analyser = SpectrumAnalyser::new(config.sample_rate_hz);
     // Single source of truth for the wire `rate_hz` field. Derived
@@ -119,29 +129,47 @@ fn run_capture_loop(
             return;
         }
 
-        // Transport-state gate at the outer-loop boundary.
-        // When transport_state is NotPlaying, the capture
-        // task holds no ALSA handle — no read, no FFT
-        // compute, no reconnect cycle, no spin against an
-        // idle snd-aloop. The task sleeps on the
-        // watch::Receiver until the gate transitions to
-        // Playing, at which point a fresh PCM is opened
-        // below.
+        // Outer-loop gate. TWO conditions must hold for the
+        // capture task to open PCM + run the FFT loop:
         //
-        // The inner-emit gate (further down in
-        // `run_fft_loop`) remains in place as the second
-        // line of defence: it gates the announcer emit
-        // when role is Receiver-without-source even if
-        // transport is Playing locally. The two gates are
-        // independent and both load-bearing.
-        if !transport_gate.borrow().should_emit() {
+        // 1. TransportGate::should_emit (i.e. Playing) — MPD
+        //    or another source is actively producing audio on
+        //    the loopback tap.
+        // 2. demand.enabled — the operator has enabled the
+        //    visualiser through the settings surface. The
+        //    demand subject is the framework's single
+        //    production-truth field; evo-ui-runtime derives it
+        //    from `ui.visualizer.enabled` on every settings
+        //    patch (F1-A apply bridge).
+        //
+        // When either half closes, the capture task holds no
+        // ALSA handle — no read, no FFT compute, no reconnect
+        // cycle, no spin against an idle snd-aloop. The task
+        // sleeps on both watch::Receivers until whichever half
+        // is closed reopens.
+        //
+        // This is the operator-metric-that-matters — an
+        // `enabled=false` toggle releases PCM identically to
+        // a `NotPlaying` transport transition. Rig-verifiable
+        // via `lsof -p <pid>`: the ALSA capture device
+        // disappears from the FD list.
+        //
+        // The inner-emit gate (in `run_fft_loop`) remains as
+        // the second line of defence for Receiver-role skip.
+        let transport_open = transport_gate.borrow().should_emit();
+        let demand_open = demand.borrow().enabled;
+        if !(transport_open && demand_open) {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
-                "transport not playing; capture task idle until \
-                 next Playing transition"
+                transport_open,
+                demand_open,
+                "capture-gate closed; task idle until either half reopens"
             );
-            if wait_for_gate_or_shutdown(&mut transport_gate.clone(), &shutdown)
-            {
+            if wait_for_capture_gate_or_shutdown(
+                &mut transport_gate.clone(),
+                &mut demand.clone(),
+                &shutdown,
+            ) {
                 return;
             }
             // Gate just opened; reset reconnect backoff so
@@ -194,7 +222,9 @@ fn run_capture_loop(
         // Inner loop: read frames, compute FFT, emit subject.
         // Exits on shutdown OR on a read error severe enough
         // that recover() fails — bubbles back to the outer loop
-        // which retries the open.
+        // which retries the open. Also exits on demand.enabled
+        // → false so the outer loop re-checks the gate + parks
+        // (dropping the PCM handle).
         let exit_inner = run_fft_loop(
             &pcm,
             &mut analyser,
@@ -204,6 +234,7 @@ fn run_capture_loop(
             rate_hz,
             &transport_gate,
             &local_role,
+            &demand,
         );
         match exit_inner {
             InnerExit::Shutdown => return,
@@ -233,6 +264,7 @@ enum InnerExit {
     TransportFailed,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_fft_loop(
     pcm: &PCM,
     analyser: &mut SpectrumAnalyser,
@@ -242,6 +274,7 @@ fn run_fft_loop(
     rate_hz: u32,
     transport_gate: &watch::Receiver<TransportGate>,
     local_role: &watch::Receiver<LocalRole>,
+    demand: &watch::Receiver<SpectrumDemand>,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
     // -> FFT_SIZE * 2 i32s per frame.
@@ -309,6 +342,22 @@ fn run_fft_loop(
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         "transport-state closed mid-capture; releasing PCM \
+                         handle and idling outer loop"
+                    );
+                    return InnerExit::TransportFailed;
+                }
+                // Demand half of the CaptureGate. When the
+                // operator disables the visualiser mid-play,
+                // bail out of the inner loop so the outer loop
+                // re-checks the gate + parks (the PCM drops
+                // when we exit this scope). Same class as the
+                // transport half above — release the ALSA
+                // handle rather than spin an idle read cycle.
+                let demand_open = demand.borrow().enabled;
+                if !demand_open {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "demand.enabled closed mid-capture; releasing PCM \
                          handle and idling outer loop"
                     );
                     return InnerExit::TransportFailed;
@@ -443,20 +492,19 @@ fn shutdown_check(shutdown: &Arc<Notify>) -> bool {
     })
 }
 
-/// Block the blocking-thread capture task until either the
-/// transport_gate transitions to `Playing` or shutdown
-/// fires. Returns `true` on shutdown (caller should exit the
-/// task), `false` on gate-opened (caller proceeds to open
-/// the PCM).
+/// Wait for BOTH the transport gate to open AND the demand
+/// gate to open — whichever transitions first wakes the block.
+/// Returns `true` on shutdown, `false` when both halves are
+/// open (the outer loop should proceed to open PCM).
 ///
-/// The watch::Receiver's `changed()` future drives the wake;
-/// we cancel on the shutdown Notify. The gate may be
-/// `Playing` already on entry (e.g. the caller polled it
-/// just before this call but a state update slipped in); in
-/// that case the function returns immediately without
-/// sleeping.
-fn wait_for_gate_or_shutdown(
-    gate: &mut watch::Receiver<TransportGate>,
+/// Same class as [`wait_for_gate_or_shutdown`] but with two
+/// watch receivers instead of one; kept as a distinct helper
+/// because the tokio::select! shape doesn't compose neatly
+/// into the single-receiver signature without generics that
+/// would obscure the read-and-check on each half.
+fn wait_for_capture_gate_or_shutdown(
+    transport_gate: &mut watch::Receiver<TransportGate>,
+    demand: &mut watch::Receiver<SpectrumDemand>,
     shutdown: &Arc<Notify>,
 ) -> bool {
     let handle = match tokio::runtime::Handle::try_current() {
@@ -465,20 +513,22 @@ fn wait_for_gate_or_shutdown(
     };
     handle.block_on(async {
         loop {
-            if gate.borrow_and_update().should_emit() {
+            let transport_open =
+                transport_gate.borrow_and_update().should_emit();
+            let demand_open = demand.borrow_and_update().enabled;
+            if transport_open && demand_open {
                 return false;
             }
             tokio::select! {
                 _ = shutdown.notified() => return true,
-                changed = gate.changed() => {
-                    match changed {
-                        Ok(()) => continue,
-                        Err(_) => {
-                            // Sender dropped — plugin
-                            // shutting down. Treat as
-                            // shutdown to exit cleanly.
-                            return true;
-                        }
+                changed = transport_gate.changed() => {
+                    if changed.is_err() {
+                        return true;
+                    }
+                }
+                changed = demand.changed() => {
+                    if changed.is_err() {
+                        return true;
                     }
                 }
             }

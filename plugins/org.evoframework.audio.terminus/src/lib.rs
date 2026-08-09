@@ -74,6 +74,7 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::Manifest;
 use serde::Deserialize;
 
+mod demand;
 mod fft;
 mod local_role;
 #[cfg(any(test, feature = "alsa-substrate"))]
@@ -120,7 +121,7 @@ const EMBEDDED_MANIFEST: &str = include_str!("../manifest.toml");
 /// Source-verb request types this plugin honours. Single entry
 /// today; extend as the audio-terminus surface grows
 /// (loudness telemetry read verb, etc.).
-const REQUEST_TYPES: &[&str] = &["get_spectrum_frame"];
+const REQUEST_TYPES: &[&str] = &["get_spectrum_frame", demand::VERB_SET_DEMAND];
 
 /// Operator-tunable plugin config. Loaded from
 /// `/etc/evo/plugins.d/org.evoframework.audio.terminus.toml`
@@ -222,6 +223,11 @@ pub struct AudioTerminusPlugin {
     /// task.
     #[cfg(feature = "alsa-substrate")]
     local_role_subscriber: Option<local_role_subscriber::SubscriberHandle>,
+    /// Spectrum-demand store. Holds the current demand +
+    /// broadcasts changes to the capture loop's outer gate. The
+    /// `audio.spectrum.set_demand` verb writes through it. `Some`
+    /// after a successful load; cleared on unload.
+    demand_store: Option<demand::SpectrumDemandStore>,
 }
 
 impl AudioTerminusPlugin {
@@ -242,6 +248,7 @@ impl AudioTerminusPlugin {
             transport_gate_subscriber: None,
             #[cfg(feature = "alsa-substrate")]
             local_role_subscriber: None,
+            demand_store: None,
         }
     }
 
@@ -337,6 +344,22 @@ impl Plugin for AudioTerminusPlugin {
             )
             .await;
 
+            // Construct + announce the spectrum-demand subject.
+            // The store's initial state is disabled — mirrors the
+            // pre-supersession wire behaviour (no spectrum
+            // activity until the operator opts in through
+            // settings) and gives evo-ui-runtime's apply bridge
+            // a well-defined starting point on any device that
+            // has never had `ui.visualizer.*` touched.
+            let demand_store =
+                demand::SpectrumDemandStore::announce_initial(Arc::clone(
+                    self.subject_announcer
+                        .as_ref()
+                        .expect("subject_announcer set above"),
+                ))
+                .await;
+            self.demand_store = Some(demand_store);
+
             // Spawn the ALSA capture loop when the alsa-substrate
             // feature is on. Without the feature, the plugin
             // admits cleanly and declares its subject + verb, but
@@ -403,6 +426,11 @@ impl Plugin for AudioTerminusPlugin {
                 self.local_role_subscriber = Some(role_subscriber_handle);
 
                 let shutdown = Arc::new(tokio::sync::Notify::new());
+                let demand_rx = self
+                    .demand_store
+                    .as_ref()
+                    .expect("demand_store constructed above")
+                    .watch();
                 let capture_handle = capture::spawn(
                     self.config.clone(),
                     Arc::clone(&self.latest_frame),
@@ -414,6 +442,7 @@ impl Plugin for AudioTerminusPlugin {
                     Arc::clone(&shutdown),
                     gate_rx,
                     role_rx,
+                    demand_rx,
                 );
                 self.capture_shutdown = Some(shutdown);
                 self.capture_task = Some(capture_handle);
@@ -529,6 +558,7 @@ impl Plugin for AudioTerminusPlugin {
             }
 
             self.subject_announcer = None;
+            self.demand_store = None;
             self.loaded = false;
             // Clear the latest frame so a subsequent re-load
             // starts fresh; a stale snapshot would mislead read
@@ -566,6 +596,17 @@ impl Respondent for AudioTerminusPlugin {
             }
             match req.request_type.as_str() {
                 "get_spectrum_frame" => self.handle_get_spectrum_frame(req),
+                verb if verb == demand::VERB_SET_DEMAND => {
+                    let store =
+                        self.demand_store.as_ref().ok_or_else(|| {
+                            PluginError::Permanent(
+                                "demand_store unavailable; plugin not \
+                             fully loaded"
+                                    .to_string(),
+                            )
+                        })?;
+                    store.handle_set_demand(req).await
+                }
                 other => Err(PluginError::Permanent(format!(
                     "unknown request type {other:?}; this plugin honours {:?}",
                     REQUEST_TYPES

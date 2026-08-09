@@ -47,5 +47,6 @@ subscribe_subjects = true
 [capabilities.respondent]
 request_types = [
     "get_spectrum_frame",
+    "audio.spectrum.set_demand",
 ]
 response_budget_ms = 100

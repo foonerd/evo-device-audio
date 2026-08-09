@@ -457,6 +457,28 @@ name = "audio_playback_stream_format"
 [[subjects]]
 name = "audio_playback_spectrum_frame"
 
+# Operator-facing spectrum-demand control-plane subject the
+# audio.terminus plugin announces at load with a disabled-
+# default envelope and updates on every
+# `audio.spectrum.set_demand` verb dispatch. Carries the
+# production-affecting fields the plugin's CaptureGate reads
+# — `enabled` (bool), `bins` (32 / 64 / 128 / 256), `channels`
+# (1 / 2), `rate_hz_target` (typically 30), `updated_at_ms`.
+# Renderer-only fields (`preset`, `palette`, `color_mode`,
+# `sensitivity_db`) MUST NOT appear here; the UI folds
+# `preset=off` into `enabled=false` at the settings layer so
+# `enabled` is the single production-truth field.
+# `enabled=false` parks the terminus producer identically to
+# `TransportGate::NotPlaying` — ALSA PCM handle released, no
+# FFT compute, no emit. Rig-verifiable via `lsof -p <pid>`.
+# Canonical addressing: `evo.audio.playback:spectrum_demand`.
+# Schema reference:
+# `schemas/org.evoframework/audio/terminus.v1.toml`
+# acceptance criterion
+# `spectrum-demand-drives-producer-park-and-shape`.
+[[subjects]]
+name = "audio_playback_spectrum_demand"
+
 # Subject type the playback warden announces at load and
 # updates on every playback state transition (play, pause,
 # stop, track change, seek, set_volume, set_mute, set_repeat,
