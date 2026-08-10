@@ -123,7 +123,15 @@ pub async fn emit_frame(
         SPECTRUM_SUBJECT_ADDRESSING_VALUE,
     );
     let state = render_spectrum_frame(frame, rate_hz);
-    if let Err(e) = announcer.update_state(addressing, state).await {
+    // Volatile emission — the spectrum subject is high-rate
+    // telemetry (30 Hz sustained during playback); mirroring
+    // every emit into the framework's durable `subject_states`
+    // table would issue ~108k sqlite writes per hour of playback
+    // for zero operator-visible payoff. The volatile path skips
+    // the durable persist entirely while preserving the
+    // in-memory update + `SubjectStateChanged` happening
+    // emission that wire subscribers observe.
+    if let Err(e) = announcer.update_state_volatile(addressing, state).await {
         tracing::debug!(
             plugin = PLUGIN_NAME,
             error = %e,

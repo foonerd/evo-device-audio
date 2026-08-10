@@ -308,7 +308,7 @@ fn run_capture_loop(
                 Ok(h) => {
                     h.spawn(async move {
                         let _ = announcer_clone
-                            .update_state(addressing, seed_addr)
+                            .update_state_volatile(addressing, seed_addr)
                             .await;
                     });
                 }
@@ -766,7 +766,10 @@ fn emit_parked_envelope(
     // by the framework's WS-out queue and is bounded well below
     // any user-perceptible window.
     handle.block_on(async move {
-        if let Err(e) = announcer_clone.update_state(addressing, parked).await {
+        if let Err(e) = announcer_clone
+            .update_state_volatile(addressing, parked)
+            .await
+        {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
                 error = %e,
