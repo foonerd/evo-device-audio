@@ -306,6 +306,7 @@ debian_package_for_binary() {
         testparm|smbpasswd)  echo "samba-common-bin" ;;
         sudo)                echo "sudo" ;;
         tee|cat)             echo "coreutils" ;;
+        evo-*)               echo "PLUGIN_PROVIDED" ;;
         *)                   echo "" ;;
     esac
 }
@@ -419,6 +420,16 @@ ensure_system_packages() {
                 if [[ -z "${pkg_name}" ]]; then
                     echo "FAIL: plugin ${plugin_id} declares required_binary '${binary}' with no debian package mapping in evo-install.sh — extend debian_package_for_binary() before shipping" >&2
                     exit 5
+                fi
+                # PLUGIN_PROVIDED is the sentinel for binaries the
+                # plugin's own dist tree installs (typically at
+                # /usr/local/bin/), not from an external apt
+                # package. Bootstrap places them during Step 3
+                # apply; admission-time PPAG re-verifies. Skip the
+                # apt-install accumulator so we don't try to fetch
+                # a package that does not exist upstream.
+                if [[ "${pkg_name}" == "PLUGIN_PROVIDED" ]]; then
+                    continue
                 fi
                 if ! dpkg -s "${pkg_name}" >/dev/null 2>&1; then
                     if ! printf '%s\n' "${pkgs_needed[@]}" | grep -qxF "${pkg_name}"; then
