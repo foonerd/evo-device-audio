@@ -48,7 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use evo_plugin_sdk::contract::{
     ExternalAddressing, PluginError, Request, Response, SubjectAnnouncement,
-    SubjectAnnouncer,
+    SubjectAnnouncer, SubjectQuerier, SubjectStateSubscriber,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -146,11 +146,28 @@ pub struct SpectrumDemandStore {
 }
 
 impl SpectrumDemandStore {
-    /// Construct with the default disabled state. Announces the
-    /// subject inline so consumers connecting during plugin load
-    /// see the seeded envelope before the first apply.
-    pub async fn announce_initial(subjects: Arc<dyn SubjectAnnouncer>) -> Self {
-        let (tx, _rx) = watch::channel(SpectrumDemand::disabled_default());
+    /// Construct on plugin load. Reads the last-persisted demand
+    /// from the framework's durable subject-state mirror first;
+    /// only falls back to `disabled_default` when no prior state
+    /// exists (first-ever boot on this device, or the state row
+    /// was cleared). Then announces the subject with whatever
+    /// value we ended up seeded to — an idempotent overwrite when
+    /// rehydrated (same value already in the registry), a first-
+    /// write when we defaulted.
+    ///
+    /// Operator intent (the `enabled` flag) survives reboot +
+    /// terminus reload without the UI having to re-push. UI
+    /// reassert stays valuable as drift-detection against a
+    /// concurrent operator override or a manual demand reset,
+    /// but it is no longer the sole memory of what the operator
+    /// asked for.
+    pub async fn announce_initial(
+        subjects: Arc<dyn SubjectAnnouncer>,
+        subscriber: Arc<dyn SubjectStateSubscriber>,
+        querier: Arc<dyn SubjectQuerier>,
+    ) -> Self {
+        let seed = rehydrate_or_default(&*subscriber, &*querier).await;
+        let (tx, _rx) = watch::channel(seed);
         let store = Self { tx, subjects };
         store.announce_initial_state().await;
         store
@@ -298,6 +315,126 @@ fn render_envelope(d: &SpectrumDemand) -> serde_json::Value {
     })
 }
 
+/// Reverse of [`render_envelope`] — read a `SpectrumDemand` out of
+/// a wire envelope. Returns `None` when the envelope is malformed,
+/// carries an unsupported version, or fails the same enum
+/// validators the set_demand verb enforces (bins ∈ {32, 64, 128,
+/// 256}, channels ∈ {1, 2}). Defensive: a rehydrated envelope
+/// from an older or forward build with an out-of-range field
+/// should NOT resurrect an invalid demand — fall through to
+/// `disabled_default` instead.
+fn parse_envelope(v: &serde_json::Value) -> Option<SpectrumDemand> {
+    let version = v.get("v")?.as_u64()? as u32;
+    if version != DEMAND_PAYLOAD_VERSION {
+        return None;
+    }
+    let enabled = v.get("enabled")?.as_bool()?;
+    let bins = v.get("bins")?.as_u64()? as u32;
+    if validate_bins(bins).is_err() {
+        return None;
+    }
+    let channels = v.get("channels")?.as_u64()? as u32;
+    if validate_channels(channels).is_err() {
+        return None;
+    }
+    let rate_hz_target = v.get("rate_hz_target")?.as_u64()? as u32;
+    let rate_hz_target = rate_hz_target.clamp(1, 60);
+    let updated_at_ms = v.get("updated_at_ms")?.as_u64()?;
+    Some(SpectrumDemand {
+        enabled,
+        bins,
+        channels,
+        rate_hz_target,
+        updated_at_ms,
+    })
+}
+
+/// Rehydrate the demand from the framework's durable subject-
+/// state mirror. Returns `disabled_default` when there is no
+/// prior state (never-applied) or when the read errors — the
+/// conservative choice: silence beats a stale-envelope-driven
+/// FFT run.
+///
+/// The framework's boot path runs `rehydrate_states_from` before
+/// plugin admission opens, so by the time this function is
+/// called the durable state is already in the registry and
+/// `current_state` returns whatever the last `apply` persisted.
+async fn rehydrate_or_default(
+    subscriber: &dyn SubjectStateSubscriber,
+    querier: &dyn SubjectQuerier,
+) -> SpectrumDemand {
+    let addressing =
+        ExternalAddressing::new(ADDRESSING_SCHEME, ADDRESSING_VALUE);
+    let canonical_id = match querier.resolve_addressing(addressing).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                source = "no-prior-state-use-default",
+                "spectrum-demand initial state: no prior addressing \
+                 in registry (first-ever boot on this device)"
+            );
+            return SpectrumDemand::disabled_default();
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                source = "no-prior-state-use-default",
+                "spectrum-demand initial state: resolve_addressing errored"
+            );
+            return SpectrumDemand::disabled_default();
+        }
+    };
+    match subscriber.current_state(canonical_id.clone()).await {
+        Ok(Some(state)) => match parse_envelope(&state) {
+            Some(d) => {
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    source = "rehydrate-from-mirror",
+                    enabled = d.enabled,
+                    bins = d.bins,
+                    channels = d.channels,
+                    rate_hz_target = d.rate_hz_target,
+                    updated_at_ms = d.updated_at_ms,
+                    "spectrum-demand initial state: rehydrated from durable mirror"
+                );
+                d
+            }
+            None => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source = "no-prior-state-use-default",
+                    canonical_id = %canonical_id,
+                    "spectrum-demand initial state: persisted envelope \
+                     did not parse; falling back to disabled default"
+                );
+                SpectrumDemand::disabled_default()
+            }
+        },
+        Ok(None) => {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                source = "no-prior-state-use-default",
+                canonical_id = %canonical_id,
+                "spectrum-demand initial state: subject known but no \
+                 prior state (never applied on this device)"
+            );
+            SpectrumDemand::disabled_default()
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                source = "no-prior-state-use-default",
+                canonical_id = %canonical_id,
+                "spectrum-demand initial state: current_state read errored"
+            );
+            SpectrumDemand::disabled_default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +512,127 @@ mod tests {
             msg.contains("preset") || msg.contains("unknown"),
             "refusal must name the unknown field, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_envelope_roundtrips_a_rendered_envelope() {
+        // Every apply persists via render_envelope; every load
+        // rehydrates via parse_envelope. The invariant that must
+        // hold: parse(render(d)) == d for every legal d.
+        for d in [
+            SpectrumDemand::disabled_default(),
+            SpectrumDemand {
+                enabled: true,
+                bins: 128,
+                channels: 2,
+                rate_hz_target: 45,
+                updated_at_ms: 1_720_000_000_000,
+            },
+            SpectrumDemand {
+                enabled: false,
+                bins: 256,
+                channels: 1,
+                rate_hz_target: 1,
+                updated_at_ms: u64::MAX,
+            },
+        ] {
+            let env = render_envelope(&d);
+            let parsed =
+                parse_envelope(&env).expect("rendered envelope must parse");
+            assert_eq!(parsed, d, "roundtrip must preserve every field");
+        }
+    }
+
+    #[test]
+    fn parse_envelope_refuses_unsupported_version() {
+        // A forward-build envelope with v=2 must NOT resurrect
+        // itself on a v=1 build; fall through to disabled_default
+        // so the operator does not see a state the current build
+        // cannot honour.
+        let env = json!({
+            "v": 2,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30,
+            "updated_at_ms": 1_000,
+        });
+        assert!(parse_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn parse_envelope_refuses_out_of_range_bins() {
+        // A corrupted persisted row with bins=100 must NOT
+        // resurrect an invalid demand — the set_demand verb
+        // would refuse this shape, and rehydrate must not
+        // sneak it in by the back door.
+        let env = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 100,
+            "channels": 1,
+            "rate_hz_target": 30,
+            "updated_at_ms": 1_000,
+        });
+        assert!(parse_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn parse_envelope_refuses_out_of_range_channels() {
+        let env = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 5,
+            "rate_hz_target": 30,
+            "updated_at_ms": 1_000,
+        });
+        assert!(parse_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn parse_envelope_clamps_rate_hz_target() {
+        // Same [1, 60] clamp the set_demand verb applies. A
+        // persisted 0 or 500 rate must not resurrect verbatim.
+        let low = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 0,
+            "updated_at_ms": 1_000,
+        });
+        assert_eq!(parse_envelope(&low).unwrap().rate_hz_target, 1);
+        let high = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 500,
+            "updated_at_ms": 1_000,
+        });
+        assert_eq!(parse_envelope(&high).unwrap().rate_hz_target, 60);
+    }
+
+    #[test]
+    fn parse_envelope_refuses_missing_fields() {
+        // Every field is required for a rehydrate. Missing any
+        // one → None → fall through to disabled_default.
+        let missing_enabled = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30,
+            "updated_at_ms": 1_000,
+        });
+        assert!(parse_envelope(&missing_enabled).is_none());
+        let missing_updated = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30,
+        });
+        assert!(parse_envelope(&missing_updated).is_none());
     }
 }

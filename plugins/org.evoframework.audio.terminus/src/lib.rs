@@ -358,20 +358,53 @@ impl Plugin for AudioTerminusPlugin {
             )
             .await;
 
+            // Acquire the subscribe + query handles once. Both
+            // the demand store's rehydrate-on-load and the ALSA
+            // capture path's subscribers read through them, so
+            // they are hoisted here rather than duplicated inside
+            // the alsa-substrate feature gate below. Manifest
+            // declares `capabilities.subscribe_subjects = true`;
+            // admission populates both handles.
+            let subject_state_subscriber = Arc::clone(
+                ctx.subject_state_subscriber.as_ref().ok_or_else(|| {
+                    PluginError::Permanent(
+                        "LoadContext.subject_state_subscriber is None; \
+                         manifest must declare \
+                         capabilities.subscribe_subjects = true"
+                            .to_string(),
+                    )
+                })?,
+            );
+            let subject_querier =
+                Arc::clone(ctx.subject_querier.as_ref().ok_or_else(|| {
+                    PluginError::Permanent(
+                        "LoadContext.subject_querier is None; \
+                         manifest must declare \
+                         capabilities.subscribe_subjects = true"
+                            .to_string(),
+                    )
+                })?);
+
             // Construct + announce the spectrum-demand subject.
-            // The store's initial state is disabled — mirrors the
-            // pre-supersession wire behaviour (no spectrum
-            // activity until the operator opts in through
-            // settings) and gives evo-ui-runtime's apply bridge
-            // a well-defined starting point on any device that
-            // has never had `ui.visualizer.*` touched.
-            let demand_store =
-                demand::SpectrumDemandStore::announce_initial(Arc::clone(
+            // The store rehydrates its initial state from the
+            // framework's durable subject-state mirror; if this
+            // device has a prior applied demand it is restored
+            // (operator intent survives reboot + terminus reload
+            // without a UI re-push). If not, `disabled_default`
+            // — mirrors the pre-supersession wire behaviour and
+            // gives evo-ui-runtime's apply bridge a well-defined
+            // starting point on any device that has never had
+            // `ui.visualizer.*` touched.
+            let demand_store = demand::SpectrumDemandStore::announce_initial(
+                Arc::clone(
                     self.subject_announcer
                         .as_ref()
                         .expect("subject_announcer set above"),
-                ))
-                .await;
+                ),
+                Arc::clone(&subject_state_subscriber),
+                Arc::clone(&subject_querier),
+            )
+            .await;
             self.demand_store = Some(demand_store);
 
             // Spawn the ALSA capture loop when the alsa-substrate
@@ -392,33 +425,14 @@ impl Plugin for AudioTerminusPlugin {
                 let (gate_tx, gate_rx) =
                     tokio::sync::watch::channel(TransportGate::NotPlaying);
 
-                // Spawn the now-playing subscriber. Owns the
-                // SDK's SubjectStateSubscriber + SubjectQuerier
-                // handles + the watch::Sender; pushes gate
-                // updates the capture loop reads via the cloned
-                // Receiver. Requires
-                // `capabilities.subscribe_subjects = true` in the
-                // manifest; admission populates both handles.
-                let subscriber = Arc::clone(
-                    ctx.subject_state_subscriber.as_ref().ok_or_else(|| {
-                        PluginError::Permanent(
-                            "LoadContext.subject_state_subscriber is None; \
-                                 manifest must declare \
-                                 capabilities.subscribe_subjects = true"
-                                .to_string(),
-                        )
-                    })?,
-                );
-                let querier = Arc::clone(
-                    ctx.subject_querier.as_ref().ok_or_else(|| {
-                        PluginError::Permanent(
-                            "LoadContext.subject_querier is None; \
-                             manifest must declare \
-                             capabilities.subscribe_subjects = true"
-                                .to_string(),
-                        )
-                    })?,
-                );
+                // Spawn the now-playing subscriber. Owns clones
+                // of the SDK's SubjectStateSubscriber +
+                // SubjectQuerier handles (acquired above for the
+                // demand-store rehydrate; shared here) plus the
+                // watch::Sender; pushes gate updates the capture
+                // loop reads via the cloned Receiver.
+                let subscriber = Arc::clone(&subject_state_subscriber);
+                let querier = Arc::clone(&subject_querier);
                 let subscriber_handle = now_playing_subscriber::spawn(
                     Arc::clone(&subscriber),
                     Arc::clone(&querier),
