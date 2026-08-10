@@ -38,13 +38,24 @@ use tokio::task::JoinHandle;
 
 const PLUGIN_NAME: &str = "org.evoframework.audio.terminus";
 
-/// Framework-owned subject addressing.
+/// Framework-owned subject addressing — per-subject-type.
+/// The framework announces one subject per observed
+/// subject_type at addressing
+/// `evo.system:subscription_interest.<subject_type>`; each
+/// subject's state carries `{ subject_type, count, at_ms }`
+/// for that type only. Per-type isolation eliminates the
+/// last-write-wins race a single-subject shape would have.
 const INTEREST_SCHEME: &str = "evo.system";
-const INTEREST_VALUE: &str = "subscription_interest";
 
-/// Subject-type this subscriber cares about. Filter every
-/// state update against this literal; ignore other types.
+/// Subject-type this subscriber cares about.
 const OBSERVED_SUBJECT_TYPE: &str = "audio_playback_spectrum_frame";
+
+/// Addressing value for this subject_type's interest subject —
+/// framework's `publish_interest_state` uses the same
+/// `subscription_interest.<subject_type>` template.
+fn interest_addressing_value() -> String {
+    format!("subscription_interest.{OBSERVED_SUBJECT_TYPE}")
+}
 
 /// Backoff for the canonical-id resolve retry loop.
 const RESOLVE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -78,7 +89,8 @@ async fn run(
     interest_tx: watch::Sender<u32>,
     shutdown: Arc<Notify>,
 ) {
-    let addressing = ExternalAddressing::new(INTEREST_SCHEME, INTEREST_VALUE);
+    let interest_value = interest_addressing_value();
+    let addressing = ExternalAddressing::new(INTEREST_SCHEME, &interest_value);
 
     // 1. Resolve canonical id with bounded backoff. Framework
     //    announces this subject at boot, before any plugin is
@@ -172,6 +184,20 @@ async fn run(
     }
 
     // 4. Stream loop.
+    //
+    // Resync discipline on transient errors:
+    //   - Lagged: broadcast dropped one or more updates; the
+    //     framework's counter is authoritative. Read the
+    //     current state from the querier and reseed the gate
+    //     from that so a missed decrement doesn't strand the
+    //     capture path in the wrong state (stuck ON after a
+    //     dropped `count → 0`, stuck OFF after a dropped
+    //     `count → 1`).
+    //   - Closed: broadcast channel dropped (steward restart).
+    //     Rebuild the subscription against the fresh registry
+    //     and reseed from current state before returning to
+    //     the loop; a plain exit would strand the gate at its
+    //     last observed value forever.
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
@@ -196,20 +222,104 @@ async fn run(
                         tracing::warn!(
                             plugin = PLUGIN_NAME,
                             dropped,
-                            "interest subscriber: stream lagged; count may \
-                             be momentarily stale until next transition"
+                            "interest subscriber: stream lagged; resyncing \
+                             count from current_state to avoid stranding \
+                             the gate at a stale value"
                         );
+                        resync_from_current_state(
+                            &subscriber,
+                            &canonical_id,
+                            &interest_tx,
+                        )
+                        .await;
                     }
                     Err(SubjectStateStreamError::Closed) => {
                         tracing::warn!(
                             plugin = PLUGIN_NAME,
-                            "interest subscriber: stream closed; task \
-                             exiting — gate stays at last value"
+                            "interest subscriber: stream closed; \
+                             re-subscribing + resyncing count"
                         );
-                        return;
+                        // Re-subscribe. If the re-subscribe
+                        // fails, back off then retry — the
+                        // steward may be mid-restart.
+                        loop {
+                            tokio::select! {
+                                _ = shutdown.notified() => return,
+                                res = subscriber
+                                    .subscribe_subject(canonical_id.clone()) => {
+                                    match res {
+                                        Ok(s) => {
+                                            stream = s;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                plugin = PLUGIN_NAME,
+                                                error = %e,
+                                                "interest subscriber: \
+                                                 re-subscribe failed; \
+                                                 retrying"
+                                            );
+                                            tokio::time::sleep(
+                                                RESOLVE_RETRY_INTERVAL,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        resync_from_current_state(
+                            &subscriber,
+                            &canonical_id,
+                            &interest_tx,
+                        )
+                        .await;
                     }
                 }
             }
+        }
+    }
+}
+
+/// Read the authoritative current count from the framework's
+/// registry (via the querier's current_state read on the
+/// per-type interest subject) and push it to the gate. Used
+/// on Lagged / Closed transitions to prevent the gate from
+/// stranding at a stale value.
+async fn resync_from_current_state(
+    subscriber: &Arc<dyn SubjectStateSubscriber>,
+    canonical_id: &str,
+    interest_tx: &watch::Sender<u32>,
+) {
+    match subscriber.current_state(canonical_id.to_string()).await {
+        Ok(Some(state)) => {
+            if let Some(count) = parse_count_for(&state, OBSERVED_SUBJECT_TYPE)
+            {
+                send_count(interest_tx, count);
+                tracing::info!(
+                    plugin = PLUGIN_NAME,
+                    resynced = count,
+                    "interest subscriber: gate resynced from current_state"
+                );
+            }
+        }
+        Ok(None) => {
+            // No state on the subject yet means no transitions
+            // have fired — count is authoritatively 0.
+            send_count(interest_tx, 0);
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "interest subscriber: current_state absent; gate resynced to 0"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "interest subscriber: resync current_state read failed; \
+                 gate stays at last observed value"
+            );
         }
     }
 }

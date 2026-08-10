@@ -136,7 +136,11 @@ When the gate reopens, the outer loop opens a fresh PCM and re-enters the FFT lo
 
 Setting-based demand alone MUST NOT start capture. A device with the visualiser permitted but no subscriber stays parked. This is the produce-iff-consumed invariant — the run-signal is the presence of a consumer, not the operator's persistent permission.
 
-The interest count comes from the framework-owned `system_subscription_interest` subject (addressing `evo.system:subscription_interest`). The steward tracks the WS subscriber count per subject_type and publishes state updates `{ subject_type, count, at_ms }` on every transition. Terminus subscribes via the standard `SubjectStateSubscriber` primitive and filters for its own subject_type.
+The interest count comes from a per-subject-type framework-owned subject. For a producer subject_type X, the framework announces a subject at addressing `evo.system:subscription_interest.X` on the first observed interest transition for X, and publishes state `{ subject_type, count, at_ms }` on it for every subsequent transition. Per-type isolation — one subject per subject_type, one state stream per subject — eliminates the last-write-wins race a single-subject shape would have when multiple types transition concurrently. Terminus subscribes to `evo.system:subscription_interest.audio_playback_spectrum_frame` via the standard `SubjectStateSubscriber` primitive.
+
+The framework's counter is fed from every subscription surface: WSS `subscribe_happenings` (per subject_type in the filter's allow-list), WSS `subscribe_subject` (canonical_id → subject_type lookup), Unix `subscribe_happenings`, Unix `subscribe_subject`. All four increment on subscribe, decrement on stream drop; multi-consumer devices see the sum.
+
+Terminus resyncs the gate from the authoritative current_state on `SubjectStateStreamError::Lagged` and `::Closed` — a missed transition on the broadcast doesn't strand the gate at a stale value.
 
 **Rig acceptance (F2A + F3 combined):**
 
