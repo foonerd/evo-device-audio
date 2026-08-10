@@ -1074,6 +1074,77 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 2.7b: systemd-timesyncd — clock-trust substrate baseline
+# ----------------------------------------------------------
+# The framework's trust substrate (ledger, peer-trust chain,
+# appointments, warden custody, audit ledger) is time-sensitive:
+# a silent 11-second wall-clock skew on a device carrying any of
+# these primitives is a correctness risk, not just an ops issue.
+# The framework's `describe_capabilities.clock_trust` field
+# reports the current kernel sync state to operators; that
+# signal is only as useful as the underlying daemon being up.
+#
+# Default behaviour: ensure systemd-timesyncd is enabled + active,
+# then confirm the target ends the bootstrap with a synchronised
+# system clock. If a vendor distribution ships chrony/ntpd
+# instead, set EVO_SKIP_TIMESYNC=1 and manage the timesync unit
+# separately.
+#
+# Not fatal on failure: a target legitimately offline during
+# bootstrap (installer-first, network-later flow) will fail the
+# sync check; the daemon is still enabled + started so the sync
+# happens as soon as the network appears.
+if [[ "${EVO_SKIP_TIMESYNC:-0}" != "1" ]]; then
+    if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
+        | grep -q '^systemd-timesyncd\.service'; then
+        # Enable + start the daemon if not already.
+        if ! "$SYSTEMCTL_BIN" is-enabled --quiet \
+            systemd-timesyncd.service 2>/dev/null; then
+            "$SYSTEMCTL_BIN" enable systemd-timesyncd.service \
+                >/dev/null 2>&1 || true
+            echo "[bootstrap] enabled systemd-timesyncd.service"
+        fi
+        if ! "$SYSTEMCTL_BIN" is-active --quiet \
+            systemd-timesyncd.service 2>/dev/null; then
+            "$SYSTEMCTL_BIN" start systemd-timesyncd.service \
+                >/dev/null 2>&1 || true
+            echo "[bootstrap] started systemd-timesyncd.service"
+        fi
+
+        # Wait up to 10 s for the first sync — operator-visible
+        # confirmation that the clock-trust substrate has a
+        # living heartbeat before evo's admission gate rides
+        # onto the state.
+        deadline=$(( $(date +%s) + 10 ))
+        synced="no"
+        while [[ $(date +%s) -lt $deadline ]]; do
+            if timedatectl status 2>/dev/null \
+                | grep -q "System clock synchronized: yes"; then
+                synced="yes"
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$synced" == "yes" ]]; then
+            echo "[bootstrap] system clock synchronized (systemd-timesyncd)"
+        else
+            echo "[bootstrap] WARN: systemd-timesyncd active but system \
+clock not synchronized within 10 s — check network reachability to NTP \
+peers (\`timedatectl show-timesync\`). Daemon is enabled + started so \
+sync will complete when the network path opens."
+        fi
+    else
+        echo "[bootstrap] systemd-timesyncd.service not present — \
+distribution uses a different timesync stack; skipping. Ensure the \
+target's active timesync daemon is enabled + started; the framework's \
+clock_trust surface will report untrusted until then."
+    fi
+else
+    echo "[bootstrap] EVO_SKIP_TIMESYNC=1 — systemd-timesyncd management \
+skipped (vendor distribution owns timesync)"
+fi
+
+# ----------------------------------------------------------
 # Step 2.8: /etc/evo/trust.d/ — distribution-tier plugin trust
 # ----------------------------------------------------------
 # Out-of-process plugins are admitted from
