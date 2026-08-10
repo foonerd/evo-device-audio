@@ -92,6 +92,7 @@ pub fn spawn(
     transport_gate: watch::Receiver<TransportGate>,
     local_role: watch::Receiver<LocalRole>,
     demand: watch::Receiver<SpectrumDemand>,
+    interest: watch::Receiver<u32>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         run_capture_loop(
@@ -102,6 +103,7 @@ pub fn spawn(
             transport_gate,
             local_role,
             demand,
+            interest,
         );
     })
 }
@@ -115,6 +117,7 @@ fn run_capture_loop(
     transport_gate: watch::Receiver<TransportGate>,
     local_role: watch::Receiver<LocalRole>,
     demand: watch::Receiver<SpectrumDemand>,
+    interest: watch::Receiver<u32>,
 ) {
     // Analyser is (re)built lazily on entry to the inner FFT
     // loop from the demand's current bins/channels. A demand
@@ -193,12 +196,15 @@ fn run_capture_loop(
         let transport_open = transport_gate.borrow().should_emit();
         let demand_open = demand.borrow().enabled;
         let role_open = local_role.borrow().should_emit();
-        if !(transport_open && demand_open && role_open) {
+        let interest_open = *interest.borrow() > 0;
+        if !(transport_open && demand_open && role_open && interest_open) {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 transport_open,
                 demand_open,
                 role_open,
+                interest_open,
+                interest_count = *interest.borrow(),
                 was_running,
                 "capture-gate closed; task idle until all halves reopen"
             );
@@ -210,6 +216,7 @@ fn run_capture_loop(
                 &mut transport_gate.clone(),
                 &mut demand.clone(),
                 &mut local_role.clone(),
+                &mut interest.clone(),
                 &shutdown,
             ) {
                 return;
@@ -337,6 +344,7 @@ fn run_capture_loop(
             &transport_gate,
             &local_role,
             &demand,
+            &interest,
         );
         match exit_inner {
             InnerExit::Shutdown => return,
@@ -392,6 +400,7 @@ fn run_fft_loop(
     transport_gate: &watch::Receiver<TransportGate>,
     local_role: &watch::Receiver<LocalRole>,
     demand: &watch::Receiver<SpectrumDemand>,
+    interest: &watch::Receiver<u32>,
 ) -> InnerExit {
     // S32_LE interleaved stereo: FFT_SIZE samples per channel
     // -> FFT_SIZE * INPUT_CHANNELS i32s per frame.
@@ -528,6 +537,21 @@ fn run_fft_loop(
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         "local role closed mid-capture (became Receiver); \
+                         releasing PCM handle and idling outer loop"
+                    );
+                    return InnerExit::TransportFailed;
+                }
+                // Interest half of the CaptureGate. When the
+                // subscriber count for the spectrum subject
+                // reaches zero (last WS consumer disconnected,
+                // kiosk killed, etc.), bail out so the outer
+                // loop emits the parked envelope + releases
+                // the PCM handle. Produce-iff-consumed
+                // substrate: no consumer means no compute.
+                if *interest.borrow() == 0 {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "subscription interest reached zero mid-capture; \
                          releasing PCM handle and idling outer loop"
                     );
                     return InnerExit::TransportFailed;
@@ -683,6 +707,7 @@ fn wait_for_capture_gate_or_shutdown(
     transport_gate: &mut watch::Receiver<TransportGate>,
     demand: &mut watch::Receiver<SpectrumDemand>,
     local_role: &mut watch::Receiver<LocalRole>,
+    interest: &mut watch::Receiver<u32>,
     shutdown: &Arc<Notify>,
 ) -> bool {
     let handle = match tokio::runtime::Handle::try_current() {
@@ -695,7 +720,8 @@ fn wait_for_capture_gate_or_shutdown(
                 transport_gate.borrow_and_update().should_emit();
             let demand_open = demand.borrow_and_update().enabled;
             let role_open = local_role.borrow_and_update().should_emit();
-            if transport_open && demand_open && role_open {
+            let interest_open = *interest.borrow_and_update() > 0;
+            if transport_open && demand_open && role_open && interest_open {
                 return false;
             }
             tokio::select! {
@@ -711,6 +737,11 @@ fn wait_for_capture_gate_or_shutdown(
                     }
                 }
                 changed = local_role.changed() => {
+                    if changed.is_err() {
+                        return true;
+                    }
+                }
+                changed = interest.changed() => {
                     if changed.is_err() {
                         return true;
                     }

@@ -95,6 +95,8 @@ pub use transport_gate::TransportGate;
 #[cfg(feature = "alsa-substrate")]
 mod capture;
 #[cfg(feature = "alsa-substrate")]
+mod interest_subscriber;
+#[cfg(feature = "alsa-substrate")]
 mod local_role_subscriber;
 #[cfg(feature = "alsa-substrate")]
 mod now_playing_subscriber;
@@ -216,6 +218,8 @@ pub struct AudioTerminusPlugin {
     /// task.
     #[cfg(feature = "alsa-substrate")]
     transport_gate_subscriber: Option<now_playing_subscriber::SubscriberHandle>,
+    #[cfg(feature = "alsa-substrate")]
+    interest_subscriber: Option<interest_subscriber::SubscriberHandle>,
     /// Local-role subscriber handle. Watches the singleton
     /// `audio_multiroom_local_role` subject and pushes
     /// `LocalRole` updates the capture loop reads alongside the
@@ -247,6 +251,8 @@ impl AudioTerminusPlugin {
             capture_task: None,
             #[cfg(feature = "alsa-substrate")]
             transport_gate_subscriber: None,
+            #[cfg(feature = "alsa-substrate")]
+            interest_subscriber: None,
             #[cfg(feature = "alsa-substrate")]
             local_role_subscriber: None,
             demand_store: None,
@@ -429,9 +435,26 @@ impl Plugin for AudioTerminusPlugin {
                 // closes this half of the combined gate.
                 let (role_tx, role_rx) =
                     tokio::sync::watch::channel(LocalRole::Auto);
-                let role_subscriber_handle =
-                    local_role_subscriber::spawn(subscriber, querier, role_tx);
+                let role_subscriber_handle = local_role_subscriber::spawn(
+                    Arc::clone(&subscriber),
+                    Arc::clone(&querier),
+                    role_tx,
+                );
                 self.local_role_subscriber = Some(role_subscriber_handle);
+
+                // Subscription-interest gate channel. Initial
+                // value 0 — the produce-iff-consumed default is
+                // to STAY parked until at least one subscriber
+                // is observed on the framework's projection-ws
+                // surface for `audio_playback_spectrum_frame`.
+                let (interest_tx, interest_rx) =
+                    tokio::sync::watch::channel(0u32);
+                let interest_subscriber_handle = interest_subscriber::spawn(
+                    subscriber,
+                    querier,
+                    interest_tx,
+                );
+                self.interest_subscriber = Some(interest_subscriber_handle);
 
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let demand_rx = self
@@ -451,6 +474,7 @@ impl Plugin for AudioTerminusPlugin {
                     gate_rx,
                     role_rx,
                     demand_rx,
+                    interest_rx,
                 );
                 self.capture_shutdown = Some(shutdown);
                 self.capture_task = Some(capture_handle);
@@ -545,6 +569,20 @@ impl Plugin for AudioTerminusPlugin {
                             plugin = PLUGIN_NAME,
                             join_budget_ms = JOIN_BUDGET.as_millis() as u64,
                             task = "transport_gate_subscriber",
+                            "subscriber join budget elapsed; abandoning"
+                        );
+                    }
+                }
+                if let Some(sub) = self.interest_subscriber.take() {
+                    sub.shutdown.notify_waiters();
+                    if tokio::time::timeout(JOIN_BUDGET, sub.task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            join_budget_ms = JOIN_BUDGET.as_millis() as u64,
+                            task = "interest_subscriber",
                             "subscriber join budget elapsed; abandoning"
                         );
                     }
