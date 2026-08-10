@@ -109,43 +109,50 @@ The operator changes `ui.visualizer.{enabled, bin_count, channel_mode}` through 
 
 ---
 
-## 4. Producer gate (F2A — landed this cycle)
+## 4. Producer gate
 
 The terminus plugin's `CaptureGate` opens when ALL of the following are true:
 
 1. `TransportGate::should_emit()` — the current transport state is `Playing` (from the `audio_playback_now_playing` subject subscription).
 2. `demand.enabled == true` — the operator has enabled the visualiser via settings (mirrored through the runtime bridge into the demand subject).
 3. `LocalRole::should_emit()` — the local device is `Source` or `Auto` (not `Receiver` — followers of an active multi-room group do not emit a parallel spectrum subject).
-4. (F3 follow-up) `interest > 0` — at least one subscription permits `audio_playback_spectrum_frame`. Optional secondary gate; NOT required by F2A; the hard park on `enabled=false` MUST NOT depend on interest accounting.
+4. (F3) `interest > 0` — at least one subscription on the framework's projection-ws layer permits `audio_playback_spectrum_frame`. Secondary gate; the hard park on `enabled=false` MUST NOT depend on interest accounting.
 
-When the gate closes for ANY reason (transport off, operator disable, role becomes Receiver, or future interest=0), the capture task:
+When the gate closes for ANY reason (transport off, operator disable, role becomes Receiver, interest → 0), the capture task:
 
+- **Emits one final `audio_playback_spectrum_frame` envelope** at the current demand's `bins`/`channels` shape with `at_ms = 0` (the "parked" sentinel — matches the empty-envelope semantics used for a fresh-connect on a quiet transport). Subscribers observing the stream see this arrive and know the silence that follows is deliberate production-side quiet, not a transient drop.
 - Exits its inner FFT loop.
 - Drops the ALSA PCM handle (verifiable rig-side via `lsof -p <pid>` — the loopback capture device disappears from the FD list).
-- Sleeps on the transport + demand watch channels (whichever transitions first wakes the outer loop).
+- Sleeps on the transport + demand + interest watch channels (whichever transitions first wakes the outer loop).
 
-When the gate reopens, the outer loop opens a fresh PCM and re-enters the FFT loop. First-frame latency is the ALSA open + first-hop-worth of samples — sub-100 ms on the reference chain.
+When the gate reopens, the outer loop opens a fresh PCM and re-enters the FFT loop. The first live frame IS the unpark signal — its `at_ms` is non-zero and the envelope carries current magnitudes. No dedicated unpark event required.
 
-**Rig acceptance for this landing:**
+**Rig acceptance (F2A + F3 combined):**
 
-- Playing + `enabled=true`: baseline CPU + PCM FD present.
-- Playing + toggle to `enabled=false`: CPU drops, spectrum subject stops updating, PCM FD disappears within one poll cycle (`lsof -p <pid>` shows the loopback device removed).
-- Playing + toggle back to `enabled=true`: CPU returns, spectrum subject resumes, PCM FD reappears.
+- Playing + `enabled=true` + `interest > 0`: baseline CPU + PCM FD present.
+- Playing + toggle to `enabled=false`: subscribers receive one final envelope with `at_ms = 0` at the current shape, CPU drops, PCM FD disappears within one poll cycle.
+- Playing + `enabled=true` + last subscriber disconnects → `interest = 0`: same final envelope + park, same FD/CPU drop.
+- Playing + toggle back to `enabled=true` (or a subscriber reconnects): CPU returns, spectrum subject resumes with a non-zero `at_ms` frame — subscribers see the unpark signal without waiting for a dedicated event.
 
-The metric that matters is the CPU + FD change, not just the subject silence. A silent subject with the FFT still spinning is exactly the class this landing exists to close.
+The metrics that matter are BOTH:
+
+- CPU + FD change on park (silence-alone is not the win — the compute path must actually drop);
+- the parked-envelope arrival on the wire (silence-alone is not the signal — subscribers must be able to distinguish deliberate quiet from a drop).
 
 ---
 
-## 5. Sequenced follow-up landings
+## 5. Landings
 
-| Wave | Scope |
-|------|-------|
-| F2B | Variable analyser: `SpectrumAnalyser::new(sample_rate_hz, bins, channels)`; `PerceptualFrame` uses `Vec<f32>` sized to `bins × channels`; rebuild on demand-change mid-play; frame payload's `bins`/`channels` fields report actual analyser state (payload-truth invariant — the frame is the shape authority, not the demand). |
-| F2C | 30 Hz emit throttle decoupled from ALSA hop rate. Inner compute loop stays hop-rate for ring-buffer discipline; emit path governed by wall-clock throttle at `demand.rate_hz_target`. |
-| F3 | Volatile emission (no `subject_states` durable mirror — spectrum frames are high-rate telemetry, not operator-visible mutations worth persisting) + optional subscription-interest signal exposed from projection-ws to terminus. |
-| F4 | Rig A/B evidence on Pi 5 across enable/disable cycle. |
+| Landing | Status | Scope |
+| --- | --- | --- |
+| F1 | Realised | `audio_playback_spectrum_demand` subject + `audio.spectrum.set_demand` verb + settings-patch bridge in the UI runtime. |
+| F2A | Realised | `CaptureGate` extends with `demand.enabled`; ALSA PCM released on disable (rig-verified 0 FDs across fleet). |
+| F2B | Realised | Variable analyser `SpectrumAnalyser::new(sample_rate_hz, bins, channels)`; `PerceptualFrame` carries payload-truth `bins`/`channels`; mono collapses at mel stage with zero-length `correlation`; rebuild on demand-change mid-play within one to two frames. |
+| F2C | Realised | 30 Hz emit throttle decoupled from ALSA hop rate — ideal-target wall-clock governor in `emit_throttle::EmitThrottle`; wire `rate_hz` field carries the governor target; rig-measured 30.0–30.40 Hz across the shape enum on the 47 Hz ALSA chain. |
+| F3 | In flight | (a) Volatile emission — no durable `subject_states` mirror. (b) Subscription-interest signal exposed by the framework's projection-ws layer + consumed as an additional park condition. (c) Parked-state wire visibility — one final envelope with `at_ms = 0` on every park transition (demand → false, transport → not-playing, role → receiver, interest → 0). |
+| F4 | Realised | Rig A/B evidence on the aarch64 (Pi 5) and x86_64 (NUC) targets across enable/disable + shape-enum cycle; producer park + shape mirror + emit rate all verified. |
 
-F2B, F2C, F3, F4 land as sequenced commits after this one. The wire shape stays 256×stereo across F2A (this landing) and only mutates at F2B; UI-side consumer (U2) lands in lockstep with F2B against the mutated wire.
+F3 lands in one commit against the framework's runtime (interest-signal primitive) + one commit against this plugin (terminus consumer + parked-envelope emission).
 
 ---
 
