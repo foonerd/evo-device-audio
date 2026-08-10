@@ -39,7 +39,7 @@ envelope; republished on every `audio.spectrum.set_demand`
 verb dispatch.
 
 | Field | Type | Meaning |
-|-------|------|---------|
+| --- | --- | --- |
 | `v` | `u32` | Envelope version. `1` today. |
 | `enabled` | `bool` | Producer gate. `false` → PCM released + no FFT + no emit. `true` → capture opens (subject to transport + role gates). |
 | `bins` | `u32` | Mel-bin count. Enum: `32 \| 64 \| 128 \| 256`. Refused with Permanent outside the enum. |
@@ -99,7 +99,7 @@ The operator changes `ui.visualizer.{enabled, bin_count, channel_mode}` through 
 **Mapping:**
 
 | Settings key | Demand field | Transformation |
-|---|---|---|
+| --- | --- | --- |
 | `ui.visualizer.enabled` (bool) | `enabled` | direct copy (with `preset=off` → `enabled=false` collapse — see below) |
 | `ui.visualizer.bin_count` (`32` / `64` / `128` / `256`) | `bins` | direct copy |
 | `ui.visualizer.channel_mode` (`mono` / `stereo`) | `channels` | `mono` → `1`; `stereo` → `2` |
