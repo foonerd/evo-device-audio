@@ -456,6 +456,35 @@ impl Plugin for AudioTerminusPlugin {
                 );
                 self.local_role_subscriber = Some(role_subscriber_handle);
 
+                // Seed the framework's per-type interest subject
+                // at `evo.system:subscription_interest.audio_
+                // playback_spectrum_frame` at `{count:0, at_ms:0}`
+                // if it doesn't already exist. Without this,
+                // interest_subscriber's resolve loop spins every
+                // 500 ms until the first consumer arrives and
+                // triggers the lazy-announce. With this, the
+                // subject exists at plugin-load time and the
+                // subscriber resolves + attaches on first
+                // attempt. Idempotent — safe even if a consumer
+                // races the seed (existing count is preserved).
+                if let Err(e) = self
+                    .subject_announcer
+                    .as_ref()
+                    .expect("subject_announcer set above")
+                    .seed_interest_zero(
+                        spectrum_subject::SPECTRUM_SUBJECT_TYPE.to_string(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "seed_interest_zero for spectrum failed; \
+                         interest_subscriber will fall back to \
+                         resolve-retry loop until first consumer"
+                    );
+                }
+
                 // Subscription-interest gate channel. Initial
                 // value 0 — the produce-iff-consumed default is
                 // to STAY parked until at least one subscriber

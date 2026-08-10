@@ -1412,6 +1412,7 @@ dependencies = [
  "flate2",
  "futures",
  "gethostname",
+ "http",
  "if-addrs 0.13.4",
  "mdns-sd",
  "nix 0.30.1",
