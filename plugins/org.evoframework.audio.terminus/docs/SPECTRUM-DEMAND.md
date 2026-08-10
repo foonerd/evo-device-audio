@@ -111,12 +111,12 @@ The operator changes `ui.visualizer.{enabled, bin_count, channel_mode}` through 
 
 ## 4. Producer gate
 
-The terminus plugin's `CaptureGate` opens when ALL of the following are true:
+The terminus plugin's `CaptureGate` opens when ALL FOUR of the following are true:
 
 1. `TransportGate::should_emit()` — the current transport state is `Playing` (from the `audio_playback_now_playing` subject subscription).
-2. `demand.enabled == true` — the operator has enabled the visualiser via settings (mirrored through the runtime bridge into the demand subject).
+2. `demand.enabled == true` — the operator has PERMITTED the visualiser via settings (mirrored through the runtime bridge into the demand subject). Necessary condition; no longer sufficient — see §4b on the demand-as-permission semantic.
 3. `LocalRole::should_emit()` — the local device is `Source` or `Auto` (not `Receiver` — followers of an active multi-room group do not emit a parallel spectrum subject).
-4. (F3) `interest > 0` — at least one subscription on the framework's projection-ws layer permits `audio_playback_spectrum_frame`. Secondary gate; the hard park on `enabled=false` MUST NOT depend on interest accounting.
+4. `interest > 0` — at least one WS subscriber is live on the framework's projection surface for `audio_playback_spectrum_frame`. The produce-iff-consumed signal: no consumer means no compute.
 
 When the gate closes for ANY reason (transport off, operator disable, role becomes Receiver, interest → 0), the capture task:
 
@@ -126,6 +126,17 @@ When the gate closes for ANY reason (transport off, operator disable, role becom
 - Sleeps on the transport + demand + interest watch channels (whichever transitions first wakes the outer loop).
 
 When the gate reopens, the outer loop opens a fresh PCM and re-enters the FFT loop. The first live frame IS the unpark signal — its `at_ms` is non-zero and the envelope carries current magnitudes. No dedicated unpark event required.
+
+### 4b. Demand as permission (not gate)
+
+`demand.enabled` is the operator's persistent opt-in — a PERMISSION, not a run-signal:
+
+- `enabled = false`: the producer stays parked regardless of every other condition. Operator's "I never want this device to capture" gesture. Persists across reboots.
+- `enabled = true`: the producer MAY capture — necessary but not sufficient. Actual capture starts only when interest > 0 AND transport is playing AND role is source/auto.
+
+Setting-based demand alone MUST NOT start capture. A device with the visualiser permitted but no subscriber stays parked. This is the produce-iff-consumed invariant — the run-signal is the presence of a consumer, not the operator's persistent permission.
+
+The interest count comes from the framework-owned `system_subscription_interest` subject (addressing `evo.system:subscription_interest`). The steward tracks the WS subscriber count per subject_type and publishes state updates `{ subject_type, count, at_ms }` on every transition. Terminus subscribes via the standard `SubjectStateSubscriber` primitive and filters for its own subject_type.
 
 **Rig acceptance (F2A + F3 combined):**
 
@@ -149,7 +160,7 @@ The metrics that matter are BOTH:
 | F2A | Realised | `CaptureGate` extends with `demand.enabled`; ALSA PCM released on disable (rig-verified 0 FDs across fleet). |
 | F2B | Realised | Variable analyser `SpectrumAnalyser::new(sample_rate_hz, bins, channels)`; `PerceptualFrame` carries payload-truth `bins`/`channels`; mono collapses at mel stage with zero-length `correlation`; rebuild on demand-change mid-play within one to two frames. |
 | F2C | Realised | 30 Hz emit throttle decoupled from ALSA hop rate — ideal-target wall-clock governor in `emit_throttle::EmitThrottle`; wire `rate_hz` field carries the governor target; rig-measured 30.0–30.40 Hz across the shape enum on the 47 Hz ALSA chain. |
-| F3 | In flight | (a) Volatile emission — no durable `subject_states` mirror. (b) Subscription-interest signal exposed by the framework's projection-ws layer + consumed as an additional park condition. (c) Parked-state wire visibility — one final envelope with `at_ms = 0` on every park transition (demand → false, transport → not-playing, role → receiver, interest → 0). |
+| F3 | Realised | (a) Volatile emission — no durable `subject_states` mirror (via `SubjectAnnouncer::update_state_volatile`). (b) Parked-state wire visibility — one final envelope with `at_ms = 0` on every park transition. (c) Subscription-interest signal via the framework-owned `system_subscription_interest` subject — subscriber count per subject_type published as state on transitions; terminus consumes via standard `SubjectStateSubscriber`; `interest > 0` becomes the fourth CaptureGate condition, `demand.enabled` demotes to operator permission. |
 | F4 | Realised | Rig A/B evidence on the aarch64 (Pi 5) and x86_64 (NUC) targets across enable/disable + shape-enum cycle; producer park + shape mirror + emit rate all verified. |
 
 F3 lands in one commit against the framework's runtime (interest-signal primitive) + one commit against this plugin (terminus consumer + parked-envelope emission).
