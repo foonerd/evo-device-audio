@@ -172,11 +172,35 @@ impl Plugin for DlnaSourcePlugin {
             tokio::spawn(async move {
                 loop {
                     if let Err(e) = refresh_discovery(&servers, &path).await {
-                        tracing::warn!(
-                            plugin = PLUGIN_NAME,
-                            error = %e,
-                            "source.dlna: discovery refresh failed"
-                        );
+                        // Classify the error: a transient
+                        // network-plane state (routing / IGMP
+                        // membership not yet established at
+                        // startup) is common when the steward
+                        // starts before network-online.target
+                        // is reached, and self-resolves within
+                        // the next few discovery cadence ticks.
+                        // Log at INFO with a "retry on next
+                        // cadence" message so the transient
+                        // does not pollute the operator's WARN
+                        // stream. Any other error class stays
+                        // at WARN — the discovery contract is
+                        // still that structural / persistent
+                        // problems are operator-visible.
+                        if e.is_transient_network() {
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "source.dlna: network not yet routable \
+                                 for SSDP multicast; will retry on next \
+                                 discovery cadence tick"
+                            );
+                        } else {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %e,
+                                "source.dlna: discovery refresh failed"
+                            );
+                        }
                     }
                     tokio::time::sleep(every).await;
                 }
