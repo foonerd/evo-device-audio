@@ -27,22 +27,27 @@
 //!   small — ~33 ms at the 30 Hz target).
 //!
 //! Lifecycle gating is enforced in this module by checking
-//! two `watch::Receiver`s before each emit:
+//! three `watch::Receiver`s before opening PCM:
 //!
 //! - `TransportGate` (from the `now_playing_subscriber`):
 //!   `Playing` opens this half of the gate; anything else
 //!   closes it.
+//! - `SpectrumDemand` (from the `demand::Store`):
+//!   `demand.enabled == true` opens this half; `false` closes.
 //! - `LocalRole` (from the `local_role_subscriber`): `Source`
 //!   and `Auto` open this half; `Receiver` closes it
 //!   (followers of an active multi-room group MUST NOT
 //!   publish a parallel spectrum subject — the source-host's
 //!   spectrum is the authoritative wavefront).
 //!
-//! Both halves MUST be open for `spectrum_subject::emit_frame`
-//! to fire. The capture loop continues running regardless of
-//! gate state (a resume picks up at the next tick without
-//! spawn latency); only the subject emit is skipped when
-//! either half is closed.
+//! All three halves MUST be open for the outer loop to open a
+//! PCM handle. Any transition from active (all-open) to parked
+//! (any-closed) publishes ONE final envelope on the spectrum
+//! subject at the current demand's shape with `at_ms = 0`
+//! before the PCM handle drops — so subscribers observing the
+//! stream see a wire-visible signal of the transition and can
+//! distinguish deliberate quiet from a transport-layer drop
+//! or a producer wedge.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -127,6 +132,18 @@ fn run_capture_loop(
     // carries it.
     let mut consecutive_failures: u32 = 0;
     let mut backoff = RECONNECT_INITIAL;
+    // Parked-state wire-visibility discipline (F3): the outer
+    // loop must emit one final envelope on the spectrum subject
+    // when transitioning FROM active TO parked, before releasing
+    // the ALSA PCM handle. Without the transition envelope,
+    // subscribers cannot distinguish "producer parked
+    // deliberately" from "transport-layer drop" from
+    // "mid-processing quiet". Track a `was_running` flag that
+    // flips true after a successful PCM open + inner-loop entry
+    // and back to false after the parked envelope is published,
+    // so we emit the transition envelope exactly once per
+    // active → parked transition and never at boot.
+    let mut was_running = false;
 
     // Outer loop reconnects on capture-open failure or
     // sustained read errors.
@@ -139,7 +156,7 @@ fn run_capture_loop(
             return;
         }
 
-        // Outer-loop gate. TWO conditions must hold for the
+        // Outer-loop gate. THREE conditions must hold for the
         // capture task to open PCM + run the FFT loop:
         //
         // 1. TransportGate::should_emit (i.e. Playing) — MPD
@@ -151,33 +168,48 @@ fn run_capture_loop(
         //    production-truth field; evo-ui-runtime derives it
         //    from `ui.visualizer.enabled` on every settings
         //    patch (F1-A apply bridge).
+        // 3. LocalRole::should_emit — the local device is
+        //    Source or Auto (not Receiver). Followers of an
+        //    active multi-room group do not publish a parallel
+        //    spectrum subject.
         //
-        // When either half closes, the capture task holds no
+        // When any half closes, the capture task holds no
         // ALSA handle — no read, no FFT compute, no reconnect
         // cycle, no spin against an idle snd-aloop. The task
-        // sleeps on both watch::Receivers until whichever half
-        // is closed reopens.
+        // sleeps on all three watch::Receivers until whichever
+        // half is closed reopens.
         //
-        // This is the operator-metric-that-matters — an
-        // `enabled=false` toggle releases PCM identically to
-        // a `NotPlaying` transport transition. Rig-verifiable
-        // via `lsof -p <pid>`: the ALSA capture device
-        // disappears from the FD list.
+        // Rig-verifiable via `lsof -p <pid>`: the ALSA capture
+        // device disappears from the FD list.
         //
-        // The inner-emit gate (in `run_fft_loop`) remains as
-        // the second line of defence for Receiver-role skip.
+        // Parked-state wire visibility (F3): when the gate
+        // closes AFTER a running session (was_running == true),
+        // publish one final envelope on the spectrum subject at
+        // the current demand's shape with at_ms = 0 BEFORE
+        // waiting for the gate to reopen. Subscribers observing
+        // the stream see the parked envelope arrive and know
+        // the silence that follows is deliberate production-
+        // side quiet, not a transient drop or a wedge.
         let transport_open = transport_gate.borrow().should_emit();
         let demand_open = demand.borrow().enabled;
-        if !(transport_open && demand_open) {
+        let role_open = local_role.borrow().should_emit();
+        if !(transport_open && demand_open && role_open) {
             tracing::debug!(
                 plugin = PLUGIN_NAME,
                 transport_open,
                 demand_open,
-                "capture-gate closed; task idle until either half reopens"
+                role_open,
+                was_running,
+                "capture-gate closed; task idle until all halves reopen"
             );
+            if was_running {
+                emit_parked_envelope(&announcer, *demand.borrow());
+                was_running = false;
+            }
             if wait_for_capture_gate_or_shutdown(
                 &mut transport_gate.clone(),
                 &mut demand.clone(),
+                &mut local_role.clone(),
                 &shutdown,
             ) {
                 return;
@@ -221,6 +253,11 @@ fn run_capture_loop(
         // Reset backoff on successful open.
         consecutive_failures = 0;
         backoff = RECONNECT_INITIAL;
+        // Mark active so the next outer-loop iteration that
+        // finds the gate closed knows to publish the parked-
+        // envelope transition signal before waiting. Cleared
+        // by the gate-close branch after emitting.
+        was_running = true;
 
         tracing::info!(
             plugin = PLUGIN_NAME,
@@ -478,9 +515,22 @@ fn run_fft_loop(
                     );
                     return InnerExit::DemandShapeChanged;
                 }
+                // Role half of the CaptureGate. When the local
+                // device becomes a Receiver (follower of an
+                // active multi-room group), bail out of the
+                // inner loop so the outer loop emits the
+                // parked envelope + releases the PCM handle.
+                // Followers of an active group must not publish
+                // a parallel spectrum subject — the group's
+                // source-host emits the authoritative wavefront.
                 let role_open = local_role.borrow().should_emit();
                 if !role_open {
-                    continue;
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "local role closed mid-capture (became Receiver); \
+                         releasing PCM handle and idling outer loop"
+                    );
+                    return InnerExit::TransportFailed;
                 }
                 // F2C emit throttle. The FFT compute above
                 // updates `latest_frame` and refreshes peak-hold
@@ -632,6 +682,7 @@ fn shutdown_check(shutdown: &Arc<Notify>) -> bool {
 fn wait_for_capture_gate_or_shutdown(
     transport_gate: &mut watch::Receiver<TransportGate>,
     demand: &mut watch::Receiver<SpectrumDemand>,
+    local_role: &mut watch::Receiver<LocalRole>,
     shutdown: &Arc<Notify>,
 ) -> bool {
     let handle = match tokio::runtime::Handle::try_current() {
@@ -643,7 +694,8 @@ fn wait_for_capture_gate_or_shutdown(
             let transport_open =
                 transport_gate.borrow_and_update().should_emit();
             let demand_open = demand.borrow_and_update().enabled;
-            if transport_open && demand_open {
+            let role_open = local_role.borrow_and_update().should_emit();
+            if transport_open && demand_open && role_open {
                 return false;
             }
             tokio::select! {
@@ -658,9 +710,71 @@ fn wait_for_capture_gate_or_shutdown(
                         return true;
                     }
                 }
+                changed = local_role.changed() => {
+                    if changed.is_err() {
+                        return true;
+                    }
+                }
             }
         }
     })
+}
+
+/// Publish one final envelope on the spectrum subject at the
+/// current demand's shape with `at_ms = 0` — the "parked"
+/// sentinel matching the existing empty-envelope semantics
+/// used for a fresh-connect on a quiet transport. Called from
+/// the outer loop's gate-close branch on every transition from
+/// active to parked, before the ALSA PCM handle drops.
+///
+/// Runs synchronously against the current tokio runtime handle
+/// so the parked envelope is on the wire before the caller
+/// proceeds to release resources; if no runtime is present
+/// (test path), the emit is skipped — the outer loop path
+/// where this is called always has a live runtime in
+/// production because it was reached from a `tokio::spawn_blocking`
+/// context wired to the framework's runtime handle.
+fn emit_parked_envelope(
+    announcer: &Arc<dyn SubjectAnnouncer>,
+    current_demand: SpectrumDemand,
+) {
+    use evo_plugin_sdk::contract::ExternalAddressing;
+    let parked = crate::spectrum_subject::render_empty_frame(
+        current_demand.rate_hz_target,
+        current_demand.bins,
+        current_demand.channels,
+    );
+    let addressing = ExternalAddressing::new(
+        crate::spectrum_subject::SPECTRUM_SUBJECT_ADDRESSING_SCHEME,
+        crate::spectrum_subject::SPECTRUM_SUBJECT_ADDRESSING_VALUE,
+    );
+    let announcer_clone = Arc::clone(announcer);
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                "no tokio runtime available for parked-envelope emit; skipping \
+                 (test path — production always has a runtime here)"
+            );
+            return;
+        }
+    };
+    // Block on the emit so the transition envelope is on the
+    // wire before the caller drops the PCM handle. The write is
+    // a single frame at the current shape; latency is dominated
+    // by the framework's WS-out queue and is bounded well below
+    // any user-perceptible window.
+    handle.block_on(async move {
+        if let Err(e) = announcer_clone.update_state(addressing, parked).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "parked-envelope emit failed; subscribers may not see the \
+                 transition signal for this park cycle"
+            );
+        }
+    });
 }
 
 fn wait_with_shutdown(shutdown: &Arc<Notify>, dur: Duration) -> bool {
