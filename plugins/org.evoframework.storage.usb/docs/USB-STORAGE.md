@@ -1,9 +1,7 @@
 # USB storage inventory — normative for the audio distribution
 
-**Bound by:** the companion decision record in evo-internal
-(thin ADR + living inventory pattern — this file carries the
-tables; the decision record binds them). This file is the sole
-source of truth for the values below. Implementation,
+This document is the sole source of truth for the USB-storage
+values below (thin-doc + living-inventory pattern). Implementation,
 bootstrap, catalogue, and UI copy MUST match this file.
 Contradictions between code and this file are defects to be
 closed against this file.
@@ -586,8 +584,8 @@ mounted window. Evidence emitted at
    subject + verb contract; not a plugin-side change).
 6. If any invariant here changes (system-disk union expands;
    FS support matrix drops a type; mount root moves off
-   `/var/lib/evo/music/USB/`), amend the companion decision
-   record in evo-internal first, then this file, then code.
+   `/var/lib/evo/music/USB/`), amend this file first, then
+   code.
 
 Reviewers refuse storage.usb code changes whose diffs do not
 touch this file OR whose diffs contradict what this file says.
