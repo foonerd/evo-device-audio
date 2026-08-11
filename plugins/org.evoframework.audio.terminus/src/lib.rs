@@ -8,7 +8,10 @@
 //! terminus health (the floor invariant per the local-playback
 //! invariant contract). The plugin owns:
 //!
-//! - **Spectrum FFT compute.** 256-bin mel-scale stereo Float32
+//! - **Spectrum FFT compute.** Demand-driven bin count + channel
+//!   count + frequency scale (log / mel / linear; default log per
+//!   the 2026-08-11 spectrum-frequency-scale ownership audit)
+//!   Float32
 //!   FFT at 30 Hz, with peak-hold per bin (perceptual decay),
 //!   per-band onset event detection (sub_bass / bass / mid / high),
 //!   and L/R correlation per bin for stereo-imaging visualisations.

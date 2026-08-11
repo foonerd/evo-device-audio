@@ -120,12 +120,15 @@ fn run_capture_loop(
     interest: watch::Receiver<u32>,
 ) {
     // Analyser is (re)built lazily on entry to the inner FFT
-    // loop from the demand's current bins/channels. A demand
-    // change mid-play breaks out of the inner loop and the
-    // outer loop rebuilds the analyser with the new shape.
+    // loop from the demand's current bins / channels /
+    // frequency_scale. A demand change on any of those exits
+    // the inner loop and the outer loop rebuilds the analyser
+    // with the new shape.
     let mut analyser: Option<SpectrumAnalyser> = None;
     let mut analyser_bins: u32 = 0;
     let mut analyser_channels: u32 = 0;
+    let mut analyser_scale: crate::demand::FrequencyScale =
+        crate::demand::FrequencyScale::default();
     // Note: the wire `rate_hz` field is populated from
     // `current_demand.rate_hz_target` at emit time (F2C —
     // wall-clock throttle target), not from the ALSA hop rate.
@@ -274,24 +277,27 @@ fn run_capture_loop(
         );
 
         // (Re)build the analyser to match the current demand's
-        // bins + channels. First open after a fresh plugin
-        // admit constructs from the disabled-default (or the
-        // last enabled-then-disabled shape). A demand change
-        // that arrives while the inner loop is running exits
-        // via `InnerExit::DemandShapeChanged` and the outer
-        // loop rebuilds here with the new shape.
+        // bins + channels + frequency_scale. First open after a
+        // fresh plugin admit constructs from the disabled-
+        // default (or the last enabled-then-disabled shape). A
+        // demand change that arrives while the inner loop is
+        // running exits via `InnerExit::DemandShapeChanged` and
+        // the outer loop rebuilds here with the new shape.
         let current_demand = *demand.borrow();
         if analyser.is_none()
             || analyser_bins != current_demand.bins
             || analyser_channels != current_demand.channels
+            || analyser_scale != current_demand.frequency_scale
         {
             analyser = Some(SpectrumAnalyser::new(
                 config.sample_rate_hz,
                 current_demand.bins as usize,
                 current_demand.channels as usize,
+                current_demand.frequency_scale,
             ));
             analyser_bins = current_demand.bins;
             analyser_channels = current_demand.channels;
+            analyser_scale = current_demand.frequency_scale;
             // Republish the empty-frame envelope at the new
             // shape so consumers see the shape change on the
             // wire immediately — the first live frame will
@@ -409,10 +415,12 @@ fn run_fft_loop(
     let mut f32_buf = vec![0.0f32; frame_samples];
 
     // Snapshot the analyser shape at inner-loop entry. A demand
-    // change to bins or channels triggers `DemandShapeChanged`
-    // exit and the outer loop rebuilds the analyser + re-enters.
+    // change to bins, channels, or frequency_scale triggers
+    // `DemandShapeChanged` exit and the outer loop rebuilds the
+    // analyser + re-enters.
     let entry_bins = analyser.bins() as u32;
     let entry_channels = analyser.channels() as u32;
+    let entry_scale = analyser.frequency_scale();
 
     // F2C — wall-clock emit throttle. The inner FFT compute
     // runs at ALSA hop rate (~47 Hz at 48 kHz / 1024-point);
@@ -507,18 +515,22 @@ fn run_fft_loop(
                     );
                     return InnerExit::TransportFailed;
                 }
-                // Demand shape change (bins or channels) mid-play.
-                // Bail out so the outer loop rebuilds the analyser
-                // at the new shape + republishes the seed envelope.
+                // Demand shape change (bins, channels, or
+                // frequency_scale) mid-play. Bail out so the
+                // outer loop rebuilds the analyser at the new
+                // shape + republishes the seed envelope.
                 if current_demand.bins != entry_bins
                     || current_demand.channels != entry_channels
+                    || current_demand.frequency_scale != entry_scale
                 {
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         entry_bins,
                         entry_channels,
+                        entry_scale = entry_scale.as_str(),
                         new_bins = current_demand.bins,
                         new_channels = current_demand.channels,
+                        new_scale = current_demand.frequency_scale.as_str(),
                         "demand shape changed mid-capture; bailing inner loop \
                          for analyser rebuild"
                     );

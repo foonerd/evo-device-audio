@@ -42,15 +42,24 @@ verb dispatch.
 | --- | --- | --- |
 | `v` | `u32` | Envelope version. `1` today. |
 | `enabled` | `bool` | Producer gate. `false` → PCM released + no FFT + no emit. `true` → capture opens (subject to transport + role gates). |
-| `bins` | `u32` | Mel-bin count. Enum: `32 \| 64 \| 128 \| 256`. Refused with Permanent outside the enum. |
+| `bins` | `u32` | Output bin count. Enum: `32 \| 64 \| 128 \| 256`. Refused with Permanent outside the enum. |
 | `channels` | `u32` | Channel mode. Enum: `1 \| 2` (`1` = mono; `2` = stereo). Refused with Permanent outside the enum. |
 | `rate_hz_target` | `u32` | Emit throttle target in Hz. Clamped to `[1, 60]` at the plugin; typical value `30`. |
+| `frequency_scale` | `string` | Frequency-bin spacing across `[20, 20000]` Hz. Enum: `"log" \| "mel" \| "linear"`. Default `"log"` (music-analyser convention). Refused with Permanent outside the enum. Absent field (older UI runtime bridge that has not been upgraded) parses to `"log"`. |
 | `updated_at_ms` | `u64` | Wall-clock ms of last apply. Zero before the first apply. |
 
 **Addressing:** `evo.audio.playback:spectrum_demand`.
 **Cardinality:** singleton per device.
 
-**Disabled default (plugin load):** `{ enabled: false, bins: 64, channels: 1, rate_hz_target: 30, updated_at_ms: 0 }` — matches the pre-supersession baseline (no spectrum activity on a device where the operator has never touched `ui.visualizer.*`).
+**Disabled default (plugin load):** `{ enabled: false, bins: 64, channels: 1, rate_hz_target: 30, frequency_scale: "log", updated_at_ms: 0 }` — matches the pre-supersession baseline (no spectrum activity on a device where the operator has never touched `ui.visualizer.*`). `frequency_scale` defaults to `"log"` per the 2026-08-11 spectrum-frequency-scale ownership audit — the log axis is the music-analyser convention and the default the wire lands at when no prior demand has been persisted.
+
+**Frequency scale semantics:**
+
+- **`"log"`** (default) — equal log-ratio spacing across `[20, 20000]` Hz. Allocates ~37% of display width to 20–250 Hz. Matches the industry music-analyser default (audioMotion, TrueRTA, most SPL meters); recommended for every music-heavy device.
+- **`"mel"`** — equal mel-scale spacing (perceptual-loudness bank the plugin originally shipped). Allocates ~8% of display width to 20–250 Hz. Better than linear for perception, but noticeably left-parked for music. Retained for operators who preferred the pre-2026-08-11 look.
+- **`"linear"`** — equal Hz spacing (raw-FFT diagnostic layout). Allocates ~1% of display width to 20–250 Hz. Useful for engineering visualisation of raw spectrum energy; not recommended as a music-playback default.
+
+The analyser rebuilds on `frequency_scale` change identically to a `bins` or `channels` change: the capture loop's inner FFT loop exits via `DemandShapeChanged`, and the outer loop constructs a new `SpectrumAnalyser` at the new scale within one or two frames. Peak-hold + onset history reset on rebuild — the small visual discontinuity is preferable to fabricating post-rebuild state.
 
 ---
 
@@ -64,11 +73,12 @@ Dispatched via the plugin's respondent surface on the
 
 ```json
 {
-  "v":              1,
-  "enabled":        true,
-  "bins":           64,
-  "channels":       1,
-  "rate_hz_target": 30
+  "v":               1,
+  "enabled":         true,
+  "bins":            64,
+  "channels":        1,
+  "rate_hz_target":  30,
+  "frequency_scale": "log"
 }
 ```
 
@@ -78,17 +88,20 @@ Dispatched via the plugin's respondent surface on the
 {
   "v":       1,
   "applied": {
-    "v":              1,
-    "enabled":        true,
-    "bins":           64,
-    "channels":       1,
-    "rate_hz_target": 30,
-    "updated_at_ms":  1720000000000
+    "v":               1,
+    "enabled":         true,
+    "bins":            64,
+    "channels":        1,
+    "rate_hz_target":  30,
+    "frequency_scale": "log",
+    "updated_at_ms":   1720000000000
   }
 }
 ```
 
-**`deny_unknown_fields`** on the parsed struct catches typos synchronously — a client passing `preset` or `palette` receives `invalid_payload` synchronously rather than silently discarding the unknown parameter.
+**`deny_unknown_fields`** on the parsed struct catches typos synchronously — a client passing `preset` or `palette` receives `invalid_payload` synchronously rather than silently discarding the unknown parameter. The same class of refusal applies to an unknown `frequency_scale` value (e.g. `"octave"`, `"logarithmic"`, `"fft"` — no aliases).
+
+**Absent `frequency_scale` on the wire** defaults to `"log"` at the verb parse boundary — the compatibility hatch for an older UI runtime bridge that has not been upgraded. UI landing the setting in the same release train removes the hatch's steady-state role; absence remains supported for future forward compatibility.
 
 ---
 
@@ -114,7 +127,10 @@ Any UI settings surface (Settings screen, Designer Visualizer Studio, future cli
 | `ui.visualizer.enabled && ui.visualizer.preset != "off"` | `enabled` | logical AND at the UI |
 | `ui.visualizer.bin_count` (`32` / `64` / `128` / `256`) | `bins` | direct copy |
 | `ui.visualizer.channel_mode` (`mono` / `stereo`) | `channels` | `mono` → `1`; `stereo` → `2` |
+| `ui.visualizer.frequency_scale` (`log` / `mel` / `linear`) | `frequency_scale` | direct copy; absent → `"log"` |
 | — | `rate_hz_target` | fixed to `30` at the runtime bridge (or read from an optional operator setting when one exists) |
+
+Renderer-only settings (`preset`, `palette`, `color_mode`, `sensitivity_db`) never appear on the demand — they change what the frame is drawn as, not what the producer emits. Visualizer.tsx MUST NOT remap bin indices for scale; the wire carries payload-truth bins in the operator-selected scale order.
 
 ### 3.2 Terminus-side apply + persistence
 

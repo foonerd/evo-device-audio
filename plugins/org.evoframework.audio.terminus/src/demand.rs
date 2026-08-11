@@ -63,6 +63,64 @@ const ADDRESSING_VALUE: &str = "spectrum_demand";
 pub(crate) const VERB_SET_DEMAND: &str = "audio.spectrum.set_demand";
 pub(crate) const DEMAND_PAYLOAD_VERSION: u32 = 1;
 
+/// Frequency-bin spacing across the analyser's `[20, 20000]` Hz
+/// window. Determines how the operator's `bins` output slots are
+/// distributed across the audible band on the wire.
+///
+/// - `Log`: equal log-ratio spacing. Music-analyser default;
+///   allocates ~37% of display width to 20–250 Hz — matches
+///   music-genre energy distribution and industry meters.
+/// - `Mel`: equal mel-scale spacing. Perceptual-loudness bank
+///   the plugin originally shipped; allocates ~8% of display
+///   width to 20–250 Hz — better than linear but noticeably
+///   left-parked for music-heavy content.
+/// - `Linear`: equal Hz spacing. Raw-FFT / diagnostics shape;
+///   allocates ~1% of display width to 20–250 Hz — mostly
+///   useful for engineering visualisation of raw spectrum.
+///
+/// Wire form is lowercase snake (`"log"` / `"mel"` / `"linear"`)
+/// via serde's `rename_all = "lowercase"`; enum-validated at the
+/// verb parse stage.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FrequencyScale {
+    /// Equal log-ratio spacing. Default; matches music-analyser
+    /// convention.
+    #[default]
+    Log,
+    /// Equal mel-scale spacing. Prior default (pre-2026-08-11
+    /// spectrum frequency-scale ownership audit).
+    Mel,
+    /// Equal Hz spacing. Diagnostics only.
+    Linear,
+}
+
+impl FrequencyScale {
+    /// Lowercase wire form (matches the serde encoding).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Mel => "mel",
+            Self::Linear => "linear",
+        }
+    }
+
+    /// Parse a wire-form string. `None` on unknown value — the
+    /// rehydrate path treats that as "roll back to
+    /// `disabled_default`" (defensive: a corrupted persisted row
+    /// cannot resurrect a scale this build does not understand).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "log" => Some(Self::Log),
+            "mel" => Some(Self::Mel),
+            "linear" => Some(Self::Linear),
+            _ => None,
+        }
+    }
+}
+
 /// Producer-plane demand shape. Every field is production-
 /// affecting; renderer-only choices never appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -71,31 +129,41 @@ pub struct SpectrumDemand {
     /// it identically to `TransportGate::NotPlaying` (ALSA PCM
     /// released, no FFT compute, no emit).
     pub enabled: bool,
-    /// Mel-bin count. Constrained to `{32, 64, 128, 256}` at
+    /// Output bin count. Constrained to `{32, 64, 128, 256}` at
     /// parse time; the analyser rebuilds when this changes
     /// mid-play.
     pub bins: u32,
     /// Channel mode. `1` = mono (producer collapses L+R at the
-    /// mel stage); `2` = stereo (producer emits both channels).
+    /// filterbank stage); `2` = stereo (producer emits both
+    /// channels).
     pub channels: u32,
     /// Emit throttle target in Hz. Clamped to `[1, 60]`.
     pub rate_hz_target: u32,
+    /// Frequency-bin spacing across `[20, 20000]` Hz. Default
+    /// `Log`; the analyser rebuilds when this changes mid-play.
+    /// Absent on the wire (older UI runtime bridge that has not
+    /// been upgraded) parses to `Log` per the spectrum-frequency-
+    /// scale ownership audit.
+    pub frequency_scale: FrequencyScale,
     /// Wall-clock ms at last apply. Zero before the first apply.
     pub updated_at_ms: u64,
 }
 
 impl SpectrumDemand {
-    /// Default: disabled, 64 bins, mono, 30 Hz. Reproduces the
-    /// operator-visible baseline the visualiser has always
-    /// carried when the operator has never opened the settings
+    /// Default: disabled, 64 bins, mono, 30 Hz, log spacing.
+    /// Reproduces the operator-visible baseline the visualiser
+    /// carries when the operator has never opened the settings
     /// surface — no spectrum activity on-device, ready to enable
-    /// on first opt-in without a plugin restart.
+    /// on first opt-in without a plugin restart. `frequency_scale`
+    /// defaults to `Log` per the spectrum-frequency-scale audit
+    /// (music-analyser convention).
     pub fn disabled_default() -> Self {
         Self {
             enabled: false,
             bins: 64,
             channels: 1,
             rate_hz_target: 30,
+            frequency_scale: FrequencyScale::Log,
             updated_at_ms: 0,
         }
     }
@@ -112,6 +180,12 @@ struct SetDemandRequest {
     channels: u32,
     #[serde(default = "default_rate_hz_target")]
     rate_hz_target: u32,
+    /// Frequency-bin spacing. Absent (older UI runtime bridge)
+    /// defaults to `Log` per the ownership audit. Unknown enum
+    /// value → serde error → `PluginError::Permanent` at the
+    /// verb boundary (same class as bad bins).
+    #[serde(default)]
+    frequency_scale: FrequencyScale,
 }
 
 fn default_v() -> u32 {
@@ -235,6 +309,7 @@ impl SpectrumDemandStore {
             bins: parsed.bins,
             channels: parsed.channels,
             rate_hz_target,
+            frequency_scale: parsed.frequency_scale,
             updated_at_ms: now_ms(),
         };
         self.apply(next).await;
@@ -276,6 +351,7 @@ impl SpectrumDemandStore {
             bins = next.bins,
             channels = next.channels,
             rate_hz_target = next.rate_hz_target,
+            frequency_scale = next.frequency_scale.as_str(),
             "spectrum demand applied"
         );
     }
@@ -306,12 +382,13 @@ fn validate_channels(channels: u32) -> Result<(), PluginError> {
 /// Assemble the wire envelope for the demand subject.
 fn render_envelope(d: &SpectrumDemand) -> serde_json::Value {
     json!({
-        "v":              DEMAND_PAYLOAD_VERSION,
-        "enabled":        d.enabled,
-        "bins":           d.bins,
-        "channels":       d.channels,
-        "rate_hz_target": d.rate_hz_target,
-        "updated_at_ms":  d.updated_at_ms,
+        "v":               DEMAND_PAYLOAD_VERSION,
+        "enabled":         d.enabled,
+        "bins":            d.bins,
+        "channels":        d.channels,
+        "rate_hz_target":  d.rate_hz_target,
+        "frequency_scale": d.frequency_scale.as_str(),
+        "updated_at_ms":   d.updated_at_ms,
     })
 }
 
@@ -319,10 +396,19 @@ fn render_envelope(d: &SpectrumDemand) -> serde_json::Value {
 /// a wire envelope. Returns `None` when the envelope is malformed,
 /// carries an unsupported version, or fails the same enum
 /// validators the set_demand verb enforces (bins ∈ {32, 64, 128,
-/// 256}, channels ∈ {1, 2}). Defensive: a rehydrated envelope
-/// from an older or forward build with an out-of-range field
-/// should NOT resurrect an invalid demand — fall through to
-/// `disabled_default` instead.
+/// 256}, channels ∈ {1, 2}, frequency_scale ∈ {log, mel, linear}).
+/// Defensive: a rehydrated envelope from an older or forward build
+/// with an out-of-range field should NOT resurrect an invalid
+/// demand — fall through to `disabled_default` instead.
+///
+/// `frequency_scale` is treated additive-compatibly: an envelope
+/// persisted by a build predating the spectrum-frequency-scale
+/// audit lacks the field, in which case the rehydrated demand
+/// resolves to `FrequencyScale::Log` (the same default a fresh
+/// `disabled_default` would carry, and the audit's migration
+/// rule). An envelope that carries the field with an unknown
+/// value (`"octave"`, mistyped, forward build) fails hard the
+/// same way an out-of-range `bins` fails hard.
 fn parse_envelope(v: &serde_json::Value) -> Option<SpectrumDemand> {
     let version = v.get("v")?.as_u64()? as u32;
     if version != DEMAND_PAYLOAD_VERSION {
@@ -339,12 +425,23 @@ fn parse_envelope(v: &serde_json::Value) -> Option<SpectrumDemand> {
     }
     let rate_hz_target = v.get("rate_hz_target")?.as_u64()? as u32;
     let rate_hz_target = rate_hz_target.clamp(1, 60);
+    let frequency_scale = match v.get("frequency_scale") {
+        None => FrequencyScale::Log,
+        Some(scale_val) => {
+            // Present-but-non-string, or present-but-unknown
+            // enum value, both fail hard (return None → caller
+            // falls back to `disabled_default`). Absent is the
+            // only migration-friendly case.
+            FrequencyScale::from_wire(scale_val.as_str()?)?
+        }
+    };
     let updated_at_ms = v.get("updated_at_ms")?.as_u64()?;
     Some(SpectrumDemand {
         enabled,
         bins,
         channels,
         rate_hz_target,
+        frequency_scale,
         updated_at_ms,
     })
 }
@@ -446,6 +543,9 @@ mod tests {
         assert_eq!(d.bins, 64);
         assert_eq!(d.channels, 1);
         assert_eq!(d.rate_hz_target, 30);
+        // frequency_scale default is Log per the 2026-08-11
+        // spectrum-frequency-scale ownership audit.
+        assert_eq!(d.frequency_scale, FrequencyScale::Log);
         assert_eq!(d.updated_at_ms, 0);
     }
 
@@ -481,6 +581,7 @@ mod tests {
             bins: 128,
             channels: 2,
             rate_hz_target: 30,
+            frequency_scale: FrequencyScale::Mel,
             updated_at_ms: 1_720_000_000_000,
         };
         let env = render_envelope(&d);
@@ -489,7 +590,42 @@ mod tests {
         assert_eq!(env["bins"], 128);
         assert_eq!(env["channels"], 2);
         assert_eq!(env["rate_hz_target"], 30);
+        assert_eq!(env["frequency_scale"], "mel");
         assert_eq!(env["updated_at_ms"], 1_720_000_000_000_u64);
+    }
+
+    #[test]
+    fn envelope_encodes_every_frequency_scale_as_lowercase_wire_form() {
+        for (scale, wire) in [
+            (FrequencyScale::Log, "log"),
+            (FrequencyScale::Mel, "mel"),
+            (FrequencyScale::Linear, "linear"),
+        ] {
+            let d = SpectrumDemand {
+                frequency_scale: scale,
+                ..SpectrumDemand::disabled_default()
+            };
+            assert_eq!(render_envelope(&d)["frequency_scale"], wire);
+        }
+    }
+
+    #[test]
+    fn frequency_scale_from_wire_accepts_documented_values_and_refuses_others()
+    {
+        assert_eq!(FrequencyScale::from_wire("log"), Some(FrequencyScale::Log));
+        assert_eq!(FrequencyScale::from_wire("mel"), Some(FrequencyScale::Mel));
+        assert_eq!(
+            FrequencyScale::from_wire("linear"),
+            Some(FrequencyScale::Linear)
+        );
+        // No aliases per the audit — `octave`, `logarithmic`,
+        // `fft` all fail hard.
+        for bad in ["octave", "logarithmic", "fft", "LOG", "", " log "] {
+            assert!(
+                FrequencyScale::from_wire(bad).is_none(),
+                "must refuse '{bad}'"
+            );
+        }
     }
 
     #[test]
@@ -526,6 +662,7 @@ mod tests {
                 bins: 128,
                 channels: 2,
                 rate_hz_target: 45,
+                frequency_scale: FrequencyScale::Log,
                 updated_at_ms: 1_720_000_000_000,
             },
             SpectrumDemand {
@@ -533,13 +670,129 @@ mod tests {
                 bins: 256,
                 channels: 1,
                 rate_hz_target: 1,
+                frequency_scale: FrequencyScale::Mel,
                 updated_at_ms: u64::MAX,
+            },
+            SpectrumDemand {
+                enabled: true,
+                bins: 32,
+                channels: 2,
+                rate_hz_target: 60,
+                frequency_scale: FrequencyScale::Linear,
+                updated_at_ms: 1_234,
             },
         ] {
             let env = render_envelope(&d);
             let parsed =
                 parse_envelope(&env).expect("rendered envelope must parse");
             assert_eq!(parsed, d, "roundtrip must preserve every field");
+        }
+    }
+
+    #[test]
+    fn parse_envelope_absent_frequency_scale_defaults_to_log() {
+        // Migration path: an envelope persisted by a build
+        // predating the frequency-scale field must resurrect as
+        // Log (the new default) rather than fail. The other
+        // fields still populate normally.
+        let env = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30,
+            "updated_at_ms": 1_000,
+        });
+        let parsed = parse_envelope(&env).expect("absent scale must parse");
+        assert_eq!(parsed.frequency_scale, FrequencyScale::Log);
+    }
+
+    #[test]
+    fn parse_envelope_refuses_unknown_frequency_scale() {
+        // Present-but-unknown scale value fails hard, same class
+        // as an out-of-range bins. A corrupted or forward-build
+        // envelope with "octave" MUST NOT resurrect an invalid
+        // demand — the caller falls back to disabled_default.
+        for bad_scale in ["octave", "logarithmic", "fft", "", "LOG"] {
+            let env = json!({
+                "v": DEMAND_PAYLOAD_VERSION,
+                "enabled": true,
+                "bins": 64,
+                "channels": 1,
+                "rate_hz_target": 30,
+                "frequency_scale": bad_scale,
+                "updated_at_ms": 1_000,
+            });
+            assert!(
+                parse_envelope(&env).is_none(),
+                "must refuse frequency_scale='{bad_scale}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_envelope_refuses_non_string_frequency_scale() {
+        // A numeric frequency_scale is a forward-build shape
+        // (someone changed the wire form). Fail hard rather than
+        // silently coerce.
+        let env = json!({
+            "v": DEMAND_PAYLOAD_VERSION,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30,
+            "frequency_scale": 0,
+            "updated_at_ms": 1_000,
+        });
+        assert!(parse_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn set_demand_request_absent_frequency_scale_defaults_to_log() {
+        // Wire compatibility: an older UI runtime bridge that
+        // has not yet been upgraded still lands enabled/bins/
+        // channels/rate. The absent frequency_scale field
+        // resolves to Log at the verb boundary — matches the
+        // audit's migration rule.
+        let json = r#"{
+            "v": 1,
+            "enabled": true,
+            "bins": 64,
+            "channels": 1,
+            "rate_hz_target": 30
+        }"#;
+        let req = serde_json::from_str::<SetDemandRequest>(json)
+            .expect("absent scale must parse");
+        assert_eq!(req.frequency_scale, FrequencyScale::Log);
+    }
+
+    #[test]
+    fn set_demand_request_accepts_every_scale_and_refuses_unknown() {
+        for good in ["log", "mel", "linear"] {
+            let json = format!(
+                r#"{{"v":1,"enabled":true,"bins":64,"channels":1,\
+                 "rate_hz_target":30,"frequency_scale":"{good}"}}"#
+            );
+            let json = json.replace('\\', "");
+            let req = serde_json::from_str::<SetDemandRequest>(&json)
+                .unwrap_or_else(|e| panic!("{good} must parse: {e}"));
+            assert_eq!(req.frequency_scale.as_str(), good);
+        }
+        for bad in ["octave", "logarithmic", "fft", "", "LOG"] {
+            let json = format!(
+                r#"{{"v":1,"enabled":true,"bins":64,"channels":1,\
+                 "rate_hz_target":30,"frequency_scale":"{bad}"}}"#
+            );
+            let json = json.replace('\\', "");
+            let err = serde_json::from_str::<SetDemandRequest>(&json)
+                .expect_err(&format!("'{bad}' must refuse"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("frequency_scale")
+                    || msg.contains(bad)
+                    || msg.contains("unknown"),
+                "refusal must name the field or value, got: {msg}"
+            );
         }
     }
 
