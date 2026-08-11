@@ -1944,70 +1944,51 @@ else
 fi
 
 if [[ "${EVO_INSTALL_KIOSK_LAYER:-1}" != "0" ]]; then
-    # Boot dependency chain (evo → evo-ui → evo-kiosk).
+    # Boot dependency chain (evo-ui → evo-kiosk).
     #
-    # Without this chain the three units can start in any
-    # order at boot: the kiosk browser can reach
+    # Without this chain the kiosk browser can reach
     # `http://127.0.0.1/` before `evo-ui-runtime` has bound
     # its listen socket, and stay on the browser-default
     # connection-refused page indefinitely (no auto-reload).
     # Operator recovery is a manual
-    # `systemctl restart evo-ui evo-kiosk` after every boot,
-    # which is unacceptable for a reference device.
+    # `systemctl restart evo-kiosk` after every boot, which is
+    # unacceptable for a reference device.
     #
-    # The chain enforced here (three drop-ins):
+    # The chain enforced here (one drop-in):
     #
-    # 1. `evo-ui.service` — depends on `evo.service` (it
-    #    reverse-proxies to the framework's :8443). Without
-    #    the framework wire up, evo-ui-runtime binds :80/:443
-    #    but every request that reaches its `/api/*` reverse
-    #    proxy path fails.
-    #
-    # 2. `evo-kiosk.service` — depends on `evo-ui.service`
+    # 1. `evo-kiosk.service` — depends on `evo-ui.service`
     #    (the browser loads http://127.0.0.1/ from it).
     #    Without evo-ui up, the browser loads a browser-
     #    default "connection refused" page and never retries.
-    #
-    # 3. `evo-kiosk.service` also carries an ExecStartPre that
-    #    waits for `http://127.0.0.1/` to return HTTP 200 (up
-    #    to 30 seconds) — belt-and-braces guarantee that the
-    #    URL is actually reachable, not just that
+    #    The drop-in also carries an ExecStartPre that waits
+    #    for `http://127.0.0.1/` to return HTTP 200 (up to
+    #    30 seconds) — belt-and-braces guarantee that the URL
+    #    is actually reachable, not just that
     #    `evo-ui.service` is systemd-active. Handles the rare
-    #    case where evo-ui-runtime is `active running` but has
-    #    not yet completed its TCP bind (bounded startup
+    #    case where evo-ui-runtime is `active running` but
+    #    has not yet completed its TCP bind (bounded startup
     #    race).
-    install -d -m 0755 -o root -g root /etc/systemd/system/evo-ui.service.d
-    cat > /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf <<'EOF'
-# Framework wire must be up before the UI runtime binds — the
-# runtime reverse-proxies /api to /wss/ against 127.0.0.1:8443.
-#
-# Systemd-level dependency is insufficient on its own: even
-# after `evo.service` reports `active`, there is a bounded
-# window before the framework's HTTPS listener is accepting
-# TLS on :8443 AND before its `ca.crt` (which evo-ui-runtime
-# reads to trust the framework's self-signed cert) has been
-# written under `/var/lib/evo/https/https/`. If evo-ui-runtime
-# starts inside that window it initialises with
-# `framework_proxy=false` and stays there for the rest of the
-# session — every operator API call 502s until the runtime is
-# manually restarted.
-#
-# The ExecStartPre below polls for BOTH conditions with a
-# 60-second bounded budget. It exits 0 as soon as ca.crt is
-# present AND :8443 accepts a TLS handshake; exits 1 with a
-# diagnostic if neither shows within budget so
-# Restart=on-failure brings the unit back cleanly instead of
-# starting into a broken state.
-[Unit]
-After=evo.service
-Wants=evo.service
-Requires=evo.service
-
-[Service]
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -f /var/lib/evo/https/https/ca.crt ] && curl -k -sS --max-time 1 -o /dev/null https://127.0.0.1:8443/ 2>/dev/null && exit 0; sleep 1; done; echo "[evo-ui-wait] framework ca.crt or :8443 accept never came up after 60s" >&2; exit 1'
-EOF
-    chmod 0644 /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf
-    echo "[bootstrap] installed evo-ui.service.d/depends-on-evo.conf (After+Wants+Requires evo.service + ExecStartPre ca.crt+:8443 readiness gate)"
+    #
+    # evo-ui.service NO LONGER gated on the framework at the
+    # unit level. Its base unit
+    # (evo-ui-eng/apps/evo-ui-runtime/scripts/device/
+    # evo-ui.service.in) binds :80/:443 early and serves the
+    # static shell + connecting surface; evo-ui-runtime's
+    # ca_watch hot-reloads the framework CA and self-heals
+    # `framework_proxy=false → true` without a restart when
+    # the framework comes up. A prior drop-in
+    # (evo-ui.service.d/depends-on-evo.conf) polled ca.crt +
+    # :8443 for up to 60s in ExecStartPre before the bind:
+    # the premise was false (self-heal already exists) and
+    # the gate added ~5s to bind for zero correctness value.
+    # Cleanup below removes any prior copy on re-provision.
+    if [ -f /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf ]; then
+        rm -f /etc/systemd/system/evo-ui.service.d/depends-on-evo.conf
+        echo "[bootstrap] removed stale evo-ui.service.d/depends-on-evo.conf (evo-ui self-heals via ca_watch; the readiness gate was a boot-delay without correctness value)"
+    fi
+    # rmdir the drop-in dir only when empty — leaves it in
+    # place if any other drop-in lives there.
+    rmdir /etc/systemd/system/evo-ui.service.d 2>/dev/null || true
 
     install -d -m 0755 -o root -g root /etc/systemd/system/evo-kiosk.service.d
     cat > /etc/systemd/system/evo-kiosk.service.d/depends-on-evo-ui.conf <<'EOF'
