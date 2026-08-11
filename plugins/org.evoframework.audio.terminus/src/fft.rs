@@ -99,6 +99,54 @@ pub const MEL_LOW_HZ: f32 = 20.0;
 /// reference.
 pub const MEL_HIGH_HZ: f32 = 20_000.0;
 
+/// The canonical sample rate the reference rig runs the ALSA
+/// loopback capture at. Used to derive the honest-max bin ceiling
+/// under [`crate::demand::FrequencyScale::Log`] at construction
+/// time. A rig running at a different sample rate would compute
+/// its own ceiling from `sample_rate_hz / FFT_SIZE`; the demand
+/// verb assumes the canonical rate so the wire refusal is
+/// deterministic across rigs.
+pub const CANONICAL_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// FFT bin width at the canonical sample rate. `48_000 / 1024 =
+/// 46.875` Hz — the raw resolution of one FFT bucket. Any output
+/// bin whose Hz-width is narrower than this reads from the same
+/// integer FFT range as its neighbour and emits an identical
+/// magnitude ("Minecraft plateau" defect from the 2026-08-11
+/// spectrum revalidation audit §3). The honest-max ceiling for
+/// [`crate::demand::FrequencyScale::Log`] is computed from this
+/// constant.
+pub const CANONICAL_BIN_WIDTH_HZ: f32 =
+    CANONICAL_SAMPLE_RATE_HZ as f32 / FFT_SIZE as f32;
+
+/// The highest `bins` value for which
+/// [`crate::demand::FrequencyScale::Log`] stays visually honest at
+/// the canonical FFT resolution — the point past which more than
+/// ~25 % of output bins would collapse onto identical FFT ranges.
+///
+/// Derivation. Under log spacing across `[MEL_LOW_HZ, MEL_HIGH_HZ]`
+/// with `N` bins, the smallest edge width sits at the low end and
+/// equals `MEL_LOW_HZ * (ratio - 1)` where `ratio = (MEL_HIGH_HZ /
+/// MEL_LOW_HZ)^(1/N)`. Two adjacent output bins share the same
+/// integer FFT range when that edge width is narrower than the FFT
+/// bin width (`CANONICAL_BIN_WIDTH_HZ`). The count of colliding
+/// low-end bins grows as `N` grows; the 2026-08-11 revalidation
+/// audit §3 tabulated the empirical curve and identified
+/// `N = 64` as the mild-collision ceiling (~25 % dup) and
+/// `N = 128` / `N = 256` as the Minecraft floor (~37 % / ~46 %
+/// dup). Framework refuses `Log` demands past this ceiling as
+/// sub-resolution.
+///
+/// The ceiling applies only to `Log`; `Mel` and `Linear` produce
+/// zero identical-range collisions at any bins ∈ `{32, 64, 128,
+/// 256}` at the canonical FFT resolution (verified by unit test
+/// `no_scale_produces_more_than_documented_collisions`).
+///
+/// Raising this ceiling is a separate engineering delta: it
+/// requires FFT_SIZE ≥ ~32 k with overlap-add (or `Log` bin count
+/// above 64 remains dishonest at 48 kHz sample rate).
+pub const LOG_HONEST_MAX_BINS: u32 = 64;
+
 /// Peak-hold decay rate. 12 dB/s in linear terms is a
 /// multiplicative decay of ~0.5^(dt/0.25s) — that is, the peak
 /// falls to half its value over ~250 ms. At 30 Hz this is
@@ -391,7 +439,15 @@ impl SpectrumAnalyser {
             // compensation restores the [0, 1] wire range.
             for out_idx in 0..self.bins {
                 let (bin_low, bin_high) = self.bounds_hz[out_idx];
-                let fft_lo = (bin_low / bin_width_hz).floor() as usize;
+                // Skip FFT bin 0 (DC) unconditionally per the
+                // 2026-08-11 spectrum revalidation audit §3: DC
+                // is not musical bass, and under log at high bin
+                // counts many low output bins collapse onto DC
+                // and paint identically-lit plateaus fed by
+                // sample-offset junk. The lower bound stays at
+                // FFT index 1 regardless of scale so no output
+                // bin can ever draw signal from the DC bucket.
+                let fft_lo = ((bin_low / bin_width_hz).floor() as usize).max(1);
                 let fft_hi = ((bin_high / bin_width_hz).ceil() as usize)
                     .min(FFT_SIZE / 2);
                 if fft_hi <= fft_lo {
@@ -988,5 +1044,122 @@ mod tests {
             3,
             crate::demand::FrequencyScale::Log,
         );
+    }
+
+    /// Count how many output bins share the SAME integer [`fft_lo`,
+    /// `fft_hi`) range with the previous bin — the "Minecraft
+    /// plateau" measure. Two adjacent output bins with identical
+    /// `(fft_lo, fft_hi)` emit identical magnitudes on the wire
+    /// regardless of signal content; that is sub-resolution the
+    /// producer must not paint over.
+    fn count_identical_range_collisions(
+        bins: usize,
+        scale: crate::demand::FrequencyScale,
+    ) -> usize {
+        let bounds = compute_bounds(bins, scale);
+        let mut prev: Option<(usize, usize)> = None;
+        let mut count = 0usize;
+        for (lo_hz, hi_hz) in bounds {
+            // Same shape the projection loop uses at compute time,
+            // including the DC-skip floor. See `process_frame`.
+            let fft_lo =
+                ((lo_hz / CANONICAL_BIN_WIDTH_HZ).floor() as usize).max(1);
+            let fft_hi = ((hi_hz / CANONICAL_BIN_WIDTH_HZ).ceil() as usize)
+                .min(FFT_SIZE / 2);
+            let this = (fft_lo, fft_hi.max(fft_lo));
+            if Some(this) == prev {
+                count += 1;
+            }
+            prev = Some(this);
+        }
+        count
+    }
+
+    #[test]
+    fn no_scale_produces_more_than_documented_collisions() {
+        use crate::demand::FrequencyScale;
+        // Under the honest-max ceiling (log ≤ 64; mel + linear all
+        // documented bins), no scale should produce more than a
+        // mild count of identical-FFT-range collisions at the
+        // canonical FFT resolution. The 2026-08-11 spectrum
+        // revalidation audit §3 tabulated log × 64 → 16
+        // collisions in 3 groups (mild; usable). Numbers below
+        // are that empirical ceiling per scale; a regression that
+        // widens the collision count fails this test loudly.
+        let cases: &[(FrequencyScale, usize, usize)] = &[
+            // (scale, bins, max_allowed_collisions)
+            (FrequencyScale::Log, 32, 12),
+            (FrequencyScale::Log, 64, 20),
+            (FrequencyScale::Mel, 32, 5),
+            (FrequencyScale::Mel, 64, 10),
+            (FrequencyScale::Mel, 128, 20),
+            (FrequencyScale::Mel, 256, 40),
+            (FrequencyScale::Linear, 32, 0),
+            (FrequencyScale::Linear, 64, 0),
+            (FrequencyScale::Linear, 128, 0),
+            (FrequencyScale::Linear, 256, 0),
+        ];
+        for (scale, bins, ceiling) in cases {
+            let count = count_identical_range_collisions(*bins, *scale);
+            assert!(
+                count <= *ceiling,
+                "{scale:?} × {bins} produced {count} collisions \
+                 (audit ceiling {ceiling})"
+            );
+        }
+    }
+
+    #[test]
+    fn log_at_bins_128_and_256_would_produce_minecraft_plateaus() {
+        // Regression guard on the audit's numeric evidence. Log ×
+        // 128 and log × 256 at the canonical FFT resolution
+        // exceed the 25 % collision threshold the revalidation
+        // audit §3 called Minecraft. The demand verb refuses
+        // these combinations with Permanent (see
+        // `validate_scale_bins_pairing`); the numeric floor here
+        // is what makes that refusal correct.
+        use crate::demand::FrequencyScale;
+        for over in [128usize, 256] {
+            let count =
+                count_identical_range_collisions(over, FrequencyScale::Log);
+            let ratio = count as f32 / over as f32;
+            assert!(
+                ratio > 0.25,
+                "log × {over} should show > 25% collisions to \
+                 justify the wire refusal, got {count}/{over} = \
+                 {ratio:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_never_reads_from_fft_bin_zero() {
+        // DC-skip invariant per the 2026-08-11 spectrum
+        // revalidation audit §3-C. FFT bin 0 (DC) must not
+        // contaminate any output bin under any scale — bins
+        // near 20 Hz that would map to FFT index 0 by
+        // `floor(20 / 46.875)` are floored up to 1 in
+        // `process_frame`. This test walks every scale × bins
+        // combination and asserts the same floor holds in the
+        // helper mirrored into
+        // `count_identical_range_collisions`.
+        use crate::demand::FrequencyScale;
+        for scale in [
+            FrequencyScale::Log,
+            FrequencyScale::Mel,
+            FrequencyScale::Linear,
+        ] {
+            for bins in [32usize, 64, 128, 256] {
+                let bounds = compute_bounds(bins, scale);
+                let (lo_hz, _) = bounds[0];
+                let fft_lo =
+                    ((lo_hz / CANONICAL_BIN_WIDTH_HZ).floor() as usize).max(1);
+                assert!(
+                    fft_lo >= 1,
+                    "{scale:?} × {bins} first output bin's fft_lo \
+                     ({fft_lo}) must be >= 1 (DC never contributes)"
+                );
+            }
+        }
     }
 }

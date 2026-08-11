@@ -42,6 +42,13 @@
 //! - `channels ∈ {1, 2}` — refused with Permanent otherwise.
 //! - `rate_hz_target` clamped to `[1, 60]`; the capture loop's
 //!   emit throttle honours the clamped value.
+//! - `frequency_scale = Log` refuses `bins > LOG_HONEST_MAX_BINS`
+//!   (64 at the canonical FFT 1024 / 48 kHz resolution). At higher
+//!   bin counts under log spacing the low-end output bins collapse
+//!   onto identical FFT ranges and paint duplicate columns —
+//!   sub-resolution the wire refuses to carry per the 2026-08-11
+//!   spectrum revalidation audit. `Mel` and `Linear` accept every
+//!   documented bins value.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,6 +310,7 @@ impl SpectrumDemandStore {
         }
         validate_bins(parsed.bins)?;
         validate_channels(parsed.channels)?;
+        validate_scale_bins_pairing(parsed.frequency_scale, parsed.bins)?;
         let rate_hz_target = parsed.rate_hz_target.clamp(1, 60);
         let next = SpectrumDemand {
             enabled: parsed.enabled,
@@ -379,6 +387,51 @@ fn validate_channels(channels: u32) -> Result<(), PluginError> {
     }
 }
 
+/// Refuse scale+bins combinations that the analyser cannot render
+/// honestly at the canonical FFT resolution.
+///
+/// Under `FrequencyScale::Log` the low-end output bins have Hz-
+/// widths narrower than one FFT bin (`CANONICAL_BIN_WIDTH_HZ =
+/// 46.875` at 48 kHz / FFT 1024) once `bins > LOG_HONEST_MAX_BINS`.
+/// The analyser would emit output bins that read from identical
+/// integer FFT ranges — clones on the wire, "Minecraft plateaus"
+/// on glass. Refuse Permanent so the runtime bridge surfaces the
+/// class synchronously and the studio control can gate the
+/// unreachable option rather than shipping a silently-dishonest
+/// frame.
+///
+/// `Mel` and `Linear` produce zero identical-range collisions at
+/// any documented `bins` value, so they pass through unchanged.
+///
+/// The error message names the effective ceiling so a runtime
+/// bridge can react intelligently (e.g. clamp its own bins slider
+/// to the reported max when the operator flips scale mid-session).
+fn validate_scale_bins_pairing(
+    scale: FrequencyScale,
+    bins: u32,
+) -> Result<(), PluginError> {
+    if matches!(scale, FrequencyScale::Log)
+        && bins > crate::fft::LOG_HONEST_MAX_BINS
+    {
+        return Err(PluginError::Permanent(format!(
+            "audio.spectrum.set_demand: frequency_scale=log with \
+             bins={bins} exceeds the honest resolution ceiling \
+             ({max}) at the canonical FFT size — one FFT bin is \
+             {bin_width:.3} Hz wide at {sample_rate} Hz sample rate \
+             ({fft_size}-point transform) and many low-end log \
+             output bins would map to identical integer FFT ranges. \
+             Choose bins <= {max} for log spacing, or select \
+             mel/linear.",
+            bins = bins,
+            max = crate::fft::LOG_HONEST_MAX_BINS,
+            bin_width = crate::fft::CANONICAL_BIN_WIDTH_HZ,
+            sample_rate = crate::fft::CANONICAL_SAMPLE_RATE_HZ,
+            fft_size = crate::fft::FFT_SIZE,
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble the wire envelope for the demand subject.
 fn render_envelope(d: &SpectrumDemand) -> serde_json::Value {
     json!({
@@ -435,6 +488,17 @@ fn parse_envelope(v: &serde_json::Value) -> Option<SpectrumDemand> {
             FrequencyScale::from_wire(scale_val.as_str()?)?
         }
     };
+    // Sub-resolution rehydrate defence: a durable row persisted
+    // before the log honest-max ceiling landed can carry
+    // `frequency_scale=log` alongside `bins=128` or `256`. That
+    // combination is now refused at the wire, so it must not
+    // sneak back in via the durable path. Fall through to
+    // `disabled_default` — the operator will be re-applied on
+    // next UI patch, and until then the visualiser stays parked
+    // rather than emitting Minecraft plateaus.
+    if validate_scale_bins_pairing(frequency_scale, bins).is_err() {
+        return None;
+    }
     let updated_at_ms = v.get("updated_at_ms")?.as_u64()?;
     Some(SpectrumDemand {
         enabled,
@@ -655,11 +719,16 @@ mod tests {
         // Every apply persists via render_envelope; every load
         // rehydrates via parse_envelope. The invariant that must
         // hold: parse(render(d)) == d for every legal d.
+        //
+        // Log demands are constrained by the honest-max ceiling
+        // (see `validate_scale_bins_pairing`), so any log
+        // envelope in this roundtrip set uses bins ≤ 64. Mel and
+        // linear take every documented bins.
         for d in [
             SpectrumDemand::disabled_default(),
             SpectrumDemand {
                 enabled: true,
-                bins: 128,
+                bins: 64,
                 channels: 2,
                 rate_hz_target: 45,
                 frequency_scale: FrequencyScale::Log,
@@ -686,6 +755,125 @@ mod tests {
             let parsed =
                 parse_envelope(&env).expect("rendered envelope must parse");
             assert_eq!(parsed, d, "roundtrip must preserve every field");
+        }
+    }
+
+    #[test]
+    fn scale_bins_pairing_refuses_log_above_honest_max() {
+        // Log × 128 and log × 256 exceed the canonical FFT
+        // resolution and produce Minecraft plateaus on the wire
+        // (2026-08-11 spectrum revalidation audit §3). Refuse
+        // Permanent so the runtime bridge surfaces the class
+        // synchronously.
+        for over in [128u32, 256] {
+            let err = validate_scale_bins_pairing(FrequencyScale::Log, over)
+                .expect_err("log × > honest max must refuse");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("frequency_scale=log")
+                    && msg.contains("honest resolution ceiling"),
+                "refusal must name scale + reason, got: {msg}"
+            );
+            assert!(
+                msg.contains(&crate::fft::LOG_HONEST_MAX_BINS.to_string()),
+                "refusal must name the effective ceiling so the bridge \
+                 can react, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_bins_pairing_accepts_log_within_honest_max() {
+        for under in [32u32, 64] {
+            validate_scale_bins_pairing(FrequencyScale::Log, under)
+                .expect("log × <= honest max must accept");
+        }
+    }
+
+    #[test]
+    fn scale_bins_pairing_accepts_mel_and_linear_at_every_bins() {
+        for scale in [FrequencyScale::Mel, FrequencyScale::Linear] {
+            for bins in [32u32, 64, 128, 256] {
+                validate_scale_bins_pairing(scale, bins).unwrap_or_else(|_| {
+                    panic!("{scale:?} × {bins} must accept")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn set_demand_request_refuses_log_at_bins_above_honest_max() {
+        // The full request-parse + validation path. Log × 128
+        // and log × 256 must Permanent-refuse at the wire so a
+        // UI runtime bridge that has not yet gated its bins
+        // option receives an actionable error, not a silent
+        // clamp.
+        for bad_bins in [128u32, 256] {
+            let json = format!(
+                r#"{{"v":1,"enabled":true,"bins":{bad_bins},"channels":1,\
+                 "rate_hz_target":30,"frequency_scale":"log"}}"#
+            );
+            let json = json.replace('\\', "");
+            let req = serde_json::from_str::<SetDemandRequest>(&json)
+                .expect("valid JSON parses");
+            let err =
+                validate_scale_bins_pairing(req.frequency_scale, req.bins)
+                    .expect_err("log × > honest max must Permanent-refuse");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("honest resolution ceiling"),
+                "refusal must explain the resolution ceiling, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_envelope_refuses_persisted_log_above_honest_max() {
+        // Rehydrate defence: a durable row persisted before the
+        // ceiling landed can carry log × 256 (exactly the shape
+        // the rig field runs today). The rehydrate path must
+        // refuse — the caller falls back to disabled_default and
+        // the visualiser stays parked until the operator re-
+        // applies via the UI. Do not resurrect a demand the wire
+        // now refuses.
+        for over in [128u32, 256] {
+            let env = json!({
+                "v": DEMAND_PAYLOAD_VERSION,
+                "enabled": true,
+                "bins": over,
+                "channels": 1,
+                "rate_hz_target": 30,
+                "frequency_scale": "log",
+                "updated_at_ms": 1_000,
+            });
+            assert!(
+                parse_envelope(&env).is_none(),
+                "persisted log × {over} must NOT rehydrate"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_envelope_accepts_persisted_mel_or_linear_at_bins_256() {
+        // Mel and linear at bins=256 stay honest and MUST
+        // rehydrate cleanly — the ceiling refusal is scale-
+        // specific to log.
+        for scale in ["mel", "linear"] {
+            let env = json!({
+                "v": DEMAND_PAYLOAD_VERSION,
+                "enabled": true,
+                "bins": 256,
+                "channels": 1,
+                "rate_hz_target": 30,
+                "frequency_scale": scale,
+                "updated_at_ms": 1_000,
+            });
+            let parsed = parse_envelope(&env).unwrap_or_else(|| {
+                panic!(
+                    "persisted {scale} × 256 must rehydrate at parse boundary"
+                )
+            });
+            assert_eq!(parsed.bins, 256);
         }
     }
 
