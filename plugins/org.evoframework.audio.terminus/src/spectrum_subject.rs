@@ -16,8 +16,8 @@
 //! { v: 1,
 //!   bins: 256,
 //!   channels: 2,
-//!   rate_hz: <actual capture-loop cadence, computed from
-//!            sample_rate_hz / FFT_SIZE via fft::frame_rate_hz>,
+//!   rate_hz: <wire emit target; compute cadence is
+//!            sample_rate_hz / HOP_SIZE via fft::frame_rate_hz>,
 //!   magnitudes: [[256 f32 L], [256 f32 R]],
 //!   peak_hold:  [[256 f32 L], [256 f32 R]],
 //!   onsets:     { sub_bass, bass, mid, high },

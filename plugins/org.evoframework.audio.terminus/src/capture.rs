@@ -59,7 +59,9 @@ use tokio::sync::{watch, Notify};
 
 use crate::demand::SpectrumDemand;
 use crate::emit_throttle::EmitThrottle;
-use crate::fft::{PerceptualFrame, SpectrumAnalyser, FFT_SIZE, INPUT_CHANNELS};
+use crate::fft::{
+    PerceptualFrame, SpectrumAnalyser, FFT_WINDOW, HOP_SIZE, INPUT_CHANNELS,
+};
 use crate::local_role::LocalRole;
 use crate::read_fail_class::{classify_read_failure, ReadFailClass};
 use crate::spectrum_subject;
@@ -408,11 +410,16 @@ fn run_fft_loop(
     demand: &watch::Receiver<SpectrumDemand>,
     interest: &watch::Receiver<u32>,
 ) -> InnerExit {
-    // S32_LE interleaved stereo: FFT_SIZE samples per channel
-    // -> FFT_SIZE * INPUT_CHANNELS i32s per frame.
-    let frame_samples: usize = FFT_SIZE * INPUT_CHANNELS;
-    let mut raw_buf = vec![0i32; frame_samples];
-    let mut f32_buf = vec![0.0f32; frame_samples];
+    // S32_LE interleaved stereo hop: HOP_SIZE frames per channel
+    // per ALSA read. Analysis uses an overlap ring of FFT_WINDOW
+    // frames (hop ≠ window) so frequency resolution improves
+    // without slowing the compute cadence.
+    let hop_samples: usize = HOP_SIZE * INPUT_CHANNELS;
+    let window_samples: usize = FFT_WINDOW * INPUT_CHANNELS;
+    let mut raw_buf = vec![0i32; hop_samples];
+    let mut hop_f32 = vec![0.0f32; hop_samples];
+    let mut ring = vec![0.0f32; window_samples];
+    let mut ring_frames: usize = 0;
 
     // Snapshot the analyser shape at inner-loop entry. A demand
     // change to bins, channels, or frequency_scale triggers
@@ -423,13 +430,14 @@ fn run_fft_loop(
     let entry_scale = analyser.frequency_scale();
 
     // F2C — wall-clock emit throttle. The inner FFT compute
-    // runs at ALSA hop rate (~47 Hz at 48 kHz / 1024-point);
-    // the wire emit is throttled independently to
-    // `demand.rate_hz_target` (typical 30). Compute keeps
-    // running for peak-hold + onset detection continuity; only
-    // the announcer.update_state call is gated. `get_spectrum_frame`
-    // still returns the latest frame regardless of throttle
-    // — the read verb serves the shared latest_frame slot.
+    // runs at ALSA hop rate (~47 Hz at 48 kHz / hop 1024) once
+    // the overlap ring is warm; the wire emit is throttled
+    // independently to `demand.rate_hz_target` (typical 30).
+    // Compute keeps running for peak-hold + onset detection
+    // continuity; only the announcer.update_state call is gated.
+    // `get_spectrum_frame` still returns the latest frame
+    // regardless of throttle — the read verb serves the shared
+    // latest_frame slot.
     //
     // Scheme details + regression-guarding tests live in the
     // `emit_throttle` module.
@@ -465,20 +473,37 @@ fn run_fft_loop(
                 consecutive_read_failures = 0;
                 frames_processed_this_session =
                     frames_processed_this_session.saturating_add(1);
-                if frames_read < FFT_SIZE {
-                    // Partial frame; drop and retry (next read
-                    // gets the remainder). FFT needs a full
-                    // frame.
+                if frames_read < HOP_SIZE {
+                    // Partial hop; drop and retry. Analysis
+                    // advances only on full hops.
                     continue;
                 }
                 // Convert i32 [-INT32_MAX, INT32_MAX] -> f32
                 // [-1, 1]. The S32_LE samples occupy the full
                 // 32-bit range; divide by max-int32 as f32.
                 let scale = 1.0f32 / (i32::MAX as f32);
-                for i in 0..frame_samples {
-                    f32_buf[i] = raw_buf[i] as f32 * scale;
+                for i in 0..hop_samples {
+                    hop_f32[i] = raw_buf[i] as f32 * scale;
                 }
-                let mut frame = analyser.process_frame(&f32_buf);
+                // Overlap ring: slide by one hop, append the new
+                // hop at the end. Warm up until FFT_WINDOW frames
+                // of audio have been seen before the first FFT.
+                if ring_frames >= FFT_WINDOW {
+                    ring.copy_within(hop_samples..window_samples, 0);
+                    ring[window_samples - hop_samples..]
+                        .copy_from_slice(&hop_f32);
+                } else {
+                    let start = ring_frames * INPUT_CHANNELS;
+                    let end = start + hop_samples;
+                    if end <= window_samples {
+                        ring[start..end].copy_from_slice(&hop_f32);
+                    }
+                    ring_frames = (ring_frames + HOP_SIZE).min(FFT_WINDOW);
+                    if ring_frames < FFT_WINDOW {
+                        continue;
+                    }
+                }
+                let mut frame = analyser.process_frame(&ring);
                 frame.at_ms = now_ms();
                 let frame_clone = clone_frame(&frame);
                 if let Ok(mut guard) = latest_frame.lock() {
@@ -680,8 +705,11 @@ fn open_capture(
         // jitter at 30 Hz emit cadence; small enough that the
         // first frame after a transport-state change reflects
         // current audio within one period.
-        hwp.set_period_size(FFT_SIZE as alsa::pcm::Frames, ValueOr::Nearest)?;
-        hwp.set_buffer_size_near((FFT_SIZE * 4) as alsa::pcm::Frames)?;
+        // Period follows the hop (not the analysis window) so
+        // ALSA delivers ~47 Hz ticks at 48 kHz while the
+        // overlap ring accumulates FFT_WINDOW samples.
+        hwp.set_period_size(HOP_SIZE as alsa::pcm::Frames, ValueOr::Nearest)?;
+        hwp.set_buffer_size_near((HOP_SIZE * 4) as alsa::pcm::Frames)?;
         pcm.hw_params(&hwp)?;
     }
     pcm.start()?;

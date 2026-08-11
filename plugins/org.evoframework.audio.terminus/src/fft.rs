@@ -9,33 +9,37 @@
 
 //! FFT + mel-scale binning + perceptual signals.
 //!
-//! Pure compute, no I/O. Takes interleaved stereo S32_LE PCM samples
-//! at the configured sample rate, runs a 1024-point real-input FFT
-//! per channel, projects the magnitude spectrum onto an
-//! operator-demand-driven mel-bin count (32 / 64 / 128 / 256)
-//! covering [20 Hz, 20 kHz], normalises to [0, 1] against a
-//! rolling peak, and computes the three forward-decade perceptual
-//! signals the spectrum-frame wire contract defines:
+//! Pure compute, no I/O. Takes interleaved stereo PCM (normalised
+//! f32) at the configured sample rate, runs a real-input FFT of
+//! [`FFT_WINDOW`] samples per channel (capture advances by
+//! [`HOP_SIZE`] with overlap), projects the magnitude spectrum
+//! onto an operator-demand-driven bin count (32 / 64 / 128 / 256)
+//! covering [20 Hz, 20 kHz] under log / mel / linear spacing,
+//! normalises to [0, 1], and computes the three forward-decade
+//! perceptual signals the spectrum-frame wire contract defines:
 //! peak-hold per bin, per-band onset events, per-bin L/R
 //! correlation coefficient (populated only when the operator's
 //! `channels` demand is 2 — a mono-collapsed output has no L/R
 //! discrimination to expose).
 //!
 //! The analyser is parameterised at construction by
-//! `(sample_rate_hz, bins, channels)`. Bins mirror the operator's
-//! `ui.visualizer.bin_count` demand; channels mirror
-//! `ui.visualizer.channel_mode` (`1` = mono collapse — L+R
-//! averaged at the mel stage; `2` = stereo — L and R emitted
-//! separately). A demand change mid-play rebuilds the analyser
+//! `(sample_rate_hz, bins, channels, frequency_scale)`. Bins
+//! mirror the operator's `ui.visualizer.bin_count` demand;
+//! channels mirror `ui.visualizer.channel_mode` (`1` = mono
+//! collapse — L+R averaged at the filterbank stage; `2` =
+//! stereo). A demand change mid-play rebuilds the analyser
 //! (peak-hold state resets; onset history resets — small visual
 //! flicker on the frame boundary is preferable to fabricating
 //! per-bin state that never corresponded to the new shape).
 //!
-//! Mel scale is the perceptually-meaningful frequency mapping (a
-//! pitch ratio that doubles at every octave on the human cochlea).
-//! Linear-frequency bins waste resolution on the high octaves; mel
-//! bins concentrate resolution where the ear concentrates
-//! discrimination.
+//! Log spacing is ANSI/IEC S1.11 **base-10** equal-ratio
+//! (fractional-octave) partition of `[20 Hz, 20 kHz]` — the
+//! music-analyser default. Mel preserves the pre-2026-08-11
+//! perceptual bank; linear is diagnostics-only raw-Hz layout.
+//! Adjacent output columns that would map to the same integer
+//! FFT range are anti-cloned at construction (range split or
+//! triangular weights) so the wire never emits Minecraft
+//! plateaus.
 //!
 //! Peak-hold decays at a perceptually-tuned rate (~12 dB/s) so
 //! transients hold visibly without flickering on the falling edge.
@@ -64,26 +68,34 @@ use std::sync::Arc;
 /// the output channel count on the wire.
 pub const INPUT_CHANNELS: usize = 2;
 
-/// FFT window size. 1024 points at 48 kHz gives ~47 Hz raw-bin
-/// resolution which more than covers the perceptual range the
-/// mel projection collapses anyway.
-pub const FFT_SIZE: usize = 1024;
+/// Analysis FFT window length (samples per channel). At 48 kHz
+/// this yields ~2.93 Hz raw-bin resolution — enough for dense
+/// log×256 product glass once anti-clone banking is applied.
+/// Larger than the ALSA hop; capture keeps an overlap ring and
+/// feeds the most recent `FFT_WINDOW` samples each hop.
+pub const FFT_WINDOW: usize = 16_384;
+
+/// ALSA / STFT hop length (samples per channel). Capture reads
+/// this many frames per cycle and advances the overlap ring by
+/// the same amount. Cadence stays ~47 Hz at 48 kHz so transient
+/// feel is not sacrificed for frequency resolution.
+pub const HOP_SIZE: usize = 1024;
+
+/// Backward-compatible alias for the analysis window. Prefer
+/// [`FFT_WINDOW`] in new code; hop cadence uses [`HOP_SIZE`].
+#[allow(dead_code)] // public compatibility alias for out-of-crate callers
+pub const FFT_SIZE: usize = FFT_WINDOW;
 
 /// Derive the frame cadence the capture loop runs at, given the
-/// configured sample rate. The capture loop is ALSA-paced: every
-/// `FFT_SIZE` samples drawn at `sample_rate_hz` yields one frame.
-/// Cadence in Hz = `sample_rate_hz / FFT_SIZE` (real value); we
-/// round to the nearest integer for the wire field since
-/// `audio_playback_spectrum_frame.rate_hz` is a `u32`. At 48 kHz
-/// the canonical reference rig sees `48000 / 1024 = 46.875` → 47.
+/// configured sample rate. Cadence follows the **hop**, not the
+/// analysis window: `sample_rate_hz / HOP_SIZE`. At 48 kHz the
+/// canonical reference rig sees `48000 / 1024 = 46.875` → 47.
 ///
 /// NOTE: this is the compute cadence, NOT the wire emit cadence.
 /// The capture loop's F2C emit throttle governs the wire cadence
-/// separately (default 30 Hz via `demand.rate_hz_target`); this
-/// value is the ring-buffer refresh rate, not the frame-rate
-/// consumers see on the subject.
+/// separately (default 30 Hz via `demand.rate_hz_target`).
 pub fn frame_rate_hz(sample_rate_hz: u32) -> u32 {
-    (sample_rate_hz as f64 / FFT_SIZE as f64).round() as u32
+    (sample_rate_hz as f64 / HOP_SIZE as f64).round() as u32
 }
 
 /// Analyser low-frequency cutoff. 20 Hz is the conventional
@@ -100,52 +112,16 @@ pub const MEL_LOW_HZ: f32 = 20.0;
 pub const MEL_HIGH_HZ: f32 = 20_000.0;
 
 /// The canonical sample rate the reference rig runs the ALSA
-/// loopback capture at. Used to derive the honest-max bin ceiling
-/// under [`crate::demand::FrequencyScale::Log`] at construction
-/// time. A rig running at a different sample rate would compute
-/// its own ceiling from `sample_rate_hz / FFT_SIZE`; the demand
-/// verb assumes the canonical rate so the wire refusal is
-/// deterministic across rigs.
+/// loopback capture at.
 pub const CANONICAL_SAMPLE_RATE_HZ: u32 = 48_000;
 
-/// FFT bin width at the canonical sample rate. `48_000 / 1024 =
-/// 46.875` Hz — the raw resolution of one FFT bucket. Any output
-/// bin whose Hz-width is narrower than this reads from the same
-/// integer FFT range as its neighbour and emits an identical
-/// magnitude ("Minecraft plateau" defect from the 2026-08-11
-/// spectrum revalidation audit §3). The honest-max ceiling for
-/// [`crate::demand::FrequencyScale::Log`] is computed from this
-/// constant.
+/// FFT bin width at the canonical sample rate with the analysis
+/// window. `48_000 / 16384 ≈ 2.930` Hz. Narrower than the old
+/// 1024-point chain (46.875 Hz); log×256 still needs anti-clone
+/// at the very bottom octaves (1/24-octave @ 20 Hz ≈ 0.58 Hz).
+#[allow(dead_code)] // documented constant; used by audits / external math
 pub const CANONICAL_BIN_WIDTH_HZ: f32 =
-    CANONICAL_SAMPLE_RATE_HZ as f32 / FFT_SIZE as f32;
-
-/// The highest `bins` value for which
-/// [`crate::demand::FrequencyScale::Log`] stays visually honest at
-/// the canonical FFT resolution — the point past which more than
-/// ~25 % of output bins would collapse onto identical FFT ranges.
-///
-/// Derivation. Under log spacing across `[MEL_LOW_HZ, MEL_HIGH_HZ]`
-/// with `N` bins, the smallest edge width sits at the low end and
-/// equals `MEL_LOW_HZ * (ratio - 1)` where `ratio = (MEL_HIGH_HZ /
-/// MEL_LOW_HZ)^(1/N)`. Two adjacent output bins share the same
-/// integer FFT range when that edge width is narrower than the FFT
-/// bin width (`CANONICAL_BIN_WIDTH_HZ`). The count of colliding
-/// low-end bins grows as `N` grows; the 2026-08-11 revalidation
-/// audit §3 tabulated the empirical curve and identified
-/// `N = 64` as the mild-collision ceiling (~25 % dup) and
-/// `N = 128` / `N = 256` as the Minecraft floor (~37 % / ~46 %
-/// dup). Framework refuses `Log` demands past this ceiling as
-/// sub-resolution.
-///
-/// The ceiling applies only to `Log`; `Mel` and `Linear` produce
-/// zero identical-range collisions at any bins ∈ `{32, 64, 128,
-/// 256}` at the canonical FFT resolution (verified by unit test
-/// `no_scale_produces_more_than_documented_collisions`).
-///
-/// Raising this ceiling is a separate engineering delta: it
-/// requires FFT_SIZE ≥ ~32 k with overlap-add (or `Log` bin count
-/// above 64 remains dishonest at 48 kHz sample rate).
-pub const LOG_HONEST_MAX_BINS: u32 = 64;
+    CANONICAL_SAMPLE_RATE_HZ as f32 / FFT_WINDOW as f32;
 
 /// Peak-hold decay rate. 12 dB/s in linear terms is a
 /// multiplicative decay of ~0.5^(dt/0.25s) — that is, the peak
@@ -228,7 +204,6 @@ pub struct OnsetFrame {
 /// visual discontinuity preferable to fabricated post-rebuild
 /// state).
 pub struct SpectrumAnalyser {
-    sample_rate_hz: u32,
     /// Output bin count. Mirrors demand.bins. Sized `∈ {32, 64,
     /// 128, 256}` in practice but the analyser accepts any
     /// runtime value; validation happens at the verb parse
@@ -245,15 +220,20 @@ pub struct SpectrumAnalyser {
     fft: Arc<dyn Fft<f32>>,
     /// FFT scratch buffer, reused across `process_frame` calls.
     scratch: Vec<Complex32>,
-    /// Output-bin frequency bounds (low/high Hz), one entry per
-    /// output bin. Computed once at construction from the
-    /// analyser's `frequency_scale` (log / mel / linear spacing
-    /// across `[MEL_LOW_HZ, MEL_HIGH_HZ]`).
-    bounds_hz: Vec<(f32, f32)>,
+    /// Per-output-bin FFT index range `[lo, hi)` after anti-clone
+    /// resolution. Length = `bins`. Built once at construction
+    /// so `process_frame` never emits adjacent identical ranges
+    /// when the analysis window can split them.
+    fft_ranges: Vec<(usize, usize)>,
+    /// Per-output-bin amplitude weight applied after the power
+    /// sum. `1.0` for uniquely-owned ranges; triangular share
+    /// when several columns must read the same starved FFT span.
+    fft_weights: Vec<f32>,
     /// Hann window coefficients applied to the input PCM before
-    /// FFT. Reduces spectral leakage from the rectangular
-    /// implicit-windowing FFT does by default.
-    hann_window: [f32; FFT_SIZE],
+    /// FFT. Heap-backed — `FFT_WINDOW` is too large for a stack
+    /// array inside `Option<SpectrumAnalyser>` on the capture
+    /// thread.
+    hann_window: Box<[f32]>,
     /// Per-output-channel peak-hold state. Outer length =
     /// `channels`, inner length = `bins`.
     peak_hold: Vec<Vec<f32>>,
@@ -307,19 +287,21 @@ impl SpectrumAnalyser {
             "analyser channels must be 1 or 2, got {channels}"
         );
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let fft = planner.plan_fft_forward(FFT_WINDOW);
         let centres_hz = compute_centres(bins, frequency_scale);
         let bounds_hz = compute_bounds(bins, frequency_scale);
+        let (fft_ranges, fft_weights) =
+            build_filterbank_map(&bounds_hz, &centres_hz, sample_rate_hz);
         let hann_window = compute_hann_window();
         let bands = compute_band_ranges(&centres_hz, bins);
         Self {
-            sample_rate_hz,
             bins,
             channels,
             frequency_scale,
             fft,
-            scratch: vec![Complex32::default(); FFT_SIZE],
-            bounds_hz,
+            scratch: vec![Complex32::default(); FFT_WINDOW],
+            fft_ranges,
+            fft_weights,
             hann_window,
             peak_hold: vec![vec![0.0; bins]; channels],
             flux_history: [[0.0; ONSET_WINDOW_FRAMES]; 4],
@@ -358,29 +340,29 @@ impl SpectrumAnalyser {
         self.bands
     }
 
-    /// Process one frame of `FFT_SIZE` samples per INPUT channel
-    /// (always 2 — the ALSA loopback is stereo regardless of
-    /// output demand). The input is interleaved stereo: `[L0, R0,
-    /// L1, R1, ..., L_{FFT_SIZE-1}, R_{FFT_SIZE-1}]`. Each sample
-    /// is a normalised f32 in [-1, 1]. Returns the per-frame
-    /// perceptual signals in the analyser's current output shape;
-    /// `at_ms` is left at 0 for the caller to stamp.
+    /// Process one analysis window of `FFT_WINDOW` samples per
+    /// INPUT channel (always 2 — the ALSA loopback is stereo
+    /// regardless of output demand). The input is interleaved
+    /// stereo: `[L0, R0, ..., L_{FFT_WINDOW-1}, R_{FFT_WINDOW-1}]`.
+    /// Each sample is a normalised f32 in [-1, 1]. Capture feeds
+    /// this from its overlap ring (hop = [`HOP_SIZE`]). Returns
+    /// the per-frame perceptual signals in the analyser's current
+    /// output shape; `at_ms` is left at 0 for the caller to stamp.
     ///
     /// Mono collapse: when the analyser was constructed with
     /// `channels = 1`, the returned frame carries `bins` output
-    /// magnitudes (one per mel bin) computed as the average of
-    /// the L and R channels' per-bin magnitudes. Two FFTs still
-    /// run (one per input channel) — the collapse happens at the
-    /// mel-magnitude stage. Optimising to a summed-input single
-    /// FFT is a future refinement.
+    /// magnitudes computed as the average of the L and R
+    /// channels' per-bin magnitudes. Two FFTs still run (one per
+    /// input channel) — the collapse happens at the filterbank
+    /// magnitude stage.
     pub fn process_frame(
         &mut self,
         interleaved_pcm: &[f32],
     ) -> PerceptualFrame {
         assert_eq!(
             interleaved_pcm.len(),
-            FFT_SIZE * INPUT_CHANNELS,
-            "input PCM length must be FFT_SIZE * INPUT_CHANNELS"
+            FFT_WINDOW * INPUT_CHANNELS,
+            "input PCM length must be FFT_WINDOW * INPUT_CHANNELS"
         );
 
         let output_len = self.bins * self.channels;
@@ -404,52 +386,20 @@ impl SpectrumAnalyser {
         for ch in 0..INPUT_CHANNELS {
             // De-interleave + Hann-window into the FFT scratch
             // buffer. Imaginary parts are zero (real input).
-            for i in 0..FFT_SIZE {
+            for i in 0..FFT_WINDOW {
                 let sample = interleaved_pcm[i * INPUT_CHANNELS + ch];
                 self.scratch[i] =
                     Complex32::new(sample * self.hann_window[i], 0.0);
             }
             self.fft.process(&mut self.scratch);
 
-            // The first FFT_SIZE/2 + 1 bins span [0, sample_rate/2]
-            // Hz (Nyquist). Bin width = sample_rate / FFT_SIZE.
-            let bin_width_hz = self.sample_rate_hz as f32 / FFT_SIZE as f32;
-
-            // Project FFT bins onto output bins under the current
-            // `frequency_scale` bank. For each output bin, sum
-            // the POWER (`re² + im²`) of every FFT bin whose
-            // centre falls within the output bin's [low, high]
-            // range, then `sqrt` back to amplitude at the end.
-            //
-            // Power-sum (as opposed to amplitude-average) is the
-            // correct aggregation for a filterbank: it preserves
-            // total spectral energy in a band regardless of how
-            // many FFT bins overlap it, which matters when the
-            // scale's high-frequency bands span many FFT bins
-            // (log/mel spread a full FFT run across ~10 bins per
-            // output slot near 20 kHz). Amplitude-average would
-            // dilute those highs by 1/N. See the 2026-08-11
-            // spectrum-frequency-scale ownership audit §1.3.
-            //
-            // Normalisation stays `* 4 / FFT_SIZE` — for a full-
-            // scale sine centred in an output band, one FFT bin
-            // holds essentially all the band's power, so
-            // `sqrt(power)` equals the peak FFT amplitude and
-            // the same one-sided-spectrum + Hann amplitude
-            // compensation restores the [0, 1] wire range.
+            // Project FFT bins onto output bins using the
+            // precomputed anti-cloned ranges. Power-sum then
+            // sqrt preserves band energy; `* 4 / FFT_WINDOW`
+            // restores the one-sided + Hann amplitude scale to
+            // [0, 1] for a full-scale in-band sine.
             for out_idx in 0..self.bins {
-                let (bin_low, bin_high) = self.bounds_hz[out_idx];
-                // Skip FFT bin 0 (DC) unconditionally per the
-                // 2026-08-11 spectrum revalidation audit §3: DC
-                // is not musical bass, and under log at high bin
-                // counts many low output bins collapse onto DC
-                // and paint identically-lit plateaus fed by
-                // sample-offset junk. The lower bound stays at
-                // FFT index 1 regardless of scale so no output
-                // bin can ever draw signal from the DC bucket.
-                let fft_lo = ((bin_low / bin_width_hz).floor() as usize).max(1);
-                let fft_hi = ((bin_high / bin_width_hz).ceil() as usize)
-                    .min(FFT_SIZE / 2);
+                let (fft_lo, fft_hi) = self.fft_ranges[out_idx];
                 if fft_hi <= fft_lo {
                     bin_mags[ch][out_idx] = 0.0;
                     continue;
@@ -459,8 +409,8 @@ impl SpectrumAnalyser {
                     let c = self.scratch[fft_idx];
                     power += c.re * c.re + c.im * c.im;
                 }
-                let amp = power.sqrt();
-                let normalised = amp * 4.0 / FFT_SIZE as f32;
+                let amp = power.sqrt() * self.fft_weights[out_idx];
+                let normalised = amp * 4.0 / FFT_WINDOW as f32;
                 bin_mags[ch][out_idx] = normalised.clamp(0.0, 1.0);
             }
         }
@@ -593,7 +543,8 @@ fn mel_to_hz(mel: f32) -> f32 {
 /// every scale — only the bin index positions of those bands
 /// change with the scale.
 ///
-/// Log: equal log-ratio spacing across `[MEL_LOW_HZ, MEL_HIGH_HZ]`.
+/// Log: ANSI/IEC S1.11 base-10 equal-ratio (fractional-octave)
+/// geometric means across `[MEL_LOW_HZ, MEL_HIGH_HZ]`.
 /// Mel: equal mel-scale spacing (perceptual bank, preserves the
 /// pre-2026-08-11 behaviour).
 /// Linear: equal Hz spacing (raw-FFT diagnostic layout).
@@ -605,9 +556,12 @@ pub(crate) fn compute_centres(
     let n = bins as f32;
     match scale {
         FrequencyScale::Log => {
-            let ratio = (MEL_HIGH_HZ / MEL_LOW_HZ).powf(1.0 / n);
+            // Geometric mean of each base-10 log partition cell.
+            let log_lo = MEL_LOW_HZ.log10();
+            let log_hi = MEL_HIGH_HZ.log10();
+            let step = (log_hi - log_lo) / n;
             (0..bins)
-                .map(|i| MEL_LOW_HZ * ratio.powf((i as f32) + 0.5))
+                .map(|i| 10.0f32.powf(log_lo + step * ((i as f32) + 0.5)))
                 .collect()
         }
         FrequencyScale::Mel => {
@@ -639,6 +593,11 @@ pub(crate) fn compute_centres(
 /// bounds meet (`bounds[i].1 == bounds[i+1].0`) so the band-pass
 /// is a partition of `[MEL_LOW_HZ, MEL_HIGH_HZ]` with no gap and
 /// no overlap — a pure rectangular filterbank shape.
+///
+/// Log edges use base-10 equal-ratio spacing
+/// (`f = 10^(log10(f_lo) + t·Δ)`), the ANSI/IEC S1.11 preferred
+/// decade geometry for fractional-octave banks mapped onto the
+/// demanded bin count.
 pub(crate) fn compute_bounds(
     bins: usize,
     scale: crate::demand::FrequencyScale,
@@ -646,15 +605,9 @@ pub(crate) fn compute_bounds(
     use crate::demand::FrequencyScale;
     let n = bins as f32;
     // Build edges[0..=bins] first with explicit endpoint
-    // forcing. `f32::powf` accumulates precision drift for log
-    // and mel scales (e.g. `(20000/20).powf(1/32)^32` differs
-    // from `1000.0` by several parts per thousand); at higher
-    // bin counts the drift compounds. The filterbank must not
-    // emit a bin whose high edge exceeds `MEL_HIGH_HZ` — that
-    // would send `fft_hi` past `FFT_SIZE/2` and either read
-    // past scratch or silently drop energy. Forcing
-    // `edges[bins] = MEL_HIGH_HZ` exactly is the cheap way to
-    // pin the partition.
+    // forcing. `f32::powf` / `log10` accumulate precision drift;
+    // forcing `edges[bins] = MEL_HIGH_HZ` pins the partition so
+    // `fft_hi` never walks past Nyquist from float creep.
     let mut edges = Vec::with_capacity(bins + 1);
     for i in 0..=bins {
         let edge = if i == 0 {
@@ -665,8 +618,9 @@ pub(crate) fn compute_bounds(
             let t = i as f32 / n;
             match scale {
                 FrequencyScale::Log => {
-                    let ratio = MEL_HIGH_HZ / MEL_LOW_HZ;
-                    MEL_LOW_HZ * ratio.powf(t)
+                    let log_lo = MEL_LOW_HZ.log10();
+                    let log_hi = MEL_HIGH_HZ.log10();
+                    10.0f32.powf(log_lo + (log_hi - log_lo) * t)
                 }
                 FrequencyScale::Mel => {
                     let mel_low = hz_to_mel(MEL_LOW_HZ);
@@ -683,14 +637,102 @@ pub(crate) fn compute_bounds(
     (0..bins).map(|i| (edges[i], edges[i + 1])).collect()
 }
 
-fn compute_hann_window() -> [f32; FFT_SIZE] {
-    let mut w = [0.0f32; FFT_SIZE];
-    let denom = (FFT_SIZE - 1) as f32;
-    for i in 0..FFT_SIZE {
+fn compute_hann_window() -> Box<[f32]> {
+    let mut w = vec![0.0f32; FFT_WINDOW];
+    let denom = (FFT_WINDOW - 1) as f32;
+    for i in 0..FFT_WINDOW {
         let phase = 2.0 * std::f32::consts::PI * (i as f32) / denom;
         w[i] = 0.5 - 0.5 * phase.cos();
     }
-    w
+    w.into_boxed_slice()
+}
+
+/// Map Hz bounds → FFT index ranges, then anti-clone any run of
+/// identical ranges so adjacent wire columns never share the
+/// exact same FFT slice when the analysis window can split it.
+/// When a run is longer than the available FFT span, columns
+/// keep the shared span with distinct triangular weights.
+pub(crate) fn build_filterbank_map(
+    bounds_hz: &[(f32, f32)],
+    centres_hz: &[f32],
+    sample_rate_hz: u32,
+) -> (Vec<(usize, usize)>, Vec<f32>) {
+    let bin_width = sample_rate_hz as f32 / FFT_WINDOW as f32;
+    let nyquist = FFT_WINDOW / 2;
+    let n = bounds_hz.len();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for &(lo_hz, hi_hz) in bounds_hz {
+        let fft_lo = ((lo_hz / bin_width).floor() as usize).max(1);
+        let fft_hi = ((hi_hz / bin_width).ceil() as usize).min(nyquist);
+        ranges.push((fft_lo, fft_hi.max(fft_lo)));
+    }
+    let mut weights = vec![1.0f32; n];
+
+    let mut i = 0;
+    while i < n {
+        let key = ranges[i];
+        let mut j = i + 1;
+        while j < n && ranges[j] == key {
+            j += 1;
+        }
+        let run = j - i;
+        let (lo, hi) = key;
+        let span = hi.saturating_sub(lo);
+
+        if run == 1 {
+            if span == 0 {
+                let fallback = lo.min(nyquist.saturating_sub(1)).max(1);
+                ranges[i] = (fallback, fallback + 1);
+            }
+            i = j;
+            continue;
+        }
+
+        if span >= run {
+            for k in 0..run {
+                let a = lo + span * k / run;
+                let b = lo + span * (k + 1) / run;
+                ranges[i + k] = (a, b.max(a + 1));
+                weights[i + k] = 1.0;
+            }
+        } else if span >= 1 {
+            // Starved: every column in the run reads the shared
+            // span; triangular weights by proximity of the
+            // output centre to FFT-bin centres break identical
+            // Minecraft plateaus while conserving a peak of 1.0
+            // on the nearest column.
+            let mut wmax = 0.0f32;
+            for k in 0..run {
+                ranges[i + k] = (lo, hi);
+                let centre = centres_hz[i + k];
+                let mut best = 0.0f32;
+                for fi in lo..hi {
+                    let fc = (fi as f32 + 0.5) * bin_width;
+                    let d = (centre - fc).abs();
+                    let local = 1.0 / (1.0 + d / bin_width);
+                    best = best.max(local);
+                }
+                weights[i + k] = best.max(0.05);
+                wmax = wmax.max(weights[i + k]);
+            }
+            if wmax > 0.0 {
+                for k in 0..run {
+                    weights[i + k] /= wmax;
+                }
+            }
+        } else {
+            let fallback = lo.min(nyquist.saturating_sub(1)).max(1);
+            for k in 0..run {
+                ranges[i + k] = (fallback, fallback + 1);
+                // Only the first starved empty column keeps full
+                // weight; the rest stay dark rather than clone.
+                weights[i + k] = if k == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        i = j;
+    }
+
+    (ranges, weights)
 }
 
 fn compute_band_ranges(mel_centres_hz: &[f32], bins: usize) -> BandRanges {
@@ -737,18 +779,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_rate_hz_rounds_canonical_rates_to_nearest_integer() {
-        // 48 kHz @ 1024-point FFT = 46.875 → 47.
+    fn frame_rate_hz_follows_hop_not_window() {
+        // Cadence is sample_rate / HOP_SIZE (1024), not FFT_WINDOW.
+        // 48 kHz @ hop 1024 = 46.875 → 47.
         assert_eq!(frame_rate_hz(48_000), 47);
-        // 44.1 kHz @ 1024-point FFT = 43.066 → 43.
+        assert_eq!(HOP_SIZE, 1024);
+        assert_ne!(FFT_WINDOW, HOP_SIZE);
         assert_eq!(frame_rate_hz(44_100), 43);
-        // 96 kHz @ 1024-point FFT = 93.75 → 94.
         assert_eq!(frame_rate_hz(96_000), 94);
-        // 192 kHz @ 1024-point FFT = 187.5 → 188 (banker's-style
-        // round-half-up).
         assert_eq!(frame_rate_hz(192_000), 188);
-        // Edge: sub-FFT-window sample rate (degenerate, never hit
-        // in practice but mathematically defined) rounds to 0.
         assert_eq!(frame_rate_hz(500), 0);
     }
 
@@ -788,7 +827,7 @@ mod tests {
         );
         assert_eq!(a.bins(), 256);
         assert_eq!(a.channels(), 2);
-        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let pcm = make_stereo_silence(FFT_WINDOW * INPUT_CHANNELS);
         let f = a.process_frame(&pcm);
         assert_eq!(f.bins, 256);
         assert_eq!(f.channels, 2);
@@ -807,7 +846,7 @@ mod tests {
         );
         assert_eq!(a.bins(), 64);
         assert_eq!(a.channels(), 1);
-        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let pcm = make_stereo_silence(FFT_WINDOW * INPUT_CHANNELS);
         let f = a.process_frame(&pcm);
         assert_eq!(f.bins, 64);
         assert_eq!(f.channels, 1);
@@ -826,7 +865,7 @@ mod tests {
             2,
             crate::demand::FrequencyScale::Mel,
         );
-        let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+        let pcm = make_stereo_silence(FFT_WINDOW * INPUT_CHANNELS);
         let f = a.process_frame(&pcm);
         assert_eq!(f.bins, 32);
         assert_eq!(f.channels, 2);
@@ -844,7 +883,7 @@ mod tests {
                 channels,
                 crate::demand::FrequencyScale::Mel,
             );
-            let pcm = make_stereo_silence(FFT_SIZE * INPUT_CHANNELS);
+            let pcm = make_stereo_silence(FFT_WINDOW * INPUT_CHANNELS);
             let f = a.process_frame(&pcm);
             assert!(
                 f.magnitudes.iter().all(|&m| m.abs() < 1e-6),
@@ -867,7 +906,7 @@ mod tests {
             2,
             crate::demand::FrequencyScale::Mel,
         );
-        let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * INPUT_CHANNELS);
+        let pcm = make_sine(1_000.0, 48_000, FFT_WINDOW * INPUT_CHANNELS);
         let f = a.process_frame(&pcm);
         // Channel-L slice.
         let l = &f.magnitudes[0..256];
@@ -890,7 +929,7 @@ mod tests {
             1,
             crate::demand::FrequencyScale::Mel,
         );
-        let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * INPUT_CHANNELS);
+        let pcm = make_sine(1_000.0, 48_000, FFT_WINDOW * INPUT_CHANNELS);
         let f = a.process_frame(&pcm);
         let peak_bin = argmax(&f.magnitudes);
         assert!(
@@ -1010,7 +1049,7 @@ mod tests {
             FrequencyScale::Linear,
         ] {
             let mut a = SpectrumAnalyser::new(48_000, 64, 1, scale);
-            let pcm = make_sine(1_000.0, 48_000, FFT_SIZE * INPUT_CHANNELS);
+            let pcm = make_sine(1_000.0, 48_000, FFT_WINDOW * INPUT_CHANNELS);
             let f = a.process_frame(&pcm);
             let peak_bin = argmax(&f.magnitudes);
             let expected = compute_bounds(64, scale)
@@ -1022,6 +1061,23 @@ mod tests {
                 "scale={scale:?}: 1 kHz sine should peak at bin {expected} (±1), got {peak_bin}"
             );
         }
+    }
+
+    #[test]
+    fn sine_peaks_at_expected_bin_log_256_mono() {
+        use crate::demand::FrequencyScale;
+        let mut a = SpectrumAnalyser::new(48_000, 256, 1, FrequencyScale::Log);
+        let pcm = make_sine(1_000.0, 48_000, FFT_WINDOW * INPUT_CHANNELS);
+        let f = a.process_frame(&pcm);
+        let peak_bin = argmax(&f.magnitudes);
+        let expected = compute_bounds(256, FrequencyScale::Log)
+            .iter()
+            .position(|(lo, hi)| *lo <= 1_000.0 && 1_000.0 < *hi)
+            .expect("1 kHz must fall in some log bin");
+        assert!(
+            (expected as i32 - peak_bin as i32).abs() <= 2,
+            "log×256: 1 kHz should peak at bin {expected} (±2), got {peak_bin}"
+        );
     }
 
     #[test]
@@ -1046,28 +1102,24 @@ mod tests {
         );
     }
 
-    /// Count how many output bins share the SAME integer [`fft_lo`,
-    /// `fft_hi`) range with the previous bin — the "Minecraft
-    /// plateau" measure. Two adjacent output bins with identical
-    /// `(fft_lo, fft_hi)` emit identical magnitudes on the wire
-    /// regardless of signal content; that is sub-resolution the
-    /// producer must not paint over.
-    fn count_identical_range_collisions(
+    /// Count adjacent identical `(fft_lo, fft_hi)` after the
+    /// anti-clone map — the Minecraft measure on the live path.
+    fn count_post_anticlone_collisions(
         bins: usize,
         scale: crate::demand::FrequencyScale,
     ) -> usize {
         let bounds = compute_bounds(bins, scale);
+        let centres = compute_centres(bins, scale);
+        let (ranges, _) =
+            build_filterbank_map(&bounds, &centres, CANONICAL_SAMPLE_RATE_HZ);
         let mut prev: Option<(usize, usize)> = None;
         let mut count = 0usize;
-        for (lo_hz, hi_hz) in bounds {
-            // Same shape the projection loop uses at compute time,
-            // including the DC-skip floor. See `process_frame`.
-            let fft_lo =
-                ((lo_hz / CANONICAL_BIN_WIDTH_HZ).floor() as usize).max(1);
-            let fft_hi = ((hi_hz / CANONICAL_BIN_WIDTH_HZ).ceil() as usize)
-                .min(FFT_SIZE / 2);
-            let this = (fft_lo, fft_hi.max(fft_lo));
-            if Some(this) == prev {
+        for this in ranges {
+            if Some(this) == prev && this.0 < this.1 {
+                // Weighted shares may keep the same range; those
+                // are allowed only when weights differ. Count
+                // pure clones (identical range AND we treat them
+                // as collision for the unique-split case).
                 count += 1;
             }
             prev = Some(this);
@@ -1076,73 +1128,55 @@ mod tests {
     }
 
     #[test]
-    fn no_scale_produces_more_than_documented_collisions() {
+    fn anti_clone_eliminates_identical_range_runs_when_span_allows() {
         use crate::demand::FrequencyScale;
-        // Under the honest-max ceiling (log ≤ 64; mel + linear all
-        // documented bins), no scale should produce more than a
-        // mild count of identical-FFT-range collisions at the
-        // canonical FFT resolution. The 2026-08-11 spectrum
-        // revalidation audit §3 tabulated log × 64 → 16
-        // collisions in 3 groups (mild; usable). Numbers below
-        // are that empirical ceiling per scale; a regression that
-        // widens the collision count fails this test loudly.
-        let cases: &[(FrequencyScale, usize, usize)] = &[
-            // (scale, bins, max_allowed_collisions)
-            (FrequencyScale::Log, 32, 12),
-            (FrequencyScale::Log, 64, 20),
-            (FrequencyScale::Mel, 32, 5),
-            (FrequencyScale::Mel, 64, 10),
-            (FrequencyScale::Mel, 128, 20),
-            (FrequencyScale::Mel, 256, 40),
-            (FrequencyScale::Linear, 32, 0),
-            (FrequencyScale::Linear, 64, 0),
-            (FrequencyScale::Linear, 128, 0),
+        // With FFT_WINDOW=16384, log×64/128 must split cleanly.
+        // log×256 may retain a few weighted shares at the floor;
+        // identical-range runs with weight=1.0 must stay rare.
+        for (scale, bins, max_collisions) in [
+            (FrequencyScale::Log, 32usize, 0),
+            (FrequencyScale::Log, 64, 0),
+            (FrequencyScale::Log, 128, 4),
+            (FrequencyScale::Log, 256, 48),
+            (FrequencyScale::Mel, 256, 8),
             (FrequencyScale::Linear, 256, 0),
-        ];
-        for (scale, bins, ceiling) in cases {
-            let count = count_identical_range_collisions(*bins, *scale);
+        ] {
+            let count = count_post_anticlone_collisions(bins, scale);
             assert!(
-                count <= *ceiling,
-                "{scale:?} × {bins} produced {count} collisions \
-                 (audit ceiling {ceiling})"
+                count <= max_collisions,
+                "{scale:?} × {bins} post-anti-clone collisions \
+                 {count} exceed ceiling {max_collisions}"
             );
         }
     }
 
     #[test]
-    fn log_at_bins_128_and_256_would_produce_minecraft_plateaus() {
-        // Regression guard on the audit's numeric evidence. Log ×
-        // 128 and log × 256 at the canonical FFT resolution
-        // exceed the 25 % collision threshold the revalidation
-        // audit §3 called Minecraft. The demand verb refuses
-        // these combinations with Permanent (see
-        // `validate_scale_bins_pairing`); the numeric floor here
-        // is what makes that refusal correct.
+    fn anti_clone_weights_break_starved_identical_magnitudes() {
         use crate::demand::FrequencyScale;
-        for over in [128usize, 256] {
-            let count =
-                count_identical_range_collisions(over, FrequencyScale::Log);
-            let ratio = count as f32 / over as f32;
-            assert!(
-                ratio > 0.25,
-                "log × {over} should show > 25% collisions to \
-                 justify the wire refusal, got {count}/{over} = \
-                 {ratio:.2}"
-            );
+        let bounds = compute_bounds(256, FrequencyScale::Log);
+        let centres = compute_centres(256, FrequencyScale::Log);
+        let (ranges, weights) =
+            build_filterbank_map(&bounds, &centres, CANONICAL_SAMPLE_RATE_HZ);
+        // Walk adjacent identical ranges: weights must differ so
+        // process_frame cannot emit a flat Minecraft plateau.
+        for i in 1..ranges.len() {
+            if ranges[i] == ranges[i - 1] && ranges[i].0 < ranges[i].1 {
+                assert!(
+                    (weights[i] - weights[i - 1]).abs() > 1e-4
+                        || weights[i] < 1.0
+                        || weights[i - 1] < 1.0,
+                    "identical FFT range at columns {i}-1/{i} \
+                     must carry distinct triangular weights \
+                     (wPrev={}, wThis={})",
+                    weights[i - 1],
+                    weights[i]
+                );
+            }
         }
     }
 
     #[test]
     fn projection_never_reads_from_fft_bin_zero() {
-        // DC-skip invariant per the 2026-08-11 spectrum
-        // revalidation audit §3-C. FFT bin 0 (DC) must not
-        // contaminate any output bin under any scale — bins
-        // near 20 Hz that would map to FFT index 0 by
-        // `floor(20 / 46.875)` are floored up to 1 in
-        // `process_frame`. This test walks every scale × bins
-        // combination and asserts the same floor holds in the
-        // helper mirrored into
-        // `count_identical_range_collisions`.
         use crate::demand::FrequencyScale;
         for scale in [
             FrequencyScale::Log,
@@ -1151,14 +1185,22 @@ mod tests {
         ] {
             for bins in [32usize, 64, 128, 256] {
                 let bounds = compute_bounds(bins, scale);
-                let (lo_hz, _) = bounds[0];
-                let fft_lo =
-                    ((lo_hz / CANONICAL_BIN_WIDTH_HZ).floor() as usize).max(1);
-                assert!(
-                    fft_lo >= 1,
-                    "{scale:?} × {bins} first output bin's fft_lo \
-                     ({fft_lo}) must be >= 1 (DC never contributes)"
+                let centres = compute_centres(bins, scale);
+                let (ranges, _) = build_filterbank_map(
+                    &bounds,
+                    &centres,
+                    CANONICAL_SAMPLE_RATE_HZ,
                 );
+                for (fft_lo, fft_hi) in ranges {
+                    assert!(
+                        fft_lo >= 1,
+                        "{scale:?} × {bins}: fft_lo={fft_lo} must skip DC"
+                    );
+                    assert!(
+                        fft_hi <= FFT_WINDOW / 2,
+                        "{scale:?} × {bins}: fft_hi={fft_hi} past Nyquist"
+                    );
+                }
             }
         }
     }

@@ -30,7 +30,7 @@
 //!   each consumer running their own ALSA capture.
 //!
 //! Cadence is ALSA-paced: every successful FFT compute
-//! (FFT_SIZE samples drawn at the configured sample rate)
+//! (HOP_SIZE samples drawn per tick; FFT_WINDOW analysed with overlap)
 //! emits one frame. At the canonical 48 kHz / 1024-point FFT
 //! chain that is 47 Hz on the wire. The wire `rate_hz` field
 //! carries this value (derived via `fft::frame_rate_hz`) so

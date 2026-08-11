@@ -42,7 +42,7 @@ verb dispatch.
 | --- | --- | --- |
 | `v` | `u32` | Envelope version. `1` today. |
 | `enabled` | `bool` | Producer gate. `false` → PCM released + no FFT + no emit. `true` → capture opens (subject to transport + role gates). |
-| `bins` | `u32` | Output bin count. Enum: `32 \| 64 \| 128 \| 256`. Refused with Permanent outside the enum. Additional pairing rule: `frequency_scale = "log"` refuses `bins > 64` with Permanent (honest-resolution ceiling at the canonical 48 kHz / FFT 1024 chain — one FFT bucket is ~46.9 Hz wide, and log-spaced bins above 64 map many output slots onto identical integer FFT ranges). `"mel"` and `"linear"` accept every enum value. |
+| `bins` | `u32` | Output bin count. Enum: `32 \| 64 \| 128 \| 256`. Refused with Permanent outside the enum. Every scale accepts every enum value — including `"log"` × 256. Honesty at dense log counts is the analyser's job (FFT window 16384 + hop 1024 overlap + anti-clone banking per ADR-0170), not a product refuse on this field. |
 | `channels` | `u32` | Channel mode. Enum: `1 \| 2` (`1` = mono; `2` = stereo). Refused with Permanent outside the enum. |
 | `rate_hz_target` | `u32` | Emit throttle target in Hz. Clamped to `[1, 60]` at the plugin; typical value `30`. |
 | `frequency_scale` | `string` | Frequency-bin spacing across `[20, 20000]` Hz. Enum: `"log" \| "mel" \| "linear"`. Default `"log"` (music-analyser convention). Refused with Permanent outside the enum. Absent field (older UI runtime bridge that has not been upgraded) parses to `"log"`. |
@@ -51,17 +51,17 @@ verb dispatch.
 **Addressing:** `evo.audio.playback:spectrum_demand`.
 **Cardinality:** singleton per device.
 
-**Disabled default (plugin load):** `{ enabled: false, bins: 64, channels: 1, rate_hz_target: 30, frequency_scale: "log", updated_at_ms: 0 }` — matches the pre-supersession baseline (no spectrum activity on a device where the operator has never touched `ui.visualizer.*`). `frequency_scale` defaults to `"log"` per the 2026-08-11 spectrum-frequency-scale ownership audit — the log axis is the music-analyser convention and the default the wire lands at when no prior demand has been persisted.
+**Disabled default (plugin load):** `{ enabled: false, bins: 256, channels: 1, rate_hz_target: 30, frequency_scale: "log", updated_at_ms: 0 }` — dense log×256 music-analyser default, parked until the operator enables the visualiser. `frequency_scale` defaults to `"log"` (music-analyser convention).
 
 **Frequency scale semantics:**
 
-- **`"log"`** (default) — equal log-ratio spacing across `[20, 20000]` Hz. Allocates ~37 % of the equal-width columns to 20–250 Hz (columns stay the same pixel width under every scale — only which Hz feeds each column changes). Matches the industry music-analyser default (audioMotion, TrueRTA, most SPL meters); recommended for every music-heavy device.
+- **`"log"`** (default) — ANSI/IEC S1.11 base-10 equal-ratio (fractional-octave) spacing across `[20, 20000]` Hz. Allocates ~37 % of the equal-width columns to 20–250 Hz (columns stay the same pixel width under every scale — only which Hz feeds each column changes). Matches the industry music-analyser default (audioMotion, TrueRTA, most SPL meters); recommended for every music-heavy device.
 - **`"mel"`** — equal mel-scale spacing (perceptual-loudness bank the plugin originally shipped). Allocates ~8 % of the equal-width columns to 20–250 Hz. Better than linear for perception, but noticeably left-parked for music. Retained for operators who preferred the pre-2026-08-11 look.
 - **`"linear"`** — equal Hz spacing (raw-FFT diagnostic layout). Allocates ~1 % of the equal-width columns to 20–250 Hz. Useful for engineering visualisation of raw spectrum energy; not recommended as a music-playback default.
 
 Column pitch on glass is `width / bins` under every scale — no scale ever changes bar width. What each scale changes is the Hz range feeding each column: `"log"` gives many equal-width columns to the bass, `"mel"` gives fewer, `"linear"` gives one or two. A renderer that widens or narrows columns per scale is remapping the wire and violates the contract.
 
-**Honest-resolution ceiling for `"log"`:** at the canonical 48 kHz / FFT 1024 chain one FFT bucket is ~46.875 Hz wide, but log spacing produces output bins ~0.55 Hz wide at 20 Hz for `bins = 256` (and ~1.1 Hz wide for `bins = 128`). Many low-end output bins would then map to the same integer FFT range and paint identical column heights — visible as "Minecraft plateaus" across the left third of the display. The wire refuses `bins > 64` when `frequency_scale = "log"` for exactly this reason. `"mel"` and `"linear"` produce no such identical-range collisions at any documented `bins` value. Raising the log ceiling above 64 requires a larger analysis FFT with overlap-add — separate engineering delta.
+**Analysis chain (ADR-0170):** capture advances by `HOP_SIZE = 1024` samples per channel (~47 Hz at 48 kHz) while each FFT analyses the most recent `FFT_WINDOW = 16384` samples from an overlap ring. Log/mel/linear banks project onto the demanded bin count; an anti-clone stage splits or weight-shares any adjacent columns that would otherwise read identical FFT ranges ("Minecraft plateaus"). There is **no** product bin-cap refuse for log.
 
 **DC-skip:** the projection loop unconditionally skips FFT bin 0 (DC). DC carries no musical content and would otherwise feed the very lowest log-scale output bins, painting a false low-end plateau from sample-offset noise. This hygiene applies under every scale.
 
@@ -81,7 +81,7 @@ Dispatched via the plugin's respondent surface on the
 {
   "v":               1,
   "enabled":         true,
-  "bins":            64,
+  "bins":            256,
   "channels":        1,
   "rate_hz_target":  30,
   "frequency_scale": "log"
@@ -96,7 +96,7 @@ Dispatched via the plugin's respondent surface on the
   "applied": {
     "v":               1,
     "enabled":         true,
-    "bins":            64,
+    "bins":            256,
     "channels":        1,
     "rate_hz_target":  30,
     "frequency_scale": "log",
@@ -109,17 +109,7 @@ Dispatched via the plugin's respondent surface on the
 
 **Absent `frequency_scale` on the wire** defaults to `"log"` at the verb parse boundary — the compatibility hatch for an older UI runtime bridge that has not been upgraded. UI landing the setting in the same release train removes the hatch's steady-state role; absence remains supported for future forward compatibility.
 
-**Scale + bins pairing refusal:** the verb refuses Permanent when `frequency_scale = "log"` is paired with `bins > 64`. The error message names the effective ceiling, the FFT bucket width, the canonical sample rate, and the FFT size so a runtime bridge can react synchronously (surface the class to the operator, clamp its own slider to the reported max, or gate the unreachable option in the studio control). Example error body:
-
-```text
-audio.spectrum.set_demand: frequency_scale=log with bins=256 exceeds the
-honest resolution ceiling (64) at the canonical FFT size — one FFT bin is
-46.875 Hz wide at 48000 Hz sample rate (1024-point transform) and many
-low-end log output bins would map to identical integer FFT ranges.
-Choose bins <= 64 for log spacing, or select mel/linear.
-```
-
-The runtime bridge SHOULD gate its bins option per scale so the operator never picks a combination the wire refuses; the refusal is the last-defence contract, not the primary UX. A UI that has not yet gated will see the refusal on the first `set_demand` after the operator flips log × 128 or 256, and its `try_apply_demand` helper will report `applied.bins != requested.bins` (in fact no apply happened because the verb refused).
+**Scale × bins:** every documented pairing is accepted. The former log honest-max refuse (ADR-0169) is retired by ADR-0170.
 
 ---
 
