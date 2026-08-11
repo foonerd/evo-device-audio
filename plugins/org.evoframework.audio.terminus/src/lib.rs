@@ -9,10 +9,9 @@
 //! invariant contract). The plugin owns:
 //!
 //! - **Spectrum FFT compute.** Demand-driven bin count + channel
-//!   count + frequency scale (log / mel / linear; default log per
-//!   the 2026-08-11 spectrum-frequency-scale ownership audit)
-//!   Float32
-//!   FFT at 30 Hz, with peak-hold per bin (perceptual decay),
+//!   count + frequency scale (log / mel / linear; default log —
+//!   the music-analyser convention) Float32 FFT at 30 Hz, with
+//!   peak-hold per bin (perceptual decay),
 //!   per-band onset event detection (sub_bass / bass / mid / high),
 //!   and L/R correlation per bin for stereo-imaging visualisations.
 //!   Emits the `audio_playback_spectrum_frame` subject on the

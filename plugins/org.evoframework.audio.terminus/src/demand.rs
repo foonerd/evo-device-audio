@@ -94,8 +94,7 @@ pub enum FrequencyScale {
     /// convention.
     #[default]
     Log,
-    /// Equal mel-scale spacing. Prior default (pre-2026-08-11
-    /// spectrum frequency-scale ownership audit).
+    /// Equal mel-scale spacing. Prior default (perceptual bank).
     Mel,
     /// Equal Hz spacing. Diagnostics only.
     Linear,

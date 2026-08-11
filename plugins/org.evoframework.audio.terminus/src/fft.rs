@@ -34,8 +34,8 @@
 //!
 //! Log spacing is ANSI/IEC S1.11 **base-10** equal-ratio
 //! (fractional-octave) partition of `[20 Hz, 20 kHz]` — the
-//! music-analyser default. Mel preserves the pre-2026-08-11
-//! perceptual bank; linear is diagnostics-only raw-Hz layout.
+//! music-analyser default. Mel preserves the prior perceptual
+//! bank; linear is diagnostics-only raw-Hz layout.
 //! Adjacent output columns that would map to the same integer
 //! FFT range are anti-cloned at construction (range split or
 //! triangular weights) so the wire never emits Minecraft
@@ -102,7 +102,7 @@ pub fn frame_rate_hz(sample_rate_hz: u32) -> u32 {
 /// audible-band lower bound. Same value for every
 /// [`FrequencyScale`] — only the spacing across `[low, high]`
 /// differs. Kept as `MEL_LOW_HZ` for backward reference; the
-/// name is legacy from the mel-only era pre-2026-08-11.
+/// name is legacy from the mel-only era.
 pub const MEL_LOW_HZ: f32 = 20.0;
 
 /// Analyser high-frequency cutoff. 20 kHz is the conventional
@@ -270,9 +270,9 @@ impl SpectrumAnalyser {
     /// - `frequency_scale` is the operator's demanded bin
     ///   spacing across `[MEL_LOW_HZ, MEL_HIGH_HZ]`.
     ///   [`Log`](crate::demand::FrequencyScale::Log) matches
-    ///   music-analyser convention (default per the 2026-08-11
-    ///   ownership audit); [`Mel`](crate::demand::FrequencyScale::Mel)
-    ///   preserves the pre-audit shape;
+    ///   music-analyser convention (the default);
+    ///   [`Mel`](crate::demand::FrequencyScale::Mel) preserves the
+    ///   prior perceptual-bank shape;
     ///   [`Linear`](crate::demand::FrequencyScale::Linear) is a
     ///   diagnostics-only raw-Hz layout.
     pub fn new(
@@ -546,7 +546,7 @@ fn mel_to_hz(mel: f32) -> f32 {
 /// Log: ANSI/IEC S1.11 base-10 equal-ratio (fractional-octave)
 /// geometric means across `[MEL_LOW_HZ, MEL_HIGH_HZ]`.
 /// Mel: equal mel-scale spacing (perceptual bank, preserves the
-/// pre-2026-08-11 behaviour).
+/// prior projection).
 /// Linear: equal Hz spacing (raw-FFT diagnostic layout).
 pub(crate) fn compute_centres(
     bins: usize,
