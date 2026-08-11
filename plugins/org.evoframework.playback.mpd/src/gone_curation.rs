@@ -13,8 +13,8 @@
 //! Gone from an Online source (file deleted, mass wipe of
 //! `/var/lib/evo/music`, MPD `update` removed the song). Ghost
 //! URIs in favourites/playlists/queue after destructive wipe are
-//! a curation lie — see
-//! `evo-internal/audits/2026-08-08-library-gone-curation-parity-gap.md`.
+//! a curation lie — the classifier below distinguishes the two
+//! cases and drives disposition accordingly.
 //!
 //! **Gone** (prune):
 //! - URI is a local MPD file path (not `http(s):`, not `dlna:…`)

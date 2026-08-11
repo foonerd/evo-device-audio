@@ -2763,11 +2763,10 @@ pub(crate) async fn rehydrate_from_mpd(
     }
     // Persist so the wire truth survives the next boot. Without
     // this, `sources.toml` keeps its stale track_count from the
-    // last persist point — a p2 wipe that empties the music
+    // last persist point — a wipe that empties the music
     // plane would still show thousands of ghost tracks on the
     // next start, because the in-memory apply above never
-    // reached disk. Audit ref:
-    // `audits/2026-08-08-library-mountpoints-continuous-deploy-audit.md` (F4).
+    // reached disk.
     if let Err(e) = ctx.registry.persist().await {
         tracing::warn!(
             plugin = PLUGIN_NAME,

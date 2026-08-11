@@ -17,9 +17,13 @@ Lineage (do not re-derive from chat):
   operator-facing bin/channel choice to renderer-only
   downsample. That contract is superseded by the
   demand-driven-producer contract this document pins.
-- Audit source: `.24` on 2026-08-09 — `ui.visualizer.
-  enabled=false` unsubscribed the browser but the terminus
-  producer continued to FFT + emit at 256×stereo.
+- Producer-hazard the contract closes: with the earlier
+  wire, `ui.visualizer.enabled = false` unsubscribed the
+  browser but the terminus producer continued to FFT and
+  emit at 256×stereo on the device — CPU + PCM held for
+  nobody. The demand-driven contract makes producer
+  activity a function of admitted demand rather than a
+  fixed shape.
 - Cross-source pattern: thin-ADR + living-inventory pattern
   already proven by `SAMBA-SHARES.md`, `USB-STORAGE.md`,
   `LIBRARY-TRIAGE.md`.
