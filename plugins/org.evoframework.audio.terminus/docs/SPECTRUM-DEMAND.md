@@ -214,19 +214,18 @@ The metrics that matter are BOTH:
 
 ---
 
-## 5. Landings
+## 5. Shipped substrate
 
-| Landing | Status | Scope |
-| --- | --- | --- |
-| F1 | Realised | `audio_playback_spectrum_demand` subject + `audio.spectrum.set_demand` verb + settings-patch bridge in the UI runtime. |
-| F2A | Realised | `CaptureGate` extends with `demand.enabled`; ALSA PCM released on disable (rig-verified 0 FDs across fleet). |
-| F2B | Realised | Variable analyser `SpectrumAnalyser::new(sample_rate_hz, bins, channels)`; `PerceptualFrame` carries payload-truth `bins`/`channels`; mono collapses at mel stage with zero-length `correlation`; rebuild on demand-change mid-play within one to two frames. |
-| F2C | Realised | 30 Hz emit throttle decoupled from ALSA hop rate — ideal-target wall-clock governor in `emit_throttle::EmitThrottle`; wire `rate_hz` field carries the governor target; rig-measured 30.0–30.40 Hz across the shape enum on the 47 Hz ALSA chain. |
-| F3 | Realised | (a) Volatile emission — no durable `subject_states` mirror (via `SubjectAnnouncer::update_state_volatile`). (b) Parked-state wire visibility — one final envelope with `at_ms = 0` on every park transition. (c) Subscription-interest signal — per-subject-type framework-owned interest subject with state published on transitions; terminus consumes via standard `SubjectStateSubscriber`; `interest > 0` becomes the fourth CaptureGate condition, `demand.enabled` demotes to operator permission. |
-| F4 | Realised | Rig A/B evidence on the aarch64 (Pi 5) and x86_64 (NUC) targets across enable/disable + shape-enum cycle; producer park + shape mirror + emit rate all verified. |
-| F5 | Realised | (a) Demand durability — terminus `SpectrumDemandStore` rehydrates from `subject_states` on plugin load, falls back to `disabled_default` only when no prior applied demand exists; operator intent survives reboot + terminus reload without UI re-push. (b) Interest boot-seed — producer plugins call `SubjectAnnouncer::seed_interest_zero` on load to eliminate the resolve-retry loop before the first consumer arrives. (c) Wire-honesty on `/api/v1/request` — refused dispatch surfaces as non-2xx with the framework error envelope preserved in the body; UI validated-apply helpers can classify by HTTP status and validate against the `applied` envelope without parsing every 200 for hidden errors. |
+The demand-driven producer contract is fully realised across the following surfaces.
 
-F3 lands in one commit against the framework's runtime (interest-signal primitive) + one commit against this plugin (terminus consumer + parked-envelope emission). F5 lands as three commits — durable-demand on this plugin (`SpectrumDemandStore::announce_initial` rehydrate), interest boot-seed as a shared framework SDK primitive plus a terminus caller-side commit, and wire-honesty as a framework-side commit on the `Dispatcher` trait + `Server::dispatch_http_wire_op` path.
+- **Control plane.** The `audio_playback_spectrum_demand` subject + `audio.spectrum.set_demand` verb are live; the UI runtime's settings-patch bridge derives every demand write from the operator's settings-store patch. Single write path.
+- **Producer gate.** `CaptureGate` extends with `demand.enabled`; the ALSA PCM handle is released the instant the operator disables the visualiser — zero file descriptors held on disable, verified across every deployed target architecture.
+- **Variable analyser.** `SpectrumAnalyser::new(sample_rate_hz, bins, channels, frequency_scale)` accepts every demanded shape at construction; `PerceptualFrame` carries payload-truth `bins` / `channels` per frame; mono demand collapses L+R at the filterbank stage and emits a zero-length correlation array; a demand-shape change mid-play rebuilds the analyser within one to two frames.
+- **Emit cadence.** The 30 Hz emit throttle is decoupled from the ALSA hop rate — an ideal-target wall-clock governor in `emit_throttle::EmitThrottle` targets `demand.rate_hz_target`; the wire `rate_hz` field carries the governor target; measured emit rate stays within ±10 % of the target across the shape enum on the canonical 47 Hz ALSA chain.
+- **Wire visibility.** Emission is volatile (no durable `subject_states` mirror on the frame subject; `SubjectAnnouncer::update_state_volatile`); parked-state is wire-visible via one final envelope with `at_ms = 0` on every park transition; the four-way `CaptureGate` (`Playing ∧ demand.enabled ∧ !Receiver ∧ interest > 0`) reduces to the produce-iff-consumed invariant, with `demand.enabled` demoted from gate to operator permission.
+- **Interest signal.** A per-subject-type framework-owned interest subject publishes state updates on subscribe / unsubscribe transitions across every wire path (WSS + Unix, subject + happenings); terminus consumes via the standard `SubjectStateSubscriber` SDK primitive and treats `interest > 0` as the fourth gate condition. Producer plugins seed their own interest subjects at boot via `SubjectAnnouncer::seed_interest_zero` so the first consumer resolves on first attempt without a retry loop.
+- **Durability.** `SpectrumDemandStore::announce_initial` rehydrates from the framework's durable subject-state mirror on plugin load, falling back to `disabled_default` only when no prior applied demand exists; operator intent survives reboot + terminus reload without a UI re-push.
+- **Wire honesty.** Refused dispatch on `/api/v1/request` surfaces as non-2xx with the framework's error envelope preserved verbatim in the response body; UI validated-apply helpers can classify by HTTP status and validate against the `applied` envelope without parsing every 200 for hidden errors.
 
 ---
 
