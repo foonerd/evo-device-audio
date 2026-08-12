@@ -739,7 +739,7 @@ UCONF
     # for step-up auth, and the /etc ReadWritePaths carve for
     # chpasswd. Without this drop-in, pair_complete{bootstrap}
     # returns pair_unknown even when /boot/evo/pair-preseed.txt
-    # exists — the 2026-08-07 fleet symptom after p2 wipe.
+    # exists — the symptom reproducible after a full reinstall.
     # Rewrite the template's hardcoded UID 1000 to the resolved
     # service-user UID so it cannot override kiosk-uids.conf
     # with a wrong value on non-1000 images.

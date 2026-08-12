@@ -47,8 +47,8 @@
 #
 # `leader_ms = 200` is the BASE per-group latency budget the
 # scheduler uses for receiver-side presentation-time
-# anchoring (per ADR's multi-room baseline). Operator-tunable
-# live via `multiroom.set_leader_ms`. Range [20, 2000].
+# anchoring. Operator-tunable live via
+# `multiroom.set_leader_ms`. Range [20, 2000].
 #
 # `group_id` is omitted (= None) at the default — a device
 # in `auto` role is not asserting membership in any group.

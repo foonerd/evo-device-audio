@@ -7,9 +7,10 @@ Contradictions between code and this file are defects to be
 closed against this file.
 
 **Scope:** removable USB mass-storage as a music source
-(P0.D2 / P0.G3 / P0.H4). Not in scope: system-disk-as-media
-(banned by construction — see §1); CD-ROM; USB DACs; USB
-Wi-Fi; per-drive Samba sections.
+(discovery / mount lifecycle / hardware acceptance). Not
+in scope: system-disk-as-media (banned by construction —
+see §1); CD-ROM; USB DACs; USB Wi-Fi; per-drive Samba
+sections.
 
 ---
 
@@ -560,12 +561,13 @@ union rule from §1 has a synthetic `/proc/self/mountinfo` +
 Fixtures live at
 `plugins/org.evoframework.storage.usb/tests/fixtures/<fixture>/{mountinfo,lsblk.json,expected.json}`.
 
-**Rig acceptance (P0.H4):** Pi 5 + NUC + VM triangle. Each
-target: plug FAT stick → row appears → browse → play → dirty
-FAT stick → Repair → clean row → Safe remove → row removed
-→ Samba parent share shows the tree via `smbclient` during
-mounted window. Evidence emitted at
-`/var/lib/evo/evidence/storage-usb-h4-<triple>.toml`.
+**Hardware acceptance:** across the supported target
+triples (aarch64 Pi 5, x86_64 NUC, x86_64 VM). Each
+target: plug FAT stick → row appears → browse → play →
+dirty FAT stick → Repair → clean row → Safe remove → row
+removed → Samba parent share shows the tree via
+`smbclient` during mounted window. Evidence emitted at
+`/var/lib/evo/evidence/storage-usb-hardware-acceptance-<triple>.toml`.
 
 ---
 
