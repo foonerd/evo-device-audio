@@ -795,10 +795,10 @@ fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
 }
 
 /// Silence the compiler about the `TouchSample` re-import
-/// staying pinned even though the current cut does not use it
-/// server-side; keeps the type available for a follow-on cycle
-/// that pipes samples through this plugin directly rather than
-/// via the on-glass wizard.
+/// staying pinned even though the current implementation does
+/// not use it server-side; keeps the type available for a
+/// direct-samples path that pipes samples through this plugin
+/// rather than via the on-glass wizard.
 #[allow(dead_code)]
 fn _touch_sample_type_pinned(_s: TouchSample) {}
 

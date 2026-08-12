@@ -6125,8 +6125,8 @@ tmpfs /tmp tmpfs rw 0 0\n";
             "var-lib-evo-music-NAS-Music.mount"
         );
         // Dash in the alias must be escaped to \x2d — this is
-        // the exact case the UI team's ls-from-host demo produced
-        // (`consumer-check` in the alias).
+        // the exact case the ls-from-host reference demo
+        // produced (`consumer-check` in the alias).
         assert_eq!(
             systemd_mount_unit_name(std::path::Path::new(
                 "/var/lib/evo/music/NAS/consumer-check"

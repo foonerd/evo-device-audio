@@ -119,8 +119,8 @@ impl ArtworkCaches {
     /// framework has handed the plugin its per-plugin state
     /// directory; a positive identity persisted here survives
     /// restart AND a MusicBrainz outage AND cold boot with MB
-    /// unreachable — the four properties Andrew's memo pinned
-    /// as P1 acceptance.
+    /// unreachable — the four durability properties this cache
+    /// commits to.
     pub(crate) fn with_state_dir(state_dir: PathBuf) -> Self {
         Self::build(Some(state_dir))
     }

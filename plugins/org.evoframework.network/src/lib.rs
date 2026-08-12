@@ -10817,12 +10817,11 @@ exit 0\n",
     }
 
     // --- Hotspot fallback + STA+AP coexistence regressions ---
-    // Andrew's F3 / F4 audit items. Locks the empty-ap_ssid
-    // soft-recovery and the widened no-serviceable-uplink
-    // recovery gate against a future edit that would restore
-    // the audit-flagged behaviour.
+    // Locks the empty-ap_ssid soft-recovery and the widened
+    // no-serviceable-uplink recovery gate against a future
+    // edit that would restore the earlier flagged behaviour.
 
-    /// F3 regression — `ensure_wifi_ap` under an enabled
+    /// Regression — `ensure_wifi_ap` under an enabled
     /// hotspot with an empty `wifi.ap_ssid` MUST NOT return
     /// a permanent error (the prior behaviour cascaded through
     /// `apply_intent` and aborted the entire STA restore).

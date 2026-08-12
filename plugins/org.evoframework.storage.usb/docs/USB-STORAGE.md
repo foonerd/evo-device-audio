@@ -578,11 +578,11 @@ removed → Samba parent share shows the tree via
    in the SAME change set.
 3. Update the sudoers template, wrapper, and bootstrap install
    stanza in the SAME change set.
-4. Update the catalogue schema `storage.usb.v1` in
-   `evo-catalogue-schemas` in the SAME change set (or the
+4. Update the catalogue schema `storage.usb.v1` in the
+   canonical schemas repository in the SAME change set (or the
    plugin fails admission).
-5. Update the UI Sources / Library USB rows in `evo-ui-eng` as
-   a coordinated follow-up (UI team reads this file for the
+5. Update the UI Sources / Library USB rows in the UI shell
+   as a coordinated change (the UI consumes this file's
    subject + verb contract; not a plugin-side change).
 6. If any invariant here changes (system-disk union expands;
    FS support matrix drops a type; mount root moves off

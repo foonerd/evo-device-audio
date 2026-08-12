@@ -412,7 +412,7 @@ if [[ -n "${UI_SHELL_ROOT}" ]]; then
         echo "  ok evo-ui-shell (from ${UI_SHELL_ROOT}/dist)"
     else
         echo "FAIL: evo-ui-shell has no built dist/ tree at ${UI_SHELL_ROOT}/dist" >&2
-        echo "      Run \`bun run build\` (or the UI team's equivalent) inside" >&2
+        echo "      Run \`bun run build\` (or the UI shell's build script) inside" >&2
         echo "      ${UI_SHELL_ROOT} before building the audio bundle." >&2
         exit 2
     fi
@@ -429,9 +429,9 @@ if [[ -n "${UI_SHELL_ROOT}" ]]; then
     #
     # Prebuilt binaries live at
     # `apps/evo-ui-runtime/target/<triple>/release/evo-ui-runtime`
-    # under evo-ui-eng. Match the current TARGET_TRIPLE; the
-    # UI team builds x86_64 + aarch64 prebuilts alongside every
-    # release.
+    # under the sibling UI checkout. Match the current
+    # TARGET_TRIPLE; x86_64 + aarch64 prebuilts are produced
+    # alongside every release.
     UI_RUNTIME_BIN="${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-runtime/target/${TARGET_TRIPLE}/release/evo-ui-runtime"
     UI_SERVICE_TEMPLATE="${REPO_ROOT}/../evo-ui-eng/apps/evo-ui-runtime/scripts/device/evo-ui.service.in"
     if [[ -x "${UI_RUNTIME_BIN}" && -f "${UI_SERVICE_TEMPLATE}" ]]; then
