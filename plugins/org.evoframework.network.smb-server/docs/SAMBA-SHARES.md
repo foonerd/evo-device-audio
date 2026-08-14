@@ -393,7 +393,7 @@ With SMB enabled on a cold or warm apply:
 | Stock + delivery shares | Shown as fixed (not editable path/name); clarify guest vs auth for `evo-plugins-stage`. |
 | Extra shares | List editor (name, path, guest_ok) per `shares.v1.toml`. |
 | Enable / min_protocol | Existing File Sharing controls. |
-| Device name | Read `envelope.hostname` from `network.smb_server.get_state` on load; refresh on every `system_smb_server` subject update. Write via `network.smb_server.apply(system_hostname = <new>)`. Reader and writer share one substrate — the kernel — so a fresh read after an apply reflects the new name immediately. Empty string on the envelope is a diagnostic signal (procfs I/O failure) — render the field placeholder, never the empty value. |
+| Device name | The device's LAN identity IS the OS hostname. There is **no** separate netbios-name storage on the runtime or in the plugin state file. `network.smb_server.apply()` reads `/proc/sys/kernel/hostname` at render time and writes it into `smb.conf` as `netbios name`. Read `envelope.hostname` from `network.smb_server.get_state` on load; refresh on every `system_smb_server` subject update. Write via `network.smb_server.apply(system_hostname = <new>)` — that call runs `hostnamectl set-hostname <new>` and then re-renders `smb.conf`, so the next render's `netbios name` reflects the new hostname without a steward restart. Empty string on the envelope is a diagnostic signal (procfs I/O failure) — render the field placeholder, never the empty value. |
 | SMB users | Add/list/revoke by username; password via device vault prompt only. UI does not create Unix accounts — the device provision path does. No need to "pick a running system user." |
 
 Copy that claims "share this device's library" is true only while

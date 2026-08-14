@@ -260,6 +260,58 @@ impl Plugin for SmbServerPlugin {
                 );
             }
 
+            // Reconcile smb.conf on load. The invariant is
+            // that `/etc/samba/smb.conf` on disk equals what the
+            // current runtime's `apply()` would produce right
+            // now, using the live OS hostname. Without this
+            // step, a plugin upgrade that changes the renderer
+            // (e.g. the netbios-name-follows-hostname fix)
+            // leaves the previous binary's smb.conf on disk
+            // until the operator gestures a Device-name change
+            // — a class where the LAN identity silently drifts
+            // from what the plugin now considers correct. This
+            // reconcile fires ONLY when the persisted state
+            // carries `enabled = true` (matches operator
+            // intent). When disabled, no smb.conf write is
+            // due; the state stays parked.
+            //
+            // A failure here does NOT block plugin admission —
+            // the plugin's dispatch_verb surface must remain
+            // reachable so the operator can inspect state and
+            // retry. The failure is logged at WARN level and
+            // the reactive subject's next envelope carries the
+            // divergence via the on-disk-vs-runtime comparison
+            // helper.
+            let state_at_load = rt.get_state().await;
+            if state_at_load.enabled {
+                match rt
+                    .apply(
+                        state_at_load.enabled,
+                        state_at_load.min_protocol,
+                        state_at_load.extra_shares.clone(),
+                    )
+                    .await
+                {
+                    Ok(_report) => {
+                        tracing::info!(
+                            plugin = PLUGIN_NAME,
+                            "network.smb-server reconcile-on-load: \
+                             re-rendered smb.conf with live hostname"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %e,
+                            "network.smb-server reconcile-on-load failed; \
+                             smb.conf on disk may not match current \
+                             hostname until the operator gestures an \
+                             apply"
+                        );
+                    }
+                }
+            }
+
             self.runtime = Some(rt);
             self.loaded = true;
             Ok(())

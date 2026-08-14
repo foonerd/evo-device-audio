@@ -116,8 +116,14 @@ pub const DEFAULT_SHARE_PATH_DENYLIST: &[&str] = &[
     "/var/lib/evo/plugins/stage/rejected",
 ];
 
-/// Default netbios name the framework advertises when the
-/// distribution has not overridden.
+/// LAST-RESORT NetBIOS name, used ONLY when the live kernel
+/// hostname is unreadable (empty `/proc/sys/kernel/hostname`).
+/// Normal operation advertises the live OS hostname so each
+/// device presents a unique LAN identity - see
+/// [`resolve_netbios_name`]. A hardcoded default here as the
+/// primary identity caused a fleet-wide name collision
+/// (every box announced `EvoDevice`); it must never be the
+/// normal path again.
 pub const DEFAULT_NETBIOS_NAME: &str = "EvoDevice";
 
 /// Default workgroup the framework advertises.
@@ -1141,6 +1147,19 @@ pub fn build_systemctl_restart_args() -> Vec<String> {
     ]
 }
 
+/// Build the argv for `sudo -n systemctl stop smbd` - the
+/// Disable path. `SAMBA-SHARES.md` requires an Off gesture to
+/// STOP the daemon, not merely rewrite the conf and leave smbd
+/// serving the inventory on the LAN.
+pub fn build_systemctl_stop_args() -> Vec<String> {
+    vec![
+        "-n".to_string(),
+        DEFAULT_SYSTEMCTL_PATH.to_string(),
+        "stop".to_string(),
+        "smbd".to_string(),
+    ]
+}
+
 /// Build the argv for `sudo -n install -m 0644 -o root -g root
 /// <candidate> <target>` — the atomic drop of the validated
 /// candidate over `/etc/samba/smb.conf`. `install` copies to a
@@ -1242,6 +1261,32 @@ pub fn read_live_hostname() -> String {
     }
 }
 
+/// Resolve the NetBIOS name to write into `smb.conf`.
+///
+/// Contract: the LAN identity IS the device hostname. An
+/// explicit `override_` (test injection or a vendor pin) wins;
+/// otherwise the LIVE kernel hostname is read here, at apply
+/// time, so a `hostnamectl set-hostname` performed in the same
+/// `apply` gesture is reflected in the rendered `netbios name`
+/// without a steward restart. Only if the kernel hostname is
+/// empty (unreadable procfs) does this fall back to
+/// [`DEFAULT_NETBIOS_NAME`]. This is the same source of truth
+/// the `system_smb_server` envelope's `hostname` field reads,
+/// so the advertised name and the UI's "Device name" agree.
+pub fn resolve_netbios_name(override_: &Option<String>) -> String {
+    match override_ {
+        Some(name) if !name.is_empty() => name.clone(),
+        _ => {
+            let host = read_live_hostname();
+            if host.is_empty() {
+                DEFAULT_NETBIOS_NAME.to_string()
+            } else {
+                host
+            }
+        }
+    }
+}
+
 struct SambaPublisher {
     announcer: Arc<dyn SubjectAnnouncer>,
 }
@@ -1268,7 +1313,13 @@ pub struct SambaServerRuntime {
     /// [`DEFAULT_SMB_CONF_CANDIDATE_PATH`] (`/var/tmp/…`) so
     /// the service user can write without sudo.
     candidate_path: PathBuf,
-    netbios_name: String,
+    /// Operator/vendor override for the advertised NetBIOS name.
+    /// `None` in normal operation - the effective name is then the
+    /// LIVE OS hostname, resolved at apply time so a `hostnamectl`
+    /// rename in the same gesture propagates into `smb.conf`
+    /// (see [`resolve_netbios_name`]). `Some` only for tests / a
+    /// vendor pin.
+    netbios_override: Option<String>,
     workgroup: String,
     path_allowlist: Vec<String>,
     path_denylist: Vec<String>,
@@ -1353,7 +1404,7 @@ impl SambaServerRuntime {
             g.state.extra_shares = new_extra_shares;
             render_smb_conf(
                 &g.state,
-                &self.netbios_name,
+                &resolve_netbios_name(&self.netbios_override),
                 &self.workgroup,
                 &self.path_allowlist,
                 &self.path_denylist,
@@ -1436,6 +1487,27 @@ impl SambaServerRuntime {
             }
             true
         } else {
+            // Disable MUST stop the daemon (SAMBA-SHARES.md Disable
+            // rule) - not merely rewrite the conf and leave smbd
+            // serving the shares on the LAN. A non-zero stop is a
+            // real lifecycle failure surfaced to the operator.
+            let stop_args = build_systemctl_stop_args();
+            let stop_out = self
+                .executor
+                .run(
+                    &self.sudo_program,
+                    &stop_args,
+                    self.subprocess_timeout_ms,
+                    b"",
+                )
+                .await?;
+            if stop_out.exit_code != Some(0) {
+                return Err(ApplyError::RestartFailed {
+                    exit_code: stop_out.exit_code,
+                    stderr: String::from_utf8_lossy(&stop_out.stderr)
+                        .into_owned(),
+                });
+            }
             false
         };
 
@@ -1869,9 +1941,7 @@ impl SambaServerRuntimeBuilder {
             candidate_path: self.candidate_path.unwrap_or_else(|| {
                 PathBuf::from(DEFAULT_SMB_CONF_CANDIDATE_PATH)
             }),
-            netbios_name: self
-                .netbios_name
-                .unwrap_or_else(|| DEFAULT_NETBIOS_NAME.to_string()),
+            netbios_override: self.netbios_name,
             workgroup: self
                 .workgroup
                 .unwrap_or_else(|| DEFAULT_WORKGROUP.to_string()),
@@ -3103,25 +3173,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_when_disabled_skips_systemctl_restart() {
+    async fn apply_when_disabled_stops_smbd() {
         let dir = tempdir();
         let (rt, executor) = built_runtime(
             &dir,
-            // testparm + install — no systemctl (server
-            // disabled → conf still rewritten, but smbd
-            // does not restart)
-            vec![ok(), ok()],
+            // testparm + install + systemctl STOP: Disable must
+            // stop the daemon (SAMBA-SHARES.md), not just rewrite
+            // the conf and leave smbd serving.
+            vec![ok(), ok(), ok()],
             HashMap::new(),
         );
         let report = rt
             .apply(false, MinProtocol::Default, Vec::new())
             .await
             .unwrap();
+        // Not "restarted" - it was stopped.
         assert!(!report.smbd_restarted);
         let calls = executor.calls.lock().await;
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert!(calls[0].1[1].ends_with("/testparm"));
         assert!(calls[1].1[1].ends_with("/install"));
+        assert!(calls[2].1[1].ends_with("/systemctl"));
+        assert_eq!(calls[2].1[2], "stop");
+        assert_eq!(calls[2].1[3], "smbd");
     }
 
     #[tokio::test]
@@ -3802,5 +3876,137 @@ mod tests {
             .unwrap();
         let _: SmbServerUserRevokeResponse =
             serde_json::from_slice(&bytes).unwrap();
+    }
+
+    // ----- LAN-identity regression: netbios follows live hostname -----
+    //
+    // These tests pin the invariant that broke on the fleet: the
+    // rendered `netbios name` in `/etc/samba/smb.conf` MUST equal
+    // the OS hostname read at apply time. `DEFAULT_NETBIOS_NAME`
+    // is a LAST-RESORT for procfs-read failure only — never the
+    // normal path. A regression that reintroduces a static
+    // fallback (as `df671f7c` did in 2026-07) fails at least one
+    // of these tests loudly.
+
+    #[test]
+    fn resolve_netbios_name_returns_live_hostname_when_override_absent() {
+        // With no operator override, the resolver MUST return the
+        // live kernel hostname. On any real host the kernel
+        // hostname is non-empty; the resolver returns it verbatim.
+        // The comparison is against `read_live_hostname()` (not a
+        // hardcoded expected string) so the test is host-agnostic
+        // and passes on any CI runner + on-rig.
+        let live = read_live_hostname();
+        assert!(
+            !live.is_empty(),
+            "test host has an empty /proc/sys/kernel/hostname — cannot \
+             assert live-hostname invariant"
+        );
+        let resolved = resolve_netbios_name(&None);
+        assert_eq!(
+            resolved, live,
+            "netbios name MUST equal live OS hostname when the operator \
+             has not set an override; got {resolved:?} against live {live:?}"
+        );
+        assert_ne!(
+            resolved, DEFAULT_NETBIOS_NAME,
+            "netbios name must never be the LAST-RESORT default \
+             ({DEFAULT_NETBIOS_NAME:?}) when the kernel hostname is \
+             readable — that shape caused the fleet-wide EvoDevice \
+             collision"
+        );
+    }
+
+    #[test]
+    fn resolve_netbios_name_honours_explicit_override() {
+        // Operator/vendor override wins over live hostname. The
+        // override path exists for tests and for a vendor that
+        // needs a pinned name; normal operation leaves it None.
+        let resolved =
+            resolve_netbios_name(&Some("vendor-pinned-name".to_string()));
+        assert_eq!(resolved, "vendor-pinned-name");
+    }
+
+    #[test]
+    fn resolve_netbios_name_ignores_empty_override_and_reads_hostname() {
+        // A `Some("")` override is treated as absent — we do not
+        // let a zero-length string silently blank the LAN
+        // identity. Falls through to the live hostname.
+        let live = read_live_hostname();
+        assert!(!live.is_empty());
+        let resolved = resolve_netbios_name(&Some(String::new()));
+        assert_eq!(resolved, live);
+    }
+
+    #[test]
+    fn default_netbios_name_is_last_resort_only_not_the_primary_path() {
+        // Meta-guard on the design: `DEFAULT_NETBIOS_NAME` exists
+        // ONLY as the last-resort fallback when procfs is
+        // unreadable. If a future edit reintroduces a `.to_string`
+        // of the constant in the normal render path, the
+        // `resolve_netbios_name_returns_live_hostname_when_override_absent`
+        // test above catches it. This test only sanity-checks the
+        // constant is not itself an empty string (which would
+        // make the last-resort silently invalid too).
+        assert!(!DEFAULT_NETBIOS_NAME.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rendered_smb_conf_carries_live_hostname_when_no_override() {
+        // End-to-end: build a runtime WITHOUT calling
+        // `.with_netbios_name(...)` (unlike the standard
+        // `built_runtime` helper), run apply(), read the rendered
+        // candidate file, assert the `netbios name = <live>` line
+        // is present and that the last-resort default is NOT.
+        let dir = tempdir();
+        // Same script shape as `built_runtime`'s
+        // `apply_success_writes_conf_runs_testparm_and_restarts`:
+        // testparm + install + systemctl restart smbd.
+        let executor = ScriptedSamba::new(vec![ok(), ok(), ok()]);
+        let creds_map: HashMap<String, Vec<u8>> = HashMap::new();
+        let (fetcher, _deletes) = StubCredentials::new(creds_map);
+        let rt = SambaServerRuntime::builder(&dir)
+            .expect("builder")
+            .with_executor(executor.clone())
+            .with_credentials(fetcher)
+            .with_sudo_program("sudo".to_string())
+            .with_smb_conf_path(dir.join("smb.conf"))
+            .with_candidate_path(dir.join("smb.conf.candidate"))
+            .with_path_allowlist(vec![
+                "/var/lib/evo/music".to_string(),
+                "/var/lib/evo/uploads".to_string(),
+                "/var/lib/evo/plugins/stage".to_string(),
+            ])
+            // Deliberately NO `.with_netbios_name(...)` — the point
+            // is to exercise the default path that reads the live
+            // kernel hostname.
+            .with_workgroup("STUDIO".to_string())
+            .with_subprocess_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        rt.apply(true, MinProtocol::Default, Vec::new())
+            .await
+            .unwrap();
+        // The renderer writes to `candidate_path` via the
+        // executor's `write_file` — inspect the recorded write to
+        // pick up what would be atomic-installed.
+        let writes = executor.writes.lock().await;
+        assert!(
+            !writes.is_empty(),
+            "expected apply() to write the rendered candidate"
+        );
+        let rendered = String::from_utf8(writes[0].1.clone()).unwrap();
+        let live = read_live_hostname();
+        assert!(
+            rendered.contains(&format!("netbios name = {live}")),
+            "expected rendered smb.conf to contain 'netbios name = {live}' \
+             (the live kernel hostname); actual smb.conf:\n{rendered}"
+        );
+        assert!(
+            !rendered
+                .contains(&format!("netbios name = {DEFAULT_NETBIOS_NAME}")),
+            "rendered smb.conf must not carry the last-resort default \
+             ({DEFAULT_NETBIOS_NAME}); actual:\n{rendered}"
+        );
     }
 }

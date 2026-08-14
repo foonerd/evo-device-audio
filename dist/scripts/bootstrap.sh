@@ -63,6 +63,38 @@
 
 set -euo pipefail
 
+# --- Pre-flight: hostname sanity ---
+# Every LAN-visible identity surface — SMB `netbios name` in
+# `/etc/samba/smb.conf`, mDNS instance name, the UI's "Device
+# name" field — derives from the OS hostname
+# (`/proc/sys/kernel/hostname`). A fleet whose devices all
+# carry a generic image-baked hostname (`raspberrypi`,
+# `debian`, `nuc`, `localhost`) collides on the subnet: NetBIOS
+# name registration refuses the second and third to try; only
+# the winner is visible from Ubuntu / macOS Finder network
+# browsers. Refuse to bootstrap in that state. The operator
+# sets a unique hostname first (`sudo hostnamectl set-hostname
+# <name>`), then re-runs. `EVO_BOOTSTRAP_ALLOW_GENERIC_HOSTNAME=1`
+# is the explicit override for image-build and CI paths that
+# know they'll set the hostname later.
+current_hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
+case "${current_hostname}" in
+    ""|localhost|localhost.localdomain|raspberrypi|debian|ubuntu|nuc)
+        if [[ "${EVO_BOOTSTRAP_ALLOW_GENERIC_HOSTNAME:-0}" != "1" ]]; then
+            echo "FAIL: hostname is generic ('${current_hostname}')." >&2
+            echo "      Every device-identity surface (SMB netbios name," >&2
+            echo "      mDNS instance name, UI 'Device name') derives from" >&2
+            echo "      /proc/sys/kernel/hostname. Set a unique hostname" >&2
+            echo "      first:" >&2
+            echo "        sudo hostnamectl set-hostname <unique-name>" >&2
+            echo "      Then re-run bootstrap.sh." >&2
+            exit 1
+        fi
+        echo "WARN: proceeding with generic hostname='${current_hostname}'" >&2
+        echo "      because EVO_BOOTSTRAP_ALLOW_GENERIC_HOSTNAME=1 is set." >&2
+        ;;
+esac
+
 # Resolve the script's own directory so dist/* paths resolve
 # regardless of the operator's CWD.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

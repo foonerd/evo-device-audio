@@ -25,8 +25,10 @@
 #    granted raw `useradd` / `userdel` / `smbpasswd` — only
 #    this wrapper. See docs/SAMBA-SHARES.md § SMB users.
 #
-# 3. `EVO_SAMBA_SERVER_RESTART` — `systemctl restart smbd`.
-#    Fires on every successful apply where enabled=true.
+# 3. `EVO_SAMBA_SERVER_RESTART` — `systemctl restart smbd`
+#    (enabled=true apply) and `systemctl stop smbd`
+#    (enabled=false apply). Disable MUST stop the daemon, not
+#    just rewrite the conf — SAMBA-SHARES.md Disable rule.
 #
 # 4. `EVO_SAMBA_SERVER_HOSTNAME` — `hostnamectl set-hostname
 #    <name>`. Fires when the operator supplies `system_hostname`
@@ -62,7 +64,8 @@
 #
 # Argv scoping: the runtime's argv builders emit fixed shapes
 # — `testparm -s <path>`, `evo-smb-user-sync add|delete
-# <user>`, `systemctl restart smbd`. The user-sync wrapper is
+# <user>`, `systemctl restart smbd`, `systemctl stop smbd`.
+# The user-sync wrapper is
 # the trust boundary for provisioning (username validation +
 # blocklist + nologin account shape).
 #
@@ -86,7 +89,8 @@ Cmnd_Alias EVO_SAMBA_SERVER_USERS = \
     /usr/local/bin/evo-smb-user-sync delete *
 
 Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
-    /usr/bin/systemctl restart smbd
+    /usr/bin/systemctl restart smbd, \
+    /usr/bin/systemctl stop smbd
 
 Cmnd_Alias EVO_SAMBA_SERVER_HOSTNAME = \
     /usr/bin/hostnamectl set-hostname *

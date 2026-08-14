@@ -210,6 +210,44 @@ case "${MODE}" in
     wipe-user-data)  PRIMITIVE_ID="p4_user_data_full_vacuum" ;;
 esac
 
+# -------- Pre-flight: hostname sanity --------
+# Every device-identity surface on the LAN — the SMB `netbios
+# name` in `/etc/samba/smb.conf`, the mDNS instance name, the
+# UI's "Device name" field — derives from the OS hostname
+# (`/proc/sys/kernel/hostname`). A fleet of devices that all
+# ship with the same generic image-baked hostname
+# (`raspberrypi`, `debian`, `nuc`, `localhost`) collide on the
+# subnet: NetBIOS name registration refuses the second and
+# third to try. Refuse to proceed if the hostname is generic;
+# the operator sets a unique one via `hostnamectl set-hostname
+# <name>` before re-running. `EVO_INSTALL_ALLOW_GENERIC_HOSTNAME=1`
+# is an explicit override for image-build and CI paths that
+# know they'll set the hostname later; it MUST NEVER be set
+# on a device the operator is bringing up.
+current_hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
+case "${current_hostname}" in
+    ""|localhost|localhost.localdomain|raspberrypi|debian|ubuntu|nuc)
+        if [[ "${EVO_INSTALL_ALLOW_GENERIC_HOSTNAME:-0}" != "1" ]]; then
+            echo "FAIL: hostname is generic ('${current_hostname}')." >&2
+            echo "      Every device-identity surface (SMB netbios name," >&2
+            echo "      mDNS instance name, UI 'Device name') derives from" >&2
+            echo "      /proc/sys/kernel/hostname. A fleet of devices with the" >&2
+            echo "      same generic hostname collides on the LAN — the first" >&2
+            echo "      to register wins, the rest go invisible." >&2
+            echo "" >&2
+            echo "      Set a unique hostname first, then re-run:" >&2
+            echo "        sudo hostnamectl set-hostname <unique-name>" >&2
+            echo "" >&2
+            echo "      Then:" >&2
+            echo "        sudo bash $0 --mode=${MODE}" >&2
+            exit 1
+        fi
+        echo "WARN: proceeding with generic hostname='${current_hostname}'" >&2
+        echo "      because EVO_INSTALL_ALLOW_GENERIC_HOSTNAME=1 is set." >&2
+        echo "      Set a real hostname before the device joins any LAN." >&2
+        ;;
+esac
+
 # -------- Pre-flight: root --------
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "FAIL: evo-install.sh must run as root (sudo bash $0)" >&2
@@ -1051,6 +1089,55 @@ verify_post_condition() {
     fi
 
     verify_pcm_playback
+    verify_smb_netbios_matches_hostname
+}
+
+# LAN-identity invariant: the SMB server's `netbios name` in
+# `/etc/samba/smb.conf` MUST equal the OS hostname read at
+# post-condition time. This closes the class that caused the
+# fleet-wide `netbios name = EvoDevice` collision: the plugin
+# is now supposed to derive the name from
+# `/proc/sys/kernel/hostname` at every apply, and this
+# assertion verifies the rendered conf carries the correct
+# value. If the plugin has been admitted but the file still
+# names the last-resort default (or any other mismatch), we
+# refuse the install.
+#
+# smb-server may be disabled by policy — in that case there is
+# no `netbios name` line to check and we skip.
+verify_smb_netbios_matches_hostname() {
+    local conf="/etc/samba/smb.conf"
+    if [[ ! -r "${conf}" ]]; then
+        SMB_NETBIOS_CHECK="skipped_no_smb_conf"
+        return 0
+    fi
+    local live_hostname netbios_in_conf
+    live_hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
+    netbios_in_conf="$(awk -F'=' '
+        /^\[/ { in_global = ($0 == "[global]"); next }
+        in_global && $1 ~ /^[[:space:]]*netbios[[:space:]]+name[[:space:]]*$/ {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+            print $2
+            exit
+        }
+    ' "${conf}")"
+    if [[ -z "${netbios_in_conf}" ]]; then
+        SMB_NETBIOS_CHECK="skipped_no_netbios_line"
+        return 0
+    fi
+    if [[ "${netbios_in_conf}" == "${live_hostname}" ]]; then
+        SMB_NETBIOS_CHECK="ok"
+    else
+        SMB_NETBIOS_CHECK="mismatch"
+        echo "" >&2
+        echo "FAIL: /etc/samba/smb.conf carries 'netbios name = ${netbios_in_conf}'" >&2
+        echo "      but /proc/sys/kernel/hostname is '${live_hostname}'." >&2
+        echo "      The LAN-identity invariant requires them to match." >&2
+        echo "      Trigger a re-apply of the smb-server plugin so the" >&2
+        echo "      renderer picks up the live hostname:" >&2
+        echo "        evo-plugin-tool ... network.smb_server.apply ..." >&2
+        echo "      Or run: sudo systemctl restart evo && sleep 5 && re-check." >&2
+    fi
 }
 
 # Active PCM playback-path probe at post-condition time. The
@@ -1167,6 +1254,7 @@ music_library_hash_post = ${music_hash_post_field}
 music_library_hash_preserved = ${MUSIC_HASH_PRESERVED}
 music_library_hash_changed = ${MUSIC_HASH_CHANGED}
 pcm_playback_probe = "${PCM_PLAYBACK_PROBE}"
+smb_netbios_check = "${SMB_NETBIOS_CHECK:-unknown}"
 
 EOF
 
@@ -1294,6 +1382,12 @@ if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi
 # device); the `skipped_*` states are documented gaps the
 # evidence record carries forward.
 if [[ "${PCM_PLAYBACK_PROBE}" == "fail" ]]; then POST_OK=0; fi
+# LAN-identity invariant. `mismatch` is a wire-visible defect
+# (the fleet would collide on `netbios name = EvoDevice` or on
+# any other stale value). The `skipped_*` states name a
+# structural absence (no smb.conf yet, or the plugin has been
+# disabled by policy) and are not a failure.
+if [[ "${SMB_NETBIOS_CHECK:-unknown}" == "mismatch" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi
