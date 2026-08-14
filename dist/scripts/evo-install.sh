@@ -1090,6 +1090,34 @@ verify_post_condition() {
 
     verify_pcm_playback
     verify_smb_netbios_matches_hostname
+    verify_lan_discovery_daemons_up
+}
+
+# LAN-discovery invariant: `avahi-daemon` publishes the SMB
+# service via mDNS (`_smb._tcp`); `nmbd` publishes the NetBIOS
+# name. Both are required for the device to appear in Ubuntu /
+# Finder / Windows network browsers under its hostname. An
+# install that leaves either one inactive silently degrades LAN
+# visibility — the class the operator hit fleet-wide when an
+# earlier bootstrap step disabled avahi.
+verify_lan_discovery_daemons_up() {
+    local avahi nmbd
+    avahi="$(systemctl is-active avahi-daemon.service 2>/dev/null || echo unknown)"
+    nmbd="$(systemctl is-active nmbd.service 2>/dev/null || echo unknown)"
+    LAN_DISCOVERY_AVAHI="${avahi}"
+    LAN_DISCOVERY_NMBD="${nmbd}"
+    if [[ "${avahi}" == "active" && "${nmbd}" == "active" ]]; then
+        LAN_DISCOVERY_CHECK="ok"
+    else
+        LAN_DISCOVERY_CHECK="degraded"
+        echo "" >&2
+        echo "FAIL: LAN discovery degraded." >&2
+        [[ "${avahi}" != "active" ]] && \
+            echo "      avahi-daemon.service is '${avahi}' — SMB will not appear via mDNS." >&2
+        [[ "${nmbd}" != "active" ]] && \
+            echo "      nmbd.service is '${nmbd}' — SMB will not appear via NetBIOS." >&2
+        echo "      Fix: sudo systemctl enable --now avahi-daemon.service nmbd.service" >&2
+    fi
 }
 
 # LAN-identity invariant: the SMB server's `netbios name` in
@@ -1255,6 +1283,9 @@ music_library_hash_preserved = ${MUSIC_HASH_PRESERVED}
 music_library_hash_changed = ${MUSIC_HASH_CHANGED}
 pcm_playback_probe = "${PCM_PLAYBACK_PROBE}"
 smb_netbios_check = "${SMB_NETBIOS_CHECK:-unknown}"
+lan_discovery_check = "${LAN_DISCOVERY_CHECK:-unknown}"
+lan_discovery_avahi = "${LAN_DISCOVERY_AVAHI:-unknown}"
+lan_discovery_nmbd = "${LAN_DISCOVERY_NMBD:-unknown}"
 
 EOF
 
@@ -1388,6 +1419,12 @@ if [[ "${PCM_PLAYBACK_PROBE}" == "fail" ]]; then POST_OK=0; fi
 # structural absence (no smb.conf yet, or the plugin has been
 # disabled by policy) and are not a failure.
 if [[ "${SMB_NETBIOS_CHECK:-unknown}" == "mismatch" ]]; then POST_OK=0; fi
+# LAN-discovery invariant. `degraded` means either avahi or
+# nmbd (or both) is inactive at install-complete — the class
+# that silently hides the device from Ubuntu / Finder / Windows
+# network browsers. Refuse the install so the bootstrap-tier
+# step 2.7 has to have activated both.
+if [[ "${LAN_DISCOVERY_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi

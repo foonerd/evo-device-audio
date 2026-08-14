@@ -1075,34 +1075,68 @@ else
 fi
 
 # ----------------------------------------------------------
-# Step 2.7: disable avahi-daemon (it fights evo's own mDNS on 5353)
+# Step 2.7: ensure LAN discovery daemons are up (avahi + nmbd)
 # ----------------------------------------------------------
-# The evo steward binds its own mDNS responder to UDP 5353 for
-# multi-room peer discovery. avahi-daemon (commonly installed on
-# Debian / Raspberry Pi OS) also binds 5353 by default; the two
-# fight for the multicast group and audio-plane peer discovery
-# becomes flaky. Default behaviour: stop + disable avahi-daemon
-# when present. Vendor distributions that need avahi for non-evo
-# services flip `EVO_DISABLE_AVAHI=0`.
-if [[ "${EVO_DISABLE_AVAHI:-1}" != "0" ]]; then
+# The device's LAN visibility to Ubuntu / macOS Finder / Windows
+# depends on TWO daemons being active:
+#
+#   1. avahi-daemon — publishes `_smb._tcp` mDNS service records
+#      for every share Samba exports. Samba's multicast-dns
+#      registration hook (compiled in by default on Debian
+#      packages) talks to avahi via D-Bus at share-add time; if
+#      avahi is not running, no mDNS service record is
+#      published, and Ubuntu / Finder never learn there's an SMB
+#      responder at this IP. avahi-daemon MUST be up for the
+#      device to appear in the "Networks" / "Other Locations"
+#      browser under its hostname.
+#
+#   2. nmbd — publishes the NetBIOS name (`netbios name` from
+#      smb.conf, which is now the OS hostname per the LAN-
+#      identity invariant). Downlevel clients + Windows Explorer
+#      "Network" browser rely on NetBIOS name registration to
+#      resolve `\\<hostname>`. nmbd MUST be up + registered.
+#
+# Historical note: an earlier version of this step disabled
+# avahi to free UDP 5353 for evo's own mDNS responder. That
+# broke SMB discovery fleet-wide the moment provisioning ran
+# on any rig — Samba never advertises without avahi, so the
+# device went invisible to Ubuntu. The current step ensures
+# avahi is active + enabled unconditionally; evo's own mDNS
+# responder co-binds 5353 (mDNS is a multicast socket and
+# multiple listeners can coexist for read; publish semantics
+# are per-daemon). Fleet visibility to non-evo clients depends
+# on avahi being up, so this step is non-negotiable.
+#
+# `EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1` is the explicit
+# override for image-build paths that intentionally omit LAN
+# discovery (headless build hosts, non-audio distributions).
+if [[ "${EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY:-0}" != "1" ]]; then
     if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
         | grep -q '^avahi-daemon\.service'; then
-        if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null \
-            || "$SYSTEMCTL_BIN" is-enabled --quiet avahi-daemon.service \
-                2>/dev/null; then
-            "$SYSTEMCTL_BIN" disable --now avahi-daemon.service \
-                >/dev/null 2>&1 || true
-            "$SYSTEMCTL_BIN" disable --now avahi-daemon.socket \
-                >/dev/null 2>&1 || true
-            echo "[bootstrap] disabled avahi-daemon (evo binds UDP 5353 directly)"
+        "$SYSTEMCTL_BIN" enable --now avahi-daemon.service \
+            >/dev/null 2>&1 || true
+        if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null; then
+            echo "[bootstrap] avahi-daemon enabled + active (SMB mDNS advertisement)"
         else
-            echo "[bootstrap] avahi-daemon already inactive + disabled"
+            echo "[bootstrap] WARN: avahi-daemon enable+start did not activate the unit; SMB will be invisible via mDNS"
         fi
     else
-        echo "[bootstrap] avahi-daemon not present — no action"
+        echo "[bootstrap] WARN: avahi-daemon not installed — SMB will be invisible via mDNS"
+    fi
+    if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
+        | grep -q '^nmbd\.service'; then
+        "$SYSTEMCTL_BIN" enable --now nmbd.service \
+            >/dev/null 2>&1 || true
+        if "$SYSTEMCTL_BIN" is-active --quiet nmbd.service 2>/dev/null; then
+            echo "[bootstrap] nmbd enabled + active (NetBIOS name registration)"
+        else
+            echo "[bootstrap] WARN: nmbd enable+start did not activate the unit; SMB will be invisible via NetBIOS"
+        fi
+    else
+        echo "[bootstrap] WARN: nmbd not installed — SMB will be invisible via NetBIOS"
     fi
 else
-    echo "[bootstrap] EVO_DISABLE_AVAHI=0 — avahi-daemon left as-is"
+    echo "[bootstrap] EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1 — avahi + nmbd left as-is"
 fi
 
 # ----------------------------------------------------------
@@ -1703,12 +1737,22 @@ else
     echo "  [WARN]  /etc/evo/plugins.d/org.evoframework.multiroom.evo-native.toml not installed (plugin uses code defaults — set EVO_INSTALL_MULTIROOM_PLUGIN_CONFIG=1 or re-run with --multiroom-role)"
 fi
 
-# avahi-daemon must NOT hold UDP 5353 — evo binds it directly.
+# LAN discovery daemons must be up so the device advertises SMB
+# via both mDNS (`_smb._tcp` via avahi) and NetBIOS (nmbd). Either
+# one down means the device is invisible to a class of client.
 if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null; then
-    echo "  [WARN]  avahi-daemon is active — it fights evo's mDNS on UDP 5353"
-    echo "          (set EVO_DISABLE_AVAHI=1 and re-run bootstrap, or disable manually)"
+    echo "  [ok]    avahi-daemon active (Samba publishes _smb._tcp via avahi's D-Bus)"
 else
-    echo "  [ok]    avahi-daemon inactive (UDP 5353 free for evo's mDNS responder)"
+    echo "  [WARN]  avahi-daemon inactive — SMB shares WILL NOT appear in Ubuntu / Finder network browsers"
+    echo "          Re-run bootstrap without EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1, or:"
+    echo "          sudo systemctl enable --now avahi-daemon.service"
+fi
+if "$SYSTEMCTL_BIN" is-active --quiet nmbd.service 2>/dev/null; then
+    echo "  [ok]    nmbd active (NetBIOS name registered for this device's hostname)"
+else
+    echo "  [WARN]  nmbd inactive — SMB shares WILL NOT appear in NetBIOS-only clients"
+    echo "          Re-run bootstrap without EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1, or:"
+    echo "          sudo systemctl enable --now nmbd.service"
 fi
 
 # ExecStart override resolves to this distribution's steward
