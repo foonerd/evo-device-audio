@@ -305,12 +305,16 @@ fi
 #   - network.smb-server: evo-smb-user-sync wrapper + evo-samba-server
 #     sudoers template
 #   - network.shares: evo-network-shares sudoers template
+#   - storage.usb: evo-usb-mount wrapper + evo-storage-usb sudoers
+#     template (Step 1g — provisioning surface for the plugin's
+#     Rust runtime that lands in Steps 2-6)
 # The bundle stages each plugin's `dist/` subtree next to its
 # binary + manifest so the bootstrap's `$DIST_DIR/../plugins/*/dist/*`
 # paths resolve inside the stage.
 for plugin_with_dist in \
     "org.evoframework.network.smb-server" \
-    "org.evoframework.network.shares" ; do
+    "org.evoframework.network.shares" \
+    "org.evoframework.storage.usb" ; do
     p_dist_src="${REPO_ROOT}/plugins/${plugin_with_dist}/dist"
     if [[ -d "${p_dist_src}" ]]; then
         install -d -m 0755 "${STAGE_DIR}/plugins/${plugin_with_dist}/dist"

@@ -1091,6 +1091,99 @@ verify_post_condition() {
     verify_pcm_playback
     verify_smb_netbios_matches_hostname
     verify_lan_discovery_daemons_up
+    verify_storage_usb_provisioning
+}
+
+# Storage-USB provisioning invariant: bootstrap Step 1g must
+# have landed the wrapper at /usr/lib/evo/evo-usb-mount
+# (executable, mode 0755), the sudoers grant at
+# /etc/sudoers.d/evo-storage-usb (mode 0440), the per-plugin
+# state directory at /var/lib/evo/plugins/org.evoframework.
+# storage.usb/, and every required binary on PATH (mount /
+# umount / blockdev / fsck.vfat / fsck.exfat / ntfsfix /
+# e2fsck / eject).
+#
+# The plugin's Rust runtime lands in Steps 2-6; those verify
+# admission via the socket-count check already in the
+# post-condition. THIS check covers what Step 1 owns: the
+# provisioning surface the plugin will exec against.
+#
+# The `not-implemented` (exit 42) probe against the wrapper's
+# `--version` action confirms the wrapper is invocable via
+# sudo through the sudoers grant. The version string is
+# stable across Steps 2-6 wrapper changes.
+verify_storage_usb_provisioning() {
+    STORAGE_USB_WRAPPER_OK="unknown"
+    STORAGE_USB_SUDOERS_OK="unknown"
+    STORAGE_USB_STATE_DIR_OK="unknown"
+    STORAGE_USB_BINARIES_OK="unknown"
+
+    # Wrapper — exists, mode 0755, --version returns exit 0
+    # and prints the stable version tag.
+    if [[ -x /usr/lib/evo/evo-usb-mount ]]; then
+        local ver
+        ver="$(/usr/lib/evo/evo-usb-mount --version 2>/dev/null || true)"
+        if [[ "${ver}" == "evo-usb-mount 1" ]]; then
+            STORAGE_USB_WRAPPER_OK="ok"
+        else
+            STORAGE_USB_WRAPPER_OK="wrong_version:${ver}"
+        fi
+    else
+        STORAGE_USB_WRAPPER_OK="missing_or_not_executable"
+    fi
+
+    # Sudoers grant — file present + mode 0440 + owner root.
+    if [[ -f /etc/sudoers.d/evo-storage-usb ]]; then
+        local mode
+        mode="$(stat -c '%a' /etc/sudoers.d/evo-storage-usb 2>/dev/null || echo unknown)"
+        if [[ "${mode}" == "440" ]]; then
+            STORAGE_USB_SUDOERS_OK="ok"
+        else
+            STORAGE_USB_SUDOERS_OK="wrong_mode:${mode}"
+        fi
+    else
+        STORAGE_USB_SUDOERS_OK="missing"
+    fi
+
+    # Per-plugin state directory (aliases.toml lives here at
+    # Step 6). Owner + mode enforcement happens at install
+    # time; post-condition just checks presence + ownership.
+    if [[ -d /var/lib/evo/plugins/org.evoframework.storage.usb/state ]]; then
+        STORAGE_USB_STATE_DIR_OK="ok"
+    else
+        STORAGE_USB_STATE_DIR_OK="missing"
+    fi
+
+    # Binary union — every tool the plugin's wrapper actions
+    # will exec (per USB-STORAGE.md §2 matrix + §9 safe-remove).
+    local missing_bins=()
+    for bin in mount umount blockdev fsck.vfat fsck.exfat ntfsfix e2fsck eject lsblk findmnt; do
+        if ! command -v "${bin}" >/dev/null 2>&1; then
+            missing_bins+=("${bin}")
+        fi
+    done
+    if [[ ${#missing_bins[@]} -eq 0 ]]; then
+        STORAGE_USB_BINARIES_OK="ok"
+    else
+        STORAGE_USB_BINARIES_OK="missing:${missing_bins[*]}"
+    fi
+
+    if [[ "${STORAGE_USB_WRAPPER_OK}" == "ok" \
+       && "${STORAGE_USB_SUDOERS_OK}" == "ok" \
+       && "${STORAGE_USB_STATE_DIR_OK}" == "ok" \
+       && "${STORAGE_USB_BINARIES_OK}" == "ok" ]]; then
+        STORAGE_USB_PROVISIONING_CHECK="ok"
+    else
+        STORAGE_USB_PROVISIONING_CHECK="degraded"
+        echo "" >&2
+        echo "FAIL: storage.usb provisioning incomplete." >&2
+        echo "      wrapper : ${STORAGE_USB_WRAPPER_OK}" >&2
+        echo "      sudoers : ${STORAGE_USB_SUDOERS_OK}" >&2
+        echo "      state   : ${STORAGE_USB_STATE_DIR_OK}" >&2
+        echo "      binaries: ${STORAGE_USB_BINARIES_OK}" >&2
+        echo "      Re-run bootstrap without EVO_INSTALL_STORAGE_USB=0, or" >&2
+        echo "      apt-install the missing binaries manually." >&2
+    fi
 }
 
 # LAN-discovery invariant: `avahi-daemon` publishes the SMB
@@ -1286,6 +1379,11 @@ smb_netbios_check = "${SMB_NETBIOS_CHECK:-unknown}"
 lan_discovery_check = "${LAN_DISCOVERY_CHECK:-unknown}"
 lan_discovery_avahi = "${LAN_DISCOVERY_AVAHI:-unknown}"
 lan_discovery_nmbd = "${LAN_DISCOVERY_NMBD:-unknown}"
+storage_usb_provisioning_check = "${STORAGE_USB_PROVISIONING_CHECK:-unknown}"
+storage_usb_wrapper = "${STORAGE_USB_WRAPPER_OK:-unknown}"
+storage_usb_sudoers = "${STORAGE_USB_SUDOERS_OK:-unknown}"
+storage_usb_state_dir = "${STORAGE_USB_STATE_DIR_OK:-unknown}"
+storage_usb_binaries = "${STORAGE_USB_BINARIES_OK:-unknown}"
 
 EOF
 
@@ -1425,6 +1523,15 @@ if [[ "${SMB_NETBIOS_CHECK:-unknown}" == "mismatch" ]]; then POST_OK=0; fi
 # network browsers. Refuse the install so the bootstrap-tier
 # step 2.7 has to have activated both.
 if [[ "${LAN_DISCOVERY_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
+# Storage-USB provisioning invariant. `degraded` means the
+# bootstrap-tier Step 1g did not land one or more of: the
+# wrapper at /usr/lib/evo/evo-usb-mount, the sudoers grant at
+# /etc/sudoers.d/evo-storage-usb, the per-plugin state dir, or
+# the union of FS-repair binaries. The plugin's mount / repair
+# / eject verbs will fail at runtime without these — refuse
+# the install so the deploy cannot silently declare success on
+# a rig where the block-storage privilege path is broken.
+if [[ "${STORAGE_USB_PROVISIONING_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi

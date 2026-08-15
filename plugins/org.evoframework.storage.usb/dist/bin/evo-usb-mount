@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Just a Nerd
+#
+# evo-usb-mount — narrow root-only wrapper for the
+# org.evoframework.storage.usb plugin's mount / umount / fsck /
+# eject dispatch. Installed by bootstrap.sh at
+# /usr/lib/evo/evo-usb-mount, mode 0755 root:root. Sole
+# privileged target of the EVO_STORAGE_USB sudoers Cmnd_Alias.
+#
+# The steward MUST NEVER receive raw mount / umount / fsck /
+# eject argv. All privileged block-storage operations flow
+# through this wrapper. Same trust-boundary discipline as
+# /usr/local/bin/evo-smb-user-sync (SMB user provisioning) and
+# /usr/local/bin/evo-captive-probe (captive network probing).
+#
+# Path allowlist for mount targets:
+#   /var/lib/evo/music/USB/<stable-id>/
+# where <stable-id> matches [A-Za-z0-9][A-Za-z0-9_-]{0,31}
+# with optional -p<N> partition suffix (see USB-STORAGE.md §3).
+#
+# Block-device allowlist for source arguments:
+#   /dev/sd[a-z][1-9]*
+#   /dev/nvme[0-9]+n[0-9]+p[0-9]+
+#   /dev/mmcblk[0-9]+p[0-9]+
+#
+# Anything outside either allowlist is a defect — the wrapper
+# refuses. The runtime's argv builders in
+# plugins/org.evoframework.storage.usb/src/runtime.rs are the
+# design-time trust boundary; the wrapper is the last-mile
+# runtime enforcement.
+#
+# STEP-1 STATE (this commit): every action returns
+# `not-implemented` (exit 42) after argv validation succeeds.
+# Steps 3-5 implement the actions in place — the wrapper's
+# invocation shape stays stable across those steps so bootstrap
+# + sudoers grant do not churn.
+#
+# Exit codes:
+#   0  — action completed successfully
+#   1  — invalid invocation (missing / malformed argv)
+#   2  — argv failed path or block-device allowlist
+#   3  — subprocess (mount / umount / fsck / eject) failed
+#   42 — action not implemented yet (Step 1 stub)
+
+set -euo pipefail
+
+readonly USB_MOUNT_ROOT="/var/lib/evo/music/USB"
+readonly STABLE_ID_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,31}(-p[0-9]+)?$'
+readonly DEVICE_NODE_RE='^/dev/(sd[a-z][1-9][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|mmcblk[0-9]+p[0-9]+)$'
+readonly PARENT_DISK_RE='^/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$'
+readonly FS_TYPE_RE='^(vfat|exfat|ntfs|ext2|ext3|ext4)$'
+
+usage() {
+    cat >&2 <<'USAGE'
+evo-usb-mount — narrow wrapper for org.evoframework.storage.usb
+
+Usage:
+  evo-usb-mount mount        <stable-id> <fs-type> <device-node>
+  evo-usb-mount umount       <stable-id>
+  evo-usb-mount umount-force <stable-id>
+  evo-usb-mount fsck         <stable-id> <fs-type> <device-node>
+  evo-usb-mount eject        <parent-disk>
+  evo-usb-mount --version
+  evo-usb-mount --help
+
+Constraints:
+  <stable-id>   matches [A-Za-z0-9][A-Za-z0-9_-]{0,31} (optional -p<N> suffix)
+  <fs-type>     one of vfat|exfat|ntfs|ext2|ext3|ext4
+  <device-node> matches /dev/sd*[N] or /dev/nvme*n*p* or /dev/mmcblk*p*
+  <parent-disk> matches /dev/sd* or /dev/nvme*n* or /dev/mmcblk*
+  Mount targets always at /var/lib/evo/music/USB/<stable-id>/
+
+Exit codes:
+  0  ok
+  1  invalid invocation
+  2  argv failed allowlist
+  3  subprocess failed
+  42 action not implemented (Step-1 stub)
+USAGE
+}
+
+die_invocation() {
+    echo "evo-usb-mount: $*" >&2
+    usage
+    exit 1
+}
+
+die_allowlist() {
+    echo "evo-usb-mount: $*" >&2
+    exit 2
+}
+
+validate_stable_id() {
+    local id="$1"
+    if [[ ! "${id}" =~ ${STABLE_ID_RE} ]]; then
+        die_allowlist "stable-id '${id}' does not match ${STABLE_ID_RE}"
+    fi
+}
+
+validate_fs_type() {
+    local fs="$1"
+    if [[ ! "${fs}" =~ ${FS_TYPE_RE} ]]; then
+        die_allowlist "fs-type '${fs}' not in ${FS_TYPE_RE}"
+    fi
+}
+
+validate_device_node() {
+    local dev="$1"
+    if [[ ! "${dev}" =~ ${DEVICE_NODE_RE} ]]; then
+        die_allowlist "device-node '${dev}' does not match ${DEVICE_NODE_RE}"
+    fi
+    # Refuse a device-node argv that resolves to a symlink pointing
+    # outside the allowlist — the wrapper only accepts a literal
+    # /dev/ path that the kernel exposes as a block device.
+    if [[ ! -b "${dev}" ]]; then
+        die_allowlist "device-node '${dev}' is not a block device"
+    fi
+}
+
+validate_parent_disk() {
+    local dev="$1"
+    if [[ ! "${dev}" =~ ${PARENT_DISK_RE} ]]; then
+        die_allowlist "parent-disk '${dev}' does not match ${PARENT_DISK_RE}"
+    fi
+    if [[ ! -b "${dev}" ]]; then
+        die_allowlist "parent-disk '${dev}' is not a block device"
+    fi
+}
+
+mount_target_for() {
+    printf '%s/%s' "${USB_MOUNT_ROOT}" "$1"
+}
+
+case "${1:-}" in
+    --version)
+        # Stable version string bootstrap + installer can grep for.
+        # Bump when the wrapper's argv shape changes.
+        echo "evo-usb-mount 1"
+        exit 0
+        ;;
+    --help|-h|"")
+        usage
+        exit 0
+        ;;
+    mount)
+        [[ $# -eq 4 ]] || die_invocation "mount requires 3 args: <stable-id> <fs-type> <device-node>"
+        validate_stable_id "$2"
+        validate_fs_type "$3"
+        validate_device_node "$4"
+        target="$(mount_target_for "$2")"
+        echo "evo-usb-mount: mount action not implemented yet (Step-1 stub)" >&2
+        echo "  planned: mount -t $3 -o <opts-per-USB-STORAGE.md-§2> $4 ${target}" >&2
+        exit 42
+        ;;
+    umount)
+        [[ $# -eq 2 ]] || die_invocation "umount requires 1 arg: <stable-id>"
+        validate_stable_id "$2"
+        target="$(mount_target_for "$2")"
+        echo "evo-usb-mount: umount action not implemented yet (Step-1 stub)" >&2
+        echo "  planned: umount ${target}" >&2
+        exit 42
+        ;;
+    umount-force)
+        [[ $# -eq 2 ]] || die_invocation "umount-force requires 1 arg: <stable-id>"
+        validate_stable_id "$2"
+        target="$(mount_target_for "$2")"
+        echo "evo-usb-mount: umount-force action not implemented yet (Step-1 stub)" >&2
+        echo "  planned: umount -l ${target}" >&2
+        exit 42
+        ;;
+    fsck)
+        [[ $# -eq 4 ]] || die_invocation "fsck requires 3 args: <stable-id> <fs-type> <device-node>"
+        validate_stable_id "$2"
+        validate_fs_type "$3"
+        validate_device_node "$4"
+        echo "evo-usb-mount: fsck action not implemented yet (Step-1 stub)" >&2
+        echo "  planned: fsck.$3 (or equivalent per USB-STORAGE.md §2) on $4" >&2
+        exit 42
+        ;;
+    eject)
+        [[ $# -eq 2 ]] || die_invocation "eject requires 1 arg: <parent-disk>"
+        validate_parent_disk "$2"
+        echo "evo-usb-mount: eject action not implemented yet (Step-1 stub)" >&2
+        echo "  planned: eject $2" >&2
+        exit 42
+        ;;
+    *)
+        die_invocation "unknown action '$1'"
+        ;;
+esac

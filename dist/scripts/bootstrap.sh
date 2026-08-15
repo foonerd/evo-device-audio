@@ -121,6 +121,9 @@ SYSTEM_KIOSK_SUDOERS_FILE="/etc/sudoers.d/evo-system-kiosk"
 NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
 SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 SMB_USER_SYNC_WRAPPER_DST="/usr/local/bin/evo-smb-user-sync"
+STORAGE_USB_SUDOERS_FILE="/etc/sudoers.d/evo-storage-usb"
+STORAGE_USB_WRAPPER_DST="/usr/lib/evo/evo-usb-mount"
+STORAGE_USB_STATE_DIR="/var/lib/evo/plugins/org.evoframework.storage.usb"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
 NMCLI_BIN="/usr/bin/nmcli"
@@ -681,6 +684,115 @@ if [[ "${EVO_INSTALL_SAMBA_SERVER_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $SAMBA_SERVER_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_SAMBA_SERVER_SUDOERS=0 — skipping smb-user-sync wrapper + samba-server sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1g: /usr/lib/evo/evo-usb-mount +
+#          /etc/sudoers.d/evo-storage-usb +
+#          FS repair packages (dosfstools / exfatprogs /
+#          ntfs-3g / e2fsprogs / util-linux / eject) +
+#          plugin state dir
+# ----------------------------------------------------------
+# Install the narrow root-elevated block-storage wrapper used by
+# org.evoframework.storage.usb, its NOPASSWD grant, the union
+# of FS-repair packages the plugin's mount/repair verbs need
+# (per USB-STORAGE.md §2 matrix), and the per-plugin state dir
+# for the alias-persistence file (aliases.toml, ADR-0161 A8).
+#
+# The wrapper is the trust boundary for every privileged
+# block-storage op: mount / umount / umount-force / fsck /
+# eject. The steward MUST NOT receive raw mount / umount /
+# fsck / eject grants — only this wrapper. See
+# plugins/org.evoframework.storage.usb/docs/USB-STORAGE.md
+# §6 (privilege model).
+#
+# All four artefacts install together — an installed sudoers
+# grant without the wrapper would break every mount/umount;
+# an installed wrapper without the packages would fail every
+# repair; without the state dir the alias-persistence file
+# has nowhere to land.
+if [[ "${EVO_INSTALL_STORAGE_USB:-1}" != "0" ]]; then
+    # Union of Debian packages required per USB-STORAGE.md §2
+    # (Package column). Union-install idempotent: apt-get is a
+    # no-op when packages are already present at the correct
+    # version. `util-linux` supplies blockdev (--getsize64 for
+    # the >2 TiB FAT32 refuse per §2). `eject` supplies the
+    # SCSI eject utility used by safe-remove (§9).
+    STORAGE_USB_PKGS=(
+        dosfstools    # fsck.vfat (§2 vfat repair)
+        exfatprogs    # fsck.exfat (§2 exfat repair)
+        ntfs-3g       # ntfsfix (§2 ntfs repair)
+        e2fsprogs     # e2fsck + dumpe2fs (§2 ext repair + dirty check)
+        util-linux    # blockdev (§2 volume-size query)
+        eject         # eject (§9 safe-remove SCSI eject)
+    )
+    if command -v apt-get >/dev/null 2>&1; then
+        # Only apt-install missing packages — no-op when
+        # every package already at the required version.
+        MISSING_PKGS=()
+        for pkg in "${STORAGE_USB_PKGS[@]}"; do
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -qE "^ii\s+$pkg"; then
+                MISSING_PKGS+=("$pkg")
+            fi
+        done
+        if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+            echo "[bootstrap] apt-install storage.usb deps: ${MISSING_PKGS[*]}"
+            DEBIAN_FRONTEND=noninteractive \
+                apt-get install -y --no-install-recommends \
+                "${MISSING_PKGS[@]}" \
+                >/dev/null 2>&1 || {
+                    echo "[bootstrap] WARN: apt-install of storage.usb deps failed — repair verbs will refuse" >&2
+                }
+        else
+            echo "[bootstrap] storage.usb deps present (${#STORAGE_USB_PKGS[@]}/${#STORAGE_USB_PKGS[@]})"
+        fi
+    else
+        echo "[bootstrap] WARN: apt-get not present — storage.usb deps not installed; repair verbs will refuse" >&2
+    fi
+
+    # Wrapper install: distribution's plugin dir → /usr/lib/evo/.
+    STORAGE_USB_WRAPPER_SRC="$DIST_DIR/../plugins/org.evoframework.storage.usb/dist/bin/evo-usb-mount"
+    if [[ ! -f "$STORAGE_USB_WRAPPER_SRC" ]]; then
+        echo "storage.usb wrapper not found at $STORAGE_USB_WRAPPER_SRC" >&2
+        exit 2
+    fi
+    install -d -m 0755 -o root -g root /usr/lib/evo
+    install -m 0755 -o root -g root \
+        "$STORAGE_USB_WRAPPER_SRC" "$STORAGE_USB_WRAPPER_DST"
+    echo "[bootstrap] installed $STORAGE_USB_WRAPPER_DST"
+
+    # Sudoers grant.
+    STORAGE_USB_SUDOERS_TEMPLATE="$DIST_DIR/../plugins/org.evoframework.storage.usb/dist/sudoers.d/evo-storage-usb.in"
+    if [[ ! -f "$STORAGE_USB_SUDOERS_TEMPLATE" ]]; then
+        echo "storage.usb sudoers template not found at $STORAGE_USB_SUDOERS_TEMPLATE" >&2
+        exit 2
+    fi
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+        "$STORAGE_USB_SUDOERS_TEMPLATE" > "$TMP"
+    if ! visudo -c -f "$TMP" >/dev/null; then
+        echo "storage.usb sudoers fragment failed visudo -c; refusing to install" >&2
+        echo "  rendered file kept at $TMP for inspection" >&2
+        trap - EXIT
+        exit 2
+    fi
+    install -m 0440 -o root -g root "$TMP" "$STORAGE_USB_SUDOERS_FILE"
+    rm -f "$TMP"
+    trap - EXIT
+    echo "[bootstrap] installed $STORAGE_USB_SUDOERS_FILE"
+
+    # Per-plugin state directory. Mode 0700 owned by the
+    # steward service user. Same shape as the smb-server
+    # plugin's state dir (aliases.toml lands here at ADR-0161
+    # A8 wiring in Step 6).
+    install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+        "$STORAGE_USB_STATE_DIR" \
+        "$STORAGE_USB_STATE_DIR/state" \
+        "$STORAGE_USB_STATE_DIR/credentials"
+    echo "[bootstrap] ensured $STORAGE_USB_STATE_DIR/{state,credentials} (owner $SERVICE_USER, mode 0700)"
+else
+    echo "[bootstrap] EVO_INSTALL_STORAGE_USB=0 — skipping storage.usb wrapper + sudoers + packages + state dir"
 fi
 
 # ----------------------------------------------------------

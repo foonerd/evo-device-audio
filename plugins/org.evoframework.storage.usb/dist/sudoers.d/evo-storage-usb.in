@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Just a Nerd
+#
+# evo-storage-usb — narrow NOPASSWD grant for the
+# org.evoframework.storage.usb plugin's block-storage mount /
+# umount / fsck / eject operations.
+#
+# Installed by `bootstrap.sh` at /etc/sudoers.d/evo-storage-usb,
+# mode 0440 root:root, after `visudo -c` validation.
+# `@EVO_SERVICE_USER@` is substituted with the operator-resolved
+# steward service user at install time (same pattern as
+# evo-network-shares + evo-samba-server).
+#
+# Trust boundary. The steward MUST NEVER receive raw `mount` /
+# `umount` / `fsck` / `eject` grants. Every privileged block-
+# storage operation flows through the single wrapper at
+# /usr/lib/evo/evo-usb-mount, which:
+#
+#   1. Validates the stable-id argv against the sanitised token
+#      rule locked in USB-STORAGE.md §3
+#      (`[A-Za-z0-9][A-Za-z0-9_-]{0,31}` with optional -p<N>).
+#   2. Validates the device-node argv against a per-transport
+#      block-device allowlist (/dev/sd*[N] + /dev/nvme*n*p* +
+#      /dev/mmcblk*p*) and refuses non-block-device paths.
+#   3. Enforces the mount target under /var/lib/evo/music/USB/
+#      by construction — the wrapper builds the target path
+#      itself from `USB_MOUNT_ROOT + stable-id`; the caller
+#      does not supply the target.
+#   4. Dispatches per USB-STORAGE.md §2 (mount options per FS
+#      family + repair tool per FS family).
+#
+# Steward's argv builder in plugins/org.evoframework.storage.usb
+# /src/runtime.rs is the design-time trust boundary; this
+# wrapper is the last-mile runtime enforcement. Argv-scoping at
+# the sudoers layer (Cmnd_Alias literal argv) is intentionally
+# NOT applied — mount option strings vary per filesystem family
+# (see USB-STORAGE.md §2 matrix) and the wrapper's per-family
+# dispatch is the correct enforcement point. Same discipline as
+# evo-network-shares (mount option flags vary with operator
+# advanced_options).
+
+Cmnd_Alias EVO_STORAGE_USB = /usr/lib/evo/evo-usb-mount
+
+@EVO_SERVICE_USER@ ALL=(ALL) NOPASSWD: EVO_STORAGE_USB
