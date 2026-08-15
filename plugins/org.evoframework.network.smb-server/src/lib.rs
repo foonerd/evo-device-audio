@@ -404,11 +404,61 @@ impl Respondent for SmbServerPlugin {
 }
 
 fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
+    use evo_plugin_sdk::error_taxonomy::ErrorClass;
+    use runtime::ApplyError;
     match e {
         VerbDispatchError::UnknownRequestType { .. }
         | VerbDispatchError::PayloadDecode { .. } => {
             PluginError::Permanent(e.to_string())
         }
+        // Structured subclass propagation. The UI routes on
+        // subclass strings — a bare Transient("...") collapses
+        // to "refused: 400 Bad Request" on the wire and gives
+        // no signal that would let the UI distinguish "already
+        // exists" from "credentials write required" from
+        // "vault unavailable" etc. Extend the match here as
+        // more ApplyError variants earn distinct UI routes.
+        VerbDispatchError::Apply(ApplyError::UserAlreadyExists {
+            ref username,
+        }) => PluginError::WithSubclass {
+            class: ErrorClass::ContractViolation,
+            subclass: "user_already_exists".into(),
+            message: format!(
+                "smb user {username:?} is already registered in plugin state \
+                 with an OS-layer backing. To change the password, edit the \
+                 user in place. To provision a different account under the \
+                 same name, revoke first."
+            ),
+        },
+        VerbDispatchError::Apply(ApplyError::CredentialMissing { ref key }) => {
+            PluginError::WithSubclass {
+                class: ErrorClass::Misconfiguration,
+                subclass: "credential_missing".into(),
+                message: format!(
+                    "smb user add: credential vault has no entry for key \
+                 {key:?} — persist the password via `credential_put` \
+                 before dispatching `user_add`."
+                ),
+            }
+        }
+        VerbDispatchError::Apply(ApplyError::CredentialVaultUnavailable) => {
+            PluginError::WithSubclass {
+                class: ErrorClass::Misconfiguration,
+                subclass: "credential_vault_unavailable".into(),
+                message: e.to_string(),
+            }
+        }
+        VerbDispatchError::Apply(ApplyError::BlockedUsername {
+            ref username,
+        }) => PluginError::WithSubclass {
+            class: ErrorClass::ContractViolation,
+            subclass: "blocked_username".into(),
+            message: format!(
+                "smb user add: username {username:?} is reserved by the \
+                 plugin's blocklist (OS / steward / audio-plane identity). \
+                 Pick a different name."
+            ),
+        },
         VerbDispatchError::Apply(_) => PluginError::Transient(e.to_string()),
         VerbDispatchError::ResponseSerialise { .. } => {
             PluginError::Permanent(e.to_string())

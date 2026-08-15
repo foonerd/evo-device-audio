@@ -520,6 +520,66 @@ pub enum ApplyError {
     },
 }
 
+/// Which internal mode [`SambaServerRuntime::add_user`]
+/// dispatches through. Selected up front from the
+/// (in-state?, NSS-exists?) pair; drives wrapper argv choice
+/// + rollback behaviour on failure.
+///
+/// Exposed as `pub` for tracing / test assertions. Not part of
+/// the wire surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAddMode {
+    /// Neither state nor OS layer knows this name — create a
+    /// fresh NSS + passdb entry via wrapper `add`.
+    AddFresh,
+    /// OS layer has a survivor from before a wipe, but state
+    /// does not (pre-reconcile-on-load window; the manual
+    /// `user_add` fires before the reconciler sees it). Adopt
+    /// via wrapper `adopt` — new state row + re-key.
+    AdoptFromOs,
+    /// State AND OS both have the name — this is the
+    /// change-password path. Re-key the existing state record's
+    /// `credential_key` and dispatch wrapper `adopt` to reset
+    /// the SMB password from the fresh vault credential.
+    /// (Missed in 2a02cda — the old duplicate guard refused this
+    /// case unconditionally, which meant every reconciled
+    /// orphan was permanently un-editable.)
+    RekeyInPlace,
+}
+
+/// Undo a state mutation applied by [`SambaServerRuntime::add_user`]
+/// per its selected mode. Symmetric with the mode-select branch
+/// so rollback keeps the state consistent with "user_add did
+/// not commit" regardless of which step downstream failed
+/// (credential fetch / wrapper subprocess).
+///
+/// - `AddFresh` / `AdoptFromOs` → drop the freshly-pushed row.
+/// - `RekeyInPlace` → restore the `old_record_snapshot` in-place.
+///
+/// Kept as a free fn (not a method) so it can hold a `&mut`
+/// borrow on `state` without the outer `Arc<Mutex>` guard
+/// contortion.
+fn revert_user_state_mutation(
+    state: &mut SmbServerState,
+    mode: UserAddMode,
+    username: &str,
+    old_record_snapshot: Option<&SmbUserRecord>,
+) {
+    match mode {
+        UserAddMode::AddFresh | UserAddMode::AdoptFromOs => {
+            state.smb_users.retain(|u| u.username != username);
+        }
+        UserAddMode::RekeyInPlace => {
+            if let (Some(old), Some(rec)) = (
+                old_record_snapshot,
+                state.smb_users.iter_mut().find(|u| u.username == username),
+            ) {
+                *rec = old.clone();
+            }
+        }
+    }
+}
+
 /// Rendered subprocess output shape (mirrors
 /// [`crate::network_shares::CommandOutput`] for isolation).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1754,6 +1814,7 @@ impl SambaServerRuntime {
     /// A plugin crash between step 2's save-success and step 4's
     /// wrapper-success leaves a phantom row; the same recovery
     /// path (operator `user_revoke`) reconciles it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_user(
         &self,
         username: String,
@@ -1772,37 +1833,105 @@ impl SambaServerRuntime {
         }
 
         let created_at_ms = (self.now_fn)() as i64;
+
+        // Step 2: mode-select + persist. Four-way decision:
+        //
+        //   in state? | NSS exists? | Mode
+        //   ----------|-------------|------------------
+        //   no        | no          | AddFresh   (create fresh NSS+passdb)
+        //   no        | yes         | AdoptFromOs (adopt survivor — pre-reconcile
+        //                                          window; reconcile-on-load
+        //                                          normally catches these first)
+        //   yes       | yes         | RekeyInPlace (change-password on an
+        //                                           already-managed user; the
+        //                                           reconciled-orphan case UI
+        //                                           team flagged in 2a02cda)
+        //   yes       | no          | RejectPhantomDup (state row without OS
+        //                                               backing — phantom;
+        //                                               refuse UserAlreadyExists)
+        //
+        // The RekeyInPlace branch is what 2a02cda missed. My
+        // reconcile-on-load sweeps every passdb survivor into
+        // state.smb_users; the old duplicate guard then refused
+        // every re-add for those names before probe_nss could
+        // fire. Result: reconciled orphans were permanently
+        // un-editable. The mode-select below reaches probe_nss
+        // FIRST so the change-password path stays reachable.
+        //
+        // Under a single lock scope so two concurrent adds
+        // cannot both pass the phantom-dup check.
+        let nss_exists = self.nss_prober.probe(&username).await;
+        let old_record_snapshot: Option<SmbUserRecord> = {
+            let g = self.inner.lock().await;
+            g.state
+                .smb_users
+                .iter()
+                .find(|u| u.username == username)
+                .cloned()
+        };
+        let mode = match (old_record_snapshot.is_some(), nss_exists) {
+            (false, false) => UserAddMode::AddFresh,
+            (false, true) => UserAddMode::AdoptFromOs,
+            (true, true) => UserAddMode::RekeyInPlace,
+            (true, false) => {
+                // Phantom row — state has the name but no OS
+                // backing. Refuse without touching anything.
+                return Err(ApplyError::UserAlreadyExists { username });
+            }
+        };
+
+        // Build the new record. When re-keying, preserve the
+        // existing created_at_ms + inherit mapped_domain_identity
+        // from the caller's payload OR the surviving record.
         let record = SmbUserRecord {
             username: username.clone(),
-            mapped_domain_identity,
-            created_at_ms,
+            mapped_domain_identity: mapped_domain_identity.or_else(|| {
+                old_record_snapshot
+                    .as_ref()
+                    .and_then(|r| r.mapped_domain_identity.clone())
+            }),
+            created_at_ms: old_record_snapshot
+                .as_ref()
+                .map(|r| r.created_at_ms)
+                .unwrap_or(created_at_ms),
             credential_key: credential_key.clone(),
         };
 
-        // Step 2: duplicate check + speculative persist in ONE
-        // lock scope. Doing both under the same guard closes the
-        // race window in which two concurrent adds could both
-        // pass the "already exists" check.
+        // Persist the state mutation. On save failure, revert
+        // the mutation per mode (drop the fresh push, or
+        // restore the old_record_snapshot).
         {
             let mut g = self.inner.lock().await;
-            if g.state.smb_users.iter().any(|u| u.username == username) {
-                return Err(ApplyError::UserAlreadyExists { username });
+            match mode {
+                UserAddMode::AddFresh | UserAddMode::AdoptFromOs => {
+                    g.state.smb_users.push(record.clone());
+                }
+                UserAddMode::RekeyInPlace => {
+                    if let Some(rec) = g
+                        .state
+                        .smb_users
+                        .iter_mut()
+                        .find(|u| u.username == username)
+                    {
+                        *rec = record.clone();
+                    }
+                }
             }
-            g.state.smb_users.push(record.clone());
             if let Err(e) = g.state.save(&g.path) {
-                // Save failed before any side effect. Roll back
-                // the in-memory push so subsequent calls in this
-                // process see the original state, then surface
-                // the persistence error.
-                g.state.smb_users.retain(|u| u.username != username);
+                revert_user_state_mutation(
+                    &mut g.state,
+                    mode,
+                    &username,
+                    old_record_snapshot.as_ref(),
+                );
                 return Err(e.into());
             }
         }
 
         // Step 3: fetch the vault password. On failure, roll
-        // back the speculative row so the plugin state stays
-        // consistent with "user not added". Best-effort rollback
-        // save; on rollback failure we return `AddRollbackFailed`
+        // back per mode (drop the fresh push or restore the
+        // old_record_snapshot). Best-effort rollback save; on
+        // rollback failure we return `AddRollbackFailed`
         // carrying both stderr strings.
         let password = match self
             .credentials
@@ -1813,7 +1942,12 @@ impl SambaServerRuntime {
             None => {
                 let rollback = {
                     let mut g = self.inner.lock().await;
-                    g.state.smb_users.retain(|u| u.username != username);
+                    revert_user_state_mutation(
+                        &mut g.state,
+                        mode,
+                        &username,
+                        old_record_snapshot.as_ref(),
+                    );
                     g.state.save(&g.path)
                 };
                 if let Err(rb) = rollback {
@@ -1832,39 +1966,23 @@ impl SambaServerRuntime {
         };
 
         // Step 4: fire the wrapper. Wrapper reads password once;
-        // it doubles for `smbpasswd -s`.
-        //
-        // Adopt-or-add dispatch. Wipe/reinstall drift: the wipe
-        // primitive resets `<state_dir>/state/smb_server.toml`
-        // but does NOT touch `/var/lib/samba/private/passdb.tdb`
-        // or the NSS accounts the plugin created via
-        // `evo-smb-user-sync add`. On the next `user_add` for a
-        // surviving name, plain `add` would fail at the
-        // `useradd` step ("already exists"). The wrapper's
-        // `adopt` action re-keys the existing NSS + passdb
-        // entry from the operator's fresh vault credential
-        // without touching NSS. We probe the NSS layer via
-        // `id -u` (unprivileged) to decide which action to fire.
-        //
-        // The reconcile-on-load path (lib.rs `load` handler)
-        // sweeps every passdb entry into `state.smb_users` at
-        // admission so `list_configured` reflects reality
-        // regardless of whether the operator ever adds a
-        // survivor manually. This adopt path here is the
-        // manual-add fallback.
+        // it doubles for `smbpasswd -s`. Argv choice comes from
+        // the mode selected at Step 2:
+        //   AddFresh                    -> wrapper add
+        //   AdoptFromOs, RekeyInPlace   -> wrapper adopt
+        // (RejectPhantomDup already returned above.)
         let mut stdin = password;
         stdin.push(b'\n');
-        let nss_exists = self.nss_prober.probe(&username).await;
-        let args = if nss_exists {
-            build_smb_user_sync_adopt_args(&username)
-        } else {
-            build_smb_user_sync_add_args(&username)
+        let args = match mode {
+            UserAddMode::AddFresh => build_smb_user_sync_add_args(&username),
+            UserAddMode::AdoptFromOs | UserAddMode::RekeyInPlace => {
+                build_smb_user_sync_adopt_args(&username)
+            }
         };
-        let dispatch_action = if nss_exists { "adopt" } else { "add" };
         tracing::info!(
             plugin = "org.evoframework.network.smb-server",
             username = %username,
-            action = dispatch_action,
+            mode = ?mode,
             "user_add dispatch"
         );
         let outcome = self
@@ -1888,7 +2006,12 @@ impl SambaServerRuntime {
                 let exit_code = out.exit_code;
                 let rollback = {
                     let mut g = self.inner.lock().await;
-                    g.state.smb_users.retain(|u| u.username != username);
+                    revert_user_state_mutation(
+                        &mut g.state,
+                        mode,
+                        &username,
+                        old_record_snapshot.as_ref(),
+                    );
                     g.state.save(&g.path)
                 };
                 if let Err(rb) = rollback {
@@ -1908,7 +2031,12 @@ impl SambaServerRuntime {
                 let io_msg = io_err.to_string();
                 let rollback = {
                     let mut g = self.inner.lock().await;
-                    g.state.smb_users.retain(|u| u.username != username);
+                    revert_user_state_mutation(
+                        &mut g.state,
+                        mode,
+                        &username,
+                        old_record_snapshot.as_ref(),
+                    );
                     g.state.save(&g.path)
                 };
                 if let Err(rb) = rollback {
@@ -3566,6 +3694,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_user_rekeys_in_place_when_name_in_state_and_nss_exists() {
+        // UI-team-flagged regression (post-2a02cda): the
+        // reconciled-orphan case. State has the name because
+        // reconcile-on-load put it there; NSS + passdb also
+        // survived the wipe. The operator gestures a
+        // change-password from the UI → user_add. Runtime MUST
+        // NOT refuse UserAlreadyExists — it must re-key the
+        // existing record's credential_key AND dispatch wrapper
+        // `adopt` so smbpasswd -s resets the SMB password from
+        // the fresh vault credential.
+        let dir = tempdir();
+        // Seed state with a reconciled record — credential_key
+        // is the synthesised `smb_user:<name>` shape that
+        // reconcile_smb_users_from_passdb writes.
+        let seed_path = dir.join("smb_server.toml");
+        let seed = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: Vec::new(),
+            smb_users: vec![SmbUserRecord {
+                username: "evo".to_string(),
+                mapped_domain_identity: None,
+                created_at_ms: 1_000,
+                credential_key: "smb_user:evo".to_string(),
+            }],
+            last_apply_at_ms: None,
+        };
+        seed.save(&seed_path).unwrap();
+        // Fresh operator-supplied credential key for the
+        // change-password gesture.
+        let mut creds = HashMap::new();
+        creds.insert("vault:smb:evo:new".to_string(), b"freshpw".to_vec());
+        // NSS says the account exists. Wrapper receives one
+        // outcome (adopt success).
+        let (rt, executor) = built_runtime_with_nss(
+            &dir,
+            vec![ok()],
+            creds,
+            vec!["evo".to_string()],
+        );
+        // Sanity — reconciled row present.
+        assert_eq!(rt.get_state().await.smb_users.len(), 1);
+        assert_eq!(
+            rt.get_state().await.smb_users[0].credential_key,
+            "smb_user:evo"
+        );
+        // The gesture.
+        let record = rt
+            .add_user("evo".to_string(), "vault:smb:evo:new".to_string(), None)
+            .await
+            .expect("re-key path must succeed, not refuse UserAlreadyExists");
+        // Record surfaces the NEW credential_key.
+        assert_eq!(record.credential_key, "vault:smb:evo:new");
+        // Wrapper dispatched adopt, not add — and only once.
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            build_smb_user_sync_adopt_args("evo"),
+            "expected wrapper adopt on RekeyInPlace path"
+        );
+        // Password piped once (wrapper doubles for smbpasswd -s).
+        assert_eq!(calls[0].2, b"freshpw\n".to_vec());
+        // Persisted record carries the new credential_key.
+        let state = rt.get_state().await;
+        assert_eq!(state.smb_users.len(), 1);
+        assert_eq!(state.smb_users[0].username, "evo");
+        assert_eq!(state.smb_users[0].credential_key, "vault:smb:evo:new");
+        // created_at_ms preserved (not reset on re-key).
+        assert_eq!(state.smb_users[0].created_at_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn add_user_refuses_only_when_in_state_and_nss_absent_phantom() {
+        // The narrow remaining UserAlreadyExists case: state
+        // has the name but NSS does not (phantom row). This is
+        // the genuine "already fully managed, create-fresh"
+        // conflict class from the memo.
+        let dir = tempdir();
+        let seed_path = dir.join("smb_server.toml");
+        let seed = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: Vec::new(),
+            smb_users: vec![SmbUserRecord {
+                username: "phantom".to_string(),
+                mapped_domain_identity: None,
+                created_at_ms: 1_000,
+                credential_key: "k".to_string(),
+            }],
+            last_apply_at_ms: None,
+        };
+        seed.save(&seed_path).unwrap();
+        let mut creds = HashMap::new();
+        creds.insert("k".to_string(), b"pw".to_vec());
+        // NSS returns empty existing set — phantom row.
+        let (rt, executor) =
+            built_runtime_with_nss(&dir, Vec::new(), creds, Vec::new());
+        let err = rt
+            .add_user("phantom".to_string(), "k".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::UserAlreadyExists { .. }));
+        // Wrapper NOT invoked — phantom refuse fires before
+        // any subprocess dispatch.
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[tokio::test]
     async fn add_user_dispatches_adopt_when_nss_exists() {
         // Post-wipe drift path: NSS+passdb survived; state does
         // not have the user; UI operator re-adds → runtime must
@@ -3628,14 +3868,21 @@ mod tests {
             stdout: b"evo\nevo1\n".to_vec(),
             stderr: Vec::new(),
         };
-        let (rt, _) =
-            built_runtime_with_nss(&dir, vec![list_output], HashMap::new(), Vec::new());
+        let (rt, _) = built_runtime_with_nss(
+            &dir,
+            vec![list_output],
+            HashMap::new(),
+            Vec::new(),
+        );
         let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
         assert_eq!(adopted, 1, "expected to adopt 1 row (evo; evo1 present)");
         let state = rt.get_state().await;
         assert_eq!(state.smb_users.len(), 2);
-        let usernames: Vec<&str> =
-            state.smb_users.iter().map(|u| u.username.as_str()).collect();
+        let usernames: Vec<&str> = state
+            .smb_users
+            .iter()
+            .map(|u| u.username.as_str())
+            .collect();
         assert!(usernames.contains(&"evo"));
         assert!(usernames.contains(&"evo1"));
     }
@@ -3663,8 +3910,12 @@ mod tests {
             stdout: b"already\n".to_vec(),
             stderr: Vec::new(),
         };
-        let (rt, _) =
-            built_runtime_with_nss(&dir, vec![list_output], HashMap::new(), Vec::new());
+        let (rt, _) = built_runtime_with_nss(
+            &dir,
+            vec![list_output],
+            HashMap::new(),
+            Vec::new(),
+        );
         let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
         assert_eq!(adopted, 0);
     }
@@ -3681,8 +3932,12 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"pdbedit: command not found".to_vec(),
         };
-        let (rt, _) =
-            built_runtime_with_nss(&dir, vec![fail], HashMap::new(), Vec::new());
+        let (rt, _) = built_runtime_with_nss(
+            &dir,
+            vec![fail],
+            HashMap::new(),
+            Vec::new(),
+        );
         let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
         assert_eq!(adopted, 0);
     }
