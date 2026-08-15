@@ -1,66 +1,58 @@
 # cross (https://github.com/cross-rs/cross) configuration for
 # evo-device-audio.
 #
-# This file shapes how `cross build` runs: per-target image
-# overrides and pre-build scripts. During pre-release development
-# the workspace's `evo-plugin-sdk` pin resolves through a sibling
-# path-dep on the framework's working tree; the volume mount
-# needed to expose that workspace root inside the container is
-# supplied via the `CROSS_CONTAINER_OPTS` environment variable
-# rather than this file's `volumes` field — see
-# `scripts/cross-build.sh` and `DEVELOPING.md` for the canonical
-# invocation.
+# ## Base image: debian:trixie
 #
-# Two reasons this config exists beyond a placeholder:
+# All three per-target images pin `FROM debian:trixie` — the
+# same OS + package universe the target devices run — so build-
+# time and runtime dynamic-linker see the SAME symbol version
+# and vendor patch level. Cross-rs's default
+# `ghcr.io/cross-rs/*:main` images resolve to Ubuntu 20.04
+# focal; libasound2's mature ABI happens to be safe across
+# Ubuntu-vendored vs Debian-runtime, but the discipline break
+# is real and other ABIs (GTK4 / WebKit6 in evo-kiosk-eng) are
+# not safe under the same mismatch. We pick discipline over
+# luck: build environment matches runtime environment exactly.
+# See `cross-images/x86_64-unknown-linux-gnu/Dockerfile` for
+# the base pinning + package list.
 #
-# 1. Path-dep workspace-root visibility. `cross` auto-discovers
-#    path-dep crate directories and mounts each leaf into the
-#    container at the host-canonical path, but it does NOT mount
-#    the path-dep's workspace root. The SDK pin uses
-#    `edition.workspace = true`, so cargo must walk up from the
-#    SDK crate to its workspace root to resolve the inheritance.
-#    The `CROSS_CONTAINER_OPTS` workaround mounts that workspace
-#    root explicitly. At release cut the SDK pin flips back to a
-#    `git = ..., tag = ...` form against the published framework
-#    release and this workaround is no longer needed.
+# ## Path-dep workspace-root visibility
 #
-# 2. libasound2 cross-target dependency. The composition.alsa
-#    plugin's optional `alsa-substrate` Cargo feature pulls in
-#    the `alsa` crate (libasound bindings). Cross-builds for
-#    aarch64-unknown-linux-gnu therefore need libasound2-dev
-#    for the arm64 architecture inside the container. The
-#    pre-build script installs it on every fresh container
-#    start. Other targets that do not enable `alsa-substrate`
-#    are unaffected.
+# During pre-release development the workspace's
+# `evo-plugin-sdk` pin resolves through a sibling path-dep on
+# the framework's working tree. `cross-rs` auto-mounts each
+# path-dep crate directory into the container at the host-
+# canonical path but does NOT mount the path-dep's workspace
+# root. The SDK pin uses `edition.workspace = true`, so cargo
+# must walk up from the SDK crate to its workspace root to
+# resolve the inheritance. `scripts/cross-build.sh` supplies
+# the missing volume mount via CROSS_CONTAINER_OPTS. At release
+# cut the SDK pin flips back to `git = ..., tag = ...` and the
+# workaround retires.
+#
+# The `volumes = ["EVO_CORE_ENG"]` entry declares that the
+# EVO_CORE_ENG environment variable holds a host path to bind-
+# mount into the container. `scripts/cross-build.sh` sets it
+# to the resolved evo-core-eng directory before invoking
+# `cross build`.
 
 [build.env]
 volumes = ["EVO_CORE_ENG"]
 
 [target.x86_64-unknown-linux-gnu]
-pre-build = [
-    "apt-get update",
-    "apt-get install --assume-yes libasound2-dev pkg-config",
-]
+dockerfile.file = "cross-images/x86_64-unknown-linux-gnu/Dockerfile"
 
 [target.x86_64-unknown-linux-gnu.env]
 volumes = ["EVO_CORE_ENG"]
 
 [target.aarch64-unknown-linux-gnu]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update",
-    "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
-]
+dockerfile.file = "cross-images/aarch64-unknown-linux-gnu/Dockerfile"
 
 [target.aarch64-unknown-linux-gnu.env]
 volumes = ["EVO_CORE_ENG"]
 
 [target.armv7-unknown-linux-gnueabihf]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update",
-    "apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH pkg-config",
-]
+dockerfile.file = "cross-images/armv7-unknown-linux-gnueabihf/Dockerfile"
 
 [target.armv7-unknown-linux-gnueabihf.env]
 volumes = ["EVO_CORE_ENG"]
