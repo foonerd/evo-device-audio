@@ -280,6 +280,42 @@ UI's subject-subscribe path resolves.
 """
 
 [[racks]]
+name = "storage"
+family = "domain"
+kinds = ["registrar"]
+charter = """
+Removable block-storage management as a music source. One \
+shelf for USB mass-storage inventory + mount lifecycle + \
+filesystem repair + safe-remove. Reference plugin: \
+`org.evoframework.storage.usb`. The plugin enumerates every \
+USB-transport block partition (system + system-adjacent + \
+removable), refuses live-system mount at the runtime layer, \
+mounts removable volumes under /var/lib/evo/music/USB/ \
+<stable-id>/, and cross-plugin dispatches library.add_source \
+on mount. Vendor distributions may replace with a same-shape \
+plugin.
+"""
+
+[[racks.shelves]]
+name = "usb"
+shape = 1
+description = """
+USB mass-storage respondent. Single claimant: \
+`org.evoframework.storage.usb`. Operator verbs: \
+list_drives / mount / safe_remove / repair_filesystem / \
+rename. Six-way per-partition role classification \
+(system-root / system-boot / system-efi / system-swap / \
+system-adjacent / removable) with non-negotiable mount \
+refuse on the four live-system roles and opt-in-required \
+gate on system-adjacent. Bootstrap installs \
+`/usr/local/bin/evo-usb-mount` (narrow root-only wrapper) \
++ `/etc/sudoers.d/evo-storage-usb` NOPASSWD grant + apt- \
+installs dosfstools + exfatprogs + ntfs-3g + e2fsprogs + \
+eject at Step 1g. Publishes the reactive \
+`storage_usb_drives` subject the UI's Sources page consumes.
+"""
+
+[[racks]]
 name = "metadata"
 family = "domain"
 kinds = ["registrar"]
@@ -782,6 +818,17 @@ name = "network_share_events"
 # apply / user_add / user_revoke.
 [[subjects]]
 name = "system_smb_server"
+
+# Published by `org.evoframework.storage.usb`: singleton
+# `storage_usb_drives` carrying the full USB-drive inventory
+# envelope (one `DriveRecord` per classified USB-transport
+# partition, with `role` in the six-way taxonomy and
+# `mount_policy` per role). Republished on every hotplug
+# attach / detach / mount / umount / rename / repair-complete.
+# UI's Sources page subscribes at page-mount for the read-
+# then-subscribe seed.
+[[subjects]]
+name = "storage_usb_drives"
 
 # Relation predicates between the audio domain's subject
 # types. The audio playback warden asserts album_of from

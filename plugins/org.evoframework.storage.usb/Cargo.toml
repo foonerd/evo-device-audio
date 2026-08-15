@@ -1,0 +1,40 @@
+[package]
+name = "org-evoframework-storage-usb"
+# Keep in sync with manifest.toml [plugin].version and PluginIdentity in describe().
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Framework-reference USB mass-storage plugin. Stocks the storage.usb shelf's inventory + mount + safe-remove + filesystem-repair + rename verbs (storage.usb.list_drives / mount / safe_remove / repair_filesystem / rename). Owns the udev userspace monitor, coldplug enumeration via lsblk, six-way role classification (system-root / system-boot / system-efi / system-swap / system-adjacent / removable), stable-id derivation ladder (operator alias → fs label → vendor+model → model → synthesized), FS support matrix (vfat / exfat / ntfs / ext), mount lifecycle at /var/lib/evo/music/USB/<stable-id>/, and the reactive storage_usb_drives subject the operator UI's Sources page consumes."
+
+[lib]
+path = "src/lib.rs"
+
+# Out-of-process wire binary cross-built by
+# `dist/scripts/deploy-distribution.sh` and staged under
+# `/opt/evo/plugins/org.evoframework.storage.usb/`; the
+# framework's plugin-discovery walks the search root at boot
+# and admits the bundle.
+[[bin]]
+name = "storage-usb-wire"
+path = "src/bin/storage-usb-wire.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+evo-plugin-sdk = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

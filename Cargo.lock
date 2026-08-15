@@ -3892,6 +3892,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-evoframework-storage-usb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "evo-plugin-sdk",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "org-evoframework-system-kiosk"
 version = "0.1.0"
 dependencies = [

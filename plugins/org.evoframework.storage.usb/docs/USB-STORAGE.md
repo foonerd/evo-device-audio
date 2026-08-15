@@ -14,41 +14,79 @@ sections.
 
 ---
 
-## 1 System-disk classification (R1 — hard-refuse rule)
+## 1 Six-way role classification
 
-A block device is classified **system player disk** when ANY
-of the following holds:
+Every USB-transport block partition is classified into one of
+six roles at classify time. The classification is deterministic
+from three inputs — `/proc/self/mountinfo`, `/proc/swaps`, and
+the JSON output of `lsblk -J -o NAME,PKNAME,MOUNTPOINT,TRAN,TYPE,UUID,LABEL,FSTYPE,PARTUUID,VENDOR,MODEL,SERIAL,SIZE`
+(with `-b` for byte-integer SIZE) — with no hidden I/O. The
+runtime shells out to `lsblk` and reads the two procfs paths;
+the classifier is a pure function so every rule below is
+fixture-testable.
 
-1. The device (or its parent disk) is the block backing for a
-   mount at `/`, `/boot`, `/boot/firmware`, `/imgpart`, or the
-   distribution's state root `/var/lib/evo` (or configured
-   equivalent).
-2. Any partition on the same physical disk (per `lsblk`
-   `PKNAME` correlation) as a mount from rule 1.
-3. Union match, not intersection: if EITHER rule 1 or rule 2
-   applies to any partition on the disk, the whole disk (and
-   every partition on it) is system.
+**Inventoried, not excluded.** The classifier NEVER omits a
+USB-transport partition from its output. A USB-booted device
+sees its own root / boot / EFI partitions in `list_drives`
+with a `role` in the four `system-*` values and a
+`mount_policy` of `refused-system-live`. Consumers (UI, MPD,
+Samba) filter by role for their surface; the plugin's mount
+verb is the enforcement point.
 
-Detection substrate: `/proc/self/mountinfo` (source of truth
-per `NETWORK-SHARES-MOUNT-TRUTH-HANDOFF.md` pattern) +
-`lsblk -J -o NAME,PKNAME,MOUNTPOINT,TRAN,TYPE,UUID,LABEL,FSTYPE`
-+ `findmnt -no SOURCE <path>` to walk mount → block device.
+### Role taxonomy
 
-**System-disk hard-refuse invariant** — for every classifier
-output `system-disk`:
-
-| Verb / behaviour | Response |
+| Role | Condition |
 |---|---|
-| Auto-mount on hotplug | **NEVER** — the classifier prunes system-disk before enumeration. |
-| `storage.usb.list_drives` | Include with `class: "system-disk"` and no actionable verbs. |
-| `storage.usb.safe_remove` | Refuse with `SystemDiskRefused { device }` structured error. |
-| `storage.usb.repair_filesystem` | Refuse with `SystemDiskRefused { device }`. |
-| `storage.usb.mount` | Refuse with `SystemDiskRefused { device }`. |
-| Samba parent share export | Not affected — Samba serves `/var/lib/evo/music/USB/*` and system disks are never mounted there. |
+| `system-root` | backs `/` per `/proc/self/mountinfo` |
+| `system-boot` | backs `/boot` or `/boot/firmware` (Pi / Debian raspi convention) |
+| `system-efi` | backs `/boot/efi` |
+| `system-swap` | listed in `/proc/swaps` as a partition-type swap |
+| `system-adjacent` | sibling partition on the same parent disk as any `system-*` partition, but not itself live-mounted or in swap |
+| `removable` | everything else |
 
-The classifier's fact-tree is fixture-testable — every union
-rule has a unit test with a synthetic `mountinfo` + `lsblk`
-output. See § "Test fixtures" below.
+### Mount-policy matrix (per role, non-negotiable)
+
+| Role | `mount_policy` | Auto-mount on plug/coldplug | `storage.usb.mount` verb | Live fsck / `repair_filesystem` | Safe-remove |
+|---|---|---|---|---|---|
+| `system-root` / `system-boot` / `system-efi` / `system-swap` | `refused-system-live` | ❌ never | ❌ refuse `system_live_partition` | ❌ refuse `system_live_partition` (offer `schedule_next_boot` via a future verb that writes `/forcefsck` sentinel + optional reboot) | ❌ refuse (would kill running OS or is meaningless for swap) |
+| `system-adjacent` | `opt-in-required` (default) | ❌ default off | ❌ refuse `system_adjacent_not_opted_in` unless alias-file entry carries `mount_policy = "opt-in"` | ✅ when unmounted | ✅ if operator opts to unmount first |
+| `removable` | `auto` | ✅ | ✅ | ✅ when unmounted | ✅ |
+
+`list_drives` reports every partition regardless of role.
+SMART / health / capacity / model report for every partition.
+`role` + `mount_policy` are required non-null enum fields on
+every `DriveRecord` (§5) so consumers render policy honestly:
+
+- **Boot drive visible** — the operator sees "this drive is
+  booting evo, 3 partitions in use by the OS, 1 sibling
+  partition available if you opt in". Not black-holed.
+- **Sibling data partitions opt-in** — the boot drive is not
+  "obviously" a music source; the operator must name an alias
+  and confirm the policy before the runtime builds mount argv.
+- **Live-system refuse non-negotiable** — mount of a partition
+  currently backing `/` / `/boot*` / swap is refused at the
+  runtime layer with a stable error class, regardless of
+  operator confirmation or alias-file entry.
+
+### Enforcement layers
+
+1. **Plugin runtime (design-time authority).** Classifier is
+   the sole source of `role`; every mutating verb consults it
+   before argv-build. Mount / safe-remove / repair refuse at
+   the runtime layer with structured errors named in the
+   `storage.usb.v1` shelf schema's acceptance rows.
+2. **Wrapper (last-mile runtime enforcement).** The wrapper is
+   not role-aware — it enforces argv shape only (path allowlist
+   for mount targets + block-device allowlist for source
+   arguments). Steps 3-5 add one defence-in-depth guard: before
+   dispatching `mount` or `fsck` on a device node, the wrapper
+   consults `/proc/self/mountinfo` and refuses if the device is
+   currently mounted anywhere.
+
+Fixtures live at
+`plugins/org.evoframework.storage.usb/tests/fixtures/<name>/{mountinfo,swaps,lsblk.json,expected.json}`.
+Every rule in the role taxonomy has at least one fixture; see
+§12 for the complete inventory.
 
 ---
 
@@ -323,7 +361,7 @@ should consider renaming it.
 
 ## 6 Sudoers grants + wrapper (§ privilege model)
 
-**Wrapper:** `/usr/lib/evo/evo-usb-mount`
+**Wrapper:** `/usr/local/bin/evo-usb-mount`
 
 Distribution-owned narrow root-only shell that takes an action
 verb + stable-id and dispatches the correct `mount` / `umount`
@@ -348,7 +386,7 @@ Wrapper actions:
 `plugins/org.evoframework.storage.usb/dist/sudoers.d/evo-storage-usb.in`:
 
 ```
-Cmnd_Alias EVO_STORAGE_USB = /usr/lib/evo/evo-usb-mount
+Cmnd_Alias EVO_STORAGE_USB = /usr/local/bin/evo-usb-mount
 @EVO_SERVICE_USER@ ALL=(ALL) NOPASSWD: EVO_STORAGE_USB
 ```
 
@@ -549,14 +587,16 @@ Consumer-stop-before-mutation is normative — mirrors the
 union rule from §1 has a synthetic `/proc/self/mountinfo` +
 `lsblk -J` output check-in:
 
-| Fixture | Description | Expected class |
+| Fixture | Description | Expected roles |
 |---|---|---|
-| `pi5-nvme-boot` | Pi 5 booting from NVMe (root on /dev/nvme0n1p2); USB stick /dev/sda1 vfat plugged | sda: media, nvme0n1: system-disk union |
-| `pi5-usb-boot` | Pi 5 booting from USB SSD (root on /dev/sda2); second USB stick /dev/sdb1 vfat plugged | sda: system-disk union (rules 1+2), sdb: media |
-| `nuc-nvme-boot-usb-stick` | NUC on NVMe; USB stick vfat plugged | nvme0n1: system-disk, sda: media |
-| `vm-virtio-root-usb-passthrough` | VM with root on /dev/vda; USB stick passthrough as /dev/sda | vda: system-disk, sda: media |
-| `relabelled-boot-partition` | Rootfs partition relabelled as "USB_MUSIC" | Still system-disk (rule 1: parent-of-mount, not label) |
-| `system-disk-with-unmounted-partition` | rootfs on /dev/sda2; /dev/sda3 is an unmounted vfat partition | Both partitions system-disk (rule 2: same parent disk) |
+| `pi5-nvme-boot` | Pi 5 booting from NVMe (root on /dev/nvme0n1p2); USB stick /dev/sda1 vfat plugged | sda1 = `removable`; nvme not in inventory (not USB-transport) |
+| `pi5-usb-boot` | Pi 5 booting from USB SSD (root on /dev/sda2, boot on /dev/sda1); second USB stick /dev/sdb1 plugged | sda1 = `system-boot`, sda2 = `system-root`, sdb1 = `removable` |
+| `nuc-nvme-boot-usb-stick` | NUC on NVMe; USB stick vfat plugged | sda1 = `removable`; nvme not in inventory |
+| `vm-virtio-root-usb-passthrough` | VM with root on /dev/vda; USB stick passthrough as /dev/sda | sda1 = `removable`; vda not in inventory |
+| `relabelled-boot-partition` | Rootfs partition relabelled as "USB_MUSIC" on USB SSD | Still `system-root` (rule uses mountinfo, not label) |
+| `usb-boot-with-swap` | USB SSD with sda1 EFI + sda2 root + sda3 swap + sda4 data | sda1 = `system-efi`, sda2 = `system-root`, sda3 = `system-swap`, sda4 = `system-adjacent` |
+| `usb-boot-with-sibling-data` | USB SSD with sda1 EFI + sda2 root + sda3 unmounted ext4 data | sda3 = `system-adjacent` (mountable + repairable when unmounted, but `mount_policy = opt-in-required` gates mount until alias entry sets `mount_policy = opt-in`) |
+| `pi5-boot-firmware-convention` | Pi 5 USB-boot with `/boot/firmware` mount (Debian raspi convention) instead of `/boot/efi` | sda1 = `system-boot` (both `/boot` and `/boot/firmware` mapped) |
 
 Fixtures live at
 `plugins/org.evoframework.storage.usb/tests/fixtures/<fixture>/{mountinfo,lsblk.json,expected.json}`.

@@ -14,7 +14,7 @@
 # Trust boundary. The steward MUST NEVER receive raw `mount` /
 # `umount` / `fsck` / `eject` grants. Every privileged block-
 # storage operation flows through the single wrapper at
-# /usr/lib/evo/evo-usb-mount, which:
+# /usr/local/bin/evo-usb-mount, which:
 #
 #   1. Validates the stable-id argv against the sanitised token
 #      rule locked in USB-STORAGE.md §3
@@ -39,6 +39,6 @@
 # evo-network-shares (mount option flags vary with operator
 # advanced_options).
 
-Cmnd_Alias EVO_STORAGE_USB = /usr/lib/evo/evo-usb-mount
+Cmnd_Alias EVO_STORAGE_USB = /usr/local/bin/evo-usb-mount
 
 @EVO_SERVICE_USER@ ALL=(ALL) NOPASSWD: EVO_STORAGE_USB

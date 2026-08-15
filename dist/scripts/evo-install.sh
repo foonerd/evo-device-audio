@@ -344,6 +344,16 @@ debian_package_for_binary() {
         testparm|smbpasswd)  echo "samba-common-bin" ;;
         sudo)                echo "sudo" ;;
         tee|cat)             echo "coreutils" ;;
+        # storage.usb plugin: block-device enumeration + repair
+        # matrix. bootstrap.sh Step 1g apt-installs the same set
+        # at install time; these mappings let the installer's
+        # per-plugin package-parity check see them.
+        lsblk|findmnt|blockdev)    echo "util-linux" ;;
+        fsck.vfat)                 echo "dosfstools" ;;
+        fsck.exfat)                echo "exfatprogs" ;;
+        ntfsfix)                   echo "ntfs-3g" ;;
+        e2fsck)                    echo "e2fsprogs" ;;
+        eject)                     echo "eject" ;;
         evo-*)               echo "PLUGIN_PROVIDED" ;;
         *)                   echo "" ;;
     esac
@@ -533,6 +543,18 @@ ensure_system_packages() {
             [[ "${has_deps}" == "true" ]] || continue
             while IFS= read -r binary; do
                 [[ -n "${binary}" ]] || continue
+                # PLUGIN_PROVIDED wrappers (evo-smb-user-sync,
+                # evo-usb-mount, …) are installed by bootstrap
+                # Step 1* which runs at install Step 6 — after
+                # this parity check. Skip them here; the
+                # steward's admission-time PPAG at Step 7 covers
+                # them symmetrically once bootstrap has placed
+                # the wrapper on PATH.
+                local pkg_name
+                pkg_name="$(debian_package_for_binary "${binary}")"
+                if [[ "${pkg_name}" == "PLUGIN_PROVIDED" ]]; then
+                    continue
+                fi
                 if ! command -v "${binary}" >/dev/null 2>&1; then
                     echo "FAIL: plugin ${plugin_id} declares required_binary '${binary}' but it is absent from PATH after apt-install — the parity gate would refuse admission; refusing to proceed" >&2
                     exit 7
@@ -1095,7 +1117,7 @@ verify_post_condition() {
 }
 
 # Storage-USB provisioning invariant: bootstrap Step 1g must
-# have landed the wrapper at /usr/lib/evo/evo-usb-mount
+# have landed the wrapper at /usr/local/bin/evo-usb-mount
 # (executable, mode 0755), the sudoers grant at
 # /etc/sudoers.d/evo-storage-usb (mode 0440), the per-plugin
 # state directory at /var/lib/evo/plugins/org.evoframework.
@@ -1120,9 +1142,9 @@ verify_storage_usb_provisioning() {
 
     # Wrapper — exists, mode 0755, --version returns exit 0
     # and prints the stable version tag.
-    if [[ -x /usr/lib/evo/evo-usb-mount ]]; then
+    if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
-        ver="$(/usr/lib/evo/evo-usb-mount --version 2>/dev/null || true)"
+        ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
         if [[ "${ver}" == "evo-usb-mount 1" ]]; then
             STORAGE_USB_WRAPPER_OK="ok"
         else
@@ -1525,7 +1547,7 @@ if [[ "${SMB_NETBIOS_CHECK:-unknown}" == "mismatch" ]]; then POST_OK=0; fi
 if [[ "${LAN_DISCOVERY_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
 # Storage-USB provisioning invariant. `degraded` means the
 # bootstrap-tier Step 1g did not land one or more of: the
-# wrapper at /usr/lib/evo/evo-usb-mount, the sudoers grant at
+# wrapper at /usr/local/bin/evo-usb-mount, the sudoers grant at
 # /etc/sudoers.d/evo-storage-usb, the per-plugin state dir, or
 # the union of FS-repair binaries. The plugin's mount / repair
 # / eject verbs will fail at runtime without these — refuse

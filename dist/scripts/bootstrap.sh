@@ -122,7 +122,7 @@ NETWORK_SHARES_SUDOERS_FILE="/etc/sudoers.d/evo-network-shares"
 SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 SMB_USER_SYNC_WRAPPER_DST="/usr/local/bin/evo-smb-user-sync"
 STORAGE_USB_SUDOERS_FILE="/etc/sudoers.d/evo-storage-usb"
-STORAGE_USB_WRAPPER_DST="/usr/lib/evo/evo-usb-mount"
+STORAGE_USB_WRAPPER_DST="/usr/local/bin/evo-usb-mount"
 STORAGE_USB_STATE_DIR="/var/lib/evo/plugins/org.evoframework.storage.usb"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
@@ -687,7 +687,7 @@ else
 fi
 
 # ----------------------------------------------------------
-# Step 1g: /usr/lib/evo/evo-usb-mount +
+# Step 1g: /usr/local/bin/evo-usb-mount +
 #          /etc/sudoers.d/evo-storage-usb +
 #          FS repair packages (dosfstools / exfatprogs /
 #          ntfs-3g / e2fsprogs / util-linux / eject) +

@@ -5,7 +5,7 @@
 # evo-usb-mount — narrow root-only wrapper for the
 # org.evoframework.storage.usb plugin's mount / umount / fsck /
 # eject dispatch. Installed by bootstrap.sh at
-# /usr/lib/evo/evo-usb-mount, mode 0755 root:root. Sole
+# /usr/local/bin/evo-usb-mount, mode 0755 root:root. Sole
 # privileged target of the EVO_STORAGE_USB sudoers Cmnd_Alias.
 #
 # The steward MUST NEVER receive raw mount / umount / fsck /

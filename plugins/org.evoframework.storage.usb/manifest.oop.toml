@@ -1,0 +1,62 @@
+[plugin]
+name = "org.evoframework.storage.usb"
+# Keep in sync with this crate's Cargo.toml [package].version.
+version = "0.1.0"
+contract = 1
+
+# Single-occupant respondent shelf. This plugin is the sole
+# stocker of the storage.usb shelf; the shelf's five verbs
+# route to this plugin exclusively. Vendor distributions may
+# replace by shipping a same-shape plugin under a vendor
+# namespace; admission refuses two occupants on the same
+# single-occupant shelf.
+[target]
+shelf = "storage.usb"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = [
+    "/var/lib/evo/music/USB",
+    "/var/lib/evo/plugins/org.evoframework.storage.usb",
+]
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 2
+
+[lifecycle]
+mode = "reload-cleanable"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = [
+    "storage.usb.list_drives",
+    "storage.usb.mount",
+    "storage.usb.safe_remove",
+    "storage.usb.repair_filesystem",
+    "storage.usb.rename",
+]
+response_budget_ms = 180000
+
+[capabilities.respondent.verb_capabilities]
+"storage.usb.list_drives" = { kind = "none" }
+"storage.usb.mount" = { kind = "step_up", scope = "storage_admin" }
+"storage.usb.safe_remove" = { kind = "step_up", scope = "storage_admin" }
+"storage.usb.repair_filesystem" = { kind = "step_up", scope = "storage_admin" }
+"storage.usb.rename" = { kind = "step_up", scope = "storage_admin" }

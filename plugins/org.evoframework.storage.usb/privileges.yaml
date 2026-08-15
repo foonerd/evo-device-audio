@@ -1,0 +1,96 @@
+schema_version: "1.0"
+plugin: org.evoframework.storage.usb
+owner: evo-device-audio
+isolation: oop
+has_os_dependencies: true
+
+# Out-of-process plugin shipped as a signed bundle under
+# `/opt/evo/plugins/org.evoframework.storage.usb/`. The
+# steward spawns the wire binary as a subprocess and wires the
+# SDK contract over a Unix domain socket. The plugin's core
+# function is discovery, classification, mount lifecycle,
+# filesystem repair, and safe-remove of USB mass-storage
+# volumes as music sources under
+# `/var/lib/evo/music/USB/<stable-id>/`. Every mount / umount /
+# fsck / eject path requires out-of-plugin host binaries
+# behind a narrow root-only wrapper; their absence is not a
+# recoverable runtime condition. Admission MUST refuse or
+# degrade to `Unhealthy` with the missing binary named; the
+# operator UI renders the resulting health state honestly.
+
+capability_intent:
+  - id: block_mount_umount_fsck_eject
+    need: invoke the narrow root-only wrapper `/usr/local/bin/evo-usb-mount` to dispatch `mount` / `umount` / `umount-force` / `fsck` / `eject` per operator gesture. The wrapper enforces the path allowlist (mount targets under `/var/lib/evo/music/USB/<stable-id>/` only) + block-device allowlist (`/dev/sd[a-z][1-9]*` + `/dev/nvme*n*p*` + `/dev/mmcblk*p*` for partition-scoped ops, parent-disk allowlist for eject). Called from the plugin's mount / safe_remove / repair_filesystem / rename verb dispatchers. Runs as root because Linux mount()/umount()/fsck syscalls are privileged regardless of target filesystem; a non-root service identity dispatches via `sudo -n /usr/local/bin/evo-usb-mount` against the narrow `EVO_STORAGE_USB` NOPASSWD Cmnd_Alias shipped by the distribution bootstrap. The steward MUST NOT be granted raw `mount` / `umount` / `fsck` / `eject` — the wrapper is the enforcement point.
+    access_path: sudoers/command
+    failure_mode: The mount / safe_remove / repair_filesystem verbs return `PluginError::Permanent` naming the missing wrapper or missing sudoers entry; the drive stays classified but unmounted; the operator UI's remedy string names the missing artefact.
+  - id: block_device_enumeration
+    need: invoke `lsblk -J -o NAME,PKNAME,MOUNTPOINT,TRAN,TYPE,UUID,LABEL,FSTYPE,PARTUUID,VENDOR,MODEL,SERIAL,SIZE` for coldplug enumeration + hotplug parent-disk correlation. Invoke `findmnt -no SOURCE <path>` for mount → block device resolution. Invoke `blockdev --getsize64 <device>` for the >2 TiB FAT32 refuse. All read-only; no elevation required.
+    access_path: direct exec
+    failure_mode: absent lsblk makes enumeration impossible; admission degrades to `Unhealthy` with reason `lsblk_missing`. absent blockdev makes the >2 TiB FAT32 refuse best-effort (the plugin still reads size from `/sys/class/block/<dev>/size` as a fallback); admission does not refuse.
+
+required_binaries:
+  # The narrow root-only wrapper installed by bootstrap.sh
+  # Step 1g at /usr/local/bin/evo-usb-mount (mode 0755 root:root).
+  # Every mount / umount / fsck / eject invocation goes through
+  # this wrapper — the plugin does NOT hold raw sudo grants on
+  # the underlying tools.
+  - name: evo-usb-mount
+    min_version: "1"
+    failure_mode: refuse to admit; the plugin's primary function is mount lifecycle and every mutating verb dispatches through the wrapper. Structured admission error names the missing wrapper + points at `bootstrap.sh` Step 1g provisioning.
+  # Block-device enumeration + parent-disk correlation +
+  # size query. All read-only invocations.
+  - name: lsblk
+    min_version: "2.30"
+    failure_mode: refuse to admit; without lsblk the plugin cannot enumerate block devices or correlate parents. Ships in `util-linux` on every supported distribution.
+  - name: findmnt
+    min_version: "2.30"
+    failure_mode: warn at admission with reason `findmnt_missing`; classifier falls back to `/proc/self/mountinfo` direct parse (adequate for system-role detection). Ships in `util-linux`.
+  - name: blockdev
+    min_version: "2.30"
+    failure_mode: warn at admission with reason `blockdev_missing`; volume-size query falls back to `/sys/class/block/<dev>/size` * 512. Ships in `util-linux`.
+  # Filesystem-repair tools per the support matrix. Each is
+  # required for its FS family; absence of one degrades repair
+  # for that family only. See USB-STORAGE.md §2 for the matrix.
+  - name: fsck.vfat
+    min_version: "4.0"
+    failure_mode: warn at admission with reason `fsck_vfat_missing`; vfat drives still enumerate + mount, but `repair_filesystem` on a dirty vfat drive returns `PluginError::Permanent` naming the missing binary. Debian ships in `dosfstools`.
+  - name: fsck.exfat
+    min_version: "1.0"
+    failure_mode: warn at admission with reason `fsck_exfat_missing`; exfat drives still enumerate + mount, but `repair_filesystem` on a dirty exfat drive returns `PluginError::Permanent` naming the missing binary. Debian Trixie ships in `exfatprogs`.
+  - name: ntfsfix
+    min_version: "2017"
+    failure_mode: warn at admission with reason `ntfsfix_missing`; ntfs drives still enumerate + mount, but `repair_filesystem` on a dirty ntfs drive returns `PluginError::Permanent` naming the missing binary. Debian ships in `ntfs-3g`.
+  - name: e2fsck
+    min_version: "1.45"
+    failure_mode: warn at admission with reason `e2fsck_missing`; ext drives still enumerate + mount, but `repair_filesystem` on a dirty ext drive returns `PluginError::Permanent` naming the missing binary. Debian ships in `e2fsprogs`.
+  - name: eject
+    min_version: "2.1"
+    failure_mode: warn at admission with reason `eject_missing`; safe-remove still succeeds (umount + retract from subject), but the best-effort SCSI eject step is skipped. Debian ships in `eject`.
+
+required_kernel_modules:
+  # Filesystem support modules per the support matrix.
+  # `vfat` + `exfat` + `ntfs3` are the in-kernel drivers used
+  # via `mount -t <fs> ...`. `fuseblk` is the FUSE fallback
+  # some distributions use for ntfs-3g userspace mount.
+  - vfat
+  - exfat
+  - ntfs3
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -d /var/lib/evo/music/USB"
+    - "test -x /usr/local/bin/evo-usb-mount"
+    - "test -d /var/lib/evo/plugins/org.evoframework.storage.usb"
+  expected:
+    - state directory exists as the steward identity
+    - mount root exists at /var/lib/evo/music/USB (created by the distribution installer per the four-primitive install/reset contract; the plugin never creates it)
+    - narrow root-only wrapper installed at /usr/local/bin/evo-usb-mount (Step 1g)
+    - plugin state root exists at /var/lib/evo/plugins/org.evoframework.storage.usb/{state,credentials} mode 0700 SERVICE_USER (Step 1g)
+
+# Per-distribution package hints for the online installer.
+# Each required_binaries entry names its providing package
+# inline in its failure_mode.
+host_provisioning: {}
