@@ -320,7 +320,8 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
         | VerbDispatchError::PayloadDecode(_)
         | VerbDispatchError::MountRefused(_)
         | VerbDispatchError::SafeRemoveRefused(_)
-        | VerbDispatchError::RepairRefused(_) => {
+        | VerbDispatchError::RepairRefused(_)
+        | VerbDispatchError::RenameRefused(_) => {
             PluginError::Permanent(e.to_string())
         }
         // Transient — retry may succeed once the underlying

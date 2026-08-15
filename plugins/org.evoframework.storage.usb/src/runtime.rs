@@ -225,9 +225,7 @@ impl StorageUsbRuntime {
             "storage.usb.repair_filesystem" => {
                 self.handle_repair_filesystem(payload).await
             }
-            "storage.usb.rename" => Err(VerbDispatchError::NotImplemented {
-                verb: verb.to_string(),
-            }),
+            "storage.usb.rename" => self.handle_rename(payload).await,
             other => Err(VerbDispatchError::UnknownRequestType {
                 verb: other.to_string(),
             }),
@@ -960,6 +958,271 @@ impl StorageUsbRuntime {
     }
 
     // ----------------------------------------------------------
+    // rename verb
+    // ----------------------------------------------------------
+
+    /// `storage.usb.rename` handler. Binds an operator-supplied
+    /// friendly name to the drive's identity tuple + runs the
+    /// full remount cycle so the mount path (`/var/lib/evo/music/
+    /// USB/<alias>`) IS the friendly id.
+    ///
+    /// Sequence (per USB-STORAGE.md §4):
+    ///
+    /// 1. Sanitise + validate alias. Empty alias → clear the
+    ///    persisted entry so the derivation ladder falls back
+    ///    to the next rule (fs label / vendor+model / etc.).
+    /// 2. Refuse if role is `system-*` live.
+    /// 3. Collision check: sanitised alias must not collide
+    ///    with a foreign physical volume's current stable_id.
+    ///    Same physical volume aliasing back to its own current
+    ///    id is a no-op success.
+    /// 4. Consumer-stop: `library.remove_source` (best-effort).
+    /// 5. `sync` on the parent disk.
+    /// 6. Wrapper `umount <old-id>`.
+    /// 7. Persist the alias to `aliases.toml` (or clear on
+    ///    empty alias).
+    /// 8. Reload the alias store into the runtime + reconcile
+    ///    to recompute the drive's stable_id with rule 0 in
+    ///    effect.
+    /// 9. Wrapper `mount <new-id>` + `library.add_source
+    ///    local_usb` + republish subject.
+    ///
+    /// Payload: `{ v: 1, stable_id, alias, mount_policy?: string }`
+    /// Response: `{ v: 1, new_stable_id, class }`
+    async fn handle_rename(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, VerbDispatchError> {
+        let req: RenameRequest = serde_json::from_slice(payload)
+            .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
+
+        // Sanitise alias. Two distinct paths:
+        //   raw trim-empty → CLEAR (removes any persisted alias;
+        //     derivation falls back to fs_label / vendor+model)
+        //   raw non-empty but sanitises to empty → InvalidAlias
+        //     refuse (operator gave all-symbol garbage; specific
+        //     feedback rather than silent no-op)
+        let raw_trimmed = req.alias.trim();
+        let clearing = raw_trimmed.is_empty();
+        let sanitised = if clearing {
+            String::new()
+        } else {
+            crate::stable_id::sanitise(&req.alias)
+        };
+        if !clearing && sanitised.is_empty() {
+            return Err(VerbDispatchError::RenameRefused(
+                RenameRefuseClass::InvalidAlias {
+                    stable_id: req.stable_id,
+                    raw: req.alias,
+                },
+            ));
+        }
+
+        self.reconcile_once().await?;
+        let record = {
+            let inner = self.inner.lock().await;
+            inner.drives.get(&req.stable_id).cloned()
+        }
+        .ok_or_else(|| {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::UnknownStableId {
+                    stable_id: req.stable_id.clone(),
+                },
+            )
+        })?;
+        if record.role.is_system_live() {
+            return Err(VerbDispatchError::RenameRefused(
+                RenameRefuseClass::SystemLivePartition {
+                    stable_id: req.stable_id,
+                    role: role_wire_string(record.role),
+                },
+            ));
+        }
+        // Serial short is required for the alias identity tuple —
+        // without it we cannot match on replug.
+        let serial = record.serial_short.as_deref().ok_or_else(|| {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::MissingIdentity {
+                    stable_id: req.stable_id.clone(),
+                    missing: "serial_short",
+                },
+            )
+        })?;
+
+        // Collision check: would the new stable_id (sanitised alias
+        // + partition suffix if the parent has >1 partition) collide
+        // with another drive's current stable_id? Skip when the
+        // alias is being cleared (post-clear stable_id derives from
+        // rule 1/2/3/4; collision may still fire via those rules but
+        // that's handled by the normal deconflict path).
+        if !clearing {
+            let inner = self.inner.lock().await;
+            let candidate_stable_id = if record.partition_count > 1 {
+                format!("{sanitised}-p{}", record.partition_index)
+            } else {
+                sanitised.clone()
+            };
+            for (other_id, other_rec) in inner.drives.iter() {
+                if *other_id == req.stable_id {
+                    continue;
+                }
+                if *other_id == candidate_stable_id {
+                    return Err(VerbDispatchError::RenameRefused(
+                        RenameRefuseClass::AliasWouldCollide {
+                            stable_id: req.stable_id.clone(),
+                            requested_alias: sanitised.clone(),
+                            colliding_stable_id: other_rec.stable_id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        // 1. Consumer-stop (best-effort).
+        if let Some(source_id) = record.library_source_id.as_ref() {
+            if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+                let stop_payload = serde_json::json!({
+                    "v": 1,
+                    "source_id": source_id,
+                });
+                if let Ok(bytes) = serde_json::to_vec(&stop_payload) {
+                    if let Err(e) = dispatcher
+                        .dispatch(
+                            "audio.library",
+                            "library.remove_source",
+                            bytes,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            plugin = "storage.usb",
+                            stable_id = %req.stable_id,
+                            source_id = %source_id,
+                            error = %e,
+                            "library.remove_source dispatch failed before rename; \
+                             proceeding (best-effort)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. sync + umount OLD path (if mounted).
+        let _ = tokio::process::Command::new("sync")
+            .arg(&record.parent_disk)
+            .output()
+            .await;
+        if record.class == DriveClass::MountedClean
+            || record.class == DriveClass::MountedDirty
+        {
+            let umount_argv = vec!["umount".to_string(), req.stable_id.clone()];
+            let out = self
+                .command_runner
+                .run_wrapper(self.needs_sudo, &umount_argv)
+                .await
+                .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+            if out.status != 0 {
+                return Err(VerbDispatchError::RenameRefused(
+                    RenameRefuseClass::UmountBeforeRenameFailed {
+                        stable_id: req.stable_id,
+                        exit_code: out.status,
+                        stderr: out.stderr,
+                    },
+                ));
+            }
+        }
+
+        // 3. Persist alias — set or clear.
+        {
+            let current = self.aliases_clone();
+            let mut mutated = (*current).clone();
+            if clearing {
+                mutated.clear_alias(
+                    record.vendor.as_deref(),
+                    record.model.as_deref(),
+                    serial,
+                    record.partuuid.as_deref(),
+                );
+            } else {
+                mutated.set_alias(
+                    record.vendor.as_deref(),
+                    record.model.as_deref(),
+                    serial,
+                    record.partuuid.as_deref(),
+                    record.partition_index,
+                    &sanitised,
+                    now_ms(),
+                );
+            }
+            mutated.save().map_err(|e| {
+                VerbDispatchError::RenameRefused(
+                    RenameRefuseClass::AliasPersistFailed {
+                        stable_id: req.stable_id.clone(),
+                        message: e.to_string(),
+                    },
+                )
+            })?;
+            self.attach_alias_store(Arc::new(mutated));
+        }
+
+        // 4. Reconcile — the classifier re-runs, the derivation
+        //    ladder picks up the new alias (or the ladder falls
+        //    through when clearing), and the drive gets a fresh
+        //    stable_id. The reconcile also handles auto-mount so
+        //    we typically don't need an explicit mount call.
+        self.reconcile_once().await?;
+
+        // 5. Find the drive's new stable_id via identity match on
+        //    (vendor, model, serial_short, partuuid).
+        let (new_stable_id, new_class) = {
+            let inner = self.inner.lock().await;
+            let mut found: Option<(String, DriveClass)> = None;
+            for (id, rec) in inner.drives.iter() {
+                let same_serial = rec
+                    .serial_short
+                    .as_deref()
+                    .map(|s| s == serial)
+                    .unwrap_or(false);
+                let same_partuuid = opt_eq_str(
+                    rec.partuuid.as_deref(),
+                    record.partuuid.as_deref(),
+                );
+                let same_dev = rec.device_node == record.device_node;
+                if same_serial && same_partuuid && same_dev {
+                    found = Some((id.clone(), rec.class));
+                    break;
+                }
+            }
+            found
+        }
+        .ok_or_else(|| {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::PostRenameLookupFailed {
+                    stable_id: req.stable_id.clone(),
+                },
+            )
+        })?;
+
+        // 6. Best-effort empty-only rmdir on the OLD mount root
+        //    if it wasn't the same as the new (rename to same
+        //    sanitised token is a no-op path).
+        if new_stable_id != req.stable_id {
+            if let Some(old_root) = record.mount_root.as_deref() {
+                let _ = tokio::fs::remove_dir(old_root).await;
+            }
+        }
+
+        let resp = RenameResponse {
+            v: 1,
+            new_stable_id,
+            class: new_class.wire_str().to_string(),
+        };
+        serde_json::to_vec(&resp)
+            .map_err(|e| VerbDispatchError::ResponseSerialise(e.to_string()))
+    }
+
+    // ----------------------------------------------------------
     // repair_filesystem verb
     // ----------------------------------------------------------
 
@@ -1632,6 +1895,40 @@ pub struct MountResponse {
     pub library_source_id: Option<String>,
 }
 
+/// `storage.usb.rename` request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameRequest {
+    /// Stable-id of the drive whose alias is being set/cleared.
+    pub stable_id: String,
+    /// The operator-supplied friendly name. Sanitised per the
+    /// stable-id token rule (`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`).
+    /// Empty string / whitespace-only clears the persisted alias
+    /// so the derivation ladder falls back to the next rule.
+    pub alias: String,
+    /// Optional mount-policy override for `system-adjacent` drives.
+    /// `"opt-in"` opts the sibling partition in for auto-mount;
+    /// omitting or setting `"opt-in-required"` keeps the gate
+    /// closed. No-op for `removable` drives (already `auto`)
+    /// and refused for `system-*` live drives (rename refuse
+    /// fires earlier). Not yet wired — mount-policy override
+    /// lands with the policy-mutation UI in a follow-on.
+    #[serde(default)]
+    pub mount_policy: Option<String>,
+}
+
+/// `storage.usb.rename` response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameResponse {
+    /// Envelope shape version.
+    pub v: u32,
+    /// The drive's new stable_id after alias resolution +
+    /// reconcile. May equal the original stable_id when the
+    /// sanitised alias resolves to the same token (no-op).
+    pub new_stable_id: String,
+    /// DriveClass wire string after the remount cycle.
+    pub class: String,
+}
+
 /// `storage.usb.repair_filesystem` request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairRequest {
@@ -1798,6 +2095,97 @@ pub enum VerbDispatchError {
     /// Repair refused per one of the fine-grained classes.
     #[error("storage.usb: repair refused: {0}")]
     RepairRefused(#[source] RepairRefuseClass),
+    /// Rename refused per one of the fine-grained classes.
+    #[error("storage.usb: rename refused: {0}")]
+    RenameRefused(#[source] RenameRefuseClass),
+}
+
+/// Fine-grained rename refusal classes.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RenameRefuseClass {
+    /// Stable-id not in the classifier's current output.
+    #[error("unknown stable_id {stable_id:?}")]
+    UnknownStableId {
+        /// Requested id.
+        stable_id: String,
+    },
+    /// Role is `system-*` live — rename refused.
+    #[error(
+        "stable_id {stable_id:?} is a live system partition (role={role}); rename refused"
+    )]
+    SystemLivePartition {
+        /// Requested id.
+        stable_id: String,
+        /// Role wire string.
+        role: String,
+    },
+    /// The raw alias is non-empty but sanitises to empty (all
+    /// symbol chars stripped). Operator gets specific feedback
+    /// instead of a silent no-op.
+    #[error("stable_id {stable_id:?} alias {raw:?} sanitises to empty")]
+    InvalidAlias {
+        /// Requested id.
+        stable_id: String,
+        /// The raw alias input.
+        raw: String,
+    },
+    /// Identity tuple lacks a serial_short — the alias key
+    /// requires it (drive would not match on replug otherwise).
+    /// Very rare — udev's ID_SERIAL_SHORT is set for
+    /// mass-storage-class devices per the USB spec.
+    #[error(
+        "stable_id {stable_id:?} missing identity field {missing:?}; rename refused"
+    )]
+    MissingIdentity {
+        /// Requested id.
+        stable_id: String,
+        /// Which identity field is absent.
+        missing: &'static str,
+    },
+    /// The sanitised alias collides with a foreign physical
+    /// volume's current stable_id. Operator picks a different
+    /// name.
+    #[error(
+        "stable_id {stable_id:?} alias {requested_alias:?} collides with {colliding_stable_id:?}"
+    )]
+    AliasWouldCollide {
+        /// Requested id.
+        stable_id: String,
+        /// The requested sanitised alias.
+        requested_alias: String,
+        /// The other drive's stable_id that collides.
+        colliding_stable_id: String,
+    },
+    /// Wrapper's umount (before rename) exited non-zero.
+    #[error(
+        "stable_id {stable_id:?} umount before rename failed: exit {exit_code}: {stderr}"
+    )]
+    UmountBeforeRenameFailed {
+        /// Requested id.
+        stable_id: String,
+        /// Wrapper exit code.
+        exit_code: i32,
+        /// Captured stderr.
+        stderr: String,
+    },
+    /// The atomic tmp+rename write of aliases.toml failed.
+    #[error("stable_id {stable_id:?} alias persist failed: {message}")]
+    AliasPersistFailed {
+        /// Requested id.
+        stable_id: String,
+        /// AliasStoreError message.
+        message: String,
+    },
+    /// After reconcile + rename the drive could not be re-
+    /// located by identity tuple. Shouldn't happen in practice
+    /// — indicates the drive was unplugged mid-rename.
+    #[error(
+        "stable_id {stable_id:?} could not be re-located after rename reconcile; drive unplugged?"
+    )]
+    PostRenameLookupFailed {
+        /// Requested id.
+        stable_id: String,
+    },
 }
 
 /// Fine-grained repair refusal classes.
@@ -2078,6 +2466,12 @@ pub fn detect_service_uid_gid() -> anyhow::Result<(u32, u32)> {
         (Some(u), Some(g)) => Ok((u, g)),
         _ => anyhow::bail!("/proc/self/status missing Uid: / Gid:"),
     }
+}
+
+/// Local `Option<&str>` equality helper — used by the rename
+/// verb's post-rename identity match. Two `None`s compare equal.
+fn opt_eq_str(a: Option<&str>, b: Option<&str>) -> bool {
+    a == b
 }
 
 fn now_ms() -> i64 {
@@ -2394,18 +2788,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remaining_mutating_verbs_not_yet_implemented() {
-        // safe_remove IS implemented (Step 4); repair_filesystem
-        // IS implemented (Step 5); rename lands in Step 6.
+    async fn all_mutating_verbs_now_implemented() {
+        // All five shelf verbs are wired (Steps 3-6). Any call
+        // with a bogus payload gets a structured refuse class,
+        // never NotImplemented.
         let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
-        for verb in ["storage.usb.rename"] {
-            let err = rt.dispatch_verb(verb, b"{}").await.unwrap_err();
-            match err {
-                VerbDispatchError::NotImplemented { verb: v } => {
-                    assert_eq!(v, verb)
-                }
-                other => panic!("expected NotImplemented, got {other:?}"),
+        for verb in [
+            "storage.usb.mount",
+            "storage.usb.safe_remove",
+            "storage.usb.repair_filesystem",
+            "storage.usb.rename",
+        ] {
+            let err = rt
+                .dispatch_verb(verb, br#"{"stable_id":"missing","alias":""}"#)
+                .await
+                .unwrap_err();
+            if let VerbDispatchError::NotImplemented { .. } = err {
+                panic!("verb {verb} still marked NotImplemented");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_unknown_stable_id() {
+        let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
+        let payload = serde_json::to_vec(&RenameRequest {
+            stable_id: "no-such-drive".to_string(),
+            alias: "My-Music".to_string(),
+            mount_policy: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.rename", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::UnknownStableId { .. },
+            ) => {}
+            other => panic!("expected UnknownStableId, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_alias_that_sanitises_to_empty() {
+        let rt = build_runtime(
+            removable_stick_lsblk(),
+            vec![CommandOutcome {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&RenameRequest {
+            stable_id: "MUSIC".to_string(),
+            alias: "!!! @@@ ###".to_string(),
+            mount_policy: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.rename", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::InvalidAlias { .. },
+            ) => {}
+            other => panic!("expected InvalidAlias, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_system_live_partition() {
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"Samsung","model":"T7","serial":"S6P5",
+             "size":1000000000000,
+             "children":[
+               {"name":"sda2","type":"part","fstype":"ext4","label":"root","size":999000000000,"partuuid":"cccc-02"}
+             ]}
+          ]
+        }"#;
+        let mi = "28 22 8:2 / / rw - ext4 /dev/sda2 rw\n";
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: mi.to_string(),
+                swaps: String::new(),
+                lsblk_json: lsblk.to_string(),
+            }),
+            Arc::new(FakeCommandRunner::new(vec![])),
+        ));
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let root_id = env
+            .drives
+            .iter()
+            .find(|d| d.role == PartitionRole::SystemRoot)
+            .map(|d| d.stable_id.clone())
+            .expect("root partition present");
+        let payload = serde_json::to_vec(&RenameRequest {
+            stable_id: root_id,
+            alias: "MyRoot".to_string(),
+            mount_policy: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.rename", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::SystemLivePartition { .. },
+            ) => {}
+            other => panic!("expected SystemLivePartition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_alias_that_would_collide() {
+        // Two identical sticks plugged; each derives MUSIC / MUSIC-2
+        // via deconflict. Renaming MUSIC-2 to MUSIC (the sibling's
+        // current id) must refuse.
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"SanDisk","model":"Cruzer","serial":"4C530",
+             "size":32000000000,
+             "children":[
+               {"name":"sda1","type":"part","fstype":"vfat","label":"MUSIC","size":32000000000,"partuuid":"aaaa-01"}
+             ]},
+            {"name":"sdb","type":"disk","tran":"usb","vendor":"SanDisk","model":"Cruzer","serial":"7B221",
+             "size":32000000000,
+             "children":[
+               {"name":"sdb1","type":"part","fstype":"vfat","label":"MUSIC","size":32000000000,"partuuid":"bbbb-01"}
+             ]}
+          ]
+        }"#;
+        let rt = build_runtime(
+            lsblk,
+            vec![
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        // The second drive got MUSIC-2 via deconflict; try to rename
+        // it to MUSIC (colliding with the first drive).
+        let payload = serde_json::to_vec(&RenameRequest {
+            stable_id: "MUSIC-2".to_string(),
+            alias: "MUSIC".to_string(),
+            mount_policy: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.rename", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RenameRefused(
+                RenameRefuseClass::AliasWouldCollide { .. },
+            ) => {}
+            other => panic!("expected AliasWouldCollide, got {other:?}"),
         }
     }
 

@@ -211,6 +211,139 @@ fn opt_eq(a: Option<&str>, b: Option<&str>) -> bool {
     a == b
 }
 
+impl AliasStore {
+    /// Set-or-update the alias entry for the identity tuple.
+    /// Replaces an existing entry that matches on the same
+    /// tuple; appends otherwise. Does NOT persist — caller
+    /// invokes [`Self::save`] separately (the runtime does
+    /// this after successful validation + collision check).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_alias(
+        &mut self,
+        vendor: Option<&str>,
+        model: Option<&str>,
+        serial_short: &str,
+        partuuid: Option<&str>,
+        partition_index: u32,
+        alias: &str,
+        set_at_ms: i64,
+    ) {
+        // Try to update in place first.
+        for entry in self.entries.iter_mut() {
+            if entry.serial_short == serial_short
+                && opt_eq(entry.vendor.as_deref(), vendor)
+                && opt_eq(entry.model.as_deref(), model)
+                && opt_eq(entry.partuuid.as_deref(), partuuid)
+            {
+                entry.alias = alias.to_string();
+                entry.partition_index =
+                    partuuid.is_none().then_some(partition_index);
+                entry.set_at_ms = Some(set_at_ms);
+                return;
+            }
+        }
+        // Append a new entry.
+        self.entries.push(AliasEntry {
+            vendor: vendor.map(str::to_string),
+            model: model.map(str::to_string),
+            serial_short: serial_short.to_string(),
+            partuuid: partuuid.map(str::to_string),
+            partition_index: partuuid.is_none().then_some(partition_index),
+            alias: alias.to_string(),
+            set_at_ms: Some(set_at_ms),
+        });
+    }
+
+    /// Remove the alias entry matching the identity tuple.
+    /// No-op when no entry matches. Does NOT persist — caller
+    /// invokes [`Self::save`] separately.
+    pub fn clear_alias(
+        &mut self,
+        vendor: Option<&str>,
+        model: Option<&str>,
+        serial_short: &str,
+        partuuid: Option<&str>,
+    ) {
+        self.entries.retain(|entry| {
+            !(entry.serial_short == serial_short
+                && opt_eq(entry.vendor.as_deref(), vendor)
+                && opt_eq(entry.model.as_deref(), model)
+                && opt_eq(entry.partuuid.as_deref(), partuuid))
+        });
+    }
+
+    /// Atomic write of the store to
+    /// `<state_dir>/state/aliases.toml`. Uses tmp+rename so a
+    /// mid-write crash never leaves a truncated file that would
+    /// fail to parse at next boot. Sets mode 0600 owned by the
+    /// current process user (steward at runtime, andrew in
+    /// unit tests).
+    ///
+    /// Errors surface as [`AliasStoreError::Io`] with the
+    /// path + underlying io error so the runtime can log and
+    /// surface an operator-visible error class.
+    pub fn save(&self) -> Result<(), AliasStoreError> {
+        use std::io::Write;
+        let file = AliasFile {
+            schema_version: ALIAS_SCHEMA_VERSION,
+            alias: self.entries.clone(),
+        };
+        let text = toml::to_string_pretty(&file).map_err(|e| {
+            AliasStoreError::Parse {
+                path: self.path.clone(),
+                message: e.to_string(),
+            }
+        })?;
+        let parent = self.path.parent().ok_or_else(|| AliasStoreError::Io {
+            path: self.path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "alias store path has no parent",
+            ),
+        })?;
+        std::fs::create_dir_all(parent).map_err(|e| AliasStoreError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+        // Tmp path sibling to the target so rename(2) is atomic
+        // (same filesystem). Suffix with pid to avoid collisions
+        // if multiple runtimes ever share a state_dir (they
+        // don't — the plugin is singleton — but discipline).
+        let tmp = self
+            .path
+            .with_extension(format!("toml.tmp.{}", std::process::id()));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| AliasStoreError::Io {
+                    path: tmp.clone(),
+                    source: e,
+                })?;
+            f.write_all(text.as_bytes())
+                .map_err(|e| AliasStoreError::Io {
+                    path: tmp.clone(),
+                    source: e,
+                })?;
+            f.sync_all().map_err(|e| AliasStoreError::Io {
+                path: tmp.clone(),
+                source: e,
+            })?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|e| AliasStoreError::Io {
+            path: self.path.clone(),
+            source: e,
+        })?;
+        Ok(())
+    }
+}
+
+// The `mode(0o600)` call above needs OpenOptionsExt in scope.
+use std::os::unix::fs::OpenOptionsExt;
+
 /// Query record for [`AliasStore::lookup`].
 #[derive(Debug, Clone)]
 pub struct AliasLookup<'a> {
