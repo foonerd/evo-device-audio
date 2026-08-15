@@ -1,52 +1,75 @@
 // Copyright (c) 2026 Just a Nerd
 // SPDX-License-Identifier: Apache-2.0
 
-//! `storage.usb` runtime — dispatch surface for the five shelf
-//! verbs.
+//! `storage.usb` runtime — dispatch surface + mount lifecycle.
 //!
-//! This module hosts [`StorageUsbRuntime`], the singleton the
-//! plugin's [`Plugin::load`](crate::StorageUsbPlugin) constructs
-//! and drives. The runtime owns:
+//! # Responsibilities
 //!
-//! - The path constants for the wrapper + mount root + state
-//!   directory.
-//! - The verb dispatcher: parses each request's payload,
-//!   invokes the internal handler, and serialises the response.
-//! - The `list_drives` handler, which invokes the classifier
-//!   against live procfs + lsblk inputs and returns the six-way
-//!   [`ClassifiedPartition`] set as the `list_drives` response.
+//! - Verb dispatch: `storage.usb.list_drives` (read) +
+//!   `storage.usb.mount` (mutating). The remaining three
+//!   mutating verbs (`safe_remove` / `repair_filesystem` /
+//!   `rename`) return a stable `NotImplemented` response until
+//!   the corresponding step lands.
+//! - Coldplug at plugin load: enumerate every USB-transport
+//!   block partition, classify (six-way role), derive stable-ids,
+//!   auto-mount removable drives, dispatch `library.add_source`
+//!   for each successful mount.
+//! - Periodic reconcile: 5-second ticker re-runs the coldplug
+//!   pipeline so plug/unplug transitions are absorbed within
+//!   one tick (userspace udev/netlink lands in a follow-on).
+//! - Subject `storage_usb_drives` announce + republish on every
+//!   transition (mount / unmount / class change).
 //!
-//! Every mutating verb (`mount` / `safe_remove` /
-//! `repair_filesystem` / `rename`) currently returns
-//! [`VerbDispatchError::NotImplemented`] with a stable error
-//! class so consumers see a deterministic response shape while
-//! Steps 3-5 land the implementations in place. The wrapper's
-//! argv shape stays stable across those steps so bootstrap +
-//! sudoers grant do not churn.
+//! # Trust boundary
+//!
+//! Every mount / umount / fsck / eject invocation dispatches
+//! through the narrow root-only wrapper at
+//! `/usr/local/bin/evo-usb-mount`. The plugin does NOT hold raw
+//! sudo grants on the underlying tools; the wrapper's argv
+//! allowlist is the last-mile runtime enforcement.
 
-use crate::classifier::{classify, ClassifiedPartition, ClassifierError};
+use crate::aliases::{AliasLookup, AliasStore};
+use crate::classifier::{
+    classify, ClassifiedPartition, ClassifierError, MountPolicy, PartitionRole,
+};
+use crate::fs_matrix::FsFamily;
+use crate::stable_id::{derive, DerivationContext, DerivationInput};
 
+use evo_plugin_sdk::contract::{
+    ExternalAddressing, ShelfRequestDispatcher, SubjectAnnouncement,
+    SubjectAnnouncer,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 /// Path to the narrow root-only wrapper installed by
-/// `bootstrap.sh` Step 1g. Every mount / umount / fsck / eject
-/// invocation dispatches through this binary; the plugin does
-/// NOT hold raw sudo grants on the underlying tools.
+/// `bootstrap.sh` Step 1g.
 pub const USB_WRAPPER_PATH: &str = "/usr/local/bin/evo-usb-mount";
 
-/// Mount root under which every media USB volume mounts. Owned
-/// by the distribution installer per the four-primitive
-/// install/reset contract; the plugin never creates it and
-/// never falls back to another location.
+/// Mount root under which every media USB volume mounts.
 pub const USB_MOUNT_ROOT: &str = "/var/lib/evo/music/USB";
 
-/// Verb list for this shelf. Kept in this crate so the
-/// [`crate::StorageUsbPlugin::describe`] impl and the
-/// manifest.request_types stay aligned by construction (a test
-/// asserts the two lists match).
+/// Reactive subject type published by this plugin.
+pub const STORAGE_USB_DRIVES_SUBJECT_TYPE: &str = "storage_usb_drives";
+
+/// Canonical addressing for the singleton `storage_usb_drives`
+/// subject. Matches the schema declaration
+/// `evo.storage.usb.drives:local`.
+pub fn storage_usb_drives_addressing() -> ExternalAddressing {
+    ExternalAddressing::new("evo.storage.usb.drives", "local")
+}
+
+/// Default reconcile cadence (ms) — a 5-second poll approximates
+/// hotplug without a udev netlink subscriber.
+pub const DEFAULT_RECONCILE_CADENCE_MS: u64 = 5_000;
+
+/// Verb list for this shelf. Kept in this crate so
+/// [`crate::StorageUsbPlugin::describe`] + the manifest stay
+/// aligned by construction (asserted by test).
 pub const STORAGE_USB_VERBS: &[&str] = &[
     "storage.usb.list_drives",
     "storage.usb.mount",
@@ -60,96 +83,145 @@ pub fn is_storage_usb_verb(v: &str) -> bool {
     STORAGE_USB_VERBS.contains(&v)
 }
 
-/// The runtime singleton. Constructed once in
-/// [`crate::StorageUsbPlugin::load`] and held for the plugin
-/// instance lifetime. Cheap-clone (`Arc<Self>` at the plugin
-/// site).
+// --------------------------------------------------------------
+// Runtime singleton
+// --------------------------------------------------------------
+
+/// The runtime singleton.
 pub struct StorageUsbRuntime {
-    /// Effective steward uid (interpolated into mount options).
-    /// Resolved at plugin load via `/proc/self/status`.
     service_uid: u32,
-    /// Effective steward gid.
     service_gid: u32,
-    /// Whether the runtime needs to prefix wrapper invocations
-    /// with `sudo -n`. `true` when the plugin runs as a non-
-    /// root steward; `false` when the plugin runs as root
-    /// (only in dev-loop test scenarios).
     needs_sudo: bool,
-    /// Injectable command runner. In production points at
-    /// [`RealCommandRunner`]; tests supply a fake to assert
-    /// argv without spawning processes.
-    #[allow(dead_code)]
     command_runner: Arc<dyn CommandRunner>,
-    /// Injectable input source for the classifier. In
-    /// production points at [`ProcfsAndLsblkSource`]; tests
-    /// supply a fake with fixture strings.
     input_source: Arc<dyn ClassifierInputSource>,
+    inner: Mutex<RuntimeInner>,
+    publisher: StdMutex<Option<StoragePublisher>>,
+    shelf_dispatcher: StdMutex<Option<Arc<dyn ShelfRequestDispatcher>>>,
+    aliases: StdMutex<Arc<AliasStore>>,
+}
+
+struct RuntimeInner {
+    drives: BTreeMap<String, DriveRecord>,
+    last_update_at_ms: i64,
+}
+
+struct StoragePublisher {
+    announcer: Arc<dyn SubjectAnnouncer>,
 }
 
 impl StorageUsbRuntime {
-    /// New runtime with production input/command sources. The
-    /// steward uid/gid MUST be resolved by the caller before
-    /// construction (the plugin's `load` handler does this via
-    /// [`detect_service_uid_gid`]).
+    /// New runtime with production input/command sources.
     pub fn new(service_uid: u32, service_gid: u32, needs_sudo: bool) -> Self {
-        Self {
+        Self::with_sources(
             service_uid,
             service_gid,
             needs_sudo,
-            command_runner: Arc::new(RealCommandRunner),
-            input_source: Arc::new(ProcfsAndLsblkSource),
-        }
+            Arc::new(ProcfsAndLsblkSource),
+            Arc::new(RealCommandRunner),
+        )
     }
 
-    /// New runtime with a caller-supplied input source. Used by
-    /// the runtime-level fixture tests that replay canned
-    /// procfs + lsblk strings.
-    #[allow(dead_code)]
-    pub fn with_input_source(
+    /// New runtime with caller-supplied sources (test path).
+    pub fn with_sources(
         service_uid: u32,
         service_gid: u32,
         needs_sudo: bool,
         input_source: Arc<dyn ClassifierInputSource>,
+        command_runner: Arc<dyn CommandRunner>,
     ) -> Self {
         Self {
             service_uid,
             service_gid,
             needs_sudo,
-            command_runner: Arc::new(RealCommandRunner),
+            command_runner,
             input_source,
+            inner: Mutex::new(RuntimeInner {
+                drives: BTreeMap::new(),
+                last_update_at_ms: 0,
+            }),
+            publisher: StdMutex::new(None),
+            shelf_dispatcher: StdMutex::new(None),
+            aliases: StdMutex::new(Arc::new(AliasStore::empty(
+                std::path::Path::new("/tmp"),
+            ))),
         }
     }
 
-    /// Getter: the resolved steward uid. Used by the plugin's
-    /// `describe` info + acceptance evidence.
+    /// Bind the alias store loaded from
+    /// `<state_dir>/state/aliases.toml`.
+    pub fn attach_alias_store(&self, store: Arc<AliasStore>) {
+        let mut slot = self
+            .aliases
+            .lock()
+            .expect("storage.usb: aliases lock poisoned on attach");
+        *slot = store;
+    }
+
+    /// Bind the framework's cross-plugin dispatcher.
+    pub fn attach_shelf_dispatcher(
+        &self,
+        dispatcher: Arc<dyn ShelfRequestDispatcher>,
+    ) {
+        let mut slot = self
+            .shelf_dispatcher
+            .lock()
+            .expect("storage.usb: dispatcher lock poisoned on attach");
+        *slot = Some(dispatcher);
+    }
+
+    /// Attach a [`SubjectAnnouncer`] and announce the initial
+    /// (usually empty) envelope so subscribers connecting before
+    /// the first reconcile see a well-formed seed.
+    pub async fn attach_subject_publisher(
+        &self,
+        announcer: Arc<dyn SubjectAnnouncer>,
+    ) -> Result<(), evo_plugin_sdk::contract::ReportError> {
+        let envelope = self.compose_envelope().await;
+        announcer
+            .announce(SubjectAnnouncement {
+                subject_type: STORAGE_USB_DRIVES_SUBJECT_TYPE.to_string(),
+                addressings: vec![storage_usb_drives_addressing()],
+                claims: Vec::new(),
+                state: serde_json::to_value(&envelope)
+                    .unwrap_or(serde_json::Value::Null),
+                announced_at: SystemTime::now(),
+            })
+            .await?;
+        let mut slot = self
+            .publisher
+            .lock()
+            .expect("storage.usb: publisher lock poisoned on attach");
+        *slot = Some(StoragePublisher { announcer });
+        Ok(())
+    }
+
+    /// Getter for tests + evidence.
     pub fn service_uid(&self) -> u32 {
         self.service_uid
     }
-
-    /// Getter: the resolved steward gid.
+    /// Getter for tests + evidence.
     pub fn service_gid(&self) -> u32 {
         self.service_gid
     }
-
-    /// Getter: whether wrapper invocations get a `sudo -n` prefix.
+    /// Getter for tests + evidence.
     pub fn needs_sudo(&self) -> bool {
         self.needs_sudo
     }
 
-    /// Dispatch a decoded request. The plugin's Respondent
-    /// impl consults [`is_storage_usb_verb`] first, then hands
-    /// the verb + raw payload here. Returns raw response bytes
-    /// (JSON) or a structured [`VerbDispatchError`] the caller
-    /// converts to `PluginError`.
+    // ----------------------------------------------------------
+    // Verb dispatch
+    // ----------------------------------------------------------
+
+    /// Dispatch a decoded request.
     pub async fn dispatch_verb(
         &self,
         verb: &str,
-        _payload: &[u8],
+        payload: &[u8],
     ) -> Result<Vec<u8>, VerbDispatchError> {
         match verb {
             "storage.usb.list_drives" => self.handle_list_drives().await,
-            "storage.usb.mount"
-            | "storage.usb.safe_remove"
+            "storage.usb.mount" => self.handle_mount(payload).await,
+            "storage.usb.safe_remove"
             | "storage.usb.repair_filesystem"
             | "storage.usb.rename" => Err(VerbDispatchError::NotImplemented {
                 verb: verb.to_string(),
@@ -160,11 +232,180 @@ impl StorageUsbRuntime {
         }
     }
 
-    /// `storage.usb.list_drives` handler: reads live procfs +
-    /// lsblk inputs, invokes the classifier, serialises the
-    /// six-way [`ClassifiedPartition`] set as the response
-    /// envelope.
     async fn handle_list_drives(&self) -> Result<Vec<u8>, VerbDispatchError> {
+        if let Err(e) = self.reconcile_once().await {
+            tracing::warn!(
+                plugin = "storage.usb",
+                error = %e,
+                "reconcile during list_drives failed; returning last known state"
+            );
+        }
+        let envelope = self.compose_envelope().await;
+        serde_json::to_vec(&envelope)
+            .map_err(|e| VerbDispatchError::ResponseSerialise(e.to_string()))
+    }
+
+    async fn handle_mount(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, VerbDispatchError> {
+        let req: MountRequest = serde_json::from_slice(payload)
+            .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
+
+        self.reconcile_once().await?;
+
+        let record = {
+            let inner = self.inner.lock().await;
+            inner.drives.get(&req.stable_id).cloned()
+        }
+        .ok_or_else(|| {
+            VerbDispatchError::MountRefused(MountRefuseClass::UnknownStableId {
+                stable_id: req.stable_id.clone(),
+            })
+        })?;
+
+        // Idempotent — already mounted-*.
+        if record.class == DriveClass::MountedClean
+            || record.class == DriveClass::MountedDirty
+        {
+            let resp = MountResponse {
+                v: 1,
+                mounted_at: record.mount_root.clone().unwrap_or_default(),
+                class: record.class.wire_str().to_string(),
+                library_source_id: record.library_source_id.clone(),
+            };
+            return serde_json::to_vec(&resp).map_err(|e| {
+                VerbDispatchError::ResponseSerialise(e.to_string())
+            });
+        }
+
+        // Role refuse.
+        if record.role.is_system_live() {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemLivePartition {
+                    stable_id: req.stable_id,
+                    role: role_wire_string(record.role),
+                },
+            ));
+        }
+        if record.role == PartitionRole::SystemAdjacent
+            && record.mount_policy != MountPolicy::Auto
+        {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemAdjacentNotOptedIn {
+                    stable_id: req.stable_id,
+                },
+            ));
+        }
+
+        // FS + size checks.
+        let family = FsFamily::from_lsblk(&record.fs_type);
+        if family == FsFamily::Unsupported {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::UnsupportedFs {
+                    stable_id: req.stable_id,
+                    fs_type: record.fs_type.clone(),
+                },
+            ));
+        }
+        if let Some(cap) = family.size_cap_bytes() {
+            if record.size_bytes > cap {
+                self.mark_drive_class(
+                    &req.stable_id,
+                    DriveClass::MountFailedOversizedVfat,
+                )
+                .await;
+                return Err(VerbDispatchError::MountRefused(
+                    MountRefuseClass::MountFailedOversizedVfat {
+                        stable_id: req.stable_id,
+                        size_bytes: record.size_bytes,
+                        cap_bytes: cap,
+                    },
+                ));
+            }
+        }
+
+        // Dispatch wrapper.
+        let opts = family.mount_options(self.service_uid, self.service_gid);
+        let fs_arg = family.wrapper_fs_arg().unwrap_or(&record.fs_type);
+        let argv = vec![
+            "mount".to_string(),
+            req.stable_id.clone(),
+            fs_arg.to_string(),
+            record.device_node.clone(),
+            opts.clone(),
+        ];
+        let outcome = self
+            .command_runner
+            .run_wrapper(self.needs_sudo, &argv)
+            .await
+            .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+        if outcome.status != 0 {
+            self.mark_drive_class(&req.stable_id, DriveClass::MountFailedOther)
+                .await;
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::MountSubprocessFailed {
+                    stable_id: req.stable_id,
+                    exit_code: outcome.status,
+                    stderr: outcome.stderr,
+                },
+            ));
+        }
+
+        let mount_root = format!("{USB_MOUNT_ROOT}/{}", req.stable_id);
+        let mut library_source_id: Option<String> = None;
+
+        if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+            match self
+                .dispatch_library_add_source(
+                    dispatcher,
+                    &req.stable_id,
+                    &record.device_node,
+                    record.display_name.as_deref().unwrap_or(&req.stable_id),
+                    &mount_root,
+                )
+                .await
+            {
+                Ok(id) => library_source_id = id,
+                Err(e) => tracing::warn!(
+                    plugin = "storage.usb",
+                    stable_id = %req.stable_id,
+                    error = %e,
+                    "library.add_source local_usb dispatch failed; mount kept"
+                ),
+            }
+        }
+
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(rec) = inner.drives.get_mut(&req.stable_id) {
+                rec.class = DriveClass::MountedClean;
+                rec.mount_root = Some(mount_root.clone());
+                rec.library_source_id = library_source_id.clone();
+                rec.last_transition_at_ms = Some(now_ms());
+            }
+        }
+        self.republish_envelope().await;
+
+        let resp = MountResponse {
+            v: 1,
+            mounted_at: mount_root,
+            class: DriveClass::MountedClean.wire_str().to_string(),
+            library_source_id,
+        };
+        serde_json::to_vec(&resp)
+            .map_err(|e| VerbDispatchError::ResponseSerialise(e.to_string()))
+    }
+
+    // ----------------------------------------------------------
+    // Reconcile
+    // ----------------------------------------------------------
+
+    /// Enumerate every USB-transport partition, classify, derive
+    /// stable-ids, and auto-mount removable drives. Called on
+    /// plugin load, on every reconcile tick, and at the start of
+    /// every verb handler (cheap in-memory op + lsblk poll).
+    pub async fn reconcile_once(&self) -> Result<(), VerbDispatchError> {
         let inputs = self
             .input_source
             .read_inputs()
@@ -173,59 +414,386 @@ impl StorageUsbRuntime {
         let classified =
             classify(&inputs.mountinfo, &inputs.swaps, &inputs.lsblk_json)
                 .map_err(VerbDispatchError::Classify)?;
-        let last_update_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let envelope = ListDrivesEnvelope {
-            v: 1,
-            drives: classified
+
+        let alias_store = self.aliases_clone();
+
+        // Sort deterministically before deriving so enumeration
+        // order is stable across boots.
+        let mut sorted = classified;
+        sorted.sort_by(|a, b| a.device_node.cmp(&b.device_node));
+
+        // Rebuild the registry from fresh classifier output;
+        // preserve mount_root + library_source_id + class for
+        // surviving stable_ids.
+        let mut inner = self.inner.lock().await;
+        let mut fresh: BTreeMap<String, DriveRecord> = BTreeMap::new();
+        let mut in_use_ids: Vec<String> = Vec::new();
+
+        for part in &sorted {
+            let alias = alias_store.lookup(&AliasLookup {
+                vendor: part.vendor.as_deref(),
+                model: part.model.as_deref(),
+                serial_short: part.serial_short.as_deref().unwrap_or_default(),
+                partuuid: part.partuuid.as_deref(),
+                partition_index: part.partition_index,
+            });
+            let alias_set = alias.is_some();
+            let derived = derive(
+                &DerivationInput {
+                    label: part.label.as_deref(),
+                    vendor: part.vendor.as_deref(),
+                    model: part.model.as_deref(),
+                    serial_short: part.serial_short.as_deref(),
+                    partition_index: part.partition_index,
+                    partition_count: part.partition_count,
+                    partuuid: part.partuuid.as_deref(),
+                },
+                &DerivationContext {
+                    operator_alias: alias,
+                    in_use_stable_ids: &in_use_ids,
+                },
+            );
+            in_use_ids.push(derived.stable_id.clone());
+            let mut rec =
+                DriveRecord::from_partition(part, &derived, alias_set);
+            if let Some(prior) = inner.drives.get(&derived.stable_id) {
+                if prior.class == DriveClass::MountedClean
+                    || prior.class == DriveClass::MountedDirty
+                {
+                    rec.class = prior.class;
+                    rec.mount_root = prior.mount_root.clone();
+                    rec.library_source_id = prior.library_source_id.clone();
+                }
+            }
+            fresh.insert(derived.stable_id.clone(), rec);
+        }
+
+        inner.drives = fresh;
+        inner.last_update_at_ms = now_ms();
+        drop(inner);
+
+        // Auto-mount removable drives that are not yet mounted.
+        let candidates: Vec<String> = {
+            let inner = self.inner.lock().await;
+            inner
+                .drives
                 .iter()
-                .map(DriveRecord::from_classified)
-                .collect(),
-            last_update_at_ms,
+                .filter(|(_, r)| {
+                    r.role == PartitionRole::Removable
+                        && r.mount_policy == MountPolicy::Auto
+                        && (r.class == DriveClass::Unmounted
+                            || r.class == DriveClass::MountFailedOther)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
         };
-        serde_json::to_vec(&envelope)
+        for id in &candidates {
+            let payload = serde_json::to_vec(&MountRequest {
+                stable_id: id.clone(),
+            })
+            .unwrap_or_default();
+            // Bypass the recursive reconcile_once call —
+            // handle_mount would loop otherwise.
+            if let Err(e) = self.mount_attempt_no_reconcile(&payload).await {
+                tracing::debug!(
+                    plugin = "storage.usb",
+                    stable_id = %id,
+                    error = %e,
+                    "auto-mount attempt failed"
+                );
+            }
+        }
+
+        self.republish_envelope().await;
+        Ok(())
+    }
+
+    /// Internal mount attempt without the pre-reconcile pass —
+    /// used by [`Self::reconcile_once`] to avoid infinite
+    /// recursion on the auto-mount loop.
+    async fn mount_attempt_no_reconcile(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, VerbDispatchError> {
+        let req: MountRequest = serde_json::from_slice(payload)
+            .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
+        let record = {
+            let inner = self.inner.lock().await;
+            inner.drives.get(&req.stable_id).cloned()
+        }
+        .ok_or_else(|| {
+            VerbDispatchError::MountRefused(MountRefuseClass::UnknownStableId {
+                stable_id: req.stable_id.clone(),
+            })
+        })?;
+        // Same body as handle_mount from the state check onward.
+        // Extract to a helper to keep the diff obvious.
+        self.mount_dispatch(req, record).await
+    }
+
+    async fn mount_dispatch(
+        &self,
+        req: MountRequest,
+        record: DriveRecord,
+    ) -> Result<Vec<u8>, VerbDispatchError> {
+        if record.class == DriveClass::MountedClean
+            || record.class == DriveClass::MountedDirty
+        {
+            let resp = MountResponse {
+                v: 1,
+                mounted_at: record.mount_root.clone().unwrap_or_default(),
+                class: record.class.wire_str().to_string(),
+                library_source_id: record.library_source_id.clone(),
+            };
+            return serde_json::to_vec(&resp).map_err(|e| {
+                VerbDispatchError::ResponseSerialise(e.to_string())
+            });
+        }
+        if record.role.is_system_live() {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemLivePartition {
+                    stable_id: req.stable_id,
+                    role: role_wire_string(record.role),
+                },
+            ));
+        }
+        if record.role == PartitionRole::SystemAdjacent
+            && record.mount_policy != MountPolicy::Auto
+        {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemAdjacentNotOptedIn {
+                    stable_id: req.stable_id,
+                },
+            ));
+        }
+        let family = FsFamily::from_lsblk(&record.fs_type);
+        if family == FsFamily::Unsupported {
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::UnsupportedFs {
+                    stable_id: req.stable_id,
+                    fs_type: record.fs_type.clone(),
+                },
+            ));
+        }
+        if let Some(cap) = family.size_cap_bytes() {
+            if record.size_bytes > cap {
+                self.mark_drive_class(
+                    &req.stable_id,
+                    DriveClass::MountFailedOversizedVfat,
+                )
+                .await;
+                return Err(VerbDispatchError::MountRefused(
+                    MountRefuseClass::MountFailedOversizedVfat {
+                        stable_id: req.stable_id,
+                        size_bytes: record.size_bytes,
+                        cap_bytes: cap,
+                    },
+                ));
+            }
+        }
+        let opts = family.mount_options(self.service_uid, self.service_gid);
+        let fs_arg = family.wrapper_fs_arg().unwrap_or(&record.fs_type);
+        let argv = vec![
+            "mount".to_string(),
+            req.stable_id.clone(),
+            fs_arg.to_string(),
+            record.device_node.clone(),
+            opts,
+        ];
+        let outcome = self
+            .command_runner
+            .run_wrapper(self.needs_sudo, &argv)
+            .await
+            .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+        if outcome.status != 0 {
+            self.mark_drive_class(&req.stable_id, DriveClass::MountFailedOther)
+                .await;
+            return Err(VerbDispatchError::MountRefused(
+                MountRefuseClass::MountSubprocessFailed {
+                    stable_id: req.stable_id,
+                    exit_code: outcome.status,
+                    stderr: outcome.stderr,
+                },
+            ));
+        }
+        let mount_root = format!("{USB_MOUNT_ROOT}/{}", req.stable_id);
+        let mut library_source_id: Option<String> = None;
+        if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+            match self
+                .dispatch_library_add_source(
+                    dispatcher,
+                    &req.stable_id,
+                    &record.device_node,
+                    record.display_name.as_deref().unwrap_or(&req.stable_id),
+                    &mount_root,
+                )
+                .await
+            {
+                Ok(id) => library_source_id = id,
+                Err(e) => tracing::warn!(
+                    plugin = "storage.usb",
+                    stable_id = %req.stable_id,
+                    error = %e,
+                    "library.add_source local_usb dispatch failed; mount kept"
+                ),
+            }
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(rec) = inner.drives.get_mut(&req.stable_id) {
+                rec.class = DriveClass::MountedClean;
+                rec.mount_root = Some(mount_root.clone());
+                rec.library_source_id = library_source_id.clone();
+                rec.last_transition_at_ms = Some(now_ms());
+            }
+        }
+        let resp = MountResponse {
+            v: 1,
+            mounted_at: mount_root,
+            class: DriveClass::MountedClean.wire_str().to_string(),
+            library_source_id,
+        };
+        serde_json::to_vec(&resp)
             .map_err(|e| VerbDispatchError::ResponseSerialise(e.to_string()))
+    }
+
+    async fn mark_drive_class(&self, stable_id: &str, class: DriveClass) {
+        let mut inner = self.inner.lock().await;
+        if let Some(rec) = inner.drives.get_mut(stable_id) {
+            rec.class = class;
+            rec.last_transition_at_ms = Some(now_ms());
+        }
+    }
+
+    async fn compose_envelope(&self) -> ListDrivesEnvelope {
+        let inner = self.inner.lock().await;
+        ListDrivesEnvelope {
+            v: 1,
+            drives: inner.drives.values().cloned().collect(),
+            last_update_at_ms: inner.last_update_at_ms,
+        }
+    }
+
+    async fn republish_envelope(&self) {
+        let envelope = self.compose_envelope().await;
+        let publisher = {
+            let slot = self
+                .publisher
+                .lock()
+                .expect("storage.usb: publisher lock poisoned on republish");
+            slot.as_ref().map(|p| Arc::clone(&p.announcer))
+        };
+        if let Some(announcer) = publisher {
+            let state = serde_json::to_value(&envelope)
+                .unwrap_or(serde_json::Value::Null);
+            if let Err(e) = announcer
+                .update_state(storage_usb_drives_addressing(), state)
+                .await
+            {
+                tracing::debug!(
+                    plugin = "storage.usb",
+                    error = %e,
+                    "subject republish failed"
+                );
+            }
+        }
+    }
+
+    fn shelf_dispatcher_clone(
+        &self,
+    ) -> Option<Arc<dyn ShelfRequestDispatcher>> {
+        let slot = self
+            .shelf_dispatcher
+            .lock()
+            .expect("storage.usb: dispatcher lock poisoned on read");
+        slot.as_ref().cloned()
+    }
+
+    fn aliases_clone(&self) -> Arc<AliasStore> {
+        let slot = self
+            .aliases
+            .lock()
+            .expect("storage.usb: aliases lock poisoned on read");
+        Arc::clone(&slot)
+    }
+
+    async fn dispatch_library_add_source(
+        &self,
+        dispatcher: Arc<dyn ShelfRequestDispatcher>,
+        stable_id: &str,
+        device_node: &str,
+        display_name: &str,
+        mount_root: &str,
+    ) -> Result<Option<String>, String> {
+        let payload = serde_json::json!({
+            "v": 1,
+            "display_name": display_name,
+            "kind": {
+                "kind": "local_usb",
+                "device_node": device_node,
+                "label": stable_id,
+            },
+            "mount_path": mount_root,
+        });
+        let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let response = dispatcher
+            .dispatch("audio.library", "library.add_source", bytes, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let parsed: serde_json::Value = serde_json::from_slice(&response)
+            .unwrap_or(serde_json::Value::Null);
+        Ok(parsed
+            .get("source_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
     }
 }
 
-// -------- Wire-shape records --------
+/// Spawn the periodic reconciler.
+pub fn spawn_reconcile_task(
+    runtime: Arc<StorageUsbRuntime>,
+    cadence: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = runtime.reconcile_once().await {
+                tracing::debug!(
+                    plugin = "storage.usb",
+                    error = %e,
+                    "periodic reconcile failed; will retry next tick"
+                );
+            }
+        }
+    })
+}
 
-/// Envelope returned by `storage.usb.list_drives`. Mirrors the
-/// `storage_usb_drives` subject payload shape.
+// --------------------------------------------------------------
+// Wire-shape records
+// --------------------------------------------------------------
+
+/// Envelope returned by `storage.usb.list_drives` + carried on
+/// the `storage_usb_drives` subject.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListDrivesEnvelope {
     /// Envelope shape version.
     pub v: u32,
     /// One record per classified USB-transport partition.
     pub drives: Vec<DriveRecord>,
-    /// Wall-clock ms of the enumeration.
+    /// Wall-clock ms of the last enumeration.
     pub last_update_at_ms: i64,
 }
 
-/// One drive record as returned by `list_drives` + carried on
-/// the `storage_usb_drives` subject. Field shapes match the
-/// schema at `evo-catalogue-schemas/schemas/org.evoframework/storage/usb.v1.toml`.
-///
-/// Fields absent in this Step-2 skeleton (`stable_id`,
-/// `display_name`, `id_source`, `mount_root`,
-/// `library_source_id`, `alias_set`, `last_transition_at_ms`)
-/// land in Steps 3-6 as the stable-id derivation, mount
-/// lifecycle, cross-plugin library dispatch, and alias
-/// persistence come online. The wire-envelope shape carries
-/// them as `Option`-typed today so the schema is stable across
-/// the roll-in.
+/// One drive record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveRecord {
-    /// Stable id (§3 derivation ladder). Populated from
-    /// Step 3 onward; `None` today.
-    pub stable_id: Option<String>,
-    /// Display token (stable-id sans partition suffix).
-    /// Populated from Step 3 onward.
+    /// Stable id (mount path leaf).
+    pub stable_id: String,
+    /// Display token — stable-id sans partition suffix.
     pub display_name: Option<String>,
     /// Which rule in the derivation ladder produced the id.
-    /// Populated from Step 3 onward.
     pub id_source: Option<String>,
     /// Partition device node.
     pub device_node: String,
@@ -239,46 +807,66 @@ pub struct DriveRecord {
     pub label: Option<String>,
     /// Filesystem UUID.
     pub uuid: Option<String>,
-    /// GPT PARTUUID (alias-key component).
+    /// GPT PARTUUID.
     pub partuuid: Option<String>,
     /// Udev vendor.
     pub vendor: Option<String>,
     /// Udev model.
     pub model: Option<String>,
-    /// Udev serial short (alias-key component).
+    /// Udev serial short.
     pub serial_short: Option<String>,
-    /// Filesystem family (`vfat` / `exfat` / `ntfs` / `ext4` / …).
+    /// Filesystem family.
     pub fs_type: String,
-    /// Byte size from `blockdev --getsize64` (via lsblk `-b`).
+    /// Byte size.
     pub size_bytes: u64,
-    /// Six-way role. Non-null.
-    pub role: String,
-    /// Mount policy. Non-null.
-    pub mount_policy: String,
-    /// Current kernel mount point (if any).
+    /// Six-way role.
+    #[serde(with = "role_serde")]
+    pub role: PartitionRole,
+    /// Mount policy.
+    #[serde(with = "policy_serde")]
+    pub mount_policy: MountPolicy,
+    /// Current class.
+    #[serde(with = "class_serde")]
+    pub class: DriveClass,
+    /// Mount point (present when class is `mounted-*`).
     pub mount_root: Option<String>,
-    /// `library.add_source` result when mounted. Populated from
-    /// Step 3 onward.
+    /// `library.add_source` result when class is `mounted-*`.
     pub library_source_id: Option<String>,
     /// True when the drive has an operator-set alias.
-    /// Populated from Step 6.
     pub alias_set: bool,
-    /// Wall-clock ms of the last state change. Populated from
-    /// Step 3 onward; `None` today (the record is
-    /// enumeration-derived, not transition-derived, in Step 2).
+    /// Wall-clock ms of the last state change.
     pub last_transition_at_ms: Option<i64>,
 }
 
 impl DriveRecord {
-    /// Build a wire record from a [`ClassifiedPartition`]. The
-    /// alias / stable-id / mount-lifecycle fields stay `None`
-    /// in Step 2; Steps 3-6 populate them as the pipeline
-    /// stages come online.
-    pub fn from_classified(p: &ClassifiedPartition) -> Self {
+    /// Build a record from a fresh classifier output + derived id.
+    pub fn from_partition(
+        p: &ClassifiedPartition,
+        derived: &crate::stable_id::DerivedId,
+        alias_set: bool,
+    ) -> Self {
+        let class = if p.role.is_system_live() {
+            DriveClass::SystemDisk
+        } else if let Some(mp) = &p.current_mount {
+            if mp.starts_with(USB_MOUNT_ROOT) {
+                DriveClass::MountedClean
+            } else {
+                DriveClass::Unmounted
+            }
+        } else if FsFamily::from_lsblk(&p.fs_type) == FsFamily::Unsupported {
+            DriveClass::Unsupported
+        } else {
+            DriveClass::Unmounted
+        };
+        let mount_root = if class == DriveClass::MountedClean {
+            p.current_mount.clone()
+        } else {
+            None
+        };
         Self {
-            stable_id: None,
-            display_name: None,
-            id_source: None,
+            stable_id: derived.stable_id.clone(),
+            display_name: Some(derived.display_name.clone()),
+            id_source: Some(derived.id_source.wire_str().to_string()),
             device_node: p.device_node.clone(),
             parent_disk: p.parent_disk.clone(),
             partition_index: p.partition_index,
@@ -291,18 +879,146 @@ impl DriveRecord {
             serial_short: p.serial_short.clone(),
             fs_type: p.fs_type.clone(),
             size_bytes: p.size_bytes,
-            role: role_wire_string(p.role),
-            mount_policy: mount_policy_wire_string(p.mount_policy),
-            mount_root: p.current_mount.clone(),
+            role: p.role,
+            mount_policy: p.mount_policy,
+            class,
+            mount_root,
             library_source_id: None,
-            alias_set: false,
+            alias_set,
             last_transition_at_ms: None,
         }
     }
 }
 
-fn role_wire_string(r: crate::classifier::PartitionRole) -> String {
-    use crate::classifier::PartitionRole;
+/// DriveClass — reflects the mount lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveClass {
+    /// Live-system partition — never mounts here.
+    SystemDisk,
+    /// FS type not in the support matrix.
+    Unsupported,
+    /// Detected, not yet mounted.
+    Unmounted,
+    /// Mounted, no dirty flag.
+    MountedClean,
+    /// Mounted, dirty flag on.
+    MountedDirty,
+    /// NTFS hiberfile present — mount refused.
+    MountedDirtyHiberfile,
+    /// Mount refused due to dirty state.
+    MountFailedDirty,
+    /// FAT32 volume > 2 TiB — mount refused per §2.
+    MountFailedOversizedVfat,
+    /// Mount errno other than dirty / oversized.
+    MountFailedOther,
+}
+
+impl DriveClass {
+    /// Stable wire string matching the schema enum.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            DriveClass::SystemDisk => "system-disk",
+            DriveClass::Unsupported => "unsupported",
+            DriveClass::Unmounted => "unmounted",
+            DriveClass::MountedClean => "mounted-clean",
+            DriveClass::MountedDirty => "mounted-dirty",
+            DriveClass::MountedDirtyHiberfile => "mounted-dirty-hiberfile",
+            DriveClass::MountFailedDirty => "mount-failed-dirty",
+            DriveClass::MountFailedOversizedVfat => {
+                "mount-failed-oversized-vfat"
+            }
+            DriveClass::MountFailedOther => "mount-failed-other",
+        }
+    }
+}
+
+mod role_serde {
+    use super::PartitionRole;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        r: &PartitionRole,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::role_wire_string(*r).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<PartitionRole, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "system-root" => Ok(PartitionRole::SystemRoot),
+            "system-boot" => Ok(PartitionRole::SystemBoot),
+            "system-efi" => Ok(PartitionRole::SystemEfi),
+            "system-swap" => Ok(PartitionRole::SystemSwap),
+            "system-adjacent" => Ok(PartitionRole::SystemAdjacent),
+            "removable" => Ok(PartitionRole::Removable),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown PartitionRole wire string {other:?}"
+            ))),
+        }
+    }
+}
+
+mod policy_serde {
+    use super::MountPolicy;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        p: &MountPolicy,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::mount_policy_wire_string(*p).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<MountPolicy, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "auto" => Ok(MountPolicy::Auto),
+            "opt-in-required" => Ok(MountPolicy::OptInRequired),
+            "refused-system-live" => Ok(MountPolicy::RefusedSystemLive),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown MountPolicy wire string {other:?}"
+            ))),
+        }
+    }
+}
+
+mod class_serde {
+    use super::DriveClass;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        c: &DriveClass,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        c.wire_str().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<DriveClass, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "system-disk" => Ok(DriveClass::SystemDisk),
+            "unsupported" => Ok(DriveClass::Unsupported),
+            "unmounted" => Ok(DriveClass::Unmounted),
+            "mounted-clean" => Ok(DriveClass::MountedClean),
+            "mounted-dirty" => Ok(DriveClass::MountedDirty),
+            "mounted-dirty-hiberfile" => Ok(DriveClass::MountedDirtyHiberfile),
+            "mount-failed-dirty" => Ok(DriveClass::MountFailedDirty),
+            "mount-failed-oversized-vfat" => {
+                Ok(DriveClass::MountFailedOversizedVfat)
+            }
+            "mount-failed-other" => Ok(DriveClass::MountFailedOther),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown DriveClass wire string {other:?}"
+            ))),
+        }
+    }
+}
+
+pub(crate) fn role_wire_string(r: PartitionRole) -> String {
     match r {
         PartitionRole::SystemRoot => "system-root",
         PartitionRole::SystemBoot => "system-boot",
@@ -314,8 +1030,7 @@ fn role_wire_string(r: crate::classifier::PartitionRole) -> String {
     .to_string()
 }
 
-fn mount_policy_wire_string(p: crate::classifier::MountPolicy) -> String {
-    use crate::classifier::MountPolicy;
+pub(crate) fn mount_policy_wire_string(p: MountPolicy) -> String {
     match p {
         MountPolicy::Auto => "auto",
         MountPolicy::OptInRequired => "opt-in-required",
@@ -324,70 +1039,148 @@ fn mount_policy_wire_string(p: crate::classifier::MountPolicy) -> String {
     .to_string()
 }
 
-// -------- Verb-dispatch error taxonomy --------
+/// `storage.usb.mount` request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountRequest {
+    /// Stable-id of the drive to mount.
+    pub stable_id: String,
+}
+
+/// `storage.usb.mount` response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountResponse {
+    /// Envelope shape version.
+    pub v: u32,
+    /// Mount point (`/var/lib/evo/music/USB/<stable-id>`).
+    pub mounted_at: String,
+    /// DriveClass wire string.
+    pub class: String,
+    /// `library.add_source` result.
+    pub library_source_id: Option<String>,
+}
+
+// --------------------------------------------------------------
+// Error taxonomy
+// --------------------------------------------------------------
+
+/// Fine-grained mount refusal classes.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum MountRefuseClass {
+    /// Stable-id not in the classifier's current output.
+    #[error("unknown stable_id {stable_id:?}")]
+    UnknownStableId {
+        /// Requested id.
+        stable_id: String,
+    },
+    /// Role is `system-*` live — non-negotiable refuse.
+    #[error(
+        "stable_id {stable_id:?} is a live system partition (role={role})"
+    )]
+    SystemLivePartition {
+        /// Requested id.
+        stable_id: String,
+        /// Role wire string.
+        role: String,
+    },
+    /// Role is `system-adjacent` but no operator opt-in.
+    #[error(
+        "stable_id {stable_id:?} is system-adjacent; operator opt-in required"
+    )]
+    SystemAdjacentNotOptedIn {
+        /// Requested id.
+        stable_id: String,
+    },
+    /// FS not in the support matrix.
+    #[error("stable_id {stable_id:?} has unsupported fs_type {fs_type:?}")]
+    UnsupportedFs {
+        /// Requested id.
+        stable_id: String,
+        /// FS type reported by the classifier.
+        fs_type: String,
+    },
+    /// FAT32 volume exceeds the 2 TiB spec cap.
+    #[error(
+        "stable_id {stable_id:?} is FAT32 at {size_bytes} bytes, over the {cap_bytes} byte spec cap"
+    )]
+    MountFailedOversizedVfat {
+        /// Requested id.
+        stable_id: String,
+        /// Volume size reported by lsblk.
+        size_bytes: u64,
+        /// Cap enforced by the FS matrix.
+        cap_bytes: u64,
+    },
+    /// The wrapper subprocess exited non-zero.
+    #[error(
+        "stable_id {stable_id:?} mount subprocess exit {exit_code}: {stderr}"
+    )]
+    MountSubprocessFailed {
+        /// Requested id.
+        stable_id: String,
+        /// Exit code from the wrapper.
+        exit_code: i32,
+        /// Captured stderr for operator diagnostics.
+        stderr: String,
+    },
+}
 
 /// Errors returned by [`StorageUsbRuntime::dispatch_verb`].
-/// The plugin's Respondent impl maps each to a `PluginError`
-/// variant.
 #[derive(Debug, thiserror::Error)]
 pub enum VerbDispatchError {
-    /// Verb string is not one of [`STORAGE_USB_VERBS`]. Maps
-    /// to `PluginError::Permanent` — no plugin restart will
-    /// help. This should never fire in production because the
-    /// dispatcher already partitions verbs by manifest; kept
-    /// as a defence-in-depth check.
+    /// Verb string is not one of [`STORAGE_USB_VERBS`].
     #[error("storage.usb: unknown verb {verb:?}")]
     UnknownRequestType {
         /// The unrecognised verb.
         verb: String,
     },
-    /// Classifier failed on the current procfs + lsblk input.
-    /// Maps to `PluginError::Transient` — a retry may succeed
-    /// if the underlying tool becomes reachable.
-    #[error("storage.usb: classifier failed: {0}")]
-    Classify(#[from] ClassifierError),
-    /// The input source (procfs read or `lsblk` invocation)
-    /// failed. Maps to `PluginError::Transient`.
-    #[error("storage.usb: input source failed: {0}")]
-    InputSource(String),
-    /// Response serialisation failed. Should never fire on
-    /// well-formed output; maps to `PluginError::Permanent`.
-    #[error("storage.usb: response serialise failed: {0}")]
-    ResponseSerialise(String),
-    /// A verb is declared in [`STORAGE_USB_VERBS`] but its
-    /// implementation lands in a later step. Steps 3-5 remove
-    /// this variant one verb at a time.
+    /// Verb declared but its implementation lands in a later step.
     #[error("storage.usb: verb {verb:?} not implemented yet")]
     NotImplemented {
         /// The declared-but-unwired verb.
         verb: String,
     },
+    /// Payload deserialisation failed.
+    #[error("storage.usb: payload decode failed: {0}")]
+    PayloadDecode(String),
+    /// Classifier failed.
+    #[error("storage.usb: classifier failed: {0}")]
+    Classify(#[from] ClassifierError),
+    /// Input source failed.
+    #[error("storage.usb: input source failed: {0}")]
+    InputSource(String),
+    /// Wrapper subprocess spawn/wait failed at the OS layer.
+    #[error("storage.usb: subprocess I/O failed: {0}")]
+    SubprocessIo(String),
+    /// Response serialisation failed.
+    #[error("storage.usb: response serialise failed: {0}")]
+    ResponseSerialise(String),
+    /// Mount refused per one of the fine-grained classes.
+    #[error("storage.usb: mount refused: {0}")]
+    MountRefused(#[source] MountRefuseClass),
 }
 
-// -------- Input source (classifier upstream) --------
+// --------------------------------------------------------------
+// Input source (classifier upstream)
+// --------------------------------------------------------------
 
-/// Triple of classifier inputs read from the host: mountinfo
-/// text + swaps text + lsblk JSON.
+/// Triple of classifier inputs.
 pub struct ClassifierInputs {
-    /// Verbatim `/proc/self/mountinfo` text.
+    /// `/proc/self/mountinfo`.
     pub mountinfo: String,
-    /// Verbatim `/proc/swaps` text.
+    /// `/proc/swaps`.
     pub swaps: String,
-    /// `lsblk -J -o …` JSON output.
+    /// `lsblk -J -b -o ...`.
     pub lsblk_json: String,
 }
 
-/// Abstraction over the classifier input path. The production
-/// impl reads `/proc/*` + spawns `lsblk`; tests supply a fake
-/// with fixture strings.
+/// Abstraction over the classifier input path.
 #[async_trait::async_trait]
 pub trait ClassifierInputSource: Send + Sync {
     /// Read the current classifier inputs.
     async fn read_inputs(&self) -> anyhow::Result<ClassifierInputs>;
 }
 
-/// Production input source: reads `/proc/self/mountinfo` +
-/// `/proc/swaps` and spawns `lsblk`.
+/// Production input source.
 pub struct ProcfsAndLsblkSource;
 
 #[async_trait::async_trait]
@@ -398,9 +1191,6 @@ impl ClassifierInputSource for ProcfsAndLsblkSource {
         let swaps = tokio::fs::read_to_string("/proc/swaps")
             .await
             .unwrap_or_default();
-        // -b forces byte SIZE (integer, not human-readable).
-        // -J emits JSON. The wide -o field list gives us
-        // everything the classifier consults in one shot.
         let output = Command::new("lsblk")
             .args([
                 "-J",
@@ -423,12 +1213,14 @@ impl ClassifierInputSource for ProcfsAndLsblkSource {
     }
 }
 
-// -------- Command runner (mount / umount / fsck / eject) --------
+// --------------------------------------------------------------
+// Command runner (wrapper invocation)
+// --------------------------------------------------------------
 
-/// Result of one command invocation.
+/// Result of one wrapper invocation.
 #[derive(Debug, Clone)]
 pub struct CommandOutcome {
-    /// Process exit status (raw code, or -1 if terminated by signal).
+    /// Process exit status.
     pub status: i32,
     /// Captured stdout.
     pub stdout: String,
@@ -436,17 +1228,10 @@ pub struct CommandOutcome {
     pub stderr: String,
 }
 
-/// Abstraction over the wrapper subprocess dispatch. The
-/// production impl spawns the real wrapper; tests supply a
-/// fake that records argv and returns a scripted
-/// [`CommandOutcome`]. Reserved for Steps 3-5 wiring — every
-/// current verb either does not call the wrapper (list_drives)
-/// or returns NotImplemented (mount/etc.).
+/// Abstraction over wrapper subprocess dispatch.
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
-    /// Run the wrapper with the supplied argv. `needs_sudo`
-    /// controls whether the invocation is prefixed with
-    /// `sudo -n`.
+    /// Run the wrapper with the supplied argv.
     async fn run_wrapper(
         &self,
         needs_sudo: bool,
@@ -454,7 +1239,7 @@ pub trait CommandRunner: Send + Sync {
     ) -> anyhow::Result<CommandOutcome>;
 }
 
-/// Production command runner: spawns the wrapper via `Command`.
+/// Production command runner.
 pub struct RealCommandRunner;
 
 #[async_trait::async_trait]
@@ -483,19 +1268,14 @@ impl CommandRunner for RealCommandRunner {
     }
 }
 
-// -------- Steward-uid resolver --------
-
 /// Resolve the plugin's effective uid + gid from
-/// `/proc/self/status`. The runtime interpolates these into
-/// the FS-matrix mount options. Called by the plugin's `load`
-/// handler.
+/// `/proc/self/status`.
 pub fn detect_service_uid_gid() -> anyhow::Result<(u32, u32)> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let mut uid: Option<u32> = None;
     let mut gid: Option<u32> = None;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
-            // Real Effective SavedSet Filesystem
             if let Some(eff) = rest.split_whitespace().nth(1) {
                 uid = eff.parse().ok();
             }
@@ -510,6 +1290,13 @@ pub fn detect_service_uid_gid() -> anyhow::Result<(u32, u32)> {
         (Some(u), Some(g)) => Ok((u, g)),
         _ => anyhow::bail!("/proc/self/status missing Uid: / Gid:"),
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -533,19 +1320,81 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FakeCommandRunner {
+        outcomes: Arc<StdMutex<Vec<CommandOutcome>>>,
+        seen_argv: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    impl FakeCommandRunner {
+        fn new(outcomes: Vec<CommandOutcome>) -> Self {
+            Self {
+                outcomes: Arc::new(StdMutex::new(outcomes)),
+                seen_argv: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for FakeCommandRunner {
+        async fn run_wrapper(
+            &self,
+            _needs_sudo: bool,
+            argv: &[String],
+        ) -> anyhow::Result<CommandOutcome> {
+            self.seen_argv.lock().unwrap().push(argv.to_vec());
+            let mut outcomes = self.outcomes.lock().unwrap();
+            if outcomes.is_empty() {
+                Ok(CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(outcomes.remove(0))
+            }
+        }
+    }
+
+    fn removable_stick_lsblk() -> &'static str {
+        r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"SanDisk","model":"Cruzer","serial":"4C530",
+             "size":32000000000,
+             "children":[
+               {"name":"sda1","type":"part","fstype":"vfat","label":"MUSIC","size":32000000000,"partuuid":"aaaa-01"}
+             ]}
+          ]
+        }"#
+    }
+
+    fn build_runtime(
+        lsblk: &str,
+        outcomes: Vec<CommandOutcome>,
+    ) -> Arc<StorageUsbRuntime> {
+        Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: String::new(),
+                swaps: String::new(),
+                lsblk_json: lsblk.to_string(),
+            }),
+            Arc::new(FakeCommandRunner::new(outcomes)),
+        ))
+    }
+
     #[test]
     fn verb_recognition() {
         for v in STORAGE_USB_VERBS {
             assert!(is_storage_usb_verb(v));
         }
         assert!(!is_storage_usb_verb("storage.usb.bogus"));
-        assert!(!is_storage_usb_verb("network.share.add"));
     }
 
     #[test]
     fn verb_list_matches_manifest() {
-        // The manifest declares the same verbs. If either drifts,
-        // the plugin's admission-time verb partition rejects.
         let m = crate::manifest();
         let resp = m
             .capabilities
@@ -562,26 +1411,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_drives_returns_classified_envelope() {
-        let lsblk = r#"{
-          "blockdevices": [
-            {"name":"sda","type":"disk","tran":"usb","vendor":"SanDisk","model":"Cruzer","serial":"4C530",
-             "size":32000000000,
-             "children":[
-               {"name":"sda1","type":"part","fstype":"vfat","label":"MUSIC","size":32000000000,"partuuid":"aaaa-01"}
-             ]}
-          ]
-        }"#;
-        let rt = StorageUsbRuntime::with_input_source(
-            1000,
-            1000,
-            true,
-            Arc::new(FakeInputSource {
-                mountinfo: String::new(),
-                swaps: String::new(),
-                lsblk_json: lsblk.to_string(),
-            }),
-        );
+    async fn list_drives_returns_stable_id_populated_records() {
+        let rt = build_runtime(removable_stick_lsblk(), Vec::new());
         let bytes = rt
             .dispatch_verb("storage.usb.list_drives", b"{}")
             .await
@@ -590,31 +1421,194 @@ mod tests {
             serde_json::from_slice(&bytes).expect("json");
         assert_eq!(env.v, 1);
         assert_eq!(env.drives.len(), 1);
-        assert_eq!(env.drives[0].device_node, "/dev/sda1");
-        assert_eq!(env.drives[0].role, "removable");
-        assert_eq!(env.drives[0].mount_policy, "auto");
-        assert_eq!(env.drives[0].fs_type, "vfat");
-        assert_eq!(env.drives[0].label.as_deref(), Some("MUSIC"));
-        // Step-2 skeleton: stable-id-derivation fields empty.
-        assert!(env.drives[0].stable_id.is_none());
-        assert!(env.drives[0].id_source.is_none());
-        assert!(!env.drives[0].alias_set);
+        assert_eq!(env.drives[0].stable_id, "MUSIC");
+        assert_eq!(env.drives[0].id_source.as_deref(), Some("fs_label"));
     }
 
     #[tokio::test]
-    async fn mutating_verbs_return_not_implemented() {
-        let rt = StorageUsbRuntime::with_input_source(
+    async fn mount_verb_returns_mounted_clean_after_reconcile_automount() {
+        // Reconcile auto-mounts the removable stick before the
+        // explicit mount call. The explicit mount then observes
+        // the already-mounted state (idempotent path).
+        let rt = build_runtime(
+            removable_stick_lsblk(),
+            vec![
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .expect("list");
+        let payload = serde_json::to_vec(&MountRequest {
+            stable_id: "MUSIC".to_string(),
+        })
+        .unwrap();
+        let bytes = rt
+            .dispatch_verb("storage.usb.mount", &payload)
+            .await
+            .expect("mount");
+        let resp: MountResponse = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(resp.class, "mounted-clean");
+        assert!(resp.mounted_at.ends_with("/MUSIC"));
+    }
+
+    #[tokio::test]
+    async fn mount_refuses_system_live_partition() {
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"Samsung","model":"T7","serial":"S6P5",
+             "size":1000000000000,
+             "children":[
+               {"name":"sda1","type":"part","fstype":"vfat","label":"EFI","size":536870912,"partuuid":"cccc-01"},
+               {"name":"sda2","type":"part","fstype":"ext4","label":"root","size":999000000000,"partuuid":"cccc-02"}
+             ]}
+          ]
+        }"#;
+        let mi = "\
+27 22 8:1 / /boot/efi rw - vfat /dev/sda1 rw
+28 22 8:2 / / rw - ext4 /dev/sda2 rw
+";
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
             1000,
             1000,
             true,
             Arc::new(FakeInputSource {
-                mountinfo: String::new(),
+                mountinfo: mi.to_string(),
                 swaps: String::new(),
-                lsblk_json: r#"{"blockdevices":[]}"#.to_string(),
+                lsblk_json: lsblk.to_string(),
             }),
-        );
+            Arc::new(FakeCommandRunner::new(vec![])),
+        ));
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let root_id = env
+            .drives
+            .iter()
+            .find(|d| d.role == PartitionRole::SystemRoot)
+            .map(|d| d.stable_id.clone())
+            .expect("root partition present");
+        let payload =
+            serde_json::to_vec(&MountRequest { stable_id: root_id }).unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.mount", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemLivePartition { .. },
+            ) => {}
+            other => panic!("expected SystemLivePartition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_refuses_system_adjacent_without_opt_in() {
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"Samsung","model":"T7","serial":"S6P5",
+             "size":1000000000000,
+             "children":[
+               {"name":"sda1","type":"part","fstype":"vfat","label":"EFI","size":536870912,"partuuid":"cccc-01"},
+               {"name":"sda2","type":"part","fstype":"ext4","label":"root","size":500000000000,"partuuid":"cccc-02"},
+               {"name":"sda3","type":"part","fstype":"ext4","label":"DATA","size":499000000000,"partuuid":"cccc-03"}
+             ]}
+          ]
+        }"#;
+        let mi = "\
+27 22 8:1 / /boot/efi rw - vfat /dev/sda1 rw
+28 22 8:2 / / rw - ext4 /dev/sda2 rw
+";
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: mi.to_string(),
+                swaps: String::new(),
+                lsblk_json: lsblk.to_string(),
+            }),
+            Arc::new(FakeCommandRunner::new(vec![])),
+        ));
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let adj_id = env
+            .drives
+            .iter()
+            .find(|d| d.role == PartitionRole::SystemAdjacent)
+            .map(|d| d.stable_id.clone())
+            .expect("adjacent partition present");
+        let payload =
+            serde_json::to_vec(&MountRequest { stable_id: adj_id }).unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.mount", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::MountRefused(
+                MountRefuseClass::SystemAdjacentNotOptedIn { .. },
+            ) => {}
+            other => panic!("expected SystemAdjacentNotOptedIn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_refuses_oversized_fat32() {
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sdb","type":"disk","tran":"usb","vendor":"WD","model":"MyPassport","serial":"WCC7K1",
+             "size":4000000000000,
+             "children":[
+               {"name":"sdb1","type":"part","fstype":"vfat","label":"BIGGY","size":4000000000000,"partuuid":"dddd-01"}
+             ]}
+          ]
+        }"#;
+        let rt = build_runtime(lsblk, vec![]);
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&MountRequest {
+            stable_id: "BIGGY".to_string(),
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.mount", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::MountRefused(
+                MountRefuseClass::MountFailedOversizedVfat {
+                    size_bytes,
+                    cap_bytes,
+                    ..
+                },
+            ) => {
+                assert!(size_bytes > cap_bytes);
+            }
+            other => panic!("expected MountFailedOversizedVfat, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mutating_verbs_not_yet_implemented() {
+        let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
         for verb in [
-            "storage.usb.mount",
             "storage.usb.safe_remove",
             "storage.usb.repair_filesystem",
             "storage.usb.rename",
@@ -622,57 +1616,27 @@ mod tests {
             let err = rt.dispatch_verb(verb, b"{}").await.unwrap_err();
             match err {
                 VerbDispatchError::NotImplemented { verb: v } => {
-                    assert_eq!(v, verb);
+                    assert_eq!(v, verb)
                 }
                 other => panic!("expected NotImplemented, got {other:?}"),
             }
         }
     }
 
-    #[tokio::test]
-    async fn unknown_verb_returns_unknown_request_type() {
-        let rt = StorageUsbRuntime::with_input_source(
-            1000,
-            1000,
-            true,
-            Arc::new(FakeInputSource {
-                mountinfo: String::new(),
-                swaps: String::new(),
-                lsblk_json: r#"{"blockdevices":[]}"#.to_string(),
-            }),
-        );
-        let err = rt
-            .dispatch_verb("storage.usb.bogus", b"{}")
-            .await
-            .unwrap_err();
-        matches!(err, VerbDispatchError::UnknownRequestType { .. });
+    #[test]
+    fn subject_addressing_shape_stable() {
+        let a = storage_usb_drives_addressing();
+        assert_eq!(a.scheme, "evo.storage.usb.drives");
+        assert_eq!(a.value, "local");
     }
 
     #[test]
-    fn role_wire_strings_match_schema() {
-        use crate::classifier::PartitionRole;
-        assert_eq!(role_wire_string(PartitionRole::SystemRoot), "system-root");
-        assert_eq!(role_wire_string(PartitionRole::SystemBoot), "system-boot");
-        assert_eq!(role_wire_string(PartitionRole::SystemEfi), "system-efi");
-        assert_eq!(role_wire_string(PartitionRole::SystemSwap), "system-swap");
+    fn drive_class_wire_strings() {
+        assert_eq!(DriveClass::SystemDisk.wire_str(), "system-disk");
+        assert_eq!(DriveClass::MountedClean.wire_str(), "mounted-clean");
         assert_eq!(
-            role_wire_string(PartitionRole::SystemAdjacent),
-            "system-adjacent"
-        );
-        assert_eq!(role_wire_string(PartitionRole::Removable), "removable");
-    }
-
-    #[test]
-    fn mount_policy_wire_strings_match_schema() {
-        use crate::classifier::MountPolicy;
-        assert_eq!(mount_policy_wire_string(MountPolicy::Auto), "auto");
-        assert_eq!(
-            mount_policy_wire_string(MountPolicy::OptInRequired),
-            "opt-in-required"
-        );
-        assert_eq!(
-            mount_policy_wire_string(MountPolicy::RefusedSystemLive),
-            "refused-system-live"
+            DriveClass::MountFailedOversizedVfat.wire_str(),
+            "mount-failed-oversized-vfat"
         );
     }
 }

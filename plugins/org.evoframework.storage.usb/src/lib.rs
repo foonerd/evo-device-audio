@@ -47,13 +47,16 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 
+pub mod aliases;
 pub mod classifier;
 pub mod fs_matrix;
 pub mod runtime;
+pub mod stable_id;
 
 use runtime::{
-    detect_service_uid_gid, is_storage_usb_verb, StorageUsbRuntime,
-    VerbDispatchError, STORAGE_USB_VERBS,
+    detect_service_uid_gid, is_storage_usb_verb, spawn_reconcile_task,
+    StorageUsbRuntime, VerbDispatchError, DEFAULT_RECONCILE_CADENCE_MS,
+    STORAGE_USB_VERBS,
 };
 
 /// Embedded manifest source.
@@ -74,10 +77,11 @@ fn plugin_crate_version() -> semver::Version {
 }
 
 /// The plugin singleton. Holds the internal runtime + the
-/// load-state flag the request handler consults.
+/// load-state flag + the periodic-reconciler join handle.
 pub struct StorageUsbPlugin {
     loaded: bool,
     runtime: Option<Arc<StorageUsbRuntime>>,
+    reconcile_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl StorageUsbPlugin {
@@ -86,6 +90,7 @@ impl StorageUsbPlugin {
         Self {
             loaded: false,
             runtime: None,
+            reconcile_task: None,
         }
     }
 }
@@ -178,7 +183,62 @@ impl Plugin for StorageUsbPlugin {
                 needs_sudo,
             ));
 
+            // Load the alias store from
+            // <state_dir>/state/aliases.toml. Missing file is a
+            // fresh install with no operator renames; empty
+            // store is fine and derivation ladder falls through
+            // to fs_label / vendor+model / etc.
+            match aliases::AliasStore::load(&ctx.state_dir) {
+                Ok(store) => rt.attach_alias_store(Arc::new(store)),
+                Err(e) => tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "aliases.toml load failed; running with empty alias store"
+                ),
+            }
+
+            // Bind the framework's cross-plugin dispatcher.
+            // Without it the runtime skips library.add_source
+            // on mount transitions (in-process test harness
+            // path). The steward's OOP wire adapter always
+            // populates this in production.
+            if let Some(dispatcher) = ctx.shelf_request_dispatcher.as_ref() {
+                rt.attach_shelf_dispatcher(Arc::clone(dispatcher));
+            } else {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    "shelf_request_dispatcher absent from LoadContext; \
+                     library.add_source dispatch will be skipped"
+                );
+            }
+
+            // Attach the subject announcer + emit the initial
+            // (empty) envelope so subscribers seeing the seed
+            // read state after the plugin's admission see a
+            // well-formed shape.
+            let announcer = Arc::clone(&ctx.subject_announcer);
+            if let Err(e) = rt.attach_subject_publisher(announcer).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "subject publisher attach failed; runtime continues \
+                     without republishing until next restart"
+                );
+            }
+
+            // Spawn the periodic reconciler (5-second cadence).
+            // Each tick re-runs the classifier + auto-mounts
+            // new removable drives + republishes the subject.
+            // The wrapper's `mount` action ensures idempotency
+            // — repeat mount of a drive already at the target
+            // path is a no-op at the OS layer.
+            let reconcile_task = spawn_reconcile_task(
+                Arc::clone(&rt),
+                std::time::Duration::from_millis(DEFAULT_RECONCILE_CADENCE_MS),
+            );
+
             self.runtime = Some(rt);
+            self.reconcile_task = Some(reconcile_task);
             self.loaded = true;
             Ok(())
         }
@@ -188,10 +248,12 @@ impl Plugin for StorageUsbPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
-            // No background tasks to abort in Step 2. The
-            // hotplug monitor + coldplug reconcile land in
-            // Step 3 and get corresponding abort handling
-            // here.
+            // Abort the reconcile task so a reload cycle does
+            // not leave two ticker loops racing on the same
+            // in-memory registry.
+            if let Some(h) = self.reconcile_task.take() {
+                h.abort();
+            }
             self.runtime = None;
             self.loaded = false;
             Ok(())
@@ -249,16 +311,20 @@ impl Respondent for StorageUsbPlugin {
 
 fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
     match e {
+        // Permanent — no plugin restart will help; operator input
+        // (bad payload / unknown verb / oversized-vfat / unsupported-fs /
+        // system-live refuse / adjacent-not-opted-in) needs to change.
         VerbDispatchError::UnknownRequestType { .. }
-        | VerbDispatchError::ResponseSerialise { .. } => {
-            PluginError::Permanent(e.to_string())
-        }
-        VerbDispatchError::NotImplemented { .. } => {
-            PluginError::Permanent(e.to_string())
-        }
-        VerbDispatchError::Classify(_) | VerbDispatchError::InputSource(_) => {
-            PluginError::Transient(e.to_string())
-        }
+        | VerbDispatchError::ResponseSerialise { .. }
+        | VerbDispatchError::NotImplemented { .. }
+        | VerbDispatchError::PayloadDecode(_)
+        | VerbDispatchError::MountRefused(_) => PluginError::Permanent(e.to_string()),
+        // Transient — retry may succeed once the underlying
+        // condition clears (device replug / wrapper subprocess
+        // restart / classifier input reachable).
+        VerbDispatchError::Classify(_)
+        | VerbDispatchError::InputSource(_)
+        | VerbDispatchError::SubprocessIo(_) => PluginError::Transient(e.to_string()),
     }
 }
 
