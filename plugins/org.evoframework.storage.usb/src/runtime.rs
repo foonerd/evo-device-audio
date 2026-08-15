@@ -222,11 +222,12 @@ impl StorageUsbRuntime {
             "storage.usb.list_drives" => self.handle_list_drives().await,
             "storage.usb.mount" => self.handle_mount(payload).await,
             "storage.usb.safe_remove" => self.handle_safe_remove(payload).await,
-            "storage.usb.repair_filesystem" | "storage.usb.rename" => {
-                Err(VerbDispatchError::NotImplemented {
-                    verb: verb.to_string(),
-                })
+            "storage.usb.repair_filesystem" => {
+                self.handle_repair_filesystem(payload).await
             }
+            "storage.usb.rename" => Err(VerbDispatchError::NotImplemented {
+                verb: verb.to_string(),
+            }),
             other => Err(VerbDispatchError::UnknownRequestType {
                 verb: other.to_string(),
             }),
@@ -958,6 +959,294 @@ impl StorageUsbRuntime {
         }
     }
 
+    // ----------------------------------------------------------
+    // repair_filesystem verb
+    // ----------------------------------------------------------
+
+    /// `storage.usb.repair_filesystem` handler. Consumer-stop
+    /// before fsck, mirroring the shares MPD-stop-before-mutation
+    /// pattern. No fsck runs while MPD holds files open.
+    ///
+    /// Sequence (per USB-STORAGE.md §8):
+    ///
+    /// 1. Refuse if role is `system-*` live (would corrupt the
+    ///    live FS).
+    /// 2. Refuse if class is `mounted-dirty-hiberfile` (NTFS
+    ///    hiberfile — ntfsfix would refuse anyway; operator must
+    ///    resume + shut down Windows cleanly first).
+    /// 3. Refuse if FS is unsupported.
+    /// 4. Dispatch `library.remove_source` for the drive's
+    ///    `library_source_id` (best-effort MPD stop).
+    /// 5. `sync` on the parent disk.
+    /// 6. Wrapper `umount <stable-id>` (if currently mounted).
+    /// 7. Wrapper `fsck <stable-id> <fs-type> <device-node>
+    ///    [escalate]`. Distinguishes success (exit 0), dirty-
+    ///    remaining (exit 5), hiberfile (exit 6), other subprocess
+    ///    failure.
+    /// 8. On repair success: wrapper `mount` again + `library.
+    ///    add_source local_usb` + republish subject with
+    ///    `class: mounted-clean`.
+    /// 9. On repair failure: republish subject with
+    ///    `class: mount-failed-dirty` and structured error class.
+    ///
+    /// Payload: `{ v: 1, stable_id, escalate?: bool }`
+    /// Response: `{ v: 1, repaired: true, before_class, after_class }`
+    async fn handle_repair_filesystem(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, VerbDispatchError> {
+        let req: RepairRequest = serde_json::from_slice(payload)
+            .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
+
+        self.reconcile_once().await?;
+
+        let record = {
+            let inner = self.inner.lock().await;
+            inner.drives.get(&req.stable_id).cloned()
+        }
+        .ok_or_else(|| {
+            VerbDispatchError::RepairRefused(
+                RepairRefuseClass::UnknownStableId {
+                    stable_id: req.stable_id.clone(),
+                },
+            )
+        })?;
+
+        if record.role.is_system_live() {
+            return Err(VerbDispatchError::RepairRefused(
+                RepairRefuseClass::SystemLivePartition {
+                    stable_id: req.stable_id,
+                    role: role_wire_string(record.role),
+                },
+            ));
+        }
+        if record.class == DriveClass::MountedDirtyHiberfile {
+            return Err(VerbDispatchError::RepairRefused(
+                RepairRefuseClass::NtfsHiberfile {
+                    stable_id: req.stable_id,
+                },
+            ));
+        }
+        let family = FsFamily::from_lsblk(&record.fs_type);
+        if family == FsFamily::Unsupported {
+            return Err(VerbDispatchError::RepairRefused(
+                RepairRefuseClass::UnsupportedFs {
+                    stable_id: req.stable_id,
+                    fs_type: record.fs_type.clone(),
+                },
+            ));
+        }
+
+        let before_class = record.class;
+
+        // 1. Consumer-stop — library.remove_source.
+        if let Some(source_id) = record.library_source_id.as_ref() {
+            if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+                let payload = serde_json::json!({
+                    "v": 1,
+                    "source_id": source_id,
+                });
+                if let Ok(bytes) = serde_json::to_vec(&payload) {
+                    if let Err(e) = dispatcher
+                        .dispatch(
+                            "audio.library",
+                            "library.remove_source",
+                            bytes,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            plugin = "storage.usb",
+                            stable_id = %req.stable_id,
+                            source_id = %source_id,
+                            error = %e,
+                            "library.remove_source dispatch failed before fsck; \
+                             proceeding (best-effort)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. sync — flush kernel dirty pages on the parent disk.
+        let _ = tokio::process::Command::new("sync")
+            .arg(&record.parent_disk)
+            .output()
+            .await;
+
+        // 3. Umount if currently mounted. Idempotent: wrapper
+        // umount on a non-mounted target returns exit 0.
+        if record.class == DriveClass::MountedClean
+            || record.class == DriveClass::MountedDirty
+        {
+            let umount_argv = vec!["umount".to_string(), req.stable_id.clone()];
+            let out = self
+                .command_runner
+                .run_wrapper(self.needs_sudo, &umount_argv)
+                .await
+                .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+            if out.status != 0 {
+                // EBUSY (4) or other. Repair requires unmounted;
+                // fail with structured class + let operator run
+                // safe_remove --force first.
+                return Err(VerbDispatchError::RepairRefused(
+                    RepairRefuseClass::UmountBeforeRepairFailed {
+                        stable_id: req.stable_id,
+                        exit_code: out.status,
+                        stderr: out.stderr,
+                    },
+                ));
+            }
+        }
+
+        // 4. Wrapper fsck (repair).
+        let fs_arg = family
+            .wrapper_fs_arg()
+            .unwrap_or(&record.fs_type)
+            .to_string();
+        let mut fsck_argv = vec![
+            "fsck".to_string(),
+            req.stable_id.clone(),
+            fs_arg.clone(),
+            record.device_node.clone(),
+        ];
+        if req.escalate.unwrap_or(false) {
+            fsck_argv.push("escalate".to_string());
+        }
+        let fsck_out = self
+            .command_runner
+            .run_wrapper(self.needs_sudo, &fsck_argv)
+            .await
+            .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+
+        match fsck_out.status {
+            0 => {
+                // Repair succeeded. Re-mount + re-add to library.
+            }
+            5 => {
+                // Dirty-remaining. Republish subject with
+                // mount-failed-dirty.
+                self.mark_drive_class(
+                    &req.stable_id,
+                    DriveClass::MountFailedDirty,
+                )
+                .await;
+                self.republish_envelope().await;
+                return Err(VerbDispatchError::RepairRefused(
+                    RepairRefuseClass::RepairFailed {
+                        stable_id: req.stable_id,
+                        fs_family: fs_arg,
+                        stderr: fsck_out.stderr,
+                    },
+                ));
+            }
+            6 => {
+                // NTFS hiberfile — mark and refuse.
+                self.mark_drive_class(
+                    &req.stable_id,
+                    DriveClass::MountedDirtyHiberfile,
+                )
+                .await;
+                self.republish_envelope().await;
+                return Err(VerbDispatchError::RepairRefused(
+                    RepairRefuseClass::NtfsHiberfile {
+                        stable_id: req.stable_id,
+                    },
+                ));
+            }
+            other => {
+                self.mark_drive_class(
+                    &req.stable_id,
+                    DriveClass::MountFailedDirty,
+                )
+                .await;
+                self.republish_envelope().await;
+                return Err(VerbDispatchError::RepairRefused(
+                    RepairRefuseClass::RepairSubprocessFailed {
+                        stable_id: req.stable_id,
+                        exit_code: other,
+                        stderr: fsck_out.stderr,
+                    },
+                ));
+            }
+        }
+
+        // 5. Re-mount via wrapper.
+        let opts = family.mount_options(self.service_uid, self.service_gid);
+        let mount_argv = vec![
+            "mount".to_string(),
+            req.stable_id.clone(),
+            fs_arg.clone(),
+            record.device_node.clone(),
+            opts,
+        ];
+        let mount_out = self
+            .command_runner
+            .run_wrapper(self.needs_sudo, &mount_argv)
+            .await
+            .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+        if mount_out.status != 0 {
+            self.mark_drive_class(&req.stable_id, DriveClass::MountFailedOther)
+                .await;
+            self.republish_envelope().await;
+            return Err(VerbDispatchError::RepairRefused(
+                RepairRefuseClass::PostRepairMountFailed {
+                    stable_id: req.stable_id,
+                    exit_code: mount_out.status,
+                    stderr: mount_out.stderr,
+                },
+            ));
+        }
+
+        // 6. Re-add to library (best-effort).
+        let mount_root = format!("{USB_MOUNT_ROOT}/{}", req.stable_id);
+        let mut library_source_id: Option<String> = None;
+        if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+            match self
+                .dispatch_library_add_source(
+                    dispatcher,
+                    &req.stable_id,
+                    &record.device_node,
+                    record.display_name.as_deref().unwrap_or(&req.stable_id),
+                    &mount_root,
+                )
+                .await
+            {
+                Ok(id) => library_source_id = id,
+                Err(e) => tracing::warn!(
+                    plugin = "storage.usb",
+                    stable_id = %req.stable_id,
+                    error = %e,
+                    "library.add_source local_usb dispatch failed \
+                     after repair; drive is mounted but not in \
+                     library until next reconcile"
+                ),
+            }
+        }
+
+        // 7. Update registry + republish.
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(rec) = inner.drives.get_mut(&req.stable_id) {
+                rec.class = DriveClass::MountedClean;
+                rec.mount_root = Some(mount_root);
+                rec.library_source_id = library_source_id;
+                rec.last_transition_at_ms = Some(now_ms());
+            }
+        }
+        self.republish_envelope().await;
+
+        let resp = RepairResponse {
+            v: 1,
+            repaired: true,
+            before_class: before_class.wire_str().to_string(),
+            after_class: DriveClass::MountedClean.wire_str().to_string(),
+        };
+        serde_json::to_vec(&resp)
+            .map_err(|e| VerbDispatchError::ResponseSerialise(e.to_string()))
+    }
+
     async fn republish_envelope(&self) {
         let envelope = self.compose_envelope().await;
         let publisher = {
@@ -1343,6 +1632,35 @@ pub struct MountResponse {
     pub library_source_id: Option<String>,
 }
 
+/// `storage.usb.repair_filesystem` request payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairRequest {
+    /// Stable-id of the drive to repair.
+    pub stable_id: String,
+    /// Escalate the repair tool to its more-aggressive mode
+    /// (`e2fsck -y` instead of `-p`). Default `false`. Operator
+    /// acknowledges the risk explicitly at the UI confirm modal
+    /// before setting this to `true`.
+    #[serde(default)]
+    pub escalate: Option<bool>,
+}
+
+/// `storage.usb.repair_filesystem` response payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairResponse {
+    /// Envelope shape version.
+    pub v: u32,
+    /// Always `true` on success (error path returns
+    /// [`RepairRefuseClass`] instead).
+    pub repaired: bool,
+    /// DriveClass wire string BEFORE the repair (usually
+    /// `mounted-dirty` or `mount-failed-dirty`).
+    pub before_class: String,
+    /// DriveClass wire string AFTER the repair (`mounted-clean`
+    /// on success).
+    pub after_class: String,
+}
+
 /// `storage.usb.safe_remove` request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafeRemoveRequest {
@@ -1477,6 +1795,106 @@ pub enum VerbDispatchError {
     /// Safe-remove refused per one of the fine-grained classes.
     #[error("storage.usb: safe-remove refused: {0}")]
     SafeRemoveRefused(#[source] SafeRemoveRefuseClass),
+    /// Repair refused per one of the fine-grained classes.
+    #[error("storage.usb: repair refused: {0}")]
+    RepairRefused(#[source] RepairRefuseClass),
+}
+
+/// Fine-grained repair refusal classes.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RepairRefuseClass {
+    /// Stable-id not in the classifier's current output.
+    #[error("unknown stable_id {stable_id:?}")]
+    UnknownStableId {
+        /// Requested id.
+        stable_id: String,
+    },
+    /// Role is `system-*` live — repair would corrupt live FS.
+    #[error(
+        "stable_id {stable_id:?} is a live system partition (role={role}); \
+         repair refused (offer schedule_next_boot in a future verb instead)"
+    )]
+    SystemLivePartition {
+        /// Requested id.
+        stable_id: String,
+        /// Role wire string.
+        role: String,
+    },
+    /// NTFS hiberfile present — ntfsfix refuses to touch;
+    /// operator must resume + shut down Windows cleanly first.
+    #[error(
+        "stable_id {stable_id:?} has active Windows hiberfile; \
+         resume + shut down Windows cleanly before repair"
+    )]
+    NtfsHiberfile {
+        /// Requested id.
+        stable_id: String,
+    },
+    /// FS not in the support matrix — no repair tool available.
+    #[error("stable_id {stable_id:?} has unsupported fs_type {fs_type:?}")]
+    UnsupportedFs {
+        /// Requested id.
+        stable_id: String,
+        /// FS type reported by the classifier.
+        fs_type: String,
+    },
+    /// Wrapper's umount (before repair) exited non-zero. Repair
+    /// requires an unmounted device; operator must safe-remove
+    /// --force first if consumers are still holding the drive.
+    #[error(
+        "stable_id {stable_id:?} umount before repair failed: exit {exit_code}: {stderr}"
+    )]
+    UmountBeforeRepairFailed {
+        /// Requested id.
+        stable_id: String,
+        /// Wrapper exit code.
+        exit_code: i32,
+        /// Captured stderr.
+        stderr: String,
+    },
+    /// Wrapper's fsck action exited with the per-FS "dirty
+    /// still remaining" code (5). Operator options: escalate
+    /// (with data-loss acknowledgement), reformat, or restore
+    /// from backup.
+    #[error(
+        "stable_id {stable_id:?} fsck on {fs_family:?} left drive dirty: {stderr}"
+    )]
+    RepairFailed {
+        /// Requested id.
+        stable_id: String,
+        /// FS family wrapper argv.
+        fs_family: String,
+        /// Captured stderr for diagnostics.
+        stderr: String,
+    },
+    /// Wrapper's fsck action exited non-zero for a reason other
+    /// than "still dirty" or "hiberfile" — missing binary,
+    /// argv-allowlist failure, etc.
+    #[error(
+        "stable_id {stable_id:?} fsck subprocess exit {exit_code}: {stderr}"
+    )]
+    RepairSubprocessFailed {
+        /// Requested id.
+        stable_id: String,
+        /// Wrapper exit code.
+        exit_code: i32,
+        /// Captured stderr.
+        stderr: String,
+    },
+    /// Repair succeeded but the subsequent re-mount failed.
+    /// Drive is clean; operator can attempt manual mount via
+    /// `storage.usb.mount`.
+    #[error(
+        "stable_id {stable_id:?} post-repair mount failed: exit {exit_code}: {stderr}"
+    )]
+    PostRepairMountFailed {
+        /// Requested id.
+        stable_id: String,
+        /// Wrapper exit code.
+        exit_code: i32,
+        /// Captured stderr.
+        stderr: String,
+    },
 }
 
 /// Fine-grained safe-remove refusal classes surfaced via
@@ -1977,10 +2395,10 @@ mod tests {
 
     #[tokio::test]
     async fn remaining_mutating_verbs_not_yet_implemented() {
-        // safe_remove IS implemented (Step 4); the remaining two
-        // (repair_filesystem + rename) land in Steps 5 + 6.
+        // safe_remove IS implemented (Step 4); repair_filesystem
+        // IS implemented (Step 5); rename lands in Step 6.
         let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
-        for verb in ["storage.usb.repair_filesystem", "storage.usb.rename"] {
+        for verb in ["storage.usb.rename"] {
             let err = rt.dispatch_verb(verb, b"{}").await.unwrap_err();
             match err {
                 VerbDispatchError::NotImplemented { verb: v } => {
@@ -1988,6 +2406,224 @@ mod tests {
                 }
                 other => panic!("expected NotImplemented, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_refuses_unknown_stable_id() {
+        let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
+        let payload = serde_json::to_vec(&RepairRequest {
+            stable_id: "no-such-drive".to_string(),
+            escalate: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RepairRefused(
+                RepairRefuseClass::UnknownStableId { .. },
+            ) => {}
+            other => panic!("expected UnknownStableId, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_refuses_system_live_partition() {
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sda","type":"disk","tran":"usb","vendor":"Samsung","model":"T7","serial":"S6P5",
+             "size":1000000000000,
+             "children":[
+               {"name":"sda2","type":"part","fstype":"ext4","label":"root","size":999000000000,"partuuid":"cccc-02"}
+             ]}
+          ]
+        }"#;
+        let mi = "28 22 8:2 / / rw - ext4 /dev/sda2 rw\n";
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: mi.to_string(),
+                swaps: String::new(),
+                lsblk_json: lsblk.to_string(),
+            }),
+            Arc::new(FakeCommandRunner::new(vec![])),
+        ));
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let root_id = env
+            .drives
+            .iter()
+            .find(|d| d.role == PartitionRole::SystemRoot)
+            .map(|d| d.stable_id.clone())
+            .expect("root partition present");
+        let payload = serde_json::to_vec(&RepairRequest {
+            stable_id: root_id,
+            escalate: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RepairRefused(
+                RepairRefuseClass::SystemLivePartition { .. },
+            ) => {}
+            other => panic!("expected SystemLivePartition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_happy_path_clean_umount_fsck_remount() {
+        // Wrapper outcomes: auto-mount (0), umount (0), fsck (0),
+        // re-mount (0). Result: repaired=true, before=mounted-clean
+        // (since MUSIC comes up clean via reconcile automount),
+        // after=mounted-clean.
+        let rt = build_runtime(
+            removable_stick_lsblk(),
+            vec![
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&RepairRequest {
+            stable_id: "MUSIC".to_string(),
+            escalate: None,
+        })
+        .unwrap();
+        let bytes = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await
+            .expect("repair");
+        let resp: RepairResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(resp.repaired);
+        assert_eq!(resp.after_class, "mounted-clean");
+    }
+
+    #[tokio::test]
+    async fn repair_fsck_dirty_remaining_returns_repair_failed() {
+        // Wrapper outcomes: auto-mount (0), umount (0), fsck exits
+        // 5 (dirty remaining). Runtime returns RepairFailed and
+        // marks drive class=mount-failed-dirty.
+        let rt = build_runtime(
+            removable_stick_lsblk(),
+            vec![
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 5,
+                    stdout: String::new(),
+                    stderr: "fsck failed".to_string(),
+                },
+            ],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&RepairRequest {
+            stable_id: "MUSIC".to_string(),
+            escalate: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RepairRefused(
+                RepairRefuseClass::RepairFailed { .. },
+            ) => {}
+            other => panic!("expected RepairFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_ntfs_hiberfile_returns_ntfs_hiberfile() {
+        // NTFS drive; fsck wrapper exits 6 (hiberfile). Runtime
+        // marks class=mounted-dirty-hiberfile and refuses.
+        let lsblk = r#"{
+          "blockdevices": [
+            {"name":"sdc","type":"disk","tran":"usb","vendor":"WD","model":"Elements","serial":"WCC9",
+             "size":500000000000,
+             "children":[
+               {"name":"sdc1","type":"part","fstype":"ntfs","label":"WINDATA","size":500000000000,"partuuid":"eeee-01"}
+             ]}
+          ]
+        }"#;
+        let rt = build_runtime(
+            lsblk,
+            vec![
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                CommandOutcome {
+                    status: 6,
+                    stdout: String::new(),
+                    stderr: "hiberfil.sys detected".to_string(),
+                },
+            ],
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&RepairRequest {
+            stable_id: "WINDATA".to_string(),
+            escalate: None,
+        })
+        .unwrap();
+        let err = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await
+            .unwrap_err();
+        match err {
+            VerbDispatchError::RepairRefused(
+                RepairRefuseClass::NtfsHiberfile { .. },
+            ) => {}
+            other => panic!("expected NtfsHiberfile, got {other:?}"),
         }
     }
 

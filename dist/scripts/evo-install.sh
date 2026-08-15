@@ -1154,7 +1154,8 @@ verify_storage_usb_provisioning() {
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 2" ]] \
+        if [[ "${ver}" == "evo-usb-mount 3" ]] \
+           || [[ "${ver}" == "evo-usb-mount 2" ]] \
            || [[ "${ver}" == "evo-usb-mount 1" ]]; then
             STORAGE_USB_WRAPPER_OK="ok"
         else

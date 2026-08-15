@@ -66,7 +66,8 @@ Usage:
   evo-usb-mount mount        <stable-id> <fs-type> <device-node> <mount-opts>
   evo-usb-mount umount       <stable-id>
   evo-usb-mount umount-force <stable-id>
-  evo-usb-mount fsck         <stable-id> <fs-type> <device-node>
+  evo-usb-mount fsck-check   <stable-id> <fs-type> <device-node>
+  evo-usb-mount fsck         <stable-id> <fs-type> <device-node> [escalate]
   evo-usb-mount eject        <parent-disk>
   evo-usb-mount --version
   evo-usb-mount --help
@@ -85,6 +86,8 @@ Exit codes:
   2  argv failed allowlist
   3  subprocess failed
   4  umount refused: target EBUSY (use umount-force or stop consumers)
+  5  fsck: filesystem is dirty (or repair failed)
+  6  fsck: NTFS hiberfile present (resume + shut down Windows cleanly first)
   42 action not implemented (stub)
 USAGE
 }
@@ -182,7 +185,7 @@ case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 2"
+        echo "evo-usb-mount 3"
         exit 0
         ;;
     --help|-h|"")
@@ -263,16 +266,154 @@ case "${1:-}" in
         rmdir "${target}" 2>/dev/null || true
         exit 0
         ;;
-    fsck)
-        [[ $# -eq 4 ]] || die_invocation "fsck requires 3 args: <stable-id> <fs-type> <device-node>"
+    fsck-check)
+        # Dry-run dirty detection per USB-STORAGE.md §2. Never
+        # writes to the device; returns:
+        #   exit 0 — clean
+        #   exit 5 — dirty (needs repair)
+        #   exit 6 — NTFS hiberfile present (unrepairable via
+        #            ntfsfix; operator must resume + shut down
+        #            Windows cleanly first)
+        #   exit 3 — subprocess failed (missing binary etc.)
+        [[ $# -eq 4 ]] || die_invocation "fsck-check requires 3 args: <stable-id> <fs-type> <device-node>"
         validate_stable_id "$2"
         validate_fs_type "$3"
         validate_device_node "$4"
         refuse_system_backed_device "$4"
-        # fsck implementation lands in Step 5 (repair_filesystem).
-        echo "evo-usb-mount: fsck action not implemented yet (Step-5 stub)" >&2
-        echo "  planned: fsck.$3 (or equivalent per USB-STORAGE.md §2) on $4" >&2
-        exit 42
+        # Device must NOT be currently mounted anywhere — fsck on
+        # a mounted-rw filesystem is unsafe.
+        if findmnt --source "$4" >/dev/null 2>&1; then
+            die_allowlist "device-node '$4' is currently mounted; fsck-check requires unmounted device"
+        fi
+        case "$3" in
+            vfat)
+                # fsck.vfat -n exit code: 0=clean, 1=dirty, other=io/setup fail
+                if fsck.vfat -n "$4" >/dev/null 2>&1; then
+                    exit 0
+                fi
+                rc=$?
+                [[ $rc -eq 1 ]] && exit 5
+                die_subprocess "fsck.vfat -n $4 exit ${rc}"
+                ;;
+            exfat)
+                # fsck.exfat -n : 0=clean, non-zero=dirty
+                if fsck.exfat -n "$4" >/dev/null 2>&1; then
+                    exit 0
+                fi
+                exit 5
+                ;;
+            ntfs)
+                # ntfsfix --no-action -d : does not write; reports
+                # dirty or hiberfile in stderr. We parse stderr
+                # for the two distinct conditions.
+                nf_stderr="$(ntfsfix --no-action -d "$4" 2>&1)" && nf_rc=0 || nf_rc=$?
+                if [[ "${nf_stderr}" == *"hiberfil.sys"* ]] \
+                   || [[ "${nf_stderr}" == *"hibernated Windows"* ]]; then
+                    exit 6
+                fi
+                if [[ $nf_rc -eq 0 ]] \
+                   && [[ "${nf_stderr}" != *"needs to be repaired"* ]] \
+                   && [[ "${nf_stderr}" != *"is dirty"* ]]; then
+                    exit 0
+                fi
+                exit 5
+                ;;
+            ext2|ext3|ext4)
+                # dumpe2fs -h : the header carries the dirty flag
+                # (via features / state fields). Exit 0 + state
+                # "clean" + no needs_recovery feature = clean.
+                dump_out="$(dumpe2fs -h "$4" 2>/dev/null)" || die_subprocess "dumpe2fs -h $4"
+                state=$(echo "${dump_out}" | grep -E "^Filesystem state:" | head -1 | awk -F: '{print $2}' | tr -d ' ')
+                needs_recovery=$(echo "${dump_out}" | grep -qE "features:.*needs_recovery" && echo 1 || echo 0)
+                if [[ "${state}" == "clean" && "${needs_recovery}" == "0" ]]; then
+                    exit 0
+                fi
+                exit 5
+                ;;
+        esac
+        die_allowlist "fsck-check: unreachable branch for fs '$3'"
+        ;;
+    fsck)
+        # Repair action. Runs the per-FS auto-repair tool per
+        # USB-STORAGE.md §2. Called from the runtime's
+        # repair_filesystem verb AFTER umount. The runtime is
+        # responsible for consumer-stop + sync + umount BEFORE
+        # invoking this action.
+        #
+        # Exit codes:
+        #   0  — repair succeeded (drive is now clean; caller
+        #        should attempt remount)
+        #   5  — repair failed (drive stays dirty; operator
+        #        must reformat or restore from backup)
+        #   6  — NTFS hiberfile refuse (ntfsfix will not touch it;
+        #        operator must resume + shut down Windows first)
+        #   3  — subprocess failed (missing binary etc.)
+        #
+        # Optional 4th positional arg `escalate` (any non-empty
+        # string) opts into the tool's more-aggressive mode
+        # (`e2fsck -y` instead of `-p`). Operator confirms this
+        # explicitly at the verb layer via `escalate: true`.
+        [[ $# -eq 4 || $# -eq 5 ]] || die_invocation "fsck requires 3 or 4 args: <stable-id> <fs-type> <device-node> [escalate]"
+        validate_stable_id "$2"
+        validate_fs_type "$3"
+        validate_device_node "$4"
+        refuse_system_backed_device "$4"
+        if findmnt --source "$4" >/dev/null 2>&1; then
+            die_allowlist "device-node '$4' is currently mounted; fsck repair requires unmounted device"
+        fi
+        escalate="${5:-}"
+        case "$3" in
+            vfat)
+                # fsck.vfat -a: auto-repair (accept defaults).
+                # No escalated mode — vfat repair is one-shot.
+                if fsck.vfat -a "$4" >/dev/null 2>&1; then
+                    exit 0
+                fi
+                exit 5
+                ;;
+            exfat)
+                # fsck.exfat -a (or -y depending on exfatprogs
+                # version). Debian trixie ships exfatprogs 1.2+
+                # which accepts -a as an auto-repair alias for
+                # -y. Try -a first; fall back to -y on invocation
+                # failure.
+                if fsck.exfat -a "$4" >/dev/null 2>&1; then
+                    exit 0
+                fi
+                if fsck.exfat -y "$4" >/dev/null 2>&1; then
+                    exit 0
+                fi
+                exit 5
+                ;;
+            ntfs)
+                # ntfsfix: no --auto flag; the default action IS
+                # auto-repair. It refuses to touch a volume with
+                # an active hiberfile — surface that condition
+                # distinctly so the runtime maps it to
+                # mounted-dirty-hiberfile.
+                nf_stderr="$(ntfsfix "$4" 2>&1)" && nf_rc=0 || nf_rc=$?
+                if [[ "${nf_stderr}" == *"hiberfil.sys"* ]] \
+                   || [[ "${nf_stderr}" == *"hibernated Windows"* ]]; then
+                    exit 6
+                fi
+                [[ $nf_rc -eq 0 ]] && exit 0
+                exit 5
+                ;;
+            ext2|ext3|ext4)
+                # e2fsck -p: auto-repair for safe changes only.
+                # If escalate is set, use -y (accept every prompt).
+                if [[ -n "${escalate}" ]]; then
+                    e2fsck -y "$4" >/dev/null 2>&1 && exit 0
+                    exit 5
+                fi
+                e2fsck -p "$4" >/dev/null 2>&1 && exit 0
+                # e2fsck -p returns non-zero for anything needing
+                # operator input; escalate is the operator's
+                # explicit acknowledgement to accept those.
+                exit 5
+                ;;
+        esac
+        die_allowlist "fsck: unreachable branch for fs '$3'"
         ;;
     eject)
         [[ $# -eq 2 ]] || die_invocation "eject requires 1 arg: <parent-disk>"
