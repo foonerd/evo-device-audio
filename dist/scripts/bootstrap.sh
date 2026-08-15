@@ -697,7 +697,7 @@ fi
 # org.evoframework.storage.usb, its NOPASSWD grant, the union
 # of FS-repair packages the plugin's mount/repair verbs need
 # (per USB-STORAGE.md §2 matrix), and the per-plugin state dir
-# for the alias-persistence file (aliases.toml, ADR-0161 A8).
+# for the alias-persistence file (aliases.toml).
 #
 # The wrapper is the trust boundary for every privileged
 # block-storage op: mount / umount / umount-force / fsck /
@@ -784,8 +784,8 @@ if [[ "${EVO_INSTALL_STORAGE_USB:-1}" != "0" ]]; then
 
     # Per-plugin state directory. Mode 0700 owned by the
     # steward service user. Same shape as the smb-server
-    # plugin's state dir (aliases.toml lands here at ADR-0161
-    # A8 wiring in Step 6).
+    # plugin's state dir (aliases.toml lands here at the
+    # rename-verb wiring step).
     install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
         "$STORAGE_USB_STATE_DIR" \
         "$STORAGE_USB_STATE_DIR/state" \
