@@ -260,6 +260,32 @@ impl Plugin for SmbServerPlugin {
                 );
             }
 
+            // Reconcile smb_users state against the samba passdb
+            // FIRST — before the smb.conf reconcile — because
+            // the smb.conf renderer projects the smb_users list
+            // into the [<username>] share entries and any
+            // downstream state read consumers see. Post-wipe
+            // drift path: /var/lib/evo/plugins/.../smb_server.toml
+            // is reset but /var/lib/samba/private/passdb.tdb +
+            // NSS accounts survive; without this reconcile, a
+            // pre-wipe SMB user is invisible in the UI (absent
+            // from get_state / list_configured), and re-adding
+            // them via the operator UI fails because
+            // evo-smb-user-sync add refuses on the existing NSS
+            // entry. reconcile_smb_users_from_passdb sweeps every
+            // provisioned-shape passdb entry into state so
+            // list_configured reflects reality. Best-effort —
+            // failure logs at WARN, does not block admission.
+            if let Err(e) = rt.reconcile_smb_users_from_passdb().await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "network.smb-server reconcile-on-load: smb_users \
+                     reconcile against passdb failed; state may lag \
+                     until next admission"
+                );
+            }
+
             // Reconcile smb.conf on load. The invariant is
             // that `/etc/samba/smb.conf` on disk equals what the
             // current runtime's `apply()` would produce right

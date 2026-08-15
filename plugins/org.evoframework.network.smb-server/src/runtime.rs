@@ -989,6 +989,64 @@ pub fn build_smb_user_sync_delete_args(username: &str) -> Vec<String> {
     ]
 }
 
+/// Build the argv for `sudo -n evo-smb-user-sync adopt <user>`
+/// (password once on stdin; wrapper doubles for smbpasswd -s).
+/// Adopt re-keys an existing NSS + passdb entry without
+/// attempting `useradd`; used when the OS layer survived a
+/// wipe that reset the plugin state directory.
+pub fn build_smb_user_sync_adopt_args(username: &str) -> Vec<String> {
+    vec![
+        "-n".to_string(),
+        DEFAULT_SMB_USER_SYNC_PATH.to_string(),
+        "adopt".to_string(),
+        username.to_string(),
+    ]
+}
+
+/// Build the argv for `sudo -n evo-smb-user-sync list -`.
+/// Enumerates the samba passdb, filtered to entries with the
+/// provisioned shape. Read-only; no password on stdin.
+pub fn build_smb_user_sync_list_args() -> Vec<String> {
+    vec![
+        "-n".to_string(),
+        DEFAULT_SMB_USER_SYNC_PATH.to_string(),
+        "list".to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// Abstraction over NSS-entry existence probe. In production
+/// the runtime holds [`RealNssProber`] which runs `id -u <user>`.
+/// Tests inject a fake with a fixed set of "existing" names to
+/// exercise the adopt-or-add dispatch in
+/// [`SambaServerRuntime::add_user`] without touching the host's
+/// real NSS.
+#[async_trait::async_trait]
+pub trait NssProber: Send + Sync + std::fmt::Debug {
+    /// Return true when an NSS entry exists for `username`.
+    async fn probe(&self, username: &str) -> bool;
+}
+
+/// Production NSS prober — invokes `id -u <username>`
+/// (unprivileged); exit 0 = present, non-zero = absent.
+#[derive(Debug, Default)]
+pub struct RealNssProber;
+
+#[async_trait::async_trait]
+impl NssProber for RealNssProber {
+    async fn probe(&self, username: &str) -> bool {
+        match tokio::process::Command::new("id")
+            .arg("-u")
+            .arg(username)
+            .output()
+            .await
+        {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+}
+
 /// Fixed blocklist for SMB login names — generic OS + Samba +
 /// audio-plane identities that MUST NOT become LAN
 /// file-share credentials on any distribution. The live
@@ -1326,6 +1384,11 @@ pub struct SambaServerRuntime {
     subprocess_timeout_ms: u64,
     publisher: StdMutex<Option<SambaPublisher>>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// NSS existence probe. Used by [`Self::add_user`] to
+    /// decide between the wrapper's `add` (fresh NSS+passdb)
+    /// and `adopt` (re-key existing NSS+passdb) actions on the
+    /// post-wipe drift path.
+    nss_prober: Arc<dyn NssProber>,
 }
 
 impl std::fmt::Debug for SambaServerRuntime {
@@ -1374,6 +1437,7 @@ impl SambaServerRuntime {
             path_denylist: None,
             subprocess_timeout_ms: None,
             now_fn: None,
+            nss_prober: None,
         })
     }
 
@@ -1382,6 +1446,136 @@ impl SambaServerRuntime {
     pub async fn get_state(&self) -> SmbServerState {
         let g = self.inner.lock().await;
         g.state.clone()
+    }
+
+    /// Reconcile `smb_users` state against the samba passdb —
+    /// the source of truth for SMB auth. Fires from the plugin
+    /// `load` handler BEFORE the smb.conf reconcile so
+    /// downstream state (list_configured, get_state) reflects
+    /// reality on first read after admission.
+    ///
+    /// # Why this exists
+    ///
+    /// The wipe primitive resets `<state_dir>/state/smb_server.toml`
+    /// (evo state root) but does NOT touch `/var/lib/samba/private/
+    /// passdb.tdb` or the NSS accounts the plugin created via
+    /// `evo-smb-user-sync add`. Without this reconcile, users
+    /// created before the wipe survive at the OS layer but are
+    /// invisible to the plugin's UI surface; the operator sees
+    /// pairing/auth work but can neither list nor re-add them.
+    ///
+    /// # Semantics
+    ///
+    /// For every passdb entry with provisioned shape (nologin +
+    /// /nonexistent — the wrapper's `list` action filters):
+    ///
+    ///   - Present in state → no-op.
+    ///   - Absent from state → adopt: insert a `SmbUserRecord`
+    ///     with `mapped_domain_identity = None` (unknown; the
+    ///     plugin didn't originally provision it) and
+    ///     `credential_key` derived from the username itself
+    ///     (mirroring the widget convention that the credential
+    ///     key IS the alias). No vault credential is written —
+    ///     the operator must supply a fresh password via the
+    ///     `user_add` adopt path to unlock LAN auth.
+    ///
+    /// Never mutates the OS layer; this is a state-catches-up-
+    /// to-OS operation, one-directional.
+    ///
+    /// # Failure semantics
+    ///
+    /// Wrapper `list` action failure (missing binary / sudoers
+    /// misconfigured / samba absent) logs at WARN and returns
+    /// Ok(0) — reconcile is best-effort and MUST NOT block
+    /// plugin admission. The next admission cycle retries.
+    ///
+    /// Returns the number of newly-adopted rows for logging.
+    pub async fn reconcile_smb_users_from_passdb(
+        &self,
+    ) -> Result<usize, ApplyError> {
+        let args = build_smb_user_sync_list_args();
+        let outcome = self
+            .executor
+            .run(&self.sudo_program, &args, self.subprocess_timeout_ms, &[])
+            .await;
+        let stdout = match outcome {
+            Ok(out) if out.exit_code == Some(0) => out.stdout,
+            Ok(out) => {
+                tracing::warn!(
+                    plugin = "org.evoframework.network.smb-server",
+                    exit_code = ?out.exit_code,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "reconcile_smb_users_from_passdb: wrapper list failed; \
+                     skipping (best-effort). next admission cycle retries."
+                );
+                return Ok(0);
+            }
+            Err(io_err) => {
+                tracing::warn!(
+                    plugin = "org.evoframework.network.smb-server",
+                    error = %io_err,
+                    "reconcile_smb_users_from_passdb: wrapper list I/O \
+                     error; skipping (best-effort)."
+                );
+                return Ok(0);
+            }
+        };
+        let passdb_users: Vec<String> = String::from_utf8_lossy(&stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let now = (self.now_fn)() as i64;
+        let mut adopted = 0usize;
+        let mut g = self.inner.lock().await;
+        for username in &passdb_users {
+            let already =
+                g.state.smb_users.iter().any(|u| &u.username == username);
+            if already {
+                continue;
+            }
+            // Adopt: insert a record with a synthesized credential
+            // key. The credential key convention (documented in
+            // the shares shelf schema) is that it can be any
+            // stable string the plugin owns — the operator's
+            // first `user_add` after adoption will supply a fresh
+            // password that lands under this key.
+            g.state.smb_users.push(SmbUserRecord {
+                username: username.clone(),
+                mapped_domain_identity: None,
+                created_at_ms: now,
+                credential_key: format!("smb_user:{username}"),
+            });
+            adopted += 1;
+        }
+        if adopted > 0 {
+            if let Err(e) = g.state.save(&g.path) {
+                tracing::warn!(
+                    plugin = "org.evoframework.network.smb-server",
+                    error = %e,
+                    "reconcile_smb_users_from_passdb: state save failed \
+                     after adopting {adopted} row(s); in-memory state is \
+                     up-to-date but on-disk is stale."
+                );
+                // Do not roll back — the in-memory state IS
+                // correct; on-disk lag is transient and next
+                // admission re-adopts the same rows.
+            }
+        }
+        drop(g);
+        if adopted > 0 {
+            tracing::info!(
+                plugin = "org.evoframework.network.smb-server",
+                adopted,
+                total_passdb = passdb_users.len(),
+                "reconcile_smb_users_from_passdb: adopted {adopted} row(s) \
+                 from passdb into smb_users state"
+            );
+            self.schedule_republish().await;
+        }
+        Ok(adopted)
     }
 
     /// Apply new server-side settings. Steps: swap in the new
@@ -1639,9 +1833,40 @@ impl SambaServerRuntime {
 
         // Step 4: fire the wrapper. Wrapper reads password once;
         // it doubles for `smbpasswd -s`.
+        //
+        // Adopt-or-add dispatch. Wipe/reinstall drift: the wipe
+        // primitive resets `<state_dir>/state/smb_server.toml`
+        // but does NOT touch `/var/lib/samba/private/passdb.tdb`
+        // or the NSS accounts the plugin created via
+        // `evo-smb-user-sync add`. On the next `user_add` for a
+        // surviving name, plain `add` would fail at the
+        // `useradd` step ("already exists"). The wrapper's
+        // `adopt` action re-keys the existing NSS + passdb
+        // entry from the operator's fresh vault credential
+        // without touching NSS. We probe the NSS layer via
+        // `id -u` (unprivileged) to decide which action to fire.
+        //
+        // The reconcile-on-load path (lib.rs `load` handler)
+        // sweeps every passdb entry into `state.smb_users` at
+        // admission so `list_configured` reflects reality
+        // regardless of whether the operator ever adds a
+        // survivor manually. This adopt path here is the
+        // manual-add fallback.
         let mut stdin = password;
         stdin.push(b'\n');
-        let args = build_smb_user_sync_add_args(&username);
+        let nss_exists = self.nss_prober.probe(&username).await;
+        let args = if nss_exists {
+            build_smb_user_sync_adopt_args(&username)
+        } else {
+            build_smb_user_sync_add_args(&username)
+        };
+        let dispatch_action = if nss_exists { "adopt" } else { "add" };
+        tracing::info!(
+            plugin = "org.evoframework.network.smb-server",
+            username = %username,
+            action = dispatch_action,
+            "user_add dispatch"
+        );
         let outcome = self
             .executor
             .run(
@@ -1829,6 +2054,7 @@ pub struct SambaServerRuntimeBuilder {
     path_denylist: Option<Vec<String>>,
     subprocess_timeout_ms: Option<u64>,
     now_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    nss_prober: Option<Arc<dyn NssProber>>,
 }
 
 impl SambaServerRuntimeBuilder {
@@ -1919,6 +2145,13 @@ impl SambaServerRuntimeBuilder {
         self
     }
 
+    /// Install a custom [`NssProber`] (test path). Production
+    /// defaults to [`RealNssProber`] which runs `id -u`.
+    pub fn with_nss_prober(mut self, prober: Arc<dyn NssProber>) -> Self {
+        self.nss_prober = Some(prober);
+        self
+    }
+
     /// Finalise.
     pub fn build(self) -> SambaServerRuntime {
         SambaServerRuntime {
@@ -1962,6 +2195,9 @@ impl SambaServerRuntimeBuilder {
                 .unwrap_or(DEFAULT_SAMBA_SUBPROCESS_TIMEOUT_MS),
             publisher: StdMutex::new(None),
             now_fn: self.now_fn.unwrap_or_else(|| Arc::new(default_now_ms)),
+            nss_prober: self
+                .nss_prober
+                .unwrap_or_else(|| Arc::new(RealNssProber)),
         }
     }
 }
@@ -3083,10 +3319,32 @@ mod tests {
         }
     }
 
+    /// Fake NSS prober that returns true for a fixed set of
+    /// "already existing" usernames — used by adopt-path tests.
+    #[derive(Debug)]
+    struct FakeNssProber {
+        existing: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl NssProber for FakeNssProber {
+        async fn probe(&self, username: &str) -> bool {
+            self.existing.iter().any(|u| u == username)
+        }
+    }
+
     fn built_runtime(
         dir: &Path,
         outputs: Vec<CommandOutput>,
         creds: HashMap<String, Vec<u8>>,
+    ) -> (SambaServerRuntime, Arc<ScriptedSamba>) {
+        built_runtime_with_nss(dir, outputs, creds, Vec::new())
+    }
+
+    fn built_runtime_with_nss(
+        dir: &Path,
+        outputs: Vec<CommandOutput>,
+        creds: HashMap<String, Vec<u8>>,
+        existing_nss_users: Vec<String>,
     ) -> (SambaServerRuntime, Arc<ScriptedSamba>) {
         let executor = ScriptedSamba::new(outputs);
         let rt = SambaServerRuntime::builder(dir)
@@ -3105,6 +3363,9 @@ mod tests {
             .with_workgroup("STUDIO".to_string())
             .with_subprocess_timeout_ms(1_000)
             .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_nss_prober(Arc::new(FakeNssProber {
+                existing: existing_nss_users,
+            }))
             .build();
         (rt, executor)
     }
@@ -3279,6 +3540,151 @@ mod tests {
         let text = String::from_utf8_lossy(&writes[0].1);
         assert!(text.contains("[Ok]"));
         assert!(!text.contains("[Nope]"));
+    }
+
+    // --- Post-wipe adopt-path regression tests (per the
+    // ---  UI-team-flagged SMB user-state drift memo) ---
+
+    #[tokio::test]
+    async fn add_user_dispatches_add_when_nss_absent() {
+        let dir = tempdir();
+        let mut creds = HashMap::new();
+        creds.insert("vault:smb:newuser".to_string(), b"pw".to_vec());
+        // NSS prober says "no existing users" → wrapper `add`.
+        let (rt, executor) =
+            built_runtime_with_nss(&dir, vec![ok()], creds, Vec::new());
+        rt.add_user(
+            "newuser".to_string(),
+            "vault:smb:newuser".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, build_smb_user_sync_add_args("newuser"));
+    }
+
+    #[tokio::test]
+    async fn add_user_dispatches_adopt_when_nss_exists() {
+        // Post-wipe drift path: NSS+passdb survived; state does
+        // not have the user; UI operator re-adds → runtime must
+        // dispatch wrapper `adopt` (re-key existing NSS+passdb)
+        // instead of `add` (which would fail useradd duplicate).
+        let dir = tempdir();
+        let mut creds = HashMap::new();
+        creds.insert("vault:smb:evo".to_string(), b"fresh".to_vec());
+        let (rt, executor) = built_runtime_with_nss(
+            &dir,
+            vec![ok()],
+            creds,
+            vec!["evo".to_string()],
+        );
+        rt.add_user("evo".to_string(), "vault:smb:evo".to_string(), None)
+            .await
+            .unwrap();
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            build_smb_user_sync_adopt_args("evo"),
+            "expected wrapper adopt dispatch on NSS-exists path"
+        );
+        // Password piped once (wrapper doubles for smbpasswd -s).
+        assert_eq!(calls[0].2, b"fresh\n".to_vec());
+        // State reflects the adopted user.
+        let state = rt.get_state().await;
+        assert_eq!(state.smb_users.len(), 1);
+        assert_eq!(state.smb_users[0].username, "evo");
+    }
+
+    #[tokio::test]
+    async fn reconcile_smb_users_from_passdb_adopts_missing_rows() {
+        // Post-wipe drift: passdb has two provisioned users
+        // (evo, evo1); state has only evo1. Reconcile must add
+        // evo to state so get_state reflects reality on the
+        // first read after admission.
+        let dir = tempdir();
+        // Seed state with only evo1.
+        let seed_path = dir.join("smb_server.toml");
+        let seed = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: Vec::new(),
+            smb_users: vec![SmbUserRecord {
+                username: "evo1".to_string(),
+                mapped_domain_identity: None,
+                created_at_ms: 1_000,
+                credential_key: "smb_user:evo1".to_string(),
+            }],
+            last_apply_at_ms: None,
+        };
+        seed.save(&seed_path).unwrap();
+
+        // Wrapper `list` returns both users on stdout.
+        let list_output = CommandOutput {
+            exit_code: Some(0),
+            stdout: b"evo\nevo1\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let (rt, _) =
+            built_runtime_with_nss(&dir, vec![list_output], HashMap::new(), Vec::new());
+        let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
+        assert_eq!(adopted, 1, "expected to adopt 1 row (evo; evo1 present)");
+        let state = rt.get_state().await;
+        assert_eq!(state.smb_users.len(), 2);
+        let usernames: Vec<&str> =
+            state.smb_users.iter().map(|u| u.username.as_str()).collect();
+        assert!(usernames.contains(&"evo"));
+        assert!(usernames.contains(&"evo1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_smb_users_no_op_when_state_matches_passdb() {
+        let dir = tempdir();
+        let seed_path = dir.join("smb_server.toml");
+        let seed = SmbServerState {
+            schema_version: SMB_SERVER_SCHEMA_VERSION,
+            enabled: true,
+            min_protocol: MinProtocol::Default,
+            extra_shares: Vec::new(),
+            smb_users: vec![SmbUserRecord {
+                username: "already".to_string(),
+                mapped_domain_identity: None,
+                created_at_ms: 1_000,
+                credential_key: "smb_user:already".to_string(),
+            }],
+            last_apply_at_ms: None,
+        };
+        seed.save(&seed_path).unwrap();
+        let list_output = CommandOutput {
+            exit_code: Some(0),
+            stdout: b"already\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let (rt, _) =
+            built_runtime_with_nss(&dir, vec![list_output], HashMap::new(), Vec::new());
+        let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
+        assert_eq!(adopted, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_smb_users_best_effort_on_wrapper_failure() {
+        // Wrapper list exits non-zero (missing binary / sudoers
+        // misconfigured). Reconcile MUST NOT block admission —
+        // returns Ok(0) so plugin load continues to the
+        // smb.conf reconcile.
+        let dir = tempdir();
+        let fail = CommandOutput {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"pdbedit: command not found".to_vec(),
+        };
+        let (rt, _) =
+            built_runtime_with_nss(&dir, vec![fail], HashMap::new(), Vec::new());
+        let adopted = rt.reconcile_smb_users_from_passdb().await.unwrap();
+        assert_eq!(adopted, 0);
     }
 
     #[tokio::test]

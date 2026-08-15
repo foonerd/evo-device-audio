@@ -32,8 +32,13 @@ die() {
 [[ -n "${USERN}" ]] || die "missing username"
 
 # Username discipline — matches SAMBA-SHARES.md / volumio-evo.
-[[ "${USERN}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
-  || die "invalid username — use [a-z_][a-z0-9_-]{0,31}"
+# The `list` action takes the literal `-` placeholder because
+# it's workspace-wide (not per-user); skip the regex there and
+# let the per-action branch validate its own argv shape.
+if [[ "${ACTION}" != "list" ]]; then
+  [[ "${USERN}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+    || die "invalid username — use [a-z_][a-z0-9_-]{0,31}"
+fi
 
 # Steward service user is substituted at install time for
 # `@EVO_SERVICE_USER@` (see bootstrap Step 1f). Hardcoded so
@@ -54,7 +59,10 @@ is_blocked() {
   return 1
 }
 
-if is_blocked "${USERN}"; then
+# The `list` action is workspace-wide and takes the literal `-`
+# placeholder — skip the blocklist check for it. Per-user actions
+# (add / delete / adopt) always enforce.
+if [[ "${ACTION}" != "list" ]] && is_blocked "${USERN}"; then
   die "username '${USERN}' is reserved — refuse to use as SMB login"
 fi
 
@@ -136,7 +144,81 @@ case "${ACTION}" in
     fi
     ;;
 
+  adopt)
+    # Adopt an existing NSS + passdb entry into evo management.
+    # Fires from the runtime's user_add path when the target
+    # already exists at the OS layer but is absent from plugin
+    # state (typical post-wipe drift: /var/lib/evo/plugins/... is
+    # reset by the wipe primitive, but /var/lib/samba + NSS
+    # survive). The plugin has to be able to re-key the account
+    # from the operator-supplied vault credential instead of
+    # refusing outright.
+    #
+    # Contract:
+    #   - NSS entry MUST already exist with provisioned shape
+    #     (nologin + /nonexistent). Any other shape refuses — we
+    #     don't ever touch OS accounts we didn't create.
+    #   - passdb entry MAY or MAY NOT exist:
+    #       present -> smbpasswd -s <user> (change password only)
+    #       absent  -> smbpasswd -a -s <user> (add + set password)
+    #   - Idempotent: repeated adopt with the same password is a
+    #     no-op at the OS layer.
+    IFS= read -r PASS || true
+    [[ -n "${PASS}" ]] || die "empty password on stdin"
+
+    id -u "${USERN}" &>/dev/null \
+      || die "cannot adopt: username '${USERN}' has no NSS entry — use 'add' instead"
+
+    is_provisioned_shape "${USERN}" \
+      || die "cannot adopt: '${USERN}' NSS entry has non-provisioned shape (login shell or real home) — refusing to touch OS account not created by evo"
+
+    if pdbedit -L 2>/dev/null | grep -qE "^${USERN}:"; then
+      # passdb has the user — change password only.
+      if ! printf '%s\n%s\n' "${PASS}" "${PASS}" \
+        | smbpasswd -s "${USERN}"; then
+        die "smbpasswd (change password) failed for ${USERN}"
+      fi
+    else
+      # NSS exists but passdb does not — add passdb entry
+      # matching the surviving NSS account.
+      if ! printf '%s\n%s\n' "${PASS}" "${PASS}" \
+        | smbpasswd -a -s "${USERN}"; then
+        die "smbpasswd -a failed for ${USERN}"
+      fi
+    fi
+    ;;
+
+  list)
+    # Enumerate passdb — prints one username per line. Used by
+    # the runtime's reconcile-on-load path to sync smb_users
+    # state against the OS/samba source of truth.
+    #
+    # Requires sudo because /var/lib/samba/private/passdb.tdb is
+    # root-mode-0600. Read-only; no state mutation.
+    #
+    # Filters to entries with the provisioned shape (nologin +
+    # /nonexistent) — anything else is an OS account that
+    # happens to have a passdb row and MUST NOT be adopted.
+    # Silent empty output when passdb is empty (fresh install).
+    #
+    # Note: the wrapper's positional argv shape requires a
+    # username, but `list` is workspace-wide. Convention: pass
+    # the literal "-" as the placeholder so the shape stays
+    # consistent with the shell case-dispatch and the
+    # sudoers-argv audit surface.
+    if [[ "${USERN}" != "-" ]]; then
+      die "list requires the literal '-' placeholder as username; got '${USERN}'"
+    fi
+    # Read every passdb row, filter to provisioned-shape only.
+    while IFS=: read -r user_field _uid_field _rest; do
+      [[ -n "${user_field}" ]] || continue
+      if is_provisioned_shape "${user_field}"; then
+        echo "${user_field}"
+      fi
+    done < <(pdbedit -L 2>/dev/null)
+    ;;
+
   *)
-    die "usage: $0 <add|delete> <username> (password on stdin for add)"
+    die "usage: $0 <add|delete|adopt|list> <username|-> (password on stdin for add/adopt)"
     ;;
 esac
