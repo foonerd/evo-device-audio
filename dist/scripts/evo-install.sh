@@ -1140,12 +1140,22 @@ verify_storage_usb_provisioning() {
     STORAGE_USB_STATE_DIR_OK="unknown"
     STORAGE_USB_BINARIES_OK="unknown"
 
-    # Wrapper — exists, mode 0755, --version returns exit 0
-    # and prints the stable version tag.
+    # Wrapper — exists, mode 0755, --version returns exit 0 and
+    # prints the stable version tag. Accepted versions:
+    #   evo-usb-mount 2 — current (Step 4, mount takes 4 argv +
+    #                     mount-opts allowlist; umount / umount-force
+    #                     / eject actions actually execute).
+    #   evo-usb-mount 1 — Step 1 stub (argv-validate only, all
+    #                     actions exit 42). Accepted so a rolling
+    #                     upgrade from a pre-Step-4 rig does not
+    #                     hard-fail; the newer wrapper installs
+    #                     over the older during the bootstrap
+    #                     apply phase.
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 1" ]]; then
+        if [[ "${ver}" == "evo-usb-mount 2" ]] \
+           || [[ "${ver}" == "evo-usb-mount 1" ]]; then
             STORAGE_USB_WRAPPER_OK="ok"
         else
             STORAGE_USB_WRAPPER_OK="wrong_version:${ver}"

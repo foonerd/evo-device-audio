@@ -318,13 +318,18 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
         | VerbDispatchError::ResponseSerialise { .. }
         | VerbDispatchError::NotImplemented { .. }
         | VerbDispatchError::PayloadDecode(_)
-        | VerbDispatchError::MountRefused(_) => PluginError::Permanent(e.to_string()),
+        | VerbDispatchError::MountRefused(_)
+        | VerbDispatchError::SafeRemoveRefused(_) => {
+            PluginError::Permanent(e.to_string())
+        }
         // Transient — retry may succeed once the underlying
         // condition clears (device replug / wrapper subprocess
         // restart / classifier input reachable).
         VerbDispatchError::Classify(_)
         | VerbDispatchError::InputSource(_)
-        | VerbDispatchError::SubprocessIo(_) => PluginError::Transient(e.to_string()),
+        | VerbDispatchError::SubprocessIo(_) => {
+            PluginError::Transient(e.to_string())
+        }
     }
 }
 

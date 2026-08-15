@@ -30,18 +30,20 @@
 # design-time trust boundary; the wrapper is the last-mile
 # runtime enforcement.
 #
-# STEP-1 STATE (this commit): every action returns
-# `not-implemented` (exit 42) after argv validation succeeds.
-# Steps 3-5 implement the actions in place — the wrapper's
-# invocation shape stays stable across those steps so bootstrap
-# + sudoers grant do not churn.
+# Mount options passed as a 4th positional argv on the `mount`
+# action are validated against a strict allowlist (alphanumeric
+# + '=' + ',' + '_' + '-') before being handed to mount(8).
+# The runtime's fs_matrix.rs builds these strings; the wrapper
+# validates + relays.
 #
 # Exit codes:
 #   0  — action completed successfully
 #   1  — invalid invocation (missing / malformed argv)
-#   2  — argv failed path or block-device allowlist
+#   2  — argv failed path / block-device / mount-opts allowlist
 #   3  — subprocess (mount / umount / fsck / eject) failed
-#   42 — action not implemented yet (Step 1 stub)
+#   4  — umount refused: target is EBUSY (files open) — operator
+#        should stop consumers or retry with `umount-force`
+#   42 — action not implemented yet (Step-N stub)
 
 set -euo pipefail
 
@@ -50,13 +52,18 @@ readonly STABLE_ID_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,31}(-p[0-9]+)?$'
 readonly DEVICE_NODE_RE='^/dev/(sd[a-z][1-9][0-9]*|nvme[0-9]+n[0-9]+p[0-9]+|mmcblk[0-9]+p[0-9]+)$'
 readonly PARENT_DISK_RE='^/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$'
 readonly FS_TYPE_RE='^(vfat|exfat|ntfs|ext2|ext3|ext4)$'
+# Mount-opts allowlist — alphanumeric + '=' + ',' + '_' + '-'
+# + '.' (for numeric-with-dot values, e.g. vers=3.1.1 shape).
+# Explicitly excludes shell metachars, spaces, and path chars
+# to prevent argv injection through the opts field.
+readonly MOUNT_OPTS_RE='^[A-Za-z0-9=,_.-]+$'
 
 usage() {
     cat >&2 <<'USAGE'
 evo-usb-mount — narrow wrapper for org.evoframework.storage.usb
 
 Usage:
-  evo-usb-mount mount        <stable-id> <fs-type> <device-node>
+  evo-usb-mount mount        <stable-id> <fs-type> <device-node> <mount-opts>
   evo-usb-mount umount       <stable-id>
   evo-usb-mount umount-force <stable-id>
   evo-usb-mount fsck         <stable-id> <fs-type> <device-node>
@@ -69,6 +76,7 @@ Constraints:
   <fs-type>     one of vfat|exfat|ntfs|ext2|ext3|ext4
   <device-node> matches /dev/sd*[N] or /dev/nvme*n*p* or /dev/mmcblk*p*
   <parent-disk> matches /dev/sd* or /dev/nvme*n* or /dev/mmcblk*
+  <mount-opts>  matches [A-Za-z0-9=,_.-]+ (validated allowlist)
   Mount targets always at /var/lib/evo/music/USB/<stable-id>/
 
 Exit codes:
@@ -76,7 +84,8 @@ Exit codes:
   1  invalid invocation
   2  argv failed allowlist
   3  subprocess failed
-  42 action not implemented (Step-1 stub)
+  4  umount refused: target EBUSY (use umount-force or stop consumers)
+  42 action not implemented (stub)
 USAGE
 }
 
@@ -89,6 +98,16 @@ die_invocation() {
 die_allowlist() {
     echo "evo-usb-mount: $*" >&2
     exit 2
+}
+
+die_subprocess() {
+    echo "evo-usb-mount: subprocess failed: $*" >&2
+    exit 3
+}
+
+die_busy() {
+    echo "evo-usb-mount: target EBUSY: $*" >&2
+    exit 4
 }
 
 validate_stable_id() {
@@ -128,15 +147,42 @@ validate_parent_disk() {
     fi
 }
 
+validate_mount_opts() {
+    local opts="$1"
+    if [[ ! "${opts}" =~ ${MOUNT_OPTS_RE} ]]; then
+        die_allowlist "mount-opts '${opts}' does not match ${MOUNT_OPTS_RE}"
+    fi
+}
+
 mount_target_for() {
     printf '%s/%s' "${USB_MOUNT_ROOT}" "$1"
+}
+
+# Defence-in-depth: refuse to mount / umount a device the kernel
+# has as backing for a live system mount. The runtime's classifier
+# is the primary gate; this is the wrapper's independent check.
+refuse_system_backed_device() {
+    local dev="$1"
+    # findmnt --source <dev> --mountpoint / — nonzero exit means
+    # <dev> is not backing /. Silence stderr; care only about the
+    # exit code + mount-point match.
+    if findmnt --source "${dev}" --mountpoint / >/dev/null 2>&1 \
+       || findmnt --source "${dev}" --mountpoint /boot >/dev/null 2>&1 \
+       || findmnt --source "${dev}" --mountpoint /boot/efi >/dev/null 2>&1 \
+       || findmnt --source "${dev}" --mountpoint /boot/firmware >/dev/null 2>&1; then
+        die_allowlist "device-node '${dev}' backs a live system mount; refusing"
+    fi
+    # And swap.
+    if grep -qE "^${dev}\s+partition" /proc/swaps 2>/dev/null; then
+        die_allowlist "device-node '${dev}' is an active swap partition; refusing"
+    fi
 }
 
 case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 1"
+        echo "evo-usb-mount 2"
         exit 0
         ;;
     --help|-h|"")
@@ -144,46 +190,100 @@ case "${1:-}" in
         exit 0
         ;;
     mount)
-        [[ $# -eq 4 ]] || die_invocation "mount requires 3 args: <stable-id> <fs-type> <device-node>"
+        [[ $# -eq 5 ]] || die_invocation "mount requires 4 args: <stable-id> <fs-type> <device-node> <mount-opts>"
         validate_stable_id "$2"
         validate_fs_type "$3"
         validate_device_node "$4"
+        validate_mount_opts "$5"
+        refuse_system_backed_device "$4"
         target="$(mount_target_for "$2")"
-        echo "evo-usb-mount: mount action not implemented yet (Step-1 stub)" >&2
-        echo "  planned: mount -t $3 -o <opts-per-USB-STORAGE.md-§2> $4 ${target}" >&2
-        exit 42
+        # install(1) creates the target dir with the correct mode +
+        # owner. -d creates parents; -m sets mode; the service user
+        # of the calling steward isn't visible here so we set world-
+        # traversable 0755 and let the mount option uid=/gid= handle
+        # the file-owner semantics for FAT-family filesystems.
+        install -d -m 0755 "${target}" || die_subprocess "install -d ${target}"
+        # Idempotent: if target is already mounted with the correct
+        # source, exit 0 immediately (reconciler loop safety).
+        if findmnt --mountpoint "${target}" --source "$4" >/dev/null 2>&1; then
+            exit 0
+        fi
+        # Refuse if target is already mounted with a DIFFERENT source
+        # (avoid stacking mounts on the same path).
+        if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+            die_subprocess "target '${target}' already has a different mount source"
+        fi
+        mount -t "$3" -o "$5" "$4" "${target}" || die_subprocess "mount -t $3 -o $5 $4 ${target}"
+        exit 0
         ;;
     umount)
         [[ $# -eq 2 ]] || die_invocation "umount requires 1 arg: <stable-id>"
         validate_stable_id "$2"
         target="$(mount_target_for "$2")"
-        echo "evo-usb-mount: umount action not implemented yet (Step-1 stub)" >&2
-        echo "  planned: umount ${target}" >&2
-        exit 42
+        # Idempotent: if target isn't a mount point, exit 0 (already
+        # unmounted).
+        if ! findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+            # Best-effort empty-only rmdir cleanup so a mount root
+            # left behind after operator umount doesn't collect
+            # stale dirs. `rmdir` refuses non-empty; safe.
+            rmdir "${target}" 2>/dev/null || true
+            exit 0
+        fi
+        # Try a clean umount first; distinguish EBUSY from other
+        # failures so the runtime can decide whether to escalate
+        # to umount-force.
+        umount_stderr="$(umount "${target}" 2>&1)" && rc=0 || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            # Empty-only rmdir cleanup so the leaf mount root
+            # doesn't stay lingering.
+            rmdir "${target}" 2>/dev/null || true
+            exit 0
+        fi
+        # umount exit code semantics vary across versions. Detect
+        # EBUSY by the "target is busy" stderr fragment which is
+        # stable in util-linux 2.30+ across the fleet.
+        if [[ "${umount_stderr}" == *"target is busy"* ]] \
+           || [[ "${umount_stderr}" == *"device is busy"* ]]; then
+            die_busy "${target}: ${umount_stderr}"
+        fi
+        die_subprocess "umount ${target}: ${umount_stderr}"
         ;;
     umount-force)
         [[ $# -eq 2 ]] || die_invocation "umount-force requires 1 arg: <stable-id>"
         validate_stable_id "$2"
         target="$(mount_target_for "$2")"
-        echo "evo-usb-mount: umount-force action not implemented yet (Step-1 stub)" >&2
-        echo "  planned: umount -l ${target}" >&2
-        exit 42
+        if ! findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+            rmdir "${target}" 2>/dev/null || true
+            exit 0
+        fi
+        # Lazy detach — the mount table clears when the last file
+        # handle closes. Operator has acknowledged the data-loss
+        # risk at the storage.usb.safe_remove verb layer.
+        umount -l "${target}" || die_subprocess "umount -l ${target}"
+        rmdir "${target}" 2>/dev/null || true
+        exit 0
         ;;
     fsck)
         [[ $# -eq 4 ]] || die_invocation "fsck requires 3 args: <stable-id> <fs-type> <device-node>"
         validate_stable_id "$2"
         validate_fs_type "$3"
         validate_device_node "$4"
-        echo "evo-usb-mount: fsck action not implemented yet (Step-1 stub)" >&2
+        refuse_system_backed_device "$4"
+        # fsck implementation lands in Step 5 (repair_filesystem).
+        echo "evo-usb-mount: fsck action not implemented yet (Step-5 stub)" >&2
         echo "  planned: fsck.$3 (or equivalent per USB-STORAGE.md §2) on $4" >&2
         exit 42
         ;;
     eject)
         [[ $# -eq 2 ]] || die_invocation "eject requires 1 arg: <parent-disk>"
         validate_parent_disk "$2"
-        echo "evo-usb-mount: eject action not implemented yet (Step-1 stub)" >&2
-        echo "  planned: eject $2" >&2
-        exit 42
+        refuse_system_backed_device "$2"
+        # SCSI eject via eject(1). Best-effort — some USB drives
+        # (Samsung T7, many SSD enclosures) simply do not respond
+        # to the eject ioctl. Non-zero exit is logged by the
+        # runtime but not fatal to safe-remove.
+        eject "$2" || die_subprocess "eject $2"
+        exit 0
         ;;
     *)
         die_invocation "unknown action '$1'"
