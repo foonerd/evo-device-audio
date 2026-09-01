@@ -1,7 +1,36 @@
 # Cargo configuration for the evo-device-audio workspace.
 #
+# ## MSRV-aware resolver
+#
+# Opts the workspace into the MSRV-aware resolver, stabilised in
+# Cargo 1.84. The resolver honours each dependency's declared
+# `package.rust-version` and prefers the newest version whose
+# MSRV is <= our own workspace MSRV
+# (`rust-version = "1.85"` in Cargo.toml `[workspace.package]`).
+#
+# Without this, cargo's default resolver picks the newest version
+# satisfying semver regardless of MSRV. When upstream crates bump
+# their MSRV silently (edition2024 uptake, icu_collections family,
+# image 0.25.10, time 0.3.55, ogg_pager, idna_adapter), the next
+# `cargo generate-lockfile` pulls in versions rustc 1.85 cannot
+# parse — publish-plugin-bundles.yml then fails with
+# `rustc 1.85.1 is not supported by the following packages`.
+#
+# `fallback` = the resolver silently downgrades to the newest
+# MSRV-compatible version; deps without a declared rust-version
+# are treated as compatible.
+#
+# Compatibility: silently ignored on Cargo < 1.84. --locked
+# consumes the committed lockfile as-is; regeneration on a 1.84+
+# toolchain produces an MSRV-safe lockfile.
+
+[resolver]
+incompatible-rust-versions = "fallback"
+
+# ## Cross-compile linker selections
+#
 # Mirror of the evo-core-eng cross-compile shape: when a developer
-# runs `cargo build --target aarch64-unknown-linux-gnu` (the reference target
+# runs `cargo build --target aarch64-unknown-linux-gnu` (the
 # reference target), cargo picks up the matching cross-gcc linker
 # the host has installed via the documented apt packages
 # (`gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabihf`). Without
