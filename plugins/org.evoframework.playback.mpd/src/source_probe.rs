@@ -581,21 +581,23 @@ fn ieee_754_extended_to_u32(bytes: &[u8; 10]) -> Option<u32> {
     // Value = mantissa * 2^(exponent - 16383 - 63)
     let bias: i32 = 16383 + 63;
     let shift = exponent as i32 - bias;
-    if shift > 0 {
-        let v = mantissa.checked_shl(shift as u32)?;
-        if v > u32::MAX as u64 {
-            None
-        } else {
-            Some(v as u32)
+    match shift.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            let v = mantissa.checked_shl(shift as u32)?;
+            if v > u32::MAX as u64 {
+                None
+            } else {
+                Some(v as u32)
+            }
         }
-    } else if shift == 0 {
-        Some(mantissa as u32)
-    } else {
-        let s = (-shift) as u32;
-        if s >= 64 {
-            None
-        } else {
-            Some((mantissa >> s) as u32)
+        std::cmp::Ordering::Equal => Some(mantissa as u32),
+        std::cmp::Ordering::Less => {
+            let s = (-shift) as u32;
+            if s >= 64 {
+                None
+            } else {
+                Some((mantissa >> s) as u32)
+            }
         }
     }
 }

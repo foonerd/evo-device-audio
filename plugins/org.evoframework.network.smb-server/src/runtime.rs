@@ -4599,18 +4599,19 @@ mod tests {
         assert_eq!(resolved, live);
     }
 
-    #[test]
-    fn default_netbios_name_is_last_resort_only_not_the_primary_path() {
-        // Meta-guard on the design: `DEFAULT_NETBIOS_NAME` exists
-        // ONLY as the last-resort fallback when procfs is
-        // unreadable. If a future edit reintroduces a `.to_string`
-        // of the constant in the normal render path, the
-        // `resolve_netbios_name_returns_live_hostname_when_override_absent`
-        // test above catches it. This test only sanity-checks the
-        // constant is not itself an empty string (which would
-        // make the last-resort silently invalid too).
-        assert!(!DEFAULT_NETBIOS_NAME.is_empty());
-    }
+    // Meta-guard on the design: `DEFAULT_NETBIOS_NAME` exists ONLY
+    // as the last-resort fallback when procfs is unreadable. If a
+    // future edit reintroduces a `.to_string` of the constant in
+    // the normal render path, the
+    // `resolve_netbios_name_returns_live_hostname_when_override_absent`
+    // test above catches it. This compile-time assert sanity-checks
+    // that the constant is not itself an empty string (which would
+    // make the last-resort silently invalid too). Moved from a
+    // runtime `#[test]` because the emptiness of a const string
+    // literal is a compile-time property; clippy's
+    // `const_is_empty` correctly refuses the runtime assert as
+    // trivially true.
+    const _: () = assert!(!DEFAULT_NETBIOS_NAME.is_empty());
 
     #[tokio::test]
     async fn rendered_smb_conf_carries_live_hostname_when_no_override() {

@@ -997,6 +997,21 @@ impl CredentialFetcher for NoCredentialFetcher {
     }
 }
 
+/// Newtype adapter that lets an `Arc<dyn CredentialStore>` satisfy
+/// `Arc<dyn CredentialFetcher>` without a trait-upcasting cast
+/// (unstable before Rust 1.86 — see rust-lang/rust#65991). Delegates
+/// `fetch_password` to the wrapped store's `CredentialFetcher` impl,
+/// which every `CredentialStore` provides via the supertrait bound
+/// declared below.
+struct CredentialStoreAsFetcher(Arc<dyn CredentialStore>);
+
+#[async_trait]
+impl CredentialFetcher for CredentialStoreAsFetcher {
+    async fn fetch_password(&self, credential_key: &str) -> Option<Vec<u8>> {
+        self.0.fetch_password(credential_key).await
+    }
+}
+
 /// Read-write credential store. Extends [`CredentialFetcher`] with
 /// `store_password`, used by the prompt-on-add flow to persist an
 /// operator-supplied password into the plugin's credentials
@@ -3243,10 +3258,16 @@ impl NetworkSharesRuntimeBuilder {
             credentials: self.credentials.unwrap_or_else(|| {
                 // When only a credential_store was supplied,
                 // route reads through the store — it implements
-                // CredentialFetcher too.
+                // CredentialFetcher too (via the supertrait bound).
+                // Wrapped in CredentialStoreAsFetcher because a bare
+                // `as Arc<dyn CredentialFetcher>` needs trait
+                // upcasting, unstable before Rust 1.86.
                 self.credential_store
                     .as_ref()
-                    .map(|s| Arc::clone(s) as Arc<dyn CredentialFetcher>)
+                    .map(|s| {
+                        Arc::new(CredentialStoreAsFetcher(Arc::clone(s)))
+                            as Arc<dyn CredentialFetcher>
+                    })
                     .unwrap_or_else(|| Arc::new(NoCredentialFetcher))
             }),
             credential_store: self.credential_store,

@@ -299,11 +299,9 @@ pub fn sanitise(input: &str) -> String {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             out.push(ch);
             last_hyphen = false;
-        } else {
-            if !last_hyphen && !out.is_empty() {
-                out.push('-');
-                last_hyphen = true;
-            }
+        } else if !last_hyphen && !out.is_empty() {
+            out.push('-');
+            last_hyphen = true;
         }
     }
     // Strip trailing hyphens.
