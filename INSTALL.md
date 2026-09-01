@@ -11,15 +11,32 @@ The install runs on the target device itself. You do not need a build machine, a
 
 The installer detects the architecture (`aarch64` or `x86_64`) and downloads the matching bundle automatically.
 
-## Prerequisites
+## Prerequisites (HARD REQUIREMENTS)
 
-The installer needs two commands present on the device before you can run it: `curl` and `sudo`. Depending on which OS image you started from, one or both may already be there.
+**`curl` and `sudo` MUST be installed on the device before you can run the installer.** They are not optional. The installer cannot bootstrap them itself — the online install one-liner is `curl … | sudo bash`, which fails at the very first step if either command is missing.
 
-### Path A — Raspberry Pi OS (both already present)
+Check both are present:
 
-Nothing to install. Skip straight to [Install](#install).
+```bash
+command -v curl && command -v sudo
+```
+
+If that prints two paths (e.g. `/usr/bin/curl` and `/usr/bin/sudo`), you are ready — skip to [Install](#install).
+
+If it prints nothing, or only one path, follow the path below that matches your OS image.
+
+### Path A — Raspberry Pi OS
+
+Both `curl` and `sudo` ship in the standard Raspberry Pi OS image. The check above should already pass. If for any reason it does not, run (as the `pi` user or your equivalent):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl sudo
+```
 
 ### Path B — Minimal Debian install (neither is present)
+
+A minimal Debian install ships without either command. You must install them before the installer will run.
 
 Log in **at the console** as `root`, using the root password you set during the OS install. Then run:
 
@@ -37,6 +54,14 @@ usermod -aG sudo <your-user-account>
 ```
 
 Log out and log back in as your ordinary user for the group change to take effect.
+
+Re-run the prerequisite check before continuing:
+
+```bash
+command -v curl && command -v sudo
+```
+
+Both paths must print. Do not proceed to [Install](#install) until they do.
 
 ## Install
 
@@ -100,9 +125,9 @@ https://raw.githubusercontent.com/foonerd/evo-device-audio/main/dist/scripts/evo
 
 ## Troubleshooting
 
-**`curl: command not found`** — your host is missing `curl`. Go back to [Prerequisites](#prerequisites).
+**`curl: command not found`** — your host is missing `curl`. Go back to [Prerequisites](#prerequisites-hard-requirements).
 
-**`sudo: command not found`** — your host is missing `sudo`. Go back to [Prerequisites](#prerequisites).
+**`sudo: command not found`** — your host is missing `sudo`. Go back to [Prerequisites](#prerequisites-hard-requirements).
 
 **`FAIL: required tool missing: X`** — the installer refused because a base tool is not present. Install with (as root or via sudo):
 
