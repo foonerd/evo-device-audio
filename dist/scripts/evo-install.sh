@@ -311,6 +311,41 @@ echo "Service user:  ${SERVICE_USER}"
 echo "Music library: $([[ ${EVO_INSTALL_MUSIC_LIBRARY} != 0 ]] && echo create-or-preserve || echo skip)"
 echo ""
 
+# -------- Pre-flight: defensive housekeeping --------
+#
+# Any daemon whose config gets rewritten by bootstrap.sh must be
+# stopped BEFORE we touch its config, and any prior evo-include
+# block left over from an earlier install must be stripped BEFORE
+# we enable that daemon in Step 3 — otherwise the daemon reads a
+# transient state (evo include line present, target file not yet
+# written) and exits, which the parity gate reports as an admission
+# refusal even though the state is a mid-install artefact, not a
+# runtime defect.
+#
+# mpd is the canonical case: /etc/mpd.conf carries an
+# `include "/etc/evo/mpd.conf"` block added by bootstrap.sh Step 5.
+# On a re-install (or on a rig where a prior install left the
+# include line but /etc/evo/ was cleaned externally), mpd starts
+# up before bootstrap.sh recreates /etc/evo/mpd.conf and dies on
+# the missing include target. Stop + strip up front so the flow
+# is idempotent against any prior-evo residue.
+echo "[0/7] pre-flight housekeeping (stop daemons + strip prior evo residue) ..."
+if command -v systemctl >/dev/null 2>&1; then
+    for _prior_unit in mpd.service smbd.service nmbd.service avahi-daemon.service; do
+        if systemctl is-active --quiet "${_prior_unit}" 2>/dev/null; then
+            systemctl stop "${_prior_unit}" >/dev/null 2>&1 || true
+            echo "  stopped ${_prior_unit}"
+        fi
+    done
+    unset _prior_unit
+fi
+if [[ -f /etc/mpd.conf ]] \
+    && grep -q '^# >>> evo-device-audio (bootstrap.sh) — DO NOT EDIT >>>$' /etc/mpd.conf 2>/dev/null; then
+    sed -i '/^# >>> evo-device-audio (bootstrap.sh) — DO NOT EDIT >>>$/,/^# <<< evo-device-audio (bootstrap.sh) — DO NOT EDIT <<<$/d' /etc/mpd.conf
+    echo "  stripped prior evo-include block from /etc/mpd.conf"
+fi
+echo ""
+
 # -------- Pre-flight: install system packages --------
 #
 # Compulsory OS-dependency provisioning. The framework's install
