@@ -344,6 +344,30 @@ if [[ -f /etc/mpd.conf ]] \
     sed -i '/^# >>> evo-device-audio (bootstrap.sh) — DO NOT EDIT >>>$/,/^# <<< evo-device-audio (bootstrap.sh) — DO NOT EDIT <<<$/d' /etc/mpd.conf
     echo "  stripped prior evo-include block from /etc/mpd.conf"
 fi
+# /etc/asound.conf: if the shipped file is the evo one (identified by
+# the first-line header bootstrap.sh writes), remove it plus the
+# whole /etc/asound.d/ tree. bootstrap.sh Step 6 restores both
+# cleanly. A partial /etc/asound.d/ (e.g. evo-options.conf wiped by
+# external cleanup but zz-evo-*.conf still present) makes
+# /etc/asound.conf's include lines refer to missing files, which
+# breaks `aplay -l` and blocks the DAC-detection step.
+if [[ -f /etc/asound.conf ]] \
+    && head -1 /etc/asound.conf 2>/dev/null | grep -q 'Modular ALSA pipeline definition for evo-device-audio'; then
+    rm -f /etc/asound.conf
+    echo "  removed prior evo /etc/asound.conf (bootstrap will restore)"
+fi
+if [[ -d /etc/asound.d ]]; then
+    _removed_asound_d=0
+    for _f in /etc/asound.d/*evo*.conf; do
+        [[ -e "$_f" ]] || continue
+        rm -f "$_f"
+        _removed_asound_d=$((_removed_asound_d + 1))
+    done
+    if (( _removed_asound_d > 0 )); then
+        echo "  removed ${_removed_asound_d} prior evo /etc/asound.d/ drop-in(s)"
+    fi
+    unset _f _removed_asound_d
+fi
 echo ""
 
 # -------- Pre-flight: install system packages --------
