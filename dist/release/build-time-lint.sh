@@ -210,6 +210,16 @@ lint_sudoers_binaries() {
         "/usr/bin/chmod"
         "/bin/chown"
         "/usr/bin/chown"
+        # shadow-file password writes (used by set_kiosk_password wire op)
+        "/usr/sbin/chpasswd"
+        # captive-portal probe wrapper installed by bootstrap.sh
+        # from dist/bin/evo-captive-probe. The /bin/ + /usr/local
+        # entries cover both the sudoers grant target and the
+        # documentation references in the drop-in comments.
+        "/usr/local/bin/evo-captive-probe"
+        "/bin/evo-captive-probe"
+        "/usr/bin/curl"
+        "/usr/local"
     )
 
     if [[ ! -d "${SUDOERS_DIR}" ]]; then
