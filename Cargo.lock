@@ -1568,7 +1568,7 @@ dependencies = [
 [[package]]
 name = "evo-kiosk-config"
 version = "0.1.13"
-source = "git+https://github.com/foonerd/evo-kiosk-eng.git?tag=v0.1.13#7746d05892603811e0ac29983a59e6d131aa0726"
+source = "git+https://github.com/foonerd/evo-kiosk.git?tag=v0.1.13#81efd2f3768d9a228fc1e0f43d6db3a6470c6526"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
