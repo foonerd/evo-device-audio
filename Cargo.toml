@@ -35,7 +35,7 @@ members = [
 # shared utilities live under crates/.
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.13"
 edition = "2021"
 # Match evo-core MSRV (see foonerd/evo-core docs/engineering/MSRV.md).
 rust-version = "1.85"
@@ -60,7 +60,12 @@ repository = "https://github.com/foonerd/evo-device-audio"
 # `git = "...evo-core.git", tag = "..."` against the matching
 # published framework tag before the branch merges to main.
 [workspace.dependencies]
-evo-plugin-sdk = { path = "../evo-core-eng/crates/evo-plugin-sdk" }
+# Framework pins — flipped from sibling path-deps to git+tag at release
+# cut. Every framework crate this workspace links resolves through
+# these three entries so a version bump is one edit, not many.
+evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+evo = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+evo-primitives = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
 evo-mpd-shared = { path = "crates/evo-mpd-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }

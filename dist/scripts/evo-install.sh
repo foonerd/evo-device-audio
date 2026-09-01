@@ -116,7 +116,7 @@ EVO_BUNDLE_TRUST_ROOT_PEM="${EVO_BUNDLE_TRUST_ROOT_PEM:-${EVO_BUNDLE_TRUST_ROOT_
 # (e.g. point at a developer-side HTTP server hosting an
 # unreleased bundle during release-cut preparation).
 EVO_BUNDLE_URL_BASE="${EVO_BUNDLE_URL_BASE:-https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download}"
-EVO_BUNDLE_VERSION="${EVO_BUNDLE_VERSION:-0.1.0}"
+EVO_BUNDLE_VERSION="${EVO_BUNDLE_VERSION:-0.1.13}"
 EVO_INSTALL_MUSIC_LIBRARY="${EVO_INSTALL_MUSIC_LIBRARY:-1}"
 EVO_INSTALL_EVIDENCE_OUT="${EVO_INSTALL_EVIDENCE_OUT:-}"
 EVO_ACCEPTANCE_SIGNING_KEY="${EVO_ACCEPTANCE_SIGNING_KEY:-}"
