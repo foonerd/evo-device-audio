@@ -6,9 +6,15 @@
 # until valid signed evidence exists for all four install/reset
 # primitives on every supported architecture.
 #
-# Called as the FIRST step of any release cut. Exits 0 only when
-# all evidence is present, signed, recent, and matches the expected
-# post-condition shape per primitive.
+# Scope. This preflight is invoked by scripts/release/cut-release.sh
+# only for cuts at v0.1.16 and later; earlier cuts (v0.1.13, v0.1.14,
+# v0.1.15) bypass it in favour of a per-release readiness assessment
+# performed by the operator alongside the release notes. See the
+# Step 3 banner in cut-release.sh for the interim path and the
+# version guard that selects between the two paths.
+#
+# When invoked, exits 0 only when all evidence is present, signed,
+# recent, and matches the expected post-condition shape per primitive.
 #
 # Evidence shape at dist/release/evidence/<version>/<arch>/<primitive>.toml:
 #   schema_version = 1
