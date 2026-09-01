@@ -18,7 +18,7 @@
 #    a privileged directory.
 #
 # 2. `EVO_SAMBA_SERVER_USERS` — narrow wrapper
-#    `/usr/local/bin/evo-smb-user-sync {add|delete} <user>`.
+#    `/usr/local/bin/evo-smb-user-sync {add|delete|list} <user|->`.
 #    The wrapper creates a non-login system account (nologin,
 #    no home) then runs `smbpasswd`; passwords are piped on
 #    stdin for `add` (never on argv). The steward MUST NOT be
@@ -63,7 +63,7 @@
 # the bootstrap script.
 #
 # Argv scoping: the runtime's argv builders emit fixed shapes
-# — `testparm -s <path>`, `evo-smb-user-sync add|delete
+# — `testparm -s <path>`, `evo-smb-user-sync add|delete|list
 # <user>`, `systemctl restart smbd`, `systemctl stop smbd`.
 # The user-sync wrapper is
 # the trust boundary for provisioning (username validation +
@@ -86,7 +86,8 @@ Cmnd_Alias EVO_SAMBA_SERVER_CONFIG = \
 
 Cmnd_Alias EVO_SAMBA_SERVER_USERS = \
     /usr/local/bin/evo-smb-user-sync add *, \
-    /usr/local/bin/evo-smb-user-sync delete *
+    /usr/local/bin/evo-smb-user-sync delete *, \
+    /usr/local/bin/evo-smb-user-sync list *
 
 Cmnd_Alias EVO_SAMBA_SERVER_RESTART = \
     /usr/bin/systemctl restart smbd, \
