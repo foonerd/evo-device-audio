@@ -329,15 +329,23 @@ echo ""
 # up before bootstrap.sh recreates /etc/evo/mpd.conf and dies on
 # the missing include target. Stop + strip up front so the flow
 # is idempotent against any prior-evo residue.
-echo "[0/7] pre-flight housekeeping (stop daemons + strip prior evo residue) ..."
+echo "[0/7] pre-flight housekeeping (stop mpd + strip prior evo residue) ..."
+# Only mpd is stopped here. mpd is the sole daemon whose config
+# bootstrap.sh mutates in a way that requires a running instance
+# to be reloaded (the include line for /etc/evo/mpd.conf is
+# consulted on every mpd start; a live instance holding a stale
+# view of an already-rewritten /etc/mpd.conf plus a not-yet-written
+# /etc/evo/mpd.conf is the concrete race we saw in the field).
+# smbd / nmbd / avahi-daemon do NOT need stopping here: the parity
+# gate in Step 3 enables+starts them if plugin declarations require
+# them, and stopping them defensively would leave them inactive
+# when parity doesn't fire (e.g. if the plugin declaration path is
+# a no-op on this run).
 if command -v systemctl >/dev/null 2>&1; then
-    for _prior_unit in mpd.service smbd.service nmbd.service avahi-daemon.service; do
-        if systemctl is-active --quiet "${_prior_unit}" 2>/dev/null; then
-            systemctl stop "${_prior_unit}" >/dev/null 2>&1 || true
-            echo "  stopped ${_prior_unit}"
-        fi
-    done
-    unset _prior_unit
+    if systemctl is-active --quiet mpd.service 2>/dev/null; then
+        systemctl stop mpd.service >/dev/null 2>&1 || true
+        echo "  stopped mpd.service"
+    fi
 fi
 if [[ -f /etc/mpd.conf ]] \
     && grep -q '^# >>> evo-device-audio (bootstrap.sh) — DO NOT EDIT >>>$' /etc/mpd.conf 2>/dev/null; then
