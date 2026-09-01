@@ -1759,7 +1759,7 @@ impl HasPayloadVersion for RemoveOverlayPayload {
 /// after the MSRV pinned for this workspace.
 struct ProviderAsAmixer<'a>(&'a dyn HardwareAudioProvider);
 
-impl<'a> AmixerReader for ProviderAsAmixer<'a> {
+impl AmixerReader for ProviderAsAmixer<'_> {
     fn list_controls<'b>(
         &'b self,
         card_hint: &'b str,
