@@ -9,9 +9,9 @@
 # `bundles/org.evoframework.artwork.local/<target>/`.
 #
 # The companion in-process variant (`manifest.toml` in this same
-# directory) is what `evo-device-volumio` and similar in-process
-# distributions consume. Both manifests describe the same plugin at
-# the same version; only the transport differs.
+# directory) is what in-process audio distributions consume. Both
+# manifests describe the same plugin at the same version; only the
+# transport differs.
 #
 # See:
 # - evo-core docs/engineering/PLUGIN_PACKAGING.md (bundle layout)

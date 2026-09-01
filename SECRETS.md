@@ -148,12 +148,12 @@ GH_TOKEN=<paste-the-PAT> gh api repos/foonerd/evo-device-audio-artefacts \
 
 `push: true` confirms write access on the scoped repo.
 
-Negative test (the PAT must not have access to anything else):
+Negative test (the PAT must not have access to anything else). Substitute any other repository the PAT is expected to have no access to:
 
 ```bash
-GH_TOKEN=<paste-the-PAT> gh api repos/foonerd/evo-device-volumio-artefacts \
+GH_TOKEN=<paste-the-PAT> gh api repos/foonerd/evo-core-eng \
     --jq '.permissions'
-# Expected: HTTP 404 (token has no access)
+# Expected: HTTP 404 (token has no access to this repo)
 ```
 
 The 404 confirms scope isolation.
@@ -234,4 +234,4 @@ Cross-reference all three when investigating any unexpected publish.
 
 ## This document is a worked example
 
-Distributions and commons creating new evo repositories copy this document with their own repo names, key namespaces, and trust contexts substituted. The two-secret model (signing key + cross-repo write token), the canonical token-name format (`<source-repo>: publish (YYYY-QN)`, kept under the GitHub 40-character limit), and the rotation cadences (12 months for signing keys, 90 days for PATs) are project-wide conventions. See [foonerd/evo-device-volumio/SECRETS.md](https://github.com/foonerd/evo-device-volumio/blob/main/SECRETS.md) for the parallel document at the distribution tier.
+Distributions and commons creating new evo repositories copy this document with their own repo names, key namespaces, and trust contexts substituted. The two-secret model (signing key + cross-repo write token), the canonical token-name format (`<source-repo>: publish (YYYY-QN)`, kept under the GitHub 40-character limit), and the rotation cadences (12 months for signing keys, 90 days for PATs) are project-wide conventions.

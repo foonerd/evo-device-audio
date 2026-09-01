@@ -88,7 +88,7 @@ A distribution catalogue admits the commons plugin by its `org.evoframework.*` n
 
 ## Status
 
-Three brand-neutral audio plugins live in this repository, signed by the evo project commons key. They are consumed by any vendor distribution that adopts the audio reference; `evo-device-volumio` is one such adopter today, and the plugins remain available unchanged to any future audio distribution.
+Three brand-neutral audio plugins live in this repository, signed by the evo project commons key. They are consumed by any vendor distribution that adopts the audio reference; the plugins remain available unchanged to any audio distribution that admits them.
 
 | Plugin | Slot | Version |
 |--------|------|---------|
@@ -116,7 +116,6 @@ A workspace-internal shared crate, `evo-device-audio-shared`, holds utilities co
 
 -   [foonerd/evo-core](https://github.com/foonerd/evo-core) - the framework.
 -   [foonerd/evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts) - the release plane for this commons.
--   [foonerd/evo-device-volumio](https://github.com/foonerd/evo-device-volumio) - the first audio distribution; consumes plugins from this commons.
 
 ## License
 
