@@ -942,6 +942,165 @@ const DLNA_ENQUEUE_MAX_DEPTH_DEFAULT: u32 = 6;
 /// `dlna.enqueue.max_tracks`.
 const DLNA_ENQUEUE_MAX_TRACKS_DEFAULT: usize = 5000;
 
+/// Depth-first descent over a DLNA container subtree; returns the
+/// stable leaf URIs collected in tree order alongside a `truncated`
+/// flag set when either the depth or the total-tracks cap fired.
+///
+/// Pure w.r.t. MPD — takes a shelf-request dispatcher and the DLNA
+/// service parameters and does one thing: browse subcontainers,
+/// collect leaves, return. The caller performs URI resolution and
+/// MPD writes. Extracted from
+/// [`handle_enqueue_selection_container`] so the descent shape is
+/// unit-testable against a scripted `ShelfRequestDispatcher` without
+/// having to fake an MPD connection.
+///
+/// Descent contract:
+///
+/// - Iterative DFS. `stack` carries `(object_id, remaining_depth)`
+///   pairs; the top of the stack is the container currently being
+///   walked.
+/// - Tree order preserved by pushing subcontainers in reverse per
+///   page (so the first-listed subcontainer is popped first).
+/// - Each container is browsed page-by-page until the peer-shelf
+///   response's `truncated` flag clears (which the source-plugin
+///   sets when `NumberReturned + StartingIndex < TotalMatches`).
+/// - Depth cap: descent into a container at `depth == 0` sets
+///   `truncated_by_cap = true` and skips it.
+/// - Track cap: on hitting `max_tracks` collected leaves, descent
+///   aborts immediately (breaks the outer loop) with
+///   `truncated_by_cap = true`.
+///
+/// Field-name contract with the source-plugin browse response
+/// (`source.dlna.browse`):
+///
+/// - `entries[i].kind`  — `"file"` for leaves, `"directory"` for
+///   subcontainers.
+/// - `entries[i].uri`   — present ONLY on leaves; carries the
+///   stable playback identity (`dlna:<service_id>/<object_id>`).
+///   This is what the caller feeds to `resolve_uri_for_mpd`.
+/// - `entries[i].path`  — present on BOTH leaves and containers;
+///   carries the raw ContentDirectory `ObjectID`. This is what we
+///   feed back into the next SOAP Browse to descend into a
+///   subcontainer.
+///
+/// A pre-fix version of this descent read `entries[i].uri` for the
+/// directory branch too. Containers carry no `uri` field, so the
+/// recursion silently no-op'd on every subcontainer — an operator
+/// tapping an artist / genre / folder / decade tile would find the
+/// queue unchanged even though the payload envelope reported
+/// `status: ok`. The regression test
+/// [`dlna_descent_walks_two_level_container_tree_via_path_field`]
+/// pins the field-name contract so this can never regress silently
+/// again.
+pub(crate) async fn collect_dlna_container_leaves(
+    dispatcher: &dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+    service_id: &str,
+    root_object_id: &str,
+    max_depth: u32,
+    max_tracks: usize,
+    page_size: u32,
+) -> Result<(Vec<String>, bool), VerbError> {
+    let mut stable_uris: Vec<String> = Vec::new();
+    let mut stack: Vec<(String, u32)> =
+        vec![(root_object_id.to_string(), max_depth)];
+    let mut truncated_by_cap = false;
+
+    'descent: while let Some((oid, depth)) = stack.pop() {
+        if depth == 0 {
+            truncated_by_cap = true;
+            continue;
+        }
+        let mut page: u32 = 0;
+        loop {
+            let request = serde_json::json!({
+                "v":          1,
+                "service_id": service_id,
+                "object_id":  oid,
+                "page":       page,
+                "page_size":  page_size,
+            });
+            let request_bytes =
+                serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!("dlna container: serialise request: {e}"),
+                })?;
+            let response_bytes = dispatcher
+                .dispatch(
+                    AUDIO_DLNA_SHELF,
+                    SOURCE_DLNA_BROWSE_VERB,
+                    request_bytes,
+                    None,
+                )
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!(
+                        "dlna container: {}",
+                        shelf_error_reason(&e)
+                    ),
+                })?;
+            let response: serde_json::Value =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: format!("dlna container: parse response: {e}"),
+                    }
+                })?;
+            let entries = response
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            // Two passes over this page in one iteration:
+            // 1) collect leaves in reading order + subcontainer
+            //    URIs in reading order; 2) push subcontainers onto
+            //    the stack in reverse so the first-listed
+            //    subcontainer pops first (tree order).
+            let mut subcontainers_this_page: Vec<String> = Vec::new();
+            for entry in &entries {
+                let kind = entry.get("kind").and_then(|v| v.as_str());
+                let uri = entry
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let path = entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                match (kind, uri, path) {
+                    (Some("file"), Some(u), _) => {
+                        stable_uris.push(u.to_string());
+                        if stable_uris.len() >= max_tracks {
+                            truncated_by_cap = true;
+                            break 'descent;
+                        }
+                    }
+                    (Some("directory"), _, Some(p)) => {
+                        subcontainers_this_page.push(p.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            for sub in subcontainers_this_page.into_iter().rev() {
+                stack.push((sub, depth - 1));
+            }
+            let page_truncated = response
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !page_truncated {
+                break;
+            }
+            page = response
+                .get("next_page")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(page + 1);
+        }
+    }
+    Ok((stable_uris, truncated_by_cap))
+}
+
 /// Container-shape handler: recursively browses a DLNA
 /// container and enqueues every leaf track its subtree carries,
 /// under bounded depth + total-track caps.
@@ -1036,107 +1195,15 @@ async fn handle_enqueue_selection_container(
     let max_depth = DLNA_ENQUEUE_MAX_DEPTH_DEFAULT;
     let max_tracks = DLNA_ENQUEUE_MAX_TRACKS_DEFAULT;
 
-    // Depth-first descent, iterative (async recursion in Rust
-    // requires Box<dyn Future> boilerplate; the iterative stack
-    // is cleaner and equivalent). `stack` carries
-    // (object_id, remaining_depth) pairs; the top of the stack
-    // is the container currently being walked. Tree order is
-    // preserved by pushing subcontainers in REVERSE so the
-    // first-listed subcontainer is popped first.
-    let mut stable_uris: Vec<String> = Vec::new();
-    let mut stack: Vec<(String, u32)> =
-        vec![(selection.uri.clone(), max_depth)];
-    let mut truncated_by_cap = false;
-
-    'descent: while let Some((oid, depth)) = stack.pop() {
-        if depth == 0 {
-            truncated_by_cap = true;
-            continue;
-        }
-        let mut page: u32 = 0;
-        loop {
-            let request = serde_json::json!({
-                "v":          1,
-                "service_id": service_id,
-                "object_id":  oid,
-                "page":       page,
-                "page_size":  effective_page_size,
-            });
-            let request_bytes =
-                serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
-                    verb: "enqueue_selection".into(),
-                    reason: format!("dlna container: serialise request: {e}"),
-                })?;
-            let response_bytes = dispatcher
-                .dispatch(
-                    AUDIO_DLNA_SHELF,
-                    SOURCE_DLNA_BROWSE_VERB,
-                    request_bytes,
-                    None,
-                )
-                .await
-                .map_err(|e| VerbError::Mpd {
-                    verb: "enqueue_selection".into(),
-                    reason: format!(
-                        "dlna container: {}",
-                        shelf_error_reason(&e)
-                    ),
-                })?;
-            let response: serde_json::Value =
-                serde_json::from_slice(&response_bytes).map_err(|e| {
-                    VerbError::Mpd {
-                        verb: "enqueue_selection".into(),
-                        reason: format!("dlna container: parse response: {e}"),
-                    }
-                })?;
-            let entries = response
-                .get("entries")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            // Two passes over this page in one iteration:
-            // 1) collect leaves in reading order + subcontainer
-            //    URIs in reading order; 2) push subcontainers
-            //    onto the stack in reverse so the first-listed
-            //    subcontainer pops first (tree order).
-            let mut subcontainers_this_page: Vec<String> = Vec::new();
-            for entry in &entries {
-                let kind = entry.get("kind").and_then(|v| v.as_str());
-                let uri = entry
-                    .get("uri")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                match (kind, uri) {
-                    (Some("file"), Some(u)) => {
-                        stable_uris.push(u.to_string());
-                        if stable_uris.len() >= max_tracks {
-                            truncated_by_cap = true;
-                            break 'descent;
-                        }
-                    }
-                    (Some("directory"), Some(u)) => {
-                        subcontainers_this_page.push(u.to_string());
-                    }
-                    _ => {}
-                }
-            }
-            for sub in subcontainers_this_page.into_iter().rev() {
-                stack.push((sub, depth - 1));
-            }
-            let page_truncated = response
-                .get("truncated")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !page_truncated {
-                break;
-            }
-            page = response
-                .get("next_page")
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(page + 1);
-        }
-    }
+    let (stable_uris, truncated_by_cap) = collect_dlna_container_leaves(
+        dispatcher.as_ref(),
+        &service_id,
+        &selection.uri,
+        max_depth,
+        max_tracks,
+        effective_page_size,
+    )
+    .await?;
     // Resolve each stable identity to a concrete `http(s)` at
     // MPD-add time via the shared boundary helper. Resolve
     // BEFORE any MPD write so a mid-descent resolve failure
@@ -1893,6 +1960,7 @@ mod tests {
     use crate::source_registry::{
         ScanPolicy, SourceKind, SourceRecord, SourceState,
     };
+    use std::collections::HashMap;
 
     fn local_source(id: &str, mount: &str, state: SourceState) -> SourceRecord {
         SourceRecord {
@@ -2389,5 +2457,255 @@ mod tests {
             }
             other => panic!("expected PayloadVersion, got {other:?}"),
         }
+    }
+
+    // --- collect_dlna_container_leaves: descent shape + field
+    //     contract regression guard ----------------------------
+
+    /// Scripted `ShelfRequestDispatcher` that answers a
+    /// `source.dlna.browse` for each `object_id` it recognises
+    /// from a pre-populated map, and errors on any unrecognised
+    /// object_id. Records the object_ids it was asked about in
+    /// call order.
+    struct ScriptedBrowseDispatcher {
+        by_object_id: HashMap<String, serde_json::Value>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher
+        for ScriptedBrowseDispatcher
+    {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        >{
+            Box::pin(async move {
+                let body: serde_json::Value = serde_json::from_slice(&payload)
+                    .expect("scripted dispatcher: payload is valid JSON");
+                let oid = body
+                    .get("object_id")
+                    .and_then(|v| v.as_str())
+                    .expect("scripted dispatcher: payload carries object_id")
+                    .to_string();
+                self.calls.lock().unwrap().push(oid.clone());
+                let response =
+                    self.by_object_id.get(&oid).unwrap_or_else(|| {
+                        panic!(
+                            "scripted dispatcher: no canned response for \
+                         object_id {oid:?}"
+                        )
+                    });
+                Ok(serde_json::to_vec(response).unwrap())
+            })
+        }
+    }
+
+    /// Build a browse-response entry shaped like the real
+    /// `source.dlna.browse` handler emits — a container carries
+    /// `kind: "directory"` + `path` + `name` but NO `uri`.
+    fn dir_entry(name: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "directory",
+            "name": name,
+            "path": path,
+            "child_count": null,
+        })
+    }
+
+    /// Build a browse-response entry shaped like the real
+    /// `source.dlna.browse` handler emits — a leaf carries
+    /// `kind: "file"` + `path` + `uri` (the stable
+    /// `dlna:<service_id>/<object_id>` playback identity).
+    fn file_entry(name: &str, path: &str, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "file",
+            "name": name,
+            "path": path,
+            "title": name,
+            "uri": uri,
+            "playable": true,
+        })
+    }
+
+    fn browse_page_response(
+        entries: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "status": "ok",
+            "entries": entries,
+            "page": 0,
+            "page_size": 50,
+            "total": entries.len(),
+            "truncated": false,
+            "next_page": serde_json::Value::Null,
+        })
+    }
+
+    /// Regression guard for the pre-fix descent bug: the descent
+    /// used to read `entry.uri` for the directory branch, but the
+    /// peer-shelf browse response emits `uri` ONLY on leaves. So
+    /// subcontainers never made it onto the DFS stack and
+    /// enqueue collapsed to "direct-child leaves of the starting
+    /// container only" — an operator tapping an artist / genre /
+    /// folder / decade tile silently no-op'd the queue.
+    ///
+    /// This test walks a two-level tree
+    ///   root  ->  [artist-A, artist-B]
+    ///   A     ->  [track-A1, track-A2]
+    ///   B     ->  [track-B1, track-B2, track-B3]
+    /// and asserts:
+    ///   1. The dispatcher was called for both artist object_ids
+    ///      (not just root) — proving descent actually pushed
+    ///      subcontainers.
+    ///   2. All 5 leaf URIs came back in tree order.
+    ///   3. The truncated flag is false (subtree exhausted, no
+    ///      cap fired).
+    #[tokio::test]
+    async fn dlna_descent_walks_two_level_container_tree_via_path_field() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![
+                dir_entry("Artist A", "oid-artist-a"),
+                dir_entry("Artist B", "oid-artist-b"),
+            ]),
+        );
+        by_oid.insert(
+            "oid-artist-a".into(),
+            browse_page_response(vec![
+                file_entry("A1", "oid-a1", "dlna:svc/oid-a1"),
+                file_entry("A2", "oid-a2", "dlna:svc/oid-a2"),
+            ]),
+        );
+        by_oid.insert(
+            "oid-artist-b".into(),
+            browse_page_response(vec![
+                file_entry("B1", "oid-b1", "dlna:svc/oid-b1"),
+                file_entry("B2", "oid-b2", "dlna:svc/oid-b2"),
+                file_entry("B3", "oid-b3", "dlna:svc/oid-b3"),
+            ]),
+        );
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            /* max_depth  */ 6,
+            /* max_tracks */ 100,
+            /* page_size  */ 50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert_eq!(
+            leaves,
+            vec![
+                "dlna:svc/oid-a1".to_string(),
+                "dlna:svc/oid-a2".to_string(),
+                "dlna:svc/oid-b1".to_string(),
+                "dlna:svc/oid-b2".to_string(),
+                "dlna:svc/oid-b3".to_string(),
+            ],
+            "leaves collected in tree order across both subcontainers"
+        );
+        assert!(!truncated, "subtree fully exhausted within caps");
+
+        let calls = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "root".to_string(),
+                "oid-artist-a".to_string(),
+                "oid-artist-b".to_string(),
+            ],
+            "descent visited both subcontainers — the pre-fix bug \
+             visited only root"
+        );
+    }
+
+    /// Track-cap regression guard: hitting `max_tracks` mid-page
+    /// aborts descent immediately and sets `truncated`.
+    #[tokio::test]
+    async fn dlna_descent_caps_tracks_and_marks_truncated() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![
+                file_entry("t1", "o1", "dlna:svc/o1"),
+                file_entry("t2", "o2", "dlna:svc/o2"),
+                file_entry("t3", "o3", "dlna:svc/o3"),
+            ]),
+        );
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            6,
+            /* max_tracks = */ 2,
+            50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert_eq!(
+            leaves,
+            vec!["dlna:svc/o1".to_string(), "dlna:svc/o2".to_string()]
+        );
+        assert!(truncated, "cap fired at 2 tracks");
+    }
+
+    /// Depth-cap regression guard: at `max_depth = 1`, the root is
+    /// browsed but its subcontainers are refused entry and
+    /// `truncated` is set.
+    #[tokio::test]
+    async fn dlna_descent_caps_depth_and_marks_truncated() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![dir_entry("child", "oid-child")]),
+        );
+        // deliberately don't register "oid-child": if descent
+        // reached it the dispatcher would panic.
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            /* max_depth = */ 1,
+            100,
+            50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert!(leaves.is_empty(), "no leaves at depth 1");
+        assert!(truncated, "depth cap fired on child");
     }
 }
