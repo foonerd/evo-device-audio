@@ -153,6 +153,23 @@ pub(crate) const SCHEME_MPD_ALBUM: &str = "mpd-album";
 /// NOT walk subdirectories: the operator's per-folder cover is
 /// always at the same level as the folder they clicked.
 pub(crate) const SCHEME_MPD_DIRECTORY: &str = "mpd-directory";
+/// `artist-name` scheme: value is a display artist name. The
+/// plugin uses MPD's tag index to find any file credited to
+/// that artist, walks up the file's directory chain until it
+/// finds a cover file (via [`sidecar_cover::find_cover_in_directory`]),
+/// and returns that cover — the operator's per-artist portrait
+/// convention (`artist.jpg` / `folder.jpg` / `cover.jpg` at the
+/// artist directory root) works without a separate operator
+/// gesture.
+///
+/// Fallback stops at the artist directory (grandparent of the
+/// track file when the layout is `<Artist>/<Album>/<file>`);
+/// operator libraries with deeper layouts (e.g. `<A>/<Artist>/`
+/// or `<Genre>/<Artist>/`) still resolve because the walk
+/// bounds at three parent levels — enough for every layout the
+/// framework has seen, cheap to bound (three fs::read_dir calls
+/// worst-case).
+pub(crate) const SCHEME_ARTIST_NAME: &str = "artist-name";
 
 /// Priority-ordered cover-art filenames, image extension fallback
 /// list, and 5 MB size ceiling live in the shared crate so
@@ -521,6 +538,9 @@ pub(crate) fn resolve_artwork(
         }
         SCHEME_MPD_DIRECTORY => {
             resolve_mpd_directory(library_roots, &req.target.value)?
+        }
+        SCHEME_ARTIST_NAME => {
+            resolve_artist_name(library_roots, &req.target.value)?
         }
         other => ArtworkResolveResponse {
             v: 1,
@@ -1193,6 +1213,169 @@ fn resolve_mpd_directory(
             )),
         }),
     }
+}
+
+/// `artist-name` handler — synthesise a per-artist portrait from
+/// the operator's on-disk convention (`artist.jpg` / `folder.jpg`
+/// / `cover.jpg` at the artist directory root).
+///
+/// Uses MPD's tag index to find one file credited to the
+/// artist, then walks up the file's directory chain checking
+/// each level for a cover file. Stops at the first cover found
+/// or after three parent levels (enough for every layout the
+/// framework has seen: `<Artist>/…`, `<A>/<Artist>/…`,
+/// `<Genre>/<A>/<Artist>/…`).
+///
+/// On MPD unreachable / query timeout / zero-matches / no-
+/// cover-anywhere-up-the-chain, returns structured NotFound
+/// with a descriptive detail — the cascade caller synthesises
+/// the online tier target from the artist identity and the
+/// operator's UI shows the online-provider result (or a
+/// placeholder if the online tier also 404s).
+fn resolve_artist_name(
+    library_roots: &[PathBuf],
+    value: &str,
+) -> Result<ArtworkResolveResponse, String> {
+    if value.is_empty() {
+        return Ok(ArtworkResolveResponse {
+            v: 1,
+            status: ResponseStatus::BadRequest,
+            path: None,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            identity: None,
+            detail: Some("empty artist-name value".to_string()),
+        });
+    }
+
+    let artist = value;
+    let Some(track_path) = find_one_track_by_artist(artist, library_roots)
+    else {
+        return Ok(ArtworkResolveResponse {
+            v: 1,
+            status: ResponseStatus::NotFound,
+            path: None,
+            content_hash: None,
+            mime: None,
+            size: None,
+            provider_id: None,
+            // No album pair to synthesise — artist-scheme
+            // cascades to `artwork.resolve_artist_online` with
+            // the caller's original artist name, not to an
+            // mpd-album target, so the identity field is
+            // unused by the framework on this response.
+            identity: None,
+            detail: Some(format!(
+                "no track found in MPD library credited to artist {artist:?}"
+            )),
+        });
+    };
+
+    // Walk up to three parents looking for a cover. Level 0 is
+    // the track's directory (album); level 1 is the artist
+    // directory in a `<Artist>/<Album>/<file>` layout; level 2
+    // covers `<A>/<Artist>/<Album>/<file>`; level 3 covers
+    // `<Genre>/<A>/<Artist>/<Album>/<file>`.
+    let mut cursor = track_path.parent();
+    for level in 0..=3 {
+        let Some(dir) = cursor else { break };
+        if let Some(cover) = find_cover_in_directory(dir) {
+            let mime = mime_from_extension(&cover);
+            return Ok(ArtworkResolveResponse {
+                v: 1,
+                status: ResponseStatus::Ok,
+                path: Some(cover.to_string_lossy().into_owned()),
+                content_hash: None,
+                mime: Some(mime),
+                size: None,
+                provider_id: Some(format!("local_sidecar:artist:l{level}")),
+                // No album pair to synthesise — artist-scheme
+                // cascades to `artwork.resolve_artist_online` with
+                // the caller's original artist name, not to an
+                // mpd-album target, so the identity field is
+                // unused by the framework on this response.
+                identity: None,
+                detail: None,
+            });
+        }
+        cursor = dir.parent();
+    }
+
+    Ok(ArtworkResolveResponse {
+        v: 1,
+        status: ResponseStatus::NotFound,
+        path: None,
+        content_hash: None,
+        mime: None,
+        size: None,
+        provider_id: None,
+        identity: None,
+        detail: Some(format!(
+            "no artist sidecar cover in any parent of {} up to 3 levels",
+            track_path.display()
+        )),
+    })
+}
+
+/// Ask MPD for one file credited to `artist` (albumartist first,
+/// fall back to artist). Returns the absolute filesystem path
+/// confined to one of the plugin's library roots.
+///
+/// Bounded on the same wall-clock budget as the mpd-album fast
+/// path — MPD unreachable / query timeout / zero matches / path
+/// unconfinable all yield `None` and the caller structures a
+/// NotFound outcome.
+fn find_one_track_by_artist(
+    artist: &str,
+    library_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    use evo_mpd_shared::{
+        MpdConnection, MpdEndpoint, MpdLibraryEntry, MpdSearchField,
+    };
+
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let endpoint = MpdEndpoint::tcp(MPD_HOST, MPD_PORT).ok()?;
+    let artist_owned = artist.to_string();
+    let entries = handle
+        .block_on(async {
+            tokio::time::timeout(MPD_INDEX_HINT_BUDGET, async {
+                let mut conn = MpdConnection::connect(endpoint).await.ok()?;
+                // AlbumArtist first — canonical for artist-scoped
+                // lookup. Fall back to Artist for libraries that
+                // populate only the Artist tag.
+                let by_album_artist = conn
+                    .find_multi(&[(
+                        MpdSearchField::AlbumArtist,
+                        artist_owned.as_str(),
+                    )])
+                    .await
+                    .ok()?;
+                if !by_album_artist.is_empty() {
+                    return Some(by_album_artist);
+                }
+                conn.find_multi(&[(
+                    MpdSearchField::Artist,
+                    artist_owned.as_str(),
+                )])
+                .await
+                .ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default();
+    for entry in entries {
+        let MpdLibraryEntry::File { path, .. } = entry else {
+            continue;
+        };
+        if let Some(abs) = confine_mpd_path_to_roots(&path, library_roots) {
+            return Some(abs);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
