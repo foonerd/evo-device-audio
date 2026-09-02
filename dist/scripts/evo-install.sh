@@ -329,7 +329,7 @@ echo ""
 # up before bootstrap.sh recreates /etc/evo/mpd.conf and dies on
 # the missing include target. Stop + strip up front so the flow
 # is idempotent against any prior-evo residue.
-echo "[0/7] pre-flight housekeeping (stop mpd + strip prior evo residue) ..."
+echo "[pre-flight] housekeeping (stop mpd + strip prior evo residue) ..."
 # Only mpd is stopped here. mpd is the sole daemon whose config
 # bootstrap.sh mutates in a way that requires a running instance
 # to be reloaded (the include line for /etc/evo/mpd.conf is
@@ -1614,14 +1614,14 @@ case "${MODE}" in
         echo "[7/7] start + verify ..."   ; start_steward ; verify_post_condition
         ;;
     reinstall)
-        echo "[1/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
-        echo "[2/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
-        echo "[3/8] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
-        echo "[4/8] FULL WIPE (binaries + config + state + music) ..."
+        echo "[1/7] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
+        echo "[2/7] extract bundle ..."  ; extract_bundle          ; echo "  ok"
+        echo "[3/7] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
+        echo "[4/7] FULL WIPE (binaries + config + state + music) ..."
         wipe_full ; echo "  ok"
-        echo "[5/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
-        echo "[6/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/8] start + verify ..."  ; start_steward ; verify_post_condition
+        echo "[5/7] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
+        echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
+        echo "[7/7] start + verify ..."  ; start_steward ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
     wipe-config)
