@@ -20,9 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use evo_dlna::{
     browse_page, default_discovered_path, discover_media_servers,
     fetch_media_server, parse_didl, pick_stream_uri, read_discovered,
-    write_discovered, BrowseParams, DidlObject, DiscoveredFile,
-    DiscoveredServer, DISCOVERED_VERSION, DLNA_PAGE_DEFAULT,
-    DLNA_PAGE_HARD_CAP,
+    spawn_notify_listener, write_discovered, BrowseParams, DidlObject,
+    DiscoveredFile, DiscoveredServer, SsdpHit, DISCOVERED_VERSION,
+    DLNA_PAGE_DEFAULT, DLNA_PAGE_HARD_CAP,
 };
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
@@ -205,6 +205,56 @@ impl Plugin for DlnaSourcePlugin {
                     tokio::time::sleep(every).await;
                 }
             });
+
+            // Passive NOTIFY listener — catches MediaServers that
+            // announce themselves between the M-SEARCH cadence
+            // above (some MediaServers, particularly appliance
+            // NAS units, announce on multicast :1900 but do not
+            // reply to M-SEARCH from a non-privileged source
+            // port). Bind is best-effort: on port-conflict
+            // (e.g. co-hosted SSDP responder like DSM already
+            // holds :1900) the plugin degrades to
+            // M-SEARCH-only discovery and logs a WARN — the
+            // operator's LAN state (which is the actual cause
+            // of the conflict) surfaces separately via the
+            // journal.
+            match spawn_notify_listener() {
+                Ok(mut rx) => {
+                    let servers = Arc::clone(&self.servers);
+                    let path = self.discovered_path.clone();
+                    tokio::spawn(async move {
+                        while let Some(hit) = rx.recv().await {
+                            if let Err(e) =
+                                merge_hit_into_discovered(&hit, &servers, &path)
+                                    .await
+                            {
+                                tracing::debug!(
+                                    plugin = PLUGIN_NAME,
+                                    location = %hit.location,
+                                    error = %e,
+                                    "source.dlna: NOTIFY-derived hit skipped \
+                                     (fetch/parse failed)"
+                                );
+                            }
+                        }
+                    });
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        "source.dlna: passive NOTIFY listener bound on \
+                         239.255.255.250:1900"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "source.dlna: passive NOTIFY listener bind failed; \
+                         discovery degrades to M-SEARCH-only cadence \
+                         (typically port conflict with a co-hosted SSDP \
+                         responder)"
+                    );
+                }
+            }
             self.loaded = true;
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -479,24 +529,7 @@ async fn refresh_discovery(
     for hit in hits {
         match fetch_media_server(&hit.location).await {
             Ok(m) => {
-                if let Some(existing) =
-                    merged.iter_mut().find(|s| s.service_id == m.service_id)
-                {
-                    existing.friendly_name = m.friendly_name;
-                    existing.control_url = m.control_url;
-                    existing.base_url = m.base_url;
-                    existing.location = m.location;
-                    existing.last_seen_ms = seen_ms;
-                } else {
-                    merged.push(DiscoveredServer {
-                        service_id: m.service_id,
-                        friendly_name: m.friendly_name,
-                        control_url: m.control_url,
-                        base_url: m.base_url,
-                        location: m.location,
-                        last_seen_ms: seen_ms,
-                    });
-                }
+                upsert_media_server(&mut merged, m, seen_ms);
             }
             Err(e) => {
                 tracing::debug!(
@@ -520,6 +553,69 @@ async fn refresh_discovery(
     )?;
     *servers.write().await = merged;
     Ok(())
+}
+
+/// Merge a single SSDP hit into the discovered-servers state
+/// (both in-memory and the on-disk sidecar). Used by the
+/// passive NOTIFY listener path — the M-SEARCH refresh loop
+/// batches into [`refresh_discovery`], which handles the
+/// grace-window retention pass. A NOTIFY hit does not retire
+/// stale entries; it only registers freshness for the specific
+/// server that announced.
+///
+/// Downstream classification (MediaServer vs MediaRenderer vs
+/// Basic:1 vs Cast target etc.) happens via
+/// [`fetch_media_server`] here identically to the M-SEARCH
+/// path — non-MediaServer devices error out and are logged at
+/// DEBUG by the caller, not written to state.
+async fn merge_hit_into_discovered(
+    hit: &SsdpHit,
+    servers: &RwLock<Vec<DiscoveredServer>>,
+    path: &std::path::Path,
+) -> Result<(), evo_dlna::DlnaError> {
+    let m = fetch_media_server(&hit.location).await?;
+    let seen_ms = now_ms();
+    let mut merged: Vec<DiscoveredServer> = servers.read().await.clone();
+    upsert_media_server(&mut merged, m, seen_ms);
+    merged.sort_by(|a, b| a.friendly_name.cmp(&b.friendly_name));
+    write_discovered(
+        path,
+        &DiscoveredFile {
+            v: DISCOVERED_VERSION,
+            servers: merged.clone(),
+        },
+    )?;
+    *servers.write().await = merged;
+    Ok(())
+}
+
+/// Insert-or-update a resolved MediaServer into the merged
+/// discovered-servers list. Shared by the M-SEARCH batch path
+/// and the passive NOTIFY listener path so both write the
+/// same shape.
+fn upsert_media_server(
+    merged: &mut Vec<DiscoveredServer>,
+    m: evo_dlna::MediaServer,
+    seen_ms: u64,
+) {
+    if let Some(existing) =
+        merged.iter_mut().find(|s| s.service_id == m.service_id)
+    {
+        existing.friendly_name = m.friendly_name;
+        existing.control_url = m.control_url;
+        existing.base_url = m.base_url;
+        existing.location = m.location;
+        existing.last_seen_ms = seen_ms;
+    } else {
+        merged.push(DiscoveredServer {
+            service_id: m.service_id,
+            friendly_name: m.friendly_name,
+            control_url: m.control_url,
+            base_url: m.base_url,
+            location: m.location,
+            last_seen_ms: seen_ms,
+        });
+    }
 }
 
 async fn handle_browse(
