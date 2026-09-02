@@ -1199,9 +1199,29 @@ verify_post_condition() {
     # the install touched (mpd), is treated as install
     # failure. The operator's engineering bar: zero "fail"
     # across every consumer of the install's output.
+    #
+    # Calibrated exclusions — narrow whitelist of documented
+    # baseline mpd first-boot behaviour that is NOT a failure:
+    #
+    #   exception: Failed to open "/var/lib/mpd/tag_cache": No such file or directory
+    #   exception: Failed to open "/var/lib/mpd/state":     No such file or directory
+    #
+    # mpd's `db_file` + `state_file` configuration references
+    # paths that do not yet exist on a fresh install; mpd logs
+    # these as `exception:` at startup, then creates the files
+    # itself on the first `update` and next graceful stop
+    # respectively. Every mpd deployment on Debian/Ubuntu with
+    # a fresh `/var/lib/mpd` logs exactly these two lines once.
+    # They are not evo-specific. Any OTHER `fail(ed|ure)?` line
+    # from mpd — including `Database corrupted`, `Bind failed`,
+    # `Config error`, missing music directory, etc. — still
+    # counts as a real journal-fail hit.
     local fail_evo fail_mpd
     fail_evo=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -iE 'fail(ed|ure)?\b' || true)
-    fail_mpd=$(journalctl -u mpd --since "60 seconds ago" --no-pager 2>/dev/null | grep -iE 'fail(ed|ure)?\b' || true)
+    fail_mpd=$(journalctl -u mpd --since "60 seconds ago" --no-pager 2>/dev/null \
+        | grep -iE 'fail(ed|ure)?\b' \
+        | grep -vE 'exception: Failed to open "/var/lib/mpd/(tag_cache|state)": No such file or directory' \
+        || true)
     JOURNAL_FAIL_HITS="${fail_evo}"
     if [[ -n "${fail_mpd}" ]]; then
         JOURNAL_FAIL_HITS="${JOURNAL_FAIL_HITS}${JOURNAL_FAIL_HITS:+$'\n'}${fail_mpd}"
