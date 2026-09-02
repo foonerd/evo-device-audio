@@ -1273,13 +1273,28 @@ fn resolve_artist_name(
         });
     };
 
-    // Walk up to three parents looking for a cover. Level 0 is
-    // the track's directory (album); level 1 is the artist
-    // directory in a `<Artist>/<Album>/<file>` layout; level 2
-    // covers `<A>/<Artist>/<Album>/<file>`; level 3 covers
-    // `<Genre>/<A>/<Artist>/<Album>/<file>`.
-    let mut cursor = track_path.parent();
-    for level in 0..=3 {
+    // Walk up looking for a cover to serve as the artist portrait.
+    // Level 0 (the track's parent = ALBUM directory) is DELIBERATELY
+    // SKIPPED — the cover file at that level is the album's cover,
+    // not the artist's portrait. Returning album art under an
+    // artist-name key would cache the wrong content and the browse
+    // tile would show an album cover as if it were the artist photo.
+    //
+    // Level 1 is the artist directory in a `<Artist>/<Album>/<file>`
+    // layout — the correct place for an operator's per-artist
+    // portrait (artist.jpg / folder.jpg / cover.jpg at the artist
+    // directory root). Levels 2 and 3 cover deeper layouts
+    // (`<A>/<Artist>/<Album>/<file>` or
+    // `<Genre>/<A>/<Artist>/<Album>/<file>`).
+    //
+    // Skipping level 0 is a deliberate correctness choice, not an
+    // optimisation: the operator's artist tile MUST NOT be served
+    // an album cover as a substitute. If no cover exists anywhere
+    // from level 1 upward, the response is NotFound and the
+    // cascade dispatches the artist-scoped online tier.
+    let album_dir = track_path.parent();
+    let mut cursor = album_dir.and_then(std::path::Path::parent);
+    for level in 1..=3 {
         let Some(dir) = cursor else { break };
         if let Some(cover) = find_cover_in_directory(dir) {
             let mime = mime_from_extension(&cover);
