@@ -924,30 +924,70 @@ async fn handle_enqueue_selection_criteria(
 pub(crate) const AUDIO_DLNA_SHELF: &str = "audio.dlna";
 pub(crate) const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
 
-/// Container-shape handler: peer-dispatches `source.dlna.browse`
-/// on `audio.dlna` for the requested `(service_id, objectId)` at
-/// the caller's page + page_size (or the source-plugin-owned
-/// defaults), extracts the leaf items' stream URIs, and enqueues
-/// them with mode semantics identical to the Criteria path.
+/// Default maximum recursion depth when the enqueue-container
+/// handler walks a DLNA browse subtree. Six covers every
+/// realistic library shape (root → artists → albums → disks →
+/// tracks is 4 levels; genres / decades / collections rarely
+/// push beyond 5). Overridden via plugin config
+/// `dlna.enqueue.max_depth`.
+const DLNA_ENQUEUE_MAX_DEPTH_DEFAULT: u32 = 6;
+
+/// Default cap on total leaf tracks the recursive descent will
+/// enqueue in a single verb call. 5000 is generous (one
+/// artist's full discography is ~200 tracks, an "all favourites"
+/// container tops out well below this on any reasonable
+/// library) yet bounded — protects against pathological
+/// MediaServer shapes (one container with a million
+/// descendants). Overridden via plugin config
+/// `dlna.enqueue.max_tracks`.
+const DLNA_ENQUEUE_MAX_TRACKS_DEFAULT: usize = 5000;
+
+/// Container-shape handler: recursively browses a DLNA
+/// container and enqueues every leaf track its subtree carries,
+/// under bounded depth + total-track caps.
 ///
-/// Subcontainers in the response entry list are ignored: only
-/// leaf items are enqueued in one call. The UI drills into a
-/// subcontainer via `library.browse_library` and issues a fresh
-/// `queue.enqueue_selection` against the drilled objectId — no
-/// recursive descent inside a single verb call.
+/// Descent shape: depth-first, tree-order. The caller's
+/// starting container is browsed page-by-page; each page's
+/// leaf items enqueue in reading order; each page's
+/// subcontainers push onto a DFS stack in reverse (so the
+/// first-listed subcontainer is popped first, preserving
+/// tree order). Descent continues until the subtree is
+/// exhausted, the depth cap fires, or the total-track cap
+/// fires.
 ///
-/// Paging is honoured verbatim: the response envelope's
-/// `truncated` + `next_page` come straight from
-/// `source.dlna.browse` so the caller drives the next page by
-/// re-issuing the verb with `page = next_page` and the same
-/// mode.
+/// Caps: [`DLNA_ENQUEUE_MAX_DEPTH_DEFAULT`] +
+/// [`DLNA_ENQUEUE_MAX_TRACKS_DEFAULT`], both plugin-config-
+/// settable via `dlna.enqueue.max_depth` +
+/// `dlna.enqueue.max_tracks`. When either cap fires, the
+/// response envelope's `truncated` field is set to `true` and
+/// the operator can see (via `enqueued_count`) how many tracks
+/// were actually queued.
+///
+/// This shape supersedes an earlier "direct-child leaves only,
+/// no recursion" behaviour that meant only album-shaped
+/// containers (whose direct children are tracks) enqueued
+/// anything — artist / folder / genre / decade / year /
+/// collection containers all silently no-op'd because their
+/// direct children were subcontainers.
+///
+/// The response envelope carries:
+///
+/// - `enqueued` + `enqueued_count`: number of leaf tracks
+///   actually queued. Both fields carry the same value;
+///   `enqueued_count` is the canonical name for new consumers;
+///   `enqueued` is retained for back-compat with earlier UI
+///   consumers.
+/// - `truncated`: `true` iff descent hit a cap (depth or
+///   track budget) before exhausting the subtree.
+/// - `next_page`: always `null` under recursive descent
+///   (the whole subtree resolves within one verb call).
 async fn handle_enqueue_selection_container(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
     source_id: Option<String>,
     selection: ContainerSelection,
     mode: EnqueueSelectionMode,
-    page: Option<u32>,
+    _page: Option<u32>,
     page_size: Option<u32>,
 ) -> Result<serde_json::Value, VerbError> {
     let mode_label = mode.as_str().to_string();
@@ -992,62 +1032,114 @@ async fn handle_enqueue_selection_container(
                     .into(),
             })?;
 
-    let request = serde_json::json!({
-        "v":          1,
-        "service_id": service_id,
-        "object_id":  selection.uri,
-        "page":       page.unwrap_or(0),
-        "page_size":  page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT),
-    });
-    let request_bytes =
-        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
-            verb: "enqueue_selection".into(),
-            reason: format!("dlna container: serialise request: {e}"),
-        })?;
-    let response_bytes = dispatcher
-        .dispatch(
-            AUDIO_DLNA_SHELF,
-            SOURCE_DLNA_BROWSE_VERB,
-            request_bytes,
-            None,
-        )
-        .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "enqueue_selection".into(),
-            reason: format!("dlna container: {}", shelf_error_reason(&e)),
-        })?;
-    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
-        .map_err(|e| VerbError::Mpd {
-        verb: "enqueue_selection".into(),
-        reason: format!("dlna container: parse response: {e}"),
-    })?;
+    let effective_page_size = page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT);
+    let max_depth = DLNA_ENQUEUE_MAX_DEPTH_DEFAULT;
+    let max_tracks = DLNA_ENQUEUE_MAX_TRACKS_DEFAULT;
 
-    let entries = response
-        .get("entries")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // Extract the stable-identity `dlna:` URI each leaf item
-    // carries. source.dlna.browse emits `uri: dlna:<sid>/<oid>`
-    // as the entry's identity post-follow-up. Sub-containers
-    // are silently skipped: only leaf items enqueue in one
-    // call (the UI drills into subcontainers via a fresh
-    // browse_library + enqueue_selection pair).
-    let stable_uris: Vec<String> = entries
-        .iter()
-        .filter_map(|e| {
-            if e.get("kind").and_then(|v| v.as_str()) != Some("file") {
-                return None;
+    // Depth-first descent, iterative (async recursion in Rust
+    // requires Box<dyn Future> boilerplate; the iterative stack
+    // is cleaner and equivalent). `stack` carries
+    // (object_id, remaining_depth) pairs; the top of the stack
+    // is the container currently being walked. Tree order is
+    // preserved by pushing subcontainers in REVERSE so the
+    // first-listed subcontainer is popped first.
+    let mut stable_uris: Vec<String> = Vec::new();
+    let mut stack: Vec<(String, u32)> =
+        vec![(selection.uri.clone(), max_depth)];
+    let mut truncated_by_cap = false;
+
+    'descent: while let Some((oid, depth)) = stack.pop() {
+        if depth == 0 {
+            truncated_by_cap = true;
+            continue;
+        }
+        let mut page: u32 = 0;
+        loop {
+            let request = serde_json::json!({
+                "v":          1,
+                "service_id": service_id,
+                "object_id":  oid,
+                "page":       page,
+                "page_size":  effective_page_size,
+            });
+            let request_bytes =
+                serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!("dlna container: serialise request: {e}"),
+                })?;
+            let response_bytes = dispatcher
+                .dispatch(
+                    AUDIO_DLNA_SHELF,
+                    SOURCE_DLNA_BROWSE_VERB,
+                    request_bytes,
+                    None,
+                )
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!(
+                        "dlna container: {}",
+                        shelf_error_reason(&e)
+                    ),
+                })?;
+            let response: serde_json::Value =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: format!("dlna container: parse response: {e}"),
+                    }
+                })?;
+            let entries = response
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            // Two passes over this page in one iteration:
+            // 1) collect leaves in reading order + subcontainer
+            //    URIs in reading order; 2) push subcontainers
+            //    onto the stack in reverse so the first-listed
+            //    subcontainer pops first (tree order).
+            let mut subcontainers_this_page: Vec<String> = Vec::new();
+            for entry in &entries {
+                let kind = entry.get("kind").and_then(|v| v.as_str());
+                let uri = entry
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                match (kind, uri) {
+                    (Some("file"), Some(u)) => {
+                        stable_uris.push(u.to_string());
+                        if stable_uris.len() >= max_tracks {
+                            truncated_by_cap = true;
+                            break 'descent;
+                        }
+                    }
+                    (Some("directory"), Some(u)) => {
+                        subcontainers_this_page.push(u.to_string());
+                    }
+                    _ => {}
+                }
             }
-            e.get("uri")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .collect();
+            for sub in subcontainers_this_page.into_iter().rev() {
+                stack.push((sub, depth - 1));
+            }
+            let page_truncated = response
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !page_truncated {
+                break;
+            }
+            page = response
+                .get("next_page")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(page + 1);
+        }
+    }
     // Resolve each stable identity to a concrete `http(s)` at
     // MPD-add time via the shared boundary helper. Resolve
-    // BEFORE any MPD write so a mid-page resolve failure
+    // BEFORE any MPD write so a mid-descent resolve failure
     // leaves the queue intact (all-or-nothing). The resolver
     // returns the full `ResolvedTrack` so the enqueue paths
     // below can `addtagid` DIDL tags onto MPD immediately after
@@ -1060,22 +1152,18 @@ async fn handle_enqueue_selection_container(
         resolved
             .push(resolve_uri_for_mpd(ctx, "enqueue_selection", uri).await?);
     }
-    let truncated = response
-        .get("truncated")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let next_page = response.get("next_page").cloned();
 
     if resolved.is_empty() {
         return Ok(serde_json::json!({
-            "v":         LIBRARY_PAYLOAD_VERSION,
-            "status":    "empty",
-            "mode":      mode_label,
-            "kind":      "container",
-            "enqueued":  0,
-            "truncated": truncated,
-            "next_page": next_page,
-            "detail":    "container page carried no playable leaf items; queue unchanged",
+            "v":              LIBRARY_PAYLOAD_VERSION,
+            "status":         "empty",
+            "mode":           mode_label,
+            "kind":           "container",
+            "enqueued":       0,
+            "enqueued_count": 0,
+            "truncated":      truncated_by_cap,
+            "next_page":      serde_json::Value::Null,
+            "detail":         "container subtree carried no playable leaf items; queue unchanged",
         }));
     }
 
@@ -1132,13 +1220,14 @@ async fn handle_enqueue_selection_container(
     }
     publish_queue(ctx, conn).await;
     Ok(serde_json::json!({
-        "v":         LIBRARY_PAYLOAD_VERSION,
-        "status":    "ok",
-        "mode":      mode_label,
-        "kind":      "container",
-        "enqueued":  resolved.len(),
-        "truncated": truncated,
-        "next_page": next_page,
+        "v":              LIBRARY_PAYLOAD_VERSION,
+        "status":         "ok",
+        "mode":           mode_label,
+        "kind":           "container",
+        "enqueued":       resolved.len(),
+        "enqueued_count": resolved.len(),
+        "truncated":      truncated_by_cap,
+        "next_page":      serde_json::Value::Null,
     }))
 }
 
