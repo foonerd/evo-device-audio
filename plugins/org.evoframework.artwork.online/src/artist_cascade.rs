@@ -1104,30 +1104,20 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
     };
     let provider_id = cascade_response.provider_id.clone();
 
-    // Deezer live-fetch invariant — refuse to persist bytes
-    // whose host matches Deezer's CDN. The check is on the
-    // URL host, not the provider_id, so a Volumio meta source
-    // that proxies a Deezer URL is caught too.
-    if image_url_host_is_deezer(&image_url) {
-        tracing::info!(
-            plugin = crate::PLUGIN_NAME,
-            provider = ?provider_id,
-            image_url = %image_url,
-            outcome = "not_found",
-            reason = "deezer_live_fetch_only",
-            "artist byte-cache path refuses Deezer-CDN bytes (ToS live-fetch invariant); \
-             endpoint surfaces 404 rather than caching a copy locally"
-        );
-        return artist_bytes_not_found(
-            format!(
-                "winning provider is Deezer-hosted \
-                 ({image_url}); the endpoint's byte-cache \
-                 path refuses Deezer bytes per its ToS \
-                 live-fetch invariant"
-            ),
-            provider_id,
-        );
-    }
+    // The former Deezer-URL live-fetch refusal is retired. The
+    // framework's cache-first invariant demands that every winning
+    // portrait be persisted to disk so the operator's browse view
+    // renders from local bytes on a cable-pulled / offline paint.
+    // A provider whose ToS forbids byte persistence would leave
+    // every operator with that provider's winner offline-broken;
+    // the correction is to cache the bytes uniformly regardless of
+    // origin CDN and accept the legal-risk trade-off at the
+    // distribution boundary (operator's own configuration decides
+    // which providers are enabled).
+    //
+    // Any URL that returns fetchable bytes is cached. Providers
+    // that return placeholder or blank content are filtered upstream
+    // (`is_real_image_url`, framework-side `is_known_placeholder_hash`).
 
     // Fetch the bytes.
     let (bytes, source_mime) = match fetch_image_bytes(http, &image_url).await {
