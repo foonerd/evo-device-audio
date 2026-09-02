@@ -1134,27 +1134,62 @@ count_expected_plugins_from_stage() {
 
 verify_post_condition() {
     local deadline
-    deadline=$(( $(date +%s) + 30 ))
+    deadline=$(( $(date +%s) + 60 ))
+    # Wait for evo.service to become active. This is the systemd
+    # start-up gate — plugin admission (which we poll below)
+    # starts only after this succeeds.
     while [[ $(date +%s) -lt ${deadline} ]]; do
         if systemctl is-active evo >/dev/null 2>&1; then
-            sleep 3   # let plugins admit
             break
         fi
         sleep 1
     done
     ACTIVE_STATE="$(systemctl is-active evo 2>/dev/null || echo unknown)"
+    PLUGINS_EXPECTED="$(count_expected_plugins_from_stage)"
+
+    # Poll-until-stable admitted-plugin count. Prior shape was
+    # a single snapshot after a fixed 3-second sleep, which
+    # under-counted on slower rigs whose OOP plugin population
+    # was still admitting in sequence (Debian-minimal x86_64
+    # hosts consistently produced 11/19 or 13/19 snapshots
+    # where live post-settle was 19/19). The install then
+    # reported failure on a race condition, not a real defect.
+    #
+    # Stop conditions:
+    #   * reached PLUGINS_EXPECTED (short-circuit: done),
+    #   * or same count for 6 consecutive samples (~3s stable
+    #     window: admission has quiesced below the expected
+    #     count, real defect worth surfacing),
+    #   * or hit poll deadline (report what we saw).
+    #
     # Count admitted plugins by listing the per-plugin Unix
     # sockets the steward creates under /var/run/evo/plugins/.
     # Each successfully-admitted OOP plugin exposes its
     # request-socket here; this is observable substrate
     # independent of the steward's log-level filter (default
     # RUST_LOG=warn hides INFO-level "plugin admitted" lines).
-    if [[ -d /var/run/evo/plugins ]]; then
-        PLUGINS_ADMITTED=$(find /var/run/evo/plugins -maxdepth 1 -name '*.sock' 2>/dev/null | wc -l)
-    else
-        PLUGINS_ADMITTED=0
-    fi
-    PLUGINS_EXPECTED="$(count_expected_plugins_from_stage)"
+    local stable_count=0 last_count=-1 poll_deadline
+    poll_deadline=$(( $(date +%s) + 60 ))
+    while [[ $(date +%s) -lt ${poll_deadline} ]]; do
+        if [[ -d /var/run/evo/plugins ]]; then
+            PLUGINS_ADMITTED=$(find /var/run/evo/plugins -maxdepth 1 -name '*.sock' 2>/dev/null | wc -l)
+        else
+            PLUGINS_ADMITTED=0
+        fi
+        if [[ "${PLUGINS_ADMITTED}" -ge "${PLUGINS_EXPECTED}" ]]; then
+            break
+        fi
+        if [[ "${PLUGINS_ADMITTED}" -eq "${last_count}" ]]; then
+            stable_count=$(( stable_count + 1 ))
+            if [[ "${stable_count}" -ge 6 ]]; then
+                break
+            fi
+        else
+            stable_count=0
+            last_count="${PLUGINS_ADMITTED}"
+        fi
+        sleep 0.5
+    done
     ADMISSION_FAILURES=$(journalctl -u evo --since "60 seconds ago" --no-pager -o cat 2>/dev/null | grep -c '^skipping plugin: admission failed$' || true)
     NOT_DECLARED=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -c 'not declared in the catalogue' || true)
     CATALOGUE_SOURCE=$(journalctl -u evo --since "60 seconds ago" --no-pager -o json 2>/dev/null | grep 'catalogue loaded' 2>/dev/null | grep -oE '"F_SOURCE":"[a-z]+"' 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//' || true)
