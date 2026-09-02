@@ -407,7 +407,26 @@ debian_package_for_binary() {
         mount.cifs)          echo "cifs-utils" ;;
         mount.nfs)           echo "nfs-common" ;;
         avahi-browse)        echo "avahi-utils" ;;
+        # avahi-daemon is the mDNS responder itself; declared as a
+        # required_binary by network.smb-server (for _smb._tcp
+        # advertisement) and network.shares (as a stronger
+        # guarantee than avahi-utils' Recommends: avahi-daemon).
+        # Debian's `avahi-utils` package lists `avahi-daemon` as
+        # Recommends, not Depends, so a host installed with
+        # --no-install-recommends will admit the plugin (avahi-
+        # browse is on PATH) but the daemon will not be running.
+        # Mapping the binary to its own package forces the parity
+        # gate to apt-install it explicitly.
+        avahi-daemon)        echo "avahi-daemon" ;;
         smbd)                echo "samba" ;;
+        # nmbd is the NetBIOS name server; ships in the same
+        # `samba` package as smbd but is a separately-managed
+        # unit (nmbd.service). Declaring it as a distinct
+        # required_binary makes the network.smb-server plugin's
+        # dependency on NetBIOS name-registration explicit and
+        # symmetric with smbd; the parity gate dedupes the
+        # package so `samba` is still apt-installed once.
+        nmbd)                echo "samba" ;;
         testparm|smbpasswd)  echo "samba-common-bin" ;;
         sudo)                echo "sudo" ;;
         tee|cat)             echo "coreutils" ;;

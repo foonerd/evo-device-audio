@@ -47,11 +47,19 @@ required_binaries:
   - name: systemctl
     min_version: "245"
     failure_mode: warn at admission and mark the plugin degraded with reason `systemctl_missing`; smbd cannot be restarted after a config change; the fragment is written but not applied. Debian bookworm and every supported distribution ship systemd 245+.
+  - name: nmbd
+    min_version: "4.10"
+    failure_mode: warn at admission and mark the plugin degraded with reason `nmbd_missing`; SMB shares remain reachable over point-to-point IP but disappear from Windows/macOS "Network" browsers that discover peers via NetBIOS name broadcasts. Ships in the same `samba` (Debian) / `samba` (Fedora, Alpine, Arch) package as smbd; declared here so the parity gate treats NetBIOS advertisement as a first-class prerequisite (nmbd.service is separately-managed even though the binary ships with smbd).
+  - name: avahi-daemon
+    min_version: "0.7"
+    failure_mode: warn at admission and mark the plugin degraded with reason `avahi_daemon_missing`; SMB shares remain reachable by IP or explicit hostname but disappear from macOS Finder and Linux `avahi-browse` peers that discover shares via mDNS `_smb._tcp`. The `avahi-daemon` package on Debian / Fedora / Alpine / Arch provides the mDNS responder; declared here (in addition to network.shares' avahi-browse client) so the parity gate installs the daemon even when the host was provisioned with `--no-install-recommends` (in which case avahi-utils would install without pulling avahi-daemon).
 
 required_kernel_modules: []
 
 required_system_services:
   - smbd.service
+  - nmbd.service
+  - avahi-daemon.service
 
 verification:
   commands:

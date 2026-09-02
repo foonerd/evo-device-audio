@@ -49,6 +49,9 @@ required_binaries:
   - name: avahi-browse
     min_version: "0.7"
     failure_mode: warn at admission and mark the plugin degraded with reason `avahi_browse_missing`; mDNS discovery becomes unavailable; explicit-config paths continue to work. The `avahi-utils` package provides this on every supported distribution.
+  - name: avahi-daemon
+    min_version: "0.7"
+    failure_mode: warn at admission and mark the plugin degraded with reason `avahi_daemon_missing`; both mDNS discovery (this plugin, via avahi-browse) and mDNS advertisement (network.smb-server) go silent; explicit-config paths continue to work. Declared here explicitly (not left to avahi-utils' Recommends dep on avahi-daemon) so the parity gate installs the daemon even on hosts provisioned with `--no-install-recommends`, which is common in slim container base images and hardened build hosts.
 
 required_kernel_modules:
   - cifs

@@ -1222,31 +1222,46 @@ fi
 # `EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1` is the explicit
 # override for image-build paths that intentionally omit LAN
 # discovery (headless build hosts, non-audio distributions).
+# ensure_lan_discovery_unit: idempotent guarantor for a single
+# LAN-discovery daemon.  The plugin manifests (network.smb-server
+# + network.shares) declare avahi-daemon + nmbd as required_binary
+# and required_system_service, so the installer's parity gate
+# apt-installs and enables both via the declarative path in
+# evo-install.sh Step 3.  This routine is belt-and-braces: it
+# runs after Step 3 completes and self-provisions the daemon in
+# the (residual) case where the parity gate somehow left it
+# absent — a directly-invoked bootstrap.sh outside the installer
+# flow, an image-build path that pre-baked bundles without
+# running Step 3's package-install phase, or a host state where
+# apt was configured to skip Recommends and no plugin declared
+# the daemon as an explicit required_binary.  Argument shape:
+#   ensure_lan_discovery_unit <unit-name> <pkg-name> <purpose-tag>
+ensure_lan_discovery_unit() {
+    local unit="$1" pkg="$2" purpose="$3"
+    if ! "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
+        | grep -q "^${unit}"; then
+        echo "[bootstrap] ${unit} not present — installing ${pkg} (belt-and-braces; parity gate should have installed it via plugin manifest declaration)"
+        if ! DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
+            echo "[bootstrap] WARN: apt-get install ${pkg} failed — ${purpose} unavailable"
+            return
+        fi
+    fi
+    "$SYSTEMCTL_BIN" enable --now "$unit" >/dev/null 2>&1 || true
+    if "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null; then
+        echo "[bootstrap] ${unit} enabled + active (${purpose})"
+    else
+        echo "[bootstrap] WARN: ${unit} enable+start did not activate the unit; ${purpose} unavailable"
+    fi
+}
+
 if [[ "${EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY:-0}" != "1" ]]; then
-    if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
-        | grep -q '^avahi-daemon\.service'; then
-        "$SYSTEMCTL_BIN" enable --now avahi-daemon.service \
-            >/dev/null 2>&1 || true
-        if "$SYSTEMCTL_BIN" is-active --quiet avahi-daemon.service 2>/dev/null; then
-            echo "[bootstrap] avahi-daemon enabled + active (SMB mDNS advertisement)"
-        else
-            echo "[bootstrap] WARN: avahi-daemon enable+start did not activate the unit; SMB will be invisible via mDNS"
-        fi
-    else
-        echo "[bootstrap] WARN: avahi-daemon not installed — SMB will be invisible via mDNS"
-    fi
-    if "$SYSTEMCTL_BIN" list-unit-files 2>/dev/null \
-        | grep -q '^nmbd\.service'; then
-        "$SYSTEMCTL_BIN" enable --now nmbd.service \
-            >/dev/null 2>&1 || true
-        if "$SYSTEMCTL_BIN" is-active --quiet nmbd.service 2>/dev/null; then
-            echo "[bootstrap] nmbd enabled + active (NetBIOS name registration)"
-        else
-            echo "[bootstrap] WARN: nmbd enable+start did not activate the unit; SMB will be invisible via NetBIOS"
-        fi
-    else
-        echo "[bootstrap] WARN: nmbd not installed — SMB will be invisible via NetBIOS"
-    fi
+    ensure_lan_discovery_unit \
+        "avahi-daemon.service" "avahi-daemon" \
+        "SMB mDNS advertisement"
+    ensure_lan_discovery_unit \
+        "nmbd.service" "samba" \
+        "NetBIOS name registration"
 else
     echo "[bootstrap] EVO_BOOTSTRAP_SKIP_LAN_DISCOVERY=1 — avahi + nmbd left as-is"
 fi
