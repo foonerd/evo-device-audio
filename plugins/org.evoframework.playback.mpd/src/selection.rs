@@ -50,7 +50,10 @@
 use serde::Deserialize;
 
 use crate::library;
-use crate::mpd::{MpdConnection, MpdLibraryEntry};
+use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdSearchField};
+use evo_device_audio_shared::artist_name::{
+    artist_fold_key, split_artist_credit,
+};
 
 /// Selection criteria — mirrors the shape the browse drill's
 /// `BrowseSelector` already carries.
@@ -215,12 +218,107 @@ impl SelectionResolver for MpdSelectionResolver {
             return Ok(ResolvedSelection::UriList(Vec::new()));
         }
         match criteria.dimension {
-            SelectionDimension::Artist => Ok(build_filter(
-                mpd_tag_for_artist_dimension(criteria),
-                value,
-                criteria.parent.as_ref(),
-                false,
-            )),
+            SelectionDimension::Artist => {
+                // Fold-key drill matching the browse-by-artist
+                // enumeration algorithm in `library::browse_by_artist`
+                // (see docstring on `enumerate_artists_via_fanout` +
+                // the drill implementation around library.rs:1990).
+                //
+                // Rationale: browse fans multi-artist credits out
+                // into standalone tiles via `split_artist_credit`
+                // (e.g. "Home Free feat. Kira Isabella" produces
+                // separate tiles "Home Free" + "Kira Isabella").
+                // If the enqueue resolver ran an exact tag-match
+                // (`findadd artist "Kira Isabella"`) it would find
+                // zero tracks — the guest artist's name never
+                // appears as a whole tag anywhere — and the
+                // operator's "Add to queue" gesture would silently
+                // no-op. The fix mirrors the browse enumeration's
+                // fold-key expansion so every tile browse shows is
+                // enqueue-able.
+                //
+                // Algorithm:
+                //   1. Compute the target fold-key for the tile's
+                //      display value.
+                //   2. List all raw `albumartist` and `artist` tag
+                //      values in the library.
+                //   3. Keep only raw values whose `split_artist_credit`
+                //      contains a member matching the target key.
+                //   4. For each surviving raw value, `find` its
+                //      tracks (by AlbumArtist or Artist as appropriate).
+                //   5. Return the union as a `UriList` selection so
+                //      the queue verb's `add`/`addid` batch enqueues
+                //      exactly the same track set the browse-drill
+                //      would list.
+                //
+                // This is intentionally a `UriList` shape (not
+                // `Filter`) because MPD's `findadd` cannot express
+                // "any credit member matches" — it only takes an
+                // exact tag literal. Materialising the URI union
+                // once at enqueue is the correct primitive.
+                let target_key = artist_fold_key(value);
+                if target_key.is_empty() {
+                    return Ok(ResolvedSelection::UriList(Vec::new()));
+                }
+                let raw_albumartists =
+                    conn.list_tag("albumartist").await.map_err(|e| {
+                        SelectionError::SourceUnreachable(e.to_string())
+                    })?;
+                let matching_albumartist: Vec<String> = raw_albumartists
+                    .into_iter()
+                    .filter(|raw| {
+                        split_artist_credit(raw)
+                            .iter()
+                            .any(|m| artist_fold_key(m) == target_key)
+                    })
+                    .collect();
+                let raw_artists =
+                    conn.list_tag("artist").await.map_err(|e| {
+                        SelectionError::SourceUnreachable(e.to_string())
+                    })?;
+                let matching_artist: Vec<String> = raw_artists
+                    .into_iter()
+                    .filter(|raw| {
+                        split_artist_credit(raw)
+                            .iter()
+                            .any(|m| artist_fold_key(m) == target_key)
+                    })
+                    .collect();
+
+                let mut uris: Vec<String> = Vec::new();
+                for raw in &matching_albumartist {
+                    let entries = conn
+                        .find(MpdSearchField::AlbumArtist, raw)
+                        .await
+                        .map_err(|e| {
+                            SelectionError::SourceUnreachable(e.to_string())
+                        })?;
+                    for e in entries {
+                        if let MpdLibraryEntry::File { path, .. } = e {
+                            uris.push(path);
+                        }
+                    }
+                }
+                for raw in &matching_artist {
+                    let entries = conn
+                        .find(MpdSearchField::Artist, raw)
+                        .await
+                        .map_err(|e| {
+                            SelectionError::SourceUnreachable(e.to_string())
+                        })?;
+                    for e in entries {
+                        if let MpdLibraryEntry::File { path, .. } = e {
+                            uris.push(path);
+                        }
+                    }
+                }
+                // Dedupe — a track can carry the matching value on
+                // BOTH `AlbumArtist` and `Artist` tags. Sort first
+                // so `dedup` collapses adjacent duplicates.
+                uris.sort();
+                uris.dedup();
+                Ok(ResolvedSelection::UriList(uris))
+            }
             SelectionDimension::Genre => Ok(build_filter(
                 "genre",
                 value,
@@ -297,20 +395,6 @@ impl SelectionResolver for MpdSelectionResolver {
             }
         }
     }
-}
-
-/// Pick the MPD tag to filter for an `artist` dimension. The
-/// browse-by-artist facet dispatches with tag `albumartist`
-/// so the default lines up with what the UI clicked; a
-/// per-track `artist` filter (for feature-guest matches)
-/// requires an explicit `parent.tag = "artist"` context.
-fn mpd_tag_for_artist_dimension(criteria: &SelectionCriteria) -> &'static str {
-    if let Some(parent) = criteria.parent.as_ref() {
-        if parent.tag.trim().eq_ignore_ascii_case("artist") {
-            return "artist";
-        }
-    }
-    "albumartist"
 }
 
 /// Build a [`ResolvedSelection::Filter`] from a primary
