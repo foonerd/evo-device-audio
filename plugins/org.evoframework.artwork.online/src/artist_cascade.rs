@@ -1096,31 +1096,156 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
         }
     }
 
-    let Some(image_url) = cascade_response.image_url else {
-        return artist_bytes_not_found(
-            "cascade returned Ok but no image_url".into(),
-            cascade_response.provider_id,
-        );
-    };
-    let provider_id = cascade_response.provider_id.clone();
-
-    // The former Deezer-URL live-fetch refusal is retired. The
-    // framework's cache-first invariant demands that every winning
-    // portrait be persisted to disk so the operator's browse view
-    // renders from local bytes on a cable-pulled / offline paint.
-    // A provider whose ToS forbids byte persistence would leave
-    // every operator with that provider's winner offline-broken;
-    // the correction is to cache the bytes uniformly regardless of
-    // origin CDN and accept the legal-risk trade-off at the
-    // distribution boundary (operator's own configuration decides
-    // which providers are enabled).
+    // Walk the sources list in priority order (already sorted by
+    // `sort_sources_by_priority` inside `query_artist_artwork`).
+    // For each source: pick a canonical portrait URL, fetch, and
+    // transcode. If the resulting content_hash matches the known-
+    // placeholder set (Deezer's empty-MD5 blank silhouette is the
+    // recurring example — an initial URL that looks valid to
+    // `is_real_image_url` but whose CDN 302-redirects to
+    // `.../artist/d41d8cd98…/…`, so the placeholder only becomes
+    // detectable after the bytes arrive), CONTINUE the cascade to
+    // the next source instead of returning the blank as a
+    // "resolved" outcome. Same for a fetch or transcode error:
+    // the provider is not usable, try the next.
     //
-    // Any URL that returns fetchable bytes is cached. Providers
-    // that return placeholder or blank content are filtered upstream
-    // (`is_real_image_url`, framework-side `is_known_placeholder_hash`).
+    // Every source that produces real bytes gets cached uniformly;
+    // legal-risk trade-off at the distribution boundary. The
+    // sibling `is_real_image_url` filter at the picker layer
+    // rejects blank-shaped URLs before we ever fetch them; this
+    // loop is the belt-and-braces for blanks whose payload only
+    // reveals itself after the download.
+    //
+    // If the initial `cascade_response.image_url` was the winner
+    // and it's still usable, this loop finds it on iteration 1 —
+    // the cost of walking is a single pick_canonical_image_url on
+    // hit-path, no extra network round-trip in the common case.
+    if cascade_response.sources.is_empty() {
+        // Legacy path: no sources list, fall back to the single-
+        // winner url. Preserves callers that don't populate
+        // sources but do populate image_url.
+        let Some(image_url) = cascade_response.image_url else {
+            return artist_bytes_not_found(
+                "cascade returned Ok but no image_url".into(),
+                cascade_response.provider_id,
+            );
+        };
+        return fetch_and_transcode_single(
+            http,
+            &image_url,
+            cascade_response.provider_id,
+            size,
+        )
+        .await;
+    }
 
-    // Fetch the bytes.
-    let (bytes, source_mime) = match fetch_image_bytes(http, &image_url).await {
+    let mut last_provider_id: Option<String> = cascade_response.provider_id;
+    let mut last_detail: Option<String> = None;
+    for source in &cascade_response.sources {
+        let Some(url) = pick_canonical_image_url(&source.payload) else {
+            // Picker rejected this source (empty URL / blank-shaped
+            // URL per is_real_image_url). Move on.
+            continue;
+        };
+        last_provider_id = Some(source.provider_id.clone());
+        let (bytes, source_mime) = match fetch_image_bytes(http, &url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                last_detail = Some(format!(
+                    "artist image download failed for {url}: {e}"
+                ));
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = %source.provider_id,
+                    error = %e,
+                    "artist source fetch failed; trying next source"
+                );
+                continue;
+            }
+        };
+        let evo_device_audio_shared::transcode::TranscodedArtwork {
+            bytes: transcoded_bytes,
+            content_hash,
+            mime,
+        } = match evo_device_audio_shared::transcode::transcode(
+            bytes,
+            &source_mime,
+            size,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                last_detail = Some(format!(
+                    "transcode of {source_mime} bytes from artist provider \
+                     {source_provider} failed: {e}",
+                    source_provider = source.provider_id
+                ));
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = %source.provider_id,
+                    error = %e,
+                    "artist source transcode failed; trying next source"
+                );
+                continue;
+            }
+        };
+        if is_placeholder_hash_hex(&content_hash) {
+            // Deezer's "no picture" blank + any other known
+            // placeholder — the URL was structurally valid but
+            // the bytes are a well-known silhouette. Provider is
+            // effectively-empty for this artist; cascade continues.
+            last_detail = Some(format!(
+                "provider {} returned a known-placeholder image \
+                 (content_hash={content_hash}); continuing cascade",
+                source.provider_id
+            ));
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider = %source.provider_id,
+                content_hash = %content_hash,
+                "artist source produced a placeholder-hash image; trying next source"
+            );
+            continue;
+        }
+        // First real winner — return.
+        return ResolveArtistBytesOutput {
+            response: ResolveArtistBytesResponse {
+                v: 1,
+                status: crate::resolve::ResponseStatus::Ok,
+                content_hash: Some(content_hash.clone()),
+                mime: Some(mime),
+                size: Some(size.as_str().to_string()),
+                provider_id: Some(source.provider_id.clone()),
+                detail: None,
+            },
+            cache_payload: Some((content_hash, transcoded_bytes)),
+        };
+    }
+
+    // Every source was skipped (picker refused / fetch failed /
+    // transcode failed / placeholder hash). Surface NotFound so
+    // the framework endpoint returns a clean 404 for the
+    // operator UI's placeholder floor rather than a stale winner.
+    artist_bytes_not_found(
+        last_detail.unwrap_or_else(|| {
+            "artist cascade exhausted every source (no usable portrait bytes)"
+                .into()
+        }),
+        last_provider_id,
+    )
+}
+
+/// Single-URL fetch + transcode, used as the legacy fall-back
+/// when a cascade response carries no `sources` list (only the
+/// legacy `image_url` single-winner shape). New paths iterate
+/// sources through the loop in `resolve_artist_bytes_to_hash`
+/// so a placeholder-hash winner cascades to next.
+async fn fetch_and_transcode_single(
+    http: &reqwest::Client,
+    image_url: &str,
+    provider_id: Option<String>,
+    size: evo_device_audio_shared::transcode::ArtworkSize,
+) -> ResolveArtistBytesOutput {
+    let (bytes, source_mime) = match fetch_image_bytes(http, image_url).await {
         Ok(pair) => pair,
         Err(e) => {
             return artist_bytes_unavailable(
@@ -1129,8 +1254,6 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
             );
         }
     };
-
-    // Transcode via the shared pipeline.
     let evo_device_audio_shared::transcode::TranscodedArtwork {
         bytes: transcoded_bytes,
         content_hash,
@@ -1150,14 +1273,22 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
             );
             return artist_bytes_unavailable(
                 format!(
-                    "transcode of {source_mime} bytes from artist provider {provider_id:?} \
-                     failed: {e}"
+                    "transcode of {source_mime} bytes from artist provider \
+                     {provider_id:?} failed: {e}"
                 ),
                 provider_id,
             );
         }
     };
-
+    if is_placeholder_hash_hex(&content_hash) {
+        return artist_bytes_not_found(
+            format!(
+                "single-source path produced a known-placeholder image \
+                 (content_hash={content_hash}); no other source to cascade to"
+            ),
+            provider_id,
+        );
+    }
     ResolveArtistBytesOutput {
         response: ResolveArtistBytesResponse {
             v: 1,
@@ -1170,6 +1301,19 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
         },
         cache_payload: Some((content_hash, transcoded_bytes)),
     }
+}
+
+/// Check whether a hex-encoded content hash matches a known
+/// upstream "no image" placeholder. Mirrors the framework-side
+/// `is_known_placeholder_hash` list; both must accept the same
+/// set so the placeholder rejection is coherent across the
+/// cascade layer (plugin-side, this file) and the endpoint
+/// layer (framework-side, `artwork_cascade.rs`).
+///
+/// Currently: the empty-string MD5 hex sentinel Deezer uses as
+/// its "no picture" marker.
+fn is_placeholder_hash_hex(hash: &str) -> bool {
+    hash.eq_ignore_ascii_case(EMPTY_HASH_MD5_HEX)
 }
 
 fn image_url_host_is_deezer(url: &str) -> bool {
