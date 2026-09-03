@@ -557,64 +557,38 @@ impl Plugin for ArtworkOnlinePlugin {
             // live-run so `set_enabled(false)` removes the
             // source on the next query, no restart.
             //
-            // Keyed-provider policy — credential-authoritative:
-            // when a keyed provider's credential IS present in
-            // the vault at load time, the framework's
-            // `online_provider_config` store row for that
-            // provider is skipped in this overlay. Plugin
-            // defaults hold (enabled = true, priority = the
-            // per-provider plugin default). Rationale: the
-            // framework historically seeds keyed providers with
-            // `enabled = false` as an implicit "credential not
-            // supplied yet" signal — once the operator has
-            // supplied the credential the seed is a stale
-            // intent-signal that would otherwise force-disable
-            // a source the operator IS trying to use. The
-            // binding requirement in
-            // `METADATA-ENRICHMENT-FLOW.md` — "off until the
-            // key exists" — treats credential presence as the
-            // enable-authority for keyed providers.
-            // Credential presence IS the enable authority for
-            // every keyed provider in this cascade — not just
-            // fanart.
+            // Keyed-provider policy — an operator row always
+            // wins; credential presence is only the DEFAULT.
             //
-            // The framework seeds identity-bearing providers as
-            // `enabled: false` so an operator's enable gesture is
-            // what triggers the key prompt. But an operator who
-            // has already stored the key never makes that
-            // gesture, and the stale row then darkens a provider
-            // whose credential is wired and whose client is
-            // built. fanart escaped that because it carried a
-            // one-off override; Discogs would have walked
-            // straight into it (rig-confirmed:
-            // `discogs_wired=true` alongside
-            // `reason="operator_disabled"`).
+            // This overlay used to SKIP the store row for any
+            // keyed provider whose credential was present, on the
+            // rationale that the framework seeded keyed providers
+            // `enabled = false` as an implicit "no credential
+            // yet" marker, making the row a stale intent-signal
+            // once the operator supplied the key.
             //
-            // So the override becomes the rule. Any keyed
-            // provider whose credential resolved at load ignores
-            // the store's enable bit and keeps its cascade
-            // default. Removing the key is the off-switch;
-            // an explicit operator toggle remains available
-            // through the settings surface.
-            let credential_authoritative_set: std::collections::HashSet<
-                artist_cascade::ArtistProviderId,
-            > = [
-                (
-                    artist_cascade::ArtistProviderId::FanartTv,
-                    self.fanart_client.is_some(),
-                ),
-                (
-                    artist_cascade::ArtistProviderId::Discogs,
-                    self.discogs_client.is_some(),
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(pid, present)| present.then_some(pid))
-            .collect();
-            let credential_authoritative =
-                |pid: artist_cascade::ArtistProviderId| -> bool {
-                    credential_authoritative_set.contains(&pid)
-                };
+            // That seeding no longer exists. Rows in
+            // `online_providers` are written only by
+            // `set_enabled` / `set_priority` / `upsert` — every
+            // one of them an operator gesture — and the
+            // migration that rebuilt the table treats
+            // auto-inserted values as noise rather than intent.
+            // So a row here is the operator speaking, and
+            // skipping it silently reversed them: toggling a
+            // keyed provider off saw it snap straight back on,
+            // leaving "delete the key" as the only way to
+            // disable Discogs / Last.fm / Genius / fanart.tv —
+            // precisely the off-switch the settings toggle was
+            // added to replace.
+            //
+            // Both halves of the contract are still honoured,
+            // because they were never in conflict:
+            //   - no row  → `ArtistProviderConfig::defaults()`
+            //     ships both keyed providers enabled, so a
+            //     stored key means the source is used with no
+            //     second gesture;
+            //   - a row   → applied verbatim, so the operator
+            //     can switch a source off and keep its key.
             {
                 let mut cfg = self.artist_provider_config.write().await;
                 if let Some(store) = ctx.online_provider_config.as_ref() {
@@ -636,19 +610,25 @@ impl Plugin for ArtworkOnlinePlugin {
                                     );
                                     continue;
                                 };
-                                if credential_authoritative(pid) {
-                                    tracing::info!(
-                                        plugin = PLUGIN_NAME,
-                                        provider_id = %row.provider_id,
-                                        store_enabled = row.enabled,
-                                        store_priority = row.priority,
-                                        "credential-authoritative: this provider's \
-                                         credential is wired at load, so the store \
-                                         overlay row is skipped and the plugin's \
-                                         cascade defaults hold"
-                                    );
-                                    continue;
-                                }
+                                // A store row IS an operator
+                                // gesture — the table only gains
+                                // one when someone calls
+                                // set_enabled / set_priority — so
+                                // it is applied verbatim, keyed
+                                // provider or not.
+                                //
+                                // Credential presence is the
+                                // DEFAULT for a provider nobody
+                                // has touched (see
+                                // `ArtistProviderConfig::defaults`,
+                                // where both keyed providers ship
+                                // enabled), never an override of
+                                // a deliberate off. Skipping the
+                                // row here made the operator's
+                                // toggle snap back on and left
+                                // "delete the key" as the only
+                                // way to disable a keyed
+                                // provider.
                                 // Sentinel semantics (migration 042):
                                 // priority < 0 means "operator has NOT
                                 // explicitly set a priority for this
@@ -689,11 +669,7 @@ impl Plugin for ArtworkOnlinePlugin {
                 let rx = store.subscribe_changes();
                 let config_slot = Arc::clone(&self.artist_provider_config);
                 self.reactor_tasks.push(tokio::spawn(
-                    online_provider_config_reactor(
-                        rx,
-                        config_slot,
-                        credential_authoritative_set.clone(),
-                    ),
+                    online_provider_config_reactor(rx, config_slot),
                 ));
             }
             tracing::info!(
@@ -1223,17 +1199,6 @@ async fn online_provider_config_reactor(
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
     >,
     config_slot: Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
-    // Keyed providers whose credential resolved at load. A
-    // config-change event naming one of these is ignored —
-    // credential presence is the enable authority, so a store row
-    // cannot darken a provider whose key is wired. Carries the
-    // whole set rather than a single fanart bool because this
-    // cascade now has two keyed providers and will have more; a
-    // scalar was what confined the rule to fanart and let Discogs
-    // walk into the stale-row trap.
-    credential_authoritative: std::collections::HashSet<
-        artist_cascade::ArtistProviderId,
-    >,
 ) {
     loop {
         match rx.recv().await {
@@ -1250,19 +1215,13 @@ async fn online_provider_config_reactor(
                     );
                     continue;
                 };
-                if credential_authoritative.contains(&pid) {
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        provider_id = %event.provider_id,
-                        event_enabled = event.enabled,
-                        event_priority = event.priority,
-                        "reactor: credential-authoritative — this provider's \
-                         credential is present, so this config-change event is \
-                         not applied to the plugin's local cascade (plugin \
-                         defaults hold)"
-                    );
-                    continue;
-                }
+                // Every operator gesture is applied, keyed
+                // provider or not. Credential presence is the
+                // default for an untouched provider, never an
+                // override of a deliberate toggle — the earlier
+                // credential-authoritative skip here is what made
+                // the off-switch snap back on.
+                //
                 // Sentinel: priority < 0 means "operator has not
                 // explicitly set a priority" (migration 042).
                 // Keep the plugin's cascade default; still apply

@@ -361,6 +361,18 @@ pub struct MetadataOnlinePlugin {
     /// operator gesture lands, so reads never contend with
     /// themselves.
     provider_config: Arc<RwLock<cascade::ProviderConfig>>,
+    /// Provider ids the operator has explicitly configured through
+    /// the framework's `online_providers` store.
+    ///
+    /// A row in that table exists only because someone called
+    /// `set_enabled` / `set_priority`, so membership here means
+    /// "the operator has spoken about this provider". Credential
+    /// authority skips these: a stored key is the DEFAULT for a
+    /// provider nobody has touched, never an override of a
+    /// deliberate off. Populated at load from the store and
+    /// extended by the config reactor on every operator gesture.
+    explicitly_configured:
+        Arc<RwLock<std::collections::HashSet<cascade::ProviderId>>>,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -402,6 +414,9 @@ impl MetadataOnlinePlugin {
             theaudiodb_client: None,
             provider_config: Arc::new(RwLock::new(
                 cascade::ProviderConfig::defaults(),
+            )),
+            explicitly_configured: Arc::new(RwLock::new(
+                std::collections::HashSet::new(),
             )),
             reconcile_cache: None,
             lyrics_cache: None,
@@ -503,6 +518,15 @@ impl Plugin for MetadataOnlinePlugin {
             // does not implement) are skipped with a debug log —
             // the store is framework-wide and other plugins
             // register their own ids there.
+            // Provider ids the operator has explicitly configured
+            // via the framework store. Shared with both reactors
+            // so a later credential event cannot undo a
+            // deliberate toggle.
+            let explicitly_configured_slot =
+                Arc::clone(&self.explicitly_configured);
+            let mut explicitly_configured =
+                explicitly_configured_slot.write().await;
+            explicitly_configured.clear();
             {
                 let mut cfg = self.provider_config.write().await;
                 *cfg = self.config.provider_config.clone();
@@ -534,6 +558,16 @@ impl Plugin for MetadataOnlinePlugin {
                                 } else {
                                     Some(row.priority as u32)
                                 };
+                                // A row here IS an operator
+                                // gesture — the table only gains
+                                // one when someone calls
+                                // set_enabled / set_priority. Note
+                                // it so credential authority
+                                // below defaults only the
+                                // providers nobody has touched,
+                                // rather than overriding a
+                                // deliberate off.
+                                explicitly_configured.insert(pid);
                                 cfg.merge_override(
                                     pid,
                                     Some(row.enabled),
@@ -553,6 +587,7 @@ impl Plugin for MetadataOnlinePlugin {
                     }
                 }
             }
+            drop(explicitly_configured);
             // Shared HTTPS client — single connection pool +
             // DNS cache across every online provider in this
             // plugin.
@@ -683,11 +718,13 @@ impl Plugin for MetadataOnlinePlugin {
             let discogs_configured = self.discogs_client.read().await.is_some();
             let genius_configured = self.genius_client.read().await.is_some();
             {
+                let explicit = self.explicitly_configured.read().await;
                 let mut cfg = self.provider_config.write().await;
                 cfg.apply_credential_authority(
                     lastfm_configured,
                     discogs_configured,
                     genius_configured,
+                    &explicit,
                 );
             }
             tracing::info!(
@@ -735,6 +772,7 @@ impl Plugin for MetadataOnlinePlugin {
                     http_for_task,
                     config_for_task,
                     provider_config_for_task,
+                    Arc::clone(&self.explicitly_configured),
                 )));
             }
             // Spawn the online-provider-config reactor. On every
@@ -756,6 +794,7 @@ impl Plugin for MetadataOnlinePlugin {
                         rx,
                         config_slot,
                         vault_for_reactor,
+                        Arc::clone(&self.explicitly_configured),
                     ),
                 ));
             }
@@ -1325,6 +1364,12 @@ async fn credential_reactor(
     http: evo_online_providers::HttpClient,
     config: PluginConfig,
     provider_config: Arc<RwLock<cascade::ProviderConfig>>,
+    // Providers the operator has explicitly toggled. Credential
+    // authority defaults only the untouched ones — a key event
+    // must never undo a deliberate off.
+    explicitly_configured: Arc<
+        RwLock<std::collections::HashSet<cascade::ProviderId>>,
+    >,
 ) {
     use evo_plugin_sdk::contract::context::CredentialChangeKind;
     loop {
@@ -1422,11 +1467,13 @@ async fn credential_reactor(
                     let lastfm_present = lastfm_slot.read().await.is_some();
                     let discogs_present = discogs_slot.read().await.is_some();
                     let genius_present = genius_slot.read().await.is_some();
+                    let explicit = explicitly_configured.read().await;
                     let mut cfg = provider_config.write().await;
                     cfg.apply_credential_authority(
                         lastfm_present,
                         discogs_present,
                         genius_present,
+                        &explicit,
                     );
                     tracing::info!(
                         plugin = PLUGIN_NAME,
@@ -1484,6 +1531,14 @@ async fn online_provider_config_reactor(
     vault: Option<
         Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
     >,
+    // Extended on every gesture that reaches this reactor. An
+    // operator toggle recorded here makes credential authority
+    // leave that provider alone from then on, so a later key
+    // add / delete cannot silently re-enable something they
+    // switched off.
+    explicitly_configured: Arc<
+        RwLock<std::collections::HashSet<cascade::ProviderId>>,
+    >,
 ) {
     loop {
         match rx.recv().await {
@@ -1509,6 +1564,13 @@ async fn online_provider_config_reactor(
                     Some(event.priority as u32)
                 };
                 {
+                    // The gesture itself marks this provider as
+                    // operator-configured, so credential
+                    // authority stops defaulting it. Recorded
+                    // before the merge so a concurrent credential
+                    // event cannot slip in between and clobber
+                    // the value we are about to write.
+                    explicitly_configured.write().await.insert(pid);
                     let mut cfg = config_slot.write().await;
                     cfg.merge_override(
                         pid,
@@ -1521,7 +1583,9 @@ async fn online_provider_config_reactor(
                     provider_id = %event.provider_id,
                     enabled = event.enabled,
                     priority = event.priority,
-                    "reactor: applied online_provider_config change"
+                    "reactor: applied online_provider_config change (provider \
+                     now operator-configured; credential authority will not \
+                     re-default it)"
                 );
 
                 // on `enabled=true` for an

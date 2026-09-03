@@ -688,12 +688,27 @@ impl ProviderConfig {
         lastfm_present: bool,
         discogs_present: bool,
         genius_present: bool,
+        explicit: &std::collections::HashSet<ProviderId>,
     ) {
         for (provider, present) in [
             (ProviderId::Lastfm, lastfm_present),
             (ProviderId::Discogs, discogs_present),
             (ProviderId::Genius, genius_present),
         ] {
+            // An explicit operator gesture WINS. Credential
+            // presence is the default for a provider the operator
+            // has never touched, not an override of one they
+            // have.
+            //
+            // Without this guard the method forced
+            // `enabled = credential_present` over a stored
+            // `false`, so an operator toggling Discogs off saw it
+            // snap straight back on and had no way to disable a
+            // keyed provider short of deleting its key — the bad
+            // off-switch the toggle exists to replace.
+            if explicit.contains(&provider) {
+                continue;
+            }
             let mut flags = self.flags(provider);
             flags.enabled = present;
             self.set_flags(provider, flags);
@@ -849,7 +864,7 @@ mod tests {
         assert!(!cfg.flags(ProviderId::Lastfm).enabled);
         assert!(!cfg.flags(ProviderId::Genius).enabled);
 
-        cfg.apply_credential_authority(true, true, true);
+        cfg.apply_credential_authority(true, true, true, &none_explicit());
 
         assert!(cfg.flags(ProviderId::Discogs).enabled);
         assert!(cfg.flags(ProviderId::Lastfm).enabled);
@@ -862,41 +877,94 @@ mod tests {
         // reactor re-derives on every credential event, so a
         // delete darkens the provider on the next dispatch.
         let mut cfg = ProviderConfig::defaults();
-        cfg.apply_credential_authority(true, true, true);
+        cfg.apply_credential_authority(true, true, true, &none_explicit());
         assert!(cfg.flags(ProviderId::Discogs).enabled);
 
-        cfg.apply_credential_authority(false, false, false);
+        cfg.apply_credential_authority(false, false, false, &none_explicit());
 
         assert!(!cfg.flags(ProviderId::Discogs).enabled);
         assert!(!cfg.flags(ProviderId::Lastfm).enabled);
         assert!(!cfg.flags(ProviderId::Genius).enabled);
     }
 
+    /// No provider has been explicitly configured by the
+    /// operator — the state of a device where nobody has touched
+    /// the settings toggles.
+    fn none_explicit() -> std::collections::HashSet<ProviderId> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
-    fn credential_authority_wins_over_stale_store_row() {
-        // The exact defect this method closes. An operator stored
-        // a Discogs token; the framework's `online_providers`
-        // store still carries the identity-bearing opt-in default
-        // (`enabled = false`) because storing a key never
-        // published a config-change event. Pre-fix, the store
-        // overlay ran last and left the provider dark with a
-        // working client behind it — key stored, client built,
-        // cascade never dispatching, no error surfaced anywhere.
-        //
-        // Load order is: defaults -> store overlay ->
-        // credential authority. Credential authority runs last
-        // and wins, so a stale row cannot re-dark a provider
-        // whose key is wired.
+    fn explicit_operator_row_beats_credential_presence() {
+        // The off-switch. An operator who toggles a keyed
+        // provider off has spoken; a stored credential must not
+        // reverse them. Before this guard, credential authority
+        // forced enabled=true over the stored false, the toggle
+        // snapped back on, and deleting the key was the only way
+        // to disable the provider.
         let mut cfg = ProviderConfig::defaults();
+        let explicit: std::collections::HashSet<ProviderId> =
+            [ProviderId::Discogs].into_iter().collect();
+
         cfg.merge_override(ProviderId::Discogs, Some(false), None);
+        cfg.apply_credential_authority(true, true, true, &explicit);
+
+        assert!(
+            !cfg.flags(ProviderId::Discogs).enabled,
+            "an explicit operator off must survive credential \
+             authority"
+        );
+        // The providers the operator did NOT touch still default
+        // from credential presence.
+        assert!(cfg.flags(ProviderId::Lastfm).enabled);
+        assert!(cfg.flags(ProviderId::Genius).enabled);
+    }
+
+    #[test]
+    fn explicit_operator_on_also_survives_credential_absence() {
+        // Symmetry: an operator who explicitly enabled a provider
+        // keeps that state even if the credential probe comes
+        // back empty. Their gesture is authoritative in both
+        // directions; the provider simply has nothing to
+        // dispatch with until a key lands.
+        let mut cfg = ProviderConfig::defaults();
+        let explicit: std::collections::HashSet<ProviderId> =
+            [ProviderId::Genius].into_iter().collect();
+
+        cfg.merge_override(ProviderId::Genius, Some(true), None);
+        cfg.apply_credential_authority(false, false, false, &explicit);
+
+        assert!(cfg.flags(ProviderId::Genius).enabled);
+        // Untouched keyed providers follow credential presence.
+        assert!(!cfg.flags(ProviderId::Discogs).enabled);
+    }
+
+    #[test]
+    fn credential_authority_lifts_an_untouched_provider() {
+        // The defect this method closes. An operator stored a
+        // Discogs token; the compile-time default for an
+        // identity-bearing provider is `enabled = false`, and
+        // storing a key publishes no config-change event, so the
+        // provider stayed dark with a working client behind it —
+        // key stored, client built, cascade never dispatching, no
+        // error surfaced anywhere.
+        //
+        // Credential presence lifts it, but ONLY because the
+        // operator has not configured this provider. An earlier
+        // revision asserted the opposite — that credential
+        // authority beat a stored `false` — which is what made
+        // the settings toggle snap back on. That behaviour is
+        // now pinned against by
+        // `explicit_operator_row_beats_credential_presence`.
+        let mut cfg = ProviderConfig::defaults();
         assert!(!cfg.flags(ProviderId::Discogs).enabled);
 
-        cfg.apply_credential_authority(false, true, false);
+        cfg.apply_credential_authority(false, true, false, &none_explicit());
 
         assert!(
             cfg.flags(ProviderId::Discogs).enabled,
-            "a stored credential must beat a stale store row that \
-             says the provider is off"
+            "a stored credential must light a provider the \
+             operator has never configured"
         );
     }
 
@@ -906,7 +974,7 @@ mod tests {
         // set (or the plugin default) survives a credential event.
         let mut cfg = ProviderConfig::defaults();
         cfg.merge_override(ProviderId::Discogs, None, Some(7));
-        cfg.apply_credential_authority(false, true, false);
+        cfg.apply_credential_authority(false, true, false, &none_explicit());
         assert!(cfg.flags(ProviderId::Discogs).enabled);
         assert_eq!(cfg.flags(ProviderId::Discogs).priority, 7);
     }
@@ -918,7 +986,7 @@ mod tests {
         // identity-bearing provider; `offline` suppresses every
         // network provider. Both outrank credential presence.
         let mut cfg = ProviderConfig::defaults();
-        cfg.apply_credential_authority(true, true, true);
+        cfg.apply_credential_authority(true, true, true, &none_explicit());
         assert!(cfg.is_effectively_enabled(ProviderId::Discogs));
 
         cfg.privacy_mode = PrivacyMode::AnonymousOnly;
@@ -951,7 +1019,7 @@ mod tests {
         let wiki_before = cfg.flags(ProviderId::Wikipedia);
         let adb_before = cfg.flags(ProviderId::TheAudioDb);
 
-        cfg.apply_credential_authority(false, false, false);
+        cfg.apply_credential_authority(false, false, false, &none_explicit());
 
         assert_eq!(cfg.flags(ProviderId::MusicBrainz), mb_before);
         assert_eq!(cfg.flags(ProviderId::Wikipedia), wiki_before);
