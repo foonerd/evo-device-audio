@@ -797,6 +797,55 @@ fn is_real_image_url(url: &str) -> bool {
     true
 }
 
+/// Whether a live Deezer fetch could still win, given the
+/// non-Deezer outcomes already in hand.
+///
+/// Returns `true` only when some other provider both outranks
+/// Deezer under the operator's priority config **and** carries a
+/// payload the portrait picker accepts. Both halves are load
+/// bearing: a better-ranked source whose payload holds no
+/// photograph is skipped by the picker during the source walk, so
+/// Deezer could still win behind it and must not be suppressed.
+///
+/// Deezer is the only artist provider exempt from the result
+/// cache — its URLs are under a live-fetch invariant — so it is
+/// the one leg that costs a network round on an otherwise warm
+/// resolve. Suppressing calls that provably cannot win is what
+/// keeps a warm browse grid off Deezer's 1 req/s budget.
+fn deezer_is_outranked(
+    non_deezer: [(&ProviderOutcome, usize); 4],
+    deezer_dispatch_index: usize,
+    config: &ArtistProviderConfig,
+) -> bool {
+    // Mirror the selection rule exactly: sources are ordered by a
+    // STABLE sort on operator priority and the first one whose
+    // payload yields a portrait wins. Under a stable sort, equal
+    // priorities keep dispatch order, so the real rank of a source
+    // is the pair (priority, dispatch index) — comparing priority
+    // alone would miss every tie.
+    //
+    // Ties are not hypothetical: a device whose operator config
+    // assigns every provider the same priority leaves dispatch
+    // order as the sole tiebreak, and a priority-only test would
+    // then never suppress anything.
+    let deezer_rank = (
+        config.flags(ArtistProviderId::Deezer).priority,
+        deezer_dispatch_index,
+    );
+    non_deezer
+        .into_iter()
+        .filter_map(|(out, idx)| match out {
+            ProviderOutcome::Hit(entry) => Some((entry, idx)),
+            _ => None,
+        })
+        .any(|(entry, idx)| {
+            ArtistProviderId::from_wire(&entry.provider_id).is_some_and(|p| {
+                (config.flags(p).priority, idx) < deezer_rank
+                    && pick_canonical_image_url(&entry.payload).is_some()
+            })
+        })
+}
+
 /// Sort a `sources` slice in place by operator priority
 /// (ascending — lower wins). Unknown provider ids sink to the
 /// tail. Stable sort preserves input order for ties.
@@ -1992,16 +2041,59 @@ async fn run_cascade(
         }
     }
 
-    // Deezer always fires live — the by-id fetch is cheap
-    // (single HTTPS round on a known id) and the URL is under
-    // the live-fetch invariant.
-    let deezer_out = fetch_deezer_artist_by_id(
-        deezer_artist_id,
-        &artist,
-        catalogue,
-        want_deezer,
-    )
-    .await;
+    // Deezer fires live — the by-id fetch is cheap (single HTTPS
+    // round on a known id) and its URL sits under the live-fetch
+    // invariant, so it is never memoised. That last part also
+    // makes it the only provider still costing a network round on
+    // an otherwise fully-warm resolve, and its 1 req/s budget then
+    // sets the pace of a whole browse grid: twelve warm tiles
+    // measured 9.2s, of which the two carrying no Deezer source
+    // returned in 2ms.
+    //
+    // So skip it when a better-ranked provider has already
+    // produced a usable portrait. The cascade sorts sources by
+    // operator priority and takes the first whose payload yields a
+    // portrait URL, so an outranked Deezer result cannot win and
+    // the call would be spent for nothing. Both halves of that
+    // test matter: priority alone is not enough, because a
+    // better-ranked source whose payload carries no photograph
+    // (fanart with only logo/banner classes, say) is skipped by
+    // the picker and Deezer could still win behind it.
+    //
+    // When nothing better-ranked answered with a portrait, Deezer
+    // may itself be the winner and is fetched exactly as before.
+    // Indices are the dispatch positions used when the outcomes
+    // are aggregated below, which is what the stable sort falls
+    // back to when priorities tie.
+    let outranked_by_usable_portrait = deezer_is_outranked(
+        [
+            (&volumio_out, 0),
+            (&tadb_out, 1),
+            (&fanart_out, 3),
+            (&discogs_out, 4),
+        ],
+        2,
+        &catalogue.config,
+    );
+    let deezer_out = if outranked_by_usable_portrait {
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "deezer",
+            artist,
+            outcome = "absent",
+            reason = "outranked_by_usable_portrait",
+            "Deezer artist image: a better-ranked provider already yielded a portrait, so the live fetch is skipped (its result could not have won)"
+        );
+        ProviderOutcome::Absent
+    } else {
+        fetch_deezer_artist_by_id(
+            deezer_artist_id,
+            &artist,
+            catalogue,
+            want_deezer,
+        )
+        .await
+    };
 
     // Aggregate over all five provider outcomes.
     // `from_provider_outcomes` implements the three-way rule: any
@@ -3078,6 +3170,174 @@ mod tests {
         assert_eq!(cfg.flags(ArtistProviderId::Deezer).priority, baseline);
         cfg.merge_override(ArtistProviderId::Deezer, None, Some(3));
         assert_eq!(cfg.flags(ArtistProviderId::Deezer).priority, 3);
+    }
+
+    /// Diagnostic pin for the rig observation that fanart_tv, at
+    /// the best default priority and carrying a real portrait,
+    /// was ordered last and lost to Deezer.
+    #[test]
+    fn fanart_sorts_ahead_of_deezer_under_defaults() {
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "volumio_meta",
+                serde_json::json!({"image_url": "https://m.example/v.jpg"}),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({"thumb_url": "https://t.example/t.jpg"}),
+            ),
+            source_of(
+                "deezer",
+                serde_json::json!({"picture_xl_url": "https://d.example/d.jpg"}),
+            ),
+            source_of(
+                "fanart_tv",
+                serde_json::json!({
+                    "artist_thumb_urls": ["https://f.example/f.jpg"],
+                    "artist_background_urls": [],
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        let order: Vec<&str> =
+            sources.iter().map(|s| s.provider_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["fanart_tv", "deezer", "theaudiodb", "volumio_meta"],
+            "priority order must place fanart_tv (40) ahead of deezer (45)"
+        );
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(
+            resp.provider_id.as_deref(),
+            Some("fanart_tv"),
+            "fanart carries a populated artist_thumb_urls, so it must win"
+        );
+    }
+
+    /// The warm-browse win: a better-ranked provider carrying a
+    /// real portrait makes a Deezer call unwinnable, so it is not
+    /// made. Deezer is the only artist provider exempt from the
+    /// result cache, so this is what keeps a warm grid off its
+    /// 1 req/s budget.
+    #[test]
+    fn deezer_skipped_when_outranked_by_a_usable_portrait() {
+        let cfg = ArtistProviderConfig::defaults();
+        let fanart = ProviderOutcome::Hit(source_of(
+            "fanart_tv",
+            serde_json::json!({
+                "artist_thumb_urls": ["https://fanart.example/a.jpg"],
+            }),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&fanart, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// The case observed on every rig: operator config assigns
+    /// every provider the same priority, so the stable sort leaves
+    /// dispatch order as the only tiebreak. A provider dispatched
+    /// ahead of Deezer therefore wins, and Deezer's call is
+    /// unwinnable — a priority-only test would have missed this
+    /// entirely and suppressed nothing.
+    #[test]
+    fn deezer_skipped_under_flat_priorities_by_dispatch_order() {
+        let mut cfg = ArtistProviderConfig::defaults();
+        for p in [
+            ArtistProviderId::VolumioMeta,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+        ] {
+            cfg.merge_override(p, Some(true), Some(100));
+        }
+        let volumio = ProviderOutcome::Hit(source_of(
+            "volumio_meta",
+            serde_json::json!({"image_url": "https://m.example/v.jpg"}),
+        ));
+        let absent = ProviderOutcome::Absent;
+        // volumio_meta dispatches at 0, Deezer at 2 — same
+        // priority, so volumio_meta wins and Deezer cannot.
+        assert!(deezer_is_outranked(
+            [(&volumio, 0), (&absent, 1), (&absent, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+        // A provider dispatched *after* Deezer at equal priority
+        // loses the tie, so Deezer may still win and must fire.
+        let discogs_late = ProviderOutcome::Hit(source_of(
+            "discogs",
+            serde_json::json!({"image_url": "https://d.example/x.jpg"}),
+        ));
+        assert!(!deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&absent, 3), (&discogs_late, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Guardrail: priority alone must not suppress Deezer. A
+    /// better-ranked source whose payload holds no photograph —
+    /// fanart carrying only logo/banner classes — is skipped by
+    /// the picker during the source walk, so Deezer can still win
+    /// behind it and must still be fetched.
+    #[test]
+    fn deezer_still_fetched_when_better_ranked_source_has_no_portrait() {
+        let cfg = ArtistProviderConfig::defaults();
+        let logos_only = ProviderOutcome::Hit(source_of(
+            "fanart_tv",
+            serde_json::json!({
+                "hd_music_logo_urls": ["https://fanart.example/logo.png"],
+            }),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(!deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&logos_only, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Guardrail: when Deezer outranks everything that answered,
+    /// it may be the winner and must fire. Skipping it here would
+    /// blank the tile.
+    #[test]
+    fn deezer_still_fetched_when_it_outranks_every_answer() {
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Deezer, Some(true), Some(1));
+        let volumio = ProviderOutcome::Hit(source_of(
+            "volumio_meta",
+            serde_json::json!({"image_url": "https://meta.example/v.jpg"}),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(!deezer_is_outranked(
+            [(&volumio, 0), (&absent, 1), (&absent, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Nothing answered at all — Deezer is the only remaining
+    /// chance and must fire.
+    #[test]
+    fn deezer_still_fetched_when_no_other_provider_hit() {
+        let cfg = ArtistProviderConfig::defaults();
+        let absent = ProviderOutcome::Absent;
+        let unavailable = ProviderOutcome::Unavailable;
+        assert!(!deezer_is_outranked(
+            [
+                (&absent, 0),
+                (&unavailable, 1),
+                (&absent, 3),
+                (&unavailable, 4)
+            ],
+            2,
+            &cfg
+        ));
     }
 
     #[test]
