@@ -373,6 +373,14 @@ pub struct MetadataOnlinePlugin {
     /// extended by the config reactor on every operator gesture.
     explicitly_configured:
         Arc<RwLock<std::collections::HashSet<cascade::ProviderId>>>,
+    /// Framework handle used to read the device's privacy posture
+    /// at request time. See
+    /// [`read_device_privacy_mode_fail_safe`] for why this is
+    /// read per-request and why every uncertain outcome resolves
+    /// to the most restrictive posture.
+    online_provider_config: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -418,6 +426,7 @@ impl MetadataOnlinePlugin {
             explicitly_configured: Arc::new(RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            online_provider_config: None,
             reconcile_cache: None,
             lyrics_cache: None,
             bio_cache: None,
@@ -518,6 +527,9 @@ impl Plugin for MetadataOnlinePlugin {
             // does not implement) are skipped with a debug log —
             // the store is framework-wide and other plugins
             // register their own ids there.
+            // Stash the provider-config handle so each request can
+            // read the device's current privacy posture.
+            self.online_provider_config = ctx.online_provider_config.clone();
             // Provider ids the operator has explicitly configured
             // via the framework store. Shared with both reactors
             // so a later credential event cannot undo a
@@ -914,7 +926,32 @@ impl Respondent for MetadataOnlinePlugin {
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
             let theaudiodb = self.theaudiodb_client.clone();
-            let provider_config = self.provider_config.read().await.clone();
+            let mut provider_config = self.provider_config.read().await.clone();
+            // Overwrite the snapshot's posture with the device's,
+            // read from the framework. This plugin no longer
+            // carries a privacy posture of its own: it used to
+            // read one from its TOML, and that local copy is
+            // exactly why the artwork cascade — which had no copy
+            // at all — enforced nothing while this one enforced
+            // something. One device, one posture, read from the
+            // framework by every cascade.
+            //
+            // Read per-request, not cached: the posture is a
+            // safety control and a cached copy goes stale the
+            // moment an operator tightens it, which is precisely
+            // the window in which a leak would happen.
+            //
+            // Fail safe on any uncertainty — handle absent, read
+            // error, or a value this build cannot parse all
+            // resolve to the most restrictive posture. Missing
+            // enrichment is visible to an operator and
+            // recoverable; credentials sent against their stated
+            // wishes are neither.
+            provider_config.privacy_mode = read_device_privacy_mode_fail_safe(
+                self.online_provider_config.as_ref(),
+            )
+            .await;
+            let provider_config = provider_config;
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -1195,6 +1232,56 @@ fn identity_bearing_prompt(
 /// Fetch an operator-supplied credential from the framework vault
 /// under `key`. Returns `None` when the vault is not wired, when
 /// no row exists, or when the stored bytes are not valid UTF-8.
+/// Read the device's privacy posture from the framework, failing
+/// safe, and map it to this cascade's `PrivacyMode`.
+///
+/// Every uncertain outcome resolves to the most restrictive
+/// posture: handle absent (steward built without the
+/// provider-config store), read error, or a wire value this build
+/// does not recognise. The failure mode is missing enrichment,
+/// which an operator can see and report; the alternative failure
+/// mode is credentials leaving the device against an explicit
+/// instruction, which they cannot see at all.
+async fn read_device_privacy_mode_fail_safe(
+    handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
+) -> cascade::PrivacyMode {
+    use evo_plugin_sdk::contract::context::PrivacyPosture;
+    let posture = match handle {
+        None => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                posture = "offline",
+                reason = "provider_config_handle_absent",
+                "device privacy posture unreadable (no provider-config \
+                 handle); failing safe to the most restrictive posture — no \
+                 network provider will dispatch"
+            );
+            PrivacyPosture::Offline
+        }
+        Some(h) => match h.privacy_mode().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    posture = "offline",
+                    reason = "privacy_mode_read_failed",
+                    error = %e,
+                    "device privacy posture read failed; failing safe to the \
+                     most restrictive posture until the read succeeds"
+                );
+                PrivacyPosture::Offline
+            }
+        },
+    };
+    match posture {
+        PrivacyPosture::Enhanced => cascade::PrivacyMode::Enhanced,
+        PrivacyPosture::AnonymousOnly => cascade::PrivacyMode::AnonymousOnly,
+        PrivacyPosture::Offline => cascade::PrivacyMode::Offline,
+    }
+}
+
 async fn resolve_credential_from_vault(
     vault: Option<
         &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,

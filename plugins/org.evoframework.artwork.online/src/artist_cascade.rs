@@ -154,6 +154,57 @@ impl ArtistProviderId {
 }
 
 /// Whether a provider requires operator credentials to query.
+/// Why a provider is or is not dispatching on this resolve.
+///
+/// Exists so the journal names the real cause. The two
+/// non-dispatching cases point an operator at different settings
+/// — a per-provider toggle versus the device privacy posture —
+/// and conflating them sends them to the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderGate {
+    /// Permitted; the provider's own preconditions still apply.
+    Dispatch,
+    /// The operator turned this provider off.
+    OperatorDisabled,
+    /// The device's privacy posture suppresses it, regardless of
+    /// the operator's per-provider setting or whether its
+    /// credential is wired.
+    SuppressedByPrivacyMode,
+}
+
+impl ProviderGate {
+    /// Stable `reason` value for the journal.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            ProviderGate::Dispatch => "dispatch",
+            ProviderGate::OperatorDisabled => "operator_disabled",
+            ProviderGate::SuppressedByPrivacyMode => "privacy_mode",
+        }
+    }
+
+    /// Operator-readable explanation for the journal line.
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            ProviderGate::Dispatch => "permitted",
+            ProviderGate::OperatorDisabled => {
+                "operator disabled the provider in the artist-artwork config \
+                 (no network call fired)"
+            }
+            ProviderGate::SuppressedByPrivacyMode => {
+                "suppressed by the device privacy mode, which outranks the \
+                 per-provider setting and credential presence (no network \
+                 call fired); change it with the privacy-mode operator \
+                 gesture, not the provider toggle"
+            }
+        }
+    }
+
+    /// Whether the cascade should dispatch.
+    pub(crate) fn permits(self) -> bool {
+        matches!(self, ProviderGate::Dispatch)
+    }
+}
+
 /// The device's privacy posture, as read from the framework.
 ///
 /// Deliberately the SDK type rather than a plugin-local copy —
@@ -260,36 +311,39 @@ impl ArtistProviderConfig {
         self.flags(provider).enabled
     }
 
-    /// Whether the provider may dispatch, accounting for the
-    /// device's privacy posture.
+    /// Why a provider is or is not dispatching, accounting for
+    /// the device's privacy posture.
     ///
-    /// This gate did not exist. `is_enabled` alone was the whole
-    /// test, so this cascade dispatched identity-bearing
+    /// No posture gate existed here at all: `is_enabled` was the
+    /// whole test, so this cascade dispatched identity-bearing
     /// providers — fanart.tv, and Discogs since this release —
-    /// regardless of the operator's privacy posture, while the
-    /// text cascade suppressed its own. An operator selecting
+    /// regardless of the operator's posture, while the text
+    /// cascade suppressed its own. An operator selecting
     /// `anonymous_only` was protected on one surface and leaked
     /// on the other.
     ///
     /// The posture is non-bypassable and outranks both the
-    /// per-provider enable flag and credential presence:
+    /// per-provider enable flag and credential presence.
+    /// `offline` suppresses every provider here, since all of
+    /// them are network sources and this cascade has no local
+    /// provider. `anonymous_only` suppresses the
+    /// identity-bearing ones and leaves the keyless ones
+    /// reachable, so the operator still gets artwork, just
+    /// nothing tied to an account. `enhanced` defers entirely to
+    /// the per-provider selection.
     ///
-    /// - `offline` suppresses every provider here. All of them
-    ///   are network sources; there is no local artist-artwork
-    ///   provider in this cascade.
-    /// - `anonymous_only` suppresses every identity-bearing
-    ///   provider, leaving the keyless ones reachable so the
-    ///   operator still gets artwork, just nothing tied to an
-    ///   account.
-    /// - `enhanced` defers entirely to the operator's
-    ///   per-provider selection.
-    pub(crate) fn is_dispatchable(
+    /// Returns the reason as well as the verdict, because the two
+    /// non-dispatching cases point an operator at different
+    /// settings and conflating them sends them to the wrong one.
+    /// Use [`Self::is_dispatchable`] where only the verdict is
+    /// needed.
+    pub(crate) fn gate(
         &self,
         provider: ArtistProviderId,
         posture: ArtistPrivacyPosture,
-    ) -> bool {
+    ) -> ProviderGate {
         if !posture.permits_network() {
-            return false;
+            return ProviderGate::SuppressedByPrivacyMode;
         }
         if !posture.permits_identity_bearing()
             && matches!(
@@ -297,9 +351,27 @@ impl ArtistProviderConfig {
                 ArtistPrivacyClass::IdentityBearing
             )
         {
-            return false;
+            return ProviderGate::SuppressedByPrivacyMode;
         }
-        self.flags(provider).enabled
+        if !self.flags(provider).enabled {
+            return ProviderGate::OperatorDisabled;
+        }
+        ProviderGate::Dispatch
+    }
+
+    /// Whether the provider may dispatch under this posture.
+    ///
+    /// The verdict half of [`Self::gate`], which is the single
+    /// source of the decision — this delegates rather than
+    /// re-deriving it, so the two can never drift and leave the
+    /// cascade dispatching on one answer while the journal
+    /// explains the other.
+    pub(crate) fn is_dispatchable(
+        &self,
+        provider: ArtistProviderId,
+        posture: ArtistPrivacyPosture,
+    ) -> bool {
+        self.gate(provider, posture).permits()
     }
 
     /// Merge a runtime operator override on top of the current
@@ -1696,18 +1768,19 @@ async fn run_cascade(
         .is_dispatchable(ArtistProviderId::Deezer, posture)
         && catalogue.deezer.is_some()
         && reconciled.deezer_artist_url.is_some();
-    let want_fanart = catalogue
-        .config
-        .is_dispatchable(ArtistProviderId::FanartTv, posture)
-        && catalogue.fanart.is_some();
+    // Carry the gate, not just a bool, so the provider's journal
+    // line names whether the operator turned it off or the
+    // privacy posture suppressed it.
+    let gate_fanart =
+        catalogue.config.gate(ArtistProviderId::FanartTv, posture);
+    let want_fanart = gate_fanart.permits() && catalogue.fanart.is_some();
     // Discogs is name-keyed, so unlike fanart it carries no MBID
     // pre-condition — which is exactly why it earns its place:
     // the artists fanart's MBID gate skips are the ones Discogs
     // can still answer.
-    let want_discogs = catalogue
-        .config
-        .is_dispatchable(ArtistProviderId::Discogs, posture)
-        && catalogue.discogs.is_some();
+    let gate_discogs =
+        catalogue.config.gate(ArtistProviderId::Discogs, posture);
+    let want_discogs = gate_discogs.permits() && catalogue.discogs.is_some();
     // volumio_meta remains a name-only source; it takes no MBID
     // and no way to validate against a canonical identity. The
     // MBID reconcile above already confirmed the artist exists
@@ -1797,8 +1870,27 @@ async fn run_cascade(
                     catalogue,
                     want_theaudiodb,
                 ),
-                fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
-                fetch_discogs_artist(&artist, catalogue, want_discogs),
+                fetch_fanart_artist(
+                    effective_mbid,
+                    catalogue,
+                    if catalogue.fanart.is_some() {
+                        gate_fanart
+                    } else {
+                        // Client absent: the fetch reports its own
+                        // no-key-wired reason, which is a distinct
+                        // cause from either gate.
+                        ProviderGate::Dispatch
+                    },
+                ),
+                fetch_discogs_artist(
+                    &artist,
+                    catalogue,
+                    if catalogue.discogs.is_some() {
+                        gate_discogs
+                    } else {
+                        ProviderGate::Dispatch
+                    },
+                ),
             );
             // Cache-write policy: only write the aggregate provider
             // snapshot when EVERY non-Deezer outcome is non-transient
@@ -1982,10 +2074,9 @@ async fn name_search_safety_net(
     // does have them. Leaving it out of this path would have left
     // the feature working everywhere except the one place it was
     // built for.
-    let want_discogs = catalogue
-        .config
-        .is_dispatchable(ArtistProviderId::Discogs, posture)
-        && catalogue.discogs.is_some();
+    let gate_discogs =
+        catalogue.config.gate(ArtistProviderId::Discogs, posture);
+    let want_discogs = gate_discogs.permits() && catalogue.discogs.is_some();
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
         artist,
@@ -2004,7 +2095,15 @@ async fn name_search_safety_net(
             &catalogue.volumio_meta_variant,
             want_volumio,
         ),
-        fetch_discogs_artist(artist, catalogue, want_discogs),
+        fetch_discogs_artist(
+            artist,
+            catalogue,
+            if catalogue.discogs.is_some() {
+                gate_discogs
+            } else {
+                ProviderGate::Dispatch
+            },
+        ),
     );
     let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
         tadb_out,
@@ -2347,22 +2446,25 @@ async fn fetch_deezer_artist_by_name(
 async fn fetch_fanart_artist(
     artist_mbid: Option<&str>,
     catalogue: &ArtistCatalogue,
-    enabled: bool,
+    gate: ProviderGate,
 ) -> ProviderOutcome {
-    // Three silent pre-conditions that used to return Absent
+    // Four silent pre-conditions that used to return Absent
     // without any journal breadcrumb — operators triaging "why
     // is fanart never firing?" had to code-read to know these
     // gates existed. Each emits one INFO line naming exactly
     // which gate refused, so a single journal grep answers the
-    // question.
-    if !enabled {
+    // question — and the gate reason distinguishes an operator
+    // toggle from a privacy-mode suppression, which point at
+    // different settings.
+    if !gate.permits() {
         tracing::info!(
             plugin = crate::PLUGIN_NAME,
             provider = "fanart_tv",
             artist_mbid,
             outcome = "absent",
-            reason = "operator_disabled",
-            "fanart.tv artist images: operator disabled the provider in the artist-artwork config (no network call fired)"
+            reason = gate.reason(),
+            "fanart.tv artist images: {}",
+            gate.detail()
         );
         return ProviderOutcome::Absent;
     }
@@ -2495,16 +2597,17 @@ async fn fetch_fanart_artist(
 async fn fetch_discogs_artist(
     artist: &str,
     catalogue: &ArtistCatalogue,
-    enabled: bool,
+    gate: ProviderGate,
 ) -> ProviderOutcome {
-    if !enabled {
+    if !gate.permits() {
         tracing::info!(
             plugin = crate::PLUGIN_NAME,
             provider = "discogs",
             artist,
             outcome = "absent",
-            reason = "operator_disabled",
-            "Discogs artist images: operator disabled the provider in the artist-artwork config (no network call fired)"
+            reason = gate.reason(),
+            "Discogs artist images: {}",
+            gate.detail()
         );
         return ProviderOutcome::Absent;
     }
@@ -2977,6 +3080,75 @@ mod tests {
         assert!(cfg.is_dispatchable(ArtistProviderId::Deezer, p));
         assert!(cfg.is_dispatchable(ArtistProviderId::TheAudioDb, p));
         assert!(cfg.is_dispatchable(ArtistProviderId::VolumioMeta, p));
+    }
+
+    #[test]
+    fn gate_names_the_real_cause_not_the_operator() {
+        // A provider suppressed by the device posture was logged
+        // as `reason="operator_disabled"`, telling an operator
+        // they had switched something off when they had not, and
+        // pointing them at the wrong setting to undo it.
+        let mut cfg = ArtistProviderConfig::defaults();
+
+        // Posture suppression on a provider the operator has ON.
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
+        let g = cfg.gate(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::AnonymousOnly,
+        );
+        assert_eq!(g, ProviderGate::SuppressedByPrivacyMode);
+        assert_eq!(g.reason(), "privacy_mode");
+        assert!(!g.permits());
+
+        // Operator suppression under a permissive posture.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(false), None);
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Enhanced);
+        assert_eq!(g, ProviderGate::OperatorDisabled);
+        assert_eq!(g.reason(), "operator_disabled");
+
+        // Posture outranks: even operator-disabled, a restrictive
+        // posture is the cause the operator must address first.
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Offline);
+        assert_eq!(g, ProviderGate::SuppressedByPrivacyMode);
+
+        // Permitted.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(true), None);
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Enhanced);
+        assert_eq!(g, ProviderGate::Dispatch);
+        assert!(g.permits());
+    }
+
+    #[test]
+    fn gate_and_is_dispatchable_never_disagree() {
+        // Two entry points onto the same decision. If they drift,
+        // the cascade dispatches on one answer while the journal
+        // explains the other.
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Deezer, Some(false), None);
+        for posture in [
+            ArtistPrivacyPosture::Enhanced,
+            ArtistPrivacyPosture::AnonymousOnly,
+            ArtistPrivacyPosture::Offline,
+        ] {
+            for provider in [
+                ArtistProviderId::FanartTv,
+                ArtistProviderId::Discogs,
+                ArtistProviderId::Deezer,
+                ArtistProviderId::TheAudioDb,
+                ArtistProviderId::VolumioMeta,
+            ] {
+                assert_eq!(
+                    cfg.gate(provider, posture).permits(),
+                    cfg.is_dispatchable(provider, posture),
+                    "gate and is_dispatchable disagree for {} under {}",
+                    provider.as_str(),
+                    posture.as_wire()
+                );
+            }
+        }
     }
 
     #[test]
