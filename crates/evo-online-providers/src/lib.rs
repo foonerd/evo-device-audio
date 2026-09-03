@@ -51,7 +51,8 @@ pub use deezer::{
     ArtistImageHit as DeezerArtistImageHit, DeezerClient, DeezerError,
 };
 pub use discogs::{
-    ArtistProfileHit, DiscogsClient, DiscogsError, ReleaseDetailHit,
+    ArtistImageHit, ArtistProfileHit, DiscogsClient, DiscogsError,
+    ReleaseDetailHit,
 };
 pub use fanart::{
     ArtistImagesHit as FanartArtistImagesHit, FanartClient, FanartError,

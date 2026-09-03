@@ -82,6 +82,7 @@ use std::sync::Arc;
 
 use evo_online_providers::{
     deezer::DeezerClient,
+    discogs::DiscogsClient,
     fanart::FanartClient,
     musicbrainz::{
         parse_deezer_artist_id, MusicBrainzClient, MusicBrainzError,
@@ -102,6 +103,20 @@ pub(crate) enum ArtistProviderId {
     Deezer,
     // Identity-bearing — API key required.
     FanartTv,
+    /// Discogs artist photography.
+    ///
+    /// Closes the artist class every other provider here misses:
+    /// fanart is MBID-gated and skips anyone MusicBrainz cannot
+    /// reconcile (most `feat.` credits, composer-conductor
+    /// entries, solo instrumentalists), and anonymous Deezer
+    /// answers those same artists with an empty body. Discogs
+    /// holds real images for them.
+    ///
+    /// The credential is the operator's Discogs token, owned by
+    /// `org.evoframework.metadata.online` and read here through
+    /// the framework's governed provider-credential grant — the
+    /// operator enters it once, for both surfaces.
+    Discogs,
 }
 
 impl ArtistProviderId {
@@ -111,6 +126,7 @@ impl ArtistProviderId {
             ArtistProviderId::TheAudioDb => "theaudiodb",
             ArtistProviderId::Deezer => "deezer",
             ArtistProviderId::FanartTv => "fanart_tv",
+            ArtistProviderId::Discogs => "discogs",
         }
     }
 
@@ -120,6 +136,7 @@ impl ArtistProviderId {
             "theaudiodb" => Some(ArtistProviderId::TheAudioDb),
             "deezer" => Some(ArtistProviderId::Deezer),
             "fanart_tv" => Some(ArtistProviderId::FanartTv),
+            "discogs" => Some(ArtistProviderId::Discogs),
             _ => None,
         }
     }
@@ -129,7 +146,9 @@ impl ArtistProviderId {
             ArtistProviderId::VolumioMeta
             | ArtistProviderId::TheAudioDb
             | ArtistProviderId::Deezer => ArtistPrivacyClass::Anonymous,
-            ArtistProviderId::FanartTv => ArtistPrivacyClass::IdentityBearing,
+            ArtistProviderId::FanartTv | ArtistProviderId::Discogs => {
+                ArtistPrivacyClass::IdentityBearing
+            }
         }
     }
 }
@@ -167,6 +186,7 @@ pub(crate) struct ArtistProviderConfig {
     pub(crate) theaudiodb: ArtistProviderFlags,
     pub(crate) deezer: ArtistProviderFlags,
     pub(crate) fanart_tv: ArtistProviderFlags,
+    pub(crate) discogs: ArtistProviderFlags,
 }
 
 impl ArtistProviderConfig {
@@ -175,6 +195,17 @@ impl ArtistProviderConfig {
             fanart_tv: ArtistProviderFlags {
                 enabled: true,
                 priority: 40,
+            },
+            // Between fanart (40) and Deezer (45), deliberately.
+            // Discogs covers exactly the artists fanart's MBID
+            // gate skips, and Deezer answers those same artists
+            // with an empty body — so a real Discogs image must
+            // beat Deezer's blank. Combined with the
+            // placeholder-hash skip in the cascade walk, this is
+            // what makes that artist class actually paint.
+            discogs: ArtistProviderFlags {
+                enabled: true,
+                priority: 42,
             },
             deezer: ArtistProviderFlags {
                 enabled: true,
@@ -200,6 +231,7 @@ impl ArtistProviderConfig {
             ArtistProviderId::TheAudioDb => self.theaudiodb,
             ArtistProviderId::Deezer => self.deezer,
             ArtistProviderId::FanartTv => self.fanart_tv,
+            ArtistProviderId::Discogs => self.discogs,
         }
     }
 
@@ -213,6 +245,7 @@ impl ArtistProviderConfig {
             ArtistProviderId::TheAudioDb => self.theaudiodb = flags,
             ArtistProviderId::Deezer => self.deezer = flags,
             ArtistProviderId::FanartTv => self.fanart_tv = flags,
+            ArtistProviderId::Discogs => self.discogs = flags,
         }
     }
 
@@ -681,6 +714,11 @@ pub(crate) struct ArtistCatalogue {
     pub(crate) theaudiodb: Option<Arc<TheAudioDbClient>>,
     pub(crate) deezer: Option<Arc<DeezerClient>>,
     pub(crate) fanart: Option<Arc<FanartClient>>,
+    /// Discogs client for artist photography. `None` when the
+    /// operator has stored no Discogs token, or the framework
+    /// refused this plugin's provider-credential grant — both
+    /// cases disable the source and the cascade walks on.
+    pub(crate) discogs: Option<Arc<DiscogsClient>>,
     /// MusicBrainz client used to reconcile the artist's
     /// canonical MBID before dispatching identity-bearing
     /// providers. Always present when the plugin has loaded
@@ -1587,6 +1625,12 @@ async fn run_cascade(
         && reconciled.deezer_artist_url.is_some();
     let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
         && catalogue.fanart.is_some();
+    // Discogs is name-keyed, so unlike fanart it carries no MBID
+    // pre-condition — which is exactly why it earns its place:
+    // the artists fanart's MBID gate skips are the ones Discogs
+    // can still answer.
+    let want_discogs = catalogue.config.is_enabled(ArtistProviderId::Discogs)
+        && catalogue.discogs.is_some();
     // volumio_meta remains a name-only source; it takes no MBID
     // and no way to validate against a canonical identity. The
     // MBID reconcile above already confirmed the artist exists
@@ -1595,7 +1639,12 @@ async fn run_cascade(
     let want_volumio =
         catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
 
-    if !(want_volumio || want_theaudiodb || want_deezer || want_fanart) {
+    if !(want_volumio
+        || want_theaudiodb
+        || want_deezer
+        || want_fanart
+        || want_discogs)
+    {
         // Reconcile succeeded but no provider is enabled /
         // available. Not the "reconcile-absent" case above.
         return Ok(ArtistArtworkResponse::not_configured(
@@ -1630,7 +1679,7 @@ async fn run_cascade(
     } else {
         None
     };
-    let (volumio_out, tadb_out, fanart_out) =
+    let (volumio_out, tadb_out, fanart_out, discogs_out) =
         if let Some(sources) = cached_non_deezer.as_ref() {
             // Warm cache — re-hydrate cached entries as Hits. The
             // cache only ever stores successful entries (see the
@@ -1641,21 +1690,23 @@ async fn run_cascade(
             let mut v = ProviderOutcome::Absent;
             let mut t = ProviderOutcome::Absent;
             let mut f = ProviderOutcome::Absent;
+            let mut d = ProviderOutcome::Absent;
             for src in sources {
                 match src.provider_id.as_str() {
                     "volumio_meta" => v = ProviderOutcome::Hit(src.clone()),
                     "theaudiodb" => t = ProviderOutcome::Hit(src.clone()),
                     "fanart_tv" => f = ProviderOutcome::Hit(src.clone()),
+                    "discogs" => d = ProviderOutcome::Hit(src.clone()),
                     _ => {}
                 }
             }
-            (v, t, f)
+            (v, t, f, d)
         } else {
             // Cold cache — hit every enabled non-Deezer provider
             // and cache only the Hits. Absent/Unavailable never
             // enter the cache: absence gets re-tried next request
             // (cheap) and unavailable MUST NOT durably poison.
-            let (v, t, f) = tokio::join!(
+            let (v, t, f, d) = tokio::join!(
                 fetch_volumio_meta_artist(
                     &artist,
                     &catalogue.volumio_meta_http,
@@ -1669,6 +1720,7 @@ async fn run_cascade(
                     want_theaudiodb,
                 ),
                 fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
+                fetch_discogs_artist(&artist, catalogue, want_discogs),
             );
             // Cache-write policy: only write the aggregate provider
             // snapshot when EVERY non-Deezer outcome is non-transient
@@ -1686,9 +1738,13 @@ async fn run_cascade(
                     && matches!(
                         f,
                         ProviderOutcome::Hit(_) | ProviderOutcome::Absent
+                    )
+                    && matches!(
+                        d,
+                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
                     );
             if can_cache && all_non_transient {
-                let snapshot: Vec<serde_json::Value> = [&v, &t, &f]
+                let snapshot: Vec<serde_json::Value> = [&v, &t, &f, &d]
                     .into_iter()
                     .filter_map(|out| match out {
                         ProviderOutcome::Hit(entry) => {
@@ -1705,7 +1761,7 @@ async fn run_cascade(
                     )
                     .await;
             }
-            (v, t, f)
+            (v, t, f, d)
         };
 
     // Deezer always fires live — the by-id fetch is cheap
@@ -1719,15 +1775,17 @@ async fn run_cascade(
     )
     .await;
 
-    // Aggregate over all four provider outcomes. `from_provider_outcomes`
-    // implements the three-way rule: any Hit wins → Ok; otherwise
-    // any Unavailable → Unavailable (retry-safe, no negative cache);
-    // otherwise all Absent → NotFound.
+    // Aggregate over all five provider outcomes.
+    // `from_provider_outcomes` implements the three-way rule: any
+    // Hit wins → Ok; otherwise any Unavailable → Unavailable
+    // (retry-safe, no negative cache); otherwise all Absent →
+    // NotFound.
     let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
         volumio_out,
         tadb_out,
         deezer_out,
         fanart_out,
+        discogs_out,
     ]);
     if matches!(response.status, CascadeStatus::Ok) {
         sort_sources_by_priority(&mut response.sources, &catalogue.config);
@@ -1747,6 +1805,8 @@ fn any_provider_configured(catalogue: &ArtistCatalogue) -> bool {
             && catalogue.deezer.is_some())
         || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
             && catalogue.fanart.is_some())
+        || (catalogue.config.is_enabled(ArtistProviderId::Discogs)
+            && catalogue.discogs.is_some())
 }
 
 // ---------------------------------------------------------------
@@ -1804,15 +1864,33 @@ async fn name_search_safety_net(
         && catalogue.deezer.is_some();
     let want_volumio =
         catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    // Discogs belongs in the safety net for the same reason
+    // TheAudioDB and Deezer do — it is name-keyed and returns the
+    // artist id + canonical entity alongside the image, so a
+    // wrong-entity picture cannot come out of a name-search hit.
+    //
+    // It matters here more than anywhere else in the cascade.
+    // This path runs precisely when MusicBrainz could not
+    // reconcile the artist, which is the population fanart's MBID
+    // gate skips — `feat.` credits, composer-conductor entries,
+    // solo instrumentalists. Of the three providers that were
+    // here before, Deezer answers that population with an empty
+    // body and the other two frequently have nothing. Discogs
+    // does have them. Leaving it out of this path would have left
+    // the feature working everywhere except the one place it was
+    // built for.
+    let want_discogs = catalogue.config.is_enabled(ArtistProviderId::Discogs)
+        && catalogue.discogs.is_some();
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
         artist,
         theaudiodb_enabled = want_theaudiodb,
         deezer_enabled = want_deezer,
         volumio_meta_enabled = want_volumio,
+        discogs_enabled = want_discogs,
         "artwork.online.artist.name_search_safety_net.begin",
     );
-    let (tadb_out, deezer_out, volumio_out) = tokio::join!(
+    let (tadb_out, deezer_out, volumio_out, discogs_out) = tokio::join!(
         fetch_theaudiodb_artist(None, artist, catalogue, want_theaudiodb),
         fetch_deezer_artist_by_name(artist, catalogue, want_deezer),
         fetch_volumio_meta_artist(
@@ -1821,11 +1899,13 @@ async fn name_search_safety_net(
             &catalogue.volumio_meta_variant,
             want_volumio,
         ),
+        fetch_discogs_artist(artist, catalogue, want_discogs),
     );
     let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
         tadb_out,
         deezer_out,
         volumio_out,
+        discogs_out,
     ]);
     if matches!(response.status, CascadeStatus::Ok) {
         sort_sources_by_priority(&mut response.sources, &catalogue.config);
@@ -2285,6 +2365,107 @@ async fn fetch_fanart_artist(
     })
 }
 
+/// Fetch a Discogs artist photograph.
+///
+/// Name-keyed, unlike fanart.tv — and that is the whole point of
+/// having it here. fanart is MBID-gated, so it silently skips
+/// every artist MusicBrainz cannot reconcile: most `feat.`
+/// credits, composer-conductor entries, solo instrumentalists.
+/// Anonymous Deezer answers those same artists with an empty
+/// body. Discogs searches by name and holds real images for them,
+/// which is why it sits at priority 42 — ahead of Deezer's blank,
+/// behind fanart's higher-quality set when fanart can answer at
+/// all.
+///
+/// Costs two rate-limited upstream requests on a hit (search,
+/// then artist detail). Both share the client's single 1 req/s
+/// limiter, and the artwork resolve contract is fetch-once-and-
+/// persist, so an artist is looked up at most once ever rather
+/// than once per paint.
+///
+/// Every refusal path emits one INFO line naming the exact gate,
+/// mirroring the fanart handler — an operator triaging "why is
+/// Discogs never firing?" gets the answer from one journal grep
+/// instead of a code read.
+async fn fetch_discogs_artist(
+    artist: &str,
+    catalogue: &ArtistCatalogue,
+    enabled: bool,
+) -> ProviderOutcome {
+    if !enabled {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            artist,
+            outcome = "absent",
+            reason = "operator_disabled",
+            "Discogs artist images: operator disabled the provider in the artist-artwork config (no network call fired)"
+        );
+        return ProviderOutcome::Absent;
+    }
+    let Some(discogs) = catalogue.discogs.as_ref() else {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            artist,
+            outcome = "absent",
+            reason = "no_token_wired",
+            "Discogs artist images: no Personal Access Token resolved at plugin load, so the client is not wired (no network call fired); the token is owned by org.evoframework.metadata.online and read here through the framework's provider-credential grant — store it once under `discogs_personal_access_token` and both the text and artwork surfaces light up"
+        );
+        return ProviderOutcome::Absent;
+    };
+    if artist.trim().is_empty() {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            outcome = "absent",
+            reason = "empty_artist_name",
+            "Discogs artist images: artist name is empty and Discogs is name-keyed (no network call fired)"
+        );
+        return ProviderOutcome::Absent;
+    }
+    let hit = match discogs.get_artist_image(artist).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                outcome = "absent",
+                reason = "no_search_match_or_no_images",
+                "Discogs artist images: search resolved no artist, or the resolved artist carries no imagery (structural absence, not a token / endpoint problem)"
+            );
+            return ProviderOutcome::Absent;
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                error = %e,
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "Discogs artist images transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
+            );
+            return ProviderOutcome::Unavailable;
+        }
+    };
+    let payload = serde_json::json!({
+        "image_url": hit.image_url,
+        "source_url": hit.source_url,
+    });
+    ProviderOutcome::Hit(SourceEntry {
+        provider_id: ArtistProviderId::Discogs.as_str().to_string(),
+        privacy_class: ArtistPrivacyClass::IdentityBearing.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Discogs".into(),
+            source_url: hit.source_url.clone(),
+            license: "Discogs terms of use".into(),
+        },
+    })
+}
+
 /// Minimal percent-encoder for URL query values. Mirrors the
 /// helper in providers.rs.
 fn percent_encode(s: &str) -> String {
@@ -2654,16 +2835,97 @@ mod tests {
             source_of("theaudiodb", serde_json::json!({})),
             source_of("volumio_meta", serde_json::json!({})),
             source_of("fanart_tv", serde_json::json!({})),
+            source_of("discogs", serde_json::json!({})),
         ];
         sort_sources_by_priority(&mut sources, &cfg);
-        // Priority order (lower wins): fanart 40, deezer 45,
-        // theaudiodb 50, volumio 55. fanart wins when its key
-        // is present and it produced a source; deezer stays
-        // the keyless fallback.
+        // Priority order (lower wins): fanart 40, discogs 42,
+        // deezer 45, theaudiodb 50, volumio 55. fanart wins when
+        // its key is present and it produced a source; discogs
+        // sits directly behind it and ahead of Deezer because
+        // Deezer answers the fanart-miss artist class with an
+        // empty body while Discogs has a real image; deezer stays
+        // the keyless fallback below both.
         assert_eq!(sources[0].provider_id, "fanart_tv");
-        assert_eq!(sources[1].provider_id, "deezer");
-        assert_eq!(sources[2].provider_id, "theaudiodb");
-        assert_eq!(sources[3].provider_id, "volumio_meta");
+        assert_eq!(sources[1].provider_id, "discogs");
+        assert_eq!(sources[2].provider_id, "deezer");
+        assert_eq!(sources[3].provider_id, "theaudiodb");
+        assert_eq!(sources[4].provider_id, "volumio_meta");
+    }
+
+    #[test]
+    fn discogs_outranks_deezer_so_a_real_image_beats_a_blank() {
+        // The operator-visible reason Discogs exists here. For the
+        // artist class fanart's MBID gate skips, Deezer is the
+        // only other provider that answers — and it answers with
+        // an empty body. If Deezer sorted first its blank would
+        // become the primary and the tile would stay a glyph.
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn.deezer.example/xl.jpg",
+                }),
+            ),
+            source_of(
+                "discogs",
+                serde_json::json!({
+                    "image_url": "https://img.discogs.example/artist.jpg",
+                    "source_url": "https://www.discogs.com/artist/12345",
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        assert_eq!(sources[0].provider_id, "discogs");
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("discogs"));
+    }
+
+    #[test]
+    fn discogs_payload_resolves_through_the_byte_path_picker() {
+        // The byte-fetch path calls pick_canonical_image_url on
+        // the winning source. Discogs emits its URL under
+        // `image_url`, which the picker's string-key list already
+        // covers — this pins that alignment so a payload-shape
+        // change cannot silently strand the provider with a
+        // cascade hit that yields no bytes.
+        let payload = serde_json::json!({
+            "image_url": "https://img.discogs.example/artist.jpg",
+            "source_url": "https://www.discogs.com/artist/12345",
+        });
+        assert_eq!(
+            pick_canonical_image_url(&payload).as_deref(),
+            Some("https://img.discogs.example/artist.jpg")
+        );
+    }
+
+    #[test]
+    fn discogs_is_identity_bearing_and_round_trips_on_the_wire() {
+        assert_eq!(ArtistProviderId::Discogs.as_str(), "discogs");
+        assert_eq!(
+            ArtistProviderId::from_wire("discogs"),
+            Some(ArtistProviderId::Discogs)
+        );
+        // Identity-bearing alongside fanart: both consume an
+        // operator-owned credential to authenticate.
+        assert_eq!(
+            ArtistProviderId::Discogs.privacy_class(),
+            ArtistPrivacyClass::IdentityBearing
+        );
+    }
+
+    #[test]
+    fn discogs_defaults_sit_between_fanart_and_deezer() {
+        let cfg = ArtistProviderConfig::defaults();
+        let fanart = cfg.flags(ArtistProviderId::FanartTv).priority;
+        let discogs = cfg.flags(ArtistProviderId::Discogs).priority;
+        let deezer = cfg.flags(ArtistProviderId::Deezer).priority;
+        assert!(
+            fanart < discogs && discogs < deezer,
+            "discogs ({discogs}) must sit strictly between fanart \
+             ({fanart}) and deezer ({deezer})"
+        );
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
     }
 
     #[test]

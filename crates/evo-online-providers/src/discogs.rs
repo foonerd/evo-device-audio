@@ -85,6 +85,23 @@ pub struct ArtistProfileHit {
     pub source_url: Option<String>,
 }
 
+/// Artist-image hit — the URL of a photograph Discogs holds for
+/// the artist, plus the artist page to attribute it to.
+///
+/// Distinct from [`ArtistProfileHit`] on purpose: the bio surface
+/// and the artwork surface live in different plugins, and a
+/// caller that wants a picture should not pay for a profile-text
+/// round trip (or vice versa).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtistImageHit {
+    /// Full-size image URL. Callers fetch and transcode this
+    /// themselves; the client returns a reference, never bytes,
+    /// matching how every other artwork provider behaves here.
+    pub image_url: String,
+    /// Artist page on Discogs, for operator-facing attribution.
+    pub source_url: Option<String>,
+}
+
 /// Discogs JSON client.
 #[derive(Clone)]
 pub struct DiscogsClient {
@@ -265,6 +282,65 @@ impl DiscogsClient {
             )),
         }))
     }
+
+    /// Fetch an artist photograph URL for `artist`.
+    ///
+    /// Returns `Ok(None)` when the search resolves no artist, or
+    /// when the resolved artist carries no imagery — both are
+    /// ordinary misses that let a cascade walk on to the next
+    /// provider, not errors. Returns `Err` on transport or decode
+    /// failure.
+    ///
+    /// Costs two rate-limited requests on a hit (search, then
+    /// detail), the same shape as [`Self::get_artist_profile`].
+    /// Both share the client's single limiter, so the ceiling
+    /// holds across the artwork and text surfaces together.
+    ///
+    /// Prefers the image Discogs marks `primary`; falls back to
+    /// the first entry carrying a URL when no primary is flagged,
+    /// because an artist with only `secondary` images still has a
+    /// usable photograph and refusing it would leave the tile
+    /// blank for no reason.
+    pub async fn get_artist_image(
+        &self,
+        artist: &str,
+    ) -> Result<Option<ArtistImageHit>, DiscogsError> {
+        let search_url = format!(
+            "{DISCOGS_API_BASE}/database/search?type=artist&q={}&per_page=1",
+            urlencode(artist),
+        );
+        let search: ArtistSearchResponse = self.get_json(search_url).await?;
+        let Some(first) = search.results.into_iter().next() else {
+            return Ok(None);
+        };
+        let detail_url = format!("{DISCOGS_API_BASE}/artists/{}", first.id);
+        let detail: ArtistDetail = self.get_json(detail_url).await?;
+        let images = detail.images.unwrap_or_default();
+        let pick = images
+            .iter()
+            .find(|i| {
+                i.kind.as_deref() == Some("primary")
+                    && i.uri.as_deref().is_some_and(|u| !u.trim().is_empty())
+            })
+            .or_else(|| {
+                images.iter().find(|i| {
+                    i.uri.as_deref().is_some_and(|u| !u.trim().is_empty())
+                })
+            });
+        let Some(entry) = pick else {
+            return Ok(None);
+        };
+        let Some(image_url) = entry.uri.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(ArtistImageHit {
+            image_url: image_url.clone(),
+            source_url: Some(format!(
+                "https://www.discogs.com/artist/{}",
+                first.id
+            )),
+        }))
+    }
 }
 
 /// Prefer the plaintext-annotated field, fall back to the raw
@@ -354,6 +430,24 @@ struct ArtistDetail {
     /// Callers prefer this over `profile`.
     #[serde(default)]
     profile_plaintext: Option<String>,
+    /// Artist photographs. Absent on artists Discogs holds no
+    /// imagery for, and absent entirely on responses to tokens
+    /// without image permission — both surface as "no image"
+    /// rather than an error.
+    #[serde(default)]
+    images: Option<Vec<ArtistImageEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistImageEntry {
+    /// `"primary"` for the artist's main photograph,
+    /// `"secondary"` for the rest. Discogs does not guarantee a
+    /// primary exists.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// Full-size image URL.
+    #[serde(default)]
+    uri: Option<String>,
 }
 
 /// Extract the numeric Discogs release id from a MusicBrainz

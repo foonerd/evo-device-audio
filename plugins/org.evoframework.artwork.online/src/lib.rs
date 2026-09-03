@@ -93,6 +93,7 @@ use std::time::Duration;
 
 use evo_online_providers::{
     deezer::DeezerClient,
+    discogs::DiscogsClient,
     fanart::FanartClient,
     musicbrainz::MusicBrainzClient,
     rate_limit::RateLimiter,
@@ -112,6 +113,16 @@ use crate::config::PluginConfig;
 /// plugin fetches the value at load and passes it to the fanart
 /// client constructor.
 const FANART_VAULT_KEY: &str = "fanart_tv_personal_api_key";
+
+/// Provider id this plugin names when asking the framework for
+/// the Discogs credential.
+///
+/// Deliberately a PROVIDER id, not a vault key: the token lives
+/// in `org.evoframework.metadata.online`'s scope and this plugin
+/// cannot address that scope directly. It names the provider and
+/// the framework's registry decides — see
+/// `CredentialVaultHandle::fetch_for_provider`.
+const DISCOGS_PROVIDER_ID: &str = "discogs";
 
 /// Embedded manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -215,6 +226,21 @@ pub struct ArtworkOnlinePlugin {
     /// cascade treats the fanart source as disabled in that
     /// case.
     fanart_client: Option<Arc<FanartClient>>,
+    /// Discogs client for artist photography.
+    ///
+    /// The credential is the operator's Discogs Personal Access
+    /// Token, which is OWNED by
+    /// `org.evoframework.metadata.online` (it was entered there
+    /// for release-credits and artist-bio). This plugin reads it
+    /// through the framework's governed provider-credential
+    /// grant rather than holding a second copy — the operator
+    /// enters the key once and both surfaces work.
+    ///
+    /// `None` when the operator has stored no Discogs token, the
+    /// framework has no vault, or the grant is refused; the
+    /// artist-artwork cascade treats the Discogs source as
+    /// disabled in every one of those cases and walks on.
+    discogs_client: Option<Arc<DiscogsClient>>,
     /// MusicBrainz client used by the artist-artwork cascade to
     /// resolve a canonical MBID from an artist name (`ws/2/artist
     /// ?query=`) plus URL relationships (`ws/2/artist/<mbid>
@@ -281,6 +307,7 @@ impl ArtworkOnlinePlugin {
             theaudiodb_client: None,
             deezer_client: None,
             fanart_client: None,
+            discogs_client: None,
             mb_client: None,
             artist_provider_config: Arc::new(tokio::sync::RwLock::new(
                 artist_cascade::ArtistProviderConfig::defaults(),
@@ -458,7 +485,67 @@ impl Plugin for ArtworkOnlinePlugin {
                 None => None,
             };
             self.fanart_client = fanart_key.and_then(|key| {
-                FanartClient::new(http.clone(), one_req_per_sec(), ua, key)
+                FanartClient::new(
+                    http.clone(),
+                    one_req_per_sec(),
+                    ua.clone(),
+                    key,
+                )
+                .map(Arc::new)
+            });
+            // Discogs: the token is OWNED by
+            // org.evoframework.metadata.online — the operator
+            // entered it there for release-credits and artist-bio.
+            // Rather than making them paste it a second time into
+            // this plugin's scope, read it through the framework's
+            // governed provider-credential grant. We name the
+            // provider, never a scope or a key; the framework's
+            // registry decides whether this plugin may read it and
+            // fetches from the owner's scope, so the secret exists
+            // in exactly one place.
+            //
+            // A refused grant, an absent token, and an unknown
+            // provider are indistinguishable here — all three
+            // yield None and the cascade treats Discogs as
+            // disabled, exactly as it treats fanart without a key.
+            let discogs_token = match ctx.credential_vault.as_ref() {
+                Some(vault) => {
+                    match vault
+                        .fetch_for_provider(DISCOGS_PROVIDER_ID.to_string())
+                        .await
+                    {
+                        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                            Ok(s) if !s.trim().is_empty() => Some(s),
+                            Ok(_) => None,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    provider_id = DISCOGS_PROVIDER_ID,
+                                    error = %e,
+                                    "provider credential is not valid UTF-8; \
+                                     Discogs artist-image source stays \
+                                     disabled"
+                                );
+                                None
+                            }
+                        },
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                provider_id = DISCOGS_PROVIDER_ID,
+                                error = %e,
+                                "provider-credential fetch failed; Discogs \
+                                 artist-image source stays disabled"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            self.discogs_client = discogs_token.and_then(|token| {
+                DiscogsClient::new(http.clone(), one_req_per_sec(), ua, token)
                     .map(Arc::new)
             });
             // Runtime-store overlay for the artist-artwork
@@ -487,7 +574,47 @@ impl Plugin for ArtworkOnlinePlugin {
             // `METADATA-ENRICHMENT-FLOW.md` — "off until the
             // key exists" — treats credential presence as the
             // enable-authority for keyed providers.
-            let fanart_credential_present = self.fanart_client.is_some();
+            // Credential presence IS the enable authority for
+            // every keyed provider in this cascade — not just
+            // fanart.
+            //
+            // The framework seeds identity-bearing providers as
+            // `enabled: false` so an operator's enable gesture is
+            // what triggers the key prompt. But an operator who
+            // has already stored the key never makes that
+            // gesture, and the stale row then darkens a provider
+            // whose credential is wired and whose client is
+            // built. fanart escaped that because it carried a
+            // one-off override; Discogs would have walked
+            // straight into it (rig-confirmed:
+            // `discogs_wired=true` alongside
+            // `reason="operator_disabled"`).
+            //
+            // So the override becomes the rule. Any keyed
+            // provider whose credential resolved at load ignores
+            // the store's enable bit and keeps its cascade
+            // default. Removing the key is the off-switch;
+            // an explicit operator toggle remains available
+            // through the settings surface.
+            let credential_authoritative_set: std::collections::HashSet<
+                artist_cascade::ArtistProviderId,
+            > = [
+                (
+                    artist_cascade::ArtistProviderId::FanartTv,
+                    self.fanart_client.is_some(),
+                ),
+                (
+                    artist_cascade::ArtistProviderId::Discogs,
+                    self.discogs_client.is_some(),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(pid, present)| present.then_some(pid))
+            .collect();
+            let credential_authoritative =
+                |pid: artist_cascade::ArtistProviderId| -> bool {
+                    credential_authoritative_set.contains(&pid)
+                };
             {
                 let mut cfg = self.artist_provider_config.write().await;
                 if let Some(store) = ctx.online_provider_config.as_ref() {
@@ -509,17 +636,16 @@ impl Plugin for ArtworkOnlinePlugin {
                                     );
                                     continue;
                                 };
-                                if pid == artist_cascade::ArtistProviderId::FanartTv
-                                    && fanart_credential_present
-                                {
+                                if credential_authoritative(pid) {
                                     tracing::info!(
                                         plugin = PLUGIN_NAME,
                                         provider_id = %row.provider_id,
                                         store_enabled = row.enabled,
                                         store_priority = row.priority,
-                                        "credential-authoritative: fanart.tv API key is \
-                                         wired at load, so the store overlay row is skipped \
-                                         and plugin defaults hold (enabled=true, priority=40)"
+                                        "credential-authoritative: this provider's \
+                                         credential is wired at load, so the store \
+                                         overlay row is skipped and the plugin's \
+                                         cascade defaults hold"
                                     );
                                     continue;
                                 }
@@ -566,7 +692,7 @@ impl Plugin for ArtworkOnlinePlugin {
                     online_provider_config_reactor(
                         rx,
                         config_slot,
-                        fanart_credential_present,
+                        credential_authoritative_set.clone(),
                     ),
                 ));
             }
@@ -579,6 +705,16 @@ impl Plugin for ArtworkOnlinePlugin {
                 theaudiodb_wired = self.theaudiodb_client.is_some(),
                 deezer_wired = self.deezer_client.is_some(),
                 fanart_wired = self.fanart_client.is_some(),
+                // Whether the framework's provider-credential
+                // grant handed us the operator's Discogs token.
+                // False means one of: no token stored, grant
+                // refused, or no vault — the three are
+                // deliberately indistinguishable to this plugin,
+                // and all three disable the source. Reported here
+                // because without it there is no way to tell a
+                // wiring failure from a provider that simply had
+                // nothing for the artist.
+                discogs_wired = self.discogs_client.is_some(),
                 "load complete"
             );
             self.loaded = true;
@@ -736,6 +872,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
+                        discogs: self.discogs_client.clone(),
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
@@ -767,6 +904,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
+                        discogs: self.discogs_client.clone(),
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
@@ -1085,7 +1223,17 @@ async fn online_provider_config_reactor(
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
     >,
     config_slot: Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
-    fanart_credential_present: bool,
+    // Keyed providers whose credential resolved at load. A
+    // config-change event naming one of these is ignored —
+    // credential presence is the enable authority, so a store row
+    // cannot darken a provider whose key is wired. Carries the
+    // whole set rather than a single fanart bool because this
+    // cascade now has two keyed providers and will have more; a
+    // scalar was what confined the rule to fanart and let Discogs
+    // walk into the stale-row trap.
+    credential_authoritative: std::collections::HashSet<
+        artist_cascade::ArtistProviderId,
+    >,
 ) {
     loop {
         match rx.recv().await {
@@ -1102,17 +1250,16 @@ async fn online_provider_config_reactor(
                     );
                     continue;
                 };
-                if pid == artist_cascade::ArtistProviderId::FanartTv
-                    && fanart_credential_present
-                {
+                if credential_authoritative.contains(&pid) {
                     tracing::info!(
                         plugin = PLUGIN_NAME,
                         provider_id = %event.provider_id,
                         event_enabled = event.enabled,
                         event_priority = event.priority,
-                        "reactor: credential-authoritative — fanart.tv credential is \
-                         present, so this config-change event is not applied to the \
-                         plugin's local cascade (plugin defaults hold)"
+                        "reactor: credential-authoritative — this provider's \
+                         credential is present, so this config-change event is \
+                         not applied to the plugin's local cascade (plugin \
+                         defaults hold)"
                     );
                     continue;
                 }
