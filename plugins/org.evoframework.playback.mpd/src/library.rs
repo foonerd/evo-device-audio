@@ -2458,6 +2458,25 @@ struct RenderCtx<'a> {
 /// [`browse_library`] caches in `browse_cache` — repeat browses
 /// serve the same URL from the cache and never re-walk the
 /// filesystem.
+/// Ceiling on directories examined while looking for a
+/// container's representative art.
+///
+/// The bound is on WORK, not on depth. Depth is nearly free: a
+/// long narrow chain — `Artist / Album (Deluxe) / Disc 1 / ...`
+/// and every box-set or archival layout that nests further —
+/// costs one directory read per level, so capping depth would
+/// blind the search to exactly the libraries that need it most
+/// while saving nothing. Breadth is what costs, and a wide tree
+/// is bounded here regardless of how deep it goes.
+///
+/// The search runs per directory tile during a browse paint, so
+/// a pathological tree must not turn one screenful into a
+/// filesystem walk. Exhausting this budget ends the descent and
+/// the tile falls back to the glyph rather than stalling the
+/// browse. The picked URL is then cached in `browse_cache`, so
+/// the cost is paid once per folder, not once per paint.
+const CONTAINER_SCAN_MAX_DIRS: usize = 512;
+
 fn pick_directory_cover_url(
     mpd_relative_path: &str,
     music_directory: &std::path::Path,
@@ -2515,37 +2534,71 @@ fn pick_directory_cover_url(
     // Prefer a child carrying a sidecar — deterministic and
     // known-present. Only when no child has one, fall back to a
     // child's first track so embedded art can surface.
-    let children = sidecar_cover::stable_sorted_child_dir_names(&abs_dir);
-    let child_relative = |child_name: &str| -> String {
+    // Descend breadth-first so the NEAREST art wins, and a
+    // deluxe or multi-disc set does not defeat the search. A
+    // container's child is frequently a container itself —
+    // `Artist / Album (Deluxe) / Disc 1 / tracks` has no sidecar
+    // and no tracks at either of the first two levels, so a
+    // one-level scan finds nothing and paints a glyph on a
+    // folder whose album art is plainly visible one click in.
+    //
+    // At each level a sidecar beats embedded art: it is the
+    // album's own declared cover, and reading it costs a stat
+    // rather than a tag parse. The descent is bounded by work
+    // rather than by depth — see CONTAINER_SCAN_MAX_DIRS — so a
+    // deeply nested library is searched to the bottom while a
+    // pathologically wide one still cannot stall a browse.
+    let child_relative = |rel: &str| -> String {
         if mpd_relative_path.is_empty() {
-            child_name.to_string()
+            rel.to_string()
         } else {
-            format!("{mpd_relative_path}/{child_name}")
+            format!("{mpd_relative_path}/{rel}")
         }
     };
-    for child_name in &children {
-        if sidecar_cover::find_cover_in_directory(&abs_dir.join(child_name))
-            .is_some()
-        {
-            return evo_device_audio_shared::artwork_target_url_sized(
-                "mpd-directory",
-                &child_relative(child_name),
-                Some("small"),
-            );
+    let mut frontier: Vec<String> =
+        sidecar_cover::stable_sorted_child_dir_names(&abs_dir);
+    let mut examined = frontier.len();
+    while !frontier.is_empty() {
+        for rel in &frontier {
+            if sidecar_cover::find_cover_in_directory(&abs_dir.join(rel))
+                .is_some()
+            {
+                return evo_device_audio_shared::artwork_target_url_sized(
+                    "mpd-directory",
+                    &child_relative(rel),
+                    Some("small"),
+                );
+            }
         }
-    }
-    for child_name in &children {
-        if let Some(track_name) =
-            sidecar_cover::first_audio_file_name_in_directory(
-                &abs_dir.join(child_name),
-            )
-        {
-            return evo_device_audio_shared::artwork_target_url_sized(
-                "mpd-path",
-                &format!("{}/{}", child_relative(child_name), track_name),
-                Some("small"),
-            );
+        for rel in &frontier {
+            if let Some(track_name) =
+                sidecar_cover::first_audio_file_name_in_directory(
+                    &abs_dir.join(rel),
+                )
+            {
+                return evo_device_audio_shared::artwork_target_url_sized(
+                    "mpd-path",
+                    &format!("{}/{}", child_relative(rel), track_name),
+                    Some("small"),
+                );
+            }
         }
+        if examined >= CONTAINER_SCAN_MAX_DIRS {
+            break;
+        }
+        let mut next = Vec::new();
+        'descend: for rel in &frontier {
+            for name in
+                sidecar_cover::stable_sorted_child_dir_names(&abs_dir.join(rel))
+            {
+                next.push(format!("{rel}/{name}"));
+                examined += 1;
+                if examined >= CONTAINER_SCAN_MAX_DIRS {
+                    break 'descend;
+                }
+            }
+        }
+        frontier = next;
     }
 
     evo_device_audio_shared::artwork_target_url_sized(
@@ -3986,6 +4039,95 @@ mod tests {
                 "{container} must show the record it contains: got {url}"
             );
         }
+    }
+
+    /// The shape that defeated a one-level scan: the container's
+    /// child is itself a container. `Artist / Album (Deluxe) /
+    /// Disc 1 / tracks` has no sidecar and no tracks at either of
+    /// the first two levels, so a flat child scan found nothing
+    /// and painted a glyph on a folder whose album art is
+    /// plainly visible one click in.
+    #[test]
+    fn container_finds_art_nested_below_a_multi_disc_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let disc = music_dir
+            .join("Container Name")
+            .join("Album (Deluxe Edition)")
+            .join("Disc 1");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("Disc%201") && url.contains("scheme=mpd-path"),
+            "must descend past the multi-disc child, got {url}"
+        );
+        assert!(!url.contains("artist-name"), "got {url}");
+    }
+
+    /// A sidecar one level down beats embedded art two levels
+    /// down: nearest art wins, and at equal depth the album's own
+    /// declared cover beats a tag parse.
+    #[test]
+    fn nearest_art_wins_over_deeper_art() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let root = music_dir.join("Container Name");
+        let shallow = root.join("A Album");
+        let deep = root.join("B Album").join("Disc 1");
+        std::fs::create_dir_all(&shallow).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(shallow.join("cover.jpg"), b"c").unwrap();
+        std::fs::write(deep.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("A%20Album") && url.contains("scheme=mpd-directory"),
+            "shallower sidecar must win, got {url}"
+        );
+    }
+
+    /// Depth must NOT defeat the search. A long narrow chain is
+    /// one directory read per level, and real libraries nest far
+    /// deeper than any fixed cap would allow — archival and
+    /// box-set layouts especially. A depth limit would blind the
+    /// search to exactly the trees that need it while saving
+    /// nothing, because breadth is what costs.
+    #[test]
+    fn container_scan_follows_a_deeply_nested_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let mut p = music_dir.join("Container Name");
+        for i in 0..120 {
+            p = p.join(format!("level{i}"));
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-path") && url.contains("level119"),
+            "a 120-level narrow chain must still be searched, got {url}"
+        );
+    }
+
+    /// Breadth is bounded. A tree wide enough to exhaust the work
+    /// budget ends at the glyph rather than walking the
+    /// filesystem during a browse paint.
+    #[test]
+    fn container_scan_is_work_bounded_on_wide_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let root = music_dir.join("Container Name");
+        // Well past the budget, all empty, so the search can
+        // never succeed and must terminate on the cap.
+        for i in 0..(CONTAINER_SCAN_MAX_DIRS + 50) {
+            std::fs::create_dir_all(root.join(format!("child{i:04}"))).unwrap();
+        }
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "exhausting the budget must fall back to the glyph, got {url}"
+        );
     }
 
     /// No child sidecar, but a child holds tracks — fall back to
