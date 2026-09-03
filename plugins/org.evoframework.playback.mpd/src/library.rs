@@ -1384,14 +1384,20 @@ pub(crate) struct BrowseSelectorParent {
 /// keyed on a representative track's `mpd-path` scheme so the
 /// framework's sidecar → embedded → online cascade decides
 /// the cover — the cover cannot be broken by a bad tag. Artist
-/// enumeration carries an `artwork_lookup` object that names
-/// the shelf, request type, and payload the UI dispatches per
-/// visible
-/// tile to obtain a live *portrait* URL — no synthesised
-/// `cover_url` (album art is the wrong image type for this
-/// facet). The UI fans out per-tile rather than following an
-/// `<img src>` URL, so live-fetch providers can honour their
-/// terms.
+/// enumeration carries a `cover_url` on the `artist-name`
+/// scheme, which the framework artwork endpoint resolves to
+/// validated bytes.
+///
+/// It previously also carried an `artwork_lookup` object naming
+/// the shelf, request type and payload for the URL-returning
+/// artist verb, so a client could dispatch per tile and paint
+/// the provider URL directly. That is a second paint path, and
+/// a paint path that skips the byte walk skips every check the
+/// byte walk performs — placeholder rejection above all. A
+/// client painting that URL shows images the serve path would
+/// refuse. The field is removed rather than documented, because
+/// a wire field is an invitation: the current UI ignored it, but
+/// the next consumer would not have.
 ///
 /// **Drill path** (payload.select present): issues MPD
 /// `find <tag> <value>` (case-sensitive exact) or, when the
@@ -1884,15 +1890,6 @@ async fn enumerate_artists_via_fanout(
         .into_iter()
         .map(|display| {
             let trimmed = display.trim();
-            let artwork_lookup = if trimmed.is_empty() {
-                None
-            } else {
-                Some(json!({
-                    "shelf":        "artwork.providers",
-                    "request_type": "artwork.resolve_artist_artwork",
-                    "payload":      { "v": 1, "artist": trimmed },
-                }))
-            };
             let cover_url = if trimmed.is_empty() {
                 None
             } else {
@@ -1905,7 +1902,6 @@ async fn enumerate_artists_via_fanout(
             json!({
                 "artist":         display,
                 "cover_url":      cover_url,
-                "artwork_lookup": artwork_lookup,
             })
         })
         .collect();
@@ -2431,25 +2427,32 @@ struct RenderCtx<'a> {
 ///    stored art inside the file). Stable-sorted first audio
 ///    track wins so repeat browses land on the same URL and the
 ///    browse cache stays coherent.
-/// 3. **Representative child cover** — the directory has no
-///    tracks of its own but has child subdirectories whose top
-///    level carries a sidecar or embedded art. Emit
-///    `mpd-directory?value=<self>/<first-child-with-cover>` so
-///    the artist tile shows an album cover from that artist's
-///    own discography. The child URL re-enters this cascade at
-///    the resolver, so a child whose art is embedded also
-///    surfaces here.
-/// 4. **Artist-name portrait** — when the directory has child
-///    subdirectories but none of them yielded a cover, and the
-///    directory has no tracks of its own, emit
-///    `artist-name?value=<basename>`. The framework's artwork
-///    cascade routes `artist-name` to `artwork.online`'s artist
-///    verb; TheAudioDB / Deezer / volumio_meta by name deliver a
-///    portrait when the MusicBrainz reconcile misses.
-/// 5. **Fallback** — emit the Tier 1 URL. The resolver returns
-///    `not_found` and the tile renders the honest glyph. Only
-///    reached for a leaf directory with no tracks, no sidecar,
-///    and no children.
+/// 3. **Representative child cover** — the directory has child
+///    subdirectories and no tracks of its own. Emit the first
+///    child carrying a sidecar as `mpd-directory`, or failing
+///    that the first child's first track as `mpd-path` so
+///    embedded art can surface. The folder shows the music it
+///    contains.
+///
+///    This tier emits NO portrait lookup, deliberately. "Has
+///    children and no files" does not mean "artist": a
+///    collaboration folder, a label or series, a box set, a
+///    genre bucket and the source root all share that shape.
+///    Keying `artist-name` on such a basename asks a provider
+///    for a person who does not exist — a guaranteed miss that
+///    still spends the rate-limited budget, once per container,
+///    on every first paint.
+///
+///    Portraits belong on the artist FACET, which is a
+///    different surface keyed on the artist TAG rather than on
+///    a directory name. Wrong-subject artwork on an artist tile
+///    is worse than a glyph; a glyph on a folder that
+///    demonstrably contains a record is worse than that
+///    record's sleeve.
+/// 4. **Fallback** — emit the Tier 1 URL. The resolver returns
+///    `not_found` and the tile renders the honest glyph. Reached
+///    for a leaf directory with no tracks, no sidecar, and no
+///    children with art.
 ///
 /// The picked URL is stored on the rendered entry which
 /// [`browse_library`] caches in `browse_cache` — repeat browses
@@ -2486,31 +2489,60 @@ fn pick_directory_cover_url(
         );
     }
 
-    for child_name in sidecar_cover::stable_sorted_child_dir_names(&abs_dir) {
-        let child_abs = abs_dir.join(&child_name);
-        if sidecar_cover::find_cover_in_directory(&child_abs).is_some() {
-            let child_relative = if mpd_relative_path.is_empty() {
-                child_name.clone()
-            } else {
-                format!("{mpd_relative_path}/{child_name}")
-            };
+    // Children only: this is a container — a collaboration
+    // folder, a label or series, a box set, a genre bucket, or
+    // an artist directory. Show the music it contains.
+    //
+    // Folder browse is a file tree, and the honest picture of a
+    // folder is what is inside it. That is true whether the
+    // basename happens to name one artist or not, which matters
+    // because "has children and no files" does NOT mean artist:
+    // a multi-artist collaboration folder, a label or series
+    // directory, a source root and every box set share the
+    // shape. Keying a
+    // portrait lookup on those strings asks a provider for a
+    // person who does not exist — a guaranteed 404 that still
+    // spends the rate-limited budget, once per container, on
+    // every first paint of a browse.
+    //
+    // The artist FACET is where a portrait belongs, and it is a
+    // different surface with a different key: `browse_by_artist`
+    // emits `artist-name` from the tag, not from a directory
+    // name. Wrong-subject artwork on an artist tile is worse
+    // than a glyph; a glyph on a folder that demonstrably
+    // contains a record is worse than that record's sleeve.
+    //
+    // Prefer a child carrying a sidecar — deterministic and
+    // known-present. Only when no child has one, fall back to a
+    // child's first track so embedded art can surface.
+    let children = sidecar_cover::stable_sorted_child_dir_names(&abs_dir);
+    let child_relative = |child_name: &str| -> String {
+        if mpd_relative_path.is_empty() {
+            child_name.to_string()
+        } else {
+            format!("{mpd_relative_path}/{child_name}")
+        }
+    };
+    for child_name in &children {
+        if sidecar_cover::find_cover_in_directory(&abs_dir.join(child_name))
+            .is_some()
+        {
             return evo_device_audio_shared::artwork_target_url_sized(
                 "mpd-directory",
-                &child_relative,
+                &child_relative(child_name),
                 Some("small"),
             );
         }
     }
-
-    if sidecar_cover::directory_has_child_dirs(&abs_dir) {
-        let basename = mpd_relative_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(mpd_relative_path);
-        if !basename.is_empty() {
+    for child_name in &children {
+        if let Some(track_name) =
+            sidecar_cover::first_audio_file_name_in_directory(
+                &abs_dir.join(child_name),
+            )
+        {
             return evo_device_audio_shared::artwork_target_url_sized(
-                "artist-name",
-                basename,
+                "mpd-path",
+                &format!("{}/{}", child_relative(child_name), track_name),
                 Some("small"),
             );
         }
@@ -2532,13 +2564,15 @@ fn render_library_entry(
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
             // Folder-cover surface: emit a `cover_url` that the
             // framework artwork endpoint resolves via the
-            // three-tier cascade in `pick_directory_cover_url`
-            // — direct sidecar → representative child cover →
-            // artist-name portrait → honest glyph. When the
-            // caller cannot supply filesystem context (facet-
-            // drill file-only render — directories never
-            // appear there in practice), we fall back to the
-            // Tier 1 URL only.
+            // cascade in `pick_directory_cover_url` — direct
+            // sidecar → own track's embedded art →
+            // representative child cover → honest glyph. It
+            // never emits a portrait lookup: a folder is a
+            // container, and portraits belong on the artist
+            // facet. When the caller cannot supply filesystem
+            // context (facet-drill file-only render —
+            // directories never appear there in practice), we
+            // fall back to the Tier 1 URL only.
             let cover_url = match ctx {
                 Some(ctx) => {
                     pick_directory_cover_url(path, ctx.music_directory)
@@ -3799,9 +3833,13 @@ mod tests {
     //
     //   1. sidecar in this dir
     //   2. embedded art of representative track in this dir
-    //   3. sidecar cover in first stable-sorted child dir
-    //   4. artist-name portrait (basename)
-    //   5. fallback → honest glyph
+    //   3. sidecar cover in first stable-sorted child dir,
+    //      else first child's first track (embedded)
+    //   4. fallback → honest glyph
+    //
+    // Folder browse NEVER emits `artist-name`. That surface is
+    // a file tree; portraits belong on the artist facet, which
+    // keys on the tag. See `pick_directory_cover_url`'s docs.
     // -----------------------------------------------------------
 
     #[test]
@@ -3887,11 +3925,19 @@ mod tests {
     }
 
     #[test]
-    fn tier3_representative_child_cover_when_no_self_cover_no_tracks() {
-        // Artist folder with no direct art AND no tracks, but
-        // Abbey Road (child album) carries `cover.jpg`. Emit
-        // the child's mpd-directory URL so the artist tile
-        // shows an actual record cover.
+    fn container_folder_shows_a_child_album_sleeve() {
+        // Folder browse is a file tree. A directory with child
+        // albums and no tracks of its own is a container —
+        // possibly an artist, but just as possibly a
+        // multi-artist collaboration, a label or series, a box
+        // set or a genre bucket. The honest picture of a
+        // container is the music inside it.
+        //
+        // Emitting `artist-name` here instead asked a provider
+        // for a person who does not exist, spending the
+        // rate-limited budget once per container on every first
+        // paint and painting a glyph on folders that visibly
+        // contain records.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("The Beatles");
@@ -3903,20 +3949,66 @@ mod tests {
         let url = pick_directory_cover_url("The Beatles", music_dir);
         assert!(
             url.contains("scheme=mpd-directory"),
-            "Tier 3 must emit mpd-directory scheme, got {url}"
+            "container must point at the child carrying art, got {url}"
         );
         assert!(
             url.contains("Abbey%20Road"),
-            "Tier 3 must point at the child directory carrying the cover, \
-             got {url}"
+            "container must show the child album's sleeve, got {url}"
+        );
+        assert!(
+            !url.contains("artist-name"),
+            "folder browse must never emit a portrait lookup, got {url}"
         );
     }
 
+    /// The collaboration / label case from the field: a folder
+    /// name that is not one artist must still show its music,
+    /// not start a doomed portrait cascade.
     #[test]
-    fn tier3_stable_sort_picks_alphabetically_first_child() {
-        // Two children both have covers; alphabetically-first
-        // wins. Guarantees the same URL across repeat browses
-        // so `browse_cache` serves consistent art.
+    fn collaboration_and_label_folders_show_their_music() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        for container in [
+            "First Artist and Second Artist and Third Artist",
+            "Example Label Series",
+        ] {
+            let dir = music_dir.join(container);
+            let child = dir.join("Collaboration Single");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("cover.jpg"), b"c").unwrap();
+            let url = pick_directory_cover_url(container, music_dir);
+            assert!(
+                !url.contains("artist-name"),
+                "{container} is a container, not a person: got {url}"
+            );
+            assert!(
+                url.contains("Collaboration%20Single"),
+                "{container} must show the record it contains: got {url}"
+            );
+        }
+    }
+
+    /// No child sidecar, but a child holds tracks — fall back to
+    /// that child's first track so embedded art can surface
+    /// rather than dropping straight to a glyph.
+    #[test]
+    fn container_falls_back_to_a_child_track_for_embedded_art() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let child = music_dir.join("Box Set").join("Disc 1");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Box Set", music_dir);
+        assert!(url.contains("scheme=mpd-path"), "got {url}");
+        assert!(url.contains("Disc%201"), "got {url}");
+        assert!(!url.contains("artist-name"), "got {url}");
+    }
+
+    #[test]
+    fn container_child_pick_is_stable_across_browses() {
+        // Two children both carry covers; the alphabetically
+        // first wins every time so `browse_cache` stays
+        // coherent across repeat browses.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("Dire Straits");
@@ -3924,55 +4016,59 @@ mod tests {
         let money = artist_dir.join("Money for Nothing");
         std::fs::create_dir_all(&brothers).unwrap();
         std::fs::create_dir_all(&money).unwrap();
-        std::fs::write(brothers.join("cover.jpg"), b"bia").unwrap();
-        std::fs::write(money.join("cover.jpg"), b"mfn").unwrap();
-        let url = pick_directory_cover_url("Dire Straits", music_dir);
+        std::fs::write(brothers.join("cover.jpg"), b"a").unwrap();
+        std::fs::write(money.join("cover.jpg"), b"b").unwrap();
+        let first = pick_directory_cover_url("Dire Straits", music_dir);
+        let second = pick_directory_cover_url("Dire Straits", music_dir);
+        assert_eq!(first, second, "repeat browses must agree");
+        assert!(first.contains("Brothers%20in%20Arms"), "got {first}");
+    }
+
+    #[test]
+    fn container_with_no_child_art_falls_to_the_glyph() {
+        // Children exist but none carries a sidecar and none
+        // holds tracks, so there is no music to show. The tile
+        // renders the honest glyph.
+        //
+        // This tier previously emitted `artist-name` on the
+        // basename. Folder browse is a file tree, and "has
+        // children, has no files" does not identify an artist —
+        // a multi-artist collaboration folder, a label or series
+        // directory, a box set and the source root all match it.
+        // Asking a provider for a portrait of such a string is a
+        // guaranteed miss that still spends the rate-limited
+        // budget, once per container, on every first paint of a
+        // browse. Portraits are the artist facet's job, keyed on
+        // the tag rather than on a directory name.
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let container = music_dir.join("Container Name");
+        std::fs::create_dir_all(container.join("First Album")).unwrap();
+        std::fs::create_dir_all(container.join("Second Album")).unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
         assert!(
-            url.contains("Brothers%20in%20Arms"),
-            "stable sort must pick alphabetically-first child, got {url}"
+            !url.contains("artist-name"),
+            "folder browse must never emit a portrait lookup, got {url}"
+        );
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "fallback addresses the folder itself, got {url}"
         );
     }
 
     #[test]
-    fn tier4_artist_name_portrait_when_children_have_no_covers() {
-        // Artist folder has child album subdirectories but none
-        // carry any cover (sidecar or otherwise resolvable). No
-        // tracks at the artist level either. Route to
-        // `artist-name` so `artwork.online`'s artist cascade
-        // delivers a portrait.
+    fn nested_container_never_emits_a_portrait_lookup() {
+        // A nested container is still a container. Whatever the
+        // path depth, folder browse does not ask for a portrait.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
-        let artist_dir = music_dir.join("Radiohead");
-        std::fs::create_dir_all(artist_dir.join("OK Computer")).unwrap();
-        std::fs::create_dir_all(artist_dir.join("Kid A")).unwrap();
-        let url = pick_directory_cover_url("Radiohead", music_dir);
+        let nested = music_dir.join("Genre").join("Container Name");
+        std::fs::create_dir_all(nested.join("First Album")).unwrap();
+        let url = pick_directory_cover_url("Genre/Container Name", music_dir);
         assert!(
-            url.contains("scheme=artist-name"),
-            "Tier 4 must emit artist-name scheme, got {url}"
-        );
-        assert!(
-            url.contains("Radiohead"),
-            "Tier 4 must carry the directory basename as artist name, \
-             got {url}"
-        );
-    }
-
-    #[test]
-    fn tier4_uses_basename_not_full_path() {
-        // For a nested container `Rock/Radiohead`, Tier 4 must
-        // carry the basename `Radiohead`, not the full path.
-        let tmp = tempfile::tempdir().unwrap();
-        let music_dir = tmp.path();
-        let nested = music_dir.join("Rock").join("Radiohead");
-        std::fs::create_dir_all(nested.join("OK Computer")).unwrap();
-        let url = pick_directory_cover_url("Rock/Radiohead", music_dir);
-        assert!(
-            url.contains("scheme=artist-name"),
-            "nested container should still trigger Tier 4, got {url}"
-        );
-        assert!(
-            url.contains("value=Radiohead"),
-            "Tier 4 must use basename, not full path, got {url}"
+            !url.contains("artist-name"),
+            "nested container must not emit a portrait lookup, got {url}"
         );
     }
 
