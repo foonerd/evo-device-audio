@@ -352,27 +352,36 @@ impl DiscogsClient {
         artist: &str,
         blocking: bool,
     ) -> Result<ArtistImageAttempt, DiscogsError> {
-        macro_rules! slot {
-            () => {
-                if blocking {
-                    self.rate.acquire().await;
-                } else if !self.rate.try_acquire().await {
-                    return Ok(ArtistImageAttempt::RateLimited);
-                }
-            };
-        }
+        // Only the ENTRY to the lookup is non-blocking. This is
+        // a two-request shape (search, then detail), and the two
+        // are milliseconds apart — far inside the 1 req/s budget.
+        // Applying the non-blocking rule to both would refuse the
+        // detail slot on essentially every call, so the lookup
+        // would spend a search request and then abandon it, and
+        // the provider could never return an image at all.
+        //
+        // Gating the entry is what protects a browse: only an
+        // artist that wins a free slot starts a lookup, so a grid
+        // does not queue tile behind tile. Once a search has been
+        // spent the lookup is committed, and the detail call waits
+        // for its slot — a bounded wait of at most one interval,
+        // paid only by a caller already past the gate.
         let search_url = format!(
             "{DISCOGS_API_BASE}/database/search?type=artist&q={}&per_page=1",
             urlencode(artist),
         );
-        slot!();
+        if blocking {
+            self.rate.acquire().await;
+        } else if !self.rate.try_acquire().await {
+            return Ok(ArtistImageAttempt::RateLimited);
+        }
         let search: ArtistSearchResponse =
             self.get_json_dispatched(search_url).await?;
         let Some(first) = search.results.into_iter().next() else {
             return Ok(ArtistImageAttempt::Completed(None));
         };
         let detail_url = format!("{DISCOGS_API_BASE}/artists/{}", first.id);
-        slot!();
+        self.rate.acquire().await;
         let detail: ArtistDetail = self.get_json_dispatched(detail_url).await?;
         let images = detail.images.unwrap_or_default();
         let pick = images
