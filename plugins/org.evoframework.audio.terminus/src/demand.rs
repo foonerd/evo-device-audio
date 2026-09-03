@@ -334,7 +334,8 @@ impl SpectrumDemandStore {
     /// value equals the old (defensive against a scenario where
     /// evo-ui-runtime pushes a duplicate on reconnect).
     async fn apply(&self, next: SpectrumDemand) {
-        let _ = self.tx.send_replace(next);
+        let previous = self.tx.send_replace(next);
+        let changed = previous != next;
         let addressing =
             ExternalAddressing::new(ADDRESSING_SCHEME, ADDRESSING_VALUE);
         if let Err(e) = self
@@ -348,15 +349,35 @@ impl SpectrumDemandStore {
                 "audio_playback_spectrum_demand update_state failed"
             );
         }
-        tracing::info!(
-            plugin = PLUGIN_NAME,
-            enabled = next.enabled,
-            bins = next.bins,
-            channels = next.channels,
-            rate_hz_target = next.rate_hz_target,
-            frequency_scale = next.frequency_scale.as_str(),
-            "spectrum demand applied"
-        );
+        // INFO only when the demand actually changed. The runtime
+        // re-pushes an identical demand on reconnect and on its
+        // periodic reconcile (see this method's own doc comment),
+        // so logging every apply at INFO emits an unchanging line
+        // roughly once a minute for the life of the device —
+        // rig-observed alongside the responder-claim flood. A
+        // heartbeat that always says the same thing is not
+        // narrative; the transition is.
+        //
+        // Duplicates still log at DEBUG, so an operator raising
+        // the level can confirm the reconcile is running at all.
+        if changed {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                enabled = next.enabled,
+                bins = next.bins,
+                channels = next.channels,
+                rate_hz_target = next.rate_hz_target,
+                frequency_scale = next.frequency_scale.as_str(),
+                "spectrum demand applied"
+            );
+        } else {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                enabled = next.enabled,
+                bins = next.bins,
+                "spectrum demand re-applied unchanged (runtime reconcile)"
+            );
+        }
     }
 }
 
