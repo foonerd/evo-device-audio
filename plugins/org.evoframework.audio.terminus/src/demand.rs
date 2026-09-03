@@ -335,7 +335,22 @@ impl SpectrumDemandStore {
     /// evo-ui-runtime pushes a duplicate on reconnect).
     async fn apply(&self, next: SpectrumDemand) {
         let previous = self.tx.send_replace(next);
-        let changed = previous != next;
+        // Compare the PRODUCTION-AFFECTING fields only.
+        //
+        // `SpectrumDemand` also carries `updated_at_ms`, which is
+        // a fresh timestamp on every push, so a whole-struct
+        // comparison is never equal and the "did anything change"
+        // test silently always answers yes — which is exactly how
+        // the first attempt at this fix still emitted an
+        // unchanging INFO line once a minute on the rig. The
+        // fields below are the ones that alter what the producer
+        // does; a re-push that differs only in when it happened
+        // is not a change worth narrating.
+        let changed = previous.enabled != next.enabled
+            || previous.bins != next.bins
+            || previous.channels != next.channels
+            || previous.rate_hz_target != next.rate_hz_target
+            || previous.frequency_scale != next.frequency_scale;
         let addressing =
             ExternalAddressing::new(ADDRESSING_SCHEME, ADDRESSING_VALUE);
         if let Err(e) = self
