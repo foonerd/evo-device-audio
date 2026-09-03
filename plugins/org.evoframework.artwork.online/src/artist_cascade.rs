@@ -154,6 +154,13 @@ impl ArtistProviderId {
 }
 
 /// Whether a provider requires operator credentials to query.
+/// The device's privacy posture, as read from the framework.
+///
+/// Deliberately the SDK type rather than a plugin-local copy —
+/// a second definition is exactly how the text cascade and this
+/// one came to disagree about whether the posture applied at all.
+pub(crate) use evo_plugin_sdk::contract::context::PrivacyPosture as ArtistPrivacyPosture;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ArtistPrivacyClass {
@@ -250,6 +257,48 @@ impl ArtistProviderConfig {
     }
 
     pub(crate) fn is_enabled(&self, provider: ArtistProviderId) -> bool {
+        self.flags(provider).enabled
+    }
+
+    /// Whether the provider may dispatch, accounting for the
+    /// device's privacy posture.
+    ///
+    /// This gate did not exist. `is_enabled` alone was the whole
+    /// test, so this cascade dispatched identity-bearing
+    /// providers — fanart.tv, and Discogs since this release —
+    /// regardless of the operator's privacy posture, while the
+    /// text cascade suppressed its own. An operator selecting
+    /// `anonymous_only` was protected on one surface and leaked
+    /// on the other.
+    ///
+    /// The posture is non-bypassable and outranks both the
+    /// per-provider enable flag and credential presence:
+    ///
+    /// - `offline` suppresses every provider here. All of them
+    ///   are network sources; there is no local artist-artwork
+    ///   provider in this cascade.
+    /// - `anonymous_only` suppresses every identity-bearing
+    ///   provider, leaving the keyless ones reachable so the
+    ///   operator still gets artwork, just nothing tied to an
+    ///   account.
+    /// - `enhanced` defers entirely to the operator's
+    ///   per-provider selection.
+    pub(crate) fn is_dispatchable(
+        &self,
+        provider: ArtistProviderId,
+        posture: ArtistPrivacyPosture,
+    ) -> bool {
+        if !posture.permits_network() {
+            return false;
+        }
+        if !posture.permits_identity_bearing()
+            && matches!(
+                provider.privacy_class(),
+                ArtistPrivacyClass::IdentityBearing
+            )
+        {
+            return false;
+        }
         self.flags(provider).enabled
     }
 
@@ -719,6 +768,20 @@ pub(crate) struct ArtistCatalogue {
     /// refused this plugin's provider-credential grant — both
     /// cases disable the source and the cascade walks on.
     pub(crate) discogs: Option<Arc<DiscogsClient>>,
+    /// The device's privacy posture, read from the framework at
+    /// the start of each resolve.
+    ///
+    /// Carried on the catalogue rather than re-read per provider
+    /// so one resolve sees one consistent posture: re-reading
+    /// mid-cascade could let an operator's mid-flight change
+    /// suppress some providers and not others, producing a
+    /// half-applied posture that is exactly the kind of state
+    /// nobody can reason about.
+    ///
+    /// Populated fail-safe: a read error or an unrecognised value
+    /// resolves to the most restrictive posture, never the
+    /// permissive default.
+    pub(crate) privacy_posture: ArtistPrivacyPosture,
     /// MusicBrainz client used to reconcile the artist's
     /// canonical MBID before dispatching identity-bearing
     /// providers. Always present when the plugin has loaded
@@ -1617,27 +1680,42 @@ async fn run_cascade(
         }
     };
 
-    let want_theaudiodb =
-        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some();
-    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+    // Every gate below runs through `is_dispatchable`, which
+    // applies the device's privacy posture ahead of the
+    // per-provider enable flag. The posture is non-bypassable:
+    // `offline` suppresses all of these (every provider in this
+    // cascade is a network source) and `anonymous_only`
+    // suppresses the identity-bearing ones.
+    let posture = catalogue.privacy_posture;
+    let want_theaudiodb = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::TheAudioDb, posture)
+        && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Deezer, posture)
         && catalogue.deezer.is_some()
         && reconciled.deezer_artist_url.is_some();
-    let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+    let want_fanart = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::FanartTv, posture)
         && catalogue.fanart.is_some();
     // Discogs is name-keyed, so unlike fanart it carries no MBID
     // pre-condition — which is exactly why it earns its place:
     // the artists fanart's MBID gate skips are the ones Discogs
     // can still answer.
-    let want_discogs = catalogue.config.is_enabled(ArtistProviderId::Discogs)
+    let want_discogs = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Discogs, posture)
         && catalogue.discogs.is_some();
     // volumio_meta remains a name-only source; it takes no MBID
     // and no way to validate against a canonical identity. The
     // MBID reconcile above already confirmed the artist exists
     // (we would not be here otherwise); volumio_meta fires only
     // as one of the enabled providers.
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    let want_volumio = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, posture);
 
     if !(want_volumio
         || want_theaudiodb
@@ -1798,14 +1876,29 @@ async fn run_cascade(
 }
 
 fn any_provider_configured(catalogue: &ArtistCatalogue) -> bool {
-    catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
-        || (catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+    // Posture-aware, like every other gate. Under `offline` this
+    // answers false for the whole cascade, so the caller reports
+    // "no provider available" honestly instead of dispatching and
+    // discovering the suppression one provider at a time.
+    let p = catalogue.privacy_posture;
+    catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, p)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::TheAudioDb, p)
             && catalogue.theaudiodb.is_some())
-        || (catalogue.config.is_enabled(ArtistProviderId::Deezer)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::Deezer, p)
             && catalogue.deezer.is_some())
-        || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::FanartTv, p)
             && catalogue.fanart.is_some())
-        || (catalogue.config.is_enabled(ArtistProviderId::Discogs)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::Discogs, p)
             && catalogue.discogs.is_some())
 }
 
@@ -1857,13 +1950,23 @@ async fn name_search_safety_net(
     artist: &str,
     catalogue: &ArtistCatalogue,
 ) -> ArtistArtworkResponse {
-    let want_theaudiodb =
-        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some();
-    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+    // Posture-aware, exactly as the main cascade is. This path is
+    // reached when MusicBrainz cannot reconcile the artist, which
+    // must not become a way around the operator's privacy
+    // posture — a suppression that holds on the main path and
+    // leaks on the fallback is not a suppression.
+    let posture = catalogue.privacy_posture;
+    let want_theaudiodb = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::TheAudioDb, posture)
+        && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Deezer, posture)
         && catalogue.deezer.is_some();
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    let want_volumio = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, posture);
     // Discogs belongs in the safety net for the same reason
     // TheAudioDB and Deezer do — it is name-keyed and returns the
     // artist id + canonical entity alongside the image, so a
@@ -1879,7 +1982,9 @@ async fn name_search_safety_net(
     // does have them. Leaving it out of this path would have left
     // the feature working everywhere except the one place it was
     // built for.
-    let want_discogs = catalogue.config.is_enabled(ArtistProviderId::Discogs)
+    let want_discogs = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Discogs, posture)
         && catalogue.discogs.is_some();
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
@@ -2850,6 +2955,99 @@ mod tests {
         assert_eq!(sources[2].provider_id, "deezer");
         assert_eq!(sources[3].provider_id, "theaudiodb");
         assert_eq!(sources[4].provider_id, "volumio_meta");
+    }
+
+    #[test]
+    fn anonymous_only_suppresses_every_identity_bearing_artwork_provider() {
+        // The invariant this cascade was missing. fanart.tv and
+        // Discogs both authenticate with an operator-owned
+        // credential; under `anonymous_only` neither may dispatch,
+        // regardless of its enable flag or whether its key is
+        // wired. Before this gate they dispatched anyway, so an
+        // operator who set the posture was protected on the text
+        // surface and leaked on the artwork one.
+        let cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::AnonymousOnly;
+
+        assert!(!cfg.is_dispatchable(ArtistProviderId::FanartTv, p));
+        assert!(!cfg.is_dispatchable(ArtistProviderId::Discogs, p));
+
+        // The keyless baseline stays reachable — the operator
+        // still gets artwork, just nothing tied to an account.
+        assert!(cfg.is_dispatchable(ArtistProviderId::Deezer, p));
+        assert!(cfg.is_dispatchable(ArtistProviderId::TheAudioDb, p));
+        assert!(cfg.is_dispatchable(ArtistProviderId::VolumioMeta, p));
+    }
+
+    #[test]
+    fn offline_suppresses_every_provider_in_this_cascade() {
+        // Every provider here is a network source; there is no
+        // local artist-artwork provider. `offline` therefore
+        // suppresses all of them.
+        let cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::Offline;
+        for provider in [
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::VolumioMeta,
+        ] {
+            assert!(
+                !cfg.is_dispatchable(provider, p),
+                "{} must not dispatch under offline",
+                provider.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn enhanced_defers_entirely_to_the_operator_selection() {
+        // Under the default posture the gate adds nothing — the
+        // per-provider flag is the whole answer, so the posture
+        // cannot become a hidden second switch the operator
+        // cannot see.
+        let mut cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::Enhanced;
+        for provider in [
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::VolumioMeta,
+        ] {
+            assert_eq!(
+                cfg.is_dispatchable(provider, p),
+                cfg.is_enabled(provider),
+                "{} under enhanced must track its enable flag exactly",
+                provider.as_str()
+            );
+        }
+        // And an operator-disabled provider stays disabled.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(false), None);
+        assert!(!cfg.is_dispatchable(ArtistProviderId::Discogs, p));
+    }
+
+    #[test]
+    fn posture_outranks_an_enabled_flag_and_a_present_credential() {
+        // Non-bypassable means non-bypassable. A provider the
+        // operator explicitly enabled, whose credential is wired,
+        // still must not dispatch under a restrictive posture —
+        // otherwise "anonymous_only" would mean "anonymous unless
+        // you happened to configure something", which is not a
+        // privacy guarantee.
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Discogs, Some(true), None);
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
+
+        assert!(!cfg.is_dispatchable(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::AnonymousOnly
+        ));
+        assert!(!cfg.is_dispatchable(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::Offline
+        ));
     }
 
     #[test]

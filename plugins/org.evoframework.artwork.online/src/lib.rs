@@ -176,6 +176,58 @@ const REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE: &str =
 /// cleared counts.
 const REQUEST_ARTWORK_ONLINE_CLEAR_CACHE: &str = "artwork.online.clear_cache";
 
+/// Read the device's privacy posture, failing safe.
+///
+/// The posture is a safety control, so every uncertain outcome
+/// resolves to the most restrictive answer rather than the
+/// permissive one:
+///
+/// - handle absent (steward built without the provider-config
+///   store) → `Offline`. We cannot establish that the operator
+///   permits identity-bearing traffic, so we do not send any.
+/// - read error → `Offline`, for the same reason. A storage
+///   fault must never be the reason credentials leave the device.
+/// - unrecognised value → `Offline`, applied inside
+///   `from_wire_fail_safe`; a newer steward may name a stricter
+///   posture this build predates.
+///
+/// The failure mode is therefore "artwork is missing", which an
+/// operator can see and report, rather than "credentials were
+/// sent against the operator's stated wishes", which they cannot.
+async fn read_privacy_posture_fail_safe(
+    handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
+) -> evo_plugin_sdk::contract::context::PrivacyPosture {
+    use evo_plugin_sdk::contract::context::PrivacyPosture;
+    let Some(h) = handle else {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            posture = "offline",
+            reason = "provider_config_handle_absent",
+            "privacy posture unreadable (no provider-config handle on this \
+             steward); failing safe to the most restrictive posture — no \
+             network artwork provider will dispatch"
+        );
+        return PrivacyPosture::Offline;
+    };
+    match h.privacy_mode().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                posture = "offline",
+                reason = "privacy_mode_read_failed",
+                error = %e,
+                "privacy posture read failed; failing safe to the most \
+                 restrictive posture — no network artwork provider will \
+                 dispatch until the read succeeds"
+            );
+            PrivacyPosture::Offline
+        }
+    }
+}
+
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
     Manifest::from_toml(MANIFEST_TOML)
@@ -241,6 +293,20 @@ pub struct ArtworkOnlinePlugin {
     /// artist-artwork cascade treats the Discogs source as
     /// disabled in every one of those cases and walks on.
     discogs_client: Option<Arc<DiscogsClient>>,
+    /// Framework handle used to read the device's privacy posture
+    /// at the start of each resolve.
+    ///
+    /// Read per-resolve rather than cached: the posture is a
+    /// safety control, and a cached copy would go stale the
+    /// moment an operator tightens it — the window between a
+    /// gesture and the next cache refresh is exactly when a leak
+    /// would happen. The cost is one local IPC on a path that is
+    /// already single-flight coalesced and about to do network
+    /// I/O, so it does not show up next to what the cascade
+    /// spends anyway.
+    online_provider_config: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
     /// MusicBrainz client used by the artist-artwork cascade to
     /// resolve a canonical MBID from an artist name (`ws/2/artist
     /// ?query=`) plus URL relationships (`ws/2/artist/<mbid>
@@ -308,6 +374,7 @@ impl ArtworkOnlinePlugin {
             deezer_client: None,
             fanart_client: None,
             discogs_client: None,
+            online_provider_config: None,
             mb_client: None,
             artist_provider_config: Arc::new(tokio::sync::RwLock::new(
                 artist_cascade::ArtistProviderConfig::defaults(),
@@ -557,6 +624,11 @@ impl Plugin for ArtworkOnlinePlugin {
             // live-run so `set_enabled(false)` removes the
             // source on the next query, no restart.
             //
+            // Stash the provider-config handle so each resolve can
+            // read the device's current privacy posture. See the
+            // field docs for why this is read per-resolve and not
+            // cached.
+            self.online_provider_config = ctx.online_provider_config.clone();
             // Keyed-provider policy — an operator row always
             // wins; credential presence is only the DEFAULT.
             //
@@ -842,6 +914,10 @@ impl Respondent for ArtworkOnlinePlugin {
                         .expect("http client present after load");
                     let config_snapshot =
                         self.artist_provider_config.read().await.clone();
+                    let privacy_posture = read_privacy_posture_fail_safe(
+                        self.online_provider_config.as_ref(),
+                    )
+                    .await;
                     let catalogue = artist_cascade::ArtistCatalogue {
                         volumio_meta_http: Arc::new(http),
                         volumio_meta_variant: self.volumio_meta_variant.clone(),
@@ -849,6 +925,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
                         discogs: self.discogs_client.clone(),
+                        privacy_posture,
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
@@ -874,6 +951,10 @@ impl Respondent for ArtworkOnlinePlugin {
                         .expect("http client present after load");
                     let config_snapshot =
                         self.artist_provider_config.read().await.clone();
+                    let privacy_posture = read_privacy_posture_fail_safe(
+                        self.online_provider_config.as_ref(),
+                    )
+                    .await;
                     let catalogue = artist_cascade::ArtistCatalogue {
                         volumio_meta_http: Arc::new(http.clone()),
                         volumio_meta_variant: self.volumio_meta_variant.clone(),
@@ -881,6 +962,7 @@ impl Respondent for ArtworkOnlinePlugin {
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
                         discogs: self.discogs_client.clone(),
+                        privacy_posture,
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
