@@ -82,7 +82,7 @@ use std::sync::Arc;
 
 use evo_online_providers::{
     deezer::DeezerClient,
-    discogs::DiscogsClient,
+    discogs::{ArtistImageAttempt, DiscogsClient},
     fanart::FanartClient,
     musicbrainz::{
         parse_deezer_artist_id, MusicBrainzClient, MusicBrainzError,
@@ -1821,118 +1821,176 @@ async fn run_cascade(
     // `ArtistImageHit`'s missing `Serialize`, and every request
     // still fires `deezer.get_artist_image_by_id(id)` fresh
     // (using the id memoised via the reconcile cache).
-    let cached_non_deezer: Option<Vec<SourceEntry>> = if can_cache {
-        catalogue
-            .caches
-            .get_provider(&fold_key)
-            .await
-            .map(|entry| deserialize_provider_entries(&entry.sources))
+    let cached_entry = if can_cache {
+        catalogue.caches.get_provider(&fold_key).await
     } else {
         None
     };
-    let (volumio_out, tadb_out, fanart_out, discogs_out) =
-        if let Some(sources) = cached_non_deezer.as_ref() {
-            // Warm cache — re-hydrate cached entries as Hits. The
-            // cache only ever stores successful entries (see the
-            // cold-path serialisation below); an absent provider
-            // in the snapshot is a definitive absence at reconcile
-            // time and stays Absent on warm calls. Transients are
-            // never cached, so no Unavailable can come from cache.
-            let mut v = ProviderOutcome::Absent;
-            let mut t = ProviderOutcome::Absent;
-            let mut f = ProviderOutcome::Absent;
-            let mut d = ProviderOutcome::Absent;
-            for src in sources {
-                match src.provider_id.as_str() {
-                    "volumio_meta" => v = ProviderOutcome::Hit(src.clone()),
-                    "theaudiodb" => t = ProviderOutcome::Hit(src.clone()),
-                    "fanart_tv" => f = ProviderOutcome::Hit(src.clone()),
-                    "discogs" => d = ProviderOutcome::Hit(src.clone()),
-                    _ => {}
+    let cached_sources: Vec<SourceEntry> = cached_entry
+        .as_ref()
+        .map(|entry| deserialize_provider_entries(&entry.sources))
+        .unwrap_or_default();
+    // Re-hydrate only the legs the snapshot durably speaks for.
+    // A provider the snapshot covers but does not list settled as
+    // a definitive absence and stays Absent; one it does not cover
+    // was never asked, so it yields `None` here and is dispatched
+    // below. That distinction is the whole point of tracking
+    // coverage: it lets a partial snapshot be trusted for what it
+    // does say without inventing answers for what it does not.
+    let hydrate = |provider_id: &str| -> Option<ProviderOutcome> {
+        let entry = cached_entry.as_ref()?;
+        if !entry.covers(provider_id) {
+            return None;
+        }
+        Some(
+            cached_sources
+                .iter()
+                .find(|s| s.provider_id == provider_id)
+                .map_or(ProviderOutcome::Absent, |s| {
+                    ProviderOutcome::Hit(s.clone())
+                }),
+        )
+    };
+    let hit_volumio = hydrate("volumio_meta");
+    let hit_tadb = hydrate("theaudiodb");
+    let hit_fanart = hydrate("fanart_tv");
+    let hit_discogs = hydrate("discogs");
+    // Whether this wave learned anything new. A fully-covered
+    // snapshot dispatches nothing and must not rewrite the entry,
+    // or a hot artist would refresh its own TTL on every request
+    // and never re-fetch.
+    let dispatched_any = hit_volumio.is_none()
+        || hit_tadb.is_none()
+        || hit_fanart.is_none()
+        || hit_discogs.is_none();
+    // Each arm yields the final outcome directly: the memoised
+    // one when the snapshot covers it, otherwise a live fetch.
+    // Suppressing a covered leg here rather than at its gate
+    // keeps the fetch's own diagnostics honest — a skipped call
+    // reports nothing rather than claiming a false absence.
+    let (volumio_out, tadb_out, fanart_out, discogs_out) = tokio::join!(
+        async {
+            match hit_volumio {
+                Some(out) => out,
+                None => {
+                    fetch_volumio_meta_artist(
+                        &artist,
+                        &catalogue.volumio_meta_http,
+                        &catalogue.volumio_meta_variant,
+                        want_volumio,
+                    )
+                    .await
                 }
             }
-            (v, t, f, d)
-        } else {
-            // Cold cache — hit every enabled non-Deezer provider
-            // and cache only the Hits. Absent/Unavailable never
-            // enter the cache: absence gets re-tried next request
-            // (cheap) and unavailable MUST NOT durably poison.
-            let (v, t, f, d) = tokio::join!(
-                fetch_volumio_meta_artist(
-                    &artist,
-                    &catalogue.volumio_meta_http,
-                    &catalogue.volumio_meta_variant,
-                    want_volumio,
-                ),
-                fetch_theaudiodb_artist(
-                    effective_mbid,
-                    &artist,
-                    catalogue,
-                    want_theaudiodb,
-                ),
-                fetch_fanart_artist(
-                    effective_mbid,
-                    catalogue,
-                    if catalogue.fanart.is_some() {
-                        gate_fanart
-                    } else {
-                        // Client absent: the fetch reports its own
-                        // no-key-wired reason, which is a distinct
-                        // cause from either gate.
-                        ProviderGate::Dispatch
-                    },
-                ),
-                fetch_discogs_artist(
-                    &artist,
-                    catalogue,
-                    if catalogue.discogs.is_some() {
-                        gate_discogs
-                    } else {
-                        ProviderGate::Dispatch
-                    },
-                ),
-            );
-            // Cache-write policy: only write the aggregate provider
-            // snapshot when EVERY non-Deezer outcome is non-transient
-            // (Hit or Absent). A single Unavailable in the wave means
-            // the memoised set would be incomplete — a subsequent
-            // read would treat the missing entry as a durable Absent,
-            // reproducing the bug we just fixed. Keep the cold cost
-            // and re-fetch next call.
-            let all_non_transient =
-                matches!(v, ProviderOutcome::Hit(_) | ProviderOutcome::Absent)
-                    && matches!(
-                        t,
-                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
+        },
+        async {
+            match hit_tadb {
+                Some(out) => out,
+                None => {
+                    fetch_theaudiodb_artist(
+                        effective_mbid,
+                        &artist,
+                        catalogue,
+                        want_theaudiodb,
                     )
-                    && matches!(
-                        f,
-                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
-                    )
-                    && matches!(
-                        d,
-                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
-                    );
-            if can_cache && all_non_transient {
-                let snapshot: Vec<serde_json::Value> = [&v, &t, &f, &d]
-                    .into_iter()
-                    .filter_map(|out| match out {
-                        ProviderOutcome::Hit(entry) => {
-                            serialize_source_entry(entry)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                catalogue
-                    .caches
-                    .put_provider(
-                        fold_key.clone(),
-                        crate::artwork_caches::ProviderEntry::new(snapshot),
-                    )
-                    .await;
+                    .await
+                }
             }
-            (v, t, f, d)
-        };
+        },
+        async {
+            match hit_fanart {
+                Some(out) => out,
+                None => {
+                    fetch_fanart_artist(
+                        effective_mbid,
+                        catalogue,
+                        if catalogue.fanart.is_some() {
+                            gate_fanart
+                        } else {
+                            // Client absent: the fetch reports its own
+                            // no-key-wired reason, which is a distinct
+                            // cause from either gate.
+                            ProviderGate::Dispatch
+                        },
+                    )
+                    .await
+                }
+            }
+        },
+        async {
+            match hit_discogs {
+                Some(out) => out,
+                None => {
+                    fetch_discogs_artist(
+                        &artist,
+                        catalogue,
+                        if catalogue.discogs.is_some() {
+                            gate_discogs
+                        } else {
+                            ProviderGate::Dispatch
+                        },
+                    )
+                    .await
+                }
+            }
+        },
+    );
+    // Cache-write policy: memoise every leg that settled and
+    // record exactly which those were. A transient leg is simply
+    // left uncovered, so the next request retries that provider
+    // alone instead of re-running the whole wave.
+    //
+    // The predecessor policy wrote only when EVERY leg was
+    // non-transient. That looked conservative and was in fact
+    // catastrophic: one rate-limited provider anywhere in the
+    // wave suppressed the write for every artist, so the snapshot
+    // was never written at all and every tile re-resolved cold
+    // forever. Partial coverage is safe precisely because the
+    // reader above consults `covers()` before trusting a leg.
+    if can_cache && dispatched_any {
+        let mut snapshot: Vec<serde_json::Value> = Vec::new();
+        let mut covered: Vec<String> = Vec::new();
+        for (provider_id, out) in [
+            ("volumio_meta", &volumio_out),
+            ("theaudiodb", &tadb_out),
+            ("fanart_tv", &fanart_out),
+            ("discogs", &discogs_out),
+        ] {
+            match out {
+                ProviderOutcome::Hit(entry) => {
+                    // Only claim coverage for content we can
+                    // actually round-trip; an entry that fails to
+                    // serialise stays uncovered and is re-fetched.
+                    if let Some(value) = serialize_source_entry(entry) {
+                        snapshot.push(value);
+                        covered.push(provider_id.to_string());
+                    }
+                }
+                ProviderOutcome::Absent => {
+                    covered.push(provider_id.to_string())
+                }
+                ProviderOutcome::Unavailable => {}
+            }
+        }
+        if !covered.is_empty() {
+            let entry = match cached_entry.as_ref() {
+                // Widening an existing snapshot inherits its
+                // expiry: filling in a flaky leg must not extend
+                // the life of the data already held.
+                Some(prev) => {
+                    crate::artwork_caches::ProviderEntry::with_expiry(
+                        snapshot,
+                        covered,
+                        prev.expires_at,
+                    )
+                }
+                None => {
+                    crate::artwork_caches::ProviderEntry::new(snapshot, covered)
+                }
+            };
+            catalogue.caches.put_provider(fold_key.clone(), entry).await;
+        }
+    }
 
     // Deezer always fires live — the by-id fetch is cheap
     // (single HTTPS round on a known id) and the URL is under
@@ -2632,9 +2690,29 @@ async fn fetch_discogs_artist(
         );
         return ProviderOutcome::Absent;
     }
-    let hit = match discogs.get_artist_image(artist).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
+    // Non-blocking on purpose. Discogs shares a 1 req/s budget
+    // with the text surface; waiting for a slot here would make
+    // that ceiling the page latency of any browse resolving
+    // several artists at once, because every tile's wave would
+    // queue behind the one before it. A spent budget is reported
+    // as transient, which leaves Discogs uncovered in the
+    // snapshot so a later pass picks the artist up while the
+    // other providers cache immediately.
+    let hit = match discogs.try_get_artist_image(artist).await {
+        Ok(ArtistImageAttempt::RateLimited) => {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                outcome = "unavailable",
+                reason = "rate_budget_spent",
+                next_attempt = "on_next_demand",
+                "Discogs artist images: no rate-limit slot free, nothing dispatched; leg left uncovered so a later request retries it"
+            );
+            return ProviderOutcome::Unavailable;
+        }
+        Ok(ArtistImageAttempt::Completed(Some(h))) => h,
+        Ok(ArtistImageAttempt::Completed(None)) => {
             tracing::info!(
                 plugin = crate::PLUGIN_NAME,
                 provider = "discogs",

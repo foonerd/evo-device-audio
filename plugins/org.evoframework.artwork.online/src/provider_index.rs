@@ -16,7 +16,14 @@
 //! Layout (mirrors [`crate::reconcile_index::ReconcileIndex`]):
 //!
 //! - `<state_dir>/provider-index/<sha256(fold_key)[0:2]>/<sha256(fold_key)>`
-//! - File body: JSON-serialised `Vec<serde_json::Value>`.
+//! - File body: a JSON envelope `{"v", "sources", "covered"}`.
+//!
+//! `covered` names the providers the snapshot durably speaks
+//! for. A provider listed there but absent from `sources`
+//! answered with a definitive absence; one missing from both was
+//! never asked. Files written before the envelope existed are a
+//! bare `Vec<serde_json::Value>` and are still read, with
+//! coverage derived from the entries present.
 //!
 //! ## Freshness contract
 //!
@@ -57,6 +64,24 @@ pub(crate) struct ProviderIndex {
     root: PathBuf,
 }
 
+/// On-disk snapshot format version. Bumped only when the shape
+/// changes incompatibly; readers fall back to the legacy
+/// bare-array form when the envelope does not parse.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Envelope written to each sidecar file.
+///
+/// The predecessor format was a bare JSON array of source
+/// entries, which could not express which providers a snapshot
+/// spoke for. Both are read; only this one is written.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredSnapshot {
+    #[serde(rename = "v")]
+    version: u32,
+    sources: Vec<serde_json::Value>,
+    covered: Vec<String>,
+}
+
 impl ProviderIndex {
     /// Construct a sidecar rooted under
     /// `<state_dir>/provider-index/`. The directory is created
@@ -67,27 +92,48 @@ impl ProviderIndex {
         }
     }
 
-    /// Read the persisted `sources` vec for the fold-key.
-    /// Returns `None` when no entry is stored, the stored file
-    /// is unreadable, or its content fails to deserialise.
+    /// Read the persisted snapshot for the fold-key: the stored
+    /// `sources` plus the provider ids the snapshot durably
+    /// covers. Returns `None` when no entry is stored, the stored
+    /// file is unreadable, or its content fails to deserialise.
     /// Never surfaces I/O errors.
+    ///
+    /// Reads both the current envelope and the legacy bare-array
+    /// form written before coverage was recorded. A legacy file
+    /// only knows which providers returned content, so coverage
+    /// is derived from the entries present: providers that were
+    /// durably absent read back as uncovered and get re-tried
+    /// once, which costs one wave per artist and then settles.
+    /// That is strictly better than the alternative reading,
+    /// which would invent a durable absence nobody observed.
     pub(crate) async fn get(
         &self,
         fold_key: &str,
-    ) -> Option<Vec<serde_json::Value>> {
+    ) -> Option<(Vec<serde_json::Value>, Vec<String>)> {
         let path = self.path_for(&Self::key_hash(fold_key));
         let raw = tokio::fs::read(&path).await.ok()?;
-        serde_json::from_slice::<Vec<serde_json::Value>>(&raw).ok()
+        if let Ok(env) = serde_json::from_slice::<StoredSnapshot>(&raw) {
+            return Some((env.sources, env.covered));
+        }
+        let sources =
+            serde_json::from_slice::<Vec<serde_json::Value>>(&raw).ok()?;
+        let covered = sources
+            .iter()
+            .filter_map(|s| s.get("provider_id")?.as_str().map(str::to_string))
+            .collect();
+        Some((sources, covered))
     }
 
-    /// Persist `sources` for the fold-key. Overwrites any
-    /// existing entry atomically. An empty `sources` list is a
-    /// legitimate "every provider tried and none had content"
-    /// signal and IS persisted.
+    /// Persist `sources` and its coverage for the fold-key.
+    /// Overwrites any existing entry atomically. An empty
+    /// `sources` list is a legitimate "every provider tried and
+    /// none had content" signal and IS persisted — provided
+    /// `covered` names the providers that reported it.
     pub(crate) async fn put(
         &self,
         fold_key: &str,
         sources: &[serde_json::Value],
+        covered: &[String],
     ) -> Result<(), std::io::Error> {
         if fold_key.is_empty() {
             return Err(std::io::Error::new(
@@ -95,9 +141,12 @@ impl ProviderIndex {
                 "provider-index refuses empty fold_key",
             ));
         }
-        let bytes = serde_json::to_vec(sources).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let bytes = serde_json::to_vec(&StoredSnapshot {
+            version: SNAPSHOT_VERSION,
+            sources: sources.to_vec(),
+            covered: covered.to_vec(),
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let key = Self::key_hash(fold_key);
         let path = self.path_for(&key);
         if let Some(parent) = path.parent() {
@@ -195,18 +244,55 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
         let sources = vec![source("theaudiodb"), source("fanart")];
-        idx.put("abba", &sources).await.unwrap();
-        assert_eq!(idx.get("abba").await.unwrap(), sources);
+        let covered = vec!["theaudiodb".to_string(), "fanart".to_string()];
+        idx.put("abba", &sources, &covered).await.unwrap();
+        assert_eq!(idx.get("abba").await.unwrap(), (sources, covered));
+    }
+
+    /// A snapshot may cover a provider that contributed no
+    /// content — that is a recorded absence, and it must survive
+    /// the disk round trip as coverage rather than being inferred
+    /// away. Losing it would send the cascade back to the network
+    /// for an answer it already has.
+    #[tokio::test]
+    async fn coverage_without_content_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let idx = ProviderIndex::new(dir.path().to_path_buf());
+        let sources = vec![source("theaudiodb")];
+        let covered = vec!["theaudiodb".to_string(), "discogs".to_string()];
+        idx.put("abba", &sources, &covered).await.unwrap();
+        let (got_sources, got_covered) = idx.get("abba").await.unwrap();
+        assert_eq!(got_sources, sources);
+        assert_eq!(got_covered, covered);
+    }
+
+    /// Sidecar files written before coverage was recorded are a
+    /// bare JSON array. They must still load, with coverage
+    /// inferred from the entries actually present — never widened
+    /// to providers the old file never spoke for.
+    #[tokio::test]
+    async fn legacy_bare_array_file_is_read_with_derived_coverage() {
+        let dir = TempDir::new().unwrap();
+        let idx = ProviderIndex::new(dir.path().to_path_buf());
+        let key = ProviderIndex::key_hash("abba");
+        let shard = dir.path().join("provider-index").join(&key[..2]);
+        tokio::fs::create_dir_all(&shard).await.unwrap();
+        let legacy = serde_json::to_vec(&vec![source("theaudiodb")]).unwrap();
+        tokio::fs::write(shard.join(&key), legacy).await.unwrap();
+        let (sources, covered) = idx.get("abba").await.unwrap();
+        assert_eq!(sources, vec![source("theaudiodb")]);
+        assert_eq!(covered, vec!["theaudiodb".to_string()]);
     }
 
     #[tokio::test]
     async fn put_empty_sources_persists_and_reads_back_empty() {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
-        idx.put("abba", &[]).await.unwrap();
+        let covered = vec!["theaudiodb".to_string()];
+        idx.put("abba", &[], &covered).await.unwrap();
         assert_eq!(
             idx.get("abba").await.unwrap(),
-            Vec::<serde_json::Value>::new()
+            (Vec::<serde_json::Value>::new(), covered)
         );
     }
 
@@ -221,16 +307,25 @@ mod tests {
     async fn put_overwrites_existing() {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
-        idx.put("abba", &[source("a")]).await.unwrap();
-        idx.put("abba", &[source("b")]).await.unwrap();
-        assert_eq!(idx.get("abba").await.unwrap(), vec![source("b")]);
+        idx.put("abba", &[source("a")], &["a".to_string()])
+            .await
+            .unwrap();
+        idx.put("abba", &[source("b")], &["b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            idx.get("abba").await.unwrap(),
+            (vec![source("b")], vec!["b".to_string()])
+        );
     }
 
     #[tokio::test]
     async fn forget_removes_entry() {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
-        idx.put("abba", &[source("a")]).await.unwrap();
+        idx.put("abba", &[source("a")], &["a".to_string()])
+            .await
+            .unwrap();
         assert!(idx.forget("abba").await.unwrap());
         assert!(idx.get("abba").await.is_none());
     }
@@ -246,7 +341,10 @@ mod tests {
     async fn put_refuses_empty_fold_key() {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
-        assert!(idx.put("", &[source("a")]).await.is_err());
+        assert!(idx
+            .put("", &[source("a")], &["a".to_string()])
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -267,9 +365,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let idx = ProviderIndex::new(dir.path().to_path_buf());
         for i in 0..5 {
-            idx.put(&format!("a-{i}"), &[source(&format!("p-{i}"))])
-                .await
-                .unwrap();
+            idx.put(
+                &format!("a-{i}"),
+                &[source(&format!("p-{i}"))],
+                &[format!("p-{i}")],
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(idx.drop_all().await.unwrap(), 5);
         for i in 0..5 {

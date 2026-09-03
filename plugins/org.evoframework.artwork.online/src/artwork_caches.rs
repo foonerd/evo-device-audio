@@ -267,8 +267,8 @@ impl ArtworkCaches {
             }
         }
         let sidecar = self.provider_index.as_ref()?;
-        let sources = sidecar.get(fold_key).await?;
-        let hydrated = ProviderEntry::new(sources);
+        let (sources, covered) = sidecar.get(fold_key).await?;
+        let hydrated = ProviderEntry::new(sources, covered);
         let mut lru = self.provider.lock().expect("provider lock poisoned");
         lru.put(fold_key.to_string(), hydrated.clone());
         Some(hydrated)
@@ -289,7 +289,9 @@ impl ArtworkCaches {
             lru.put(fold_key.clone(), entry.clone());
         }
         if let Some(sidecar) = &self.provider_index {
-            if let Err(e) = sidecar.put(&fold_key, &entry.sources).await {
+            if let Err(e) =
+                sidecar.put(&fold_key, &entry.sources, &entry.covered).await
+            {
                 tracing::warn!(
                     plugin = crate::PLUGIN_NAME,
                     fold_key = %fold_key,
@@ -508,15 +510,58 @@ pub(crate) enum MissReason {
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderEntry {
     pub(crate) sources: Vec<serde_json::Value>,
+    /// Provider ids whose outcome in this snapshot is *durable* —
+    /// they returned either content (and appear in `sources`) or
+    /// a definitive absence (and do not).
+    ///
+    /// This is what lets a snapshot be partial. Without it, a
+    /// provider missing from `sources` is ambiguous: it could
+    /// have answered "nothing here" or never have been asked at
+    /// all, and a reader must assume the pessimistic reading. The
+    /// old all-or-nothing write policy existed purely to dodge
+    /// that ambiguity — one transient provider anywhere in the
+    /// wave suppressed the write for every artist, so nothing was
+    /// ever cached. Recording coverage explicitly means a wave
+    /// can memoise the legs that did settle and leave the flaky
+    /// one to a later pass.
+    pub(crate) covered: Vec<String>,
     pub(crate) expires_at: Instant,
 }
 
 impl ProviderEntry {
-    pub(crate) fn new(sources: Vec<serde_json::Value>) -> Self {
+    /// A freshly-observed snapshot, starting a new TTL window.
+    pub(crate) fn new(
+        sources: Vec<serde_json::Value>,
+        covered: Vec<String>,
+    ) -> Self {
         Self {
             sources,
+            covered,
             expires_at: Instant::now() + PROVIDER_RESULT_TTL,
         }
+    }
+
+    /// A snapshot that inherits an existing expiry.
+    ///
+    /// Used when a later pass fills in providers an earlier pass
+    /// left uncovered. Widening coverage must not extend the life
+    /// of the data already held, or an artist whose flaky
+    /// provider keeps re-settling would refresh its TTL forever
+    /// and never re-fetch the legs that *did* succeed.
+    pub(crate) fn with_expiry(
+        sources: Vec<serde_json::Value>,
+        covered: Vec<String>,
+        expires_at: Instant,
+    ) -> Self {
+        Self {
+            sources,
+            covered,
+            expires_at,
+        }
+    }
+
+    pub(crate) fn covers(&self, provider_id: &str) -> bool {
+        self.covered.iter().any(|p| p == provider_id)
     }
 }
 
@@ -601,13 +646,58 @@ mod tests {
         let caches = ArtworkCaches::new();
         let sources = vec![serde_json::json!({"provider_id": "theaudiodb"})];
         caches
-            .put_provider("abba".into(), ProviderEntry::new(sources.clone()))
+            .put_provider(
+                "abba".into(),
+                ProviderEntry::new(
+                    sources.clone(),
+                    vec!["theaudiodb".to_string()],
+                ),
+            )
             .await;
         let entry = caches
             .get_provider("abba")
             .await
             .expect("provider entry present");
         assert_eq!(entry.sources, sources);
+    }
+
+    /// The invariant that keeps a flaky provider from disabling
+    /// caching for everyone: a snapshot may settle some legs and
+    /// leave others open, and it must report that honestly. A
+    /// provider that contributed no content but did answer is
+    /// covered; one that never answered is not, and the cascade
+    /// re-dispatches only the latter.
+    #[tokio::test]
+    async fn partial_snapshot_reports_only_the_legs_that_settled() {
+        let entry = ProviderEntry::new(
+            vec![serde_json::json!({"provider_id": "fanart_tv"})],
+            vec!["fanart_tv".to_string(), "theaudiodb".to_string()],
+        );
+        assert!(entry.covers("fanart_tv"), "a leg that returned content");
+        assert!(
+            entry.covers("theaudiodb"),
+            "a leg that answered with a definitive absence"
+        );
+        assert!(
+            !entry.covers("discogs"),
+            "a leg that never answered must stay uncovered so it is retried"
+        );
+    }
+
+    /// Widening coverage must not renew the entry's life. A
+    /// provider that keeps re-settling would otherwise refresh
+    /// the TTL on every pass and the data already held would
+    /// never be re-fetched.
+    #[tokio::test]
+    async fn widening_coverage_inherits_the_original_expiry() {
+        let first = ProviderEntry::new(vec![], vec!["fanart_tv".to_string()]);
+        let widened = ProviderEntry::with_expiry(
+            vec![],
+            vec!["fanart_tv".to_string(), "discogs".to_string()],
+            first.expires_at,
+        );
+        assert_eq!(widened.expires_at, first.expires_at);
+        assert!(widened.covers("discogs"));
     }
 
     #[tokio::test]
@@ -619,6 +709,7 @@ mod tests {
                 "stale".to_string(),
                 ProviderEntry {
                     sources: vec![],
+                    covered: vec![],
                     expires_at: Instant::now() - Duration::from_secs(1),
                 },
             );
@@ -666,13 +757,19 @@ mod tests {
         caches
             .put_provider(
                 "abba".into(),
-                ProviderEntry::new(vec![serde_json::json!({"src":"a"})]),
+                ProviderEntry::new(
+                    vec![serde_json::json!({"src":"a"})],
+                    vec!["theaudiodb".to_string()],
+                ),
             )
             .await;
         caches
             .put_provider(
                 "adele".into(),
-                ProviderEntry::new(vec![serde_json::json!({"src":"b"})]),
+                ProviderEntry::new(
+                    vec![serde_json::json!({"src":"b"})],
+                    vec!["theaudiodb".to_string()],
+                ),
             )
             .await;
         assert!(caches.get_reconcile("abba").await.is_some());
@@ -773,7 +870,13 @@ mod tests {
         let caches = ArtworkCaches::with_state_dir(dir.path().to_path_buf());
         let sources = vec![serde_json::json!({"provider_id": "theaudiodb"})];
         caches
-            .put_provider("abba".into(), ProviderEntry::new(sources.clone()))
+            .put_provider(
+                "abba".into(),
+                ProviderEntry::new(
+                    sources.clone(),
+                    vec!["theaudiodb".to_string()],
+                ),
+            )
             .await;
         caches.provider.lock().unwrap().clear();
         let entry = caches
@@ -793,7 +896,10 @@ mod tests {
         caches
             .put_provider(
                 "abba".into(),
-                ProviderEntry::new(vec![serde_json::json!({"src": "a"})]),
+                ProviderEntry::new(
+                    vec![serde_json::json!({"src": "a"})],
+                    vec!["theaudiodb".to_string()],
+                ),
             )
             .await;
         // Both dropped: LRU + sidecar = 2 each.

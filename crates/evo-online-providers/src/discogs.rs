@@ -136,11 +136,22 @@ impl DiscogsClient {
         format!("Discogs token={}", self.personal_access_token)
     }
 
+    /// Wait for a rate-limit slot, then dispatch.
     async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         url: String,
     ) -> Result<T, DiscogsError> {
         self.rate.acquire().await;
+        self.get_json_dispatched(url).await
+    }
+
+    /// Dispatch immediately, assuming the caller has already
+    /// taken a rate-limit slot. Never consults the limiter, so
+    /// calling it without a slot in hand overruns the budget.
+    async fn get_json_dispatched<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: String,
+    ) -> Result<T, DiscogsError> {
         let resp = self
             .http
             .get(&url)
@@ -305,16 +316,64 @@ impl DiscogsClient {
         &self,
         artist: &str,
     ) -> Result<Option<ArtistImageHit>, DiscogsError> {
+        match self.artist_image_impl(artist, true).await? {
+            ArtistImageAttempt::Completed(hit) => Ok(hit),
+            // Unreachable: the blocking path waits for a slot
+            // rather than reporting one unavailable.
+            ArtistImageAttempt::RateLimited => Ok(None),
+        }
+    }
+
+    /// Look up an artist image without ever waiting on the shared
+    /// 1 req/s budget.
+    ///
+    /// Yields [`ArtistImageAttempt::RateLimited`] — having
+    /// dispatched nothing — when no slot is free, so a caller on
+    /// a latency-sensitive path can record a transient miss and
+    /// move on instead of holding its whole provider wave open.
+    /// A browse grid resolving many artists at once would
+    /// otherwise pay the budget serially and inherit Discogs'
+    /// ceiling as its own page latency.
+    ///
+    /// The caller is expected to treat `RateLimited` as transient
+    /// (retry on a later pass), never as an absence.
+    pub async fn try_get_artist_image(
+        &self,
+        artist: &str,
+    ) -> Result<ArtistImageAttempt, DiscogsError> {
+        self.artist_image_impl(artist, false).await
+    }
+
+    /// Shared body for the blocking and non-blocking lookups.
+    /// `blocking` selects how each of the two rate-limited
+    /// requests (search, then detail) takes its slot.
+    async fn artist_image_impl(
+        &self,
+        artist: &str,
+        blocking: bool,
+    ) -> Result<ArtistImageAttempt, DiscogsError> {
+        macro_rules! slot {
+            () => {
+                if blocking {
+                    self.rate.acquire().await;
+                } else if !self.rate.try_acquire().await {
+                    return Ok(ArtistImageAttempt::RateLimited);
+                }
+            };
+        }
         let search_url = format!(
             "{DISCOGS_API_BASE}/database/search?type=artist&q={}&per_page=1",
             urlencode(artist),
         );
-        let search: ArtistSearchResponse = self.get_json(search_url).await?;
+        slot!();
+        let search: ArtistSearchResponse =
+            self.get_json_dispatched(search_url).await?;
         let Some(first) = search.results.into_iter().next() else {
-            return Ok(None);
+            return Ok(ArtistImageAttempt::Completed(None));
         };
         let detail_url = format!("{DISCOGS_API_BASE}/artists/{}", first.id);
-        let detail: ArtistDetail = self.get_json(detail_url).await?;
+        slot!();
+        let detail: ArtistDetail = self.get_json_dispatched(detail_url).await?;
         let images = detail.images.unwrap_or_default();
         let pick = images
             .iter()
@@ -328,19 +387,35 @@ impl DiscogsClient {
                 })
             });
         let Some(entry) = pick else {
-            return Ok(None);
+            return Ok(ArtistImageAttempt::Completed(None));
         };
         let Some(image_url) = entry.uri.as_ref() else {
-            return Ok(None);
+            return Ok(ArtistImageAttempt::Completed(None));
         };
-        Ok(Some(ArtistImageHit {
+        Ok(ArtistImageAttempt::Completed(Some(ArtistImageHit {
             image_url: image_url.clone(),
             source_url: Some(format!(
                 "https://www.discogs.com/artist/{}",
                 first.id
             )),
-        }))
+        })))
     }
+}
+
+/// Outcome of a non-blocking artist-image lookup.
+///
+/// Separates "we asked and this is the answer" from "we never
+/// asked, because the rate-limit budget was spent". Collapsing
+/// the two into `Option` would let a caller memoise a
+/// rate-limited pass as a durable absence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArtistImageAttempt {
+    /// The lookup ran to completion: `Some` on a hit, `None` on
+    /// an ordinary miss (no search match, or no usable imagery).
+    Completed(Option<ArtistImageHit>),
+    /// No rate-limit slot was free. Nothing was dispatched and
+    /// nothing is known about this artist; retry on a later pass.
+    RateLimited,
 }
 
 /// Prefer the plaintext-annotated field, fall back to the raw
