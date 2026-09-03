@@ -674,12 +674,30 @@ impl Plugin for MetadataOnlinePlugin {
                     build_genius_client(&http, &self.config, token)
                 });
             let lastfm_configured = self.lastfm_client.read().await.is_some();
+            // Credential presence IS the enable authority for
+            // keyed providers. Runs AFTER the store overlay above
+            // so a stale store row cannot leave a provider dark
+            // while its key sits wired in the vault. See
+            // `ProviderConfig::apply_credential_authority` for the
+            // full rationale and the privacy-mode carve-out.
+            let discogs_configured = self.discogs_client.read().await.is_some();
+            let genius_configured = self.genius_client.read().await.is_some();
+            {
+                let mut cfg = self.provider_config.write().await;
+                cfg.apply_credential_authority(
+                    lastfm_configured,
+                    discogs_configured,
+                    genius_configured,
+                );
+            }
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 cache_wired = self.reconcile_cache.is_some(),
                 musicbrainz_ua = %self.config.musicbrainz_user_agent,
                 mb_min_interval_ms = self.config.musicbrainz_min_interval.as_millis() as u64,
                 lastfm_configured = lastfm_configured,
+                discogs_configured = discogs_configured,
+                genius_configured = genius_configured,
                 lrclib_wired = self.lrclib_client.is_some(),
                 "load complete"
             );
@@ -706,6 +724,8 @@ impl Plugin for MetadataOnlinePlugin {
                 let genius_slot = Arc::clone(&self.genius_client);
                 let http_for_task = http.clone();
                 let config_for_task = self.config.clone();
+                let provider_config_for_task =
+                    Arc::clone(&self.provider_config);
                 self.reactor_tasks.push(tokio::spawn(credential_reactor(
                     rx,
                     vault_for_task,
@@ -714,6 +734,7 @@ impl Plugin for MetadataOnlinePlugin {
                     genius_slot,
                     http_for_task,
                     config_for_task,
+                    provider_config_for_task,
                 )));
             }
             // Spawn the online-provider-config reactor. On every
@@ -1303,6 +1324,7 @@ async fn credential_reactor(
     genius_slot: Arc<RwLock<Option<GeniusClient>>>,
     http: evo_online_providers::HttpClient,
     config: PluginConfig,
+    provider_config: Arc<RwLock<cascade::ProviderConfig>>,
 ) {
     use evo_plugin_sdk::contract::context::CredentialChangeKind;
     loop {
@@ -1385,6 +1407,35 @@ async fn credential_reactor(
                             // Silently ignore.
                         }
                     }
+                }
+                // Credential presence IS the enable authority.
+                // Re-derive the enable bit for all three keyed
+                // providers after every credential event, so a
+                // key add lights the provider on the next
+                // dispatch and a key delete darkens it — without
+                // a plugin restart and without the operator
+                // needing a second gesture anywhere. Re-deriving
+                // all three (rather than only the changed one)
+                // keeps the config convergent even if an earlier
+                // event was dropped under broadcast lag.
+                {
+                    let lastfm_present = lastfm_slot.read().await.is_some();
+                    let discogs_present = discogs_slot.read().await.is_some();
+                    let genius_present = genius_slot.read().await.is_some();
+                    let mut cfg = provider_config.write().await;
+                    cfg.apply_credential_authority(
+                        lastfm_present,
+                        discogs_present,
+                        genius_present,
+                    );
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        lastfm_enabled = lastfm_present,
+                        discogs_enabled = discogs_present,
+                        genius_enabled = genius_present,
+                        "reactor: credential authority re-applied to \
+                         keyed-provider enable bits"
+                    );
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
