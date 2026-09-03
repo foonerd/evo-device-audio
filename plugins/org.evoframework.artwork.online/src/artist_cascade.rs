@@ -1389,6 +1389,7 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
             bytes: transcoded_bytes,
             content_hash,
             mime,
+            flat_tone_ratio,
         } = match evo_device_audio_shared::transcode::transcode(
             bytes,
             &source_mime,
@@ -1410,21 +1411,27 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
                 continue;
             }
         };
-        if is_placeholder_hash_hex(&content_hash) {
-            // Deezer's "no picture" blank + any other known
-            // placeholder — the URL was structurally valid but
-            // the bytes are a well-known silhouette. Provider is
-            // effectively-empty for this artist; cascade continues.
+        if is_not_a_photograph(flat_tone_ratio) {
+            // A provider's generic "no image" silhouette. The URL
+            // was structurally valid and the bytes decode as an
+            // image, so nothing upstream of here could reject it;
+            // the pixels are the only honest signal. Provider is
+            // effectively-empty for this artist, so the cascade
+            // continues and a real portrait behind it can win.
+            let ratio = flat_tone_ratio.unwrap_or(0.0);
             last_detail = Some(format!(
-                "provider {} returned a known-placeholder image \
-                 (content_hash={content_hash}); continuing cascade",
-                source.provider_id
+                "provider {} returned a flat non-photographic image \
+                 (two tones cover {pct:.0}% of pixels, \
+                 content_hash={content_hash}); continuing cascade",
+                source.provider_id,
+                pct = ratio * 100.0,
             ));
             tracing::info!(
                 plugin = crate::PLUGIN_NAME,
                 provider = %source.provider_id,
                 content_hash = %content_hash,
-                "artist source produced a placeholder-hash image; trying next source"
+                flat_tone_ratio = ratio,
+                "artist source produced a placeholder (non-photographic) image; trying next source"
             );
             continue;
         }
@@ -1480,6 +1487,7 @@ async fn fetch_and_transcode_single(
         bytes: transcoded_bytes,
         content_hash,
         mime,
+        flat_tone_ratio,
     } = match evo_device_audio_shared::transcode::transcode(
         bytes,
         &source_mime,
@@ -1502,11 +1510,13 @@ async fn fetch_and_transcode_single(
             );
         }
     };
-    if is_placeholder_hash_hex(&content_hash) {
+    if is_not_a_photograph(flat_tone_ratio) {
         return artist_bytes_not_found(
             format!(
-                "single-source path produced a known-placeholder image \
-                 (content_hash={content_hash}); no other source to cascade to"
+                "single-source path produced a flat non-photographic image \
+                 (two tones cover {pct:.0}% of pixels, \
+                 content_hash={content_hash}); no other source to cascade to",
+                pct = flat_tone_ratio.unwrap_or(0.0) * 100.0,
             ),
             provider_id,
         );
@@ -1525,17 +1535,42 @@ async fn fetch_and_transcode_single(
     }
 }
 
-/// Check whether a hex-encoded content hash matches a known
-/// upstream "no image" placeholder. Mirrors the framework-side
-/// `is_known_placeholder_hash` list; both must accept the same
-/// set so the placeholder rejection is coherent across the
-/// cascade layer (plugin-side, this file) and the endpoint
-/// layer (framework-side, `artwork_cascade.rs`).
+/// Fraction of the frame that two colours must cover before the
+/// image is judged a flat graphic rather than a photograph.
 ///
-/// Currently: the empty-string MD5 hex sentinel Deezer uses as
-/// its "no picture" marker.
-fn is_placeholder_hash_hex(hash: &str) -> bool {
-    hash.eq_ignore_ascii_case(EMPTY_HASH_MD5_HEX)
+/// Measured against real provider output: every observed
+/// silhouette — all four sizes Deezer serves, and both CDN
+/// byte-variants seen at 500x500 — lands between 0.91 and 0.99,
+/// while genuine artist portraits land between 0.13 and 0.40.
+/// The threshold sits in the empty half of that gap, more than
+/// ten points clear of the flattest real photograph observed and
+/// fifty clear of the busiest silhouette.
+const NON_PHOTOGRAPH_FLAT_TONE_RATIO: f32 = 0.80;
+
+/// Whether decoded pixels say "this is not a photograph of
+/// anybody" — a provider's generic no-image silhouette, a
+/// wordmark, a solid fill.
+///
+/// This replaced a content-hash comparison that could never
+/// match: it tested a SHA-256 (64 hex chars) against the MD5 of
+/// the empty string (32 hex chars), so the guard never fired
+/// once and every placeholder that cleared the URL filter won
+/// its cascade outright.
+///
+/// Hashes were the wrong instrument regardless of that defect.
+/// The silhouette is served from per-artist URLs that carry a
+/// real-looking entity segment, so no URL rule reaches it, and
+/// it exists in several byte-variants per size, so an exact-hash
+/// list would need an entry per variant and would silently lag
+/// every CDN re-encode. The pixels are stable where the bytes
+/// are not.
+///
+/// `None` — an `Original`-size passthrough, which is never
+/// decoded — reads as "not measured" and never rejects. An
+/// unmeasurable image must not be discarded on the strength of
+/// a statistic that was never taken.
+fn is_not_a_photograph(flat_tone_ratio: Option<f32>) -> bool {
+    flat_tone_ratio.is_some_and(|r| r >= NON_PHOTOGRAPH_FLAT_TONE_RATIO)
 }
 
 fn image_url_host_is_deezer(url: &str) -> bool {
@@ -3919,6 +3954,54 @@ mod tests {
             pick_canonical_image_url(&mixed).as_deref(),
             Some("https://f/artist/real/thumb.jpg")
         );
+    }
+
+    /// The regression that made tiles look empty: the guard this
+    /// replaced compared a SHA-256 against an MD5 constant, so it
+    /// never fired and a provider silhouette won its cascade
+    /// outright, outranking a real portrait behind it.
+    #[test]
+    fn flat_silhouette_ratio_is_rejected_as_non_photographic() {
+        // Real provider silhouettes measure 0.911-0.988 through
+        // the transcode path at every size Deezer serves, and in
+        // both CDN byte-variants observed at 500x500.
+        for r in [0.911_f32, 0.949, 0.962, 0.974, 0.988] {
+            assert!(
+                is_not_a_photograph(Some(r)),
+                "measured silhouette ratio {r} must be rejected"
+            );
+        }
+    }
+
+    /// The other half: real portraits must survive. These are the
+    /// measured ratios of genuine artist images through the same
+    /// path, including the flattest one observed.
+    #[test]
+    fn real_portrait_ratios_are_accepted() {
+        for r in [0.133_f32, 0.239, 0.245, 0.357, 0.395] {
+            assert!(
+                !is_not_a_photograph(Some(r)),
+                "measured real-portrait ratio {r} must be accepted"
+            );
+        }
+    }
+
+    /// An unmeasured image (`Original` passthrough, never decoded)
+    /// must never be rejected on the strength of a statistic that
+    /// was not taken. Failing open here is correct: the cost is a
+    /// possible placeholder, the cost of failing closed is
+    /// discarding a real portrait.
+    #[test]
+    fn unmeasured_ratio_is_never_rejected() {
+        assert!(!is_not_a_photograph(None));
+    }
+
+    #[test]
+    fn threshold_sits_between_the_measured_populations() {
+        // Flattest real portrait observed, busiest silhouette
+        // observed. The threshold must fall strictly between.
+        const { assert!(NON_PHOTOGRAPH_FLAT_TONE_RATIO > 0.395) };
+        const { assert!(NON_PHOTOGRAPH_FLAT_TONE_RATIO < 0.911) };
     }
 
     #[test]

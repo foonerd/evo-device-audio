@@ -233,6 +233,13 @@ pub(crate) async fn resolve_artwork(
         bytes,
         content_hash,
         mime,
+        // `flat_tone_ratio` is deliberately not consulted on the
+        // album surface. It distinguishes a photograph from a flat
+        // graphic, which is the right question for an artist
+        // portrait and the wrong one for a cover: plenty of real
+        // sleeves are two-tone typographic art, and rejecting them
+        // would blank legitimate covers.
+        ..
     } = match transcode(hit.bytes, &source_mime, size) {
         Ok(t) => t,
         Err(e) => {
