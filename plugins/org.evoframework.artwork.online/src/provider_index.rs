@@ -49,9 +49,13 @@
 //! content") and DOES persist; it prevents a browse burst from
 //! re-hammering exhausted providers after restart.
 //!
-//! Deezer entries are excluded upstream (in the caller) because
-//! the plugin's live-fetch invariant forbids caching Deezer
-//! image URLs. This module is not the enforcement point — it
+//! Deezer entries are excluded upstream (in the caller), so its
+//! URL is re-derived on each resolve rather than memoised here.
+//! That is no longer a terms-of-service restriction — Deezer
+//! bytes are cached like any other provider's — but a freshness
+//! choice: its CDN links are the shortest-lived of the set, and
+//! a memoised URL that has since expired serves a 404 instead of
+//! a picture. This module is not the enforcement point; it
 //! stores whatever the caller passes.
 
 use std::path::{Path, PathBuf};

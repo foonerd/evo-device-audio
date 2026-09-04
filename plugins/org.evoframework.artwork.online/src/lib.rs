@@ -33,11 +33,12 @@
 //! - Volumio meta proxy — no key; disabled by default
 //!   (historical primary that shipped 500s).
 //!
-//! Deezer is deliberately excluded from the album cascade per
-//! its live-fetch ToS invariant — the artist cascade also
-//! forbids Deezer bytes structurally via `ArtistImageHit`'s
-//! missing `Serialize`. The `[providers.deezer]` toggle is
-//! retained for the artist path's live-fetch channel.
+//! Deezer is not consulted by the album cascade: Cover Art
+//! Archive and iTunes cover the practical case there. That is a
+//! provider-set choice for album covers, not a restriction on
+//! Deezer — its bytes are cached like any other provider's,
+//! governed by the operator's artwork-caching setting. The
+//! `[providers.deezer]` toggle governs the artist path.
 //!
 //! Each provider is enable/disable + per-key configurable via
 //! `/etc/evo/plugins.d/org.evoframework.artwork.online.toml`.
@@ -157,12 +158,6 @@ const REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK: &str =
 /// to `/api/v1/audio/artwork/{content_hash}` — same local
 /// serve path album covers already use.
 ///
-/// The Deezer live-fetch invariant is preserved structurally:
-/// any winning URL whose host is on Deezer's CDN is refused at
-/// the byte-cache path with `status=not_found` so the
-/// endpoint never persists ToS-restricted bytes locally. See
-/// [`crate::artist_cascade::resolve_artist_bytes_to_hash`]
-/// for the full contract.
 const REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE: &str =
     "artwork.resolve_artist_online";
 

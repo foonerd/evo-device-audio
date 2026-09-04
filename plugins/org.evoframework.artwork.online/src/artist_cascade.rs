@@ -38,14 +38,12 @@
 //!   verb consumes the bio; this cascade consumes the thumb).
 //!   Cache-safe.
 //! - **deezer** — anonymous keyless. Provides four resolution
-//!   tiers of the artist portrait via the public API. **Live-
-//!   fetch invariant, ToS-mandated**: the response body must
-//!   NEVER be persisted. Enforced at the type level by
-//!   `ArtistImageHit`'s deliberate absence of `Serialize`; the
-//!   fetch helper extracts URLs into a local JSON payload
-//!   inline. The URLs themselves are stable metadata and
-//!   render-time links; the images they point at are what the
-//!   ToS restricts.
+//!   tiers of the artist portrait via the public API. Its
+//!   bytes are cached like any other provider's, governed by
+//!   the operator's artwork-caching setting. `ArtistImageHit`
+//!   still lacks `Serialize`, which keeps the response body
+//!   from leaking into a JSON payload wholesale — a type-level
+//!   hygiene property, not a caching restriction.
 //! - **fanart.tv** — identity-bearing, keyed by operator's
 //!   fanart.tv personal API key from the framework credential
 //!   vault. Provides HD music logos, HD artist logos,
@@ -1043,19 +1041,6 @@ pub(crate) async fn query_artist_artwork(
     }
 }
 
-/// Deezer CDN host token used to identify URLs whose bytes
-/// MUST NOT be cached durably by this device per Deezer's
-/// terms of service (live-fetch invariant, mirrored
-/// structurally by [`evo_online_providers::deezer::ArtistImageHit`]'s
-/// missing `Serialize`). Any winning image URL whose host
-/// matches this token is refused at the byte-caching path;
-/// the endpoint returns `not_found` on the artist scheme,
-/// which drives the source-walk to the next cacheable
-/// provider on the next resolve if one is available, and
-/// stays honest (no ToS-violating byte copy on disk) if
-/// Deezer was the only source.
-const DEEZER_CDN_HOST_TOKEN: &str = "dzcdn.net";
-
 /// Wire request for the endpoint-facing artist byte-resolve
 /// path — mirrors the shape the framework's `artwork.resolve`
 /// / `artwork.resolve_online` dispatch already uses so the
@@ -1181,22 +1166,6 @@ fn artist_bytes_unavailable(
 /// `/api/v1/audio/artwork/{content_hash}` — same local serve
 /// path album covers already use.
 ///
-/// ## Deezer live-fetch invariant
-///
-/// Deezer's terms of service prohibit persisting image bytes.
-/// The plugin's byte-cache path refuses any winning URL whose
-/// host matches [`DEEZER_CDN_HOST_TOKEN`] — the response
-/// becomes `not_found` (with the Deezer `provider_id` echoed
-/// for observability), so the endpoint surfaces a 404 rather
-/// than storing ToS-restricted bytes locally. Deezer remains
-/// available to callers of [`query_artist_artwork`] over the
-/// WebSocket verb (which returns URLs, not bytes) — this
-/// carve-out only applies to the durable local pipeline.
-///
-/// The rig proof (2026-07-28) shows fanart_tv wins for the
-/// overwhelming majority of artists with a fanart photo, so
-/// this Deezer-refusal leaves the fleet portrait coverage
-/// essentially unchanged in practice.
 pub(crate) async fn resolve_artist_bytes_to_hash(
     payload: &[u8],
     catalogue: &ArtistCatalogue,
@@ -1571,22 +1540,6 @@ const NON_PHOTOGRAPH_FLAT_TONE_RATIO: f32 = 0.80;
 /// a statistic that was never taken.
 fn is_not_a_photograph(flat_tone_ratio: Option<f32>) -> bool {
     flat_tone_ratio.is_some_and(|r| r >= NON_PHOTOGRAPH_FLAT_TONE_RATIO)
-}
-
-fn image_url_host_is_deezer(url: &str) -> bool {
-    // Parse enough of the URL to grab the host portion. Cheap
-    // string split — no full URL parser needed for the ToS
-    // check.
-    let rest = match url.split_once("://") {
-        Some((_, r)) => r,
-        None => url,
-    };
-    let host_and_rest = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
-    let host = host_and_rest
-        .split_once('?')
-        .map(|(h, _)| h)
-        .unwrap_or(host_and_rest);
-    host.to_ascii_lowercase().contains(DEEZER_CDN_HOST_TOKEN)
 }
 
 async fn fetch_image_bytes(
@@ -2496,15 +2449,15 @@ async fn fetch_deezer_artist_by_id(
     let Some(id) = deezer_artist_id else {
         return ProviderOutcome::Absent;
     };
-    // Deezer live-fetch invariant (ToS-mandated):
-    // ------------------------------------------------------------
-    // `ArtistImageHit` deliberately does NOT derive `Serialize`.
-    // The compiler refuses any code path that would round-trip
-    // the hit through JSON — so persisting the response body is
-    // structurally impossible, not merely policy. This fetch
-    // extracts URL fields into a plain serde_json::json! payload
-    // one field at a time; the hit itself is never serialised
-    // and never leaves this function.
+    // `ArtistImageHit` deliberately does NOT derive `Serialize`,
+    // so the compiler refuses any path that would round-trip the
+    // whole hit through JSON. This fetch extracts URL fields into
+    // a plain serde_json::json! payload one field at a time; the
+    // hit itself never leaves this function.
+    //
+    // Type-level hygiene, not a caching restriction: Deezer bytes
+    // are cached like any other provider's, governed by the
+    // operator's artwork-caching setting.
     //
     // What DOES cross the wire: URL strings that the operator UI
     // resolves inline against Deezer's CDN on render. Every
@@ -2547,7 +2500,6 @@ async fn fetch_deezer_artist_by_id(
         "deezer_artist_id": hit.deezer_artist_id,
         "artist_name": hit.artist_name,
         "source_url": hit.source_url.clone(),
-        "cache_policy": "live_fetch_only",
     });
     let source_url = hit.source_url.clone();
     // `hit` drops here — the ArtistImageHit type is un-Serialize,
@@ -2574,9 +2526,9 @@ async fn fetch_deezer_artist_by_id(
 /// does not clear MB's ≥90 % confidence threshold or when MB is
 /// transiently unreachable.
 ///
-/// Same Deezer live-fetch invariant as
-/// [`fetch_deezer_artist_by_id`]: the `ArtistImageHit` is never
-/// serialised; only URL strings cross the wire.
+/// Same shape as [`fetch_deezer_artist_by_id`]: the
+/// `ArtistImageHit` is never serialised whole; only URL strings
+/// cross the wire.
 async fn fetch_deezer_artist_by_name(
     artist: &str,
     catalogue: &ArtistCatalogue,
@@ -2612,7 +2564,6 @@ async fn fetch_deezer_artist_by_name(
         "deezer_artist_id": hit.deezer_artist_id,
         "artist_name": hit.artist_name,
         "source_url": hit.source_url.clone(),
-        "cache_policy": "live_fetch_only",
     });
     let source_url = hit.source_url.clone();
     ProviderOutcome::Hit(SourceEntry {

@@ -165,10 +165,10 @@ pub(crate) struct ProviderHit {
 ///   the other in-flight request is dropped. Every provider
 ///   call is wrapped in a per-provider hard timeout
 ///   ([`PluginConfig::request_timeout`]); a hung upstream
-///   cannot stall the cascade. Deezer is deliberately
-///   excluded from this cascade per its live-fetch ToS
-///   invariant (DEFECT-4 fix — one canonical Deezer posture
-///   across album and artist paths).
+///   cannot stall the cascade. Deezer is not consulted here:
+///   Cover Art Archive and iTunes cover the practical case
+///   for album covers. A provider-set choice, not a caching
+///   restriction.
 /// - **Tier 2 sequential**: `lastfm` (requires operator API
 ///   key) and `volumio_meta` (operator-opt-in). Attempted in
 ///   order only when Tier 1 exhausted without a hit; they
@@ -283,21 +283,18 @@ pub(crate) async fn run_cascade(
             ("itunes", out)
         }));
     }
-    // DEFECT-4 fix: Deezer is deliberately excluded from the
-    // album byte-cache cascade. The artist cascade forbids
-    // dzcdn.net-hosted bytes structurally via
-    // `ArtistImageHit`'s missing `Serialize` derive because
-    // Deezer's Terms of Service mandate live-fetch only,
-    // never persist. The album path used to fetch Deezer
-    // image bytes that the framework's AssetCache persisted
-    // under a content hash — the same ToS breach on a
-    // different code path. One canonical Deezer posture
-    // across artist and album: live-fetch only, no byte
-    // cache. CAA and iTunes cover the practical case for the
-    // album path. The `[providers.deezer]` config toggle is
-    // retained for the artist path (via the wire-op
-    // response's `image_url` live-fetch channel) — it has no
-    // effect on this album cascade.
+    // Deezer is not consulted by the album cascade. Cover Art
+    // Archive and iTunes cover the practical case for album
+    // covers, and this cascade has never needed a third.
+    //
+    // This exclusion was originally justified by a
+    // never-persist reading of Deezer's terms. That reading is
+    // retired — Deezer bytes are now cached like any other
+    // provider's, governed by the operator's artwork-caching
+    // setting — so what remains here is a provider-set choice
+    // about album covers, nothing more. The
+    // `[providers.deezer]` toggle governs the artist path and
+    // has no effect on this cascade.
 
     use futures_util::StreamExt;
     while let Some((name, maybe_outcome)) = tier1.next().await {

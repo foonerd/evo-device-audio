@@ -11,9 +11,9 @@
 //! `artwork.resolve` from the local plugin so consumers can
 //! use identical decoder logic across the two cascade tiers.
 //!
-//! Deezer is deliberately excluded from the album cascade
-//! per its live-fetch ToS invariant (see `providers.rs`
-//! module doc + DEFECT-4 comment).
+//! Deezer is not consulted by the album cascade — a
+//! provider-set choice, not a caching restriction. See the
+//! `providers.rs` module doc.
 
 use evo_device_audio_shared::transcode::{
     transcode, ArtworkSize, TranscodedArtwork,
