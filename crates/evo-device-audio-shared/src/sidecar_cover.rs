@@ -11,13 +11,11 @@
 //! 1. Direct sidecar in the browsed directory itself.
 //! 2. Representative child cover — the first stable-sorted child
 //!    subdirectory whose top level carries a sidecar.
-//! 3. Artist-name portrait — for container folders shaped like an
-//!    artist's discography (child subdirectories present) the
-//!    emitter routes to the framework's `artist-name` scheme so
-//!    `artwork.online`'s artist cascade delivers a portrait.
 //!
-//! `find_cover_in_directory` powers steps 1 and 2 verbatim.
-//! `directory_has_child_dirs` powers the step-3 shape test.
+//! `find_cover_in_directory` powers both steps verbatim.
+//! `find_artist_images_in_directory` is the artist-portrait
+//! counterpart: an operator's `artist*.*` file names a person,
+//! where a cover file names a record.
 
 use std::path::{Path, PathBuf};
 
@@ -114,6 +112,60 @@ pub fn find_cover_in_directory(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Filename stem that marks a file as an artist portrait rather
+/// than a record's cover. Matched case-insensitively as a
+/// PREFIX, so `artist.jpg`, `Artist.png`, `ARTIST2.jpeg` and
+/// `artist-live.webp` all qualify.
+pub const ARTIST_IMAGE_PREFIX: &str = "artist";
+
+/// Every `artist*.*` image in `dir`'s top level, ordered by
+/// filename ascending.
+///
+/// Separate from [`find_cover_in_directory`] because the two
+/// answer different questions. A cover file names a *record*; an
+/// `artist*.*` file names a *person*. Serving one where the
+/// other was asked for is the wrong-subject failure that no
+/// image inspection can detect — the picture is real, it is
+/// simply of the wrong thing.
+///
+/// Returns every match rather than the first so a subject with
+/// several portraits can be presented as a slideshow. Callers
+/// that need a single representative image take the first: the
+/// ordering is by lowercased filename, so it is stable across
+/// case differences and across filesystems that enumerate in
+/// arbitrary order.
+///
+/// Empty vector on I/O failure or no matches — never an error to
+/// propagate; the caller falls through to its next source.
+pub fn find_artist_images_in_directory(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut matches: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_lowercase();
+            let path = e.path();
+            let ext = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(str::to_lowercase)?;
+            if !name.starts_with(ARTIST_IMAGE_PREFIX) {
+                return None;
+            }
+            if !FALLBACK_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+                return None;
+            }
+            if !cover_size_ok(&path) {
+                return None;
+            }
+            Some((name, path))
+        })
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches.into_iter().map(|(_, p)| p).collect()
 }
 
 /// True when the candidate file exists and is below
@@ -411,6 +463,74 @@ mod tests {
             first_audio_file_name_in_directory(dir.path()).as_deref(),
             Some("zz.flac"),
             "the alphabetically-first REAL file wins; symlinked audio is skipped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod artist_image_tests {
+    use super::*;
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    #[test]
+    fn matches_artist_prefix_case_insensitively() {
+        let d = tempfile::tempdir().unwrap();
+        for n in ["artist.jpg", "Artist2.PNG", "ARTIST-live.webp"] {
+            touch(d.path(), n);
+        }
+        let got = find_artist_images_in_directory(d.path());
+        assert_eq!(got.len(), 3, "got {got:?}");
+    }
+
+    /// A cover file names a record, an artist file names a
+    /// person. Mixing them is the wrong-subject failure that no
+    /// image inspection can catch.
+    #[test]
+    fn does_not_match_cover_files() {
+        let d = tempfile::tempdir().unwrap();
+        for n in ["cover.jpg", "folder.png", "front.jpg", "back.jpg"] {
+            touch(d.path(), n);
+        }
+        assert!(find_artist_images_in_directory(d.path()).is_empty());
+    }
+
+    /// Order must be stable across case and across filesystems
+    /// that enumerate arbitrarily, because the first is the
+    /// representative image a grid tile shows.
+    #[test]
+    fn orders_by_lowercased_filename() {
+        let d = tempfile::tempdir().unwrap();
+        for n in ["artist3.jpg", "Artist1.jpg", "ARTIST2.jpg"] {
+            touch(d.path(), n);
+        }
+        let got: Vec<String> = find_artist_images_in_directory(d.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_lowercase())
+            .collect();
+        assert_eq!(got, vec!["artist1.jpg", "artist2.jpg", "artist3.jpg"]);
+    }
+
+    #[test]
+    fn ignores_non_image_extensions_and_oversized_files() {
+        let d = tempfile::tempdir().unwrap();
+        touch(d.path(), "artist.txt");
+        touch(d.path(), "artist.pdf");
+        std::fs::write(
+            d.path().join("artist-huge.jpg"),
+            vec![0u8; (MAX_COVER_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(find_artist_images_in_directory(d.path()).is_empty());
+    }
+
+    #[test]
+    fn missing_directory_is_empty_not_an_error() {
+        assert!(
+            find_artist_images_in_directory(Path::new("/nonexistent/xyz"))
+                .is_empty()
         );
     }
 }

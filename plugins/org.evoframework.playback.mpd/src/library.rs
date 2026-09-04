@@ -2485,7 +2485,15 @@ fn pick_directory_cover_url(
 
     let abs_dir = music_directory.join(mpd_relative_path);
 
-    if sidecar_cover::find_cover_in_directory(&abs_dir).is_some() {
+    // Tier 1 also accepts `artist*.*`: a container folder often
+    // carries an artist portrait and no cover file, and the
+    // resolver treats that as the folder's own art. The emitter
+    // must agree, or the tile addresses a folder the resolver
+    // would have answered for and the browse cache remembers a
+    // glyph.
+    if sidecar_cover::find_cover_in_directory(&abs_dir).is_some()
+        || !sidecar_cover::find_artist_images_in_directory(&abs_dir).is_empty()
+    {
         return evo_device_audio_shared::artwork_target_url_sized(
             "mpd-directory",
             mpd_relative_path,
@@ -4293,5 +4301,51 @@ mod tests {
             url.contains("scheme=mpd-directory"),
             "root-with-direct-art picks Tier 1, got {url}"
         );
+    }
+}
+
+#[cfg(test)]
+mod artist_image_container_tests {
+    use super::*;
+
+    /// A container folder carrying an operator's `artist*.*` shows
+    /// it. Before, tier 1 matched cover files only, so such a
+    /// folder found nothing and descended to a child album's
+    /// sleeve — or drew a glyph — while the picture the operator
+    /// had put there by hand sat unused.
+    #[test]
+    fn container_with_an_artist_image_addresses_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let dir = music_dir.join("Container Name");
+        std::fs::create_dir_all(dir.join("First Album")).unwrap();
+        std::fs::write(dir.join("artist.jpg"), b"a").unwrap();
+        std::fs::write(dir.join("First Album").join("cover.jpg"), b"c")
+            .unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "folder must address itself, got {url}"
+        );
+        assert!(
+            !url.contains("First%20Album"),
+            "must not borrow the child sleeve when it has its own \
+             artist image, got {url}"
+        );
+    }
+
+    /// Case must not matter — the operator's filesystem may or may
+    /// not preserve it.
+    #[test]
+    fn container_artist_image_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let dir = music_dir.join("Container Name");
+        std::fs::create_dir_all(dir.join("First Album")).unwrap();
+        std::fs::write(dir.join("ARTIST2.PNG"), b"a").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(url.contains("Container%20Name"), "got {url}");
+        assert!(!url.contains("First%20Album"), "got {url}");
     }
 }

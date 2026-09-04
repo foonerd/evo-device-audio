@@ -216,6 +216,16 @@ pub(crate) struct ArtworkResolveResponse {
     /// working; HTTPS callers consume `content_hash` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Every local image this subject has, ordered by filename
+    /// ascending, when more than one was found.
+    ///
+    /// `path` / `content_hash` carry the representative image a
+    /// grid tile shows — the first of this list. This carries the
+    /// whole set so a detail or immersive view can cycle them.
+    /// Absent when the subject has zero or one local image, so a
+    /// consumer that ignores it sees no change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_images: Option<Vec<String>>,
     /// SHA-256 (lowercase hex, 64 chars) of the resolved variant's
     /// bytes. Set when `status` is [`ResponseStatus::Ok`]. The
     /// framework's `/api/v1/audio/artwork/:content_hash` endpoint
@@ -369,7 +379,22 @@ pub(crate) fn find_cover_beside_audio_file(mpd_file: &Path) -> Option<PathBuf> {
 /// in `playback.mpd` consume so the two paths never disagree
 /// on what counts as folder art.
 pub(crate) fn find_cover_in_directory(dir: &Path) -> Option<PathBuf> {
-    sidecar_cover::find_cover_in_directory(dir)
+    // An `artist*.*` file wins over a cover file here too.
+    //
+    // A container folder — an artist's discography, a
+    // collaboration, a label — often carries `artist.jpg` and no
+    // cover file at all. Without this the directory scheme found
+    // nothing and the tile drew a glyph, on a folder whose
+    // picture the operator had already put there by hand.
+    //
+    // Where both exist the artist file still wins: the operator
+    // naming a file `artist.jpg` has said which picture is the
+    // person, and a cover file is only ever evidence about a
+    // record.
+    sidecar_cover::find_artist_images_in_directory(dir)
+        .into_iter()
+        .next()
+        .or_else(|| sidecar_cover::find_cover_in_directory(dir))
 }
 
 /// Resolve MPD `file` string to a local [`PathBuf`] if the file exists.
@@ -434,6 +459,7 @@ pub(crate) fn resolve_artwork(
         return Ok(ResolveOutput {
             response: ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::BadRequest,
                 path: None,
                 content_hash: None,
@@ -453,6 +479,7 @@ pub(crate) fn resolve_artwork(
             return Ok(ResolveOutput {
                 response: ArtworkResolveResponse {
                     v: 1,
+                    local_images: None,
                     status: ResponseStatus::BadRequest,
                     path: None,
                     content_hash: None,
@@ -473,6 +500,7 @@ pub(crate) fn resolve_artwork(
             return Ok(ResolveOutput {
                 response: ArtworkResolveResponse {
                     v: 1,
+                    local_images: None,
                     status: ResponseStatus::BadRequest,
                     path: None,
                     content_hash: None,
@@ -490,6 +518,7 @@ pub(crate) fn resolve_artwork(
         return Ok(ResolveOutput {
             response: ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::BadRequest,
                 path: None,
                 content_hash: None,
@@ -513,6 +542,7 @@ pub(crate) fn resolve_artwork(
             return Ok(ResolveOutput {
                 response: ArtworkResolveResponse {
                     v: 1,
+                    local_images: None,
                     status: ResponseStatus::BadRequest,
                     path: None,
                     content_hash: None,
@@ -544,6 +574,7 @@ pub(crate) fn resolve_artwork(
         }
         other => ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::BadRequest,
             path: None,
             content_hash: None,
@@ -648,6 +679,7 @@ fn resolve_mpd_album(
             Err(_) => {
                 return Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::BadRequest,
                 path: None,
                 content_hash: None,
@@ -737,6 +769,7 @@ fn resolve_mpd_album(
         Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
             return Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::NotFound,
                 path: None,
                 content_hash: None,
@@ -753,6 +786,7 @@ fn resolve_mpd_album(
         Err(evo_device_audio_shared::MatchError::Io(m)) => {
             return Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::NotFound,
                 path: None,
                 content_hash: None,
@@ -784,6 +818,7 @@ fn resolve_mpd_album(
                 Ok(None) => {
                     return Ok(ArtworkResolveResponse {
                         v: 1,
+                        local_images: None,
                         status: ResponseStatus::NotFound,
                         path: None,
                         content_hash: None,
@@ -805,6 +840,7 @@ fn resolve_mpd_album(
                 Err(evo_device_audio_shared::MatchError::LimitExceeded) => {
                     return Ok(ArtworkResolveResponse {
                         v: 1,
+                        local_images: None,
                         status: ResponseStatus::NotFound,
                         path: None,
                         content_hash: None,
@@ -821,6 +857,7 @@ fn resolve_mpd_album(
                 Err(evo_device_audio_shared::MatchError::Io(m)) => {
                     return Ok(ArtworkResolveResponse {
                         v: 1,
+                        local_images: None,
                         status: ResponseStatus::NotFound,
                         path: None,
                         content_hash: None,
@@ -879,6 +916,7 @@ fn resolve_cover_for_audio_file(
         let Some(dir) = state_dir else {
             return Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::NotFound,
                 path: None,
                 content_hash: None,
@@ -904,6 +942,7 @@ fn resolve_cover_for_audio_file(
 
     Ok(ArtworkResolveResponse {
         v: 1,
+        local_images: None,
         status: ResponseStatus::NotFound,
         path: None,
         content_hash: None,
@@ -952,6 +991,7 @@ fn ok_from_path(
         .to_string();
     Ok(ArtworkResolveResponse {
         v: 1,
+        local_images: None,
         status: ResponseStatus::Ok,
         path: Some(path),
         content_hash: None,
@@ -971,6 +1011,7 @@ fn resolve_mpd_path(
     if value.is_empty() {
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::BadRequest,
             path: None,
             content_hash: None,
@@ -1009,6 +1050,7 @@ fn resolve_mpd_path(
         };
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::NotFound,
             path: None,
             content_hash: None,
@@ -1156,6 +1198,7 @@ fn resolve_mpd_directory(
     if value.is_empty() {
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::BadRequest,
             path: None,
             content_hash: None,
@@ -1170,6 +1213,7 @@ fn resolve_mpd_directory(
     let Some(dir_path) = resolve_directory_path(library_roots, value) else {
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::NotFound,
             path: None,
             content_hash: None,
@@ -1188,6 +1232,7 @@ fn resolve_mpd_directory(
             let mime = mime_from_extension(&cover);
             Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::Ok,
                 path: Some(cover.to_string_lossy().into_owned()),
                 content_hash: None,
@@ -1200,6 +1245,7 @@ fn resolve_mpd_directory(
         }
         None => Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::NotFound,
             path: None,
             content_hash: None,
@@ -1239,6 +1285,7 @@ fn resolve_artist_name(
     if value.is_empty() {
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::BadRequest,
             path: None,
             content_hash: None,
@@ -1255,6 +1302,7 @@ fn resolve_artist_name(
     else {
         return Ok(ArtworkResolveResponse {
             v: 1,
+            local_images: None,
             status: ResponseStatus::NotFound,
             path: None,
             content_hash: None,
@@ -1292,14 +1340,46 @@ fn resolve_artist_name(
     // an album cover as a substitute. If no cover exists anywhere
     // from level 1 upward, the response is NotFound and the
     // cascade dispatches the artist-scoped online tier.
+    // At each level an `artist*.*` file wins over a cover file.
+    // The operator naming a file `artist.jpg` has said which
+    // picture is the person; a cover file at the same level is
+    // only ever evidence about a record. Where both exist, using
+    // the cover would be the wrong-subject failure that no image
+    // inspection can detect — the picture is real, it is simply
+    // of the wrong thing.
+    //
+    // Every `artist*.*` match is carried, ordered by filename, so
+    // a detail view can cycle them; the first is what a grid tile
+    // shows.
     let album_dir = track_path.parent();
     let mut cursor = album_dir.and_then(std::path::Path::parent);
     for level in 1..=3 {
         let Some(dir) = cursor else { break };
+        let artist_images = sidecar_cover::find_artist_images_in_directory(dir);
+        if let Some(first) = artist_images.first() {
+            let mime = mime_from_extension(first);
+            let all: Vec<String> = artist_images
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            return Ok(ArtworkResolveResponse {
+                v: 1,
+                local_images: (all.len() > 1).then_some(all),
+                status: ResponseStatus::Ok,
+                path: Some(first.to_string_lossy().into_owned()),
+                content_hash: None,
+                mime: Some(mime),
+                size: None,
+                provider_id: Some(format!("local_artist_image:l{level}")),
+                identity: None,
+                detail: None,
+            });
+        }
         if let Some(cover) = find_cover_in_directory(dir) {
             let mime = mime_from_extension(&cover);
             return Ok(ArtworkResolveResponse {
                 v: 1,
+                local_images: None,
                 status: ResponseStatus::Ok,
                 path: Some(cover.to_string_lossy().into_owned()),
                 content_hash: None,
@@ -1320,6 +1400,7 @@ fn resolve_artist_name(
 
     Ok(ArtworkResolveResponse {
         v: 1,
+        local_images: None,
         status: ResponseStatus::NotFound,
         path: None,
         content_hash: None,
