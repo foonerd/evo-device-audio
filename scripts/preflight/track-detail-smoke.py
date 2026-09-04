@@ -171,15 +171,33 @@ def pick_known_lyric_track(target_user, target_host):
 
 
 def bootstrap_preseed(target_user, target_host):
-    """Read the pair-preseed code from the rig."""
-    try:
-        return ssh(target_user, target_host, f"sudo -n cat {PRESEED_PATH}").strip()
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"cannot read pair preseed at {PRESEED_PATH} on "
-            f"{target_host} (rc={e.returncode}); gate cannot mint a "
-            f"bearer"
-        )
+    """Read the pair-preseed code from the rig.
+
+    The steward loads this file itself, as the service user, at
+    startup — a preseed the service user cannot read is a preseed
+    that never seeds. So the plain read is the one that must work,
+    and it is tried first. The sudo read stays as a fallback for a
+    rig where the operator dropped the file root-owned; that rig
+    boots with no first-pair path anyway, but the fallback keeps
+    the gate's diagnostic honest instead of blaming permissions.
+
+    Requiring sudo unconditionally made the gate depend on
+    passwordless sudo being configured on every target, which is a
+    property of the rig, not of the thing being verified.
+    """
+    for cmd in (f"cat {PRESEED_PATH}", f"sudo -n cat {PRESEED_PATH}"):
+        try:
+            code = ssh(target_user, target_host, cmd).strip()
+        except subprocess.CalledProcessError:
+            continue
+        if code:
+            return code
+    raise RuntimeError(
+        f"cannot read pair preseed at {PRESEED_PATH} on "
+        f"{target_host}; gate cannot mint a bearer. The operator "
+        f"drops this file before first boot and the steward must be "
+        f"able to read it as its own service user."
+    )
 
 
 async def wss_call(target_host, op, payload, bearer=None):
