@@ -336,9 +336,9 @@ pub struct ArtworkOnlinePlugin {
     /// memoises the MB reconcile outcome and the non-Deezer
     /// provider results so repeat browse of the same artist
     /// set does not re-hammer upstream. LRU-capped, TTL-bound,
-    /// dropped on unload. Deezer results never enter these
-    /// caches (live-fetch invariant enforced by
-    /// `ArtistImageHit`'s missing `Serialize`).
+    /// dropped on unload. Deezer's URL is not memoised here:
+    /// its CDN links are the shortest-lived of the set, so it is
+    /// re-derived per resolve rather than served stale.
     artwork_caches: Arc<artwork_caches::ArtworkCaches>,
     /// Single-flight coalescer for the artist-artwork cascade.
     /// Keyed on fold-key so a browse fan-out that surfaces the

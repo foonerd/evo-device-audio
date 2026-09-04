@@ -511,7 +511,7 @@ where
 /// breaker on success or resets the open window on failure.
 ///
 /// Scope: process-local, `Mutex`-guarded `HashMap` — no
-/// cross-process state, no persistence. On plugin reload the
+/// cross-process state, nothing written to disk. On plugin reload the
 /// state resets, which is the correct behaviour: a reload
 /// probably came from an operator gesture that wants a fresh
 /// attempt.

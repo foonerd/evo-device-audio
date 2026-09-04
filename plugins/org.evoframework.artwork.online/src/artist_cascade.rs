@@ -57,9 +57,11 @@
 //! (matches the transient-not-cached discipline the album
 //! cascade already enforces). Only structural misses (clean
 //! 404, empty result) or successful hits touch the cache.
-//! Deezer additionally never caches its response body
-//! regardless of outcome — enforced structurally by
-//! `ArtistImageHit`'s missing `Serialize`.
+//! Deezer's URL is re-derived per resolve rather than memoised
+//! with the others: its CDN links are the shortest-lived of the
+//! set, and a stored link that has since expired serves a 404
+//! instead of a picture. The image bytes behind it are cached
+//! like any other provider's.
 //!
 //! ## Enable + priority
 //!
@@ -806,8 +808,8 @@ fn is_real_image_url(url: &str) -> bool {
 /// Deezer could still win behind it and must not be suppressed.
 ///
 /// Deezer is the only artist provider exempt from the result
-/// cache — its URLs are under a live-fetch invariant — so it is
-/// the one leg that costs a network round on an otherwise warm
+/// cache — its CDN links expire too quickly to memoise — so it
+/// is the one leg that costs a network round on an otherwise warm
 /// resolve. Suppressing calls that provably cannot win is what
 /// keeps a warm browse grid off Deezer's 1 req/s budget.
 fn deezer_is_outranked(
@@ -1854,9 +1856,9 @@ async fn run_cascade(
     // memoising the `SourceEntry` snapshot lets a browse of the
     // same artist set after the first cascade skip every non-
     // Deezer network round. Deezer is deliberately excluded —
-    // its live-fetch invariant remains structurally enforced by
-    // `ArtistImageHit`'s missing `Serialize`, and every request
-    // still fires `deezer.get_artist_image_by_id(id)` fresh
+    // its CDN links are the shortest-lived of the set, so a
+    // memoised URL would serve a 404 rather than a picture, and
+    // every request still fires `deezer.get_artist_image_by_id(id)` fresh
     // (using the id memoised via the reconcile cache).
     let cached_entry = if can_cache {
         catalogue.caches.get_provider(&fold_key).await
@@ -2459,10 +2461,11 @@ async fn fetch_deezer_artist_by_id(
     // are cached like any other provider's, governed by the
     // operator's artwork-caching setting.
     //
-    // What DOES cross the wire: URL strings that the operator UI
-    // resolves inline against Deezer's CDN on render. Every
-    // render is a live fetch. No plugin-side cache; no framework
-    // asset-cache push; no persistence layer touches the bytes.
+    // What crosses the wire: URL strings. The framework fetches
+    // and stores the image behind them like any other
+    // provider's, per the operator's artwork caching setting.
+    // The URL itself is re-derived per resolve rather than
+    // memoised, because these CDN links expire quickly.
     //
     // This entry's presence in `sources[]` implicitly declares
     // to the UI: "render live from these URLs; do not persist
@@ -2512,8 +2515,7 @@ async fn fetch_deezer_artist_by_id(
         attribution: Attribution {
             source_name: "Deezer".into(),
             source_url: Some(source_url),
-            license: "Deezer terms of use (live-fetch only, no persistence)"
-                .into(),
+            license: "Deezer terms of use".into(),
         },
     })
 }
@@ -2573,8 +2575,7 @@ async fn fetch_deezer_artist_by_name(
         attribution: Attribution {
             source_name: "Deezer".into(),
             source_url: Some(source_url),
-            license: "Deezer terms of use (live-fetch only, no persistence)"
-                .into(),
+            license: "Deezer terms of use".into(),
         },
     })
 }
@@ -4110,10 +4111,13 @@ mod tests {
     }
 
     /// Compile-fence attestation: ArtistImageHit MUST NOT derive
-    /// Serialize. If a future refactor accidentally adds
-    /// Serialize to it, the plugin's Deezer helper would be able
-    /// to round-trip the hit through JSON — which would let a
-    /// caller persist it in violation of Deezer's ToS.
+    /// Serialize.
+    ///
+    /// Type-level hygiene, not a storage restriction. The helper
+    /// lifts the URL fields it needs into a payload one at a
+    /// time; without this fence a refactor could round-trip the
+    /// whole response body through JSON by accident, carrying
+    /// provider-internal fields into a cache nobody inspected.
     ///
     /// This test doesn't run Deezer; it asserts the type-level
     /// invariant by relying on trait bounds. If ArtistImageHit

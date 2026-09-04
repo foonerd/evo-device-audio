@@ -15,12 +15,12 @@
 //!    volumio_meta. Each is one HTTPS round through a shared
 //!    rate limiter; results are stable per artist and safe
 //!    to memoise.
-//! 3. Deezer. Live-fetch by artist id. Stable id is cached
-//!    (via the MB reconcile URL-rels); the image URL itself
-//!    is deliberately NOT memoised — Deezer's ToS treats the
-//!    response body as a live-fetch surface and the plugin
-//!    honours that structurally by refusing to `Serialize`
-//!    the response type.
+//! 3. Deezer. Fetched by artist id. The id is cached (via the
+//!    MB reconcile URL-rels); the image URL itself is
+//!    deliberately NOT memoised, because Deezer's CDN links are
+//!    the shortest-lived of the set and a stored one that has
+//!    expired serves a 404 instead of a picture. The image
+//!    bytes behind it are cached like any other provider's.
 //!
 //! Two caches, keyed on the same fold-key
 //! ([`evo_device_audio_shared::artist_name::artist_fold_key`]):
@@ -251,8 +251,8 @@ impl ArtworkCaches {
     /// LRU first, then the persistent [`ProviderIndex`]
     /// sidecar. A sidecar hit hydrates the LRU under a fresh
     /// TTL. Deezer entries are excluded upstream (in the caller)
-    /// per the live-fetch invariant; the sidecar stores whatever
-    /// the caller passed.
+    /// because its CDN links expire quickly; the sidecar stores
+    /// whatever the caller passed.
     pub(crate) async fn get_provider(
         &self,
         fold_key: &str,
@@ -505,8 +505,8 @@ pub(crate) enum MissReason {
 /// provider that responded to the cascade this cycle — an
 /// empty vector represents "all non-Deezer providers were
 /// tried and none returned content". Deezer is deliberately
-/// excluded (its live-fetch invariant would break if the URL
-/// crossed this cache).
+/// excluded: its CDN links are short-lived, and a memoised one
+/// that has expired serves a 404 instead of a picture.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderEntry {
     pub(crate) sources: Vec<serde_json::Value>,

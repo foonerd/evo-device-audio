@@ -73,11 +73,11 @@ pub enum FanartError {
 /// that only wants the first entry uses `.first()` on the
 /// relevant field.
 ///
-/// URLs point at fanart.tv's CDN and are stable per artist MBID;
-/// unlike Deezer's live-fetch invariant, fanart.tv responses
-/// are safe to cache under the plugin's per-provider cache
-/// layer with the same license/attribution shape the other
-/// keyed-with-cache providers use.
+/// URLs point at fanart.tv's CDN and are stable per artist MBID.
+/// Long-lived links, so unlike Deezer's the URL itself is worth
+/// memoising under the plugin's per-provider cache layer, with
+/// the same license/attribution shape the other keyed providers
+/// use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistImagesHit {
     /// The MusicBrainz artist MBID the manifest is keyed on
