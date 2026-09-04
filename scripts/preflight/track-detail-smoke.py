@@ -38,6 +38,17 @@ Design notes
 - Bearer is minted via the framework's `pair_complete`
   bootstrap-preseed handshake, the same path
   keyless-first-probe.py uses.
+- The preseed file must be owned by the steward's own service
+  user, mode 0600 — `<service-user>:<service-user>`, NOT
+  `root:root`. The steward reads it as itself at startup, so a
+  root-owned 0600 file is unreadable to it and pairing simply
+  never seeds. That failure is SILENT to the operator: the only
+  trace is one boot line, `pairing: bootstrap preseed load
+  failed; first-pair path unavailable this boot`, after which
+  `pair_complete{bootstrap}` answers 403 and every bearer-minting
+  path — this gate and remote UI auth both — is dead. Nothing
+  installs the file; the operator drops it before first boot, and
+  a reinstall wipes it.
 - Named sources checked: `metadata_local`, `reconciliation`,
   `artist_bio`, `album_notes`, `lyrics`. `artwork` is not in
   the gate list because artwork lives in its own plugin plane;
