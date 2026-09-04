@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/evo-device-audio-shared",
     "crates/evo-device-audio-distribution",
+    "crates/evo-device-audio-http",
     "crates/evo-mpd-shared",
     "crates/evo-multiroom",
     "crates/evo-online-providers",
@@ -66,7 +67,15 @@ repository = "https://github.com/foonerd/evo-device-audio"
 evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo-primitives = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+# Consumed by the distribution's HTTPS hookup. Mounting product
+# routes on the router the framework hands back means naming its
+# types and gating on its auth; these are that surface.
+evo-runtime-http = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+evo-auth-bearer = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+evo-projection-core = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
+evo-device-audio-http = { path = "crates/evo-device-audio-http", version = "0.1.0" }
+async-trait = "0.1"
 evo-mpd-shared = { path = "crates/evo-mpd-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
@@ -124,3 +133,11 @@ missing_docs = "warn"
 # workspace level.
 [workspace.lints.clippy]
 manual_async_fn = "allow"
+
+[patch."https://github.com/foonerd/evo-core.git"]
+evo = { path = "../evo-core-eng/crates/evo" }
+evo-plugin-sdk = { path = "../evo-core-eng/crates/evo-plugin-sdk" }
+evo-primitives = { path = "../evo-core-eng/crates/evo-primitives" }
+evo-runtime-http = { path = "../evo-core-eng/crates/evo-runtime-http" }
+evo-auth-bearer = { path = "../evo-core-eng/crates/evo-auth-bearer" }
+evo-projection-core = { path = "../evo-core-eng/crates/evo-projection-core" }

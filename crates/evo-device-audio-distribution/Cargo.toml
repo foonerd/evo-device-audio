@@ -33,6 +33,8 @@ evo-multiroom = { path = "../evo-multiroom" }
 evo-primitives = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { path = "../evo-device-audio-shared" }
+evo-device-audio-http = { workspace = true }
+serde_json = { workspace = true }
 
 # Plugin set this distribution links in-process. Each plugin
 # crate exports its public Plugin type and the embedded

@@ -127,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
     let args = evo::cli::Args::parse();
     let opts = evo::RunOptions::new(args, audio_distribution_admission())
         .with_post_admission(audio_distribution_post_admission())
-        .with_runtime_setup(audio_distribution_runtime_setup());
+        .with_runtime_setup(audio_distribution_runtime_setup())
+        .with_https_setup(audio_distribution_https_setup());
     evo::run(opts).await
 }
 
@@ -355,6 +356,85 @@ fn audio_distribution_admission() -> AdmissionSetup {
 /// delivery.alsa consumes the happening once the consumer
 /// path is wired, re-derives the topology from the operator's
 /// settings, and re-publishes via the same store.
+/// Claimant this distribution announces its own happenings under.
+///
+/// The framework mints a token for whatever string it is given and
+/// invents no actor of its own. This must not borrow the name of a
+/// plugin that merely fetches on the hookup's behalf — the artwork
+/// plugins are providers, and the composition is this binary's.
+/// Naming the wrong actor is a lie the operator cannot see through.
+const HTTPS_CLAIMANT: &str = "org.evoframework.device.audio.http";
+
+/// Announces a landed artwork resolve on the happenings bus.
+///
+/// Carried as a plugin event with an opaque `event_type` rather
+/// than a variant on the steward's own vocabulary: the framework
+/// stores strings and enumerates nothing about artwork.
+struct ArtworkLandingAnnouncer {
+    bus: std::sync::Arc<evo::happenings::HappeningBus>,
+}
+
+impl evo_device_audio_http::ArtworkResolvedNotifier
+    for ArtworkLandingAnnouncer
+{
+    fn artwork_resolved(
+        &self,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        content_hash: &str,
+    ) {
+        self.bus.emit(evo::happenings::Happening::PluginEvent {
+            plugin: HTTPS_CLAIMANT.to_string(),
+            event_type: "artwork_resolved".to_string(),
+            payload: serde_json::json!({
+                "scheme": scheme,
+                "value": value,
+                "size": size,
+                "content_hash": content_hash,
+            }),
+            at: std::time::SystemTime::now(),
+        });
+    }
+}
+
+/// Mounts this distribution's own HTTP surfaces.
+///
+/// Artwork resolve and serve, and track-detail aggregation. They
+/// are product — they know about albums, artists, cover files and
+/// named online services — so they attach here, on the router the
+/// framework hands over, rather than being compiled into the
+/// steward. The framework keeps the substrate underneath and knows
+/// nothing about what is served over it.
+fn audio_distribution_https_setup() -> evo::HttpsSetup {
+    evo::HttpsSetup {
+        claimant_name: HTTPS_CLAIMANT.to_string(),
+        hook: Box::new(|ctx: evo::HttpsSetupContext| {
+            Box::pin(async move {
+                let notifier: std::sync::Arc<
+                    dyn evo_device_audio_http::ArtworkResolvedNotifier,
+                > = std::sync::Arc::new(ArtworkLandingAnnouncer {
+                    bus: std::sync::Arc::clone(&ctx.bus),
+                });
+                let router = evo_device_audio_http::mount(
+                    ctx.router,
+                    evo_device_audio_http::MountConfig {
+                        api_prefix: ctx.api_prefix,
+                        dispatcher: ctx.dispatcher,
+                        asset_cache: ctx.asset_cache,
+                        validator: ctx.validator,
+                        tier_provider: ctx.tier_provider,
+                        lan_trust_caps: ctx.lan_trust_caps,
+                        state_dir: ctx.state_dir,
+                        resolved_notifier: Some(notifier),
+                    },
+                )?;
+                Ok(router)
+            })
+        }),
+    }
+}
+
 fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
     Box::new(|ctx: evo::PostAdmissionContext| {
         Box::pin(async move {

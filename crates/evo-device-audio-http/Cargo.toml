@@ -1,0 +1,27 @@
+[package]
+name = "evo-device-audio-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Audio-distribution HTTP surfaces: artwork resolve/serve, track-detail aggregation, and the cascade that composes them."
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+evo-runtime-http = { workspace = true }
+evo-auth-bearer = { workspace = true }
+evo-projection-core = { workspace = true }
+evo-plugin-sdk = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
