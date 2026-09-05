@@ -1426,6 +1426,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "evo-audio-topology"
+version = "0.1.13"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "evo",
+ "evo-plugin-sdk",
+ "evo-primitives",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evo-auth-bearer"
 version = "0.1.13"
 dependencies = [
@@ -1456,6 +1472,7 @@ dependencies = [
  "anyhow",
  "clap",
  "evo",
+ "evo-audio-topology",
  "evo-device-audio-http",
  "evo-device-audio-shared",
  "evo-multiroom",

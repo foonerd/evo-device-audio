@@ -30,6 +30,13 @@ evo = { workspace = true }
 # enforces the framework / domain separation at the build
 # system level.
 evo-multiroom = { path = "../evo-multiroom" }
+
+# evo-audio-topology holds the audio product plane: the topology,
+# routing and policy stores, and the chain scorer. The steward
+# ships the wire ops that report on it and reaches the stores
+# through AudioTopologySlot; deciding what a good chain is
+# belongs here.
+evo-audio-topology = { path = "../evo-audio-topology" }
 evo-primitives = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-device-audio-shared = { path = "../evo-device-audio-shared" }

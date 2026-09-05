@@ -5,6 +5,7 @@ members = [
     "crates/evo-device-audio-distribution",
     "crates/evo-device-audio-http",
     "crates/evo-mpd-shared",
+    "crates/evo-audio-topology",
     "crates/evo-multiroom",
     "crates/evo-online-providers",
     "crates/evo-parity-harness",
