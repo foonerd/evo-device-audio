@@ -132,21 +132,27 @@ async fn main() -> anyhow::Result<()> {
     evo::run(opts).await
 }
 
-/// Build the audio distribution's runtime-setup closure. The
-/// framework invokes this once during boot after its data-
-/// plane substrates exist and the audio plane has started but
-/// before admission begins. We construct the multi-room
-/// crate's `ElectionRuntime` against the framework substrates
-/// exposed in [`RuntimeSetupContext`], rehydrate it from
-/// persistence, attach the audio-plane runtime (so election's
-/// liveness predicate sees in-flight channel activity), start
-/// it, install it into the framework's shared election-state
-/// handle, and register an async shutdown closure into the
-/// supplied registry. From this point every framework consumer
-/// (audio_plane, group_topology, server wire ops) reads
-/// election state through the multi-room runtime; the
-/// framework crate itself has no production dep on
-/// `evo-multiroom`.
+/// Build the audio distribution's runtime-setup closure.
+///
+/// The framework invokes this once during boot, after its own
+/// substrates and the witness / announce runtimes exist and
+/// before admission begins. This callback is where the audio
+/// plane starts — the framework builds none, because a plane
+/// only makes sense on a device that moves audio.
+///
+/// It constructs and starts the plane, writes both faces into
+/// `AudioPlaneSlot` so the steward can answer its own wire ops
+/// and plugins receive the SDK handle, bridges the plane into
+/// the witness chain, then builds the multi-room crate's
+/// `ElectionRuntime` against the framework substrates exposed in
+/// [`RuntimeSetupContext`], rehydrates it, attaches the plane so
+/// election's liveness predicate sees in-flight channel
+/// activity, starts it, and installs it into the shared
+/// election-state handle.
+///
+/// Shutdown hooks are registered plane-first so peers receive
+/// goodbyes while the transport is still up. The framework crate
+/// has no production dep on `evo-multiroom`.
 fn audio_distribution_runtime_setup() -> RuntimeSetup {
     Box::new(|ctx: RuntimeSetupContext| {
         Box::pin(async move {
@@ -158,10 +164,112 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
                 shared_election_state,
                 shared_role_store,
                 multiroom_substrate_slot,
-                audio_plane_runtime,
+                audio_plane_slot,
+                domain_witness_runtime,
+                announce_runtime,
+                discovery_runtime,
+                clock_sync_runtime,
+                multiroom_control_port,
                 shutdown_registry,
                 ..
             } = ctx;
+
+            // The audio plane. It belongs here, not in the
+            // steward: it exists to move audio between a source
+            // host and receivers, which is a fact about this
+            // distribution rather than about running a device.
+            // The steward advertises the control port; the plane
+            // binds the one it was told, so the record and the
+            // listener cannot disagree.
+            let audio_plane =
+                Arc::new(evo_multiroom::audio_plane::AudioPlaneRuntime::new(
+                    evo_multiroom::audio_plane::AudioPlaneConfig {
+                        control_port: multiroom_control_port,
+                        ..Default::default()
+                    },
+                    Arc::clone(&bus),
+                    Arc::clone(&discovery_runtime),
+                    shared_election_state.clone(),
+                    Arc::clone(&clock_sync_runtime),
+                    Arc::clone(&group_store),
+                    device_id.clone(),
+                ));
+            if let Err(e) = audio_plane.start().await {
+                tracing::warn!(
+                    error = %e,
+                    "audio-plane runtime: start failed; multi-room \
+                     transport will not function on this boot"
+                );
+            } else {
+                tracing::info!(
+                    control_port = multiroom_control_port,
+                    "audio-plane runtime: ready"
+                );
+            }
+
+            // Both faces of the one runtime, so the steward can
+            // answer its own wire ops and plugins get the SDK
+            // contract. Written together; a half-filled slot
+            // would leave one op working and its sibling
+            // refusing.
+            let plane_handle: Arc<
+                dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+            > = Arc::new(
+                evo_multiroom::audio_plane_handle::RuntimeAudioPlaneHandle::new(
+                    Arc::clone(&audio_plane),
+                    Arc::clone(&group_store),
+                ),
+            );
+            audio_plane_slot.set(
+                Arc::clone(&audio_plane) as Arc<dyn evo::AudioPlaneControl>,
+                Arc::clone(&plane_handle),
+            );
+
+            // Held so they can be aborted on drain. Dropping a
+            // `JoinHandle` detaches the task rather than stopping
+            // it, and the plane's shutdown does not close the
+            // channels these read, so an unheld pump would
+            // outlive the plane it bridges with no way to reach
+            // it.
+            let mut inbound_pump = None;
+            let mut announce_pump = None;
+
+            // Bridge the plane into the witness chain: carry
+            // witnesses out, drain inbound chain traffic in, and
+            // reconcile against peers the announce carrier saw.
+            // The framework ships no transport, so if it booted a
+            // witness runtime it is sitting on null carriers until
+            // this binds real ones.
+            if let Some(witness) = domain_witness_runtime.as_ref() {
+                use evo_multiroom::audio_plane_integration::AudioPlaneWitnessBroadcaster;
+                // One bridge in both roles, as the framework wired
+                // it before the plane moved out.
+                let bridge = Arc::new(AudioPlaneWitnessBroadcaster::new(
+                    Arc::clone(&audio_plane),
+                ));
+                witness.set_broadcaster(Arc::clone(&bridge)
+                    as Arc<
+                        dyn evo::domain_witness::runtime::WitnessBroadcaster,
+                    >);
+                witness.set_requester(
+                    bridge
+                        as Arc<
+                            dyn evo::domain_witness::runtime::ChainRequester,
+                        >,
+                );
+                inbound_pump =
+                    Some(evo_multiroom::inbound_pump::InboundPump::spawn(
+                        Arc::clone(&audio_plane),
+                        Arc::clone(witness),
+                    ));
+                announce_pump = announce_runtime.as_ref().map(|ar| {
+                    evo_multiroom::announce_pump::AnnouncePump::spawn(
+                        Arc::clone(&audio_plane),
+                        Arc::clone(ar),
+                        Arc::clone(witness),
+                    )
+                });
+            }
 
             let election_runtime =
                 Arc::new(evo_multiroom::ElectionRuntime::new(
@@ -185,7 +293,7 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // audio-plane TCP connection as alive even when
             // mDNS-SD record freshness has aged past the
             // liveness window.
-            election_runtime.with_audio_plane(Arc::clone(&audio_plane_runtime));
+            election_runtime.with_audio_plane(Arc::clone(&audio_plane));
 
             if let Err(e) = election_runtime.start().await {
                 tracing::warn!(
@@ -206,6 +314,29 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // rewiring is needed.
             shared_election_state.set(Arc::clone(&election_runtime)
                 as Arc<dyn evo_primitives::ElectionState>);
+
+            // Plane first, so peers get their goodbyes while the
+            // transport is still up, and only then the tasks that
+            // ride it. Registered before election because drain
+            // runs in registration order and a receiver should
+            // learn we are leaving before the election that named
+            // us stops answering.
+            let plane_for_shutdown = Arc::clone(&audio_plane);
+            shutdown_registry.register(Box::new(move || {
+                let plane = Arc::clone(&plane_for_shutdown);
+                let inbound = inbound_pump.take();
+                let announce = announce_pump.take();
+                Box::pin(async move {
+                    plane.shutdown().await;
+                    if let Some(p) = inbound {
+                        p.shutdown();
+                    }
+                    if let Some(p) = announce {
+                        p.shutdown();
+                    }
+                    tracing::info!("audio-plane runtime: stopped");
+                })
+            }));
 
             // Register the shutdown closure. The framework's
             // drain path invokes every registered hook in

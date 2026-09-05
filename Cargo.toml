@@ -67,6 +67,7 @@ repository = "https://github.com/foonerd/evo-device-audio"
 evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 evo-primitives = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+evo-witness = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
 # Consumed by the distribution's HTTPS hookup. Mounting product
 # routes on the router the framework hands back means naming its
 # types and gating on its auth; these are that surface.
@@ -141,3 +142,4 @@ evo-primitives = { path = "../evo-core-eng/crates/evo-primitives" }
 evo-runtime-http = { path = "../evo-core-eng/crates/evo-runtime-http" }
 evo-auth-bearer = { path = "../evo-core-eng/crates/evo-auth-bearer" }
 evo-projection-core = { path = "../evo-core-eng/crates/evo-projection-core" }
+evo-witness = { path = "../evo-core-eng/crates/evo-witness" }

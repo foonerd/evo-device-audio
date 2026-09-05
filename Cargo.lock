@@ -1593,9 +1593,11 @@ version = "0.1.13"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64",
  "evo",
  "evo-plugin-sdk",
  "evo-primitives",
+ "evo-witness",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

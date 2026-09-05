@@ -140,7 +140,7 @@ pub struct ElectionRuntime {
     /// without the audio plane (CLI, isolated election unit
     /// tests) continue to compile and behave deterministically
     /// against mDNS-SD freshness alone.
-    audio_plane: arc_swap::ArcSwapOption<evo::audio_plane::AudioPlaneRuntime>,
+    audio_plane: arc_swap::ArcSwapOption<crate::audio_plane::AudioPlaneRuntime>,
     local_device_id: DeviceId,
     config: ElectionConfig,
     inner: AsyncMutex<ElectionInner>,
@@ -201,7 +201,7 @@ impl ElectionRuntime {
     /// the cached handle atomically.
     pub fn with_audio_plane(
         &self,
-        audio_plane: Arc<evo::audio_plane::AudioPlaneRuntime>,
+        audio_plane: Arc<crate::audio_plane::AudioPlaneRuntime>,
     ) {
         self.audio_plane.store(Some(audio_plane));
     }

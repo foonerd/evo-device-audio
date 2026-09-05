@@ -23,6 +23,8 @@ path = "src/lib.rs"
 evo = { workspace = true }
 evo-plugin-sdk = { workspace = true }
 evo-primitives = { workspace = true }
+evo-witness = { workspace = true }
+base64 = "0.22"
 async-trait = "0.1"
 arc-swap = "1.7"
 serde = { version = "1", features = ["derive"] }
