@@ -542,6 +542,49 @@ impl Plugin for MetadataOnlinePlugin {
             {
                 let mut cfg = self.provider_config.write().await;
                 *cfg = self.config.provider_config.clone();
+                // Declare this cascade's providers before reading
+                // any config for them. Whether a provider costs
+                // the operator an identity is this plugin's fact,
+                // not something the store can infer, and
+                // registration is what seeds an identity-bearing
+                // source disabled. The order matters: a provider
+                // read before it registers takes the anonymous
+                // default, which for a keyed source means enabled
+                // with no key, no change-event, and so no
+                // credential prompt. Existing rows are left
+                // untouched.
+                if let Some(store) = ctx.online_provider_config.as_ref() {
+                    use cascade::PrivacyClass as Pc;
+                    use evo_plugin_sdk::contract::context::ProviderPrivacyClass;
+                    for pid in [
+                        cascade::ProviderId::MusicBrainz,
+                        cascade::ProviderId::Wikipedia,
+                        cascade::ProviderId::Wikidata,
+                        cascade::ProviderId::Lrclib,
+                        cascade::ProviderId::TheAudioDb,
+                        cascade::ProviderId::Lastfm,
+                        cascade::ProviderId::Discogs,
+                        cascade::ProviderId::Genius,
+                    ] {
+                        let class = match pid.privacy_class() {
+                            Pc::Anonymous => ProviderPrivacyClass::Anonymous,
+                            Pc::IdentityBearing => {
+                                ProviderPrivacyClass::IdentityBearing
+                            }
+                        };
+                        if let Err(e) =
+                            store.register(pid.as_str(), class).await
+                        {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                provider_id = pid.as_str(),
+                                error = %format!("{e:?}"),
+                                "online provider registration failed; the \
+                                 store keeps whatever row it already had"
+                            );
+                        }
+                    }
+                }
                 if let Some(store) = ctx.online_provider_config.as_ref() {
                     match store.list_all().await {
                         Ok(rows) => {
