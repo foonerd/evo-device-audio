@@ -4,30 +4,35 @@
 //! Active audio topology — operator-visible signal-path
 //! snapshot per delivery target.
 //!
-//! The framework owns the publish primitive + persistence +
-//! propagation; the vendor distribution drives the actual
+//! This store owns the publish path — validation, persistence
+//! and propagation — and whoever drives it owns the actual
 //! chain decision (which source / composition / delivery
 //! plugins to wire, what OS substrate to use, what format to
-//! negotiate). The vendor pushes a complete
-//! [`ActiveAudioTopology`] snapshot through the framework's
-//! `publish_active_audio_topology` wire op; the framework:
+//! negotiate). A complete [`ActiveAudioTopology`] snapshot
+//! arrives here three ways — an operator's
+//! `publish_active_audio_topology` wire op, this
+//! distribution's default chain at post-admission, and boot
+//! rehydration of what was already stored — and every one of
+//! them takes the same path:
 //!
 //! 1. Validates the snapshot's basic shape.
 //! 2. Computes the `ScoreBreakdown` via
 //!    [`crate::topology_scoring::score_topology`] when the
-//!    vendor did not supply one (vendor-supplied breakdowns
-//!    are accepted verbatim because the vendor has visibility
-//!    into the full hardware profile).
+//!    caller did not supply one (supplied breakdowns are
+//!    accepted verbatim, because whoever built the chain has
+//!    visibility into the full hardware profile).
 //! 3. Persists the snapshot.
-//! 4. Emits a typed `Happening::AudioTopologyChanged` so the
-//!    operator UI subscribes to live updates.
-//! 5. Propagates each chain stage's resolved endpoint to that
+//! 4. Propagates each chain stage's resolved endpoint to that
 //!    plugin's [`crate::audio_routing::AudioRoutingRuntime`]
 //!    handle so the plugin's
 //!    [`evo_plugin_sdk::contract::audio_routing::AudioRouting`]
 //!    methods return the new endpoint.
-//! 6. Lands an audit-ledger entry under the operations
-//!    control plane.
+//! 5. Announces the change on the happenings bus so operator
+//!    UIs can render the rewire as it happens.
+//!
+//! The wire op lands its own audit-ledger entry under the
+//! operations control plane; the other two paths are not
+//! operator actions and land none.
 //!
 //! ## Operator-visible schema
 //!
@@ -73,20 +78,33 @@ pub enum AudioTopologyError {
 pub struct AudioTopologyStore {
     persistence: Arc<dyn PersistenceStore>,
     routing: Arc<AudioRoutingRuntime>,
+    bus: Arc<evo::happenings::HappeningBus>,
 }
+
+/// Claimant this plane announces under.
+///
+/// The steward enumerates nothing about audio topologies, so
+/// the change goes out as a plugin event and this names who
+/// sent it.
+pub const TOPOLOGY_CLAIMANT: &str = "org.evoframework.device.audio.topology";
+
+/// Event type carried on the announcement.
+pub const TOPOLOGY_CHANGED_EVENT: &str = "audio_topology_changed";
 
 impl AudioTopologyStore {
     /// Construct a store. Holds Arc clones of the persistence
-    /// handle + the audio routing runtime so the publish path
-    /// updates both substrates without a separate plumbing
-    /// hop.
+    /// handle, the audio routing runtime and the happenings
+    /// bus, so the publish path updates both substrates and
+    /// announces the result without a separate plumbing hop.
     pub fn new(
         persistence: Arc<dyn PersistenceStore>,
         routing: Arc<AudioRoutingRuntime>,
+        bus: Arc<evo::happenings::HappeningBus>,
     ) -> Self {
         Self {
             persistence,
             routing,
+            bus,
         }
     }
 
@@ -94,10 +112,11 @@ impl AudioTopologyStore {
     /// Validates the snapshot, persists it, and propagates
     /// each chain stage's resolved endpoint to the
     /// corresponding plugin's
-    /// [`AudioRoutingRuntime::publish_topology`] entry. The
-    /// caller is responsible for emitting the
-    /// `Happening::AudioTopologyChanged` (the wire-op
-    /// handler does it after this method returns).
+    /// [`AudioRoutingRuntime::publish_topology`] entry, then
+    /// announces the change on the bus. Every caller gets the
+    /// announcement: an operator's wire op, this
+    /// distribution's default chain, and boot rehydration all
+    /// rewire the same plugins and deserve the same notice.
     pub async fn publish(
         &self,
         topology: ActiveAudioTopology,
@@ -126,6 +145,40 @@ impl AudioTopologyStore {
         for stage in &topology.chain {
             let resolved = stage_to_resolved_routing(stage, &topology);
             self.routing.publish_topology(stage_plugin(stage), resolved);
+        }
+
+        // The full snapshot is deliberately not carried: it can
+        // be large (every stage's endpoint, format and score
+        // breakdown). Subscribers get the identity key plus the
+        // summary they render at a glance, and call
+        // `get_active_audio_topology` when they need the rest.
+        //
+        // Durable, because a rewire is a transition an operator
+        // UI must not miss. A failure here means the durable
+        // backing store is full or corrupt, which is not a
+        // reason to fail a chain that is already persisted and
+        // already propagated — log it and return the success
+        // that actually happened.
+        if let Err(e) = self
+            .bus
+            .emit_durable(evo::happenings::Happening::PluginEvent {
+                plugin: TOPOLOGY_CLAIMANT.to_string(),
+                event_type: TOPOLOGY_CHANGED_EVENT.to_string(),
+                payload: serde_json::json!({
+                    "target_key": topology.target_key,
+                    "display_name": topology.display_name,
+                    "bit_perfect": topology.bit_perfect,
+                    "score_total": topology.score.total,
+                }),
+                at: std::time::SystemTime::now(),
+            })
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                target_key = %topology.target_key,
+                "audio topology store: announcing the change failed"
+            );
         }
 
         Ok(topology)
@@ -411,11 +464,18 @@ mod tests {
         }
     }
 
+    /// A bus nothing subscribes to. These tests assert what
+    /// the store persists and propagates; the announcement it
+    /// makes is asserted in its own test below.
+    fn bus() -> Arc<evo::happenings::HappeningBus> {
+        Arc::new(evo::happenings::HappeningBus::new())
+    }
+
     fn store() -> AudioTopologyStore {
         let persistence: Arc<dyn PersistenceStore> =
             Arc::new(MemoryPersistenceStore::new());
         let routing = Arc::new(AudioRoutingRuntime::new());
-        AudioTopologyStore::new(persistence, routing)
+        AudioTopologyStore::new(persistence, routing, bus())
     }
 
     #[tokio::test]
@@ -441,7 +501,7 @@ mod tests {
             "org.evoframework.delivery.alsa",
             PluginAudioRole::Delivery,
         );
-        let s = AudioTopologyStore::new(persistence, routing);
+        let s = AudioTopologyStore::new(persistence, routing, bus());
         s.publish(passthrough_topology(), "user:1000")
             .await
             .unwrap();
@@ -532,6 +592,7 @@ mod tests {
         let s = AudioTopologyStore::new(
             Arc::clone(&persistence),
             Arc::clone(&routing),
+            bus(),
         );
         s.publish(passthrough_topology(), "alice").await.unwrap();
         source_handle.write_endpoint().expect("published");
@@ -594,5 +655,60 @@ mod tests {
         let json = serde_json::to_string(&stage).unwrap();
         let parsed: ActiveChainStage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, stage);
+    }
+
+    /// Every publish announces, whoever made it. The steward's
+    /// wire handler no longer emits, so a chain that arrives
+    /// from boot rehydration or from this distribution's own
+    /// default reaches subscribers the same way an operator's
+    /// does.
+    #[tokio::test]
+    async fn publish_announces_the_change_on_the_bus() {
+        let bus = bus();
+        let mut rx = bus.subscribe();
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let routing = Arc::new(AudioRoutingRuntime::new());
+        let s = AudioTopologyStore::new(persistence, routing, Arc::clone(&bus));
+
+        let topology = passthrough_topology();
+        s.publish(topology.clone(), "system:rehydrate")
+            .await
+            .unwrap();
+
+        let evo::happenings::Happening::PluginEvent {
+            plugin,
+            event_type,
+            payload,
+            ..
+        } = rx.recv().await.expect("publish should announce")
+        else {
+            panic!("expected a plugin event");
+        };
+        assert_eq!(plugin, TOPOLOGY_CLAIMANT);
+        assert_eq!(event_type, TOPOLOGY_CHANGED_EVENT);
+        assert_eq!(payload["target_key"], topology.target_key);
+        assert_eq!(payload["display_name"], topology.display_name);
+        assert_eq!(payload["bit_perfect"], topology.bit_perfect);
+        assert_eq!(payload["score_total"], topology.score.total);
+    }
+
+    /// Clearing a target does not announce. It did not before
+    /// the announcement moved here, and moving it is not a
+    /// reason to start.
+    #[tokio::test]
+    async fn clear_announces_nothing() {
+        let bus = bus();
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let routing = Arc::new(AudioRoutingRuntime::new());
+        let s = AudioTopologyStore::new(persistence, routing, Arc::clone(&bus));
+        s.publish(passthrough_topology(), "user:1000")
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+        s.clear("usb:vid=0x21b4,pid=0x0096").await.unwrap();
+        assert!(rx.try_recv().is_err(), "clear should announce nothing");
     }
 }

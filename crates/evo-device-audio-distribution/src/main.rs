@@ -207,6 +207,7 @@ fn audio_distribution_runtime_setup(
                 evo_audio_topology::audio_topology::AudioTopologyStore::new(
                     Arc::clone(&persistence),
                     Arc::clone(&audio_routing_runtime),
+                    Arc::clone(&bus),
                 ),
             );
 
