@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use evo::{
     AudioPolicyControl, AudioRoutingControl, AudioStoreFuture,
-    AudioTopologyControl, AudioTopologyRefusal,
+    AudioTopologyControl, AudioTopologyRefusal, HardwareProfileControl,
 };
 use evo_plugin_sdk::contract::audio_routing::AudioRouting;
 
@@ -23,6 +23,7 @@ use crate::audio_routing::{
     install_audio_routing_forwarder, AudioRoutingRuntime, PluginAudioRole,
 };
 use crate::audio_topology::{AudioTopologyError, AudioTopologyStore};
+use crate::hardware_profile::{HardwareProfileError, HardwareProfileStore};
 
 impl From<AudioTopologyError> for AudioTopologyRefusal {
     fn from(e: AudioTopologyError) -> Self {
@@ -43,6 +44,19 @@ impl From<AudioPolicyError> for AudioTopologyRefusal {
         // failure or a malformed stored row are both this
         // device failing.
         Self::Other(e.to_string())
+    }
+}
+
+impl From<HardwareProfileError> for AudioTopologyRefusal {
+    fn from(e: HardwareProfileError) -> Self {
+        match e {
+            // The one refusal the operator can act on: they
+            // sent an override that sets nothing.
+            HardwareProfileError::EmptyOverride => {
+                Self::Validation(e.to_string())
+            }
+            other => Self::Other(other.to_string()),
+        }
     }
 }
 
@@ -210,5 +224,48 @@ impl AudioPolicyControl for PolicyControl {
         target_key: &'a str,
     ) -> AudioStoreFuture<'a, ()> {
         Box::pin(async move { Ok(self.0.clear_volume_mode(target_key).await?) })
+    }
+}
+
+/// Binds [`HardwareProfileStore`] to [`HardwareProfileControl`].
+#[derive(Debug)]
+pub struct HardwareControl(Arc<HardwareProfileStore>);
+
+impl HardwareControl {
+    /// Wrap a store.
+    pub fn new(store: Arc<HardwareProfileStore>) -> Self {
+        Self(store)
+    }
+}
+
+impl HardwareProfileControl for HardwareControl {
+    fn put<'a>(
+        &'a self,
+        identity: evo::server::HardwareIdentity,
+        override_: evo::server::HardwareProfileOverride,
+        principal: &'a str,
+    ) -> AudioStoreFuture<'a, evo::server::HardwareProfileOverrideRecord> {
+        Box::pin(async move {
+            Ok(self.0.put_override(identity, override_, principal).await?)
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> AudioStoreFuture<'a, Option<evo::server::HardwareProfileOverrideRecord>>
+    {
+        Box::pin(async move { Ok(self.0.get_override(key).await?) })
+    }
+
+    fn list<'a>(
+        &'a self,
+    ) -> AudioStoreFuture<'a, Vec<evo::server::HardwareProfileOverrideRecord>>
+    {
+        Box::pin(async move { Ok(self.0.list_overrides().await?) })
+    }
+
+    fn clear<'a>(&'a self, key: &'a str) -> AudioStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(self.0.clear_override(key).await?) })
     }
 }

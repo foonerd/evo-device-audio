@@ -46,7 +46,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use evo::hardware_profile::{HardwareProfile, HardwareVolumeCapability};
+use crate::hardware_profile::HardwareProfile;
+use evo::server::HardwareVolumeCapability;
 use evo::server::{OperatorPolicy, ScoreBreakdown, VolumeMode};
 use evo_plugin_sdk::audio::AudioFormat;
 
@@ -402,10 +403,13 @@ pub fn validate_bit_perfect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evo::hardware_profile::{
+    use crate::hardware_profile::{
         compose_profile, DatabaseHardwareData, DeclaredHardwareData,
+        PcmCapabilities, ProbedHardwareData,
+    };
+    use evo::server::{
         HardwareIdentity, HardwareProfileOverride, HardwareTier,
-        PcmCapabilities, ProbedHardwareData, TopologyPreferences,
+        TopologyPreferences,
     };
     use evo_plugin_sdk::audio::PcmCodec;
 

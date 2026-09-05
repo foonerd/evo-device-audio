@@ -192,9 +192,10 @@ fn audio_distribution_runtime_setup(
 
             // The audio product plane. Same reasoning as the
             // transport plane below it: a topology store, a
-            // routing broker and an operator-policy store only
-            // mean something on a device that moves audio, so
-            // they are built here and reached through the slot.
+            // routing broker, an operator-policy store and a
+            // hardware-profile override store only mean
+            // something on a device that moves audio, so they
+            // are built here and reached through the slot.
             let audio_policy_store = Arc::new(
                 evo_audio_topology::audio_policy::AudioPolicyStore::new(
                     Arc::clone(&persistence),
@@ -203,6 +204,28 @@ fn audio_distribution_runtime_setup(
             let audio_routing_runtime = Arc::new(
                 evo_audio_topology::audio_routing::AudioRoutingRuntime::new(),
             );
+            // The override layer of the four-source hardware
+            // profile the scorer composes. The other three —
+            // live probe, plugin-declared, database lookup —
+            // are computed on demand; only the operator's
+            // overrides are durable.
+            let hardware_profile_store = Arc::new(
+                evo_audio_topology::hardware_profile::HardwareProfileStore::new(
+                    Arc::clone(&persistence),
+                ),
+            );
+            match hardware_profile_store.list_overrides().await {
+                Ok(rows) => tracing::info!(
+                    entries = rows.len(),
+                    "hardware profile store: rehydrated from substrate"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "hardware profile store: list failed; substrate may be \
+                     uninitialised or corrupt"
+                ),
+            }
+
             let audio_topology_store = Arc::new(
                 evo_audio_topology::audio_topology::AudioTopologyStore::new(
                     Arc::clone(&persistence),
@@ -255,6 +278,9 @@ fn audio_distribution_runtime_setup(
                 )),
                 Arc::new(evo_audio_topology::control::PolicyControl::new(
                     audio_policy_store,
+                )),
+                Arc::new(evo_audio_topology::control::HardwareControl::new(
+                    hardware_profile_store,
                 )),
             );
 

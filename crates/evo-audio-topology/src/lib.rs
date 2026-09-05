@@ -18,4 +18,5 @@ pub mod audio_policy;
 pub mod audio_routing;
 pub mod audio_topology;
 pub mod control;
+pub mod hardware_profile;
 pub mod topology_scoring;
