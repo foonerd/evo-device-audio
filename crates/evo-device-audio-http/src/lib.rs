@@ -37,6 +37,7 @@ pub mod artwork_negative_cache;
 pub mod artwork_resolve_coalescer;
 pub mod artwork_resolve_endpoint;
 pub mod artwork_resolve_index;
+pub mod captive_session_endpoint;
 pub mod track_detail_endpoint;
 
 use std::sync::Arc;
@@ -120,6 +121,21 @@ pub fn mount(
         &cfg.api_prefix,
         Arc::clone(&cfg.dispatcher),
         Arc::clone(&cascade),
+        Arc::clone(&cfg.validator),
+        Arc::clone(&cfg.tier_provider),
+        cfg.lan_trust_caps.clone(),
+    )?;
+
+    // Device-proxied captive-portal session surface. Product for
+    // the same reason the artwork presenters are: it exists
+    // because a venue portal has to be fetched over the interface
+    // carrying it, which is a fact about this distribution's
+    // networking, not about serving HTTP. The route and its gate
+    // are unchanged by the move — only who mounts it.
+    router = captive_session_endpoint::attach_captive_session_endpoint(
+        router,
+        &cfg.api_prefix,
+        Arc::clone(&cfg.dispatcher),
         Arc::clone(&cfg.validator),
         Arc::clone(&cfg.tier_provider),
         cfg.lan_trust_caps,
