@@ -50,8 +50,10 @@ use evo_plugin_sdk::contract::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -2483,6 +2485,12 @@ pub struct NetworkSharesRuntime {
     /// `mount_share` adopts an already-active host mount instead
     /// of re-running the dialect probe.
     mount_point_check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// Asks whether the device has L3. `None` means no gate is
+    /// installed and boot-mount proceeds immediately, which is
+    /// the behaviour a runtime built without one has always had.
+    l3_gate: Option<L3Gate>,
+    /// How long boot-mount waits for L3 before giving up.
+    l3_wait_ms: u64,
     /// Deduplication map for in-flight credential prompts. Keyed
     /// on `credential_key` so multiple concurrent mount / add
     /// attempts against the same missing credential collapse to
@@ -2611,6 +2619,8 @@ impl NetworkSharesRuntime {
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
             mount_point_check: Arc::new(|p: &Path| is_path_mounted(p)),
+            l3_gate: None,
+            l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -2648,6 +2658,8 @@ impl NetworkSharesRuntime {
             smbclient_timeout_ms: None,
             now_fn: None,
             mount_point_check: None,
+            l3_gate: None,
+            l3_wait_ms: None,
         })
     }
 
@@ -2682,6 +2694,8 @@ impl NetworkSharesRuntime {
             // suites cannot accidentally adopt a host mount from
             // the machine running `cargo test`.
             mount_point_check: Arc::new(|_: &Path| false),
+            l3_gate: None,
+            l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -3177,6 +3191,8 @@ pub struct NetworkSharesRuntimeBuilder {
     // factoring a one-off type alias.
     #[allow(clippy::type_complexity)]
     mount_point_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
+    l3_gate: Option<L3Gate>,
+    l3_wait_ms: Option<u64>,
 }
 
 impl NetworkSharesRuntimeBuilder {
@@ -3297,6 +3313,19 @@ impl NetworkSharesRuntimeBuilder {
         self
     }
 
+    /// Install the L3 gate boot-mount waits on. Without one,
+    /// boot-mount proceeds immediately.
+    pub fn with_l3_gate(mut self, gate: L3Gate) -> Self {
+        self.l3_gate = Some(gate);
+        self
+    }
+
+    /// Override how long boot-mount waits for L3.
+    pub fn with_l3_wait_ms(mut self, ms: u64) -> Self {
+        self.l3_wait_ms = Some(ms);
+        self
+    }
+
     /// Wrap mount + umount with `sudo -n` so the plugin can
     /// invoke the mount helper as root even when running under a
     /// non-root service identity. Sets `mount_program = "sudo"`
@@ -3410,6 +3439,8 @@ impl NetworkSharesRuntimeBuilder {
                     Arc::new(|p: &Path| is_path_mounted(p))
                 }
             }),
+            l3_gate: self.l3_gate,
+            l3_wait_ms: self.l3_wait_ms.unwrap_or(DEFAULT_L3_WAIT_MS),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -4996,6 +5027,30 @@ fn envelope_to_json<T: Serialize>(envelope: &T) -> serde_json::Value {
 // Mount lifecycle (Ship 2g)
 // --------------------------------------------------------------
 
+/// How long boot-mount waits for the network to reach L3 before
+/// giving up on this pass (60 seconds).
+///
+/// Giving up is not a failure: the remount task runs on its own
+/// cadence and picks the shares up once the link is there. This
+/// bound exists so the boot task does not sit forever on a device
+/// that has no network at all.
+pub const DEFAULT_L3_WAIT_MS: u64 = 60 * 1_000;
+
+/// Interval between L3 checks while boot-mount is waiting.
+const L3_POLL_INTERVAL_MS: u64 = 500;
+
+/// Asks whether the device has L3 connectivity — a carrier and an
+/// address. Injected so the runtime does not have to know how
+/// that fact is published, and so the tests can drive both
+/// answers without a network.
+///
+/// Deliberately not `internet_reachable`: a NAS on the LAN is
+/// reachable with no route to the internet at all, and gating
+/// mounts on a captive portal or a DNS probe would strand a
+/// perfectly good local share.
+pub type L3Gate =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
 /// Default cadence for the background remount task (5 minutes).
 /// Every tick, the runtime walks its per-share state map and
 /// retries the shares in [`MountState::Failed`] or
@@ -5047,6 +5102,32 @@ impl BootMountReport {
 }
 
 impl NetworkSharesRuntime {
+    /// Wait for the device to reach L3, up to the configured
+    /// bound. Returns whether it got there.
+    ///
+    /// No gate installed means yes immediately — a runtime built
+    /// without one behaves as it always did.
+    async fn await_l3(&self) -> bool {
+        let Some(gate) = self.l3_gate.as_ref() else {
+            return true;
+        };
+        if gate().await {
+            return true;
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.l3_wait_ms);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                L3_POLL_INTERVAL_MS,
+            ))
+            .await;
+            if gate().await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Attempt to mount every configured share. Runs
     /// sequentially (not concurrently) — CIFS probe ladders can
     /// take up to 150 s each and firing them concurrently would
@@ -5054,7 +5135,31 @@ impl NetworkSharesRuntime {
     /// startup surfaces the sequential progression also renders
     /// cleaner. Publishes per-share state transitions via the
     /// Ship 2f subject substrate.
+    ///
+    /// Waits for L3 first when a gate is installed, and mounts
+    /// nothing if the link never arrives within the bound.
     pub async fn boot_mount_all(&self) -> BootMountReport {
+        // Mounting before the link is up spends the whole CIFS
+        // dialect ladder failing against a host that is not
+        // reachable yet, marks every share Failed, and leaves the
+        // operator looking at a broken library on a device that
+        // was merely booting faster than its network.
+        //
+        // Waiting costs nothing: this runs detached, so plugin
+        // readiness is not behind it, and giving up after the
+        // bound is safe because the remount task picks the shares
+        // up on its own cadence.
+        if !self.await_l3().await {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                waited_ms = self.l3_wait_ms,
+                "no L3 connectivity; skipping boot mount. Shares will \
+                 mount from the remount pass once the link is up"
+            );
+            return BootMountReport {
+                outcomes: Vec::new(),
+            };
+        }
         // Reconcile first so already-active host mounts become
         // Mounted before we spend probe-ladder budget on them.
         self.reconcile_os_mount_states().await;
@@ -8943,6 +9048,164 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             programs_run(&executor).await,
             vec!["/bin/umount".to_string(), "/bin/mount".to_string()]
         );
+    }
+
+    /// An L3 gate with a fixed answer.
+    fn l3_gate_fixed(up: bool) -> L3Gate {
+        Arc::new(move || Box::pin(async move { up }))
+    }
+
+    #[tokio::test]
+    async fn boot_mount_skips_every_share_when_there_is_no_l3() {
+        // Mounting before the link is up spends the whole dialect
+        // ladder failing against a host that is not reachable
+        // yet, and leaves the operator looking at a broken
+        // library on a device that was merely booting faster than
+        // its network.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_000_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            // Short bound so the fixture does not sit for a
+            // minute proving a negative.
+            .with_l3_wait_ms(0)
+            .build();
+        rt.add_share(built_record("NoLink", "192.0.2.50"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert!(report.outcomes.is_empty(), "no L3 means no boot mount");
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no L3 must mean zero mount helper calls, got {:?}",
+            programs_run(&executor).await
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_runs_the_normal_path_once_l3_is_up() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_100_000))
+            .with_l3_gate(l3_gate_fixed(true))
+            .build();
+        let id = rt
+            .add_share(built_record("HasLink", "192.0.2.51"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/mount".to_string()]
+        );
+        let g = rt.share_states.lock().await;
+        assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+    }
+
+    #[tokio::test]
+    async fn boot_mount_proceeds_when_l3_arrives_during_the_wait() {
+        // The ordinary boot race: the plugin is up before the
+        // link is. The wait is the point — the shares must mount
+        // once it lands, not be skipped because the first check
+        // was early.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let up = Arc::new(AtomicBool::new(false));
+        let up_for_gate = Arc::clone(&up);
+        let gate: L3Gate = Arc::new(move || {
+            let flag = Arc::clone(&up_for_gate);
+            Box::pin(async move { flag.load(Ordering::SeqCst) })
+        });
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_200_000))
+            .with_l3_gate(gate)
+            .with_l3_wait_ms(5_000)
+            .build();
+        rt.add_share(built_record("LateLink", "192.0.2.52"))
+            .await
+            .unwrap();
+
+        // Link comes up shortly after boot-mount starts waiting.
+        let flip = Arc::clone(&up);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            flip.store(true, Ordering::SeqCst);
+        });
+
+        let report = rt.boot_mount_all().await;
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/mount".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_gives_up_within_its_bound() {
+        // The wait is bounded, so the detached boot task cannot
+        // sit forever on a device with no network. Readiness is
+        // never behind it either way — boot-mount is spawned
+        // detached — but an unbounded wait would leak a task per
+        // restart.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_300_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            .with_l3_wait_ms(1_200)
+            .build();
+        rt.add_share(built_record("NeverLink", "192.0.2.53"))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let report = rt.boot_mount_all().await;
+        let waited = started.elapsed();
+
+        assert!(report.outcomes.is_empty());
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "boot-mount must give up on its bound, waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_without_a_gate_is_unchanged() {
+        // A runtime built without a gate behaves as it always
+        // did. Every existing fixture depends on this.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_400_000))
+            .build();
+        rt.add_share(built_record("NoGate", "192.0.2.54"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+        assert_eq!(report.outcomes.len(), 1);
     }
 
     #[tokio::test]

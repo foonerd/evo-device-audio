@@ -58,9 +58,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::{
-    BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, Request, Respondent, Response,
-    RuntimeCapabilities,
+    BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
+    PluginDescription, PluginError, PluginIdentity, Request, Respondent,
+    Response, RuntimeCapabilities,
 };
 use evo_plugin_sdk::Manifest;
 
@@ -77,6 +77,75 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 /// Plugin name (reverse-DNS); same as manifest and tests.
 pub const PLUGIN_NAME: &str = "org.evoframework.network.shares";
+
+/// External addressing of the connectivity subject the network
+/// plugin publishes. Kept as literals rather than a code
+/// dependency on that plugin's crate: this is a published
+/// contract between two plugins on the same device, and taking a
+/// build-graph dependency for two strings would buy nothing.
+const CONNECTIVITY_SCHEME: &str = "evo.networking.link";
+const CONNECTIVITY_VALUE: &str = "connectivity";
+
+/// Does this connectivity-subject state mean the device can reach
+/// a NAS on its own LAN?
+///
+/// `carrier` only, and deliberately so on both sides.
+///
+/// Not `internet_reachable`: a NAS on the same LAN needs a local
+/// link, not a route out, and gating on a probe verdict would
+/// strand a perfectly good share behind a captive portal or a DNS
+/// failure.
+///
+/// Not `ip_address` either, however much an address is the
+/// honest definition of L3. The network plugin publishes that
+/// field as `None` unconditionally — the rtnetlink address read
+/// that would fill it has not landed — so requiring it would mean
+/// boot-mount never runs on any device at all. `carrier` is the
+/// field that carries real information today: it is the
+/// supervisor's uplink verdict, ethernet carrier or wifi
+/// associated. When the address read lands, this predicate is
+/// where it joins.
+pub(crate) fn l3_from_connectivity_state(state: &serde_json::Value) -> bool {
+    state
+        .get("carrier")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Build the L3 gate boot-mount waits on.
+///
+/// A missing handle, an unresolvable subject, or a state nobody
+/// has published yet all read as "not yet", so boot-mount waits
+/// rather than charging at a link that may not be there. The wait
+/// is bounded, so a device where the network plugin is absent
+/// entirely gives up and leaves the shares to the remount pass.
+fn connectivity_l3_gate(ctx: &LoadContext) -> runtime::L3Gate {
+    let querier = ctx.subject_querier.clone();
+    let states = ctx.subject_state_subscriber.clone();
+    Arc::new(move || {
+        let querier = querier.clone();
+        let states = states.clone();
+        Box::pin(async move {
+            let (Some(querier), Some(states)) = (querier, states) else {
+                return false;
+            };
+            let addressing = ExternalAddressing {
+                scheme: CONNECTIVITY_SCHEME.to_string(),
+                value: CONNECTIVITY_VALUE.to_string(),
+            };
+            let Ok(Some(canonical_id)) =
+                querier.resolve_addressing(addressing).await
+            else {
+                return false;
+            };
+            let Ok(Some(state)) = states.current_state(canonical_id).await
+            else {
+                return false;
+            };
+            l3_from_connectivity_state(&state)
+        })
+    })
+}
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -267,6 +336,7 @@ impl Plugin for NetworkSharesPlugin {
                     .with_credential_store(credential_store)
                     .with_password_prompter(prompter)
                     .with_sudo_wrapping(needs_sudo)
+                    .with_l3_gate(connectivity_l3_gate(ctx))
                     .build(),
             );
 
@@ -430,6 +500,64 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connectivity subject as the network plugin actually
+    /// publishes it today: `carrier` carries the uplink verdict,
+    /// `ip_address` is unconditionally null because the rtnetlink
+    /// address read has not landed.
+    ///
+    /// Requiring an address here would mean boot-mount never runs
+    /// on any device — which is exactly the bug this pins.
+    #[test]
+    fn l3_is_up_on_the_shape_the_network_plugin_publishes_today() {
+        let state = serde_json::json!({
+            "interface_up": true,
+            "carrier": true,
+            "ip_address": null,
+            "default_gateway": null,
+            "dns_resolves": false,
+            "internet_reachable": null,
+            "source": "rtnetlink",
+        });
+        assert!(
+            l3_from_connectivity_state(&state),
+            "a device with a live uplink and the stubbed address \
+             field must read as up"
+        );
+    }
+
+    #[test]
+    fn l3_is_down_without_carrier() {
+        let state = serde_json::json!({
+            "interface_up": false,
+            "carrier": false,
+            "ip_address": null,
+        });
+        assert!(!l3_from_connectivity_state(&state));
+    }
+
+    #[test]
+    fn l3_is_down_when_the_state_says_nothing_useful() {
+        // Boot-default state, and a malformed one. Both mean
+        // "not yet", so boot-mount waits rather than charging.
+        assert!(!l3_from_connectivity_state(&serde_json::json!({})));
+        assert!(!l3_from_connectivity_state(
+            &serde_json::json!({ "carrier": "yes" })
+        ));
+    }
+
+    #[test]
+    fn l3_ignores_internet_reachability() {
+        // A device behind a captive portal, or with no route out,
+        // still has every share on its own LAN.
+        let state = serde_json::json!({
+            "carrier": true,
+            "ip_address": null,
+            "internet_reachable": false,
+            "dns_resolves": false,
+        });
+        assert!(l3_from_connectivity_state(&state));
+    }
 
     #[test]
     fn manifest_parses() {
