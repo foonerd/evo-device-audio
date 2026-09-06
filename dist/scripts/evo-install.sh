@@ -1154,9 +1154,13 @@ JOURNAL_FAIL_HITS=""
 JOURNAL_FAIL_COUNT=0
 # Active PCM playback probe state. Set by verify_pcm_playback().
 # Values: not_run / ok / busy / fail / skipped_no_aplay /
-# skipped_no_probe_wav. Only `fail` participates in POST_OK
-# gating; `busy` is evidence the chain works (MPD has the
-# device).
+# skipped_no_probe_wav. No value gates POST_OK — the probe is
+# evidence, not a verdict on the install. `busy` means the chain
+# works and MPD already holds the device; `fail` means the card
+# written into asound.conf will not open for playback right
+# now, which is an audio-output problem the operator resolves by
+# choosing their listening device, not a reason to leave them
+# without a running system to choose it on.
 PCM_PLAYBACK_PROBE="not_run"
 
 # Count functional plugin bundles staged in the extracted
@@ -1460,6 +1464,29 @@ verify_smb_netbios_matches_hostname() {
     fi
 }
 
+# Path the rendered ALSA config landed at. bootstrap.sh owns
+# writing it; the post-condition only reads it back.
+ASOUND_CONF_PATH_POST="/etc/asound.conf"
+
+# The card that was actually written, read back from the
+# rendered asound.conf rather than re-derived. If the probe is
+# going to tell the operator their output does not open, it has
+# to name the card the system is really pointed at — a second
+# detection run here could disagree with what bootstrap wrote
+# and send them chasing the wrong device. Falls back to an
+# explicit --card override, then to empty.
+chosen_audio_card() {
+    local card=""
+    if [[ -r "${ASOUND_CONF_PATH_POST}" ]]; then
+        card="$(awk -F'"' '/^[[:space:]]*card[[:space:]]+"/ { print $2; exit }' \
+            "${ASOUND_CONF_PATH_POST}" 2>/dev/null)"
+    fi
+    if [[ -z "${card}" ]]; then
+        card="${EVO_INSTALL_AUDIO_CARD}"
+    fi
+    printf '%s' "${card}"
+}
+
 # Active PCM playback-path probe at post-condition time. The
 # bootstrap-tier probe runs against pcm.evo before the steward
 # starts; this one runs AFTER the steward + plugin admission +
@@ -1495,8 +1522,21 @@ verify_pcm_playback() {
         PCM_PLAYBACK_PROBE="busy"
     else
         PCM_PLAYBACK_PROBE="fail"
-        echo "FAIL: pcm.evo playback probe (aplay --dump-hw-params -D evo) failed:" >&2
-        printf '%s\n' "${probe_out}" | head -5 | sed 's/^/  /' >&2
+        local chosen_card
+        chosen_card="$(chosen_audio_card)"
+        echo "WARN: pcm.evo did not open for playback on this host." >&2
+        echo "      card written into ${ASOUND_CONF_PATH_POST}: ${chosen_card:-<unreadable>}" >&2
+        printf '%s\n' "${probe_out}" | head -5 | sed 's/^/      /' >&2
+        echo "      playback devices this host reports:" >&2
+        if command -v aplay >/dev/null 2>&1; then
+            # Same locale rule as the detector: parse and show
+            # the C-locale output, not the host's translation.
+            LC_ALL=C aplay -l 2>&1 | sed 's/^/        /' >&2
+        else
+            echo "        (aplay not on PATH)" >&2
+        fi
+        echo "      The install continues. Choose the listening device in" >&2
+        echo "      Settings → System → Audio, or re-run with --card <NAME>." >&2
     fi
 }
 
@@ -1702,14 +1742,25 @@ if [[ "${PLUGINS_ADMITTED}" -lt "${PLUGINS_EXPECTED}" ]]; then POST_OK=0; fi
 if [[ "${ADMISSION_FAILURES}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${NOT_DECLARED}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi
-# The PCM playback-path probe is the dedicated catch for the
-# regression class that the old gate missed: a placement that
-# leaves pcm.evo unopenable for playback while the steward +
-# plugin admission look healthy. `fail` is the only state that
-# breaks the gate; `busy` is positive evidence (MPD has the
-# device); the `skipped_*` states are documented gaps the
-# evidence record carries forward.
-if [[ "${PCM_PLAYBACK_PROBE}" == "fail" ]]; then POST_OK=0; fi
+# The PCM playback-path probe is evidence, not a gate. It was
+# a gate, and it cost a working install: a box whose only
+# enumerated output is HDMI can have the steward active and
+# every declared plugin admitted, and still not open pcm.evo —
+# so the operator got a FAIL banner and a pointer back to curl
+# for a machine that was, in fact, installed and running. The
+# listening device is an operator choice made in Settings →
+# System → Audio; the install's job is to leave them a system
+# on which to make it.
+#
+# What still fails the primitive is unchanged and sits above and
+# below this line: a steward that is not active, short or failed
+# admission, journal failures, a netbios mismatch, degraded LAN
+# discovery, degraded USB provisioning. Those are the install
+# not having worked. A DAC that is not plugged in is not.
+#
+# The probe's verdict rides the evidence record either way, and
+# `fail` prints a WARN naming the card and what the host does
+# report — see verify_pcm_playback.
 # LAN-identity invariant. `mismatch` is a wire-visible defect
 # (the fleet would collide on `netbios name = EvoDevice` or on
 # any other stale value). The `skipped_*` states name a
