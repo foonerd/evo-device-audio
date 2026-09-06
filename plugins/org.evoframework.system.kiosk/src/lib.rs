@@ -100,12 +100,16 @@ pub const VERB_SET_OSK: &str = "set_osk";
 
 /// Verb name — show or hide the mouse pointer.
 ///
-/// Persists the operator's choice. The pointer is applied by
-/// `evo-kiosk-session` at session start, not live: labwc has no
-/// action that reveals a hidden cursor, so a running session
-/// cannot be talked into showing one. Callers must present this
-/// as a setting that takes effect on the next session, never as
-/// an immediate toggle.
+/// Takes effect immediately. Pointer visibility is decided by
+/// which cursor theme the compositor loads, and a compositor
+/// reads that once at startup, so the verb persists the choice
+/// and then restarts the kiosk session to apply it. The operator
+/// sees a brief flash as the session comes back.
+///
+/// The restart is the whole applier. There is no compositor
+/// action that hides a pointer durably — labwc's `HideCursor`
+/// gives it back on the next pointer motion, and does not exist
+/// at all on the older labwc in the field.
 pub const VERB_SET_CURSOR: &str = "set_cursor";
 
 /// Verb name — read the complete persisted operator-visible state
@@ -472,7 +476,7 @@ impl Respondent for SystemKioskPlugin {
                     handle_set_sleep_inhibit_while_playing(req)
                 }
                 VERB_SET_OSK => handle_set_osk(req),
-                VERB_SET_CURSOR => handle_set_cursor(req),
+                VERB_SET_CURSOR => handle_set_cursor(req).await,
                 VERB_GET_DISPLAY_STATE => handle_get_display_state(req),
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
@@ -799,18 +803,80 @@ struct SetCursorReq {
     visible: bool,
 }
 
-fn handle_set_cursor(req: &Request) -> Result<Response, PluginError> {
+async fn handle_set_cursor(req: &Request) -> Result<Response, PluginError> {
     let parsed: SetCursorReq = parse_payload(req, VERB_SET_CURSOR)?;
-    // Persist only. Unlike the keyboard, the pointer has no live
-    // applier: `evo-kiosk-session` reads this overlay at session
-    // start and fires the compositor's hide keybind when it says
-    // `hide`. There is no counterpart that reveals a hidden
-    // cursor, so nothing here tries to change a running session.
+    // Persist first, so a read taken while the session is
+    // bouncing already reports the operator's choice.
     let applied = evo_kiosk_config::set_cursor(parsed.visible)
         .map_err(|e| kiosk_config_error(VERB_SET_CURSOR, e))?;
+
+    // A stopped session is left stopped. `systemctl restart`
+    // would start it, so an operator who has turned the kiosk
+    // off would find a pointer preference had switched their
+    // screen back on. The overlay is already written and
+    // `evo-kiosk-launch` exports the theme at exec, so the
+    // choice still applies whenever the session next starts.
+    if !kiosk_session_running().await {
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            cursor_visible = applied,
+            "set_cursor: session not running; persisted for next start"
+        );
+        return cursor_response(req, applied);
+    }
+
+    // Sudo grant is enumerated by the paired
+    // /etc/sudoers.d/evo-system-kiosk drop-in as
+    // EVO_SYSTEM_KIOSK_RESTART. Argv must match the alias
+    // exactly; no shell interpolation, and deliberately no
+    // `--now` — this restarts a session, it never changes
+    // whether the unit is enabled.
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .arg("-n")
+        .arg("/usr/bin/systemctl")
+        .arg("restart")
+        .arg("evo-kiosk.service")
+        .output()
+        .await
+        .map_err(|e| {
+            PluginError::Transient(format!(
+                "set_cursor: spawning sudo systemctl failed: {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        // Roll the overlay back: the pointer on screen did not
+        // change, so the read must not claim it did.
+        let _ = evo_kiosk_config::set_cursor(!parsed.visible);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PluginError::Transient(format!(
+            "set_cursor: systemctl restart evo-kiosk.service exited {:?}: {stderr}",
+            output.status.code()
+        )));
+    }
+    cursor_response(req, applied)
+}
+
+/// Is the kiosk session currently up? Read-only and unprivileged
+/// — `is-active` needs no grant, and its exit status is the
+/// answer.
+async fn kiosk_session_running() -> bool {
+    tokio::process::Command::new("/usr/bin/systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg("evo-kiosk.service")
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn cursor_response(
+    req: &Request,
+    cursor_visible: bool,
+) -> Result<Response, PluginError> {
     let body = serde_json::json!({
         "ok": true,
-        "cursor_visible": applied,
+        "cursor_visible": cursor_visible,
     });
     Ok(Response::for_request(
         req,
@@ -1106,8 +1172,60 @@ mod tests {
         }
     }
 
+    /// The sudoers template that grants this plugin its three
+    /// systemctl invocations. Read here so the argv the code
+    /// builds and the alias the drop-in authorises are pinned to
+    /// each other: a mismatch is invisible until a device denies
+    /// the sudo call at the moment an operator presses the
+    /// button.
+    const SUDOERS_TEMPLATE: &str =
+        include_str!("../../../dist/sudoers.d/evo-system-kiosk.in");
+
     #[test]
-    fn set_cursor_writes_the_policy_the_session_script_reads() {
+    fn sudoers_authorises_exactly_the_restart_argv_the_verb_uses() {
+        // The argv in handle_set_cursor, as a single line.
+        let argv = "/usr/bin/systemctl restart evo-kiosk.service";
+        let alias = format!("Cmnd_Alias EVO_SYSTEM_KIOSK_RESTART = {argv}");
+        assert!(
+            SUDOERS_TEMPLATE.lines().any(|l| l.trim() == alias),
+            "sudoers must authorise exactly `{argv}`; sudo matches argv \
+             literally, so any drift denies the operator's toggle"
+        );
+        assert!(
+            SUDOERS_TEMPLATE.lines().any(|l| l
+                .trim()
+                .ends_with("NOPASSWD: EVO_SYSTEM_KIOSK_RESTART")),
+            "the restart alias must be granted, not merely defined"
+        );
+        // No `--now` on the restart alias: this restarts a
+        // session and must never change whether the unit is
+        // enabled.
+        assert!(
+            !SUDOERS_TEMPLATE
+                .lines()
+                .any(|l| l.contains("EVO_SYSTEM_KIOSK_RESTART =")
+                    && l.contains("--now")),
+            "the restart alias must not carry --now"
+        );
+    }
+
+    /// These fixtures drive the real verb, which restarts the
+    /// kiosk session when one is running. A build host has no
+    /// such unit, so the verb takes its persist-and-return path
+    /// and spawns nothing. Asserted rather than assumed: running
+    /// the suite on a device would otherwise bounce the
+    /// operator's screen.
+    async fn refuse_if_a_live_session_would_be_restarted() {
+        assert!(
+            !kiosk_session_running().await,
+            "evo-kiosk.service is active here; these fixtures would \
+             restart a live session. Run them on a build host."
+        );
+    }
+
+    #[tokio::test]
+    async fn set_cursor_writes_the_policy_the_session_script_reads() {
+        refuse_if_a_live_session_would_be_restarted().await;
         // `evo-kiosk-session` matches the literal `hide`, so the
         // bool has to land as those exact bytes to have any effect
         // at the next session start.
@@ -1117,6 +1235,7 @@ mod tests {
             VERB_SET_CURSOR,
             serde_json::json!({"visible": false}),
         ))
+        .await
         .expect("set_cursor false");
         assert_eq!(body(&resp)["ok"], true);
         assert_eq!(body(&resp)["cursor_visible"], false);
@@ -1126,13 +1245,15 @@ mod tests {
             VERB_SET_CURSOR,
             serde_json::json!({"visible": true}),
         ))
+        .await
         .expect("set_cursor true");
         assert_eq!(body(&resp)["cursor_visible"], true);
         assert_eq!(scratch.bytes("cursor").as_deref(), Some("show"));
     }
 
-    #[test]
-    fn set_cursor_refuses_a_malformed_payload() {
+    #[tokio::test]
+    async fn set_cursor_refuses_a_malformed_payload() {
+        refuse_if_a_live_session_would_be_restarted().await;
         let _scratch = ScratchOverlays::new("badcursor");
         for payload in [
             serde_json::json!({}),
@@ -1141,20 +1262,24 @@ mod tests {
         ] {
             assert!(
                 handle_set_cursor(&request(VERB_SET_CURSOR, payload.clone()))
+                    .await
                     .is_err(),
                 "must refuse {payload}"
             );
         }
     }
 
-    #[test]
-    fn set_cursor_refuses_an_unrecognised_overlay_rather_than_clobbering() {
+    #[tokio::test]
+    async fn set_cursor_refuses_an_unrecognised_overlay_rather_than_clobbering()
+    {
+        refuse_if_a_live_session_would_be_restarted().await;
         let scratch = ScratchOverlays::new("cursorclobber");
         std::fs::write(scratch.dir.join("cursor"), "dim").unwrap();
         let err = handle_set_cursor(&request(
             VERB_SET_CURSOR,
             serde_json::json!({"visible": true}),
         ))
+        .await
         .expect_err("must refuse");
         assert!(
             matches!(err, PluginError::Permanent(_)),
@@ -1163,13 +1288,15 @@ mod tests {
         assert_eq!(scratch.bytes("cursor").as_deref(), Some("dim"));
     }
 
-    #[test]
-    fn set_cursor_round_trips_through_get_display_state() {
+    #[tokio::test]
+    async fn set_cursor_round_trips_through_get_display_state() {
+        refuse_if_a_live_session_would_be_restarted().await;
         let _scratch = ScratchOverlays::new("cursorroundtrip");
         handle_set_cursor(&request(
             VERB_SET_CURSOR,
             serde_json::json!({"visible": false}),
         ))
+        .await
         .unwrap();
         let resp = handle_get_display_state(&request(
             VERB_GET_DISPLAY_STATE,
