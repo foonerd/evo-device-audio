@@ -187,6 +187,7 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_BRIGHTNESS.to_string(),
                         VERB_SET_SLEEP_TIMEOUT.to_string(),
                         VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING.to_string(),
+                        VERB_SET_OSK.to_string(),
                         VERB_GET_DISPLAY_STATE.to_string(),
                     ],
                     accepts_custody: false,
@@ -939,6 +940,41 @@ mod tests {
                     panic!("{label}: {VERB_SET_OSK} must be write/system_admin, got {other:?}")
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_and_the_manifests_declare_the_same_verbs() {
+        // The steward refuses admission when the manifest and the
+        // runtime describe() disagree, so a verb added to one and
+        // not the other unloads the plugin on the device. This
+        // pins all three lists to each other.
+        let described: std::collections::BTreeSet<String> =
+            SystemKioskPlugin::default()
+                .describe()
+                .await
+                .runtime_capabilities
+                .request_types
+                .into_iter()
+                .collect();
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml).expect("manifest parses");
+            let declared: std::collections::BTreeSet<String> = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .expect("respondent")
+                .request_types
+                .iter()
+                .cloned()
+                .collect();
+            assert_eq!(
+                declared, described,
+                "{label} manifest and describe() must stock the same verbs; \
+                 a mismatch fails admission on the device"
+            );
         }
     }
 
