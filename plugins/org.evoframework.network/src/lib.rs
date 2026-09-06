@@ -3573,6 +3573,39 @@ impl NmInner {
         }
     }
 
+    /// Write a passphrase the caller supplied, and leave the
+    /// stored one alone when they supplied none.
+    ///
+    /// Omitting a field is not the same as clearing it. Every
+    /// settings write that is not a join — a country change, an AP
+    /// toggle, a radio switch, an address edit — arrives without
+    /// the passphrase, and treating that as "delete" wiped the
+    /// stored one each time. NetworkManager kept its own copy, so
+    /// the device stayed on the network and the loss only surfaced
+    /// later, when something needed the passphrase and found none.
+    ///
+    /// An explicitly empty value is refused rather than treated as
+    /// a clear: it is far more often a form submitting a blank box
+    /// than an operator asking to forget a network. Forgetting has
+    /// its own verb, and that verb stays the only way to clear.
+    async fn write_secret_if_supplied(
+        &self,
+        path: PathBuf,
+        value: Option<&str>,
+        field: &str,
+    ) -> Result<(), PluginError> {
+        match value {
+            None => Ok(()),
+            Some(v) if v.trim().is_empty() => {
+                Err(PluginError::Permanent(format!(
+                    "{field} was supplied empty; omit it to keep the saved \
+                     passphrase, or use the forget verb to clear it"
+                )))
+            }
+            Some(v) => self.write_optional_secret(path, Some(v)).await,
+        }
+    }
+
     async fn write_optional_secret(
         &self,
         path: PathBuf,
@@ -3989,6 +4022,61 @@ impl NmInner {
             ));
         }
         rows
+    }
+
+    /// SSID recorded on an existing NM profile, if it has one.
+    async fn nm_profile_ssid(&self, name: &str) -> Option<String> {
+        let out = self
+            .dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                &["-g", "802-11-wireless.ssid", "connection", "show", name],
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let ssid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if ssid.is_empty() {
+            None
+        } else {
+            Some(ssid)
+        }
+    }
+
+    /// May this station be brought up without a passphrase of our
+    /// own, by leaving the one NetworkManager already holds?
+    ///
+    /// True only when there is nothing to supply and nothing to
+    /// change: the network is not open, we hold no passphrase, a
+    /// profile already exists, and it is for the same SSID. Then
+    /// NM's stored secret is still the right secret and rewriting
+    /// `wifi-sec.psk` would replace a working credential with
+    /// nothing.
+    ///
+    /// A different SSID is a different network — NM's secret does
+    /// not apply and there is nothing to reuse.
+    async fn sta_secret_is_reusable(
+        &self,
+        wifi: &WifiIntent,
+        sta_psk: Option<&str>,
+    ) -> bool {
+        if wifi.sta_open {
+            return false;
+        }
+        if sta_psk.map(str::trim).is_some_and(|s| !s.is_empty()) {
+            return false;
+        }
+        let wanted = wifi.sta_ssid.trim();
+        if wanted.is_empty() {
+            return false;
+        }
+        match self.nm_profile_ssid(NM_CON_WIFI_STA).await {
+            Some(existing) => existing == wanted,
+            None => false,
+        }
     }
 
     async fn nm_connection_exists(&self, name: &str) -> bool {
@@ -5153,15 +5241,9 @@ impl NmInner {
                 ));
             }
             // No wifi-sec.* args on `base`.
-        } else {
-            let psk = sta_psk
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    PluginError::Permanent(
-                        "wifi-sta.psk missing while sta_open=false".to_string(),
-                    )
-                })?;
+        } else if let Some(psk) =
+            sta_psk.map(str::trim).filter(|s| !s.is_empty())
+        {
             base.extend([
                 "wifi-sec.key-mgmt".into(),
                 "wpa-psk".into(),
@@ -5170,6 +5252,20 @@ impl NmInner {
                 "wifi-sec.psk".into(),
                 psk.to_string(),
             ]);
+        } else if self.sta_secret_is_reusable(wifi, sta_psk).await {
+            // We hold no passphrase, but this profile is already
+            // for this SSID and NetworkManager still has the one
+            // that worked. Touch every other field and leave
+            // `wifi-sec.psk` alone — rewriting it here is what
+            // replaced a working credential with nothing.
+            steps.push(format!(
+                "reusing the saved passphrase already on {NM_CON_WIFI_STA} \
+                 (none supplied, same network)"
+            ));
+        } else {
+            return Err(PluginError::Permanent(
+                "wifi-sta.psk missing while sta_open=false".to_string(),
+            ));
         }
         base.extend(Self::nm_ipv4_args(
             &wifi.sta_ipv4_mode,
@@ -6241,6 +6337,26 @@ impl NmInner {
                         "pre-STA: removed AP vif {resolved_ap_ifname} to free phy for STA association"
                     ));
                 }
+                // Do not take down what cannot be put back.
+                //
+                // The station comes down here so the profile can be
+                // rewritten and brought up again. If we have no
+                // passphrase and NetworkManager's stored one cannot
+                // be reused — a different SSID, or no profile at
+                // all — then the bring-up will refuse, and refusing
+                // after the disconnect leaves the operator with no
+                // network and no way back. Refuse first instead.
+                if !intent.wifi.sta_open
+                    && !sta_psk.map(str::trim).is_some_and(|s| !s.is_empty())
+                    && !self.sta_secret_is_reusable(&intent.wifi, sta_psk).await
+                {
+                    return Err(PluginError::Permanent(format!(
+                        "no passphrase for {:?} and no matching saved \
+                         network to reuse one from; refusing before taking \
+                         the station down",
+                        intent.wifi.sta_ssid.trim()
+                    )));
+                }
                 self.connection_down_lossy(NM_CON_WIFI_STA).await;
                 steps.push(
                     "pre-STA: nmcli connection down STA profile (best effort before modify/up)"
@@ -7128,14 +7244,16 @@ impl Respondent for NetworkPlugin {
                         NmInner::parse_request_json::<IntentSetRequest>(req)?;
                     self.scan_cache.lock().await.clear();
                     self.save_intent(&body.intent).await?;
-                    self.write_optional_secret(
+                    self.write_secret_if_supplied(
                         self.sta_psk_path()?,
                         body.sta_psk.as_deref(),
+                        "sta_psk",
                     )
                     .await?;
-                    self.write_optional_secret(
+                    self.write_secret_if_supplied(
                         self.ap_psk_path()?,
                         body.ap_psk.as_deref(),
+                        "ap_psk",
                     )
                     .await?;
                     let report = if body.apply {
@@ -9774,6 +9892,243 @@ exit 0\n",
         // The configured default is the stale one on this host.
         p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
         p
+    }
+
+    /// nmcli mock that answers as a host with an existing STA
+    /// profile for `profile_ssid`, and logs every argv line.
+    fn write_sta_profile_mock(
+        dir: &std::path::Path,
+        profile_ssid: &str,
+    ) -> (String, std::path::PathBuf) {
+        let path = dir.join("nmcli-sta.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"-g\" && \"$2\" == \"802-11-wireless.ssid\" ]]; then\n\
+  echo '{ssid}'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                ssid = profile_ssid
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        (path.to_string_lossy().to_string(), log)
+    }
+
+    #[tokio::test]
+    async fn a_settings_write_without_the_passphrase_keeps_it() {
+        // Every settings write that is not a join omits the
+        // passphrase — a country change, an AP toggle, a radio
+        // switch. Treating that as "clear" wiped the stored one on
+        // each of them, and nothing noticed until something needed
+        // it and found none.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+
+        let base = serde_json::json!({
+            "version": 1,
+            "ethernet": { "enabled": false },
+            "wifi": { "role": "sta", "ifname": "wlan0",
+                      "sta_ssid": "M(edia) Spot" },
+            "fallback": { "hotspot_enabled": false }
+        });
+
+        // A join: the passphrase is supplied and stored.
+        let set_with = req(
+            REQUEST_NETWORK_INTENT_SET,
+            serde_json::json!({ "intent": base, "sta_psk": "correct horse",
+                                "apply": false }),
+            2701,
+        );
+        p.handle_request(&set_with).await.expect("set with psk");
+        let after_join: Value = serde_json::from_slice(
+            &p.handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                2702,
+            ))
+            .await
+            .expect("get")
+            .payload,
+        )
+        .expect("json");
+        assert_eq!(after_join["sta_psk_configured"], true);
+
+        // A later settings write that simply omits the field.
+        let set_without = req(
+            REQUEST_NETWORK_INTENT_SET,
+            serde_json::json!({ "intent": base, "apply": false }),
+            2703,
+        );
+        p.handle_request(&set_without)
+            .await
+            .expect("set without psk");
+        let after_settings: Value = serde_json::from_slice(
+            &p.handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                2704,
+            ))
+            .await
+            .expect("get")
+            .payload,
+        )
+        .expect("json");
+        assert_eq!(
+            after_settings["sta_psk_configured"], true,
+            "omitting the field must not clear the stored passphrase"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_empty_passphrase_is_refused_not_a_clear() {
+        // An empty box on a form is far more often a mistake than
+        // an operator asking to forget a network. Forgetting has
+        // its own verb.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_SET,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "M(edia) Spot" },
+                        "fallback": { "hotspot_enabled": false }
+                    },
+                    "sta_psk": "",
+                    "apply": false
+                }),
+                2705,
+            ))
+            .await;
+        assert!(
+            matches!(out, Err(PluginError::Permanent(ref m))
+                     if m.contains("supplied empty")),
+            "empty must be refused, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_reuses_the_saved_passphrase_instead_of_downing_the_station()
+    {
+        // The failure this exists for: no sidecar, a profile
+        // already on this SSID, and the apply took the station
+        // down before discovering it had no passphrase to put it
+        // back with. The operator lost the network and the box
+        // went Offline.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli_path, log) =
+            write_sta_profile_mock(dir.path(), "M(edia) Spot");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli_path;
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_APPLY,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "M(edia) Spot",
+                                  "sta_open": false },
+                        "fallback": { "hotspot_enabled": false }
+                    }
+                }),
+                2706,
+            ))
+            .await
+            .expect("apply must not refuse when the saved passphrase fits");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-wifi-sta")),
+            "the station must be brought up: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.contains("wifi-sec.psk")),
+            "the saved passphrase must be left alone, not rewritten: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_changed_ssid_before_touching_the_station() {
+        // A different SSID is a different network; the saved
+        // passphrase does not apply. Refuse while the operator
+        // still has their connection.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli_path, log) =
+            write_sta_profile_mock(dir.path(), "M(edia) Spot");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli_path;
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_APPLY,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "A Different Network",
+                                  "sta_open": false },
+                        "fallback": { "hotspot_enabled": false }
+                    }
+                }),
+                2707,
+            ))
+            .await;
+        assert!(
+            matches!(out, Err(PluginError::Permanent(_))),
+            "a changed SSID with no passphrase must refuse, got {out:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.starts_with("connection down evo-network-wifi-sta")),
+            "the live station must not be taken down before the refusal: \
+             {calls}"
+        );
     }
 
     #[tokio::test]
