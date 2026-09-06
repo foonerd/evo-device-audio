@@ -4983,12 +4983,12 @@ impl NmInner {
         &self,
         con_name: &str,
         steps: &mut Vec<String>,
-    ) -> bool {
+    ) -> HotspotBringUp {
         const HOTSPOT_BRINGUP_ATTEMPTS: u32 = 4;
         const HOTSPOT_BRINGUP_DELAY_MS: u64 = 400;
 
         if con_name.trim().is_empty() {
-            return false;
+            return HotspotBringUp::Failed;
         }
         for attempt in 1..=HOTSPOT_BRINGUP_ATTEMPTS {
             match self
@@ -5004,7 +5004,18 @@ impl NmInner {
                     } else {
                         steps.push(format!("brought up {con_name}"));
                     }
-                    return true;
+                    return HotspotBringUp::Up;
+                }
+                Ok(out) => {
+                    // The radio refusing to carry an AP next to
+                    // the STA is not a transient. Retrying it
+                    // pulls the STA down once per attempt, which
+                    // is what the operator sees as the join
+                    // dropping and coming back.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if is_phy_exclusive_failure(&stderr) {
+                        return HotspotBringUp::PhyExclusive;
+                    }
                 }
                 _ => {}
             }
@@ -5019,7 +5030,7 @@ impl NmInner {
             "warning: {} did not come up after {} attempts",
             con_name, HOTSPOT_BRINGUP_ATTEMPTS
         ));
-        false
+        HotspotBringUp::Failed
     }
 
     async fn ensure_wifi_sta(
@@ -5414,13 +5425,28 @@ impl NmInner {
             self.nmcli_output_owned(&add).await?;
             steps.push(format!("added hotspot profile {hotspot_name}"));
         }
-        if !self
+        match self
             .connection_up_hotspot_with_retries(hotspot_name, steps)
             .await
         {
-            return Err(PluginError::Transient(
-                "nmcli connection up wifi AP failed after retries".to_string(),
-            ));
+            HotspotBringUp::Up => {}
+            HotspotBringUp::PhyExclusive => {
+                // AP-only role on a radio that will not carry one
+                // beside whatever is already on it. Permanent, not
+                // transient: retrying is what costs the operator
+                // their STA.
+                return Err(PluginError::Permanent(
+                    "this radio will not carry an AP alongside the station \
+                     already on it; a second radio is needed for a hotspot"
+                        .to_string(),
+                ));
+            }
+            HotspotBringUp::Failed => {
+                return Err(PluginError::Transient(
+                    "nmcli connection up wifi AP failed after retries"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -5946,9 +5972,11 @@ impl NmInner {
             "critical: no serviceable uplink past grace; forcing open AP fallback on {}",
             hs_name
         ));
-        Ok(self
-            .connection_up_hotspot_with_retries(hs_name, steps)
-            .await)
+        Ok(matches!(
+            self.connection_up_hotspot_with_retries(hs_name, steps)
+                .await,
+            HotspotBringUp::Up
+        ))
     }
 
     async fn nm_active_connection_names_on_device(
@@ -6380,13 +6408,38 @@ impl NmInner {
                         .await?;
 
                         if !hs_name.trim().is_empty() {
-                            let ok = self
+                            let bringup = self
                                 .connection_up_hotspot_with_retries(
                                     hs_name.as_str(),
                                     &mut steps,
                                 )
                                 .await;
-                            let recovered = if !ok {
+                            let phy_exclusive =
+                                matches!(bringup, HotspotBringUp::PhyExclusive);
+                            if phy_exclusive {
+                                // This radio will not carry an AP
+                                // beside the STA already on it.
+                                // Leave the STA alone and take the
+                                // vif back out — chasing the AP
+                                // costs the operator their join
+                                // and cannot succeed.
+                                if sta_ifname != resolved_ap_ifname {
+                                    let _ = self
+                                        .ensure_ap_vif_absent(
+                                            &resolved_ap_ifname,
+                                        )
+                                        .await;
+                                }
+                                steps.push(format!(
+                                    "radio {} will not carry an AP beside the \
+                                     STA on it; removed AP vif {} and left \
+                                     the STA connected. Hotspot needs a \
+                                     second radio.",
+                                    sta_ifname, resolved_ap_ifname
+                                ));
+                            }
+                            let ok = matches!(bringup, HotspotBringUp::Up);
+                            let recovered = if !ok && !phy_exclusive {
                                 self.try_critical_open_hotspot_recovery(
                                     intent,
                                     hs_name.as_str(),
@@ -6396,7 +6449,10 @@ impl NmInner {
                             } else {
                                 false
                             };
-                            if sta_ifname == resolved_ap_ifname {
+                            if phy_exclusive {
+                                // Nothing to restore: the STA was
+                                // never taken down.
+                            } else if sta_ifname == resolved_ap_ifname {
                                 self.restore_sta_after_hotspot_on_shared_radio(
                                     intent,
                                     sta_ifname.as_str(),
@@ -6410,7 +6466,7 @@ impl NmInner {
                                     resolved_ap_ifname, sta_ifname
                                 ));
                             }
-                            if !ok && !recovered {
+                            if !ok && !recovered && !phy_exclusive {
                                 steps.push(
                                     "warning: hotspot did not activate after retries (and critical open recovery if applicable)"
                                         .to_string(),
@@ -7868,6 +7924,39 @@ fn is_no_bindable_device_failure(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("no suitable device found")
         || m.contains("connection type is not loopback")
+}
+
+/// What a hotspot bring-up attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotspotBringUp {
+    /// The hotspot is up.
+    Up,
+    /// The radio will not carry an AP alongside the STA that is
+    /// already on it. Retrying cannot change that, and each
+    /// attempt drags the STA down with it.
+    PhyExclusive,
+    /// Did not come up for some other reason. Worth the existing
+    /// retries and the critical-open recovery.
+    Failed,
+}
+
+/// Does this bring-up failure mean the radio cannot carry an AP
+/// while the STA is on it?
+///
+/// The kernel refuses to set the vif's UP flag and NetworkManager
+/// surfaces it as "Could not set interface ap0 flags (UP): Device
+/// or resource busy". The PHY on the reference NUC advertises
+/// `managed` and `AP` in one combination, so the capability read
+/// says concurrency is legal — but only at `#channels <= 1`, with
+/// a P2P-device already holding one of three slots. The mode list
+/// cannot see that; the driver's refusal can.
+///
+/// Narrow on purpose: a busy message without the flag-set failure
+/// is some other contention, and still worth a retry.
+fn is_phy_exclusive_failure(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("device or resource busy")
+        && (s.contains("flags (up)") || s.contains("set interface"))
 }
 
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
@@ -9658,6 +9747,159 @@ exit 0\n",
         // The configured default is the stale one on this host.
         p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
         p
+    }
+
+    #[test]
+    fn phy_exclusive_failure_recognises_the_flag_refusal() {
+        // The line the NUC's journal actually carried.
+        assert!(is_phy_exclusive_failure(
+            "Error: Connection activation failed: Could not set interface \
+             ap0 flags (UP): Device or resource busy"
+        ));
+        assert!(is_phy_exclusive_failure(
+            "could not set interface ap0 flags (up): device or resource busy"
+        ));
+    }
+
+    #[test]
+    fn phy_exclusive_failure_leaves_other_contention_alone() {
+        // Busy without the flag-set refusal is some other
+        // contention and still worth the existing retries.
+        for msg in [
+            "Error: Connection activation failed: Device or resource busy",
+            "Error: Connection activation failed: Secrets were required but \
+             not provided",
+            "Error: Connection activation failed: The Wi-Fi network could \
+             not be found",
+            "Error: Connection activation failed: IP configuration could \
+             not be reserved",
+        ] {
+            assert!(
+                !is_phy_exclusive_failure(msg),
+                "must stay retryable / a normal failure: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hotspot_bringup_stops_on_an_exclusive_radio_instead_of_retrying() {
+        // The NUC. Its PHY advertises managed and AP in one
+        // combination, so the capability read says concurrency is
+        // legal — but the driver refuses the vif's UP flag, and
+        // the old loop retried four times, dragging the STA down
+        // on each attempt. One attempt, one verdict, STA left
+        // alone.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-excl.sh");
+        let call_log = dir.path().join("up-calls.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo up >> \"{log}\"\n\
+  echo \"Error: Connection activation failed: Could not set interface ap0 flags (UP): Device or resource busy\" >&2\n\
+  exit 4\n\
+fi\n\
+exit 0\n",
+                log = call_log.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let mut steps: Vec<String> = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(
+            verdict,
+            HotspotBringUp::PhyExclusive,
+            "the driver's refusal must be read as an exclusive radio"
+        );
+        let attempts = std::fs::read_to_string(&call_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "an exclusive radio must be concluded on the first attempt, not \
+             retried — each retry is what pulled the STA down"
+        );
+    }
+
+    #[tokio::test]
+    async fn hotspot_bringup_still_retries_an_ordinary_failure() {
+        // The counterpart: a failure that is not the exclusive
+        // signature keeps the existing retry budget.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-retry.sh");
+        let call_log = dir.path().join("up-calls.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo up >> \"{log}\"\n\
+  echo \"Error: Connection activation failed: The Wi-Fi network could not be found\" >&2\n\
+  exit 4\n\
+fi\n\
+exit 0\n",
+                log = call_log.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let mut steps: Vec<String> = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let attempts = std::fs::read_to_string(&call_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            attempts > 1,
+            "an ordinary failure must keep its retries, saw {attempts}"
+        );
     }
 
     #[tokio::test]
