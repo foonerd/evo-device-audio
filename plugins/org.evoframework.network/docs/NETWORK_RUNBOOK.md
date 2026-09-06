@@ -73,7 +73,9 @@ Operator action:
 - `general_status` failed:
   - inspect NetworkManager daemon state;
   - keep current connections unchanged while diagnosing.
-- `wifi_scan` failed:
+- `wifi_scan` skipped on status (`skipped: true`):
+  - expected. Status is look-only. Scan is `network.nm.scan` on the STA iface, never `ap*`.
+- `wifi_scan` failed on `network.nm.scan`:
   - do not clear persisted credentials preemptively;
   - continue with known SSID/BSSID policy where possible.
 - `radio` blocked:

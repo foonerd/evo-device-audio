@@ -778,6 +778,23 @@ fn default_ap_ssid() -> String {
         .unwrap_or_else(|| "evo".to_string())
 }
 
+/// AP vifs and their P2P companions are not scan targets.
+/// `nmcli device wifi list` on `ap0` (or a bare list that
+/// includes it) fights the beacon on brcmfmac: AP-DISABLED,
+/// driver `-52`, `Failed to initiate AP scan`, escan timeout.
+fn is_ap_scan_ifname(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    if n.starts_with("p2p-dev-") {
+        return true;
+    }
+    match n.strip_prefix("ap") {
+        Some(rest) => {
+            rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Last three MAC octets of the first usable host netdev, upper-hex,
 /// no separators (e.g. `7B6816`). Used to derive a per-device
 /// hotspot SSID without leaking serial numbers.
@@ -4396,11 +4413,32 @@ impl NmInner {
         Some(parse_iw_link(&link_raw))
     }
 
+    /// STA iface to scan, or `None` when the only wifi ifaces
+    /// are AP. Never an AP/p2p name. `None` means do not call
+    /// `nmcli device wifi list` — a bare list scans every wifi
+    /// device, including `ap0`.
+    async fn scan_target_ifname(
+        &self,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if let Some(n) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+            if !is_ap_scan_ifname(n) {
+                return Some(n.to_string());
+            }
+        }
+        self.resolve_wifi_sta_ifname(None)
+            .await
+            .filter(|n| !is_ap_scan_ifname(n))
+    }
+
     async fn wifi_scan(
         &self,
         ifname: Option<&str>,
     ) -> Result<Vec<ScanRow>, PluginError> {
-        let mut args: Vec<String> = vec![
+        let Some(target) = self.scan_target_ifname(ifname).await else {
+            return Ok(Vec::new());
+        };
+        let args: Vec<String> = vec![
             "-t".into(),
             "-f".into(),
             // FREQ appended so the scan handler can filter rows
@@ -4410,11 +4448,9 @@ impl NmInner {
             "dev".into(),
             "wifi".into(),
             "list".into(),
+            "ifname".into(),
+            target,
         ];
-        if let Some(i) = ifname.map(str::trim).filter(|s| !s.is_empty()) {
-            args.push("ifname".into());
-            args.push(i.to_string());
-        }
         let raw = self.nmcli_output_owned(&args).await?;
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -4450,18 +4486,19 @@ impl NmInner {
         &self,
         ifname: Option<&str>,
     ) -> Result<Vec<WifiStaCandidate>, PluginError> {
-        let mut args: Vec<String> = vec![
+        let Some(target) = self.scan_target_ifname(ifname).await else {
+            return Ok(Vec::new());
+        };
+        let args: Vec<String> = vec![
             "-t".into(),
             "-f".into(),
             "BSSID,SSID,SIGNAL,FREQ,ACTIVE".into(),
             "dev".into(),
             "wifi".into(),
             "list".into(),
+            "ifname".into(),
+            target,
         ];
-        if let Some(i) = ifname.map(str::trim).filter(|s| !s.is_empty()) {
-            args.push("ifname".into());
-            args.push(i.to_string());
-        }
         let raw = self.nmcli_output_owned(&args).await?;
         let mut out = Vec::new();
         for line in raw.lines() {
@@ -4616,7 +4653,7 @@ impl NmInner {
         requested: Option<&str>,
     ) -> Option<String> {
         if let Some(pinned) = requested.map(str::trim) {
-            if !pinned.is_empty() {
+            if !pinned.is_empty() && !is_ap_scan_ifname(pinned) {
                 return Some(pinned.to_string());
             }
         }
@@ -7044,12 +7081,6 @@ impl Respondent for NetworkPlugin {
                         }
                         Err(e) => (None, Some(format!("{e}"))),
                     };
-                    let scan_if = self.config.default_wifi_iface.clone();
-                    let wifi_scan_error = self
-                        .wifi_scan(Some(scan_if.as_str()))
-                        .await
-                        .err()
-                        .map(|e| format!("{e}"));
                     let radio_out = self.nm_radio_state().await;
                     let (radio, radio_error) = match radio_out {
                         Ok(v) => (Some(v), Option::<String>::None),
@@ -7071,7 +7102,6 @@ impl Respondent for NetworkPlugin {
                         );
                     let degraded = devices_error.is_some()
                         || general_error.is_some()
-                        || wifi_scan_error.is_some()
                         || radio_error.is_some()
                         || (radio_blocked && !radio_blocked_intentional);
                     NmInner::response_json(
@@ -7088,8 +7118,8 @@ impl Respondent for NetworkPlugin {
                                 "radios": {
                                     "wifi": wifi_radio_view,
                                 },
-                                "scan_ifname": scan_if,
-                                "wifi_scan_error": wifi_scan_error,
+                                "scan_ifname": serde_json::Value::Null,
+                                "wifi_scan_error": serde_json::Value::Null,
                                 "flight_mode": {
                                     "configured_enabled": configured_flight_mode,
                                     "wifi_blocked": radio_blocked,
@@ -7113,8 +7143,9 @@ impl Respondent for NetworkPlugin {
                                         "error": general_error,
                                     },
                                     "wifi_scan": {
-                                        "ok": wifi_scan_error.is_none(),
-                                        "error": wifi_scan_error,
+                                        "ok": true,
+                                        "skipped": true,
+                                        "error": serde_json::Value::Null,
                                     },
                                     "radio": {
                                         "ok": radio_error.is_none()
@@ -10678,7 +10709,7 @@ exit 0\n",
     #[tokio::test]
     async fn scan_names_no_interface_when_there_are_no_radios() {
         // No inventory means nothing honest to pin. Naming a ghost
-        // guarantees a refusal; naming nothing lets nmcli answer.
+        // guarantees a refusal; naming nothing does not scan.
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let iw_path = dir.path().join("iw-empty.sh");
@@ -11082,6 +11113,117 @@ exit 0\n",
         assert_eq!(status_v["degraded"], true);
         assert_eq!(status_v["domain_health"]["device_table"]["ok"], false);
         assert_eq!(status_v["domain_health"]["general_status"]["ok"], true);
+        assert_eq!(status_v["domain_health"]["wifi_scan"]["skipped"], true);
+    }
+
+    #[tokio::test]
+    async fn status_does_not_scan() {
+        // Glass polls status every few seconds. Scanning the PHY
+        // from look-only fights a live AP (brcmf -52 / AP scan).
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-status-noscans.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == GENERAL.DEVICE* ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$4\" == \"radio\" ]]; then\n\
+  echo \"enabled:enabled:enabled:enabled\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let status_req =
+            req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1910);
+        let out = p.handle_request(&status_req).await.expect("status");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert_eq!(v["domain_health"]["wifi_scan"]["skipped"], true);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("wifi list"),
+            "status must not scan: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_scan_does_not_target_an_ap_iface() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-no-ap-scan.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw_path = dir.path().join("iw-empty.sh");
+        std::fs::write(&iw_path, "#!/usr/bin/env bash\nexit 0\n")
+            .expect("write iw");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        let rows = p
+            .inner_mut()
+            .wifi_scan(Some("ap0"))
+            .await
+            .expect("scan");
+        assert!(rows.is_empty(), "AP iface is not a scan target");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("ifname ap0") && !calls.contains("wifi list"),
+            "must not nmcli-scan ap0 or every wifi device: {calls}"
+        );
     }
 
     #[tokio::test]
@@ -11123,13 +11265,21 @@ exit 0\n",
             nmcli_path.to_string_lossy().to_string();
         p.inner_mut().config.scan_cache_ttl_ms = 60000;
 
-        let scan_req_1 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1101);
+        let scan_req_1 = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "ifname": "wlan0" }),
+            1101,
+        );
         p.handle_request(&scan_req_1).await.expect("scan-1");
-        let scan_req_2 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1102);
+        let scan_req_2 = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "ifname": "wlan0" }),
+            1102,
+        );
         p.handle_request(&scan_req_2).await.expect("scan-2");
         let scan_req_3 = req(
             REQUEST_NETWORK_SCAN,
-            serde_json::json!({ "refresh": true }),
+            serde_json::json!({ "ifname": "wlan0", "refresh": true }),
             1103,
         );
         p.handle_request(&scan_req_3).await.expect("scan-3");
@@ -11586,6 +11736,17 @@ exit 0\n",
     #[test]
     fn parse_nm_route4_reject_empty_dst() {
         assert!(parse_nm_route4("nh = 192.0.2.1").is_none());
+    }
+
+    #[test]
+    fn ap_ifnames_are_not_scan_targets() {
+        assert!(is_ap_scan_ifname("ap0"));
+        assert!(is_ap_scan_ifname("AP0"));
+        assert!(is_ap_scan_ifname("ap"));
+        assert!(is_ap_scan_ifname("p2p-dev-ap0"));
+        assert!(!is_ap_scan_ifname("wlan0"));
+        assert!(!is_ap_scan_ifname("wlp0s20f3"));
+        assert!(!is_ap_scan_ifname("aphost"));
     }
 
     #[test]

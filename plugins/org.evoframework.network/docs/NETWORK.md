@@ -441,8 +441,8 @@ Single-claimant respondent on `networking.link`. Verbs:
 
 | Request type | Read/write | Returns |
 |--------------|------------|---------|
-| `network.nm.status` | read | NM device table + active connections + connectivity + captive-portal phase + radio state |
-| `network.nm.scan` | read | Wi-Fi scan rows + STA candidates + cache hit flag |
+| `network.nm.status` | read | NM device table + active connections + connectivity + captive-portal phase + radio state. Does **not** scan. |
+| `network.nm.scan` | read | Wi-Fi scan rows + STA candidates + cache hit flag. STA iface only — never `ap*` / `p2p-dev-*`. |
 | `network.nm.intent.get` | read | Current persisted `NetworkIntent` + PSK-configured flags |
 | `network.nm.intent.set` | write | Persists a new intent + optional PSKs; optional immediate apply |
 | `network.nm.intent.apply` | write | Replays the apply pipeline; returns the steps + ok flag |
