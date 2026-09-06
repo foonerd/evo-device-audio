@@ -6582,6 +6582,13 @@ impl NmInner {
                             ));
                         }
                     } else if intent.fallback.hotspot_enabled {
+                        // `ensure_hotspot_profile` → `ensure_wifi_ap`
+                        // already `connection up`. A second up here
+                        // is `new-activation`: AP-DISABLED, brcmf
+                        // -52, then wpa AP-scan on the same PHY.
+                        // Phy-exclusive / failed raise already
+                        // returned from ensure. Restore-after-
+                        // hotspot is the only remaining work.
                         self.ensure_hotspot_profile(
                             &resolved_ap_ifname,
                             &wifi_for_ap,
@@ -6591,79 +6598,27 @@ impl NmInner {
                         )
                         .await?;
 
-                        if !hs_name.trim().is_empty() {
-                            let bringup = self
-                                .connection_up_hotspot_with_retries(
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await;
-                            let phy_exclusive =
-                                matches!(bringup, HotspotBringUp::PhyExclusive);
-                            if phy_exclusive {
-                                // This radio will not carry an AP
-                                // beside the STA already on it.
-                                // Leave the STA alone and take the
-                                // vif back out — chasing the AP
-                                // costs the operator their join
-                                // and cannot succeed.
-                                if sta_ifname != resolved_ap_ifname {
-                                    let _ = self
-                                        .ensure_ap_vif_absent(
-                                            &resolved_ap_ifname,
-                                        )
-                                        .await;
-                                }
-                                steps.push(format!(
-                                    "radio {} will not carry an AP beside the \
-                                     STA on it; removed AP vif {} and left \
-                                     the STA connected. Hotspot needs a \
-                                     second radio.",
-                                    sta_ifname, resolved_ap_ifname
-                                ));
-                            }
-                            let ok = matches!(bringup, HotspotBringUp::Up);
-                            let recovered = if !ok && !phy_exclusive {
-                                self.try_critical_open_hotspot_recovery(
-                                    intent,
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await?
-                            } else {
-                                false
-                            };
-                            if phy_exclusive {
-                                // Nothing to restore: the STA was
-                                // never taken down.
-                            } else if sta_ifname == resolved_ap_ifname
-                                && !intent.wifi.sta_ssid.trim().is_empty()
-                            {
-                                self.restore_sta_after_hotspot_on_shared_radio(
-                                    intent,
-                                    sta_ifname.as_str(),
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await?;
-                            } else if sta_ifname == resolved_ap_ifname {
-                                steps.push(
-                                    "shared iface: no STA to restore \
-                                     (forgotten); hotspot left up"
-                                        .to_string(),
-                                );
-                            } else {
-                                steps.push(format!(
-                                    "intent: hotspot on {}, STA on {}",
-                                    resolved_ap_ifname, sta_ifname
-                                ));
-                            }
-                            if !ok && !recovered && !phy_exclusive {
-                                steps.push(
-                                    "warning: hotspot did not activate after retries (and critical open recovery if applicable)"
-                                        .to_string(),
-                                );
-                            }
+                        if sta_ifname == resolved_ap_ifname
+                            && !intent.wifi.sta_ssid.trim().is_empty()
+                        {
+                            self.restore_sta_after_hotspot_on_shared_radio(
+                                intent,
+                                sta_ifname.as_str(),
+                                hs_name.as_str(),
+                                &mut steps,
+                            )
+                            .await?;
+                        } else if sta_ifname == resolved_ap_ifname {
+                            steps.push(
+                                "shared iface: no STA to restore \
+                                 (forgotten); hotspot left up"
+                                    .to_string(),
+                            );
+                        } else {
+                            steps.push(format!(
+                                "intent: hotspot on {}, STA on {}",
+                                resolved_ap_ifname, sta_ifname
+                            ));
                         }
                     }
                 }
@@ -10408,12 +10363,13 @@ exit 0\n",
             "enabled hotspot must not be torn down by Forget-STA: {steps:?}"
         );
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            calls
-                .lines()
-                .any(|l| l.starts_with("connection up evo-network-hotspot")),
-            "AP name/enable with no saved STA must still raise the hotspot: \
-             {calls}"
+        let hotspot_ups = calls
+            .lines()
+            .filter(|l| l.starts_with("connection up evo-network-hotspot"))
+            .count();
+        assert_eq!(
+            hotspot_ups, 1,
+            "AP Save must raise the hotspot once, not bounce it: {calls}"
         );
     }
 

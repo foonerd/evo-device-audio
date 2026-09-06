@@ -142,14 +142,15 @@ time per plugin instance) and follows this sequence:
      association; if PHY supports concurrent `managed + AP`,
      create the `ap0` virtual vif via `iw dev <sta> interface
      add ap0 type __ap`; adopt the STA's channel + band for the
-     AP when same-PHY; ensure the hotspot profile; attempt
-     `connection up` with retries; on retry exhaustion attempt
-     critical recovery (see below); restore-after-hotspot on
-     shared radio only when a STA SSID is still declared.
+     AP when same-PHY; ensure the hotspot profile (`ensure_wifi_ap`
+     already `connection up` with retries). Do **not** `connection
+     up` the hotspot a second time — that is `new-activation`,
+     AP-DISABLED, brcmf `-52`, then wpa AP-scan. Restore-after-
+     hotspot on shared radio only when a STA SSID is still declared.
    - `Ap` — bring STA down; ensure the hotspot profile on the AP
-     interface.
-5. **Hotspot connection up with retries**: bounded retry loop
-   around `nmcli connection up <hotspot>`. On exhaustion + no
+     interface (one `connection up`).
+5. **Hotspot connection up with retries**: lives inside
+   `ensure_wifi_ap` only. One raise per apply. On exhaustion + no
    Ethernet carrier, the open critical-recovery path runs.
 6. **Critical open hotspot recovery**: when AP `connection up`
    fails AND `intent.ethernet.enabled && !ethernet_carrier_up`,
