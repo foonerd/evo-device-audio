@@ -3492,7 +3492,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         share_id: &ShareId,
         edits: ShareEdits,
     ) -> Result<bool, SharesStateError> {
-        let (changed, material, alias, configured_envelope) = {
+        let (changed, material, alias, mount_root, configured_envelope) = {
             let mut g = self.inner.lock().await;
             let record = g.state.find_mut(share_id).ok_or_else(|| {
                 SharesStateError::ShareNotFound {
@@ -3504,6 +3504,9 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             // edits (alias only) do not need a remount; material
             // edits (host / path / fstype / creds / options) do.
             let material = edits.is_material_against(record);
+            // The mount point is not editable, so this is the
+            // same path before and after the mutation.
+            let mount_root = record.mount_root.clone();
             let changed = edits.apply_to(record);
             let alias = record.alias.clone();
             if changed {
@@ -3513,31 +3516,38 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 shares: g.state.shares.clone(),
                 last_update_at: SystemTime::now(),
             };
-            (changed, material, alias, envelope)
+            (changed, material, alias, mount_root, envelope)
         };
         if changed {
             self.update_share_state_alias(share_id, &alias).await;
             self.schedule_republish_configured(configured_envelope);
         }
-        // Material change on a currently-mounted share: unmount +
-        // remount so the OS-side mount reflects the edited record.
-        // Silent no-op when the share is not currently mounted;
-        // the next mount attempt naturally picks up the new record.
-        // Errors from the cycle are logged but do NOT fail the
-        // edit — the persisted state is authoritative and the
-        // operator can retry mount from the UI. Fire the cycle
-        // via `mount_share` / `unmount_share` so the F1.1 / F1.2
+        // Material change on a share the OS still has mounted:
+        // unmount + remount so the OS-side mount reflects the
+        // edited record.
+        //
+        // Keyed on the host mount table, not on what the subject
+        // says. A share can be recorded Failed while its mount is
+        // still up — a probe that failed after the mount landed,
+        // or a state that has not reconciled yet — and editing
+        // the credentials of a share in that condition has to
+        // cycle the real mount, or the operator changes a
+        // password and the old mount keeps serving. The converse
+        // matters too: a subject still claiming Mounted over a
+        // path the OS no longer has must not fire a cycle against
+        // nothing.
+        //
+        // Silent no-op when the path is not mounted; the next
+        // mount attempt naturally picks up the new record. Errors
+        // from the cycle are logged but do NOT fail the edit —
+        // the persisted state is authoritative and the operator
+        // can retry mount from the UI. Fire the cycle via
+        // `mount_share` / `unmount_share` so the F1.1 / F1.2
         // hooks (MPD library update + queue safety + event ring)
         // apply uniformly.
         if changed && material {
-            let is_mounted = {
-                let g = self.share_states.lock().await;
-                matches!(
-                    g.get(share_id).map(|e| &e.state),
-                    Some(MountState::Mounted)
-                )
-            };
-            if is_mounted {
+            let os_has_mount = (self.mount_point_check)(&mount_root);
+            if os_has_mount {
                 if let Err(e) = self.unmount_share(share_id).await {
                     tracing::warn!(
                         share_id = %share_id,
@@ -8710,6 +8720,228 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             executor.calls.lock().await.len(),
             calls_after_first,
             "retry pass issued a mount call for an NFS auth refusal"
+        );
+    }
+
+    /// A mount table that follows an unmount/mount cycle.
+    ///
+    /// The path starts out mounted, stops being a mount point
+    /// once the umount call has run, and is a mount point again
+    /// after the remount. Without this the check would still say
+    /// "mounted" immediately after the unmount, and `mount_share`
+    /// would adopt the phantom mount instead of issuing one —
+    /// which is the fixture lying, not the code being wrong.
+    fn cycling_mount_table(
+        executor: &Arc<ScriptedExecutor>,
+    ) -> Arc<dyn Fn(&Path) -> bool + Send + Sync> {
+        let exec = Arc::clone(executor);
+        Arc::new(move |_: &Path| {
+            let calls = exec.cursor.load(Ordering::SeqCst);
+            calls == 0 || calls >= 2
+        })
+    }
+
+    /// Programs the executor was asked to run, in order, so a
+    /// fixture can say "unmount then mount" rather than "some
+    /// number of calls happened".
+    async fn programs_run(executor: &Arc<ScriptedExecutor>) -> Vec<String> {
+        executor
+            .calls
+            .lock()
+            .await
+            .iter()
+            .map(|(program, _)| program.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_a_mount_the_os_still_has_despite_failed() {
+        // The case this exists for: the subject says Failed while
+        // the mount is still up. Editing the credentials of a
+        // share in that condition has to cycle the real mount, or
+        // the operator changes a password and the old mount keeps
+        // serving.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            ok_mount_output(), // umount
+            ok_mount_output(), // remount
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_000_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let record = built_record("EditFailed", "192.0.2.40");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::Timeout {
+                id: id.clone(),
+                timeout_ms: 1_000,
+            },
+        )
+        .await;
+
+        let changed = rt
+            .edit_share(
+                &id,
+                ShareEdits {
+                    host: Some("192.0.2.41".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+
+        let programs = programs_run(&executor).await;
+        assert_eq!(
+            programs,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()],
+            "a material edit over a live OS mount must cycle it"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_the_happy_path_too() {
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![ok_mount_output(), ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_100_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let record = built_record("EditMounted", "192.0.2.42");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                path: Some("Media".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_does_not_cycle_when_the_os_has_no_mount() {
+        // The converse. A subject still claiming Mounted over a
+        // path the OS no longer has must not fire a cycle against
+        // nothing.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_200_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("EditStale", "192.0.2.43");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                host: Some("192.0.2.44".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no OS mount means nothing to cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_material_edit_does_not_cycle() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_300_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("EditAlias", "192.0.2.45");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                alias: Some("Renamed".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "an alias change is cosmetic; the mount must not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_an_nfs_mount_the_os_still_has() {
+        // Same gate, no filesystem-specific branch.
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![ok_mount_output(), ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_400_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let mut record = built_record("EditNfs", "192.0.2.46");
+        record.fstype = FsType::Nfs;
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::Timeout {
+                id: id.clone(),
+                timeout_ms: 1_000,
+            },
+        )
+        .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                path: Some("/export/media".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()]
         );
     }
 
