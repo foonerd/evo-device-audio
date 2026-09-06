@@ -64,6 +64,7 @@ request_types = [
   "set_brightness",
   "set_sleep_timeout",
   "set_sleep_inhibit_while_playing",
+  "set_osk",
   "get_display_state",
 ]
 response_budget_ms = 5000
@@ -86,6 +87,13 @@ response_budget_ms = 5000
 "set_brightness" = { kind = "write", scope = "system_admin" }
 "set_sleep_timeout" = { kind = "write", scope = "system_admin" }
 "set_sleep_inhibit_while_playing" = { kind = "write", scope = "system_admin" }
+# The on-screen keyboard is the same class of per-device physical
+# setting as brightness and sleep: the operator holding a paired
+# bearer is authoritative, and no credential is minted. A step-up
+# gate would also be self-defeating here — the keyboard is what a
+# touch operator types the step-up password with, so gating it
+# behind step-up can lock the operator out of their own glass.
+"set_osk" = { kind = "write", scope = "system_admin" }
 # Read-side companion to the set_* surface — returns the complete
 # persisted operator-visible state so the Display & Touch settings
 # panel opens showing the device's real state on any browser and

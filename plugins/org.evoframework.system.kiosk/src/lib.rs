@@ -95,6 +95,9 @@ pub const VERB_SET_SLEEP_TIMEOUT: &str = "set_sleep_timeout";
 pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
     "set_sleep_inhibit_while_playing";
 
+/// Verb name — turn the on-screen keyboard on or off.
+pub const VERB_SET_OSK: &str = "set_osk";
+
 /// Verb name — read the complete persisted operator-visible state
 /// (display rotation, touch triple, brightness, sleep, inhibit-
 /// while-playing, kiosk enabled). Companion to the `set_*` surface
@@ -456,6 +459,7 @@ impl Respondent for SystemKioskPlugin {
                 VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING => {
                     handle_set_sleep_inhibit_while_playing(req)
                 }
+                VERB_SET_OSK => handle_set_osk(req),
                 VERB_GET_DISPLAY_STATE => handle_get_display_state(req),
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
@@ -527,7 +531,9 @@ fn kiosk_config_error(
     match &err {
         KioskConfigError::InvalidRotation(_)
         | KioskConfigError::SampleCountMismatch(_)
-        | KioskConfigError::SampleOutOfRange(_) => {
+        | KioskConfigError::SampleOutOfRange(_)
+        | KioskConfigError::InvalidOsk(_)
+        | KioskConfigError::InvalidCursor(_) => {
             PluginError::Permanent(format!("{verb}: {err}"))
         }
         KioskConfigError::Io(_) => {
@@ -747,6 +753,32 @@ fn handle_set_sleep_inhibit_while_playing(
     ))
 }
 
+// ------------------------------ set_osk -------------------------------
+
+#[derive(Deserialize)]
+struct SetOskReq {
+    enabled: bool,
+}
+
+fn handle_set_osk(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetOskReq = parse_payload(req, VERB_SET_OSK)?;
+    // The overlay write is the whole action. The kiosk-side
+    // watcher owns starting and stopping the keyboard when the
+    // overlay changes, so this verb never spawns or kills a
+    // process itself — one writer, one applier.
+    let applied = evo_kiosk_config::set_osk(parsed.enabled)
+        .map_err(|e| kiosk_config_error(VERB_SET_OSK, e))?;
+    let body = serde_json::json!({
+        "ok": true,
+        "osk_enabled": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
 // ------------------------------ get_display_state ---------------------
 
 fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
@@ -786,6 +818,8 @@ fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
         "sleep_timeout_seconds": state.sleep_timeout_seconds,
         "sleep_inhibit_while_playing": state.sleep_inhibit_while_playing,
         "enabled": state.enabled,
+        "osk_enabled": state.osk_enabled,
+        "cursor_visible": state.cursor_visible,
     });
     Ok(Response::for_request(
         req,
@@ -811,6 +845,194 @@ mod tests {
         let m = manifest();
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.plugin.version, plugin_crate_version());
+    }
+
+    /// The out-of-process manifest is the one that ships. A verb
+    /// declared in only one of the two manifests is a verb the
+    /// device refuses, so both are parsed and compared here.
+    const MANIFEST_OOP_TOML: &str = include_str!("../manifest.oop.toml");
+
+    static OVERLAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points the kiosk-settings read/write surface at a scratch
+    /// directory so a fixture can drive the real verb handler and
+    /// then read the bytes it actually wrote.
+    struct ScratchOverlays {
+        dir: std::path::PathBuf,
+        previous: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchOverlays {
+        fn new(tag: &str) -> Self {
+            let guard = OVERLAY_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = std::env::temp_dir()
+                .join(format!("evo-kiosk-plugin-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let previous = std::env::var("KIOSK_SETTINGS_DIR").ok();
+            std::env::set_var("KIOSK_SETTINGS_DIR", &dir);
+            Self {
+                dir,
+                previous,
+                _guard: guard,
+            }
+        }
+
+        fn bytes(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir.join(name)).ok()
+        }
+    }
+
+    impl Drop for ScratchOverlays {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KIOSK_SETTINGS_DIR", v),
+                None => std::env::remove_var("KIOSK_SETTINGS_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn request(verb: &str, payload: serde_json::Value) -> Request {
+        Request {
+            request_type: verb.to_string(),
+            payload: serde_json::to_vec(&payload).unwrap(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: Some("system_admin".to_string()),
+            has_step_up: false,
+        }
+    }
+
+    fn body(resp: &Response) -> serde_json::Value {
+        serde_json::from_slice(&resp.payload).expect("response is JSON")
+    }
+
+    #[test]
+    fn set_osk_is_declared_and_scoped_in_both_manifests() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types.iter().any(|v| v == VERB_SET_OSK),
+                "{label} manifest must stock {VERB_SET_OSK}"
+            );
+            // Write scope, not step-up: the on-screen keyboard is
+            // how a touch operator would type a step-up password,
+            // so gating it behind step-up can lock them out.
+            match r.verb_capabilities.get(VERB_SET_OSK) {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => {
+                    panic!("{label}: {VERB_SET_OSK} must be write/system_admin, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_osk_writes_the_overlay_and_echoes_the_applied_state() {
+        let scratch = ScratchOverlays::new("setosk");
+
+        let resp = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": false}),
+        ))
+        .expect("set_osk false");
+        assert_eq!(body(&resp)["ok"], true);
+        assert_eq!(body(&resp)["osk_enabled"], false);
+        assert_eq!(
+            scratch.bytes("osk").as_deref(),
+            Some("none"),
+            "the verb must write the bytes the session script reads"
+        );
+
+        let resp = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": true}),
+        ))
+        .expect("set_osk true");
+        assert_eq!(body(&resp)["osk_enabled"], true);
+        assert_eq!(scratch.bytes("osk").as_deref(), Some("squeekboard"));
+    }
+
+    #[test]
+    fn set_osk_refuses_a_malformed_payload() {
+        let _scratch = ScratchOverlays::new("badpayload");
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": "yes"}),
+            serde_json::json!({"enable": true}),
+        ] {
+            assert!(
+                handle_set_osk(&request(VERB_SET_OSK, payload.clone()))
+                    .is_err(),
+                "must refuse {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_osk_refuses_an_unrecognised_overlay_rather_than_clobbering() {
+        let scratch = ScratchOverlays::new("clobber");
+        std::fs::write(scratch.dir.join("osk"), "some-future-engine").unwrap();
+        let err = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": true}),
+        ))
+        .expect_err("must refuse");
+        assert!(
+            matches!(err, PluginError::Permanent(_)),
+            "an unparseable overlay is permanent, not retryable: {err:?}"
+        );
+        assert_eq!(
+            scratch.bytes("osk").as_deref(),
+            Some("some-future-engine"),
+            "the refused write must leave the overlay untouched"
+        );
+    }
+
+    #[test]
+    fn get_display_state_reports_the_keyboard_and_pointer_axes() {
+        let _scratch = ScratchOverlays::new("getstate");
+        handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": false}),
+        ))
+        .unwrap();
+
+        let resp = handle_get_display_state(&request(
+            VERB_GET_DISPLAY_STATE,
+            serde_json::json!({}),
+        ))
+        .expect("get_display_state");
+        let b = body(&resp);
+        assert_eq!(b["osk_enabled"], false);
+        // No cursor overlay was written, so this is the documented
+        // default rather than a stale value.
+        assert_eq!(b["cursor_visible"], true);
+        // The pre-existing surface must not have shifted.
+        for key in [
+            "display_rotation",
+            "brightness_percent",
+            "sleep_timeout_seconds",
+            "sleep_inhibit_while_playing",
+            "enabled",
+        ] {
+            assert!(!b[key].is_null(), "{key} missing from get_display_state");
+        }
     }
 
     #[test]

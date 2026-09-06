@@ -136,6 +136,14 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 manual_async_fn = "allow"
 
+# The kiosk settings crate is pinned by git+tag in the plugin that
+# consumes it, the same shape evo-core deps use. During development
+# it resolves to the sibling eng clone so a change to the write path
+# and the verb that calls it land together; the declared pin stays on
+# the published URL so the release path is unchanged.
+[patch."https://github.com/foonerd/evo-kiosk.git"]
+evo-kiosk-config = { path = "../evo-kiosk-eng/crates/evo-kiosk-config" }
+
 [patch."https://github.com/foonerd/evo-core.git"]
 evo = { path = "../evo-core-eng/crates/evo" }
 evo-plugin-sdk = { path = "../evo-core-eng/crates/evo-plugin-sdk" }
