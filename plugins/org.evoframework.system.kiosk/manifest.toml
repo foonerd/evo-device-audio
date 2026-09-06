@@ -65,6 +65,7 @@ request_types = [
   "set_sleep_timeout",
   "set_sleep_inhibit_while_playing",
   "set_osk",
+  "set_cursor",
   "get_display_state",
 ]
 response_budget_ms = 5000
@@ -94,6 +95,10 @@ response_budget_ms = 5000
 # touch operator types the step-up password with, so gating it
 # behind step-up can lock the operator out of their own glass.
 "set_osk" = { kind = "write", scope = "system_admin" }
+# Pointer visibility is the same per-device physical setting, and
+# it is persist-only: `evo-kiosk-session` applies it at session
+# start. No step-up, for the same reason as the keyboard.
+"set_cursor" = { kind = "write", scope = "system_admin" }
 # Read-side companion to the set_* surface — returns the complete
 # persisted operator-visible state so the Display & Touch settings
 # panel opens showing the device's real state on any browser and

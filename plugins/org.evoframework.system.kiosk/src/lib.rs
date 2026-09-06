@@ -98,6 +98,16 @@ pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
 /// Verb name — turn the on-screen keyboard on or off.
 pub const VERB_SET_OSK: &str = "set_osk";
 
+/// Verb name — show or hide the mouse pointer.
+///
+/// Persists the operator's choice. The pointer is applied by
+/// `evo-kiosk-session` at session start, not live: labwc has no
+/// action that reveals a hidden cursor, so a running session
+/// cannot be talked into showing one. Callers must present this
+/// as a setting that takes effect on the next session, never as
+/// an immediate toggle.
+pub const VERB_SET_CURSOR: &str = "set_cursor";
+
 /// Verb name — read the complete persisted operator-visible state
 /// (display rotation, touch triple, brightness, sleep, inhibit-
 /// while-playing, kiosk enabled). Companion to the `set_*` surface
@@ -188,6 +198,7 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_SLEEP_TIMEOUT.to_string(),
                         VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING.to_string(),
                         VERB_SET_OSK.to_string(),
+                        VERB_SET_CURSOR.to_string(),
                         VERB_GET_DISPLAY_STATE.to_string(),
                     ],
                     accepts_custody: false,
@@ -461,6 +472,7 @@ impl Respondent for SystemKioskPlugin {
                     handle_set_sleep_inhibit_while_playing(req)
                 }
                 VERB_SET_OSK => handle_set_osk(req),
+                VERB_SET_CURSOR => handle_set_cursor(req),
                 VERB_GET_DISPLAY_STATE => handle_get_display_state(req),
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
@@ -780,6 +792,33 @@ fn handle_set_osk(req: &Request) -> Result<Response, PluginError> {
     ))
 }
 
+// ------------------------------ set_cursor ----------------------------
+
+#[derive(Deserialize)]
+struct SetCursorReq {
+    visible: bool,
+}
+
+fn handle_set_cursor(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetCursorReq = parse_payload(req, VERB_SET_CURSOR)?;
+    // Persist only. Unlike the keyboard, the pointer has no live
+    // applier: `evo-kiosk-session` reads this overlay at session
+    // start and fires the compositor's hide keybind when it says
+    // `hide`. There is no counterpart that reveals a hidden
+    // cursor, so nothing here tries to change a running session.
+    let applied = evo_kiosk_config::set_cursor(parsed.visible)
+        .map_err(|e| kiosk_config_error(VERB_SET_CURSOR, e))?;
+    let body = serde_json::json!({
+        "ok": true,
+        "cursor_visible": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
 // ------------------------------ get_display_state ---------------------
 
 fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
@@ -1038,6 +1077,106 @@ mod tests {
             Some("some-future-engine"),
             "the refused write must leave the overlay untouched"
         );
+    }
+
+    #[test]
+    fn set_cursor_is_declared_and_scoped_in_both_manifests() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types.iter().any(|v| v == VERB_SET_CURSOR),
+                "{label} manifest must stock {VERB_SET_CURSOR}"
+            );
+            match r.verb_capabilities.get(VERB_SET_CURSOR) {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => panic!(
+                    "{label}: {VERB_SET_CURSOR} must be write/system_admin, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn set_cursor_writes_the_policy_the_session_script_reads() {
+        // `evo-kiosk-session` matches the literal `hide`, so the
+        // bool has to land as those exact bytes to have any effect
+        // at the next session start.
+        let scratch = ScratchOverlays::new("setcursor");
+
+        let resp = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": false}),
+        ))
+        .expect("set_cursor false");
+        assert_eq!(body(&resp)["ok"], true);
+        assert_eq!(body(&resp)["cursor_visible"], false);
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("hide"));
+
+        let resp = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": true}),
+        ))
+        .expect("set_cursor true");
+        assert_eq!(body(&resp)["cursor_visible"], true);
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("show"));
+    }
+
+    #[test]
+    fn set_cursor_refuses_a_malformed_payload() {
+        let _scratch = ScratchOverlays::new("badcursor");
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"visible": "yes"}),
+            serde_json::json!({"show": true}),
+        ] {
+            assert!(
+                handle_set_cursor(&request(VERB_SET_CURSOR, payload.clone()))
+                    .is_err(),
+                "must refuse {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_cursor_refuses_an_unrecognised_overlay_rather_than_clobbering() {
+        let scratch = ScratchOverlays::new("cursorclobber");
+        std::fs::write(scratch.dir.join("cursor"), "dim").unwrap();
+        let err = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": true}),
+        ))
+        .expect_err("must refuse");
+        assert!(
+            matches!(err, PluginError::Permanent(_)),
+            "an unparseable overlay is permanent, not retryable: {err:?}"
+        );
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("dim"));
+    }
+
+    #[test]
+    fn set_cursor_round_trips_through_get_display_state() {
+        let _scratch = ScratchOverlays::new("cursorroundtrip");
+        handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": false}),
+        ))
+        .unwrap();
+        let resp = handle_get_display_state(&request(
+            VERB_GET_DISPLAY_STATE,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        assert_eq!(body(&resp)["cursor_visible"], false);
     }
 
     #[test]
