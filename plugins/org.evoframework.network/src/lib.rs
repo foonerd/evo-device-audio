@@ -6298,20 +6298,20 @@ impl NmInner {
                 steps.push("wifi role disabled; brought down STA and hotspot (best effort)".to_string());
             }
             WifiRole::Sta => {
-                // Empty `sta_ssid` under `WifiRole::Sta` is the
-                // Forget semantic: operator declared "no saved
-                // network" while keeping the STA role. Rather
-                // than surfacing "wifi.sta_ssid is required"
-                // from ensure_wifi_sta (which would leave the
-                // NM profile intact and NM would autoconnect
-                // right back), tear down the profile + PSK
-                // sidecar here and return ok. `wifi.forget`
-                // wire-op is the operator-explicit path; this
-                // branch closes the gap for UIs that Forget by
-                // saving an empty-SSID intent + calling
-                // intent.apply.
+                let same_iface = sta_ifname == resolved_ap_ifname;
+                let concurrent_vif = !same_iface
+                    && !intent_hotspot_if_is_explicit
+                    && phy_supports_concurrent;
+
+                // Empty `sta_ssid` under `WifiRole::Sta` is
+                // Forget-STA, not Forget-radio. Purge the STA
+                // profile + PSK so NM cannot autoconnect back.
+                // `fallback.hotspot_enabled` still owns the AP:
+                // a name/enable apply with no saved STA must
+                // reach the hotspot tail. Returning here was
+                // the regression — glass Save on the AP downed
+                // the hotspot and never wrote it back.
                 if intent.wifi.sta_ssid.trim().is_empty() {
-                    self.connection_down_lossy(&hs_name).await;
                     self.purge_wifi_sta(&mut steps).await;
                     steps.push(
                         "wifi.sta_ssid empty under role=Sta \
@@ -6319,67 +6319,71 @@ impl NmInner {
                          PSK sidecar purged"
                             .to_string(),
                     );
-                    steps
-                        .push("hotspot brought down (best effort)".to_string());
-                    return Ok(ApplyReport { ok: true, steps });
-                }
-
-                let same_iface = sta_ifname == resolved_ap_ifname;
-                let concurrent_vif = !same_iface
-                    && !intent_hotspot_if_is_explicit
-                    && phy_supports_concurrent;
-
-                self.connection_down_lossy(&hs_name).await;
-                if concurrent_vif {
-                    let _ =
-                        self.ensure_ap_vif_absent(&resolved_ap_ifname).await;
-                    steps.push(format!(
+                    if !intent.fallback.hotspot_enabled {
+                        self.connection_down_lossy(&hs_name).await;
+                        steps.push(
+                            "hotspot brought down (best effort)".to_string(),
+                        );
+                        return Ok(ApplyReport { ok: true, steps });
+                    }
+                } else {
+                    self.connection_down_lossy(&hs_name).await;
+                    if concurrent_vif {
+                        let _ = self
+                            .ensure_ap_vif_absent(&resolved_ap_ifname)
+                            .await;
+                        steps.push(format!(
                         "pre-STA: removed AP vif {resolved_ap_ifname} to free phy for STA association"
                     ));
-                }
-                // Do not take down what cannot be put back.
-                //
-                // The station comes down here so the profile can be
-                // rewritten and brought up again. If we have no
-                // passphrase and NetworkManager's stored one cannot
-                // be reused — a different SSID, or no profile at
-                // all — then the bring-up will refuse, and refusing
-                // after the disconnect leaves the operator with no
-                // network and no way back. Refuse first instead.
-                if !intent.wifi.sta_open
-                    && !sta_psk.map(str::trim).is_some_and(|s| !s.is_empty())
-                    && !self.sta_secret_is_reusable(&intent.wifi, sta_psk).await
-                {
-                    return Err(PluginError::Permanent(format!(
-                        "no passphrase for {:?} and no matching saved \
+                    }
+                    // Do not take down what cannot be put back.
+                    //
+                    // The station comes down here so the profile can be
+                    // rewritten and brought up again. If we have no
+                    // passphrase and NetworkManager's stored one cannot
+                    // be reused — a different SSID, or no profile at
+                    // all — then the bring-up will refuse, and refusing
+                    // after the disconnect leaves the operator with no
+                    // network and no way back. Refuse first instead.
+                    if !intent.wifi.sta_open
+                        && !sta_psk
+                            .map(str::trim)
+                            .is_some_and(|s| !s.is_empty())
+                        && !self
+                            .sta_secret_is_reusable(&intent.wifi, sta_psk)
+                            .await
+                    {
+                        return Err(PluginError::Permanent(format!(
+                            "no passphrase for {:?} and no matching saved \
                          network to reuse one from; refusing before taking \
                          the station down",
-                        intent.wifi.sta_ssid.trim()
-                    )));
-                }
-                self.connection_down_lossy(NM_CON_WIFI_STA).await;
-                steps.push(
+                            intent.wifi.sta_ssid.trim()
+                        )));
+                    }
+                    self.connection_down_lossy(NM_CON_WIFI_STA).await;
+                    steps.push(
                     "pre-STA: nmcli connection down STA profile (best effort before modify/up)"
                         .to_string(),
                 );
 
-                let sta_up_nonfatal = intent.fallback.hotspot_enabled;
-                self.ensure_wifi_sta(
-                    &sta_ifname,
-                    &intent.wifi,
-                    &intent.radio_policy,
-                    sta_psk,
-                    sta_up_nonfatal,
-                    &mut steps,
-                )
-                .await?;
-                // Restore autoconnect on the STA profile so a
-                // subsequent apply after a `wifi.disconnect`
-                // hold undoes the hold. Best-effort.
-                self.nm_set_autoconnect(NM_CON_WIFI_STA, true).await;
-                steps.push(format!(
+                    let sta_up_nonfatal = intent.fallback.hotspot_enabled;
+                    self.ensure_wifi_sta(
+                        &sta_ifname,
+                        &intent.wifi,
+                        &intent.radio_policy,
+                        sta_psk,
+                        sta_up_nonfatal,
+                        &mut steps,
+                    )
+                    .await?;
+                    // Restore autoconnect on the STA profile so a
+                    // subsequent apply after a `wifi.disconnect`
+                    // hold undoes the hold. Best-effort.
+                    self.nm_set_autoconnect(NM_CON_WIFI_STA, true).await;
+                    steps.push(format!(
                     "restored connection.autoconnect=yes on {NM_CON_WIFI_STA}"
                 ));
+                }
 
                 // Captive-hold gate: while a captive sign-in
                 // is in progress (session open, or `is_captive`
@@ -6595,7 +6599,9 @@ impl NmInner {
                             if phy_exclusive {
                                 // Nothing to restore: the STA was
                                 // never taken down.
-                            } else if sta_ifname == resolved_ap_ifname {
+                            } else if sta_ifname == resolved_ap_ifname
+                                && !intent.wifi.sta_ssid.trim().is_empty()
+                            {
                                 self.restore_sta_after_hotspot_on_shared_radio(
                                     intent,
                                     sta_ifname.as_str(),
@@ -6603,6 +6609,12 @@ impl NmInner {
                                     &mut steps,
                                 )
                                 .await?;
+                            } else if sta_ifname == resolved_ap_ifname {
+                                steps.push(
+                                    "shared iface: no STA to restore \
+                                     (forgotten); hotspot left up"
+                                        .to_string(),
+                                );
                             } else {
                                 steps.push(format!(
                                     "intent: hotspot on {}, STA on {}",
@@ -10255,6 +10267,182 @@ exit 0\n",
         assert!(
             !steps.iter().any(|s| s.contains("shared-PHY defer")),
             "a radio with no STA on it has nothing to defer for: {steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_empty_sta_ssid_still_raises_an_enabled_hotspot() {
+        // Glass AP Save with no saved STA writes empty sta_ssid +
+        // hotspot_enabled. Forget-STA must not return before the
+        // hotspot tail — that left the AP Off after a name change.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-ap-forget.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw_path = dir.path().join("iw-down.sh");
+        std::fs::write(
+            &iw_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" && \"$3\" == \"link\" ]]; then\n\
+  echo 'Not connected.'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "",
+                        "sta_open": true,
+                        "ap_ssid": "evo-renamed",
+                        "ap_channel": 4
+                    },
+                    "fallback": {
+                        "hotspot_enabled": true,
+                        "hotspot_ifname": ""
+                    }
+                }
+            }),
+            1902,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("treated as forget")),
+            "empty STA must still forget: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.contains("hotspot brought down")),
+            "enabled hotspot must not be torn down by Forget-STA: {steps:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-hotspot")),
+            "AP name/enable with no saved STA must still raise the hotspot: \
+             {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_empty_sta_ssid_downs_hotspot_when_intent_disables_it() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-forget-off.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "sta", "ifname": "wlan0", "sta_ssid": "" },
+                    "fallback": { "hotspot_enabled": false }
+                }
+            }),
+            1903,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection down evo-network-hotspot")),
+            "disabled hotspot must still come down: {calls}"
+        );
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-hotspot")),
+            "disabled hotspot must not be raised: {calls}"
         );
     }
 

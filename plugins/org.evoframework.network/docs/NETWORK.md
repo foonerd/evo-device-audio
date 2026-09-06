@@ -133,14 +133,19 @@ time per plugin instance) and follows this sequence:
 4. **Wi-Fi role branch**:
    - `Disabled` — bring STA and hotspot down; remove the virtual
      AP vif if it exists on a shared PHY.
-   - `Sta` — pre-tear hotspot + STA profile (avoids brcmfmac AP
-     channel pinning); attempt STA association; if PHY supports
-     concurrent `managed + AP`, create the `ap0` virtual vif via
-     `iw dev <sta> interface add ap0 type __ap`; adopt the STA's
-     channel + band for the AP when same-PHY; ensure the hotspot
-     profile; attempt `connection up` with retries; on retry
-     exhaustion attempt critical recovery (see below);
-     restore-after-hotspot on shared radio.
+   - `Sta` — empty `sta_ssid` is Forget-STA only: purge the STA
+     profile + PSK. If `fallback.hotspot_enabled` is off, bring
+     the hotspot down and stop. If it is on, do **not** return
+     — the hotspot tail below still runs (AP name/enable with
+     no saved STA). Non-empty SSID: pre-tear hotspot + STA
+     profile (avoids brcmfmac AP channel pinning); attempt STA
+     association; if PHY supports concurrent `managed + AP`,
+     create the `ap0` virtual vif via `iw dev <sta> interface
+     add ap0 type __ap`; adopt the STA's channel + band for the
+     AP when same-PHY; ensure the hotspot profile; attempt
+     `connection up` with retries; on retry exhaustion attempt
+     critical recovery (see below); restore-after-hotspot on
+     shared radio only when a STA SSID is still declared.
    - `Ap` — bring STA down; ensure the hotspot profile on the AP
      interface.
 5. **Hotspot connection up with retries**: bounded retry loop
