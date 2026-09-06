@@ -706,6 +706,67 @@ pub struct MountReport {
     pub elapsed_ms: u64,
 }
 
+/// Whether waiting can change the outcome of a failed mount.
+///
+/// The remount pass runs on a cadence, so it needs to know the
+/// difference between "the NAS was still booting" and "the
+/// password is wrong". Re-attempting the second every few
+/// minutes is a credential storm against the server, and it
+/// buries the real state under a churn of identical failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Conditions outside this device may change on their own —
+    /// a cable goes back in, a NAS finishes booting, the station
+    /// reassociates. Worth another attempt.
+    Transient,
+    /// Nothing changes by waiting. The operator has to act:
+    /// fix the credential, restore the share on the server,
+    /// answer the prompt.
+    Permanent,
+}
+
+impl MountError {
+    /// Whether the remount pass should try this share again.
+    ///
+    /// Matched exhaustively on purpose: a new error variant is a
+    /// compile error here, so the person adding it decides what
+    /// the retry loop does with it rather than inheriting a
+    /// default that quietly storms someone's NAS.
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            // The credential family. Every one of these needs a
+            // person, and re-attempting is exactly the storm
+            // this classification exists to stop.
+            Self::AuthenticationRefused { .. }
+            | Self::CredentialMissing { .. }
+            | Self::CredentialStoreUnavailable
+            | Self::CredentialPromptCancelled { .. }
+            | Self::CredentialPromptFailed { .. }
+            | Self::NoResponderAvailable { .. } => FailureClass::Permanent,
+
+            // No record to mount. A retry cannot invent one.
+            Self::ShareNotFound { .. } => FailureClass::Permanent,
+
+            // Wire, protocol and host-reachability failures. A
+            // NAS that was not answering may be answering now.
+            // Dialect exhaustion is explicitly the non-auth
+            // branch — auth short-circuits above — so it belongs
+            // here rather than with the credential family.
+            Self::DialectProbeExhausted { .. }
+            | Self::Timeout { .. }
+            | Self::SubprocessIo(_)
+            | Self::MountFailed { .. } => FailureClass::Transient,
+
+            // Local conditions that clear on their own: a raced
+            // directory removal the next attempt re-creates, a
+            // full disk, a filesystem that was briefly read-only.
+            Self::MountDirectoryMissing { .. }
+            | Self::CredentialStoreWriteFailed { .. }
+            | Self::Persistence(_) => FailureClass::Transient,
+        }
+    }
+}
+
 /// Errors surfaced by [`NetworkSharesHandle::mount_share`].
 /// Distinct classes so operator UI can render the right
 /// remediation ("check credentials" vs "check host is
@@ -1721,6 +1782,35 @@ pub fn is_cifs_auth_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
         || s.contains("STATUS_PASSWORD_EXPIRED")
 }
 
+/// Pure check: does this `mount.nfs` failure mean the server
+/// refused the caller, rather than a condition that may clear on
+/// its own?
+///
+/// NFS has no credential exchange the way CIFS does — the server
+/// authorises by client address, export list and, under Kerberos,
+/// by principal. All three are operator-side facts that do not
+/// change because a retry timer fired, which is why they belong
+/// with the refusals rather than with the reachable-later class.
+///
+/// The signals, as `mount.nfs` renders them:
+/// - `access denied by server while mounting` — the export list
+///   does not admit this client.
+/// - `Permission denied` — same refusal, terser rendering.
+/// - `RPC: Authentication error` — the RPC layer rejected the
+///   caller's credential, typically under `sec=krb5`.
+/// - `no permission to mount` — older servers' phrasing.
+///
+/// Deliberately narrow. `Connection refused`, `No route to host`
+/// and timeouts are NOT here: those are exactly the case a
+/// remount pass exists to recover.
+pub fn is_nfs_auth_refusal(stderr: &str) -> bool {
+    let s = stderr.to_ascii_uppercase();
+    s.contains("ACCESS DENIED BY SERVER")
+        || s.contains("PERMISSION DENIED")
+        || s.contains("RPC: AUTHENTICATION ERROR")
+        || s.contains("NO PERMISSION TO MOUNT")
+}
+
 /// Pure check: does `proc_mounts` contents list `mount_root` as
 /// an active mount target (column 2 of `/proc/mounts`)?
 ///
@@ -2300,6 +2390,10 @@ struct ShareStateEntry {
     alias: String,
     state: MountState,
     reason: Option<String>,
+    /// Set alongside a failure so the remount pass can tell a
+    /// NAS that was still booting from a password that is wrong.
+    /// `None` for every non-failure state.
+    failure_class: Option<FailureClass>,
     negotiated_vers: Option<String>,
     last_transition_at_ms: u64,
 }
@@ -3347,6 +3441,7 @@ fn seed_share_states(
                     alias: r.alias.clone(),
                     state: MountState::Unmounted,
                     reason: None,
+                    failure_class: None,
                     negotiated_vers: None,
                     last_transition_at_ms: now_ms,
                 },
@@ -3681,13 +3776,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                         }
                     }
                 }
-                self.set_share_state(
-                    share_id,
-                    MountState::Failed,
-                    Some(format!("{e}")),
-                    None,
-                )
-                .await;
+                self.set_share_failed(share_id, e).await;
             }
         }
 
@@ -3753,13 +3842,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
             }
             Err(e) => {
-                self.set_share_state(
-                    share_id,
-                    MountState::Failed,
-                    Some(format!("{e}")),
-                    None,
-                )
-                .await;
+                self.set_share_failed(share_id, e).await;
                 self.publish_share_event(ShareEvent::unmount_failed(
                     share_id.clone(),
                     format!("{e}"),
@@ -4379,6 +4462,17 @@ impl NetworkSharesRuntime {
             // mount root doesn't exist, mount.nfs errors at
             // chdir before touching the network. Report as
             // MountDirectoryMissing, not MountFailed.
+            // A server that refused this client will refuse it
+            // again in five minutes. Raise the same typed refusal
+            // the CIFS path raises so the remount pass leaves it
+            // alone instead of re-probing on every tick.
+            if is_nfs_auth_refusal(&classify_stderr) {
+                return Err(MountError::AuthenticationRefused {
+                    id: record.share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr: classify_stderr,
+                });
+            }
             if is_mount_directory_missing(&classify_stderr) {
                 return Err(MountError::MountDirectoryMissing {
                     id: record.share_id.clone(),
@@ -4733,6 +4827,40 @@ impl NetworkSharesRuntime {
         reason: Option<String>,
         negotiated_vers: Option<String>,
     ) {
+        self.set_share_state_classified(
+            share_id,
+            state,
+            reason,
+            None,
+            negotiated_vers,
+        )
+        .await;
+    }
+
+    /// Record a failure together with whether it is worth
+    /// retrying. Split from [`Self::set_share_state`] rather than
+    /// widening it, because every other transition has no failure
+    /// to classify and passing `None` at a dozen call sites is
+    /// how the classification would drift out of step.
+    async fn set_share_failed(&self, share_id: &ShareId, e: &MountError) {
+        self.set_share_state_classified(
+            share_id,
+            MountState::Failed,
+            Some(format!("{e}")),
+            Some(e.failure_class()),
+            None,
+        )
+        .await;
+    }
+
+    async fn set_share_state_classified(
+        &self,
+        share_id: &ShareId,
+        state: MountState,
+        reason: Option<String>,
+        failure_class: Option<FailureClass>,
+        negotiated_vers: Option<String>,
+    ) {
         let now_ms = (self.now_fn)();
         let envelope_opt = {
             let mut g = self.share_states.lock().await;
@@ -4740,11 +4868,16 @@ impl NetworkSharesRuntime {
                 alias: String::new(),
                 state,
                 reason: None,
+                failure_class: None,
                 negotiated_vers: None,
                 last_transition_at_ms: now_ms,
             });
             entry.state = state;
             entry.reason = reason;
+            // Cleared on every non-failure transition, so a share
+            // that mounts after a permanent failure is retryable
+            // again if it later drops out.
+            entry.failure_class = failure_class;
             entry.negotiated_vers = negotiated_vers;
             entry.last_transition_at_ms = now_ms;
             Some(entry.to_envelope(share_id))
@@ -4762,6 +4895,7 @@ impl NetworkSharesRuntime {
                 alias: record.alias.clone(),
                 state: MountState::Unmounted,
                 reason: None,
+                failure_class: None,
                 negotiated_vers: None,
                 last_transition_at_ms: now_ms,
             };
@@ -4805,9 +4939,11 @@ fn envelope_to_json<T: Serialize>(envelope: &T) -> serde_json::Value {
 
 /// Default cadence for the background remount task (5 minutes).
 /// Every tick, the runtime walks its per-share state map and
-/// retries any share in [`MountState::Failed`] or
-/// [`MountState::Unmounted`] — matches the volumio-evo reference
-/// 5-min re-mount cadence.
+/// retries the shares in [`MountState::Failed`] or
+/// [`MountState::Unmounted`] whose failure could clear on its own
+/// — matches the volumio-evo reference 5-min re-mount cadence.
+/// A refused credential is not retried on this cadence; see
+/// [`FailureClass`].
 pub const DEFAULT_REMOUNT_CADENCE_MS: u64 = 5 * 60 * 1_000;
 
 /// Default cadence for the background discovery task (5 minutes).
@@ -4907,10 +5043,17 @@ impl NetworkSharesRuntime {
         BootMountReport { outcomes }
     }
 
-    /// Retry every share currently in [`MountState::Failed`] or
-    /// [`MountState::Unmounted`]. Called by the background
-    /// remount task and directly by tests to exercise the retry
-    /// path without spawning a task.
+    /// Retry the shares in [`MountState::Failed`] or
+    /// [`MountState::Unmounted`] whose last failure could plausibly
+    /// clear on its own. Called by the background remount task and
+    /// directly by tests to exercise the retry path without
+    /// spawning a task.
+    ///
+    /// A share whose failure was [`FailureClass::Permanent`] — a
+    /// refused password above all — is left alone. It is not going
+    /// to mount because the cadence ticked again, and hammering it
+    /// is a credential storm against the server plus a churn of
+    /// identical failures over the real state.
     pub async fn remount_retry_pass(&self) -> Vec<BootMountOutcome> {
         // Adopt any host mounts that came back (or survived)
         // before selecting Failed/Unmounted candidates — a share
@@ -4926,6 +5069,17 @@ impl NetworkSharesRuntime {
                         e.state,
                         MountState::Failed | MountState::Unmounted
                     )
+                })
+                // A share that refused authentication will not
+                // start accepting it because five minutes
+                // passed. Re-attempting on every tick is a
+                // credential storm against someone's NAS, and it
+                // buries the real state under identical
+                // failures. Entries with no recorded class —
+                // a fresh boot, an operator unmount — keep the
+                // behaviour they had.
+                .filter(|(_, e)| {
+                    e.failure_class != Some(FailureClass::Permanent)
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -6000,6 +6154,40 @@ mod tests {
             Some(32),
             "Job failed.\nmount error(13): Permission denied"
         ));
+    }
+
+    #[test]
+    fn is_nfs_auth_refusal_recognises_server_refusals() {
+        for stderr in [
+            "mount.nfs: access denied by server while mounting 192.0.2.1:/vol",
+            "mount.nfs: Permission denied",
+            "mount.nfs: RPC: Authentication error; why = Client credential too weak",
+            "mount.nfs: no permission to mount",
+        ] {
+            assert!(
+                is_nfs_auth_refusal(stderr),
+                "should be a refusal: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_nfs_auth_refusal_rejects_reachability_failures() {
+        // The whole point of the remount pass. If any of these
+        // classify as a refusal, a NAS that was rebooting never
+        // comes back without the operator.
+        for stderr in [
+            "mount.nfs: Connection refused",
+            "mount.nfs: No route to host",
+            "mount.nfs: Connection timed out",
+            "mount.nfs: Network is unreachable",
+            "mount.nfs: Stale file handle",
+        ] {
+            assert!(
+                !is_nfs_auth_refusal(stderr),
+                "should NOT be a refusal: {stderr}"
+            );
+        }
     }
 
     #[test]
@@ -8328,10 +8516,12 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
-    async fn remount_retry_pass_targets_failed_and_unmounted_only() {
+    async fn remount_retry_pass_retries_a_transient_failure() {
         let dir = tempdir();
-        // Sequence: fail on first boot attempt (probe exhausted),
-        // succeed on retry.
+        // Probe ladder exhausted on the first attempt — a wire /
+        // negotiation failure, not an auth one — then succeeds.
+        // A NAS that was still booting is exactly this shape, and
+        // it must come back without the operator.
         let mut outputs = Vec::new();
         for _ in 0..CIFS_VERS_PROBE_LADDER.len() {
             outputs.push(err_mount_output());
@@ -8348,10 +8538,11 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let id = rt.add_share(record).await.unwrap();
 
         let _ = rt.mount_share(&id).await;
-        // After the first attempt: Failed.
         {
             let g = rt.share_states.lock().await;
-            assert_eq!(g.get(&id).unwrap().state, MountState::Failed);
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Transient));
         }
 
         let outcomes = rt.remount_retry_pass().await;
@@ -8359,13 +8550,153 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert!(outcomes[0].is_ok());
         {
             let g = rt.share_states.lock().await;
-            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            // Mounting clears the class, so a later drop-out is
+            // retryable again.
+            assert_eq!(e.failure_class, None);
         }
 
-        // Second retry: nothing to do — no candidates in Failed
-        // or Unmounted.
-        let outcomes2 = rt.remount_retry_pass().await;
-        assert!(outcomes2.is_empty());
+        // Nothing left in a retryable state.
+        assert!(rt.remount_retry_pass().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_leaves_an_auth_refusal_alone() {
+        let dir = tempdir();
+        // One permission-denied response. Auth refusal short-
+        // circuits the ladder, so this is the only mount call the
+        // share should ever generate: the retry pass must not add
+        // more. Re-probing a rejected password every cadence tick
+        // is a credential storm against the server.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let store = Arc::new(FileCredentialStore::new(dir.clone()));
+        store.store_password("storm_key", b"wrong").await.unwrap();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_888_000))
+            .build();
+        let mut record = built_record("AuthShare", "192.0.2.24");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "storm_key".to_string(),
+            domain: None,
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(err, MountError::AuthenticationRefused { .. }));
+        let calls_after_first = executor.calls.lock().await.len();
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Permanent));
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert!(
+            outcomes.is_empty(),
+            "auth-refused share must not be retried, got {outcomes:?}"
+        );
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls_after_first,
+            "retry pass issued a mount call for an auth-refused share"
+        );
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_leaves_an_nfs_auth_refusal_alone() {
+        let dir = tempdir();
+        // NFS refuses with exit 32 / access denied. Same class,
+        // same treatment — the retry filter is not a CIFS-only
+        // rule.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount.nfs: access denied by server while mounting",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_999_000))
+            .build();
+        let mut record = built_record("NfsShare", "192.0.2.25");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        let calls_after_first = executor.calls.lock().await.len();
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Permanent));
+        }
+
+        assert!(rt.remount_retry_pass().await.is_empty());
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls_after_first,
+            "retry pass issued a mount call for an NFS auth refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_adopt_wins_over_a_stale_failed() {
+        let dir = tempdir();
+        // The share is recorded Failed, but the OS says the mount
+        // is live. Adoption runs before candidate selection, so
+        // the share must come out Mounted and generate no mount
+        // call — regardless of how it failed.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let record = built_record("Adopted", "192.0.2.26");
+        let mount_root = record.mount_root.clone();
+        let id = record.share_id.clone();
+        // The OS reports this share's mount point as live.
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_001_000_000))
+            .with_mount_point_check(Arc::new(move |p: &Path| {
+                p == mount_root.as_path()
+            }))
+            .build();
+        rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::AuthenticationRefused {
+                id: id.clone(),
+                exit_code: Some(13),
+                stderr: "NT_STATUS_LOGON_FAILURE".to_string(),
+            },
+        )
+        .await;
+
+        let calls_before = executor.calls.lock().await.len();
+        let outcomes = rt.remount_retry_pass().await;
+        assert!(outcomes.is_empty(), "adopted share must not be retried");
+        assert_eq!(executor.calls.lock().await.len(), calls_before);
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+        }
     }
 
     #[tokio::test]
