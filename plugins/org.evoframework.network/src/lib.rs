@@ -6345,13 +6345,25 @@ impl NmInner {
                     let is_shared_phy = same_iface || concurrent_vif;
                     let mut wifi_for_ap = intent.wifi.clone();
                     let mut channel_synced = false;
-                    if sta_ifname != resolved_ap_ifname
-                        && !intent_hotspot_if_is_explicit
+                    // Is anything actually on this radio? The
+                    // deferral below exists to avoid racing a live
+                    // STA onto a foreign channel, so it has to
+                    // know whether there is a live STA — not
+                    // whether the AP happens to have its own
+                    // interface name. No configured SSID means
+                    // nothing to wait for and no reason to pay the
+                    // association timeout on every apply.
+                    let mut sta_link_up = false;
+                    if is_shared_phy && !intent.wifi.sta_ssid.trim().is_empty()
                     {
                         let link = self
                             .wait_for_sta_association(&sta_ifname, 10_000)
                             .await;
-                        if link.connected {
+                        sta_link_up = link.connected;
+                        if link.connected
+                            && sta_ifname != resolved_ap_ifname
+                            && !intent_hotspot_if_is_explicit
+                        {
                             if let (Some(ch), Some(band)) =
                                 (link.channel, link.band.clone())
                             {
@@ -6363,7 +6375,7 @@ impl NmInner {
                                     wifi_for_ap.ap_band, wifi_for_ap.ap_channel
                                 ));
                             }
-                        } else {
+                        } else if !link.connected {
                             tracing::debug!(
                                 plugin = PLUGIN_NAME,
                                 sta_if = %sta_ifname,
@@ -6384,7 +6396,22 @@ impl NmInner {
                     // the next apply cycle picks up the correct
                     // channel and restores autoconnect via
                     // `ensure_wifi_ap` + `connection_up`.
-                    let defer_ap_shared_phy = is_shared_phy && !channel_synced;
+                    // Defer only when there is something to race.
+                    //
+                    // The channel read runs only where the AP has
+                    // its own interface, so on a single-radio box
+                    // `channel_synced` could never become true and
+                    // this gate deferred every apply, forever —
+                    // the hotspot profile was not merely down, it
+                    // was never written, and the operator's glass
+                    // said Enabled over a radio that had never
+                    // been asked to beacon.
+                    //
+                    // With no STA on the radio there is no channel
+                    // to collide with: write the profile and bring
+                    // the AP up on the operator's own channel.
+                    let defer_ap_shared_phy =
+                        is_shared_phy && sta_link_up && !channel_synced;
 
                     if defer_ap_shared_phy {
                         if !hs_name.trim().is_empty() {
@@ -9747,6 +9774,133 @@ exit 0\n",
         // The configured default is the stale one on this host.
         p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
         p
+    }
+
+    #[tokio::test]
+    async fn hotspot_profile_is_written_when_the_sta_is_down_on_one_radio() {
+        // The hole: the channel read runs only where the AP has
+        // its own interface, so on a single-radio box the sync
+        // flag could never become true and the deferral fired on
+        // every apply — the profile was never written at all, and
+        // the glass said Enabled over a radio that had never been
+        // asked to beacon. With no STA on the air there is no
+        // channel to race, so the AP must go up on the operator's
+        // own channel.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-ap.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        // `iw` reports one radio and no association: the STA is
+        // configured but not on the air.
+        let iw_path = dir.path().join("iw-down.sh");
+        std::fs::write(
+            &iw_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" && \"$3\" == \"link\" ]]; then\n\
+  echo 'Not connected.'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        // Same-iface: no explicit hotspot ifname, so the AP lands
+        // on the STA's own radio — the single-radio shape.
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "M(edia) Spot",
+                        "sta_open": true,
+                        "ap_ssid": "evo-d674",
+                        "ap_channel": 4
+                    },
+                    "fallback": {
+                        "hotspot_enabled": true,
+                        "hotspot_ifname": ""
+                    }
+                }
+            }),
+            1901,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().any(|l| l.starts_with("connection add")
+                || l.starts_with("connection modify")),
+            "the hotspot profile must be written, not deferred forever: \
+             {calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-hotspot")),
+            "the AP must be brought up once the profile exists: {calls}"
+        );
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !steps.iter().any(|s| s.contains("shared-PHY defer")),
+            "a radio with no STA on it has nothing to defer for: {steps:?}"
+        );
     }
 
     #[test]
