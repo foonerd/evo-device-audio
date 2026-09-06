@@ -4503,6 +4503,81 @@ impl NmInner {
         }
     }
 
+    /// Which interface a scan or a publish should name, given
+    /// what the caller asked for.
+    ///
+    /// An operator pin wins untouched — `Some(non-empty)` is a
+    /// deliberate choice and this does not second-guess it.
+    ///
+    /// Everything else resolves against the radios actually on
+    /// this host. The configured default is `wlan0`, and
+    /// `WifiIntent::ifname` carries the same string as a serde
+    /// default, so a request that named no interface still
+    /// arrived at nmcli as `ifname wlan0`. On a box whose only
+    /// radio is `wlp0s20f3` that is a name for nothing: nmcli
+    /// refuses outright and the operator gets a failure where a
+    /// list of networks belonged. A default that does not exist
+    /// is not a pin — it is a stale guess, and it is dropped.
+    ///
+    /// `None` means "name no interface at all". With no radio
+    /// inventory there is nothing honest to pin, and letting
+    /// nmcli answer for every interface returns rows rather than
+    /// an error.
+    async fn resolve_wifi_sta_ifname(
+        &self,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if let Some(pinned) = requested.map(str::trim) {
+            if !pinned.is_empty() {
+                return Some(pinned.to_string());
+            }
+        }
+        let inventory = self.enumerate_wifi_radios().await;
+        if inventory.is_empty() {
+            return None;
+        }
+        let assignment = wifi_roles::assign_wifi_roles(
+            &inventory,
+            &[],
+            wifi_roles::RoleOverrides {
+                explicit_sta: "",
+                explicit_ap: "",
+                default_sta_fallback: self.config.default_wifi_iface.as_str(),
+            },
+        );
+        // The assigner falls back to the configured default when
+        // no radio can bear STA duty, so the name it returns is
+        // not guaranteed to be on the box. Only pin one that is.
+        if inventory.iter().any(|r| r.ifname == assignment.sta_ifname) {
+            Some(assignment.sta_ifname)
+        } else {
+            None
+        }
+    }
+
+    /// The STA interface worth publishing, given what the intent
+    /// currently records.
+    ///
+    /// A recorded name that is on this host is kept — that is an
+    /// operator's choice and it is live. Anything else, including
+    /// the `wlan0` serde default on a host that has no `wlan0`,
+    /// is replaced by whatever radio is actually here. `None`
+    /// when there is no inventory to speak from, in which case
+    /// the caller leaves the record alone rather than inventing.
+    async fn live_sta_ifname(&self, recorded: &str) -> Option<String> {
+        let inventory = self.enumerate_wifi_radios().await;
+        if inventory.is_empty() {
+            return None;
+        }
+        let recorded = recorded.trim();
+        if !recorded.is_empty()
+            && inventory.iter().any(|r| r.ifname == recorded)
+        {
+            return Some(recorded.to_string());
+        }
+        self.resolve_wifi_sta_ifname(None).await
+    }
+
     fn effective_wifi_ifname(&self, intent: &NetworkIntent) -> String {
         let t = intent.wifi.ifname.trim();
         if !t.is_empty() {
@@ -6852,15 +6927,10 @@ impl Respondent for NetworkPlugin {
                     } else {
                         NmInner::parse_request_json::<ScanRequest>(req)?
                     };
-                    let ifname_owned = scan_req.ifname.unwrap_or_else(|| {
-                        self.config.default_wifi_iface.clone()
-                    });
-                    let ifname_trimmed = ifname_owned.trim().to_string();
-                    let ifname = if ifname_trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(ifname_trimmed.as_str())
-                    };
+                    let ifname_owned = self
+                        .resolve_wifi_sta_ifname(scan_req.ifname.as_deref())
+                        .await;
+                    let ifname = ifname_owned.as_deref();
                     let scan_cache_key =
                         ifname.unwrap_or_default().trim().to_string();
                     let scan_result = self
@@ -6937,7 +7007,17 @@ impl Respondent for NetworkPlugin {
                     )
                 }
                 REQUEST_NETWORK_INTENT_GET => {
-                    let intent = self.load_intent().await?;
+                    let mut intent = self.load_intent().await?;
+                    // `WifiIntent::ifname` defaults to `wlan0`, so a
+                    // device that never had one published a radio it
+                    // does not own — and the UI sent that name back
+                    // on every scan and apply. Publish what is
+                    // actually on the box.
+                    if let Some(live) =
+                        self.live_sta_ifname(&intent.wifi.ifname).await
+                    {
+                        intent.wifi.ifname = live;
+                    }
                     let sta_psk = self
                         .read_optional_secret(&self.sta_psk_path()?)
                         .await?
@@ -9488,6 +9568,219 @@ exit 0\n",
             steps.iter().any(|s| s.contains("not activated")),
             "the un-bindable ethernet profile must be reported, not \
              swallowed: {steps:?}"
+        );
+    }
+
+    /// Mock `iw` presenting one STA-capable radio under the given
+    /// ifname, plus a mock `nmcli` that refuses any scan pinned to
+    /// an interface the mock `iw` did not list — the way the real
+    /// nmcli refuses a name that is not on the box.
+    fn write_wifi_mocks(
+        dir: &std::path::Path,
+        live_ifname: &str,
+    ) -> (String, String) {
+        let iw_path = dir.join("iw-mock.sh");
+        std::fs::write(
+            &iw_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface {live}\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                live = live_ifname
+            ),
+        )
+        .expect("write iw mock");
+        let nmcli_path = dir.join("nmcli-scan-mock.sh");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+args=\"$*\"\n\
+# Refuse a pin naming an interface this host does not have,\n\
+# which is what the field hit with `ifname wlan0`.\n\
+if [[ \"$args\" == *\"ifname \"* && \"$args\" != *\"ifname {live}\"* ]]; then\n\
+  echo \"Error: Device '' not found.\" >&2\n\
+  exit 10\n\
+fi\n\
+if [[ \"$args\" == *\"SSID,SIGNAL,SECURITY,ACTIVE\"* ]]; then\n\
+  echo 'M(edia) Spot:78:WPA2:no'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$args\" == *\"BSSID,SSID,SIGNAL,FREQ,ACTIVE\"* ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$args\" == *\"general status\"* ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                live = live_ifname
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod iw");
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod nmcli");
+        }
+        (
+            iw_path.to_string_lossy().to_string(),
+            nmcli_path.to_string_lossy().to_string(),
+        )
+    }
+
+    fn wifi_mock_plugin(
+        dir: &std::path::Path,
+        live_ifname: &str,
+    ) -> NetworkPlugin {
+        let (iw_path, nmcli_path) = write_wifi_mocks(dir, live_ifname);
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.iw_path = iw_path;
+        p.inner_mut().config.nmcli_path = nmcli_path;
+        // The configured default is the stale one on this host.
+        p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
+        p
+    }
+
+    #[tokio::test]
+    async fn scan_without_ifname_uses_the_live_radio_not_wlan0() {
+        // The field case: the only STA radio is wlp0s20f3, the UI
+        // sends {refresh:true} and no ifname, and the configured
+        // default pinned `wlan0` — a name for nothing — so nmcli
+        // refused and the operator got a 400 instead of a list.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+
+        // Pin the resolution itself: without this the test would
+        // also pass on an empty inventory, where scan omits the
+        // ifname and the mock answers anyway.
+        assert_eq!(
+            p.inner_mut().resolve_wifi_sta_ifname(None).await.as_deref(),
+            Some("wlp0s20f3"),
+            "the resolver must name the radio that is on the box"
+        );
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_SCAN,
+                serde_json::json!({ "refresh": true }),
+                1701,
+            ))
+            .await
+            .expect("scan must not fail on a host without wlan0");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let rows = v["available"].as_array().expect("available rows");
+        assert!(
+            rows.iter().any(|r| r["ssid"] == "M(edia) Spot"),
+            "the live radio's networks must come back: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_still_works_where_wlan0_is_the_live_radio() {
+        // The Pi. Same path, and the answer must not change.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlan0");
+
+        assert_eq!(
+            p.inner_mut().resolve_wifi_sta_ifname(None).await.as_deref(),
+            Some("wlan0"),
+            "the Pi's real wlan0 must still resolve"
+        );
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_SCAN,
+                serde_json::json!({ "refresh": true }),
+                1702,
+            ))
+            .await
+            .expect("scan must still work where wlan0 is real");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert!(v["available"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|r| r["ssid"] == "M(edia) Spot"));
+    }
+
+    #[tokio::test]
+    async fn scan_honours_an_explicit_operator_pin() {
+        // An operator naming a radio is a choice, not a stale
+        // default, and it is passed through untouched.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+        let resolved =
+            p.inner_mut().resolve_wifi_sta_ifname(Some("wlan1")).await;
+        assert_eq!(resolved.as_deref(), Some("wlan1"));
+    }
+
+    #[tokio::test]
+    async fn scan_names_no_interface_when_there_are_no_radios() {
+        // No inventory means nothing honest to pin. Naming a ghost
+        // guarantees a refusal; naming nothing lets nmcli answer.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let iw_path = dir.path().join("iw-empty.sh");
+        std::fs::write(&iw_path, "#!/usr/bin/env bash\nexit 0\n")
+            .expect("write");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &iw_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        assert_eq!(p.inner_mut().resolve_wifi_sta_ifname(None).await, None);
+    }
+
+    #[tokio::test]
+    async fn intent_get_publishes_the_live_sta_ifname() {
+        // The intent's serde default is wlan0, so a device that
+        // never had one published a radio it does not own — and
+        // the UI sent that name straight back on every scan.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                1703,
+            ))
+            .await
+            .expect("intent.get");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(
+            v["intent"]["wifi"]["ifname"], "wlp0s20f3",
+            "intent.get must publish the radio on the box: {v}"
         );
     }
 
