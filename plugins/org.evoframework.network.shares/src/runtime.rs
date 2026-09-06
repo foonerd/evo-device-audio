@@ -4368,10 +4368,29 @@ impl NetworkSharesRuntime {
         })
     }
 
-    /// Walk configured shares and adopt any whose mount_root is
-    /// already active in the host mount table. Upward-only:
-    /// never marks a share Unmounted/Failed based on a missing
-    /// OS mount (that needs reachability gating — follow-on).
+    /// Walk configured shares and make the recorded state agree
+    /// with the host mount table, in both directions.
+    ///
+    /// Upward: a share whose `mount_root` is already active is
+    /// adopted, so an OS mount that survived a restart is not
+    /// re-mounted underneath itself.
+    ///
+    /// Downward: a share recorded `Mounted` whose mount point is
+    /// no longer in the table is marked `Unmounted` with a reason
+    /// saying so. Without this the subject keeps claiming a share
+    /// is mounted after the cable came out or the NAS went away,
+    /// and the operator is told a working library is there while
+    /// every read fails. `Unmounted` is also where the remount
+    /// pass looks, so a mount that vanished for a transient
+    /// reason comes back on its own.
+    ///
+    /// `Mounting` is left alone in both directions. The mount
+    /// point legitimately does not exist yet while the helper is
+    /// running — marking it down there would flap the subject on
+    /// every reconcile that lands mid-attempt.
+    ///
+    /// Filesystem-agnostic: NFS and CIFS both reconcile from the
+    /// same mount-table truth.
     ///
     /// Safe to call before the subject publisher is attached
     /// (updates the in-memory state map so the initial announce
@@ -4382,17 +4401,47 @@ impl NetworkSharesRuntime {
             g.state.shares.clone()
         };
         for record in records {
+            let recorded = {
+                let g = self.share_states.lock().await;
+                g.get(&record.share_id).map(|e| e.state)
+            };
             if !(self.mount_point_check)(&record.mount_root) {
+                // The OS says this path is not a mount point.
+                // Only a share we are claiming is Mounted needs
+                // correcting; Mounting is in flight, and the
+                // other states already agree.
+                if recorded == Some(MountState::Mounted) {
+                    tracing::info!(
+                        plugin = crate::PLUGIN_NAME,
+                        share_id = %record.share_id,
+                        mount_root = %record.mount_root.display(),
+                        "mount point vanished; marking share unmounted"
+                    );
+                    self.set_share_state(
+                        &record.share_id,
+                        MountState::Unmounted,
+                        Some(format!(
+                            "mount point {} is no longer present in the \
+                             host mount table",
+                            record.mount_root.display()
+                        )),
+                        None,
+                    )
+                    .await;
+                    self.publish_share_event(ShareEvent::unmounted(
+                        record.share_id.clone(),
+                        (self.now_fn)(),
+                    ))
+                    .await;
+                }
                 continue;
             }
-            let already_mounted = {
-                let g = self.share_states.lock().await;
-                matches!(
-                    g.get(&record.share_id).map(|e| &e.state),
-                    Some(MountState::Mounted)
-                )
-            };
-            if already_mounted {
+            if recorded == Some(MountState::Mounted) {
+                continue;
+            }
+            if recorded == Some(MountState::Mounting) {
+                // A mount is in flight against this path. Let it
+                // finish and record its own outcome.
                 continue;
             }
             let start_ms = (self.now_fn)();
@@ -5979,7 +6028,7 @@ mod tests {
     // Ship 2c: CIFS mount + probe ladder tests (mock executor)
     // -----------------------------------------------------------
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// One recorded subprocess invocation: `(program, args)`.
     type RecordedCall = (String, Vec<String>);
@@ -8528,11 +8577,20 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         }
         outputs.push(ok_mount_output());
         let executor = ScriptedExecutor::new(outputs);
+        // Model the mount table: the path becomes a mount point
+        // once the successful mount call has been consumed.
+        // Without this the reconcile pass would correctly read a
+        // share it just mounted as vanished.
+        let exec_for_check = Arc::clone(&executor);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
             .with_mount_timeout_ms(1_000)
             .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                exec_for_check.cursor.load(Ordering::SeqCst)
+                    > CIFS_VERS_PROBE_LADDER.len()
+            }))
             .build();
         let record = built_record("Retry", "192.0.2.22");
         let id = rt.add_share(record).await.unwrap();
@@ -8656,6 +8714,148 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
+    async fn reconcile_marks_a_vanished_mount_unmounted() {
+        // The cable came out, or the NAS went away. The subject
+        // must stop claiming the share is mounted — otherwise the
+        // operator is told a working library is there while every
+        // read fails.
+        let dir = tempdir();
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_check = Arc::clone(&live);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_000_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                live_for_check.load(Ordering::SeqCst)
+            }))
+            .build();
+        let record = built_record("Vanish", "192.0.2.30");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        // Adopted from the live mount table.
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+        }
+
+        // The mount goes away underneath us.
+        live.store(false, Ordering::SeqCst);
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Unmounted);
+            assert!(
+                e.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no longer present"),
+                "reason must say why, got {:?}",
+                e.reason
+            );
+            // Not a failure — nothing to skip on the retry pass,
+            // so a transient disappearance recovers on its own.
+            assert_eq!(e.failure_class, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_live_mount_alone() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("Live", "192.0.2.31");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.reconcile_os_mount_states().await;
+        let first = {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            (e.state, e.last_transition_at_ms)
+        };
+        assert_eq!(first.0, MountState::Mounted);
+
+        // A second pass over an unchanged mount table must not
+        // transition anything.
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            assert_eq!(e.last_transition_at_ms, first.1);
+            assert_eq!(e.reason, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_flip_a_share_that_is_mounting() {
+        // The mount point legitimately does not exist yet while
+        // the helper is running. Marking it down here would flap
+        // the subject on every reconcile landing mid-attempt.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_200_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("InFlight", "192.0.2.32");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounting, None, None)
+            .await;
+
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounting);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_a_vanished_nfs_mount_unmounted() {
+        // Same truth source, same treatment. A stale Mounted is
+        // as much a lie for NFS as for CIFS.
+        let dir = tempdir();
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_check = Arc::clone(&live);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_300_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                live_for_check.load(Ordering::SeqCst)
+            }))
+            .build();
+        let mut record = built_record("VanishNfs", "192.0.2.33");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+        }
+
+        live.store(false, Ordering::SeqCst);
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Unmounted);
+        }
+    }
+
+    #[tokio::test]
     async fn remount_retry_pass_adopt_wins_over_a_stale_failed() {
         let dir = tempdir();
         // The share is recorded Failed, but the OS says the mount
@@ -8708,12 +8908,21 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         }
         outputs.push(ok_mount_output());
         let executor = ScriptedExecutor::new(outputs);
+        // Same mount-table model as the retry fixture: once the
+        // successful mount is consumed the path is live, so later
+        // cadence ticks reconcile it as mounted rather than
+        // re-mounting a share that is already up.
+        let exec_for_check = Arc::clone(&executor);
         let rt = Arc::new(
             NetworkSharesRuntime::builder(&dir)
                 .unwrap()
                 .with_executor(executor)
                 .with_mount_timeout_ms(1_000)
                 .with_now_fn(Arc::new(|| 1_700_000_777_000))
+                .with_mount_point_check(Arc::new(move |_: &Path| {
+                    exec_for_check.cursor.load(Ordering::SeqCst)
+                        > CIFS_VERS_PROBE_LADDER.len()
+                }))
                 .build(),
         );
         let record = built_record("SpawnRetry", "192.0.2.23");
