@@ -1078,11 +1078,36 @@ invoke_bootstrap_placement() {
         args+=(--multiroom-group-member-addresses "${MULTIROOM_GROUP_MEMBER_ADDRESSES}")
     fi
     # EVO_DIST_DIR points bootstrap.sh at the bundle-staged tree
-    # instead of its own script-relative dist/ parent. Subprocess
-    # exit status propagates back via `set -e` — bootstrap.sh
-    # exits 2 on placeholder-residue or visudo failure; the
-    # install primitive surfaces that to the operator.
-    EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}"
+    # instead of its own script-relative dist/ parent.
+    # bootstrap.sh exits 2 on placeholder-residue, visudo
+    # failure, or no detectable playback card; the install
+    # primitive surfaces that to the operator.
+    local rc=0
+    EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}" \
+        || rc=$?
+    if (( rc != 0 )); then
+        # install_main_systemd_unit ran immediately before this
+        # and placed the framework reference unit, which carries
+        # no concrete ExecStart on purpose — the distribution's
+        # exec-start.conf drop-in supplies it. bootstrap.sh
+        # writes that drop-in, so an abort before it leaves a
+        # unit systemd refuses to load, and every later
+        # `systemctl` on the box reports bad-setting instead of
+        # the real reason the install stopped.
+        #
+        # Take the half-placed unit back out. The decision is
+        # in lib/ so the regression suite can drive it against a
+        # temp root; see that file for why the drop-in is the
+        # discriminator.
+        # shellcheck source=lib/unwind-half-placed-unit.sh
+        . "${STAGE_DIR}/dist/scripts/lib/unwind-half-placed-unit.sh"
+        if unwind_half_placed_unit ""; then
+            systemctl daemon-reload || true
+            echo "  removed half-placed evo.service (no ExecStart drop-in;" >&2
+            echo "  leaving it would report bad-setting instead of this error)" >&2
+        fi
+        return "$rc"
+    fi
 }
 
 purge_evo_mpd_includes() {

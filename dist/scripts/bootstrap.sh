@@ -345,10 +345,15 @@ if [[ -z "$AUDIO_CARD" ]]; then
         echo "aplay not found on PATH; install alsa-utils or pass --card <NAME>" >&2
         exit 1
     fi
-    if ! AUDIO_CARD="$(aplay -l 2>/dev/null | detect_audio_card_from_aplay_output)"; then
+    # LC_ALL=C: alsa-utils translates the card line, so a
+    # French host emits `carte 0:` and a German one `Karte 0:`.
+    # Pinning the locale keeps the parser reading the shape it
+    # was written against, and keeps the operator-facing dump
+    # below in the same language as this script's own messages.
+    if ! AUDIO_CARD="$(LC_ALL=C aplay -l 2>/dev/null | detect_audio_card_from_aplay_output)"; then
         echo "no ALSA playback card detected via aplay -l; pass --card <NAME> to override" >&2
         echo "  (current aplay -l output:)" >&2
-        aplay -l 2>&1 | sed 's/^/  /' >&2
+        LC_ALL=C aplay -l 2>&1 | sed 's/^/  /' >&2
         exit 2
     fi
     echo "[bootstrap] detected ALSA playback card: $AUDIO_CARD"
