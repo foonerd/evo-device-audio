@@ -8792,6 +8792,53 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
+    async fn remount_retry_pass_retries_a_transient_nfs_failure() {
+        // The other half of the NFS retry contract. A refusal is
+        // left alone; a server that was not answering has to come
+        // back without the operator, exactly as for CIFS.
+        //
+        // NFS mounts in a single attempt — no dialect ladder — so
+        // this is one failure then one success.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("mount.nfs: Connection refused"),
+            ok_mount_output(),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_005_000_000))
+            .build();
+        let mut record = built_record("NfsTransient", "192.0.2.60");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(
+                e.failure_class,
+                Some(FailureClass::Transient),
+                "a refused connection is reachability, not authorisation"
+            );
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert_eq!(outcomes.len(), 1, "a transient NFS failure must retry");
+        assert!(outcomes[0].is_ok());
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            assert_eq!(e.failure_class, None);
+        }
+    }
+
+    #[tokio::test]
     async fn remount_retry_pass_leaves_an_nfs_auth_refusal_alone() {
         let dir = tempdir();
         // NFS refuses with exit 32 / access denied. Same class,
@@ -9085,6 +9132,35 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             programs_run(&executor).await.is_empty(),
             "no L3 must mean zero mount helper calls, got {:?}",
             programs_run(&executor).await
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_skips_an_nfs_share_when_there_is_no_l3() {
+        // The gate sits above the filesystem split, so this is
+        // the same assertion as the CIFS case: without a link,
+        // zero mount helper calls. Pinned separately so a future
+        // per-filesystem boot path cannot quietly bypass it.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_005_100_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            .with_l3_wait_ms(0)
+            .build();
+        let mut record = built_record("NfsNoLink", "192.0.2.61");
+        record.fstype = FsType::Nfs;
+        rt.add_share(record).await.unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert!(report.outcomes.is_empty());
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no L3 must mean zero mount helper calls for NFS too"
         );
     }
 
