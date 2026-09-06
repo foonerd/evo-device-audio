@@ -4579,6 +4579,18 @@ impl NmInner {
         } else {
             eth.device.trim().to_string()
         };
+        // Loopback is never an ethernet target. `first_ethernet_device`
+        // already filters it out, but an operator-supplied
+        // `ethernet.device` reaches here unfiltered, and binding the
+        // profile to `lo` guarantees the activation below fails.
+        if ifname == "lo" {
+            steps.push(
+                "warning: ethernet device resolved to loopback; skipping \
+                 ethernet profile"
+                    .to_string(),
+            );
+            return Ok(());
+        }
         let props = Self::nm_ipv4_args(
             &eth.ipv4_mode,
             &eth.ipv4_address,
@@ -4613,9 +4625,34 @@ impl NmInner {
             steps.push(format!("added {NM_CON_ETHERNET}"));
         }
 
-        self.nmcli_output(&["connection", "up", NM_CON_ETHERNET])
-            .await?;
-        steps.push(format!("brought up {NM_CON_ETHERNET}"));
+        match self
+            .nmcli_output(&["connection", "up", NM_CON_ETHERNET])
+            .await
+        {
+            Ok(_) => {
+                steps.push(format!("brought up {NM_CON_ETHERNET}"));
+            }
+            Err(e) if is_no_bindable_device_failure(&e.to_string()) => {
+                // Nothing to bind to. Same outcome as finding no
+                // ethernet device at all, and the same treatment:
+                // the profile is saved and will activate when a
+                // cable appears. Failing here would throw away a
+                // country change that already succeeded earlier in
+                // this apply.
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    connection = NM_CON_ETHERNET,
+                    error = %e,
+                    "ethernet profile has no bindable device; leaving it \
+                     saved and continuing the apply"
+                );
+                steps.push(format!(
+                    "warning: {NM_CON_ETHERNET} saved but not activated \
+                     (no bindable ethernet device)"
+                ));
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 
@@ -7730,6 +7767,29 @@ impl Respondent for NetworkPlugin {
     }
 }
 
+/// Does this `nmcli connection up` failure mean NetworkManager
+/// had no interface to bind the profile to?
+///
+/// The shape that matters: NM falls back to considering `lo`,
+/// then refuses it because a loopback interface cannot carry an
+/// ethernet profile — "No suitable device found for this
+/// connection (device lo not available because ... connection
+/// type is not loopback)".
+///
+/// That is the same condition as having found no ethernet device
+/// at all, and it must not fail an apply. A country write that
+/// already succeeded cannot be undone by an ethernet profile that
+/// has nothing to bind to.
+///
+/// Deliberately narrow: a real activation failure — bad
+/// credentials, carrier down, a refused address — is still an
+/// error, because those are things the operator can act on.
+fn is_no_bindable_device_failure(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("no suitable device found")
+        || m.contains("connection type is not loopback")
+}
+
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
     devices
         .iter()
@@ -9314,6 +9374,121 @@ version = 1
                 .await
                 .expect("read sta secret");
         assert!(sta_psk_raw.contains("\"cipher\": \"xchacha20poly1305\""));
+    }
+
+    #[test]
+    fn no_bindable_device_failure_recognises_the_loopback_refusal() {
+        // The exact shape NetworkManager emits when it falls back
+        // to considering lo for an ethernet profile.
+        assert!(is_no_bindable_device_failure(
+            "nmcli failed (args [\"connection\", \"up\"], strategy sudo): \
+             Error: Connection activation failed: No suitable device found \
+             for this connection (device lo not available because \
+             profile connection type is not loopback)."
+        ));
+        assert!(is_no_bindable_device_failure(
+            "No suitable device found for this connection"
+        ));
+    }
+
+    #[test]
+    fn no_bindable_device_failure_leaves_real_failures_alone() {
+        // A failure the operator can act on must stay an error.
+        for msg in [
+            "Error: Connection activation failed: IP configuration could not \
+             be reserved (no available address, timeout, or no DHCP server)",
+            "Error: Connection activation failed: Secrets were required but \
+             not provided",
+            "Error: unknown connection 'evo-network-ethernet'",
+            "Error: Connection activation failed: The device carrier is off",
+        ] {
+            assert!(
+                !is_no_bindable_device_failure(msg),
+                "must stay an error: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_continues_when_ethernet_cannot_bind_to_a_device() {
+        // The defect: apply_regdomain runs first and succeeds, then
+        // ensure_ethernet's activation fails because NM can only
+        // offer lo, and the `?` threw the whole apply away — taking
+        // the country write with it. A country change must not die
+        // because an ethernet profile has nothing to bind to.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:eth0\\nGENERAL.TYPE:ethernet\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:--\\nGENERAL.HWADDR:AA:BB:CC:DD:EE:01\\nGENERAL.MTU:1500\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo \"Error: Connection activation failed: No suitable device found for this connection (device lo not available because profile connection type is not loopback).\" >&2\n\
+  exit 4\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let apply_req = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": true },
+                    "wifi": { "role": "disabled", "ifname": "wlan0" },
+                    "fallback": { "hotspot_enabled": false },
+                    "radio_policy": { "country": "GB" }
+                }
+            }),
+            1601,
+        );
+        let out = p
+            .handle_request(&apply_req)
+            .await
+            .expect("apply must not fail because ethernet could not bind");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("GB")),
+            "the country step must survive the ethernet failure: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("not activated")),
+            "the un-bindable ethernet profile must be reported, not \
+             swallowed: {steps:?}"
+        );
     }
 
     #[tokio::test]
