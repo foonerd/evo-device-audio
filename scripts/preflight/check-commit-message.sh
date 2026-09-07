@@ -29,7 +29,16 @@ fi
 # only `ADR-` was listed here. All three carry a leading word
 # boundary so an unrelated token ending in the letter (`SENSOR-042`)
 # cannot false-hit.
-PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|\bADR-[0-9]{3,}|\bR-[0-9]{3,}|\bPD-[0-9]{3,}|first cut|swap later|deferred to later|follow-on release|later release|future release'
+#
+# The two literals after them are the validation fleet's own
+# wireless network names — the network the rigs join and the hotspot
+# name one unit derives from its address. Same class the file gate
+# carries, and deliberately two literals rather than a pattern
+# shaped like "any SSID" or "any MAC": a message legitimately
+# describes wireless work, and a generic pattern would refuse the
+# describing. Illustrative names built from the documented sample
+# address are not devices and are not matched.
+PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|\bADR-[0-9]{3,}|\bR-[0-9]{3,}|\bPD-[0-9]{3,}|M\(edia\) Spot|evo-d674|first cut|swap later|deferred to later|follow-on release|later release|future release'
 
 # DCO / Signed-off-by trailers already carry the maintainer
 # address on every historical commit. That is identity in the
