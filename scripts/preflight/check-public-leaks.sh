@@ -22,7 +22,9 @@
 #
 # Exemptions are deliberately three, and no more:
 #
-#   1. This script. It has to contain the patterns it forbids.
+#   1. The guard family — this script and the two beside it — which
+#      have to contain the patterns they forbid and the literals the
+#      positive control plants.
 #   2. The lab range is matched narrowly (192.168.30.x) so the
 #      RFC1918 block 192.168.0.0/16 — legitimate technical content
 #      in a LAN-trust classifier — cannot false-hit.
@@ -43,7 +45,16 @@ set -eo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-SELF="scripts/preflight/check-public-leaks.sh"
+# The guard family: scripts whose whole purpose is to name the
+# strings this gate forbids. Listed explicitly rather than by
+# directory glob, so a new file under scripts/preflight/ is scanned
+# like anything else and cannot inherit an exemption by living in the
+# right folder.
+GUARDS=(
+    "scripts/preflight/check-public-leaks.sh"
+    "scripts/preflight/check-public-leaks-positive.sh"
+    "scripts/preflight/check-commit-message.sh"
+)
 
 # Every committed path. Binary files are skipped by grep -I.
 # Exclude this script from the FILE LIST, not from grep's output.
@@ -51,8 +62,10 @@ SELF="scripts/preflight/check-public-leaks.sh"
 # grep omits the filename when handed a single file, which happens as
 # soon as xargs splits the list, and the gate then scored its own
 # pattern definitions.
+EXCLUDE_RE="$(printf '%s\n' "${GUARDS[@]}" \
+    | sed 's/[.[\*^$]/\\&/g' | paste -sd'|' -)"
 mapfile -d '' -t TRACKED < <(git ls-files -z 2>/dev/null \
-    | grep -zv "^${SELF}$" || true)
+    | grep -zvE "^(${EXCLUDE_RE})$" || true)
 if [[ ${#TRACKED[@]} -eq 0 ]]; then
     echo "public-leak check: no committed files to scan." >&2
     exit 0
