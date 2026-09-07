@@ -23,9 +23,9 @@
 #
 # Exemptions are deliberately three, and no more:
 #
-#   1. The guard family — this script and the two beside it — which
-#      have to contain the patterns they forbid and the literals the
-#      positive control plants.
+#   1. The guard family — this script and the three beside it —
+#      which have to contain the patterns they forbid and the
+#      literals their positive controls plant.
 #   2. The lab range is matched narrowly (192.168.30.x) so the
 #      RFC1918 block 192.168.0.0/16 — legitimate technical content
 #      in a LAN-trust classifier — cannot false-hit.
@@ -55,6 +55,7 @@ GUARDS=(
     "scripts/preflight/check-public-leaks.sh"
     "scripts/preflight/check-public-leaks-positive.sh"
     "scripts/preflight/check-commit-message.sh"
+    "scripts/preflight/check-commit-message-positive.sh"
 )
 
 # Every committed path. Binary files are skipped by grep -I.
