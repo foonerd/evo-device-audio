@@ -4026,7 +4026,38 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
             }
             Err(e) => {
-                self.set_share_failed(share_id, e).await;
+                // A failed unmount says nothing about whether the
+                // share is mounted. `umount` refuses a busy target
+                // routinely — something is reading a file, MPD is
+                // mid-scan — and the mount is left exactly as it
+                // was: healthy, serving, still in the mount table.
+                //
+                // Recording Failed there is a lie the operator can
+                // see: the tile reads Failed over a share they are
+                // listening to, and the remount pass then treats a
+                // live mount as something to retry.
+                //
+                // The OS is the authority. If the path is still a
+                // mount point, the state stays Mounted and only the
+                // event reports the refusal.
+                if (self.mount_point_check)(&record.mount_root) {
+                    // Keep the negotiated dialect: nothing about it
+                    // changed, and dropping it would make the next
+                    // mount re-walk the ladder for no reason.
+                    let negotiated = {
+                        let g = self.share_states.lock().await;
+                        g.get(share_id).and_then(|e| e.negotiated_vers.clone())
+                    };
+                    self.set_share_state(
+                        share_id,
+                        MountState::Mounted,
+                        None,
+                        negotiated,
+                    )
+                    .await;
+                } else {
+                    self.set_share_failed(share_id, e).await;
+                }
                 self.publish_share_event(ShareEvent::unmount_failed(
                     share_id.clone(),
                     format!("{e}"),
@@ -5363,17 +5394,6 @@ impl NetworkSharesRuntime {
         BootMountReport { outcomes }
     }
 
-    /// Retry the shares in [`MountState::Failed`] or
-    /// [`MountState::Unmounted`] whose last failure could plausibly
-    /// clear on its own. Called by the background remount task and
-    /// directly by tests to exercise the retry path without
-    /// spawning a task.
-    ///
-    /// A share whose failure was [`FailureClass::Permanent`] — a
-    /// refused password above all — is left alone. It is not going
-    /// to mount because the cadence ticked again, and hammering it
-    /// is a credential storm against the server plus a churn of
-    /// identical failures over the real state.
     /// Retry only the shares whose last failure was
     /// [`FailureClass::Unreachable`] — the ones waiting on a host
     /// that has not answered.
@@ -6899,6 +6919,77 @@ tmpfs /tmp tmpfs rw 0 0\n";
     fn probe_port_is_total_over_filesystem_type() {
         assert_eq!(probe_port_for_fstype(FsType::Cifs), 445);
         assert_eq!(probe_port_for_fstype(FsType::Nfs), 2049);
+    }
+
+    #[tokio::test]
+    async fn a_failed_unmount_over_a_live_mount_stays_mounted() {
+        // umount refuses a busy target routinely and leaves the
+        // mount exactly as it was. Reporting Failed there puts the
+        // tile in a failed state over a share the operator is
+        // listening to, and hands the retry pass a live mount to
+        // re-attempt.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /mnt/x: target is busy",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            // The OS still has the path: this is the authority the
+            // state must follow.
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("busy_share", "192.0.2.28");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.unmount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::MountFailed { .. }),
+            "the caller is still told the unmount failed: {err:?}"
+        );
+        let g = rt.share_states.lock().await;
+        let entry = g.get(&id).expect("share state recorded");
+        assert_eq!(
+            entry.state,
+            MountState::Mounted,
+            "a live OS mount must not be reported Failed because umount refused"
+        );
+        assert_eq!(
+            entry.failure_class, None,
+            "a share that is still mounted carries no failure class"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_unmount_with_no_live_mount_is_still_failed() {
+        // The other direction. If the path is genuinely not a
+        // mount point, the failure is real and must not be
+        // softened into Mounted.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /mnt/x: not mounted",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("gone_share", "192.0.2.29");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.unmount_share(&id).await.unwrap_err();
+        let g = rt.share_states.lock().await;
+        assert_eq!(
+            g.get(&id).expect("share state recorded").state,
+            MountState::Failed,
+            "with no live mount the failure is real and stays Failed"
+        );
     }
 
     #[test]
