@@ -41,6 +41,7 @@ pub mod reconcile;
 pub mod rfkill;
 pub mod source;
 pub mod supervisor;
+pub mod wifi_acquire;
 pub mod wifi_phy;
 pub mod wifi_radio;
 pub mod wifi_roles;
@@ -234,6 +235,15 @@ struct PluginConfig {
     rfkill_timeout_ms: u64,
     curl_timeout_ms: u64,
     scan_cache_ttl_ms: u64,
+    /// Where an imaging tool may have left Wi-Fi credentials on the
+    /// boot partition, most specific first. Read once at load by
+    /// the acquisition step and retired on success. Overridable via
+    /// `EVO_NETWORK_BOOT_WIFI_CONF` (comma-separated) or
+    /// `boot_wifi_conf_paths` (plugin TOML array); an empty list
+    /// turns the file source off and leaves profile adoption as the
+    /// only route. Defaults to
+    /// [`wifi_acquire::DEFAULT_BOOT_WIFI_CONF_PATHS`].
+    boot_wifi_conf_paths: Vec<String>,
 }
 
 #[derive(
@@ -308,6 +318,22 @@ impl PluginConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v >= 100)
             .unwrap_or(2000);
+        // An explicitly empty override turns the file source off,
+        // which is distinct from an absent override falling back to
+        // the shipped locations.
+        let boot_wifi_conf_paths =
+            match std::env::var("EVO_NETWORK_BOOT_WIFI_CONF") {
+                Ok(v) => v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Err(_) => wifi_acquire::DEFAULT_BOOT_WIFI_CONF_PATHS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
         Self {
             nmcli_path: "/usr/bin/nmcli".to_string(),
             iw_path,
@@ -323,6 +349,7 @@ impl PluginConfig {
             rfkill_timeout_ms,
             curl_timeout_ms: 30000,
             scan_cache_ttl_ms: 3000,
+            boot_wifi_conf_paths,
         }
     }
 
@@ -462,6 +489,20 @@ impl PluginConfig {
             .and_then(|v| v.as_bool())
         {
             out.require_encrypted_secrets = v;
+        }
+        // An array that is present but empty turns the boot-file
+        // source off deliberately, so it replaces the default rather
+        // than being treated as "nothing was configured".
+        if let Some(arr) =
+            table.get("boot_wifi_conf_paths").and_then(|v| v.as_array())
+        {
+            out.boot_wifi_conf_paths = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
         }
         Ok(out)
     }
@@ -1427,6 +1468,24 @@ async fn run_command_stdin_with_timeout(
             timeout_ms
         ))),
     }
+}
+
+/// What acquisition did, for the caller's log line.
+///
+/// Carries no passphrase — the whole point of naming the outcome
+/// rather than returning the acquired network is that this value is
+/// safe to print.
+#[derive(Debug, PartialEq, Eq)]
+enum AcquireOutcome {
+    /// A station was already recorded; nothing was touched.
+    AlreadyDeclared,
+    /// Taken from a credentials file on the boot partition.
+    FromBootFile { ssid: String, secured: bool },
+    /// Taken over from a NetworkManager profile this plugin did not
+    /// create.
+    FromForeignProfile { ssid: String, previous_name: String },
+    /// Neither source had anything to offer.
+    NothingToAcquire,
 }
 
 /// Universal per-interface device row surfaced on
@@ -4142,11 +4201,27 @@ impl NmInner {
 
     /// SSID recorded on an existing NM profile, if it has one.
     async fn nm_profile_ssid(&self, name: &str) -> Option<String> {
+        self.nm_profile_field(name, "802-11-wireless.ssid").await
+    }
+
+    /// Read one field from an NM connection profile. `None` when
+    /// nmcli fails or the field is empty.
+    ///
+    /// Only ever called for fields that are not secrets. nmcli
+    /// withholds secret values unless asked with `-s`, and this
+    /// deliberately does not ask — see
+    /// [`NmInner::adopt_foreign_wifi_profile`] for why a passphrase
+    /// held by NetworkManager is never read out.
+    async fn nm_profile_field(
+        &self,
+        name: &str,
+        field: &str,
+    ) -> Option<String> {
         let out = self
             .dispatcher
             .dispatch(
                 &self.config.nmcli_path,
-                &["-g", "802-11-wireless.ssid", "connection", "show", name],
+                &["-g", field, "connection", "show", name],
                 Duration::from_millis(self.config.nmcli_timeout_ms),
             )
             .await
@@ -4154,12 +4229,263 @@ impl NmInner {
         if !out.status.success() {
             return None;
         }
-        let ssid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if ssid.is_empty() {
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if value.is_empty() {
             None
         } else {
-            Some(ssid)
+            Some(value)
         }
+    }
+
+    /// Take ownership of a Wi-Fi network the operator configured
+    /// before this plugin ever ran. Called once, at load.
+    ///
+    /// A device is usually flashed with a network already chosen, so
+    /// it boots onto a network the plugin does not know about: the
+    /// settings page shows no station, there is nothing to move away
+    /// from, and a profile nobody owns decides what happens at the
+    /// next reboot.
+    ///
+    /// A recorded station always wins. If `wifi.sta_ssid` is set,
+    /// the operator has spoken through the interface and acquisition
+    /// does nothing at all — it exists to fill a gap, never to
+    /// overwrite an answer.
+    ///
+    /// Otherwise two sources are tried in order. A credentials file
+    /// on the boot partition comes first: it is the more specific
+    /// statement of intent, and it is the only one of the two that
+    /// carries a passphrase this plugin can store. Failing that, a
+    /// NetworkManager profile this plugin did not create is taken
+    /// over in place.
+    ///
+    /// Nothing here brings an interface up. Acquisition records what
+    /// is already true; changing the radio is what apply is for.
+    async fn acquire_operator_wifi(
+        &self,
+    ) -> Result<AcquireOutcome, PluginError> {
+        let intent = self.load_intent().await?;
+        if !intent.wifi.sta_ssid.trim().is_empty() {
+            return Ok(AcquireOutcome::AlreadyDeclared);
+        }
+
+        if let Some((path, net)) = self.read_boot_wifi_conf().await {
+            // Order matters: everything that must survive is
+            // written before the file that holds the only copy of
+            // the passphrase is removed. A failure here leaves the
+            // file in place for the next boot to try again.
+            let mut adopted = intent.clone();
+            adopted.wifi.sta_ssid = net.ssid.clone();
+            adopted.wifi.sta_open = net.open;
+            adopted.wifi.sta_hidden = net.hidden;
+            self.save_intent(&adopted).await?;
+            if let Some(psk) = net.psk.as_deref() {
+                let psk_path = self.sta_psk_path()?;
+                self.write_optional_secret(psk_path, Some(psk)).await?;
+            }
+            self.write_acquired_sta_profile(&net).await?;
+            self.retire_boot_wifi_conf(&path).await;
+            return Ok(AcquireOutcome::FromBootFile {
+                ssid: net.ssid,
+                secured: !net.open,
+            });
+        }
+
+        let hotspot = NmInner::hotspot_connection_name(&intent);
+        if let Some(row) = self.find_foreign_wifi_profile(&hotspot).await {
+            if let Some(ssid) = self.nm_profile_ssid(&row.name).await {
+                let secured = self
+                    .nm_profile_field(
+                        &row.name,
+                        "802-11-wireless-security.key-mgmt",
+                    )
+                    .await
+                    .is_some();
+                self.adopt_foreign_wifi_profile(&row.name).await?;
+                let mut adopted = intent.clone();
+                adopted.wifi.sta_ssid = ssid.clone();
+                adopted.wifi.sta_open = !secured;
+                self.save_intent(&adopted).await?;
+                return Ok(AcquireOutcome::FromForeignProfile {
+                    ssid,
+                    previous_name: row.name,
+                });
+            }
+        }
+
+        Ok(AcquireOutcome::NothingToAcquire)
+    }
+
+    /// Read the first boot-partition credentials file that parses
+    /// into a usable network.
+    ///
+    /// A path that does not exist is the ordinary case, not a
+    /// failure — most devices have no such file. A path that exists
+    /// but cannot be read or parsed is logged and skipped so one bad
+    /// file does not hide a good one after it.
+    async fn read_boot_wifi_conf(
+        &self,
+    ) -> Option<(PathBuf, wifi_acquire::WpaNetwork)> {
+        for candidate in &self.config.boot_wifi_conf_paths {
+            let path = PathBuf::from(candidate);
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        error = %e,
+                        "boot wifi credentials file present but unreadable"
+                    );
+                    continue;
+                }
+            };
+            match wifi_acquire::parse_wpa_supplicant_conf(&raw) {
+                Some(net) => return Some((path, net)),
+                None => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "boot wifi credentials file declares no usable network"
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Write the station profile for an acquired network.
+    ///
+    /// Deliberately does not bind the profile to an interface name.
+    /// Acquisition runs before anything has established which radio
+    /// this device has, and the name differs between machines; an
+    /// unbound profile attaches to whichever Wi-Fi device is
+    /// present. Apply binds it later, when the radio is known.
+    ///
+    /// Never overwrites an existing profile of ours. If one is
+    /// there, it is either already this network or something the
+    /// operator arranged, and neither is ours to replace from a file
+    /// on a removable card.
+    async fn write_acquired_sta_profile(
+        &self,
+        net: &wifi_acquire::WpaNetwork,
+    ) -> Result<(), PluginError> {
+        if self.nm_connection_exists(NM_CON_WIFI_STA).await {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                connection = NM_CON_WIFI_STA,
+                "station profile already present; acquisition left it alone"
+            );
+            return Ok(());
+        }
+        let mut args: Vec<String> = vec![
+            "connection".into(),
+            "add".into(),
+            "type".into(),
+            "wifi".into(),
+            "con-name".into(),
+            NM_CON_WIFI_STA.into(),
+            "ssid".into(),
+            net.ssid.clone(),
+            "802-11-wireless.hidden".into(),
+            if net.hidden {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        ];
+        if let Some(psk) = net.psk.as_deref() {
+            args.extend([
+                "wifi-sec.key-mgmt".into(),
+                "wpa-psk".into(),
+                "wifi-sec.psk-flags".into(),
+                "0".into(),
+                "wifi-sec.psk".into(),
+                psk.to_string(),
+            ]);
+        }
+        self.nmcli_output_owned(&args).await?;
+        Ok(())
+    }
+
+    /// Remove a boot-partition credentials file once its contents
+    /// are held somewhere better.
+    ///
+    /// The file sits in the clear on a partition that any reader of
+    /// the card can mount, and it is re-applied on every boot by
+    /// whatever wrote it. Leaving it would keep a passphrase
+    /// readable for the life of the device and leave a second owner
+    /// of the network configuration. Best-effort: a read-only or
+    /// already-absent boot partition is not a reason to fail a load
+    /// whose real work has already succeeded.
+    async fn retire_boot_wifi_conf(&self, path: &Path) {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => tracing::info!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                "retired boot wifi credentials file after acquisition"
+            ),
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                error = %e,
+                "could not retire boot wifi credentials file; \
+                 the passphrase remains readable on the boot partition"
+            ),
+        }
+    }
+
+    /// Find a Wi-Fi profile this plugin did not create.
+    async fn find_foreign_wifi_profile(
+        &self,
+        hotspot: &str,
+    ) -> Option<wifi_acquire::NmProfileRow> {
+        let raw = self
+            .nmcli_output(&["-t", "-f", "NAME,TYPE", "connection", "show"])
+            .await
+            .ok()?;
+        let rows = wifi_acquire::parse_nm_profile_rows(&raw);
+        wifi_acquire::pick_foreign_wifi_profile(&rows, NM_CON_WIFI_STA, hotspot)
+            .cloned()
+    }
+
+    /// Take over a foreign profile by renaming it to ours.
+    ///
+    /// Renaming rather than copying is the whole point. The
+    /// passphrase NetworkManager holds stays where it is: it is
+    /// never read out, never passes through this process, and so can
+    /// never reach a log or a crash dump. The profile keeps its
+    /// UUID and its active state, so a device connected through it
+    /// right now stays connected — which matters, because the
+    /// operator may be reaching this device over that very network.
+    ///
+    /// Afterwards the profile is ours by every test the rest of the
+    /// plugin applies, including the one that lets apply reuse a
+    /// passphrase already on our profile instead of demanding a new
+    /// one.
+    ///
+    /// Refuses if a profile of ours already exists, rather than
+    /// colliding two profiles on one name.
+    async fn adopt_foreign_wifi_profile(
+        &self,
+        name: &str,
+    ) -> Result<(), PluginError> {
+        if self.nm_connection_exists(NM_CON_WIFI_STA).await {
+            return Err(PluginError::Transient(format!(
+                "cannot adopt {name}: {NM_CON_WIFI_STA} already exists"
+            )));
+        }
+        self.nmcli_output_owned(&[
+            "connection".to_string(),
+            "modify".to_string(),
+            name.to_string(),
+            "connection.id".to_string(),
+            NM_CON_WIFI_STA.to_string(),
+        ])
+        .await?;
+        Ok(())
     }
 
     /// May this station be brought up without a passphrase of our
@@ -7043,6 +7369,43 @@ impl Plugin for NetworkPlugin {
                     rfkill_auto,
                     rx,
                 );
+            }
+
+            // Take ownership of a network the operator configured
+            // before this plugin existed, before anything reads the
+            // intent for real. Best-effort by design: a device that
+            // cannot be acquired is a device that works exactly as
+            // it did before, so a failure here is reported and the
+            // load continues.
+            match self.acquire_operator_wifi().await {
+                Ok(AcquireOutcome::AlreadyDeclared)
+                | Ok(AcquireOutcome::NothingToAcquire) => {}
+                Ok(AcquireOutcome::FromBootFile { ssid, secured }) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        ssid = %ssid,
+                        secured,
+                        "acquired operator wifi from the boot partition"
+                    );
+                }
+                Ok(AcquireOutcome::FromForeignProfile {
+                    ssid,
+                    previous_name,
+                }) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        ssid = %ssid,
+                        adopted_from = %previous_name,
+                        "adopted an existing NetworkManager wifi profile"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "wifi acquisition failed; continuing load"
+                    );
+                }
             }
 
             let intent = self.load_intent().await?;
@@ -12988,6 +13351,237 @@ exit 1
         assert!(
             !log.contains("dev wlan0 info"),
             "the STA path must not move to `info`: {log}"
+        );
+    }
+
+    // --- acquisition of a pre-existing operator network ---
+
+    /// nmcli mock for the acquisition tests. Reports our station
+    /// profile absent, lists whatever `profiles` says, and answers
+    /// the two non-secret field reads. Every invocation is logged so
+    /// a test can assert on what was *not* run.
+    fn acquire_nmcli_mock(dir: &Path, profiles: &str, ssid: &str) -> PathBuf {
+        let path = dir.join("nmcli-acquire.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection show evo-network-wifi-sta\") exit 1 ;;\n\
+  \"-t -f NAME,TYPE connection show\") printf '{profiles}' ;;\n\
+  \"-g 802-11-wireless.ssid connection show \"*) printf '{ssid}\\n' ;;\n\
+  \"-g 802-11-wireless-security.key-mgmt connection show \"*)\n\
+      printf 'wpa-psk\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                profiles = profiles,
+                ssid = ssid,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    /// A device flashed with a network by an imaging tool boots onto
+    /// it while this plugin knows nothing about it. Acquisition
+    /// takes the network over: name recorded, passphrase moved into
+    /// the sidecar, our profile written — and the file that held the
+    /// passphrase in the clear on a removable card is retired.
+    ///
+    /// Nothing is brought up. Acquisition records what is already
+    /// true; changing the radio is what apply is for.
+    #[tokio::test]
+    async fn acquires_the_network_an_imager_left_on_the_boot_partition() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boot_conf = dir.path().join("wpa_supplicant.conf");
+        std::fs::write(
+            &boot_conf,
+            "country=GB\n\
+             ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n\
+             update_config=1\n\
+             \n\
+             network={\n\
+             \tssid=\"Guest (Lobby) Net\"\n\
+             \tpsk=\"correct horse battery\"\n\
+             }\n",
+        )
+        .expect("write boot conf");
+        let nmcli_path = acquire_nmcli_mock(dir.path(), "", "");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.boot_wifi_conf_paths =
+            vec![boot_conf.to_string_lossy().into_owned()];
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::FromBootFile {
+                ssid: "Guest (Lobby) Net".to_string(),
+                secured: true,
+            }
+        );
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(intent.wifi.sta_ssid, "Guest (Lobby) Net");
+        assert!(!intent.wifi.sta_open);
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        let stored = p
+            .read_secret_value_permissive(&psk_path)
+            .await
+            .expect("read sidecar");
+        assert_eq!(stored.as_deref(), Some("correct horse battery"));
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection add type wifi con-name \
+                            evo-network-wifi-sta ssid Guest (Lobby) Net"
+            ),
+            "our profile must be written: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection up")),
+            "acquisition must not bring anything up: {calls}"
+        );
+        assert!(
+            !boot_conf.exists(),
+            "the credentials file must not be left readable on the card"
+        );
+    }
+
+    /// The current imaging tool writes a NetworkManager profile
+    /// rather than a file. Acquisition takes that profile over by
+    /// renaming it, which carries the passphrase without this
+    /// process ever reading it — so there is nothing to leak, by
+    /// construction rather than by care.
+    #[tokio::test]
+    async fn adopts_a_foreign_profile_without_ever_reading_its_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = acquire_nmcli_mock(
+            dir.path(),
+            "evo-network-hotspot:802-11-wireless\\n\
+             Wired connection 1:802-3-ethernet\\n\
+             preconfigured:802-11-wireless\\n",
+            "Guest (Lobby) Net",
+        );
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        // No file source: the boot partition has nothing.
+        p.inner_mut().config.boot_wifi_conf_paths = vec![dir
+            .path()
+            .join("absent.conf")
+            .to_string_lossy()
+            .into_owned()];
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::FromForeignProfile {
+                ssid: "Guest (Lobby) Net".to_string(),
+                previous_name: "preconfigured".to_string(),
+            },
+            "the foreign wifi profile must be the one adopted"
+        );
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(intent.wifi.sta_ssid, "Guest (Lobby) Net");
+        assert!(!intent.wifi.sta_open, "key-mgmt present means secured");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection modify preconfigured connection.id \
+                 evo-network-wifi-sta"
+            ),
+            "adoption must rename the profile in place: {calls}"
+        );
+        // The passphrase stays with NetworkManager. nmcli withholds
+        // secrets unless asked with `-s`, and asking is the only way
+        // one could ever reach this process.
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.split_whitespace().any(|a| a == "-s")),
+            "acquisition must never ask nmcli for secrets: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection up")),
+            "acquisition must not bring anything up: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "adoption must not delete the operator's profile: {calls}"
+        );
+    }
+
+    /// A station the operator has already declared through the
+    /// interface is the answer. Acquisition exists to fill a gap and
+    /// must not overwrite one — not from a stale file left on the
+    /// boot partition, and not from some other profile.
+    #[tokio::test]
+    async fn acquisition_never_overwrites_a_declared_station() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boot_conf = dir.path().join("wpa_supplicant.conf");
+        std::fs::write(
+            &boot_conf,
+            "network={\n\tssid=\"Stale From Card\"\n\tpsk=\"old\"\n}\n",
+        )
+        .expect("write boot conf");
+        let nmcli_path = acquire_nmcli_mock(
+            dir.path(),
+            "preconfigured:802-11-wireless\\n",
+            "Some Other Net",
+        );
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.boot_wifi_conf_paths =
+            vec![boot_conf.to_string_lossy().into_owned()];
+
+        let mut declared = NetworkIntent::default();
+        declared.wifi.sta_ssid = "Chosen On The Glass".to_string();
+        p.save_intent(&declared).await.expect("save intent");
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(outcome, AcquireOutcome::AlreadyDeclared);
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(
+            intent.wifi.sta_ssid, "Chosen On The Glass",
+            "a declared station must survive acquisition untouched"
+        );
+        assert!(
+            boot_conf.exists(),
+            "a file that was not consumed must not be retired"
+        );
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.trim().is_empty(),
+            "a declared station must cost no nmcli calls at all: {calls}"
         );
     }
 }
