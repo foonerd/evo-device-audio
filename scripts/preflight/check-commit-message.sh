@@ -22,7 +22,7 @@ else
     exit 2
 fi
 
-PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|ADR-[0-9]{3,}|first cut|swap later'
+PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|ADR-[0-9]{3,}|first cut|swap later|deferred to later|follow-on release|later release|future release'
 
 # DCO / Signed-off-by trailers already carry the maintainer
 # address on every historical commit. That is identity in the
