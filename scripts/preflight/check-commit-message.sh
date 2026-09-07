@@ -22,7 +22,14 @@ else
     exit 2
 fi
 
-PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|ADR-[0-9]{3,}|first cut|swap later|deferred to later|follow-on release|later release|future release'
+# `ADR-`, `R-` and `PD-` are the three internal identifier families
+# the file gate already refuses in source. A commit message is
+# published surface too, so it refuses them as well — a residual or
+# parked-decision number reached history through the message while
+# only `ADR-` was listed here. All three carry a leading word
+# boundary so an unrelated token ending in the letter (`SENSOR-042`)
+# cannot false-hit.
+PATTERN='192\.168\.30\.[0-9]{1,3}|pi5target|x64proto|nucproto|evoproto@|andser@|andrew@dt-ltd|SESSION_LOG [0-9]{4}-|\bADR-[0-9]{3,}|\bR-[0-9]{3,}|\bPD-[0-9]{3,}|first cut|swap later|deferred to later|follow-on release|later release|future release'
 
 # DCO / Signed-off-by trailers already carry the maintainer
 # address on every historical commit. That is identity in the

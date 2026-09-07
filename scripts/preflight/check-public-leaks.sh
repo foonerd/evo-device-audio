@@ -17,8 +17,9 @@
 #   what the system does, not which internal document decided it.
 #
 #   Rig identity — the validation fleet's addresses, hostnames,
-#   service user, and maintainer contact. None of it is secret, and
-#   all of it is somebody's private infrastructure.
+#   service user, maintainer contact, and the wireless network names
+#   it joins and broadcasts. None of it is secret, and all of it is
+#   somebody's private infrastructure.
 #
 # Exemptions are deliberately three, and no more:
 #
@@ -81,7 +82,6 @@ scan_pattern() {
     local label="$1" pattern="$2" scope="${3:-all}" matches
     matches=$(printf '%s\0' "${TRACKED[@]}" \
         | xargs -0 grep -HnIE "${pattern}" 2>/dev/null \
-        | grep -v "^${SELF}:" \
         || true)
     if [[ "${scope}" == "ours" && -n "${matches}" ]]; then
         matches=$(printf '%s\n' "${matches}" | grep -vE "${VENDORED}" || true)
@@ -144,6 +144,19 @@ scan_pattern "Service-user account in user@host form" \
 
 scan_pattern "Maintainer contact addresses" \
     '(andser@|andrew@dt-ltd)'
+
+# The fleet's own wireless network names: the network the rigs join
+# and the hotspot name a specific unit derives from its MAC.
+#
+# Deliberately two literals, not a generic SSID or MAC class. A
+# pattern shaped like "any SSID" or "any MAC" would fail every
+# honest wifi fixture in this repo — parsers for `iw` output have to
+# carry realistic sample text — and the leak is not the shape of an
+# SSID, it is these two names. Illustrative fixture values built
+# from the documented placeholder MAC (aa:11:22:33:44:66, whence
+# `evo-4466`) are not devices and are not matched.
+scan_pattern "Fleet wireless network names" \
+    'M\(edia\) Spot|evo-d674'
 
 # ------------------------------- verdict -------------------------------
 
