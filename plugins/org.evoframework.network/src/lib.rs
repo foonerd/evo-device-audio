@@ -6481,28 +6481,44 @@ impl NmInner {
                     && !intent_hotspot_if_is_explicit
                     && phy_supports_concurrent;
 
-                // Empty `sta_ssid` under `WifiRole::Sta` is
-                // Forget-STA, not Forget-radio. Purge the STA
-                // profile + PSK so NM cannot autoconnect back.
-                // `fallback.hotspot_enabled` still owns the AP:
-                // a name/enable apply with no saved STA must
-                // reach the hotspot tail. Returning here was
-                // the regression — glass Save on the AP downed
-                // the hotspot and never wrote it back.
+                // An empty `sta_ssid` under `WifiRole::Sta` is an
+                // absent station, not an instruction to delete
+                // one. Forgetting is a verb —
+                // `network.nm.wifi.forget` — and only that verb
+                // removes the NM profile and the PSK sidecar.
+                //
+                // Apply carries the whole intent, so every save
+                // that never touched the station fields arrives
+                // here with an empty SSID: an AP rename, a
+                // hotspot enable toggle, any glass Save from a
+                // page that does not own the station. Deleting
+                // on those was forget-by-apply — it took out a
+                // live association and its secret, and the
+                // operator had no way back because the secret
+                // was gone with it. With no station present it
+                // is equally a no-op: nothing to write, nothing
+                // to delete.
+                //
+                // Control must still reach the hotspot tail
+                // below. `fallback.hotspot_enabled` owns the AP,
+                // and returning from here is what downed the
+                // hotspot on an AP-only save and never wrote it
+                // back.
                 if intent.wifi.sta_ssid.trim().is_empty() {
-                    self.purge_wifi_sta(&mut steps).await;
                     steps.push(
                         "wifi.sta_ssid empty under role=Sta \
-                         — treated as forget; NM STA profile + \
-                         PSK sidecar purged"
+                         — no station in intent; NM STA profile \
+                         and PSK sidecar left untouched \
+                         (forgetting is the wifi.forget verb)"
                             .to_string(),
                     );
                     if !intent.fallback.hotspot_enabled {
                         self.connection_down_lossy(&hs_name).await;
                         steps.push(
-                            "hotspot brought down (best effort)".to_string(),
+                            "hotspot disabled in intent; brought down \
+                             (best effort)"
+                                .to_string(),
                         );
-                        return Ok(ApplyReport { ok: true, steps });
                     }
                 } else {
                     self.connection_down_lossy(&hs_name).await;
@@ -6751,8 +6767,8 @@ impl NmInner {
                             .await?;
                         } else if sta_ifname == resolved_ap_ifname {
                             steps.push(
-                                "shared iface: no STA to restore \
-                                 (forgotten); hotspot left up"
+                                "shared iface: no station in intent to \
+                                 restore; hotspot left up"
                                     .to_string(),
                             );
                         } else {
@@ -10496,12 +10512,12 @@ exit 0\n",
             .map(|s| s.as_str().unwrap_or_default().to_string())
             .collect();
         assert!(
-            steps.iter().any(|s| s.contains("treated as forget")),
-            "empty STA must still forget: {steps:?}"
+            steps.iter().any(|s| s.contains("no station in intent")),
+            "empty STA must be reported as absent, not forgotten: {steps:?}"
         );
         assert!(
             !steps.iter().any(|s| s.contains("hotspot brought down")),
-            "enabled hotspot must not be torn down by Forget-STA: {steps:?}"
+            "enabled hotspot must not be torn down by an AP save: {steps:?}"
         );
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let hotspot_ups = calls
@@ -10511,6 +10527,168 @@ exit 0\n",
         assert_eq!(
             hotspot_ups, 1,
             "AP Save must raise the hotspot once, not bounce it: {calls}"
+        );
+        // Profile survival is asserted by
+        // `apply_with_empty_sta_ssid_keeps_a_saved_station_and_its_secret`,
+        // whose mock reports the profile present. Asserting it here
+        // would be vacuous: this mock answers `connection show` with
+        // nothing, so a purge would find nothing to delete and the
+        // assertion could not fail.
+    }
+
+    /// An apply whose intent carries no station SSID must leave a
+    /// saved station and its secret exactly where they are.
+    ///
+    /// Apply ships the whole intent, so any save from a page that
+    /// does not own the station fields arrives with an empty SSID.
+    /// Treating that as a forget deleted the NM profile and the PSK
+    /// sidecar together, which is unrecoverable from the glass: the
+    /// association is gone and so is the passphrase needed to
+    /// rebuild it. Forgetting is the `wifi.forget` verb, and only
+    /// the verb.
+    #[tokio::test]
+    async fn apply_with_empty_sta_ssid_keeps_a_saved_station_and_its_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-keep-sta.sh");
+        let log = dir.path().join("nmcli.log");
+
+        // `connection show` reports the station profile present, so
+        // a purge would find something to delete and the assertion
+        // below is not vacuous.
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  *connection\\ show*) printf 'evo-network-wifi-sta\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        std::fs::write(&psk_path, "supersecret").expect("write PSK");
+
+        // An AP-only save: the station fields are untouched and so
+        // arrive empty.
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "",
+                        "ap_ssid": "evo-4466",
+                        "ap_channel": 4
+                    },
+                    "fallback": { "hotspot_enabled": true }
+                }
+            }),
+            1904,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.lines().any(
+                |l| l.starts_with("connection delete evo-network-wifi-sta")
+            ),
+            "the station profile must survive an empty-SSID apply: {calls}"
+        );
+        assert!(
+            psk_path.exists(),
+            "the PSK sidecar must survive an empty-SSID apply"
+        );
+    }
+
+    /// The counterpart: the verb still purges both. If this ever
+    /// fails alongside the test above passing, forgetting has been
+    /// removed rather than moved.
+    #[tokio::test]
+    async fn wifi_forget_verb_still_purges_the_profile_and_the_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-forget-verb.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  *connection\\ show*) printf 'evo-network-wifi-sta\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        std::fs::write(&psk_path, "supersecret").expect("write PSK");
+        let mut seeded = NetworkIntent::default();
+        seeded.wifi.sta_ssid = "Guest (Lobby) Net".to_string();
+        p.save_intent(&seeded).await.expect("save intent");
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_WIFI_FORGET,
+                serde_json::json!({}),
+                1905,
+            ))
+            .await
+            .expect("forget");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert_eq!(v["forgotten"], true);
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().any(
+                |l| l.starts_with("connection delete evo-network-wifi-sta")
+            ),
+            "the verb must delete the station profile: {calls}"
+        );
+        assert!(!psk_path.exists(), "the verb must remove the PSK sidecar");
+        let after = p.load_intent().await.expect("load intent");
+        assert!(
+            after.wifi.sta_ssid.is_empty(),
+            "the verb must blank the persisted SSID"
         );
     }
 
