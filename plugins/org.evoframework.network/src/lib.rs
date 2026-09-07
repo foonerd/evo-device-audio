@@ -6592,6 +6592,28 @@ impl NmInner {
                     "802-11-wireless-security",
                 ])
                 .await;
+            // The same distinction the write path draws, drawn on a
+            // profile that was already here.
+            //
+            // A device that once offered a standing access point
+            // still carries its profile, autoconnect and all, after
+            // the switch is turned off. Opening that profile for
+            // recovery and leaving autoconnect alone would bring it
+            // back at the next boot — open, and standing — which is
+            // the back door the write path was careful to close,
+            // reached instead through a leftover.
+            //
+            // Only when the switch is off. With it on, autoconnect
+            // belongs to the operator's standing access point and
+            // recovery has no business touching it.
+            if !intent.fallback.hotspot_enabled {
+                self.nm_set_autoconnect(hs_name, false).await;
+                steps.push(format!(
+                    "critical: {hs_name} opened for recovery with \
+                     autoconnect no (no standing AP is offered, so it \
+                     must not return after a reboot)"
+                ));
+            }
         } else {
             self.write_open_recovery_ap_profile(intent, hs_name, steps)
                 .await?;
@@ -13928,6 +13950,91 @@ exit 0\n",
         assert!(
             !calls.contains("connection down evo-network-wifi-sta"),
             "a serving station must never be taken down: {calls}"
+        );
+    }
+
+    /// A device that once offered a standing access point still
+    /// carries its profile after the switch is turned off,
+    /// autoconnect and all. Opening that leftover for recovery and
+    /// leaving autoconnect alone would bring it back at the next
+    /// boot — open, and standing. Same back door the write path
+    /// closes, reached through a profile that was already here.
+    #[tokio::test]
+    async fn recovery_disarms_a_leftover_profile_when_no_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot \
+                 connection.autoconnect no"
+            ),
+            "a leftover profile must not return after a reboot: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "the profile is disarmed, not replaced: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "an existing profile must not be rewritten: {calls}"
+        );
+    }
+
+    /// With a standing access point offered, autoconnect belongs to
+    /// the operator's profile and recovery has no business touching
+    /// it. Recovery still opens the profile and raises it.
+    #[tokio::test]
+    async fn recovery_leaves_autoconnect_alone_when_an_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(raised, "recovery still raises the AP: {steps:?}");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection.autoconnect"),
+            "a standing AP's autoconnect is the operator's: {calls}"
+        );
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot remove \
+                 802-11-wireless-security"
+            ),
+            "the profile is still opened for recovery: {calls}"
         );
     }
 }
