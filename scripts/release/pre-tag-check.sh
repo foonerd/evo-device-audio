@@ -83,6 +83,28 @@ else
     exit 1
 fi
 
+log_step "Gate 4b/7: scripts/preflight/check-public-leaks-positive.sh"
+if [[ -x "${REPO_ROOT}/scripts/preflight/check-public-leaks-positive.sh" ]]; then
+    if ! bash "${REPO_ROOT}/scripts/preflight/check-public-leaks-positive.sh"; then
+        log_fail "leak positive-control did not fire"
+        exit 1
+    fi
+else
+    log_fail "scripts/preflight/check-public-leaks-positive.sh missing"
+    exit 1
+fi
+
+log_step "Gate 4c/7: scripts/preflight/check-commit-message.sh --head"
+if [[ -x "${REPO_ROOT}/scripts/preflight/check-commit-message.sh" ]]; then
+    if ! bash "${REPO_ROOT}/scripts/preflight/check-commit-message.sh" --head; then
+        log_fail "HEAD commit message leak"
+        exit 1
+    fi
+else
+    log_fail "scripts/preflight/check-commit-message.sh missing"
+    exit 1
+fi
+
 # -------------------------------------------------------------
 # Gate 5: catalogue-schemas alignment (foot-lock preflight)
 # -------------------------------------------------------------
