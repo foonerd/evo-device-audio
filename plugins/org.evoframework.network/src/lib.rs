@@ -11169,11 +11169,7 @@ exit 0\n",
             nmcli_path.to_string_lossy().to_string();
         p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
 
-        let rows = p
-            .inner_mut()
-            .wifi_scan(Some("ap0"))
-            .await
-            .expect("scan");
+        let rows = p.inner_mut().wifi_scan(Some("ap0")).await.expect("scan");
         assert!(rows.is_empty(), "AP iface is not a scan target");
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
