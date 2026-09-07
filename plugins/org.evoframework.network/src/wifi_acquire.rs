@@ -259,11 +259,16 @@ pub struct NmProfileRow {
 /// Choose a Wi-Fi profile this plugin did not create.
 ///
 /// Skips the plugin's own station and hotspot profiles by name.
-/// Everything else that is Wi-Fi is a candidate, and the first is
-/// taken: NetworkManager lists profiles most-recently-used first,
-/// so on a device flashed with one network the first is the only
-/// one, and on a device with several it is the one last connected —
-/// which is the one the operator is on.
+/// Everything else that is Wi-Fi is a candidate and the first is
+/// taken.
+///
+/// No ordering is imposed and none is assumed. `nmcli connection
+/// show` returns rows in its own order unless asked otherwise, so
+/// on a device carrying several foreign profiles which one is first
+/// is not something this can claim to know. The case this serves is
+/// the one that occurs: a freshly imaged device has exactly one
+/// Wi-Fi profile, and the first is the only one. Imposing an order
+/// would need a measurement nobody has taken.
 pub fn pick_foreign_wifi_profile<'a>(
     rows: &'a [NmProfileRow],
     ours: &str,
