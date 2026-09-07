@@ -15,6 +15,25 @@
 # first, reads the planned diff, then re-runs without
 # `--dry-run` to actually mutate the public repo.
 #
+# Workflow-preservation contract: the wipe-and-copy step in §6
+# preserves the PUBLIC repo's `.github/workflows/` directory
+# verbatim and strips any workflow files from staging so `cp -a`
+# cannot leak eng-side workflow content into the public tree.
+# The public workflow set is the canonical shipping surface;
+# a wipe that copied staging over the public workflow directory
+# would delete public workflows or route public CI to the wrong
+# runner pool. This is a HARD invariant of the tool: never
+# remove the preservation predicate without operator
+# authorisation.
+#
+# `--dry-run` prints three buckets against the post-scrub
+# staging tree before any public mutation:
+#   WORKFLOW KEEP — public workflow filenames that survive
+#   WOULD ADD     — paths staging would introduce
+#   WOULD DELETE  — public paths staging would remove
+# Staging `.github/workflows/` and `target/` are excluded from
+# ADD/DELETE because the mutate path strips them.
+#
 # Usage:
 #
 #   scripts/release/promote.sh \
@@ -196,6 +215,43 @@ log_error() {
     printf '[promote.sh][ERROR] %s\n' "$*" >&2
 }
 
+# File-level promote plan. Workflows are a keep-list, not an
+# add/delete, because the mutate path restores public workflows
+# after wipe. Staging target/ is stripped before copy.
+print_promote_plan() {
+    local public_repo="$1"
+    local staging="$2"
+    local pub_file stg_file
+
+    printf 'WORKFLOW KEEP\n'
+    if [[ -d "${public_repo}/.github/workflows" ]]; then
+        ls -1 "${public_repo}/.github/workflows"
+    else
+        printf '(none)\n'
+    fi
+
+    pub_file="$(mktemp)"
+    stg_file="$(mktemp)"
+    git -C "${public_repo}" ls-files >"${pub_file}.raw"
+    grep -v '^\.github/workflows/' "${pub_file}.raw" >"${pub_file}.keep" || true
+    sort "${pub_file}.keep" >"${pub_file}"
+    rm -f "${pub_file}.raw" "${pub_file}.keep"
+    (
+        cd "${staging}"
+        find . -mindepth 1 \
+            \( -path './.git' -o -path './.git/*' \
+               -o -path './.github/workflows' -o -path './.github/workflows/*' \
+               -o -path './target' -o -path './target/*' \) -prune \
+            -o \( -type f -o -type l \) -print
+    ) | sed 's|^\./||' | sort >"${stg_file}"
+
+    printf 'WOULD ADD\n'
+    comm -13 "${pub_file}" "${stg_file}"
+    printf 'WOULD DELETE\n'
+    comm -23 "${pub_file}" "${stg_file}"
+    rm -f "${pub_file}" "${stg_file}"
+}
+
 # -------------------------------------------------------------
 # Precondition checks
 # -------------------------------------------------------------
@@ -297,23 +353,23 @@ log_step "Step 2/8: Applying .scrub-exclude"
 
 SCRUB_EXCLUDE="${STAGE_DIR}/.scrub-exclude"
 if [[ ! -f "${SCRUB_EXCLUDE}" ]]; then
-    log_warn "no .scrub-exclude in tag tree; skipping path-scrub step"
-else
-    while IFS= read -r path || [[ -n "${path}" ]]; do
-        # Skip blank lines and comments.
-        path="${path%%#*}"
-        path="${path%"${path##*[![:space:]]}"}"  # rtrim
-        path="${path#"${path%%[![:space:]]*}"}"  # ltrim
-        if [[ -z "${path}" ]]; then continue; fi
-        full="${STAGE_DIR}/${path}"
-        if [[ -e "${full}" ]]; then
-            log_step "  scrubbing: ${path}"
-            rm -rf "${full}"
-        else
-            log_step "  scrub no-op (already absent): ${path}"
-        fi
-    done < "${SCRUB_EXCLUDE}"
+    log_error "no .scrub-exclude in tag tree; refuse"
+    exit 4
 fi
+while IFS= read -r path || [[ -n "${path}" ]]; do
+    # Skip blank lines and comments.
+    path="${path%%#*}"
+    path="${path%"${path##*[![:space:]]}"}"  # rtrim
+    path="${path#"${path%%[![:space:]]*}"}"  # ltrim
+    if [[ -z "${path}" ]]; then continue; fi
+    full="${STAGE_DIR}/${path}"
+    if [[ -e "${full}" ]]; then
+        log_step "  scrubbing: ${path}"
+        rm -rf "${full}"
+    else
+        log_step "  scrub no-op (already absent): ${path}"
+    fi
+done < "${SCRUB_EXCLUDE}"
 
 # -------------------------------------------------------------
 # 3. Workspace member filter + Cargo.lock refresh
@@ -444,9 +500,11 @@ log_step "Step 7/8: Running cargo test --workspace --lib on staging tree"
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
     log_step "Step 8/8: --dry-run set; not mutating public repo"
+    print_promote_plan "${PUBLIC_REPO}" "${STAGE_DIR}"
     log_dry "would: cd ${PUBLIC_REPO}"
     log_dry "would: git reset --soft ${PREV_TAG}"
-    log_dry "would: replace working tree with staging contents"
+    log_dry "would: preserve public .github/workflows/ verbatim across the wipe"
+    log_dry "would: replace working tree with staging contents (workflows stripped from staging)"
     log_dry "would: git add -A && git commit -m 'release ${TAG}'"
     log_dry "would: git tag ${TAG}"
     if [[ ${NO_PUSH} -eq 0 ]]; then
@@ -463,15 +521,49 @@ log_step "Step 8/8: Applying staging to public main"
 
     git reset --soft "refs/tags/${PREV_TAG}"
 
+    # Preserve public .github/workflows/ across the wipe. The
+    # public workflow set is the canonical shipping surface;
+    # a wipe-and-copy that let staging land workflows over the
+    # public tree would delete public workflows or route public
+    # CI to the wrong runner pool. This is a HARD invariant of
+    # the tool: never remove the preservation predicate without
+    # operator authorisation.
+    PRESERVED_WORKFLOWS="$(mktemp -d -t evo-promote-workflows-XXXXXX)"
+    if [[ -d ".github/workflows" ]]; then
+        cp -a ".github/workflows/." "${PRESERVED_WORKFLOWS}/"
+    fi
+
     # Wipe the working tree (except .git) and replace from
     # staging. The reset --soft preserves the index pointing at
     # prev-tag; the per-file replace below builds the new
     # squashed commit's content.
     find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
+    # Strip staging's target/ before copy. Steps 4-7 (fmt / clippy /
+    # test) run cargo IN STAGING and leave a target/ tree behind;
+    # copying that over creates race hazards on cp -a against any
+    # parallel cargo state on public and bloats the release commit
+    # with build artefacts that are never part of the shipped
+    # source. The .scrub-exclude iteration at Step 2 runs BEFORE
+    # cargo populates target, so the entry there is a no-op — target/
+    # has to be stripped here, at the last moment before cp reads
+    # staging.
+    rm -rf "${STAGE_DIR}/target"
+
+    # Strip any workflows staging tried to introduce so cp -a
+    # cannot leak eng-side workflow content into the public tree.
+    rm -rf "${STAGE_DIR}/.github/workflows"
+
     # cp -a preserves attributes + dotfiles. The trailing /. on
     # the source ensures hidden files are copied too.
     cp -a "${STAGE_DIR}/." .
+
+    # Restore preserved public workflows verbatim.
+    if [[ -n "$(ls -A "${PRESERVED_WORKFLOWS}" 2>/dev/null || true)" ]]; then
+        mkdir -p ".github/workflows"
+        cp -a "${PRESERVED_WORKFLOWS}/." ".github/workflows/"
+    fi
+    rm -rf "${PRESERVED_WORKFLOWS}"
 
     git add -A
     git commit -m "release ${TAG}"
