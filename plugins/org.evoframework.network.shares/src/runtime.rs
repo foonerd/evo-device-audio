@@ -3848,10 +3848,16 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 let port = probe_port_for_fstype(record.fstype);
                 if !(self.host_reachable)(&host, port) {
                     let err = MountError::HostUnreachable { host, port };
-                    self.set_share_state(
+                    // Classified, not bare: the short poll selects
+                    // on this class, so a state written without it
+                    // would leave the share on the remount cadence
+                    // — the very wait this cut removes.
+                    let class = err.failure_class();
+                    self.set_share_state_classified(
                         share_id,
                         MountState::Failed,
                         Some(err.to_string()),
+                        Some(class),
                         None,
                     )
                     .await;
@@ -5197,6 +5203,19 @@ pub type L3Gate =
 /// [`FailureClass`].
 pub const DEFAULT_REMOUNT_CADENCE_MS: u64 = 5 * 60 * 1_000;
 
+/// Cadence for polling shares whose host has not answered
+/// (5 seconds).
+///
+/// Separate from [`DEFAULT_REMOUNT_CADENCE_MS`] because the two
+/// waits mean different things. A dialect failure, a bad option,
+/// a busy server — those are answers, and re-asking every few
+/// seconds is a storm against a NAS that already replied. A host
+/// that has not answered has given no answer to respect, the
+/// question costs one refused connection, and the operator who
+/// just switched their NAS on is standing in front of the device
+/// waiting for the share to appear.
+pub const DEFAULT_UNREACHABLE_POLL_MS: u64 = 5_000;
+
 /// Default cadence for the background discovery task (5 minutes).
 /// Aligns with the operator-widgets contract's
 /// `network.discovered.nas.card.list` refresh policy.
@@ -5355,6 +5374,52 @@ impl NetworkSharesRuntime {
     /// to mount because the cadence ticked again, and hammering it
     /// is a credential storm against the server plus a churn of
     /// identical failures over the real state.
+    /// Retry only the shares whose last failure was
+    /// [`FailureClass::Unreachable`] — the ones waiting on a host
+    /// that has not answered.
+    ///
+    /// Runs on its own short cadence so a NAS coming back is
+    /// noticed in seconds rather than at the next remount tick.
+    /// It is affordable precisely because those shares short-
+    /// circuit on one refused connection: no dialect ladder, no
+    /// subprocess, no credential work. Shares in any other class
+    /// are untouched here and keep the remount cadence.
+    pub async fn unreachable_poll_pass(&self) -> Vec<BootMountOutcome> {
+        // Adopt any host mounts that came back first, exactly as
+        // the remount pass does: a share whose OS mount is live
+        // must not sit in a retry set.
+        self.reconcile_os_mount_states().await;
+
+        let candidates: Vec<ShareId> = {
+            let g = self.share_states.lock().await;
+            g.iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e.state,
+                        MountState::Failed | MountState::Unmounted
+                    )
+                })
+                .filter(|(_, e)| {
+                    e.failure_class == Some(FailureClass::Unreachable)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut outcomes = Vec::with_capacity(candidates.len());
+        for share_id in candidates {
+            let result = self.mount_share(&share_id).await;
+            outcomes.push(BootMountOutcome { share_id, result });
+        }
+        outcomes
+    }
+
+    /// Retry the shares in [`MountState::Failed`] or
+    /// [`MountState::Unmounted`] whose last failure could plausibly
+    /// clear on its own, on the remount cadence.
+    ///
+    /// A [`FailureClass::Permanent`] failure — a refused password
+    /// above all — is left alone: it will not mount because the
+    /// cadence ticked, and re-attempting is a credential storm.
     pub async fn remount_retry_pass(&self) -> Vec<BootMountOutcome> {
         // Adopt any host mounts that came back (or survived)
         // before selecting Failed/Unmounted candidates — a share
@@ -5418,6 +5483,30 @@ pub fn spawn_remount_task(
             ticker.tick().await;
             let Some(rt) = weak.upgrade() else { return };
             let _ = rt.remount_retry_pass().await;
+        }
+    })
+}
+
+/// Spawn a background task that polls only the shares waiting on
+/// an unanswered host, on a short cadence.
+///
+/// Deliberately its own task rather than a faster shared ticker:
+/// the remount cadence still governs every other failure class,
+/// so a dialect failure is not re-attempted every few seconds.
+pub fn spawn_unreachable_poll_task(
+    runtime: Arc<NetworkSharesRuntime>,
+    cadence: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(&runtime);
+    drop(runtime);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(rt) = weak.upgrade() else { return };
+            let _ = rt.unreachable_poll_pass().await;
         }
     })
 }
@@ -6810,6 +6899,74 @@ tmpfs /tmp tmpfs rw 0 0\n";
     fn probe_port_is_total_over_filesystem_type() {
         assert_eq!(probe_port_for_fstype(FsType::Cifs), 445);
         assert_eq!(probe_port_for_fstype(FsType::Nfs), 2049);
+    }
+
+    #[test]
+    fn the_unreachable_poll_is_faster_than_the_remount_cadence() {
+        // The whole point of the separate task. If these ever
+        // converge, a dialect failure starts storming a NAS.
+        // A const block, so converging cadences are a compile
+        // error rather than a test that someone can delete.
+        const {
+            assert!(DEFAULT_UNREACHABLE_POLL_MS < DEFAULT_REMOUNT_CADENCE_MS);
+            assert!(DEFAULT_UNREACHABLE_POLL_MS == 5_000);
+            assert!(DEFAULT_REMOUNT_CADENCE_MS == 5 * 60 * 1_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_poll_pass_retries_an_unreachable_share() {
+        // A NAS that comes back must be picked up by the short
+        // poll, not waited on for the remount tick.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor);
+        let record = built_record("nas_off", "192.0.2.26");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let _ = rt.mount_share(&id).await;
+
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the share waiting on an unanswered host is the poll's business"
+        );
+        assert_eq!(outcomes[0].share_id, id);
+    }
+
+    #[tokio::test]
+    async fn the_poll_pass_leaves_every_other_failure_class_alone() {
+        // A dialect failure already got an answer from the server.
+        // Re-asking it every 5 s is the storm this task must not
+        // become, so the poll must not select it.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("cifs: bad option 'vers=2.0'"),
+            failure_output("cifs: bad option 'vers=2.1'"),
+            failure_output("cifs: bad option 'vers=3.0'"),
+            failure_output("cifs: bad option 'vers=3.02'"),
+            failure_output("cifs: bad option 'vers=3.1.1'"),
+        ]);
+        // Host answers; the ladder runs and is exhausted.
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| true))
+            .build();
+        let record = built_record("bad_dialects", "192.0.2.27");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert_eq!(err.failure_class(), FailureClass::Transient);
+
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert!(
+            outcomes.is_empty(),
+            "a share that already got an answer keeps the remount cadence"
+        );
     }
 
     #[tokio::test]

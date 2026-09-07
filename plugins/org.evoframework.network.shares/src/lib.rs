@@ -68,8 +68,9 @@ pub mod runtime;
 
 use runtime::{
     is_network_shares_verb, spawn_discovery_task, spawn_remount_task,
-    NetworkSharesRuntime, VerbDispatchError, DEFAULT_DISCOVERY_CADENCE_MS,
-    DEFAULT_REMOUNT_CADENCE_MS, NETWORK_SHARES_VERBS,
+    spawn_unreachable_poll_task, NetworkSharesRuntime, VerbDispatchError,
+    DEFAULT_DISCOVERY_CADENCE_MS, DEFAULT_REMOUNT_CADENCE_MS,
+    DEFAULT_UNREACHABLE_POLL_MS, NETWORK_SHARES_VERBS,
 };
 
 /// Embedded manifest source.
@@ -164,6 +165,7 @@ pub struct NetworkSharesPlugin {
     loaded: bool,
     runtime: Option<Arc<NetworkSharesRuntime>>,
     remount_task: Option<tokio::task::JoinHandle<()>>,
+    unreachable_poll_task: Option<tokio::task::JoinHandle<()>>,
     discovery_task: Option<tokio::task::JoinHandle<()>>,
     boot_mount_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -175,6 +177,7 @@ impl NetworkSharesPlugin {
             loaded: false,
             runtime: None,
             remount_task: None,
+            unreachable_poll_task: None,
             discovery_task: None,
             boot_mount_task: None,
         }
@@ -385,6 +388,14 @@ impl Plugin for NetworkSharesPlugin {
                 Arc::clone(&rt),
                 std::time::Duration::from_millis(DEFAULT_REMOUNT_CADENCE_MS),
             ));
+            // Shares waiting on an unanswered host get their own
+            // short cadence. The remount task above keeps the
+            // 5-minute interval for every other failure class, so
+            // a dialect failure is not re-attempted every 5 s.
+            self.unreachable_poll_task = Some(spawn_unreachable_poll_task(
+                Arc::clone(&rt),
+                std::time::Duration::from_millis(DEFAULT_UNREACHABLE_POLL_MS),
+            ));
             self.discovery_task = Some(spawn_discovery_task(
                 Arc::clone(&rt),
                 std::time::Duration::from_millis(DEFAULT_DISCOVERY_CADENCE_MS),
@@ -407,6 +418,9 @@ impl Plugin for NetworkSharesPlugin {
                 h.abort();
             }
             if let Some(h) = self.remount_task.take() {
+                h.abort();
+            }
+            if let Some(h) = self.unreachable_poll_task.take() {
                 h.abort();
             }
             if let Some(h) = self.discovery_task.take() {
