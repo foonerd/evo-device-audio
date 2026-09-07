@@ -6547,9 +6547,26 @@ impl NmInner {
         hs_name: &str,
         steps: &mut Vec<String>,
     ) -> Result<bool, PluginError> {
-        if !intent.fallback.hotspot_enabled || hs_name.trim().is_empty() {
+        if hs_name.trim().is_empty() {
             return Ok(false);
         }
+        // `fallback.hotspot_enabled` is deliberately not consulted.
+        //
+        // It is the standing-AP switch: whether this device offers
+        // an access point as part of how it normally runs. It is not
+        // a statement that the operator would rather the device be
+        // unreachable. Treating "no standing AP" as "stay dark when
+        // you fall off the network" left the only recovery route
+        // vetoed by a setting about something else, on exactly the
+        // devices that needed it — a Wi-Fi-only box that loses its
+        // network has no other way to be reached.
+        //
+        // The switch keeps its meaning everywhere it means
+        // something: apply still raises and lowers the standing AP
+        // by it, and a profile raised here does not become a
+        // standing one — see the autoconnect note in
+        // `write_open_recovery_ap_profile`.
+        //
         // Broad uplink check. Previously gated on
         // `ethernet_intent_has_no_carrier` alone, which failed
         // Wi-Fi-only deployments (never raised) and "all radios
@@ -6559,15 +6576,48 @@ impl NmInner {
         if !self.no_serviceable_uplink(intent).await? {
             return Ok(false);
         }
-        let _ = self
-            .nmcli_output(&[
-                "connection",
-                "modify",
-                hs_name,
-                "remove",
-                "802-11-wireless-security",
-            ])
-            .await;
+
+        // There may be no profile to raise. The standing AP is
+        // written by apply only when the switch is on, so a device
+        // that never offered one has nothing here — which is
+        // precisely the device that has just run out of ways to be
+        // reached.
+        if self.nm_connection_exists(hs_name).await {
+            let _ = self
+                .nmcli_output(&[
+                    "connection",
+                    "modify",
+                    hs_name,
+                    "remove",
+                    "802-11-wireless-security",
+                ])
+                .await;
+        } else {
+            self.write_open_recovery_ap_profile(intent, hs_name, steps)
+                .await?;
+        }
+
+        // Free the radio before asking it to beacon.
+        //
+        // On a single-radio chipset an AP cannot come up while the
+        // station still holds the PHY: the activation is refused
+        // busy and nothing beacons. Nothing is lost by taking the
+        // station down here, because reaching this point has already
+        // established that no Wi-Fi device is associated — that is
+        // what `no_serviceable_uplink` tested. What the station may
+        // still be doing is holding the radio while it retries a
+        // network that is not answering, and that is the state which
+        // refuses the AP.
+        //
+        // This is a down, not a delete: the profile, its passphrase
+        // and its autoconnect all survive, so the station comes back
+        // on its own the moment its network does.
+        self.connection_down_lossy(NM_CON_WIFI_STA).await;
+        steps.push(format!(
+            "critical: released {NM_CON_WIFI_STA} so the radio can carry \
+             the recovery AP (profile and secret untouched)"
+        ));
+
         steps.push(format!(
             "critical: no serviceable uplink past grace; forcing open AP fallback on {}",
             hs_name
@@ -6577,6 +6627,75 @@ impl NmInner {
                 .await,
             HotspotBringUp::Up
         ))
+    }
+
+    /// Write an open access point for a device that has run out of
+    /// ways to be reached.
+    ///
+    /// Open by construction: this exists so somebody standing next
+    /// to the device can connect to it and fix the network, and a
+    /// passphrase nobody has been told is the same as no access
+    /// point at all.
+    ///
+    /// **`connection.autoconnect` is `no`, and that is the whole
+    /// distinction between recovery and policy.** The standing AP
+    /// that apply writes autoconnects, because the operator asked
+    /// for an access point. This one is raised now, by this call,
+    /// and does not return after a reboot. Otherwise a device that
+    /// was briefly offline would come back permanently beaconing an
+    /// open network the operator never asked for — which would make
+    /// `fallback.hotspot_enabled` mean nothing, by the back door,
+    /// on exactly the devices this is trying to help.
+    ///
+    /// Not bound to an interface name. Recovery has no idea what
+    /// this device calls its radio, and the station has just been
+    /// released, so the profile attaches to whichever Wi-Fi device
+    /// is free.
+    async fn write_open_recovery_ap_profile(
+        &self,
+        intent: &NetworkIntent,
+        hs_name: &str,
+        steps: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        let ssid_owned;
+        let ssid = if intent.wifi.ap_ssid.trim().is_empty() {
+            ssid_owned = default_ap_ssid();
+            ssid_owned.as_str()
+        } else {
+            intent.wifi.ap_ssid.trim()
+        };
+        if ssid.is_empty() {
+            steps.push(
+                "warning: no name available for a recovery AP; \
+                 skipping"
+                    .to_string(),
+            );
+            return Ok(());
+        }
+        self.nmcli_output_owned(&[
+            "connection".to_string(),
+            "add".to_string(),
+            "type".to_string(),
+            "wifi".to_string(),
+            "con-name".to_string(),
+            hs_name.to_string(),
+            "ssid".to_string(),
+            ssid.to_string(),
+            "wifi.mode".to_string(),
+            "ap".to_string(),
+            "ipv4.method".to_string(),
+            "shared".to_string(),
+            "ipv6.method".to_string(),
+            "ignore".to_string(),
+            "autoconnect".to_string(),
+            "no".to_string(),
+        ])
+        .await?;
+        steps.push(format!(
+            "critical: wrote open recovery AP profile {hs_name} \
+             (autoconnect no; raised now, not standing)"
+        ));
+        Ok(())
     }
 
     async fn nm_active_connection_names_on_device(
@@ -13582,6 +13701,233 @@ exit 0\n",
         assert!(
             calls.trim().is_empty(),
             "a declared station must cost no nmcli calls at all: {calls}"
+        );
+    }
+
+    // --- recovery access point for an unreachable device ---
+
+    /// nmcli mock for the recovery tests. Reports one wifi device in
+    /// the state named by `wifi_state`, reports the hotspot profile
+    /// present or absent per `hotspot_exists`, and succeeds at
+    /// everything else. Every invocation is logged in order, so a
+    /// test can assert on sequence as well as content.
+    fn recovery_nmcli_mock(
+        dir: &Path,
+        wifi_state: &str,
+        hotspot_exists: bool,
+    ) -> PathBuf {
+        let path = dir.join("nmcli-recovery.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection show evo-network-hotspot\") exit {hs_rc} ;;\n\
+  \"-t -f GENERAL.DEVICE\"*)\n\
+      printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 ({state})\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                hs_rc = if hotspot_exists { 0 } else { 1 },
+                state = wifi_state,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    fn recovery_plugin(dir: &Path, nmcli: &Path) -> NetworkPlugin {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli.to_string_lossy().into_owned();
+        // No `iw` on the box under test: the device-table read
+        // tolerates its absence, which keeps this fixture about
+        // recovery rather than about radio introspection.
+        p.inner_mut().config.iw_path =
+            dir.join("no-such-iw").to_string_lossy().into_owned();
+        p
+    }
+
+    /// A device with no way to be reached must raise an access point
+    /// even though it offers no standing one.
+    ///
+    /// `fallback.hotspot_enabled` says whether an access point is
+    /// part of how this device normally runs. It does not say the
+    /// operator would rather the device stayed dark after falling
+    /// off the network. Reading it as a veto left a Wi-Fi-only box
+    /// that lost its network with no route back at all.
+    #[tokio::test]
+    async fn recovery_raises_an_ap_even_when_no_standing_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(raised, "the recovery AP must come up: {steps:?}");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "the AP must be raised: {calls}"
+        );
+    }
+
+    /// A profile recovery writes is open, and does **not** become a
+    /// standing access point. Autoconnect is the whole distinction:
+    /// without it a device that was briefly offline would come back
+    /// permanently beaconing an open network nobody asked for, which
+    /// would make the standing-AP switch meaningless by the back
+    /// door.
+    #[tokio::test]
+    async fn a_recovery_profile_is_open_and_does_not_autoconnect() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        let add = calls
+            .lines()
+            .find(|l| l.starts_with("connection add type wifi"))
+            .expect("a profile must be written when none exists");
+        assert!(add.contains("wifi.mode ap"), "{add}");
+        assert!(add.contains("ssid evo-4466"), "{add}");
+        assert!(
+            add.contains("autoconnect no"),
+            "a recovery AP must not return after a reboot: {add}"
+        );
+        assert!(
+            !add.contains("wifi-sec"),
+            "a recovery AP must be open — a passphrase nobody has \
+             been told is the same as no AP at all: {add}"
+        );
+    }
+
+    /// On a single-radio chipset the AP cannot come up while the
+    /// station still holds the radio. The station goes down first,
+    /// and it is a down and not a delete: nothing about the saved
+    /// network changes, so it returns on its own when its network
+    /// does.
+    #[tokio::test]
+    async fn recovery_releases_the_station_before_raising_the_ap() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        let lines: Vec<&str> = calls.lines().collect();
+        let down = lines
+            .iter()
+            .position(|l| *l == "connection down evo-network-wifi-sta")
+            .expect("the station must be released");
+        let up = lines
+            .iter()
+            .position(|l| l.starts_with("connection up evo-network-hotspot"))
+            .expect("the AP must be raised");
+        assert!(
+            down < up,
+            "the station must be released before the AP is raised: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "recovery must never delete the saved station: {calls}"
+        );
+        // An existing profile is opened rather than replaced.
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot remove \
+                 802-11-wireless-security"
+            ),
+            "an existing hotspot profile must be opened: {calls}"
+        );
+    }
+
+    /// Recovery is for a device that cannot be reached. A device
+    /// with a working uplink is reachable, so nothing is raised and
+    /// nothing is taken down — least of all the station carrying
+    /// that uplink.
+    #[tokio::test]
+    async fn recovery_stays_out_of_the_way_while_an_uplink_is_serving() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(!raised, "an associated station is a serviceable uplink");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-hotspot"),
+            "no AP may be raised while the uplink works: {calls}"
+        );
+        assert!(
+            !calls.contains("connection down evo-network-wifi-sta"),
+            "a serving station must never be taken down: {calls}"
         );
     }
 }
