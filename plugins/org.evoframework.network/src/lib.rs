@@ -5216,6 +5216,97 @@ impl NmInner {
         }
     }
 
+    /// Is this profile currently activated?
+    ///
+    /// NetworkManager reports `GENERAL.STATE` as `activated` for a
+    /// profile that is up and returns nothing at all for one that is
+    /// not, so absence is the negative rather than a separate
+    /// question.
+    async fn nm_profile_is_active(&self, name: &str) -> bool {
+        self.nm_profile_field(name, "GENERAL.STATE")
+            .await
+            .is_some_and(|s| s.trim() == "activated")
+    }
+
+    /// Does the profile NetworkManager holds already carry
+    /// everything this apply would write to it?
+    ///
+    /// Takes the very argument list that would be written, so the
+    /// question asked is exactly the change proposed and the two
+    /// cannot drift apart.
+    ///
+    /// Returns false for anything it cannot prove. An unreadable
+    /// field, a value that does not compare, a profile that is not
+    /// up: all of them mean "not known to match", and the caller
+    /// goes on to assert the profile as it always did.
+    async fn nm_live_profile_satisfies(
+        &self,
+        name: &str,
+        props: &[String],
+    ) -> bool {
+        if !self.nm_profile_is_active(name).await {
+            return false;
+        }
+        for pair in props.chunks(2) {
+            let [key, want] = pair else {
+                // An odd trailing element means the caller built the
+                // list differently than assumed; refuse to guess.
+                return false;
+            };
+            let read_as = match nm_prop_read_name(key) {
+                NmPropRead::Field(f) => f,
+                // nmcli withholds secrets and this never asks; the
+                // caller handles them separately.
+                NmPropRead::Secret => continue,
+                // Nothing is assumed about a key this does not know.
+                NmPropRead::Unknown => return false,
+            };
+            let live = self
+                .nm_profile_field(name, read_as)
+                .await
+                .unwrap_or_default();
+            if !nm_prop_values_match(want, &live) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Was the passphrase written after the profile last came up?
+    ///
+    /// A running access point keeps the key it was raised with, so a
+    /// changed passphrase is stored but not on the air until the
+    /// profile is raised again. NetworkManager will not hand back
+    /// the stored key to compare, and asking for it is forbidden, so
+    /// the comparison is by time instead: the sidecar's last write
+    /// against the profile's last activation, both of which are
+    /// already recorded.
+    ///
+    /// True — meaning "re-raise it" — for anything unprovable.
+    async fn nm_secret_is_newer_than_activation(
+        &self,
+        name: &str,
+        secret_path: &Path,
+    ) -> bool {
+        let Ok(meta) = tokio::fs::metadata(secret_path).await else {
+            return true;
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        let Ok(written) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            return true;
+        };
+        let Some(activated) = self
+            .nm_profile_field(name, "connection.timestamp")
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
+            return true;
+        };
+        activated == 0 || written.as_secs() > activated
+    }
+
     async fn ensure_ethernet(
         &self,
         intent: &NetworkIntent,
@@ -5270,14 +5361,38 @@ impl NmInner {
         );
 
         if self.nm_connection_exists(NM_CON_ETHERNET).await {
+            // What this apply is asking of the profile, as one list:
+            // written below, and compared against the live profile
+            // to decide whether raising it would change anything.
+            let mut ask: Vec<String> =
+                vec!["connection.interface-name".into(), ifname.clone()];
+            ask.extend(props.clone());
+
+            // A link that is already up and already carries this
+            // exact configuration has nothing to gain from being
+            // raised again, and something to lose: `connection up`
+            // on an active profile is a fresh activation, so the
+            // link drops and returns. On a wired device that is the
+            // operator's session going away mid-save, for no change
+            // at all.
+            //
+            // Ethernet carries no secret, so everything asked of it
+            // can be read back and the answer is either proven or
+            // the profile is asserted as before.
+            if self.nm_live_profile_satisfies(NM_CON_ETHERNET, &ask).await {
+                steps.push(format!(
+                    "{NM_CON_ETHERNET} is already up and already matches \
+                     the intent; left alone"
+                ));
+                return Ok(());
+            }
+
             let mut args = vec![
                 "connection".into(),
                 "modify".into(),
                 NM_CON_ETHERNET.into(),
-                "connection.interface-name".into(),
-                ifname.clone(),
             ];
-            args.extend(props);
+            args.extend(ask);
             self.nmcli_output_owned(&args).await?;
             steps.push(format!("modified {NM_CON_ETHERNET}"));
         } else {
@@ -5972,7 +6087,55 @@ impl NmInner {
             ]);
         }
 
+        // Asked before anything is written, because the question is
+        // whether the profile NetworkManager holds *right now*
+        // already matches — not whether it will once this apply has
+        // rewritten it, which it always would.
         if self.nm_connection_exists(hotspot_name).await {
+            let mut already_satisfied = self
+                .nm_live_profile_satisfies(hotspot_name, &modify[3..])
+                .await;
+            if already_satisfied && psk.is_some() {
+                // Everything readable matches, so the one thing that
+                // could still differ is the passphrase — which
+                // NetworkManager will not show and this will not
+                // ask for. A running access point keeps the key it
+                // was raised with, so a passphrase written since
+                // then is stored but not yet on the air, and the
+                // profile does have to be raised again.
+                let psk_path = self.ap_psk_path()?;
+                if self
+                    .nm_secret_is_newer_than_activation(hotspot_name, &psk_path)
+                    .await
+                {
+                    already_satisfied = false;
+                }
+            }
+
+            // Leave it alone means leave it alone: nothing is
+            // written and nothing is raised.
+            //
+            // An access point that is already up and already
+            // beaconing this configuration has nothing to gain from
+            // any of the three writes below. Storing the same values
+            // back is not free — it moves the profile under
+            // NetworkManager for no change — and the security strip
+            // on the open path is a second write that takes the
+            // setting off the stored profile while the air keeps
+            // whatever it was raised with. Skipping only the raise
+            // would leave both of those, which is the disturbance
+            // this exists to remove, arriving by a different door.
+            //
+            // When the check says raise, everything below runs
+            // exactly as it did: write, then raise.
+            if already_satisfied {
+                steps.push(format!(
+                    "hotspot {hotspot_name} is already up and already \
+                     matches the intent; left alone"
+                ));
+                return Ok(());
+            }
+
             self.nmcli_output_owned(&modify).await?;
             if psk.is_none() {
                 let _ = self
@@ -6029,6 +6192,7 @@ impl NmInner {
             self.nmcli_output_owned(&add).await?;
             steps.push(format!("added hotspot profile {hotspot_name}"));
         }
+
         match self
             .connection_up_hotspot_with_retries(hotspot_name, steps)
             .await
@@ -9327,6 +9491,90 @@ fn sta_candidate_score(
         StaSelectionMode::PreferBand => (signal * 2) + pref,
         StaSelectionMode::LockBssid => signal,
     }
+}
+
+/// How a written property can be read back for comparison.
+#[derive(Debug, PartialEq, Eq)]
+enum NmPropRead {
+    /// Read it back under this field name and compare.
+    Field(&'static str),
+    /// A secret. Never read, never compared — the caller decides
+    /// separately what to do about secrets.
+    Secret,
+    /// Not a key this comparison knows how to read back. The
+    /// comparison fails rather than guessing, so the profile is
+    /// asserted as it always was.
+    Unknown,
+}
+
+/// The name a written property answers to when read back.
+///
+/// nmcli accepts short aliases when writing — `wifi.mode`,
+/// `wifi-sec.key-mgmt` — and rejects those same names when reading,
+/// where only the long form is a field. Measured, not assumed:
+/// `nmcli -g wifi.mode connection show <id>` answers
+/// `invalid field 'wifi.mode'`. Comparing by the written name would
+/// therefore never match on an aliased key, and a check that never
+/// matches is a check that does nothing.
+///
+/// Secrets are [`NmPropRead::Secret`]. NetworkManager withholds
+/// them unless asked with `-s` — a passphrase reads back as
+/// `<hidden>` — and asking is not something this plugin does.
+fn nm_prop_read_name(write_key: &str) -> NmPropRead {
+    match write_key {
+        k if k.starts_with("wifi-sec.")
+            || k.starts_with("802-11-wireless-security.") =>
+        {
+            NmPropRead::Secret
+        }
+        "wifi.mode" | "802-11-wireless.mode" => {
+            NmPropRead::Field("802-11-wireless.mode")
+        }
+        "wifi.ssid" | "802-11-wireless.ssid" => {
+            NmPropRead::Field("802-11-wireless.ssid")
+        }
+        "wifi.hidden" | "802-11-wireless.hidden" => {
+            NmPropRead::Field("802-11-wireless.hidden")
+        }
+        "wifi.band" | "802-11-wireless.band" => {
+            NmPropRead::Field("802-11-wireless.band")
+        }
+        "wifi.channel" | "802-11-wireless.channel" => {
+            NmPropRead::Field("802-11-wireless.channel")
+        }
+        "autoconnect" | "connection.autoconnect" => {
+            NmPropRead::Field("connection.autoconnect")
+        }
+        "connection.interface-name" => {
+            NmPropRead::Field("connection.interface-name")
+        }
+        "connection.autoconnect-priority" => {
+            NmPropRead::Field("connection.autoconnect-priority")
+        }
+        "ipv4.method" => NmPropRead::Field("ipv4.method"),
+        "ipv4.addresses" => NmPropRead::Field("ipv4.addresses"),
+        "ipv4.gateway" => NmPropRead::Field("ipv4.gateway"),
+        "ipv4.dns" => NmPropRead::Field("ipv4.dns"),
+        "ipv6.method" => NmPropRead::Field("ipv6.method"),
+        _ => NmPropRead::Unknown,
+    }
+}
+
+/// Do a written value and a read-back value say the same thing?
+///
+/// Lists survive the round trip in a different shape — several DNS
+/// servers are written separated by spaces and come back separated
+/// by commas — so both sides are reduced to their elements before
+/// being compared. Everything else compares as trimmed text.
+fn nm_prop_values_match(want: &str, live: &str) -> bool {
+    let split = |s: &str| -> Vec<String> {
+        s.split([',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    split(want) == split(live)
 }
 
 fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
@@ -14035,6 +14283,386 @@ exit 0\n",
                  802-11-wireless-security"
             ),
             "the profile is still opened for recovery: {calls}"
+        );
+    }
+
+    // --- not re-raising a profile that already satisfies the ask ---
+
+    /// nmcli mock that answers field reads from a table of
+    /// `field=value` pairs, reports both profiles present, and logs
+    /// every invocation. Any field not in the table reads empty,
+    /// which is how a real profile answers for a property it does
+    /// not carry.
+    fn satisfies_nmcli_mock(dir: &Path, fields: &[(&str, &str)]) -> PathBuf {
+        let path = dir.join("nmcli-satisfies.sh");
+        let log = dir.join("nmcli.log");
+        let mut cases = String::new();
+        for (field, value) in fields {
+            // `printf '%s\n' <value>`, not `printf '<value>\n'`: a
+            // value like the autoconnect priority `-100` is read as
+            // an option by printf and prints nothing, which would
+            // make the fixture disagree with the code for a reason
+            // that has nothing to do with the code.
+            cases.push_str(&format!(
+                "  \"-g {field} connection show \"*) \
+                 printf '%s\\n' '{value}' ;;\n"
+            ));
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+{cases}\
+esac\n\
+exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    fn satisfies_plugin(dir: &Path, nmcli: &Path) -> NetworkPlugin {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_path =
+            dir.join("no-such-iw").to_string_lossy().into_owned();
+        p
+    }
+
+    fn dhcp_ethernet_intent() -> NetworkIntent {
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = true;
+        intent.ethernet.device = "eth0".to_string();
+        intent.ethernet.ipv4_mode = Ipv4Mode::Dhcp;
+        intent
+    }
+
+    /// A wired link that is already up and already carries exactly
+    /// this configuration must not be raised again.
+    ///
+    /// `connection up` on an active profile is a fresh activation:
+    /// the link drops and returns. On the wire that is the
+    /// operator's own session going away in the middle of a save
+    /// that changed nothing.
+    #[tokio::test]
+    async fn a_live_matching_ethernet_is_not_raised_again() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-ethernet"),
+            "a live matching link must not be re-raised: {calls}"
+        );
+        // Left alone means no write either. A store write moves the
+        // profile under NetworkManager for no change, and a fixture
+        // that only watches the raise cannot see that happen.
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection modify")),
+            "a live matching link must not be written back: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "a live matching link must not be recreated: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("already matches")),
+            "the outcome must be reported, not silent: {steps:?}"
+        );
+    }
+
+    /// Down is not satisfied. A profile that exists but is not up
+    /// still comes up — the whole point of apply.
+    #[tokio::test]
+    async fn a_down_ethernet_profile_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // No GENERAL.STATE: NetworkManager reports nothing for a
+        // profile that is not activated.
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a down profile must still be raised: {calls}"
+        );
+    }
+
+    /// Live but different is not satisfied either. Here the live
+    /// profile is on DHCP while the operator asked for a static
+    /// address, so the ask has to be asserted.
+    #[tokio::test]
+    async fn a_live_but_mismatched_ethernet_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut intent = dhcp_ethernet_intent();
+        intent.ethernet.ipv4_mode = Ipv4Mode::Static;
+        intent.ethernet.ipv4_address = "192.0.2.10/24".to_string();
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&intent, &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a changed address must be asserted: {calls}"
+        );
+    }
+
+    fn open_ap_intent() -> WifiIntent {
+        WifiIntent {
+            ap_ssid: "evo-4466".to_string(),
+            // Channel 0 leaves band and channel out of the ask,
+            // keeping this fixture about the re-raise rather than
+            // about channel selection.
+            ap_channel: 0,
+            ..WifiIntent::default()
+        }
+    }
+
+    /// An access point that is already up and already beaconing
+    /// this configuration must not be raised again. A fresh
+    /// activation stops and restarts the beacon: every client
+    /// drops, and on a shared radio the station goes with it.
+    #[tokio::test]
+    async fn a_live_matching_hotspot_is_not_raised_again() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-hotspot"),
+            "a live matching AP must not be re-raised: {calls}"
+        );
+        // Left alone means no write either — neither the store
+        // write nor the security strip. Skipping only the raise
+        // would leave both, which is the same disturbance arriving
+        // by a different door, and a fixture watching only the
+        // raise cannot see it.
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection modify")),
+            "a live matching AP must not be written back, and its \
+             security must not be stripped: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "a live matching AP must not be recreated: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("already matches")),
+            "the outcome must be reported, not silent: {steps:?}"
+        );
+    }
+
+    /// A renamed access point is a different ask, so it is asserted.
+    #[tokio::test]
+    async fn a_live_but_mismatched_hotspot_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-was-called-this"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a renamed AP must be asserted: {calls}"
+        );
+    }
+
+    /// A down access point is still raised. This is also the pin
+    /// that recovery keeps working: a recovery profile is not up
+    /// when recovery needs it, and nothing here may teach the raise
+    /// to skip it.
+    #[tokio::test]
+    async fn a_down_hotspot_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a down AP must still be raised: {calls}"
+        );
+    }
+
+    /// Everything readable matches, but the passphrase was written
+    /// after the access point was last raised — so what is on the
+    /// air is the old key and the profile has to be raised again.
+    ///
+    /// NetworkManager will not show a stored passphrase and this
+    /// never asks, so the comparison is by time: the sidecar's last
+    /// write against the profile's last activation.
+    #[tokio::test]
+    async fn a_hotspot_whose_passphrase_changed_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+                // Last raised at the epoch; the sidecar written just
+                // now is necessarily newer.
+                ("connection.timestamp", "1"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+        let ap_psk_path = p.ap_psk_path().expect("ap_psk_path");
+        std::fs::write(&ap_psk_path, "a-new-passphrase").expect("write psk");
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            Some("a-new-passphrase"),
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a changed passphrase must reach the air: {calls}"
+        );
+        // And it was never read back out of NetworkManager.
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.split_whitespace().any(|a| a == "-s")),
+            "the stored passphrase must never be read: {calls}"
         );
     }
 }
