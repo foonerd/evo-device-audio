@@ -703,7 +703,7 @@ mod tests {
         // reported no channel — and the AP deferred on a radio it
         // could have followed.
         let raw = "Connected to a2:05:d6:d9:99:ef (on wlan0)\n\
-                   \tSSID: M(edia) Spot\n\
+                   \tSSID: Guest (Lobby) Net\n\
                    \tfreq: 5240.0\n\
                    \tsignal: -48 dBm\n";
         let info = parse_sta_link_info(raw);
@@ -718,7 +718,7 @@ mod tests {
         // The other iw build. Both must work; this is the one
         // every existing rig was read with.
         let raw = "Connected to a2:05:d6:d9:99:ef (on wlan0)\n\
-                   \tSSID: M(edia) Spot\n\
+                   \tSSID: Guest (Lobby) Net\n\
                    \tfreq: 2437\n";
         let info = parse_sta_link_info(raw);
         assert!(info.connected);

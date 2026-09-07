@@ -9983,7 +9983,7 @@ if [[ \"$args\" == *\"ifname \"* && \"$args\" != *\"ifname {live}\"* ]]; then\n\
   exit 10\n\
 fi\n\
 if [[ \"$args\" == *\"SSID,SIGNAL,SECURITY,ACTIVE\"* ]]; then\n\
-  echo 'M(edia) Spot:78:WPA2:no'\n\
+  echo 'Guest (Lobby) Net:78:WPA2:no'\n\
   exit 0\n\
 fi\n\
 if [[ \"$args\" == *\"BSSID,SSID,SIGNAL,FREQ,ACTIVE\"* ]]; then\n\
@@ -10087,7 +10087,7 @@ exit 0\n",
             "version": 1,
             "ethernet": { "enabled": false },
             "wifi": { "role": "sta", "ifname": "wlan0",
-                      "sta_ssid": "M(edia) Spot" },
+                      "sta_ssid": "Guest (Lobby) Net" },
             "fallback": { "hotspot_enabled": false }
         });
 
@@ -10158,7 +10158,7 @@ exit 0\n",
                         "version": 1,
                         "ethernet": { "enabled": false },
                         "wifi": { "role": "sta", "ifname": "wlan0",
-                                  "sta_ssid": "M(edia) Spot" },
+                                  "sta_ssid": "Guest (Lobby) Net" },
                         "fallback": { "hotspot_enabled": false }
                     },
                     "sta_psk": "",
@@ -10185,7 +10185,7 @@ exit 0\n",
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let (nmcli_path, log) =
-            write_sta_profile_mock(dir.path(), "M(edia) Spot");
+            write_sta_profile_mock(dir.path(), "Guest (Lobby) Net");
         let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
@@ -10200,7 +10200,7 @@ exit 0\n",
                         "version": 1,
                         "ethernet": { "enabled": false },
                         "wifi": { "role": "sta", "ifname": "wlan0",
-                                  "sta_ssid": "M(edia) Spot",
+                                  "sta_ssid": "Guest (Lobby) Net",
                                   "sta_open": false },
                         "fallback": { "hotspot_enabled": false }
                     }
@@ -10233,7 +10233,7 @@ exit 0\n",
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let (nmcli_path, log) =
-            write_sta_profile_mock(dir.path(), "M(edia) Spot");
+            write_sta_profile_mock(dir.path(), "Guest (Lobby) Net");
         let mut p = NetworkPlugin::new();
         p.inner_mut().loaded.store(true, Relaxed);
         p.inner_mut().state_dir = Some(dir.path().to_path_buf());
@@ -10355,9 +10355,9 @@ exit 0\n",
                     "wifi": {
                         "role": "sta",
                         "ifname": "wlan0",
-                        "sta_ssid": "M(edia) Spot",
+                        "sta_ssid": "Guest (Lobby) Net",
                         "sta_open": true,
-                        "ap_ssid": "evo-d674",
+                        "ap_ssid": "evo-4466",
                         "ap_channel": 4
                     },
                     "fallback": {
@@ -10757,7 +10757,7 @@ exit 0\n",
         assert_eq!(v["status"], "ok", "payload: {v}");
         let rows = v["available"].as_array().expect("available rows");
         assert!(
-            rows.iter().any(|r| r["ssid"] == "M(edia) Spot"),
+            rows.iter().any(|r| r["ssid"] == "Guest (Lobby) Net"),
             "the live radio's networks must come back: {v}"
         );
     }
@@ -10788,7 +10788,7 @@ exit 0\n",
             .as_array()
             .expect("rows")
             .iter()
-            .any(|r| r["ssid"] == "M(edia) Spot"));
+            .any(|r| r["ssid"] == "Guest (Lobby) Net"));
     }
 
     #[tokio::test]
