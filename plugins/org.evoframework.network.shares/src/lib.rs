@@ -337,6 +337,13 @@ impl Plugin for NetworkSharesPlugin {
                     .with_password_prompter(prompter)
                     .with_sudo_wrapping(needs_sudo)
                     .with_l3_gate(connectivity_l3_gate(ctx))
+                    // Installed here, not defaulted in the builder,
+                    // so a unit suite never opens a socket. The L3
+                    // gate is wired the same way for the same
+                    // reason.
+                    .with_host_reachable(std::sync::Arc::new(
+                        crate::runtime::default_host_reachable,
+                    ))
                     .build(),
             );
 

@@ -79,6 +79,51 @@ pub const NETWORK_SHARES_SCHEMA_VERSION: u32 = 1;
 pub const CIFS_VERS_PROBE_LADDER: &[&str] =
     &["2.0", "2.1", "3.0", "3.02", "3.1.1"];
 
+/// Probe that answers whether a share host is listening on a
+/// port. Injected so a unit suite never opens a socket.
+pub type HostReachableProbe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+
+/// Production host-reachability probe: a short-timeout TCP
+/// connect to the share host's service port.
+///
+/// Deliberately a connect and nothing more. It answers "is
+/// something listening", which is the question that decides
+/// whether a mount attempt is worth making; it does not
+/// negotiate, authenticate, or infer anything about the share.
+pub fn default_host_reachable(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let timeout = std::time::Duration::from_millis(1500);
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The port a share host must answer on before this runtime will
+/// spend a mount attempt on it.
+///
+/// Carrier is not reachability. A device can hold a link, an
+/// address and a default route while the NAS is off, still
+/// booting, or on a subnet the device cannot route to. The boot
+/// gate answers "has this device got a network"; this answers
+/// "is the server there", and only the second one justifies
+/// walking a dialect ladder.
+///
+/// Total over [`FsType`] rather than over a string: a new
+/// filesystem type is a compile error here, so whoever adds one
+/// chooses its port instead of inheriting SMB's by default.
+pub fn probe_port_for_fstype(fstype: FsType) -> u16 {
+    match fstype {
+        FsType::Cifs => 445,
+        FsType::Nfs => 2049,
+    }
+}
+
 /// The path under `<state_dir>/` this module owns.
 pub const NETWORK_SHARES_FILE: &str = "network_shares.toml";
 
@@ -725,6 +770,13 @@ pub enum FailureClass {
     /// fix the credential, restore the share on the server,
     /// answer the prompt.
     Permanent,
+    /// The host has not answered yet. Worth retrying, but by
+    /// asking the host again rather than by re-running a mount:
+    /// a mount attempt against an absent server burns the whole
+    /// dialect ladder and its timeouts before failing, which is
+    /// how a five-minute remount silence appears to an operator
+    /// whose NAS came back thirty seconds ago.
+    Unreachable,
 }
 
 impl MountError {
@@ -754,6 +806,8 @@ impl MountError {
             // Dialect exhaustion is explicitly the non-auth
             // branch — auth short-circuits above — so it belongs
             // here rather than with the credential family.
+            Self::HostUnreachable { .. } => FailureClass::Unreachable,
+
             Self::DialectProbeExhausted { .. }
             | Self::Timeout { .. }
             | Self::SubprocessIo(_)
@@ -775,6 +829,24 @@ impl MountError {
 /// reachable" vs "share path missing on server").
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
+    /// The share host did not answer on its service port, so no
+    /// mount was attempted.
+    ///
+    /// Distinct from [`Self::DialectProbeExhausted`] on purpose:
+    /// exhaustion means every dialect was offered and refused,
+    /// which is a statement about the server's SMB support. A
+    /// host that never answered has said nothing about dialects,
+    /// and reporting exhaustion there sends an operator to look
+    /// at their NAS configuration over what is usually a NAS that
+    /// is simply off.
+    #[error("share host {host}:{port} did not answer")]
+    HostUnreachable {
+        /// The host this runtime tried to reach.
+        host: String,
+        /// The service port for the share's filesystem type.
+        port: u16,
+    },
+
     /// Look-up failed — no share record for this ID.
     #[error("share {id} not found")]
     ShareNotFound {
@@ -2485,6 +2557,12 @@ pub struct NetworkSharesRuntime {
     /// `mount_share` adopts an already-active host mount instead
     /// of re-running the dialect probe.
     mount_point_check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// Asks whether a share host answers on its service port.
+    /// Production opens a short-timeout TCP connection; tests
+    /// inject a fixture so unit suites never touch a socket.
+    /// Consulted before any mount work, so an absent server costs
+    /// one refused connection instead of a full dialect ladder.
+    host_reachable: HostReachableProbe,
     /// Asks whether the device has L3. `None` means no gate is
     /// installed and boot-mount proceeds immediately, which is
     /// the behaviour a runtime built without one has always had.
@@ -2619,6 +2697,7 @@ impl NetworkSharesRuntime {
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
             mount_point_check: Arc::new(|p: &Path| is_path_mounted(p)),
+            host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
@@ -2645,6 +2724,7 @@ impl NetworkSharesRuntime {
             path,
             executor: None,
             credentials: None,
+            host_reachable: None,
             credential_store: None,
             prompter: None,
             mount_program: None,
@@ -2694,6 +2774,7 @@ impl NetworkSharesRuntime {
             // suites cannot accidentally adopt a host mount from
             // the machine running `cargo test`.
             mount_point_check: Arc::new(|_: &Path| false),
+            host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
@@ -3191,6 +3272,8 @@ pub struct NetworkSharesRuntimeBuilder {
     // factoring a one-off type alias.
     #[allow(clippy::type_complexity)]
     mount_point_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
+    // Same shape as the runtime struct's `host_reachable`.
+    host_reachable: Option<HostReachableProbe>,
     l3_gate: Option<L3Gate>,
     l3_wait_ms: Option<u64>,
 }
@@ -3301,6 +3384,14 @@ impl NetworkSharesRuntimeBuilder {
         self
     }
 
+    /// Inject the host-reachability probe. Production installs
+    /// [`default_host_reachable`] at plugin load; tests use this
+    /// to hold a NAS down without opening a socket.
+    pub fn with_host_reachable(mut self, probe: HostReachableProbe) -> Self {
+        self.host_reachable = Some(probe);
+        self
+    }
+
     /// Override the mount-point probe (test path). Production
     /// defaults to [`is_path_mounted`]. Tests that exercise the
     /// already-mounted adopt path inject a closure returning
@@ -3375,6 +3466,15 @@ impl NetworkSharesRuntimeBuilder {
                 state: self.state,
                 path: self.path,
             })),
+            // No probe installed means "assume reachable", which is
+            // the behaviour a runtime built without one has always
+            // had. Production installs `default_host_reachable`
+            // explicitly at plugin load, the same way the L3 gate is
+            // installed; a unit suite that never asks for one never
+            // opens a socket.
+            host_reachable: self
+                .host_reachable
+                .unwrap_or_else(|| Arc::new(|_: &str, _: u16| true)),
             executor: self
                 .executor
                 .unwrap_or_else(|| Arc::new(SubprocessMountExecutor)),
@@ -3721,6 +3821,43 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
             }
             return Ok(report);
+        }
+
+        // Reachability before effort. The boot gate asks whether
+        // this device has a network; it cannot ask whether the
+        // server is there, and carrier has never implied that. A
+        // NAS that is off, still booting, or on an unroutable
+        // subnet answers nothing, and every mount attempt against
+        // it walks the whole dialect ladder and its timeouts
+        // before failing — minutes of silence, then a verdict
+        // about SMB dialects that the server never participated
+        // in.
+        //
+        // One refused connection replaces that. It also makes the
+        // retry cadence honest: a share waiting on an absent host
+        // now costs a poll per tick instead of a ladder burn, so
+        // the pass returns in time to notice the moment the NAS
+        // comes back.
+        //
+        // Placed after the OS-truth adopt so a live mount is never
+        // second-guessed by a probe, and before credential work so
+        // an absent server cannot raise a password prompt.
+        {
+            let host = record.host.trim().to_string();
+            if !host.is_empty() {
+                let port = probe_port_for_fstype(record.fstype);
+                if !(self.host_reachable)(&host, port) {
+                    let err = MountError::HostUnreachable { host, port };
+                    self.set_share_state(
+                        share_id,
+                        MountState::Failed,
+                        Some(err.to_string()),
+                        None,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         }
 
         // Prompt-on-mount: for UserPassword shares whose
@@ -6653,6 +6790,99 @@ tmpfs /tmp tmpfs rw 0 0\n";
 
         let after = rt.get_share(&id).await.unwrap().unwrap();
         assert_eq!(after.persisted_vers.as_deref(), Some("2.1"));
+    }
+
+    /// Build a runtime whose share host never answers.
+    fn build_runtime_host_down(
+        dir: &Path,
+        executor: Arc<dyn MountExecutor>,
+    ) -> NetworkSharesRuntime {
+        NetworkSharesRuntime::builder(dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| false))
+            .build()
+    }
+
+    #[test]
+    fn probe_port_is_total_over_filesystem_type() {
+        assert_eq!(probe_port_for_fstype(FsType::Cifs), 445);
+        assert_eq!(probe_port_for_fstype(FsType::Nfs), 2049);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_is_not_dialect_exhaustion() {
+        // The field case: carrier up, NAS off. The old path walked
+        // all five dialects and reported exhaustion, which is a
+        // verdict about SMB support the server never gave.
+        let dir = tempdir();
+        // A ladder that would succeed if it ran at all — so a
+        // failure here can only come from the reachability gate.
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor.clone());
+        let record = built_record("nas_off", "192.0.2.23");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::HostUnreachable { ref host, port } => {
+                assert_eq!(host, "192.0.2.23");
+                assert_eq!(port, 445, "CIFS probes the SMB port");
+            }
+            other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+        assert_eq!(
+            err.failure_class(),
+            FailureClass::Unreachable,
+            "an absent host is its own class: retry by asking the host, \
+             not by burning a ladder"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_costs_no_mount_attempt() {
+        // The reason the retry cadence stopped being honest: every
+        // tick against an absent NAS spent the full ladder and its
+        // timeouts. The executor must not be called at all.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor.clone());
+        let record = built_record("nas_off", "192.0.2.24");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            0,
+            "no mount subprocess may run against a host that has not answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_host_still_mounts_normally() {
+        // The gate must not become the thing that breaks mounting.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| true))
+            .build();
+        let record = built_record("nas_up", "192.0.2.25");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.mount_share(&id).await.expect("reachable host mounts");
+        assert!(
+            !executor.calls.lock().await.is_empty(),
+            "the ladder still runs when the host answers"
+        );
     }
 
     #[tokio::test]
