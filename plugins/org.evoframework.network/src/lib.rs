@@ -778,21 +778,28 @@ fn default_ap_ssid() -> String {
         .unwrap_or_else(|| "evo".to_string())
 }
 
-/// AP vifs and their P2P companions are not scan targets.
-/// `nmcli device wifi list` on `ap0` (or a bare list that
-/// includes it) fights the beacon on brcmfmac: AP-DISABLED,
-/// driver `-52`, `Failed to initiate AP scan`, escan timeout.
-fn is_ap_scan_ifname(name: &str) -> bool {
+/// AP vif names the apply pipeline creates on a shared PHY —
+/// `ap`, `ap0`, `ap1`. Such an interface beacons rather than
+/// associates, so `iw dev <name> link` answers `Not connected.`
+/// for it by design and its live SSID is only readable from
+/// `iw dev <name> info`.
+fn is_ap_vif_ifname(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
-    if n.starts_with("p2p-dev-") {
-        return true;
-    }
     match n.strip_prefix("ap") {
         Some(rest) => {
             rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
         }
         None => false,
     }
+}
+
+/// AP vifs and their P2P companions are not scan targets.
+/// `nmcli device wifi list` on `ap0` (or a bare list that
+/// includes it) fights the beacon on brcmfmac: AP-DISABLED,
+/// driver `-52`, `Failed to initiate AP scan`, escan timeout.
+fn is_ap_scan_ifname(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n.starts_with("p2p-dev-") || is_ap_vif_ifname(&n)
 }
 
 /// Last three MAC octets of the first usable host netdev, upper-hex,
@@ -978,6 +985,85 @@ fn parse_iw_link(raw: &str) -> WifiInfo {
     w
 }
 
+/// Parsed `iw dev <ifname> info`. `iftype` is the mode the
+/// driver reports for the interface (`AP` / `managed` /
+/// `monitor`); `wifi` carries the runtime fields that reach
+/// the wire.
+struct IwDevInfo {
+    iftype: String,
+    wifi: WifiInfo,
+}
+
+/// Pure parser for `iw dev <ifname> info` — the only call that
+/// reports the SSID an AP vif is broadcasting, since an AP
+/// beacons rather than associates and so has no `link` to read.
+///
+/// Field shape of `iw dev ap0 info` for a beaconing AP vif
+/// (identifiers below are illustrative, not from any device):
+///
+/// ```text
+/// Interface ap0
+///     ifindex 8
+///     wdev 0x2
+///     addr aa:11:22:33:44:66
+///     ssid evo-4466
+///     type AP
+///     channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz
+/// ```
+///
+/// An SSID may contain spaces and punctuation, so the `ssid`
+/// value is everything to end of line rather than the first
+/// token. In AP mode the vif's own MAC is the BSSID
+/// clients see, so `addr` populates `bssid`. Signal and bitrate
+/// describe an association the AP side does not have and stay
+/// `None`.
+fn parse_iw_dev_info(raw: &str) -> IwDevInfo {
+    let mut out = IwDevInfo {
+        iftype: String::new(),
+        wifi: WifiInfo::default(),
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ssid ") {
+            out.wifi.ssid = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("type ") {
+            out.iftype = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("addr ") {
+            out.wifi.bssid = rest.trim().to_ascii_lowercase();
+        } else if let Some(rest) = trimmed.strip_prefix("channel ") {
+            parse_iw_channel_line(rest, &mut out.wifi);
+        }
+    }
+    out
+}
+
+/// Fill channel / frequency / band from the tail of an `iw`
+/// `channel` line — `36 (5180 MHz), width: 80 MHz, center1:
+/// 5210 MHz`. The reported channel number is taken verbatim;
+/// the band label is derived from the frequency in parentheses
+/// so it agrees with what the `link` path produces.
+fn parse_iw_channel_line(rest: &str, w: &mut WifiInfo) {
+    let rest = rest.trim();
+    let chan: String =
+        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(n) = chan.parse::<u32>() {
+        w.channel = Some(n);
+    }
+    let Some(open) = rest.find('(') else {
+        return;
+    };
+    let Some(close) = rest[open..].find(')') else {
+        return;
+    };
+    let inner = rest[open + 1..open + close].trim();
+    let mhz: String =
+        inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(mhz) = mhz.parse::<u32>() {
+        w.freq_mhz = Some(mhz);
+        w.band = band_label_from_freq(mhz);
+    }
+}
+
 fn channel_from_freq_mhz(mhz: u32) -> Option<u32> {
     // Standard 2.4 GHz + 5 GHz + 6 GHz channel derivations.
     if (2412..=2472).contains(&mhz) {
@@ -1042,6 +1128,19 @@ fn nm_state_text(raw: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Word-boundary test for NM's connected state text, as
+/// normalised by [`nm_state_text`]. NM emits `connected`,
+/// `connected (site only)` and `connected (local only)` — and
+/// `disconnected`, which a naive `contains("connected")`
+/// predicate false-positives on. Single truth for every
+/// association gate in this plugin.
+fn nm_state_is_connected(state: &str) -> bool {
+    let s = state.trim();
+    s == "connected"
+        || s.starts_with("connected ")
+        || s.starts_with("connected(")
 }
 
 /// Last two octets of a MAC address, lowercase hex, no
@@ -1372,9 +1471,14 @@ struct DeviceRow {
     ip6: Option<Ip6Info>,
     /// Wi-Fi runtime — SSID / BSSID / signal / bitrate /
     /// band / channel / frequency / security. Present only
-    /// when kind == "wifi" AND the interface is associated
-    /// (STA connected, or AP up). Sourced from `iw dev
-    /// <ifname> link` + `iw dev <ifname> info`.
+    /// when kind == "wifi" AND the interface is carrying a
+    /// network: a STA that is associated, or an AP vif that is
+    /// beaconing. The two are read by different calls because
+    /// they are different facts — a STA from `iw dev <ifname>
+    /// link`, a connected `ap*` from `iw dev <ifname> info`,
+    /// which is the only call that reports the SSID an AP
+    /// broadcasts. An AP row carries no signal or bitrate:
+    /// those describe an association the AP side does not have.
     #[serde(skip_serializing_if = "Option::is_none")]
     wifi: Option<WifiInfo>,
 }
@@ -2868,12 +2972,7 @@ impl NmInner {
         };
         rows.iter()
             .find(|r| r.device == ifname)
-            .map(|r| {
-                let s = r.state.trim();
-                s == "connected"
-                    || s.starts_with("connected ")
-                    || s.starts_with("connected(")
-            })
+            .map(|r| nm_state_is_connected(&r.state))
             .unwrap_or(false)
     }
 
@@ -4344,7 +4443,21 @@ impl NmInner {
                 }
             }
             if row.kind == "wifi" {
-                if let Some(wifi) = self.wifi_runtime_for(&row.device).await {
+                // An AP vif carries no upstream association, so
+                // `link` answers `Not connected.` for it by
+                // design and the STA path drops the row's wifi
+                // block entirely — the beaconing SSID never
+                // reached the wire. Read a connected `ap*` from
+                // `info` instead. STA rows keep the `link` path
+                // unchanged.
+                let runtime = if is_ap_vif_ifname(&row.device)
+                    && nm_state_is_connected(&row.state)
+                {
+                    self.wifi_ap_runtime_for(&row.device).await
+                } else {
+                    self.wifi_runtime_for(&row.device).await
+                };
+                if let Some(wifi) = runtime {
                     row.wifi = Some(wifi);
                 }
             }
@@ -4388,11 +4501,12 @@ impl NmInner {
         (m4, m6)
     }
 
-    /// Fetch wifi runtime info via `iw dev <ifname> link` +
-    /// `iw dev <ifname> info`. Only invoked when the device
-    /// row's kind is `wifi`. Returns `None` when the interface
-    /// is not associated or `iw` refuses (unauthorised /
-    /// missing binary).
+    /// Fetch STA wifi runtime info via `iw dev <ifname> link`.
+    /// Invoked for a `wifi` device row that is not a connected
+    /// AP vif — see [`NmInner::wifi_ap_runtime_for`] for that
+    /// path. Returns `None` when the interface is not
+    /// associated or `iw` refuses (unauthorised / missing
+    /// binary).
     async fn wifi_runtime_for(&self, ifname: &str) -> Option<WifiInfo> {
         let timeout = Duration::from_millis(self.config.iw_timeout_ms);
         let iw_exec = self.effective_iw_exec();
@@ -4411,6 +4525,37 @@ impl NmInner {
             return None;
         }
         Some(parse_iw_link(&link_raw))
+    }
+
+    /// Fetch AP wifi runtime info via `iw dev <ifname> info`.
+    /// An AP vif beacons rather than associates: `link` answers
+    /// `Not connected.` for it by design and carries no SSID,
+    /// so `info` is the only call that reports the network the
+    /// device is actually broadcasting.
+    ///
+    /// Returns `None` unless the interface really is in AP mode
+    /// (`type AP`) and really is beaconing (a non-empty `ssid`
+    /// line). The name shape alone does not make a row an AP,
+    /// and a created-but-idle vif still prints its `Interface`
+    /// block — two independent guarantees, so a quiet AP never
+    /// paints a stale SSID on the wire.
+    async fn wifi_ap_runtime_for(&self, ifname: &str) -> Option<WifiInfo> {
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let info_raw = wifi_phy::iw_output(
+            iw_exec.as_ref(),
+            &self.config.iw_path,
+            &["dev", ifname, "info"],
+            timeout,
+        )
+        .await
+        .ok()?;
+        let info = parse_iw_dev_info(&info_raw);
+        if !info.iftype.eq_ignore_ascii_case("ap") || info.wifi.ssid.is_empty()
+        {
+            return None;
+        }
+        Some(info.wifi)
     }
 
     /// STA iface to scan, or `None` when the only wifi ifaces
@@ -6063,11 +6208,7 @@ impl NmInner {
             if row.kind != "wifi" {
                 continue;
             }
-            let s = row.state.trim();
-            let associated = s == "connected"
-                || s.starts_with("connected ")
-                || s.starts_with("connected(");
-            if associated {
+            if nm_state_is_connected(&row.state) {
                 return Ok(false);
             }
         }
@@ -11734,6 +11875,102 @@ exit 0\n",
         assert!(w.signal_dbm.is_none());
     }
 
+    /// A beaconing AP vif must yield its live SSID.
+    /// The block below is the field shape `iw dev ap0 info`
+    /// prints on a brcmfmac AP vif with the hotspot up
+    /// (identifiers synthetic): the AP reports its SSID here
+    /// and nowhere else, because `iw dev ap0 link` answers
+    /// `Not connected.` for an interface that beacons instead
+    /// of associating.
+    #[test]
+    fn parse_iw_dev_info_reads_a_beaconing_ap() {
+        let raw = "Interface ap0\n\
+                   \tifindex 8\n\
+                   \twdev 0x2\n\
+                   \taddr AA:11:22:33:44:66\n\
+                   \tssid evo-4466\n\
+                   \ttype AP\n\
+                   \twiphy 0\n\
+                   \tchannel 36 (5180 MHz), width: 80 MHz, \
+                   center1: 5210 MHz\n\
+                   \ttxpower 31.00 dBm\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.iftype, "AP");
+        assert_eq!(info.wifi.ssid, "evo-4466");
+        // In AP mode the vif's own MAC is the BSSID clients see.
+        assert_eq!(info.wifi.bssid, "aa:11:22:33:44:66");
+        assert_eq!(info.wifi.channel, Some(36));
+        assert_eq!(info.wifi.freq_mhz, Some(5180));
+        assert_eq!(info.wifi.band, "5ghz");
+        // An AP has no association, so no signal and no
+        // bitrate — those must stay absent rather than zero.
+        assert!(info.wifi.signal_dbm.is_none());
+        assert!(info.wifi.bitrate_mbps.is_none());
+    }
+
+    /// An SSID is free text. `iw` prints it unquoted to end of
+    /// line, so a name carrying a space and parentheses must
+    /// survive intact — a first-token parse would truncate
+    /// `Guest (Lobby) Net` to `Guest`.
+    #[test]
+    fn parse_iw_dev_info_keeps_an_ssid_with_spaces() {
+        let raw = "Interface wlan1\n\
+                   \tifindex 3\n\
+                   \twdev 0x1\n\
+                   \taddr aa:11:22:33:44:77\n\
+                   \tssid Guest (Lobby) Net\n\
+                   \ttype managed\n\
+                   \twiphy 0\n\
+                   \tchannel 48 (5240 MHz), width: 80 MHz, \
+                   center1: 5210 MHz\n\
+                   \ttxpower 22.00 dBm\n\
+                   \tmulticast TXQ:\n\
+                   \t\tqsz-byt\tqsz-pkt\tflows\tdrops\n\
+                   \t\t0\t0\t0\t0\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.wifi.ssid, "Guest (Lobby) Net");
+        assert_eq!(info.iftype, "managed");
+        assert_eq!(info.wifi.channel, Some(48));
+        assert_eq!(info.wifi.freq_mhz, Some(5240));
+    }
+
+    /// A created-but-idle AP vif still prints its `Interface`
+    /// block. With no `ssid` line there is nothing on the air,
+    /// so nothing may reach the wire.
+    #[test]
+    fn parse_iw_dev_info_on_an_idle_ap_has_no_ssid() {
+        let raw = "Interface ap0\n\
+                   \tifindex 8\n\
+                   \twdev 0x2\n\
+                   \taddr aa:11:22:33:44:66\n\
+                   \ttype AP\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.iftype, "AP");
+        assert!(
+            info.wifi.ssid.is_empty(),
+            "an idle AP must not report an SSID"
+        );
+    }
+
+    /// The AP-vif name shape is its own predicate: `ap*` picks
+    /// the beaconing vif, and must not swallow a STA radio or
+    /// the P2P companion device (which is `wifi-p2p`, never a
+    /// `wifi` row). `is_ap_scan_ifname` keeps covering both.
+    #[test]
+    fn is_ap_vif_ifname_separates_ap_vifs_from_sta_and_p2p() {
+        for name in ["ap", "ap0", "ap1", "AP0", " ap0 "] {
+            assert!(is_ap_vif_ifname(name), "{name} is an AP vif");
+            assert!(is_ap_scan_ifname(name), "{name} is not a scan target");
+        }
+        for name in ["wlan0", "wlp2s0", "apple0", "eth0", "p2p-dev-wlan0"] {
+            assert!(!is_ap_vif_ifname(name), "{name} is not an AP vif");
+        }
+        // The P2P companion is still excluded from scans, just
+        // not by the AP-vif rule.
+        assert!(is_ap_scan_ifname("p2p-dev-wlan0"));
+        assert!(!is_ap_scan_ifname("wlan0"));
+    }
+
     #[test]
     fn channel_from_freq_covers_common_channels() {
         assert_eq!(channel_from_freq_mhz(2412), Some(1));
@@ -12010,16 +12247,10 @@ exit 0\n",
     /// disconnected radio as associated.
     #[tokio::test]
     async fn wifi_interface_is_associated_word_boundary() {
-        // Rebuild the predicate inline against the NM state
-        // vocabulary rather than mocking `nm_device_table`.
-        // The check is what matters — same logic that
-        // `wifi_interface_is_associated` uses.
-        let is_associated = |s: &str| -> bool {
-            let s = s.trim();
-            s == "connected"
-                || s.starts_with("connected ")
-                || s.starts_with("connected(")
-        };
+        // Bound to the real predicate every association gate
+        // in this plugin now calls, so a regression in it fails
+        // here rather than passing against a copy.
+        let is_associated = nm_state_is_connected;
         assert!(is_associated("connected"));
         assert!(is_associated("connected (site only)"));
         assert!(is_associated("connected (local only)"));
@@ -12468,6 +12699,117 @@ exit 0\n",
             elapsed < Duration::from_millis(3000),
             "waited {:?}; timeout guard did not fire in bounded time",
             elapsed
+        );
+    }
+
+    /// The device table must carry a connected AP vif's live
+    /// SSID, and must still read a STA from `link` alone.
+    ///
+    /// Both halves are pinned by the recorded `iw` argv: `ap0`
+    /// is asked `info` and never `link` (which would answer
+    /// `Not connected.` and drop the row's wifi block, the
+    /// defect), and `wlan0` is asked `link` and never `info`
+    /// (the STA path does not move).
+    #[tokio::test]
+    async fn connected_ap_row_carries_the_beaconing_ssid() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock.sh");
+        let iw_path = dir.path().join("iw-mock.sh");
+        let iw_log = dir.path().join("iw.log");
+
+        // Shared-PHY shape: hotspot on `ap0`, STA on `wlan0`.
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:ap0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-hotspot\\nGENERAL.HWADDR:AA:11:22:33:44:66\\nGENERAL.MTU:1500\\n\\nGENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-wifi-sta\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write nmcli mock");
+
+        std::fs::write(
+            &iw_path,
+            format!(
+                r#"#!/usr/bin/env bash
+echo "$@" >> "{}"
+if [[ "$1" == "dev" && "$2" == "ap0" && "$3" == "info" ]]; then
+  printf 'Interface ap0\n\tifindex 8\n\twdev 0x2\n\taddr aa:11:22:33:44:66\n\tssid evo-4466\n\ttype AP\n\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n'
+  exit 0
+fi
+if [[ "$1" == "dev" && "$2" == "wlan0" && "$3" == "link" ]]; then
+  printf 'Connected to aa:11:22:33:44:55 (on wlan0)\n\tSSID: Guest (Lobby) Net\n\tfreq: 5180\n\tsignal: -58 dBm\n'
+  exit 0
+fi
+exit 1
+"#,
+                iw_log.display()
+            ),
+        )
+        .expect("write iw mock");
+
+        #[cfg(unix)]
+        for path in [&nmcli_path, &iw_path] {
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let rows = p.inner_mut().nm_device_table().await.expect("device table");
+
+        let ap = rows
+            .iter()
+            .find(|r| r.device == "ap0")
+            .expect("ap0 row present");
+        let ap_wifi = ap
+            .wifi
+            .as_ref()
+            .expect("connected ap0 must carry a wifi block");
+        assert_eq!(
+            ap_wifi.ssid, "evo-4466",
+            "ap0 must carry the SSID it is beaconing"
+        );
+        assert_eq!(ap_wifi.channel, Some(36));
+        assert_eq!(ap_wifi.band, "5ghz");
+
+        let sta = rows
+            .iter()
+            .find(|r| r.device == "wlan0")
+            .expect("wlan0 row present");
+        let sta_wifi = sta
+            .wifi
+            .as_ref()
+            .expect("associated wlan0 must carry a wifi block");
+        assert_eq!(sta_wifi.ssid, "Guest (Lobby) Net");
+        assert_eq!(sta_wifi.signal_dbm, Some(-58));
+
+        let log = std::fs::read_to_string(&iw_log).expect("iw log");
+        assert!(
+            log.contains("dev ap0 info"),
+            "ap0 must be read with `info`: {log}"
+        );
+        assert!(
+            !log.contains("dev ap0 link"),
+            "`link` on an AP vif answers Not connected. — never ask it: {log}"
+        );
+        assert!(
+            log.contains("dev wlan0 link"),
+            "the STA path must still read `link`: {log}"
+        );
+        assert!(
+            !log.contains("dev wlan0 info"),
+            "the STA path must not move to `info`: {log}"
         );
     }
 }
