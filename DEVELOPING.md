@@ -28,20 +28,40 @@ Mirrors evo-core; any deviation is deliberate.
 
 ## Build and test
 
-From the workspace root:
+### Commit entry gate (compulsory)
+
+Before every commit, and before any push, tag, or remint, run the full cargo workout from a clean tree. rustdoc `-D warnings` is part of the gate. Public CI historically omitted it; that is how intra-doc failures slid.
+
+```
+scripts/preflight/check-cargo-workout.sh
+```
+
+That is, on toolchain **1.85** (the public `build.yml` pin; host rustc newer than 1.85 is not the gate):
+
+```
+cargo +1.85 clean
+cargo +1.85 fmt --all -- --check
+cargo +1.85 clippy --all-targets -- -D warnings
+cargo +1.85 test --workspace
+RUSTDOCFLAGS='-D warnings' cargo +1.85 doc --workspace --no-deps
+```
+
+Do not commit if any step is non-zero. Do not `#[allow]` rustdoc or clippy to silence the gate. Capture cargo's exit status, not `tee`.
+
+From the workspace root, incremental type-check while editing:
 
 ```
 cargo build --workspace
 cargo test --workspace
 ```
 
-Both must be green before any version bump. In Phase 1 scaffolding state the workspace contains only the `evo-device-audio-shared` anchor crate (an empty library that future plugins will share utilities through); `build` and `test` succeed trivially until plugin crates land.
+Both must be green before any version bump. The commit entry gate above is stricter (clean + rustdoc) and is the one that must pass before the change leaves the worktree.
 
 ## GitHub Actions
 
 Workflows under [`.github/workflows/`](.github/workflows/):
 
--   **build** - on every `pull_request` and `push`: `cargo fmt`, `clippy` (`-D warnings`), `cargo test --workspace`. The SDK is fetched directly from the git tag; no sibling evo-core checkout.
+-   **build** - on every `pull_request` and `push`: `cargo fmt`, `clippy` (`-D warnings`), `cargo test --workspace`. The SDK is fetched directly from the git tag; no sibling evo-core checkout. The local commit entry gate also requires `cargo clean` and `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` (`scripts/preflight/check-cargo-workout.sh`).
 -   **continuous-dev** - on `push` to `main` when code, CI, keys, or build config change: same checks, then `cross build` for `aarch64-unknown-linux-gnu` (when there are members), then optional `evo-plugin-tool` sign/verify against an OOP sample bundle (when one is present in `ci/oob-sign-smoke/`). Publishing to the artefacts repository is not wired yet.
 -   **manual-build** - `workflow_dispatch` with a git `ref` and a `channel` input (for logging; same publish gap as above).
 -   **promote** - placeholder for channel pointer moves on the artefacts repo (no rebuild).
@@ -62,7 +82,7 @@ The private key never leaves the GitHub Actions runner. The public key fingerpri
 4.  Add the new path to `[workspace].members` in the root `Cargo.toml`.
 5.  Implement against the SDK trait that matches the slot the plugin will stock. See evo-core's [`PLUGIN_AUTHORING.md`](https://github.com/foonerd/evo-core/blob/main/docs/engineering/PLUGIN_AUTHORING.md).
 6.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-device-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
-7.  `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` all green before commit.
+7.  `scripts/preflight/check-cargo-workout.sh` green before commit (clean, fmt, clippy `-D warnings`, test, rustdoc `-D warnings` on toolchain 1.85).
 
 ## Boundary discipline
 

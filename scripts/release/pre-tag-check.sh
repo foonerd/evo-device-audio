@@ -20,38 +20,17 @@ log_ok()   { printf '[pre-tag] OK: %s\n' "$*" >&2; }
 log_fail() { printf '[pre-tag] FAIL: %s\n' "$*" >&2; }
 
 # -------------------------------------------------------------
-# Gate 1: cargo fmt --all -- --check
+# Gates 1-3 + rustdoc: compulsory cargo workout
+# Cut trees are pin-flipped; --locked matches the published lock.
+# Sitting [patch] trees use the script without --locked.
 # -------------------------------------------------------------
 
-log_step "Gate 1/7: cargo fmt --all -- --check"
-if ! cargo fmt --all -- --check; then
-    log_fail "cargo fmt drift detected"
-    log_fail "Fix: cargo fmt --all"
+log_step "Gates 1-3 + rustdoc: scripts/preflight/check-cargo-workout.sh --locked"
+if ! bash "${REPO_ROOT}/scripts/preflight/check-cargo-workout.sh" --locked; then
+    log_fail "cargo workout (clean / fmt / clippy / test / rustdoc) failed"
     exit 1
 fi
-log_ok "fmt clean"
-
-# -------------------------------------------------------------
-# Gate 2: cargo clippy --workspace --all-targets --locked -- -D warnings
-# -------------------------------------------------------------
-
-log_step "Gate 2/7: cargo clippy --workspace --all-targets --locked -- -D warnings"
-if ! cargo clippy --workspace --all-targets --locked -- -D warnings; then
-    log_fail "clippy warnings (treated as errors)"
-    exit 1
-fi
-log_ok "clippy clean"
-
-# -------------------------------------------------------------
-# Gate 3: cargo test --workspace --locked
-# -------------------------------------------------------------
-
-log_step "Gate 3/7: cargo test --workspace --locked"
-if ! cargo test --workspace --locked; then
-    log_fail "test failure"
-    exit 1
-fi
-log_ok "tests pass"
+log_ok "cargo workout clean"
 
 # -------------------------------------------------------------
 # Gate 4a: SPDX headers on crates/ + plugins/
