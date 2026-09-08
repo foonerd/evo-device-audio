@@ -4500,6 +4500,11 @@ impl NmInner {
     ///
     /// A different SSID is a different network — NM's secret does
     /// not apply and there is nothing to reuse.
+    /// `None` and whitespace-only are the same: nothing to write to NM.
+    fn sta_psk_is_blank(sta_psk: Option<&str>) -> bool {
+        sta_psk.map(str::trim).is_none_or(|s| s.is_empty())
+    }
+
     async fn sta_secret_is_reusable(
         &self,
         wifi: &WifiIntent,
@@ -4508,7 +4513,7 @@ impl NmInner {
         if wifi.sta_open {
             return false;
         }
-        if sta_psk.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        if !Self::sta_psk_is_blank(sta_psk) {
             return false;
         }
         let wanted = wifi.sta_ssid.trim();
@@ -7171,9 +7176,7 @@ impl NmInner {
                     // after the disconnect leaves the operator with no
                     // network and no way back. Refuse first instead.
                     if !intent.wifi.sta_open
-                        && !sta_psk
-                            .map(str::trim)
-                            .is_some_and(|s| !s.is_empty())
+                        && Self::sta_psk_is_blank(sta_psk)
                         && !self
                             .sta_secret_is_reusable(&intent.wifi, sta_psk)
                             .await

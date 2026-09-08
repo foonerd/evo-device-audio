@@ -93,9 +93,9 @@ impl AudioTopologyControl for TopologyControl {
         Box::pin(async move { Ok(self.0.get(target_key).await?) })
     }
 
-    fn list<'a>(
-        &'a self,
-    ) -> AudioStoreFuture<'a, Vec<evo::server::ActiveAudioTopology>> {
+    fn list(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<evo::server::ActiveAudioTopology>> {
         Box::pin(async move { Ok(self.0.list().await?) })
     }
 
@@ -168,9 +168,9 @@ impl AudioPolicyControl for PolicyControl {
         Box::pin(async move { Ok(self.0.get_policy(target_key).await?) })
     }
 
-    fn list_policies<'a>(
-        &'a self,
-    ) -> AudioStoreFuture<'a, Vec<evo::server::AudioOperatorPolicyRecord>> {
+    fn list_policies(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<evo::server::AudioOperatorPolicyRecord>> {
         Box::pin(async move { Ok(self.0.list_policies().await?) })
     }
 
@@ -199,9 +199,9 @@ impl AudioPolicyControl for PolicyControl {
         Box::pin(async move { Ok(self.0.get_volume_mode(target_key).await?) })
     }
 
-    fn list_volume_modes<'a>(
-        &'a self,
-    ) -> AudioStoreFuture<'a, Vec<evo::server::AudioVolumeModeRecord>> {
+    fn list_volume_modes(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<evo::server::AudioVolumeModeRecord>> {
         Box::pin(async move { Ok(self.0.list_volume_modes().await?) })
     }
 
@@ -258,9 +258,9 @@ impl HardwareProfileControl for HardwareControl {
         Box::pin(async move { Ok(self.0.get_override(key).await?) })
     }
 
-    fn list<'a>(
-        &'a self,
-    ) -> AudioStoreFuture<'a, Vec<evo::server::HardwareProfileOverrideRecord>>
+    fn list(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<evo::server::HardwareProfileOverrideRecord>>
     {
         Box::pin(async move { Ok(self.0.list_overrides().await?) })
     }
