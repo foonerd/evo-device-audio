@@ -101,7 +101,7 @@ impl LrclibClient {
     /// path (5xx / decode / transport error) by pointing the
     /// client at a stub server or an unroutable address, without
     /// touching the real LRCLIB endpoint. Production code stays
-    /// on [`Self::new`] which pins [`LRCLIB_API_BASE`].
+    /// on [`Self::new`] which pins `LRCLIB_API_BASE`.
     pub fn new_with_base_url(
         http: Client,
         rate: Arc<RateLimiter>,

@@ -167,7 +167,7 @@ fn plugin_crate_version() -> semver::Version {
 /// `audio.options.settings` subject. The subject subscriber
 /// pushes a fresh snapshot to `eq_state_tx`; the byte-flow
 /// substrate observes it through `eq_state_rx` and
-/// reconfigures the [`EqProcessor`] on every change.
+/// reconfigures the `EqProcessor` on every change.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EqRuntimeState {
     /// `true` engages the EQ processing path; `false` pumps
@@ -244,10 +244,10 @@ pub enum WorkerStatus {
     /// Substrate exited with an error. The worker waits
     /// for the next route change to retry. `reason`
     /// carries the structured error message from
-    /// [`ByteFlowError::Display`](crate::byte_flow::ByteFlowError).
+    /// `ByteFlowError::Display`.
     Failed {
         /// Operator-readable failure reason carrying the
-        /// underlying [`ByteFlowError`] message.
+        /// underlying `ByteFlowError` message.
         reason: String,
     },
     /// Substrate kind declared by the framework is not

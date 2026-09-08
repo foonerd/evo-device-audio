@@ -137,9 +137,9 @@ pub enum AmixerReadOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveControlState {
     /// The control's runtime-reported type. For enum controls,
-    /// pair this with [`enum_values`] to know the legal set; for
-    /// integer / db_scale controls, pair with [`integer_min`] /
-    /// [`integer_max`] for the range.
+    /// pair this with `enum_values` to know the legal set; for
+    /// integer / db_scale controls, pair with `integer_min` /
+    /// `integer_max` for the range.
     pub control_type: ControlType,
     /// Current value as a JSON-typed payload (string for enum,
     /// integer for integer / db_scale, bool for boolean). Keeps

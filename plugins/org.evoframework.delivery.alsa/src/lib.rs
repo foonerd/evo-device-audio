@@ -285,7 +285,7 @@ struct HardwareAudioObserverHandle {
 /// observer task on every state update. Operator-facing wire-op
 /// `delivery.active_endpoint` returns this verbatim under the
 /// `active_dac_config` field so the UI can render
-/// "currently playing through: <name> via pcm.evo" without
+/// "currently playing through: `<name>` via pcm.evo" without
 /// parsing `aplay -L` output.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ActiveDacConfig {

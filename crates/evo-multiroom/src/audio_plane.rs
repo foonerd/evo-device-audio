@@ -342,7 +342,7 @@ pub enum AudioPlaneError {
     /// JSON encode / decode error.
     #[error("audio-plane wire format: {0}")]
     Serde(#[from] serde_json::Error),
-    /// Frame longer than [`MAX_FRAME_BYTES`].
+    /// Frame longer than `MAX_FRAME_BYTES`.
     #[error("audio-plane frame too large: {0} bytes")]
     FrameTooLarge(usize),
     /// Invariant violated by the peer (zero-length frame,
@@ -619,7 +619,7 @@ impl AudioPlaneRuntime {
     /// Subscribe to the inbound stream of domain-witness
     /// events delivered by peers over the audio-plane
     /// control channel. The
-    /// [`crate::domain_witness::DomainWitnessRuntime`]
+    /// `crate::domain_witness::DomainWitnessRuntime`
     /// consumes the stream; consumers that fall behind by
     /// more than the channel capacity see `Lagged` errors
     /// and re-subscribe.
@@ -1064,7 +1064,7 @@ impl AudioPlaneRuntime {
     /// Route a receiver back-report to the source-host peer of
     /// the named group. Receiver-role plugins call this once
     /// per frame they render via the SDK's
-    /// [`AudioPlaneHandle::report_frame_trace`]; the framework
+    /// `AudioPlaneHandle::report_frame_trace`; the framework
     /// looks up the source-host's connection from
     /// `local_device_id`-keyed group membership + per-peer
     /// connection state and queues the corresponding

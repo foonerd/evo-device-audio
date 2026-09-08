@@ -4,7 +4,7 @@
 //! Persistent (scheme, value, size) → content_hash sidecar
 //! index for the framework's artwork resolve endpoint.
 //!
-//! Complements [`evo_runtime_http::asset_cache::FilesystemAssetCache`]:
+//! Complements `evo_runtime_http::asset_cache::FilesystemAssetCache`:
 //! the AssetCache stores bytes by content hash; this index
 //! stores a small mapping row that makes those bytes reachable
 //! by an operator-facing key. Without this index, the
@@ -15,7 +15,7 @@
 //! 100 k-track library that turns browse into an O(library)
 //! per-tile tag-walk.
 //!
-//! Layout (mirrors [`FilesystemAssetCache`]):
+//! Layout (mirrors `FilesystemAssetCache`):
 //!
 //! - `<root>/artwork-resolve-index/<first-2-chars-of-key-hash>/<full-key-hash>`
 //! - File content: 64-lowercase-hex content hash + newline.
@@ -43,10 +43,10 @@
 //!
 //! ## Invalidation
 //!
-//! The endpoint's `?refresh=1` gesture calls [`Self::forget`]
+//! The endpoint's `?refresh=1` gesture calls `Self::forget`
 //! alongside the negative memo, coalescer memo, and
 //! `AssetCache::delete`. See
-//! [`evo_runtime_http::artwork_cascade::ArtworkCascade::forget`]
+//! `evo_runtime_http::artwork_cascade::ArtworkCascade::forget`
 //! for the fan-out.
 
 use std::path::{Path, PathBuf};

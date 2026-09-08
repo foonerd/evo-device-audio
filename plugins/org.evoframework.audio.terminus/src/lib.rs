@@ -4,7 +4,7 @@
 //!
 //! Canonical owner of every post-mixer audio-derived signal.
 //! Parallel-tapped from `pcm.evo` via `snd-aloop`; the primary
-//! audio path (pcm.evo -> hw:CARD=<dac>) is unaffected by
+//! audio path (pcm.evo -> hw:CARD=`<dac>`) is unaffected by
 //! terminus health (the floor invariant per the local-playback
 //! invariant contract). The plugin owns:
 //!

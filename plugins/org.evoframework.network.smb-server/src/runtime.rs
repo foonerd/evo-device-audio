@@ -581,7 +581,7 @@ fn revert_user_state_mutation(
 }
 
 /// Rendered subprocess output shape (mirrors
-/// [`crate::network_shares::CommandOutput`] for isolation).
+/// `crate::network_shares::CommandOutput` for isolation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     /// exit code (`None` on signal termination).
@@ -728,7 +728,7 @@ pub trait SmbCredentialFetcher: Send + Sync {
 }
 
 /// Placeholder fetcher installed by the plugin's
-/// [`crate::SmbServerPlugin::load`] when the LoadContext does
+/// `crate::SmbServerPlugin::load` when the LoadContext does
 /// not carry a credential vault handle. Every fetch returns
 /// `None` and [`Self::is_operator_wired`] is `false` so the
 /// runtime's `add_user` path fails with a distinct error class
@@ -1112,7 +1112,7 @@ impl NssProber for RealNssProber {
 /// file-share credentials on any distribution. The live
 /// steward service user (whatever the distribution configured
 /// it as) is added dynamically at validation time by
-/// [`blocked_smb_usernames`] reading `EVO_SERVICE_USER` and
+/// `blocked_smb_usernames` reading `EVO_SERVICE_USER` and
 /// `USER`, so a vendor distribution with a non-audio-reference
 /// service-user name inherits the protection without editing
 /// this array.
@@ -1361,7 +1361,7 @@ pub struct SystemSmbServerEnvelope {
 /// Reads `/proc/sys/kernel/hostname` — the kernel-authoritative
 /// value that reflects the last `sethostname(2)` call. This is
 /// what `hostnamectl set-hostname <name>` (used by
-/// [`apply_system_hostname_best_effort`]) causes systemd-hostnamed
+/// `apply_system_hostname_best_effort`) causes systemd-hostnamed
 /// to write, so the reader and the writer agree on the same
 /// substrate without a config-file round-trip that could go
 /// stale. Trailing newline stripped.
@@ -1472,7 +1472,7 @@ fn default_now_ms() -> u64 {
 impl SambaServerRuntime {
     /// Start a builder for constructing a runtime. The plugin's
     /// `load` path wires it up with the framework credential
-    /// vault handle from [`LoadContext`]; test suites use the
+    /// vault handle from `LoadContext`; test suites use the
     /// same builder with an in-process fetcher. There is no
     /// convenience `open()` constructor — a runtime with no
     /// explicit credential fetcher would silently return

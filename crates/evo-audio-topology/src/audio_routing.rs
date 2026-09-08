@@ -232,7 +232,7 @@ fn resolved_to_wire(
 /// This function attaches that edge:
 ///
 /// 1. Registers a callback on the local handle so every
-///    [`Self::publish_topology`] hit fans out across the wire
+///    `Self::publish_topology` hit fans out across the wire
 ///    as a [`evo_plugin_sdk::wire::WireFrame::AudioRoutingStateChanged`]
 ///    frame. The SDK proxy's reader loop ingests the frame,
 ///    updates its cache, and fires the plugin's registered

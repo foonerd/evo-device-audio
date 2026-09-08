@@ -397,7 +397,7 @@ pub struct Settings {
     /// load / steward restart. Valid range 0..=100. Default 30
     /// — protects ears + speakers when the device boots after a
     /// power cycle, since the operator may not remember the
-    /// pre-shutdown level. Capped at [`max_volume_percent`].
+    /// pre-shutdown level. Capped at `max_volume_percent`.
     #[serde(default = "default_startup_volume_percent")]
     pub startup_volume_percent: u8,
     /// Operator-imposed maximum volume the playback plugin

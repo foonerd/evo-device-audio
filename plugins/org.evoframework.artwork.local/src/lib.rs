@@ -17,24 +17,24 @@
 //! ```
 //! Response always includes `"v":1` and a `status` field: `ok`,
 //! `not_found`, `unsupported`, or `bad_request`, plus optional
-//! `path`, `mime`, and `detail` as document in [`resolve::ArtworkResolveResponse`].
+//! `path`, `mime`, and `detail` as document in `resolve::ArtworkResolveResponse`.
 //!
 //! - **`mpd-path`**: `value` is MPD’s `file` (relative to a configured
-//!   [`config::PluginConfig::library_roots`] or absolute on disk). A cover
+//!   `config::PluginConfig::library_roots` or absolute on disk). A cover
 //!   file next to the resolved audio file is chosen from a fixed name list
-//!   (`folder.jpg`, `cover.jpg`, …) in [`resolve::find_cover_beside_audio_file`].
+//!   (`folder.jpg`, `cover.jpg`, …) in `resolve::find_cover_beside_audio_file`.
 //! - **`mpd-album`**: `value` is `"{artist}|{album}"` as emitted by
 //!   `org.evoframework.playback.mpd` for the `album` subject. The respondent scans
-//!   files under [library] roots and picks the **first** track (deterministic
+//!   files under `[library]` roots and picks the **first** track (deterministic
 //!   walk) whose primary tag artist and album match; it then uses the same
 //!   cover logic as `mpd-path` for that file. Large libraries are bounded (see
 //!   `evo_device_audio_shared::MAX_MPD_ALBUM_SCAN_CANDIDATES`).
 //!
 //! # Version alignment
 //!
-//! [`PluginIdentity::version`], the embedded `manifest.toml` `[plugin]`
+//! [`PluginIdentity::version`], the embedded `manifest.toml [plugin]`
 //! section, and this crate’s `CARGO_PKG_VERSION` must match; see
-//! [`plugin_crate_version`].
+//! `plugin_crate_version`.
 //!
 //! # Reference
 //!

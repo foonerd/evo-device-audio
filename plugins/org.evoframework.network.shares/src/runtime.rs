@@ -286,7 +286,7 @@ pub struct ShareRecord {
     /// `/var/lib/evo/music/NAS/<sanitized_alias>` at record-creation time.
     pub mount_root: PathBuf,
     /// Wall-clock millis when this record was first created.
-    /// Used by operator UI for "added <n> ago" freshness.
+    /// Used by operator UI for "added `<n>` ago" freshness.
     pub created_at_ms: i64,
     /// Wall-clock millis of the last successful mount. `None`
     /// means the share has never been successfully mounted.
@@ -913,7 +913,7 @@ pub enum MountError {
     },
     /// The password prompt could not be issued — the framework's
     /// user-interaction responder returned a
-    /// [`ReportError`](evo_plugin_sdk::contract::ReportError).
+    /// [`ReportError`].
     /// The reason is preserved verbatim for operator visibility.
     #[error("password prompt failed for key {key}: {reason}")]
     CredentialPromptFailed {
@@ -1111,7 +1111,7 @@ impl MountExecutor for SubprocessMountExecutor {
 
 /// Look up the bytes for a credential key. Trait so tests can
 /// mock the credential vault interaction without pulling in the
-/// full [`crate::credentials::CredentialVault`] fixture.
+/// full `crate::credentials::CredentialVault` fixture.
 #[async_trait]
 pub trait CredentialFetcher: Send + Sync {
     /// Return the password bytes for `credential_key`, or
@@ -1809,7 +1809,7 @@ pub fn systemd_mount_unit_name(mount_root: &Path) -> String {
 
 /// True when the mount helper's stderr indicates the target
 /// directory is absent (ENOENT). Read by
-/// [`NetworkSharesRuntime::mount_cifs`] to short-circuit the
+/// `NetworkSharesRuntime::mount_cifs` to short-circuit the
 /// dialect probe on a missing-directory error rather than
 /// walking the full ladder and mislabelling five ENOENTs as
 /// "dialect probe exhausted".
@@ -1827,7 +1827,7 @@ pub fn is_mount_directory_missing(stderr: &str) -> bool {
 
 /// True when the mount.cifs exit code + stderr fragment indicate
 /// an authentication failure rather than a dialect / protocol
-/// failure. Read by [`NetworkSharesRuntime::mount_cifs`] to
+/// failure. Read by `NetworkSharesRuntime::mount_cifs` to
 /// short-circuit the dialect probe on auth-refusal.
 ///
 /// The canonical CIFS auth-refusal signals:
@@ -3221,7 +3221,7 @@ impl ShareEvent {
 pub struct ShareEventsEnvelope {
     /// Last N lifecycle events in insertion order (oldest
     /// first). Empty at boot until the first mount / unmount
-    /// attempt completes; bounded by [`SHARE_EVENTS_RING_CAPACITY`]
+    /// attempt completes; bounded by `SHARE_EVENTS_RING_CAPACITY`
     /// so a long-lived runtime does not grow the payload
     /// without bound.
     pub events: Vec<ShareEvent>,
@@ -3287,7 +3287,7 @@ impl NetworkSharesRuntimeBuilder {
     }
 
     /// Install a custom [`CredentialFetcher`] (typically the
-    /// framework's [`crate::credentials::CredentialVault`]
+    /// framework's `crate::credentials::CredentialVault`
     /// bridged through a small adapter).
     pub fn with_credentials(
         mut self,

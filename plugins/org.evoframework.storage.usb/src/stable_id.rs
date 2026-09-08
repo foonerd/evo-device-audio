@@ -53,7 +53,7 @@
 //! When two DIFFERENT physical volumes derive the same base id
 //! (two "Music" sticks; two identical `SanDisk-Cruzer-Blade` sticks)
 //! the caller passes the current set of in-use mount roots to
-//! [`derive`] via [`DerivationContext::in_use_stable_ids`] and
+//! `derive` via [`DerivationContext::in_use_stable_ids`] and
 //! the deriver appends `-2` / `-3` / … until unique. Enumeration
 //! is deterministic: caller sorts the input partition set before
 //! deriving so the same physical set produces the same suffix
@@ -120,7 +120,7 @@ pub struct DerivationInput<'a> {
     pub partuuid: Option<&'a str>,
 }
 
-/// Context supplied to [`derive`] for alias lookup + collision
+/// Context supplied to `derive` for alias lookup + collision
 /// resolution. Kept as a trait-free struct so callers can build
 /// it from any state store.
 #[derive(Debug, Clone, Default)]

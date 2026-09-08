@@ -68,7 +68,7 @@ pub fn storage_usb_drives_addressing() -> ExternalAddressing {
 pub const DEFAULT_RECONCILE_CADENCE_MS: u64 = 5_000;
 
 /// Verb list for this shelf. Kept in this crate so
-/// [`crate::StorageUsbPlugin::describe`] + the manifest stay
+/// `crate::StorageUsbPlugin::describe` + the manifest stay
 /// aligned by construction (asserted by test).
 pub const STORAGE_USB_VERBS: &[&str] = &[
     "storage.usb.list_drives",

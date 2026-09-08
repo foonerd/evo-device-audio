@@ -6,7 +6,7 @@
 //! audio.favourites / audio.library shelf contexts plus the
 //! sticker reconciler handle in one struct so the plugin
 //! lifecycle (load/unload) and the verb dispatcher each touch
-//! a single Option<ShelfBundle> instead of N fields.
+//! a single `Option<ShelfBundle>` instead of N fields.
 //!
 //! # Verb dispatch
 //!
