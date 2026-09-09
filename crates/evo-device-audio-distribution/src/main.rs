@@ -114,6 +114,8 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+mod rtc_wake;
+
 use clap::Parser as _;
 use std::sync::{Arc, OnceLock};
 
@@ -137,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     // Nothing hands it to the steward and nothing hands it back.
     let topology_store: SharedTopologyStore = Arc::new(OnceLock::new());
     let opts = evo::RunOptions::new(args, audio_distribution_admission())
+        .with_rtc_wake(Arc::new(rtc_wake::SysfsRtcWake::new()))
         .with_post_admission(audio_distribution_post_admission(Arc::clone(
             &topology_store,
         )))

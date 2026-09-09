@@ -123,6 +123,8 @@ SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 SMB_USER_SYNC_WRAPPER_DST="/usr/local/bin/evo-smb-user-sync"
 STORAGE_USB_SUDOERS_FILE="/etc/sudoers.d/evo-storage-usb"
 STORAGE_USB_WRAPPER_DST="/usr/local/bin/evo-usb-mount"
+RTC_WAKE_SUDOERS_FILE="/etc/sudoers.d/evo-rtc-wake"
+RTC_WAKE_WRAPPER_DST="/usr/local/bin/evo-rtc-wake"
 STORAGE_USB_STATE_DIR="/var/lib/evo/plugins/org.evoframework.storage.usb"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
@@ -799,6 +801,34 @@ if [[ "${EVO_INSTALL_STORAGE_USB:-1}" != "0" ]]; then
 else
     echo "[bootstrap] EVO_INSTALL_STORAGE_USB=0 — skipping storage.usb wrapper + sudoers + packages + state dir"
 fi
+
+# ----------------------------------------------------------
+# Step 1h: /usr/local/bin/evo-rtc-wake +
+#          /etc/sudoers.d/evo-rtc-wake (narrow NOPASSWD)
+# ----------------------------------------------------------
+# The steward service user cannot write the kernel RTC sysfs
+# node directly. This root-owned wrapper is the only privileged
+# target and performs the required clear-then-program sequence.
+RTC_WAKE_WRAPPER_SRC="$DIST_DIR/bin/evo-rtc-wake"
+RTC_WAKE_SUDOERS_TEMPLATE="$DIST_DIR/sudoers.d/evo-rtc-wake.in"
+if [[ ! -f "$RTC_WAKE_WRAPPER_SRC" || ! -f "$RTC_WAKE_SUDOERS_TEMPLATE" ]]; then
+    echo "RTC wake wrapper or sudoers template missing under $DIST_DIR" >&2
+    exit 2
+fi
+install -m 0755 -o root -g root "$RTC_WAKE_WRAPPER_SRC" "$RTC_WAKE_WRAPPER_DST"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+    "$RTC_WAKE_SUDOERS_TEMPLATE" > "$TMP"
+if ! visudo -c -f "$TMP" >/dev/null; then
+    echo "RTC wake sudoers fragment failed visudo -c; refusing to install" >&2
+    trap - EXIT
+    exit 2
+fi
+install -m 0440 -o root -g root "$TMP" "$RTC_WAKE_SUDOERS_FILE"
+rm -f "$TMP"
+trap - EXIT
+echo "[bootstrap] installed $RTC_WAKE_WRAPPER_DST and $RTC_WAKE_SUDOERS_FILE"
 
 # ----------------------------------------------------------
 # Step 1d: /usr/share/evo-device-audio/dacs.json
