@@ -163,6 +163,29 @@ if [[ ! -f "${kiosk_tgz}" ]]; then
 fi
 unpack_tree "${kiosk_tgz}" "${STAGE}/layers/evo-kiosk-eng"
 
+# The composed box must carry the kiosk program for the target it
+# is composed for. bootstrap.sh selects layer mode only when
+# layer/binaries/<triple>/evo-kiosk-browser is executable in the
+# unpacked piece; with the program absent it falls back to cargo
+# mode and apt-installs a toolchain plus the GTK4/WebKit dev set
+# to build the browser on the tester's device. A published box
+# that lands in that branch is the brick.
+#
+# The piece is minted with the program by the kiosk train
+# (cross-build.sh then stage-kiosk-piece.sh). Compose does not
+# build and does not substitute: one check per composed target,
+# and no program means no bundle.
+KIOSK_PROGRAM="${STAGE}/layers/evo-kiosk-eng/layer/binaries/${TARGET}/evo-kiosk-browser"
+[[ -e "${KIOSK_PROGRAM}" ]] || die \
+    "kiosk piece ${KIOSK_VER} carries no program for ${TARGET}: layer/binaries/${TARGET}/evo-kiosk-browser is absent. Mint the piece with the kiosk train (scripts/release/cross-build.sh then scripts/release/stage-kiosk-piece.sh); compose will not build it and will not ship a box that falls back to cargo mode."
+[[ -f "${KIOSK_PROGRAM}" ]] || die \
+    "kiosk program for ${TARGET} is not a regular file: layer/binaries/${TARGET}/evo-kiosk-browser"
+[[ -x "${KIOSK_PROGRAM}" ]] || die \
+    "kiosk program for ${TARGET} is not executable: layer/binaries/${TARGET}/evo-kiosk-browser (mode $(stat -c %a "${KIOSK_PROGRAM}"))"
+[[ -s "${KIOSK_PROGRAM}" ]] || die \
+    "kiosk program for ${TARGET} is empty: layer/binaries/${TARGET}/evo-kiosk-browser"
+log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
+
 {
     echo "schema_version = 1"
     echo "bundle_kind = \"evo-device-audio\""
