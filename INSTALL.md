@@ -71,6 +71,8 @@ From your ordinary user account, run:
 curl -fsSL https://raw.githubusercontent.com/foonerd/evo-device-audio/main/dist/scripts/evo-install.sh | sudo bash
 ```
 
+The installer downloads the signed bundle from the artefacts repo's **GitHub Release** (not from a git path). Default is `https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download`. The tarball is larger than GitHub's 100 MB git limit, so it is not stored as a blob on `main`. Pin a cut with `EVO_BUNDLE_URL_BASE=https://github.com/foonerd/evo-device-audio-artefacts/releases/download/<tag>` and `EVO_BUNDLE_VERSION=0.1.13`.
+
 The installer:
 
 1. Downloads the signed bundle for your architecture.

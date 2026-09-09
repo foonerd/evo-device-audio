@@ -62,9 +62,10 @@ Both must be green before any version bump. The commit entry gate above is stric
 Workflows under [`.github/workflows/`](.github/workflows/):
 
 -   **build** - on every `pull_request` and `push`: `cargo fmt`, `clippy` (`-D warnings`), `cargo test --workspace`. The SDK is fetched directly from the git tag; no sibling evo-core checkout. The local commit entry gate also requires `cargo clean` and `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` (`scripts/preflight/check-cargo-workout.sh`).
--   **continuous-dev** - on `push` to `main` when code, CI, keys, or build config change: same checks, then `cross build` for `aarch64-unknown-linux-gnu` (when there are members), then optional `evo-plugin-tool` sign/verify against an OOP sample bundle (when one is present in `ci/oob-sign-smoke/`). Publishing to the artefacts repository is not wired yet.
--   **manual-build** - `workflow_dispatch` with a git `ref` and a `channel` input (for logging; same publish gap as above).
--   **promote** - placeholder for channel pointer moves on the artefacts repo (no rebuild).
+-   **publish-pieces** - manual. Selector `all` / `steward` / `plugin`. Cross-builds and signs versioned slots on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). Append-only. A published version slot is frozen.
+-   **publish-distribution-bundle** - public tag / `workflow_dispatch`. First-boot composition. The tarball is ~110 MB; GitHub rejects git blobs over 100 MB, so the bytes live as GitHub Release assets on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). Testers curl `releases/latest/download`. Git holds only `bundles/distribution/<cargo-version>.toml`. Do not `git add` the tarball.
+-   **promote** - manual. Moves a channel pointer (`dev` / `test` / `prod`) to a piece version that is already published. No rebuild.
+-   **secret-smoke** - manual. Proves the artefacts token and the signing key without publishing.
 
 ## Repository secret PLUGIN_SIGNING_KEY_PEM
 
