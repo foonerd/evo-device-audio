@@ -990,10 +990,18 @@ MDROP
     # USB and NAS adopts are other filesystems; a recursive
     # chown descends into them, fails EROFS on a read-only
     # share, and under set -e dies before asound is rendered.
+    #
+    # Mode must match StateDirectoryMode=0755 (state-dir-mode
+    # .conf). ProtectSystem=strict remounts the unit namespace
+    # read-only; systemd will only hand /var/lib/evo to User=
+    # if the host inode already matches that user and mode.
+    # A 0750 here, or a later reparent to root, forces an
+    # adjustment that returns EROFS and the unit dies
+    # 238/STATE_DIRECTORY before the binary starts.
     if [[ -d /var/lib/evo ]]; then
         chown_tree_same_fs /var/lib/evo "$SERVICE_USER"
-        chmod 0750 /var/lib/evo
-        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750, same-filesystem)"
+        chmod 0755 /var/lib/evo
+        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0755, same-filesystem)"
     fi
 
 else
@@ -1504,7 +1512,10 @@ fi
 # SERVICE_USER:SERVICE_USER fallback for hosts where the
 # `audio` group does not exist.
 if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
-    install -d -m 0755 -o root -g root /var/lib/evo
+    # Parent must stay the tenant. `install -d -o root` on an
+    # existing /var/lib/evo reparents it and arms the
+    # 238/STATE_DIRECTORY path under ProtectSystem=strict.
+    install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" /var/lib/evo
     if ! install -d -m 0755 -o "$SERVICE_USER" -g audio \
             /var/lib/evo/music \
             /var/lib/evo/music/INTERNAL \
@@ -1552,6 +1563,12 @@ if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
             /var/lib/evo/plugins/stage
     fi
     echo "[bootstrap] /var/lib/evo/plugins/stage ensured (mode 0775, group $SERVICE_USER)"
+
+    # Re-assert the StateDirectory inode only. Children keep
+    # their own owners (music:audio, uploads root, plugin
+    # stage). Do not walk.
+    chown "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
+    chmod 0755 /var/lib/evo
 
     # mpd's music_directory must point at /var/lib/evo/music
     # before the restart later in this script. The line is
