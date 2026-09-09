@@ -62,16 +62,34 @@ Both must be green before any version bump. The commit entry gate above is stric
 Workflows under [`.github/workflows/`](.github/workflows/):
 
 -   **build** - on every `pull_request` and `push`: `cargo fmt`, `clippy` (`-D warnings`), `cargo test --workspace`. The SDK is fetched directly from the git tag; no sibling evo-core checkout. The local commit entry gate also requires `cargo clean` and `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` (`scripts/preflight/check-cargo-workout.sh`).
--   **publish-pieces** - manual. Selector `all` / `steward` / `plugin`. Cross-builds and signs versioned slots on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). Append-only. A published version slot is frozen.
--   **publish-distribution-bundle** - public tag / `workflow_dispatch`. First-boot composition. The tarball is ~110 MB; GitHub rejects git blobs over 100 MB, so the bytes live as GitHub Release assets on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). Testers curl `releases/latest/download`. Git holds only `bundles/distribution/<cargo-version>.toml`. Do not `git add` the tarball.
--   **promote** - manual. Moves a channel pointer (`dev` / `test` / `prod`) to a piece version that is already published. No rebuild.
+-   **publish-pieces** - manual. Selector `all` / `steward` / `plugin` / `dist`. Cross-builds and signs versioned slots on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). Append-only. A published version slot is frozen. Between cuts, if bytes would change, bump that piece's version before minting again. Re-running the same version is a no-op. Does not bake the installer tarball.
+
+### Piece list (append-only slots)
+
+Pieces first, then the first-boot tarball. Bake composes from `scripts/release/piece-pins.toml` and refuses to compile a part whose slot exists.
+
+| Piece | Kind | Slot | Minted by |
+|-------|------|------|-----------|
+| `evo-device-audio` | audio-steward | `binaries/evo-device-audio/<ver>/<target>/` | audio `publish-pieces` (`steward`) |
+| `org.evoframework.*` | plugin-bundle | `bundles/<plugin>/<target>/<plugin>-<ver>-<target>.tar.gz` | audio `publish-pieces` (`plugin`) |
+| `evo-device-audio-dist` | audio-dist | `bundles/evo-device-audio-dist/<ver>/` | audio `publish-pieces` (`dist`) |
+| `evo-ui-shell` | ui-shell | `bundles/evo-ui-shell/<ver>/` | public `evo-ui` `publish-pieces` |
+| `evo-ui-runtime` | ui-runtime | `binaries/evo-ui-runtime/<ver>/<target>/` | public `evo-ui` `publish-pieces` |
+| `evo-kiosk` | kiosk-session | `bundles/evo-kiosk/<ver>/` | public `evo-kiosk` `publish-pieces` |
+| `evo-device-boot` | boot-theme | `bundles/evo-device-boot/<ver>/` | `evo-device-boot` `publish-pieces` |
+
+Targets for per-arch pieces: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`. Sign with the audio commons key (`PLUGIN_SIGNING_KEY_PEM`). Do not invent a second UI key. Overlay a live UI shell with `evo-install.sh --piece evo-ui-shell --version <ver>`.
+
+`pieces/` on artefacts is leftover stub catalogue. Promote ignores it.
+-   **publish-distribution-bundle** - on public tag push `v*.*.*` (and `workflow_dispatch`). First-boot composition: steward, all OOP wires, UI shell, `evo-ui-runtime`, kiosk layer, boot layer. The tarball is ~110 MB; GitHub rejects git blobs over 100 MB, so the bytes live as GitHub Release assets on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts), not as git objects. Testers already curl `releases/latest/download`. The bake creates GitHub Release `<tag>` with `--latest=false` and commits only a thin pointer `bundles/distribution/<cargo-version>.toml` (+ `.sig`) on artefacts `main`. Do not `git add` the tarball. Mark the remint release Latest only after this job is green. UI and kiosk have no piece channel yet — without this bake, testers keep the previous cut's tarball.
+-   **promote** - manual. Moves a channel pointer (`dev` / `test` / `prod`) to a piece version that is already published. No rebuild. Piece is `evo-device-audio` or a plugin from `dist/scripts/lib/oop-plugins.sh`.
 -   **secret-smoke** - manual. Proves the artefacts token and the signing key without publishing.
 
 ## Repository secret PLUGIN_SIGNING_KEY_PEM
 
 PKCS#8 PEM for the **private** key that pairs with the public key in [`keys/commons-plugin-signing-public.pem`](keys/commons-plugin-signing-public.pem) and its [`keys/commons-plugin-signing-public.meta.toml`](keys/commons-plugin-signing-public.meta.toml) sidecar.
 
-When set, the continuous-dev and manual-build workflows sign and verify the OOP sign-smoke bundle. When unset, the sign step is skipped and CI remains green - the secret is required only for actually exercising the signing pipeline, not for build/test.
+When set, `secret-smoke.yml` signs a throw-away payload and verifies it against the committed public key. `build.yml` does not need this secret.
 
 The private key never leaves the GitHub Actions runner. The public key fingerprint (SHA256 of the DER-encoded SubjectPublicKeyInfo) is recorded in the meta sidecar for verification on key rotation.
 
@@ -81,9 +99,10 @@ The private key never leaves the GitHub Actions runner. The public key fingerpri
 2.  Add `Cargo.toml` with `name` set to the dotted name with dots replaced by hyphens (e.g. `org-evoframework-playback-mpd`) and `package = { workspace = true }` for shared metadata.
 3.  Add `manifest.toml` with `name` set to the dotted form matching the directory name (e.g. `org.evoframework.playback.mpd`). The reverse-DNS namespace prefix is reserved for the plugin commons; do not publish under any other prefix from this repo.
 4.  Add the new path to `[workspace].members` in the root `Cargo.toml`.
-5.  Implement against the SDK trait that matches the slot the plugin will stock. See evo-core's [`PLUGIN_AUTHORING.md`](https://github.com/foonerd/evo-core/blob/main/docs/engineering/PLUGIN_AUTHORING.md).
-6.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-device-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
-7.  `scripts/preflight/check-cargo-workout.sh` green before commit (clean, fmt, clippy `-D warnings`, test, rustdoc `-D warnings` on toolchain 1.85).
+5.  Add the plugin to `dist/scripts/lib/oop-plugins.sh` (installer tarball and `publish-pieces.yml` both read this list).
+6.  Implement against the SDK trait that matches the slot the plugin will stock. See evo-core's [`PLUGIN_AUTHORING.md`](https://github.com/foonerd/evo-core/blob/main/docs/engineering/PLUGIN_AUTHORING.md).
+7.  If the plugin needs utilities shared with other plugins (path normalisation, library scanning, common error types), depend on `evo-device-audio-shared = { workspace = true }` and add the helper to that crate. Do not duplicate across plugins.
+8.  `scripts/preflight/check-cargo-workout.sh` green before commit (clean, fmt, clippy `-D warnings`, test, rustdoc `-D warnings` on toolchain 1.85).
 
 ## Boundary discipline
 
@@ -742,9 +761,8 @@ At the release-cut, the SDK pin flips back to a `git+tag` form, the path-dep wor
 
 1.  Verify the new evo-core tag is green (`cargo test --workspace` in evo-core).
 2.  Update `[workspace.dependencies].evo-plugin-sdk` in this repo's `Cargo.toml`: bump `tag = "..."` and `version = "..."` to match.
-3.  Update `EVO_CORE_TAG` in `.github/workflows/continuous-dev.yml` and `.github/workflows/manual-build.yml`.
-4.  Rerun `cargo build --workspace` and `cargo test --workspace`.
-5.  Commit with a message naming the new evo-core version and any public-surface changes the bump forced.
+3.  Rerun `cargo build --workspace` and `cargo test --workspace`.
+4.  Commit with a message naming the new evo-core version and any public-surface changes the bump forced.
 
 ## License
 

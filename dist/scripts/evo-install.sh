@@ -51,7 +51,8 @@
 # Channel selection:
 #
 #   EVO_BUNDLE_URL_BASE selects the artefact source. The
-#   default points at the project's STABLE artefact channel.
+#   default is the artefacts GitHub Release Latest asset
+#   (the first-boot tarball is not a git blob).
 #   Override the value to point at a developer-side HTTP
 #   server hosting an unreleased bundle during release-cut
 #   preparation.
@@ -64,6 +65,7 @@
 #   sudo bash evo-install.sh --mode=reinstall
 #   sudo bash evo-install.sh --mode=wipe-config
 #   sudo bash evo-install.sh --mode=wipe-user-data
+#   sudo bash evo-install.sh --piece evo-ui-shell --version 0.1.13
 #
 # Env tunables (apply across modes):
 #   EVO_BUNDLE_URL_BASE         Channel-base URL.
@@ -111,10 +113,12 @@ MCowBQYDK2VwAyEAvJqIhluihUhLY435rJZnIjskDS9affTKSDUIYVIjVE0=
 EVO_BUNDLE_TRUST_ROOT_PEM="${EVO_BUNDLE_TRUST_ROOT_PEM:-${EVO_BUNDLE_TRUST_ROOT_PEM_DEFAULT}}"
 
 # -------- Defaults --------
-# Default URL points at the public artefact channel for the
-# stable distribution. Set EVO_BUNDLE_URL_BASE to override
-# (e.g. point at a developer-side HTTP server hosting an
-# unreleased bundle during release-cut preparation).
+# Default URL is the artefacts GitHub Release Latest asset.
+# The first-boot tarball is ~110 MB; it is not a git blob
+# (GitHub rejects files over 100 MB). Pin a cut with
+# EVO_BUNDLE_URL_BASE=.../releases/download/<tag>.
+# Override to point at a developer-side HTTP server during
+# release-cut preparation.
 EVO_BUNDLE_URL_BASE="${EVO_BUNDLE_URL_BASE:-https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download}"
 EVO_BUNDLE_VERSION="${EVO_BUNDLE_VERSION:-0.1.13}"
 EVO_INSTALL_MUSIC_LIBRARY="${EVO_INSTALL_MUSIC_LIBRARY:-1}"
@@ -123,6 +127,8 @@ EVO_ACCEPTANCE_SIGNING_KEY="${EVO_ACCEPTANCE_SIGNING_KEY:-}"
 
 # -------- Argument parsing --------
 MODE="install"
+PIECE=""
+PIECE_VERSION=""
 # Flags relayed to bootstrap.sh's placement primitive. evo-
 # install.sh delegates ALL /etc placement (asound.conf,
 # sudoers, systemd drop-ins, mpd include, plugins.d defaults,
@@ -154,6 +160,14 @@ while [[ $# -gt 0 ]]; do
             MODE="$2"
             shift 2
             ;;
+        --piece)
+            PIECE="$2"; shift 2 ;;
+        --piece=*)
+            PIECE="${1#--piece=}"; shift ;;
+        --version)
+            PIECE_VERSION="$2"; shift 2 ;;
+        --version=*)
+            PIECE_VERSION="${1#--version=}"; shift ;;
         --card)
             EVO_INSTALL_AUDIO_CARD="$2" ; shift 2 ;;
         --card=*)
@@ -193,6 +207,15 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "${PIECE}" ]]; then
+    if [[ -z "${PIECE_VERSION}" ]]; then
+        echo "FAIL: --piece requires --version" >&2
+        exit 1
+    fi
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    exec bash "${SCRIPT_DIR}/apply-piece.sh" --piece "${PIECE}" --version "${PIECE_VERSION}"
+fi
 
 case "${MODE}" in
     install|reinstall|wipe-config|wipe-user-data) ;;
