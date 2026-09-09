@@ -341,6 +341,8 @@ echo "[bootstrap] systemctl binary: $SYSTEMCTL_BIN"
 # script.
 # shellcheck source=lib/detect-audio-card.sh
 . "$SCRIPT_DIR/lib/detect-audio-card.sh"
+# shellcheck source=lib/chown-tree-same-fs.sh
+. "$SCRIPT_DIR/lib/chown-tree-same-fs.sh"
 
 if [[ -z "$AUDIO_CARD" ]]; then
     if ! command -v aplay >/dev/null 2>&1; then
@@ -983,10 +985,15 @@ MDROP
     # time). Without this chown the new tenant cannot read its
     # own signing key, subject state, ledger, or persistence
     # chain. Idempotent: chowning to the same owner is a no-op.
+    #
+    # The walk stays on the filesystem that holds /var/lib/evo.
+    # USB and NAS adopts are other filesystems; a recursive
+    # chown descends into them, fails EROFS on a read-only
+    # share, and under set -e dies before asound is rendered.
     if [[ -d /var/lib/evo ]]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
+        chown_tree_same_fs /var/lib/evo "$SERVICE_USER"
         chmod 0750 /var/lib/evo
-        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750)"
+        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750, same-filesystem)"
     fi
 
 else
