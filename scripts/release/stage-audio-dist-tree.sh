@@ -30,6 +30,11 @@ install -m 0644 "${REPO_ROOT}/dist/catalogue/audio-rack.toml" \
     "${OUT}/dist/catalogue/audio-rack.toml"
 cp -a "${REPO_ROOT}/dist/sudoers.d/." "${OUT}/dist/sudoers.d/"
 cp -a "${REPO_ROOT}/dist/systemd/evo.service.d/." "${OUT}/dist/systemd/evo.service.d/"
+if [[ ! -f "${REPO_ROOT}/dist/systemd/evo.service" ]]; then
+    echo "stage-audio-dist-tree: missing dist/systemd/evo.service" >&2
+    exit 1
+fi
+install -m 0644 "${REPO_ROOT}/dist/systemd/evo.service"     "${OUT}/dist/systemd/evo.service"
 install -m 0755 "${REPO_ROOT}/dist/scripts/bootstrap.sh" "${OUT}/dist/scripts/bootstrap.sh"
 cp -a "${REPO_ROOT}/dist/scripts/lib/." "${OUT}/dist/scripts/lib/"
 cp -a "${REPO_ROOT}/dist/alsa/." "${OUT}/dist/alsa/"

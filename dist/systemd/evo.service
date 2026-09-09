@@ -1,0 +1,35 @@
+# Distribution-owned evo.service. ExecStart and User/Group are
+# not baked here: bootstrap.sh writes
+# evo.service.d/exec-start.conf and service-user.conf.
+# Shape matches the framework reference unit (KillMode=mixed,
+# RuntimeDirectory, StateDirectory, hardening).
+
+[Unit]
+Description=Evo steward
+After=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30s
+RuntimeDirectory=evo
+RuntimeDirectoryMode=0755
+StateDirectory=evo
+StateDirectoryMode=0750
+ConfigurationDirectory=evo
+ConfigurationDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

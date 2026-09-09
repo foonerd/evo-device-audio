@@ -105,6 +105,15 @@ log "pins steward=${STEWARD_VER} ui-shell=${SHELL_VER} ui-runtime=${RUNTIME_VER}
 # Dist tree + plugin overlays
 unpack_tree "${ARTEFACTS}/bundles/evo-device-audio-dist/${DIST_VER}/tree.tar.gz" "${STAGE}/_distpiece"
 cp -a "${STAGE}/_distpiece/dist" "${STAGE}/dist"
+# The installer install_main_systemd_unit() requires
+# dist/systemd/evo.service. The published dist piece 0.1.13
+# never carried it (stage copied only evo.service.d/). The
+# unit is distribution-owned and lives in this repo. Place
+# it after the piece unpack so a frozen slot cannot produce
+# a box that dies at [7/8].
+UNIT_SRC="${REPO_ROOT}/dist/systemd/evo.service"
+[[ -f "${UNIT_SRC}" ]] || die "missing ${UNIT_SRC}"
+install -m 0644 "${UNIT_SRC}" "${STAGE}/dist/systemd/evo.service"
 if [[ -d "${STAGE}/_distpiece/plugin-overlays" ]]; then
     mkdir -p "${STAGE}/plugins"
     for ov in "${STAGE}/_distpiece/plugin-overlays"/*; do
@@ -185,6 +194,9 @@ KIOSK_PROGRAM="${STAGE}/layers/evo-kiosk-eng/layer/binaries/${TARGET}/evo-kiosk-
 [[ -s "${KIOSK_PROGRAM}" ]] || die \
     "kiosk program for ${TARGET} is empty: layer/binaries/${TARGET}/evo-kiosk-browser"
 log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
+[[ -f "${STAGE}/dist/systemd/evo.service" ]] || die \
+    "composed tree has no dist/systemd/evo.service; install_main_systemd_unit cannot place the unit"
+log "evo.service present ($(wc -c < "${STAGE}/dist/systemd/evo.service") bytes)"
 
 {
     echo "schema_version = 1"
