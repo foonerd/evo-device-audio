@@ -8,10 +8,17 @@
 #   steward  — evo-device-audio only
 #   plugin   — one plugin from dist/scripts/lib/oop-plugins.sh
 #   dist     — evo-device-audio-dist placement tree
+#   kiosk    — evo-kiosk piece, built from an evo-kiosk-eng
+#              checkout (program stored; sources alone refused)
+#
+# all does not imply kiosk. Kiosk mint needs the kiosk-eng
+# tree and three WebKit cross-builds; it is dispatched on
+# its own scope so an existing all run does not change.
 #
 # Slots (append-only):
 #   binaries/evo-device-audio/<version>/<target>/
 #   bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
+#   bundles/evo-kiosk/<version>/
 #
 # Does not publish evo-core's `evo` or `evo-plugin-tool`. Those
 # live on evo-core's own publish.yml / evo-core-artefacts.
@@ -27,13 +34,18 @@ name: publish-pieces
       scope:
         description: "What to mint"
         type: choice
-        options: [all, steward, plugin, dist]
+        options: [all, steward, plugin, dist, kiosk]
         default: all
       plugin:
         description: "Plugin name when scope=plugin (must be in oop-plugins.sh)"
         type: string
         required: false
         default: ""
+      kiosk_ref:
+        description: "git ref of foonerd/evo-kiosk-eng when scope=kiosk"
+        type: string
+        required: false
+        default: v0.1.13.1
 
 concurrency:
   group: publish-pieces
@@ -53,6 +65,7 @@ jobs:
     outputs:
       build_steward: ${{ steps.resolve.outputs.build_steward }}
       build_dist: ${{ steps.resolve.outputs.build_dist }}
+      build_kiosk: ${{ steps.resolve.outputs.build_kiosk }}
       plugin_count: ${{ steps.resolve.outputs.plugin_count }}
       plugin_matrix: ${{ steps.resolve.outputs.plugin_matrix }}
     steps:
@@ -335,8 +348,80 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+
+  build-kiosk:
+    needs: resolve
+    if: needs.resolve.outputs.build_kiosk == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out audio
+        uses: actions/checkout@v5
+
+      - name: Require KIOSK_ENG_READ_TOKEN
+        env:
+          TOKEN: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TOKEN" ]; then
+            echo "::error::KIOSK_ENG_READ_TOKEN is empty — scope=kiosk reads foonerd/evo-kiosk-eng"
+            exit 1
+          fi
+
+      - name: Check out evo-kiosk-eng
+        uses: actions/checkout@v5
+        with:
+          repository: foonerd/evo-kiosk-eng
+          ref: ${{ inputs.kiosk_ref }}
+          token: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
+          path: evo-kiosk-eng
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up Docker / Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Mint kiosk piece
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+          export EVO_PLUGIN_SIGNING_KEY=/tmp/key.pem
+          VERSION=$(awk -F'"' '/^version *=/{print $2; exit}' \
+            evo-kiosk-eng/crates/kiosk-browser/Cargo.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read kiosk-browser version"
+            exit 1
+          fi
+          mkdir -p "/tmp/stage/bundles/evo-kiosk/${VERSION}"
+          bash scripts/release/mint-kiosk-piece.sh \
+            --kiosk-src "${GITHUB_WORKSPACE}/evo-kiosk-eng" \
+            --out-dir "/tmp/stage/bundles/evo-kiosk/${VERSION}" \
+            --version "$VERSION"
+          shred -u /tmp/key.pem
+          ls -la "/tmp/stage/bundles/evo-kiosk/${VERSION}"
+
+      - name: Upload kiosk piece
+        uses: actions/upload-artifact@v7
+        with:
+          name: kiosk-tree
+          path: /tmp/stage/bundles/
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: [resolve, host-tool, build-steward, build-plugin, build-dist]
+    needs: [resolve, host-tool, build-steward, build-plugin, build-dist, build-kiosk]
     if: |
       always() &&
       needs.resolve.result == 'success' &&
@@ -344,7 +429,8 @@ jobs:
       (needs.build-steward.result == 'success' || needs.build-steward.result == 'skipped') &&
       (needs.build-plugin.result == 'success' || needs.build-plugin.result == 'skipped') &&
       (needs.build-dist.result == 'success' || needs.build-dist.result == 'skipped') &&
-      (needs.build-steward.result == 'success' || needs.build-plugin.result == 'success' || needs.build-dist.result == 'success')
+      (needs.build-kiosk.result == 'success' || needs.build-kiosk.result == 'skipped') &&
+      (needs.build-steward.result == 'success' || needs.build-plugin.result == 'success' || needs.build-dist.result == 'success' || needs.build-kiosk.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download steward artefacts
@@ -368,6 +454,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           pattern: dist-tree
+          path: /tmp/stage/bundles/
+          merge-multiple: true
+
+      - name: Download kiosk artefact
+        if: needs.build-kiosk.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kiosk-tree
           path: /tmp/stage/bundles/
           merge-multiple: true
 
