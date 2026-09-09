@@ -105,15 +105,15 @@ log "pins steward=${STEWARD_VER} ui-shell=${SHELL_VER} ui-runtime=${RUNTIME_VER}
 # Dist tree + plugin overlays
 unpack_tree "${ARTEFACTS}/bundles/evo-device-audio-dist/${DIST_VER}/tree.tar.gz" "${STAGE}/_distpiece"
 cp -a "${STAGE}/_distpiece/dist" "${STAGE}/dist"
-# The installer install_main_systemd_unit() requires
-# dist/systemd/evo.service. The published dist piece 0.1.13
-# never carried it (stage copied only evo.service.d/). The
-# unit is distribution-owned and lives in this repo. Place
-# it after the piece unpack so a frozen slot cannot produce
-# a box that dies at [7/8].
-UNIT_SRC="${REPO_ROOT}/dist/systemd/evo.service"
-[[ -f "${UNIT_SRC}" ]] || die "missing ${UNIT_SRC}"
-install -m 0644 "${UNIT_SRC}" "${STAGE}/dist/systemd/evo.service"
+# The frozen dist piece is a published snapshot. This repo's
+# install primitives (bootstrap, the libs it sources, the
+# files it hard-requires) move independently. Overlay them
+# after unpack so a playground compose cannot ship a
+# bootstrap the piece cannot satisfy. Not a remint: alsa/,
+# plugins.d/, keys/, catalogue/, and systemd drop-ins stay
+# the piece. See overlay-dist-install-surface.sh.
+bash "${SCRIPT_DIR}/overlay-dist-install-surface.sh" \
+    --repo-root "${REPO_ROOT}" --dest-dist "${STAGE}/dist"
 if [[ -d "${STAGE}/_distpiece/plugin-overlays" ]]; then
     mkdir -p "${STAGE}/plugins"
     for ov in "${STAGE}/_distpiece/plugin-overlays"/*; do
@@ -196,7 +196,20 @@ KIOSK_PROGRAM="${STAGE}/layers/evo-kiosk-eng/layer/binaries/${TARGET}/evo-kiosk-
 log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
 [[ -f "${STAGE}/dist/systemd/evo.service" ]] || die \
     "composed tree has no dist/systemd/evo.service; install_main_systemd_unit cannot place the unit"
+[[ -f "${STAGE}/dist/scripts/lib/chown-tree-same-fs.sh" ]] || die \
+    "composed tree has no dist/scripts/lib/chown-tree-same-fs.sh; bootstrap will chown a live adopt"
+[[ -x "${STAGE}/dist/bin/evo-rtc-wake" ]] || die \
+    "composed tree has no dist/bin/evo-rtc-wake; bootstrap Step 1h exits 2"
+[[ -f "${STAGE}/dist/sudoers.d/evo-rtc-wake.in" ]] || die \
+    "composed tree has no dist/sudoers.d/evo-rtc-wake.in; bootstrap Step 1h exits 2"
+if grep -qE 'chown[[:space:]]+-R[[:space:]]+"\$SERVICE_USER:\$SERVICE_USER"[[:space:]]+/var/lib/evo' \
+        "${STAGE}/dist/scripts/bootstrap.sh"; then
+    die "composed bootstrap still recursively chowns /var/lib/evo"
+fi
+grep -q 'chown_tree_same_fs /var/lib/evo' "${STAGE}/dist/scripts/bootstrap.sh" \
+    || die "composed bootstrap does not call chown_tree_same_fs"
 log "evo.service present ($(wc -c < "${STAGE}/dist/systemd/evo.service") bytes)"
+log "install surface overlaid (bootstrap, chown lib, rtc-wake)"
 
 {
     echo "schema_version = 1"
