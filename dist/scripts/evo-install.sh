@@ -733,9 +733,23 @@ extract_bundle() {
 }
 
 # -------- Music library hash discipline --------
+# Preserve-music is a local-library contract. USB volumes and
+# NAS/SMB/NFS adopts under music/USB and music/NAS are other
+# filesystems: wipe-config does not write them, and hashing
+# them makes MUSIC_HASH_PRESERVED a race against the NAS.
+# `find -xdev` keeps the snapshot on the filesystem that
+# holds the music root (INTERNAL and any local files there).
 snapshot_music_hashes() {
-    if [[ -d /var/lib/evo/music ]]; then
-        find /var/lib/evo/music -type f -print0 2>/dev/null \
+    local root="$1"
+    if [[ -z "${root}" ]]; then
+        echo "no_music_library"
+        return 0
+    fi
+    if [[ -d "${root}" ]]; then
+        local count
+        count="$(find "${root}" -xdev -type f 2>/dev/null | wc -l)"
+        printf '  local music files (this filesystem only): %s\n' "${count}" >&2
+        find "${root}" -xdev -type f -print0 2>/dev/null \
             | sort -z | xargs -0 -r sha256sum 2>/dev/null \
             | sha256sum | awk '{print $1}'
     else
@@ -1570,7 +1584,7 @@ MUSIC_HASH_PRESERVED="true"
 MUSIC_HASH_CHANGED="false"
 
 verify_music_hashes_preserved() {
-    MUSIC_HASH_POST="$(snapshot_music_hashes)"
+    MUSIC_HASH_POST="$(snapshot_music_hashes /var/lib/evo/music)"
     if [[ "${MUSIC_HASH_PRE}" == "${MUSIC_HASH_POST}" ]]; then
         MUSIC_HASH_PRESERVED="true"
     else
@@ -1713,7 +1727,7 @@ case "${MODE}" in
         MUSIC_HASH_CHANGED="true"
         ;;
     wipe-config)
-        echo "[1/8] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[1/8] snapshot music library hashes (local filesystem; USB/NAS mounts excluded) ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes /var/lib/evo/music)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
         echo "[2/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
         echo "[3/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
         echo "[4/8] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
@@ -1724,7 +1738,7 @@ case "${MODE}" in
         echo "[8/8] start + verify + music library byte-equal ..."  ; start_steward ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)
-        echo "[1/7] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[1/7] snapshot music library hashes (local filesystem; USB/NAS mounts excluded) ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes /var/lib/evo/music)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
         echo "[2/7] fetch bundle (for /etc/evo baseline) ..." ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
         echo "[3/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
         echo "[4/7] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
