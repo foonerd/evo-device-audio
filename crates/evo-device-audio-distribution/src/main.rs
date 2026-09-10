@@ -114,6 +114,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+mod household_groups;
 mod rtc_wake;
 
 use clap::Parser as _;
@@ -144,7 +145,13 @@ async fn main() -> anyhow::Result<()> {
             &topology_store,
         )))
         .with_runtime_setup(audio_distribution_runtime_setup(topology_store))
-        .with_https_setup(audio_distribution_https_setup());
+        .with_https_setup(audio_distribution_https_setup())
+        // This product's Settings groups. The framework owns the
+        // protection mechanism; the group names are ours, on the
+        // documented seam, so the steward stays domain-neutral.
+        .with_household_groups(Arc::new(
+            household_groups::AudioHouseholdGroups,
+        ));
     evo::run(opts).await
 }
 

@@ -176,6 +176,11 @@ pub fn attach_artwork_resolve_endpoint(
         observatory: None,
         tier_provider,
         lan_trust_caps,
+        // Product endpoints keep the playback floor. The privileged
+        // LAN arm belongs to the framework's own routes, which the
+        // household-protection gate polices; a product route must
+        // not hand out network_admin / system_admin.
+        lan_privileged_caps: None,
     };
     let state = HandlerState {
         cascade,
@@ -199,6 +204,8 @@ pub fn attach_artwork_resolve_endpoint(
         observatory: None,
         tier_provider: Arc::clone(&auth.tier_provider),
         lan_trust_caps: auth.lan_trust_caps.clone(),
+        // Product endpoint: playback floor only.
+        lan_privileged_caps: None,
     };
     let resolve_route =
         get(handle_resolve).with_state(state.clone()).route_layer(

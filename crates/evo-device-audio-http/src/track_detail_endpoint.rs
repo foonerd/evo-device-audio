@@ -80,6 +80,11 @@ pub fn attach_track_detail_endpoint(
         observatory: None,
         tier_provider,
         lan_trust_caps,
+        // Product endpoints keep the playback floor. The privileged
+        // LAN arm belongs to the framework's own routes, which the
+        // household-protection gate polices; a product route must
+        // not hand out network_admin / system_admin.
+        lan_privileged_caps: None,
     };
     let state = HandlerState {
         dispatcher,
