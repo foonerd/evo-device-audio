@@ -1173,10 +1173,63 @@ purge_evo_mpd_includes() {
     sed -i -e ':a' -e '/^$/{$d;N;ba' -e '}' /etc/mpd.conf
 }
 
+unit_exists() {
+    systemctl cat "$1" >/dev/null 2>&1
+}
+
+wait_for_local_shell() {
+    # evo-ui binds :80/:443. The kiosk unit's ExecStartPre
+    # waits on this URL; starting kiosk before the shell
+    # answers leaves glass on a connection-refused page.
+    local deadline code
+    deadline=$(( $(date +%s) + 30 ))
+    while [[ $(date +%s) -lt ${deadline} ]]; do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 1 http://127.0.0.1/ 2>/dev/null || true)"
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            return 0
+        fi
+        code="$(curl -skS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 1 https://127.0.0.1/ 2>/dev/null || true)"
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 start_steward() {
     systemctl daemon-reload
     systemctl enable evo.service >/dev/null 2>&1 || true
     systemctl restart evo.service
+}
+
+# stop_prior_steward stops evo-ui and evo-kiosk so a wipe
+# cannot 209/STDOUT-loop on a missing log dir. The other
+# half: after step 7 has placed the units and trees, start
+# them again in dependency order. Without this, wipe-config
+# reports rc=0 and hands back a box with no browser and no
+# glass — both units stay enabled, so only a reboot hid it.
+start_operator_surface() {
+    start_steward
+    if unit_exists evo-ui.service; then
+        systemctl enable evo-ui.service >/dev/null 2>&1 || true
+        systemctl restart evo-ui.service
+        echo "  started evo-ui.service"
+        if ! wait_for_local_shell; then
+            echo "  WARN: evo-ui started but http://127.0.0.1/ did not answer yet" >&2
+        fi
+    else
+        echo "  evo-ui.service absent — no browser session to start"
+    fi
+    if unit_exists evo-kiosk.service; then
+        systemctl enable evo-kiosk.service >/dev/null 2>&1 || true
+        systemctl restart evo-kiosk.service
+        echo "  started evo-kiosk.service"
+    else
+        echo "  evo-kiosk.service absent — no glass session to start"
+    fi
 }
 
 # -------- Post-condition verification --------
@@ -1189,6 +1242,12 @@ CATALOGUE_SOURCE=""
 
 JOURNAL_FAIL_HITS=""
 JOURNAL_FAIL_COUNT=0
+# Operator surface. wipe-config used to leave these stopped
+# and still exit 0. Values: ok / inactive / absent (units)
+# and ok / refused / skipped (shell fetch).
+EVO_UI_CHECK="not_run"
+EVO_KIOSK_CHECK="not_run"
+SHELL_FETCH="not_run"
 # Active PCM playback probe state. Set by verify_pcm_playback().
 # Values: not_run / ok / busy / fail / skipped_no_aplay /
 # skipped_no_probe_wav. No value gates POST_OK — the probe is
@@ -1321,6 +1380,55 @@ verify_post_condition() {
     verify_smb_netbios_matches_hostname
     verify_lan_discovery_daemons_up
     verify_storage_usb_provisioning
+    verify_operator_surface
+}
+
+# Glass and browser session. The install is not complete if
+# the steward is up and the operator cannot open the shell.
+# Absent units (a headless compose without those layers) are
+# not a failure. Present-but-inactive is.
+verify_operator_surface() {
+    local code=""
+
+    if unit_exists evo-ui.service; then
+        if systemctl is-active evo-ui >/dev/null 2>&1; then
+            EVO_UI_CHECK="ok"
+        else
+            EVO_UI_CHECK="inactive"
+        fi
+        code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 2 http://127.0.0.1/ 2>/dev/null || true)"
+        if [[ ! "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            code="$(curl -skS -o /dev/null -w '%{http_code}' \
+                --connect-timeout 2 https://127.0.0.1/ 2>/dev/null || true)"
+        fi
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            SHELL_FETCH="ok"
+        else
+            SHELL_FETCH="refused"
+        fi
+    else
+        EVO_UI_CHECK="absent"
+        SHELL_FETCH="skipped"
+    fi
+
+    if unit_exists evo-kiosk.service; then
+        local deadline
+        deadline=$(( $(date +%s) + 30 ))
+        while [[ $(date +%s) -lt ${deadline} ]]; do
+            if systemctl is-active evo-kiosk >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+        if systemctl is-active evo-kiosk >/dev/null 2>&1; then
+            EVO_KIOSK_CHECK="ok"
+        else
+            EVO_KIOSK_CHECK="inactive"
+        fi
+    else
+        EVO_KIOSK_CHECK="absent"
+    fi
 }
 
 # Storage-USB provisioning invariant: bootstrap Step 1g must
@@ -1713,7 +1821,7 @@ case "${MODE}" in
         echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
         echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/7] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[7/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         ;;
     reinstall)
         echo "[1/7] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
@@ -1723,7 +1831,7 @@ case "${MODE}" in
         wipe_full ; echo "  ok"
         echo "[5/7] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
         echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/7] start + verify ..."  ; start_steward ; verify_post_condition
+        echo "[7/7] start + verify ..."  ; start_operator_surface ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
     wipe-config)
@@ -1735,7 +1843,7 @@ case "${MODE}" in
         wipe_config ; echo "  ok"
         echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
         echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[8/8] start + verify + music library byte-equal ..."  ; start_steward ; verify_post_condition ; verify_music_hashes_preserved
+        echo "[8/8] start + verify + music library byte-equal ..."  ; start_operator_surface ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)
         echo "[1/7] snapshot music library hashes (local filesystem; USB/NAS mounts excluded) ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes /var/lib/evo/music)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
@@ -1744,7 +1852,7 @@ case "${MODE}" in
         echo "[4/7] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
         wipe_user_data ; echo "  ok"
         echo "[5/7] /etc/evo baseline (re-apply) + drop-ins + sudoers + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[6/7] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[6/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         echo "[7/7] verify music library byte-equal ..." ; verify_music_hashes_preserved
         ;;
 esac
@@ -1757,6 +1865,9 @@ echo "  not-declared warnings: ${NOT_DECLARED}"
 echo "  catalogue source:      ${CATALOGUE_SOURCE:-unknown}"
 echo "  journal fail hits:     ${JOURNAL_FAIL_COUNT}"
 echo "  pcm.evo playback:      ${PCM_PLAYBACK_PROBE}"
+echo "  evo-ui:                ${EVO_UI_CHECK}"
+echo "  evo-kiosk:             ${EVO_KIOSK_CHECK}"
+echo "  shell fetch:           ${SHELL_FETCH}"
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     echo "  music library hash:    ${MUSIC_HASH_PRESERVED} (pre=${MUSIC_HASH_PRE} post=${MUSIC_HASH_POST})"
 fi
@@ -1819,6 +1930,12 @@ if [[ "${LAN_DISCOVERY_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
 # the install so the deploy cannot silently declare success on
 # a rig where the block-storage privilege path is broken.
 if [[ "${STORAGE_USB_PROVISIONING_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
+# Glass and browser. A present unit that is not active, or a
+# shell that refuses, is the install handing back a box the
+# operator cannot use. Absent units are a headless compose.
+if [[ "${EVO_UI_CHECK:-absent}" == "inactive" ]]; then POST_OK=0; fi
+if [[ "${SHELL_FETCH:-skipped}" == "refused" ]]; then POST_OK=0; fi
+if [[ "${EVO_KIOSK_CHECK:-absent}" == "inactive" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi

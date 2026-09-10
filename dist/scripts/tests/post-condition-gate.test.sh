@@ -58,6 +58,9 @@ healthy_env() {
     STORAGE_USB_PROVISIONING_CHECK="ok"
     MUSIC_HASH_PRESERVED="true"
     MODE="p1"
+    EVO_UI_CHECK="ok"
+    EVO_KIOSK_CHECK="ok"
+    SHELL_FETCH="ok"
 }
 
 assert_gate() {
@@ -117,6 +120,22 @@ assert_gate "wipe-config with music hash changed → fails" \
     0 'MODE="wipe-config"' 'MUSIC_HASH_PRESERVED="false"'
 assert_gate "p1 ignores the music-hash invariant" \
     1 'MODE="p1"' 'MUSIC_HASH_PRESERVED="false"'
+
+assert_gate "dead evo-ui → fails" 0 'EVO_UI_CHECK="inactive"'
+assert_gate "shell refused → fails" 0 'SHELL_FETCH="refused"'
+assert_gate "dead evo-kiosk → fails" 0 'EVO_KIOSK_CHECK="inactive"'
+assert_gate "headless compose (no ui/kiosk units) → succeeds" \
+    1 'EVO_UI_CHECK="absent"' 'EVO_KIOSK_CHECK="absent"' 'SHELL_FETCH="skipped"'
+
+if grep -q 'start_operator_surface' "$INSTALLER" \
+    && grep -q 'systemctl restart evo-ui.service' "$INSTALLER" \
+    && grep -q 'systemctl restart evo-kiosk.service' "$INSTALLER"; then
+    echo "PASS  installer restarts evo-ui and evo-kiosk after stop (POST_OK=n/a)"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL  installer does not restart evo-ui and evo-kiosk"
+    FAIL=$((FAIL + 1))
+fi
 
 echo ""
 echo "post-condition-gate.test.sh: $PASS passed, $FAIL failed"
