@@ -198,6 +198,8 @@ log "kiosk program ${TARGET} present ($(wc -c < "${KIOSK_PROGRAM}") bytes)"
     "composed tree has no dist/systemd/evo.service; install_main_systemd_unit cannot place the unit"
 [[ -f "${STAGE}/dist/scripts/lib/chown-tree-same-fs.sh" ]] || die \
     "composed tree has no dist/scripts/lib/chown-tree-same-fs.sh; bootstrap will chown a live adopt"
+[[ -f "${STAGE}/dist/scripts/lib/chown-tenant-state-trees.sh" ]] || die \
+    "composed tree has no dist/scripts/lib/chown-tenant-state-trees.sh; kiosk mkdir stays root-owned"
 [[ -x "${STAGE}/dist/bin/evo-rtc-wake" ]] || die \
     "composed tree has no dist/bin/evo-rtc-wake; bootstrap Step 1h exits 2"
 [[ -f "${STAGE}/dist/sudoers.d/evo-rtc-wake.in" ]] || die \
@@ -208,6 +210,8 @@ if grep -qE 'chown[[:space:]]+-R[[:space:]]+"\$SERVICE_USER:\$SERVICE_USER"[[:sp
 fi
 grep -q 'chown_tree_same_fs /var/lib/evo' "${STAGE}/dist/scripts/bootstrap.sh" \
     || die "composed bootstrap does not call chown_tree_same_fs"
+grep -q 'chown_tenant_state_trees' "${STAGE}/dist/scripts/bootstrap.sh" \
+    || die "composed bootstrap does not tenant-own kiosk state trees after layer installers"
 log "evo.service present ($(wc -c < "${STAGE}/dist/systemd/evo.service") bytes)"
 log "install surface overlaid (bootstrap, chown lib, rtc-wake)"
 

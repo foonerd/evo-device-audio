@@ -54,6 +54,12 @@ else
     fail "overlay missing chown-tree-same-fs.sh"
 fi
 
+if [[ -f "$DEST/scripts/lib/chown-tenant-state-trees.sh" ]]; then
+    pass "overlay places chown-tenant-state-trees.sh"
+else
+    fail "overlay missing chown-tenant-state-trees.sh"
+fi
+
 if [[ -x "$DEST/bin/evo-rtc-wake" ]]; then
     pass "overlay places evo-rtc-wake"
 else

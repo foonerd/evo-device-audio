@@ -43,6 +43,7 @@ need() {
 
 need "${REPO_ROOT}/dist/scripts/bootstrap.sh"
 need "${REPO_ROOT}/dist/scripts/lib/chown-tree-same-fs.sh"
+need "${REPO_ROOT}/dist/scripts/lib/chown-tenant-state-trees.sh"
 need "${REPO_ROOT}/dist/bin/evo-rtc-wake"
 need "${REPO_ROOT}/dist/sudoers.d/evo-rtc-wake.in"
 need "${REPO_ROOT}/dist/systemd/evo.service"

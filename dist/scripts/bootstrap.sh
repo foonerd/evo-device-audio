@@ -343,6 +343,8 @@ echo "[bootstrap] systemctl binary: $SYSTEMCTL_BIN"
 . "$SCRIPT_DIR/lib/detect-audio-card.sh"
 # shellcheck source=lib/chown-tree-same-fs.sh
 . "$SCRIPT_DIR/lib/chown-tree-same-fs.sh"
+# shellcheck source=lib/chown-tenant-state-trees.sh
+. "$SCRIPT_DIR/lib/chown-tenant-state-trees.sh"
 
 if [[ -z "$AUDIO_CARD" ]]; then
     if ! command -v aplay >/dev/null 2>&1; then
@@ -2433,6 +2435,19 @@ EOF
     fi
 else
     echo "[bootstrap] Step 4b: EVO_INSTALL_KIOSK_LAYER=0 — skipping kiosk session install"
+fi
+
+# The kiosk layer mkdir -p's /var/lib/evo/settings/kiosk and
+# /var/lib/evo/ui as root, after chown_tree_same_fs has
+# already run. A single wipe+bootstrap (the tester path)
+# therefore leaves those trees root:root and the steward
+# cannot seed kiosk overlays (sleep_inhibit_active → journal
+# fail, installer rc=5). A second bootstrap hides it because
+# chown_tree_same_fs then sees the dirs. Tenant-own those
+# trees now. Do not walk: uploads and music keep their owners.
+if [[ -n "${SERVICE_USER:-}" ]]; then
+    chown_tenant_state_trees "$SERVICE_USER"
+    echo "[bootstrap] tenant-owned /var/lib/evo/{settings,settings/kiosk,ui} -> $SERVICE_USER (after layer installers)"
 fi
 
 echo

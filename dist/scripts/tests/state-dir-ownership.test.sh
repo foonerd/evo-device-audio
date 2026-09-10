@@ -44,5 +44,35 @@ else
     fail "music step does not tenant-own /var/lib/evo"
 fi
 
+LIB_TREES="$(cd "$SCRIPT_DIR/../lib" && pwd)/chown-tenant-state-trees.sh"
+# shellcheck source=../lib/chown-tenant-state-trees.sh
+. "$LIB_TREES"
+
+kiosk_line="$(grep -n 'KIOSK_LAYER_DIR}/scripts/install/install.sh' "$BOOTSTRAP" | tail -1 | cut -d: -f1)"
+own_line="$(grep -n 'chown_tenant_state_trees "\$SERVICE_USER"' "$BOOTSTRAP" | head -1 | cut -d: -f1)"
+if [[ -n "$kiosk_line" && -n "$own_line" && "$own_line" -gt "$kiosk_line" ]]; then
+    pass "tenant-own of kiosk state trees runs after the kiosk installer"
+else
+    fail "chown_tenant_state_trees is missing or runs before the kiosk installer (kiosk=$kiosk_line own=$own_line)"
+fi
+
+FAKE="$(mktemp -d)"
+cleanup_fake() { rm -rf "$FAKE"; }
+trap cleanup_fake EXIT
+mkdir -p "$FAKE/settings/kiosk" "$FAKE/ui" "$FAKE/uploads" "$FAKE/music/INTERNAL"
+printf 'keep-root\n' > "$FAKE/uploads/marker"
+chmod 0777 "$FAKE/uploads"
+chown_tenant_state_trees "$(id -u)" "$FAKE"
+if [[ -f "$FAKE/uploads/marker" ]] && grep -qx 'keep-root' "$FAKE/uploads/marker"; then
+    pass "post-layer pass does not walk uploads"
+else
+    fail "post-layer pass disturbed uploads"
+fi
+if [[ -d "$FAKE/settings/kiosk" && -d "$FAKE/ui" ]]; then
+    pass "post-layer pass keeps settings/kiosk and ui"
+else
+    fail "post-layer pass dropped kiosk state trees"
+fi
+
 echo "summary: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
