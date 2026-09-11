@@ -3,7 +3,8 @@
 //! # org-evoframework-system-kiosk
 //!
 //! Framework-reserved kiosk operator-settings plugin. Stocks the
-//! `system.kiosk` shelf with three operator-gestured verbs:
+//! `system.kiosk` shelf with eleven operator-gestured verbs: ten
+//! writes and one read. Display and touch alignment:
 //!
 //! - `set_display_rotation` — persists the compositor display
 //!   rotation overlay so the kiosk's in-session watcher picks
@@ -25,19 +26,24 @@
 //!   winning triple and its mean residual.
 //!
 //!   This verb exists so the wizard's own write is gated. The
-//!   kiosk-browser exposes the same operation as the
-//!   `evo_sample_touch_calibration_from_corners` WebKit handler,
-//!   which calls `evo_kiosk_config::derive_and_apply_touch_calibration`
-//!   in-process: same math, same overlay files, but it never
-//!   reaches the framework dispatcher, so no capability gate and
-//!   no household policy can refuse it. A box whose household
-//!   level protects system settings would still have its touch
-//!   matrix rewritten from its own glass. Routed through here it
-//!   is refused like every other write on this shelf.
+//!   kiosk-browser used to do this in-process through an
+//!   `evo_sample_touch_calibration_from_corners` WebKit handler
+//!   that never reached the framework dispatcher, so nothing
+//!   could refuse it — a box whose household level protects
+//!   system settings would still have its touch matrix rewritten
+//!   from its own glass. That handler is gone from the browser
+//!   source; this verb is where the operation lives.
 //!
-//! All three verbs are gated at the framework dispatcher's
-//! per-verb capability gate as `write:system_admin` (no
-//! step-up). Rationale: rotation is a cosmetic-visible change,
+//! The rest of the shelf is the per-device physical settings the
+//! same operator flow reaches: `set_enabled`, `set_brightness`,
+//! `set_sleep_timeout`, `set_sleep_inhibit_while_playing`,
+//! `set_osk`, `set_cursor`, and the read companion
+//! `get_display_state`.
+//!
+//! Every write is gated at the framework dispatcher's per-verb
+//! capability gate as `write:system_admin` (no step-up);
+//! `get_display_state` is `read:system`. Rationale for no
+//! step-up: rotation is a cosmetic-visible change,
 //! not a credential mint. A step-up gate would require the
 //! operator to enter the kiosk password on the very glass they
 //! are trying to fix — recursive breakage. The bootstrap-
@@ -46,24 +52,36 @@
 //!
 //! ## Why this plugin exists
 //!
-//! The kiosk-browser (`evo-kiosk-browser`) exposes the same
-//! writes via WebKit script-message handlers on its
-//! UserContentManager. Those handlers are reachable only from
-//! JavaScript running inside the kiosk-browser process — a
-//! paired laptop or phone browser loading the same UI over WSS
-//! cannot reach them (per-webview surface). The initial-
-//! alignment recovery case is exactly the scenario where the
-//! on-glass touch is unusable, so the on-glass UI cannot drive
-//! the fix. This plugin exposes the same writes over WSS so a
-//! remote paired browser can drive them.
+//! It is the writer. The kiosk-browser
+//! (`evo-kiosk-browser`) once exposed these writes as WebKit
+//! script-message handlers on its UserContentManager, reachable
+//! from JavaScript inside the browser process and from nowhere
+//! else. Those handlers called [`evo_kiosk_config`] directly, so
+//! they bypassed the framework dispatcher entirely: no
+//! capability gate, no household policy, no refusal possible.
 //!
-//! ## Byte parity with the on-glass path
+//! The browser source no longer registers the two touch
+//! handlers, and the one name it still registers —
+//! `evo_set_display_rotation` — is a presence probe whose
+//! handler only logs. The UI reads that name to tell "am I on
+//! the glass" and nothing more. Both the glass UI and a remote
+//! paired browser now dispatch the verbs below; they differ in
+//! which screen the operator is looking at, not in the path the
+//! write takes.
 //!
-//! Both paths call into [`evo_kiosk_config`] for the actual
-//! filesystem work. A drift between them (different overlay
-//! bytes for the same operator intent) would surface as a
-//! difference in what the kiosk-side apply machinery does. One
-//! source of truth eliminates that class.
+//! That is a statement about the source, NOT about any
+//! particular device. The playground glass still runs an older
+//! browser binary that carries the old handlers; overlaying it
+//! is a held row. Until that lands, a script inside that binary
+//! can still write these overlays ungated.
+//!
+//! ## One writer
+//!
+//! This plugin calls [`evo_kiosk_config`] for the actual
+//! filesystem work, and it is now the only caller on the write
+//! path. The wizard's derivation math lives there too, so there
+//! is no second overlay format and no second validator to drift
+//! from.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -100,9 +118,10 @@ pub const VERB_LAUNCH_TOUCH_CALIBRATION: &str = "launch_touch_calibration";
 /// Verb name — derive the touch triple from four corner samples
 /// and persist it.
 ///
-/// Same derivation and same overlay write as the on-glass
-/// WebKit handler; the difference is that this one passes the
-/// dispatcher's `write:system_admin` gate first.
+/// The wizard's own write. It replaces an in-process WebKit
+/// handler that performed the same derivation without passing
+/// the dispatcher; this one is gated `write:system_admin` like
+/// every other write on the shelf.
 pub const VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS: &str =
     "derive_touch_calibration_from_corners";
 
@@ -542,8 +561,8 @@ struct LaunchTouchCalibrationReq {}
 /// Exactly four samples, in the order the wizard drew the
 /// targets. The count and coordinate range are enforced by
 /// `evo_kiosk_config::derive_touch_calibration`, so this struct
-/// deliberately does not re-check them: one validator, shared
-/// with the on-glass path.
+/// deliberately does not re-check them: one validator, in the
+/// crate that owns the math.
 #[derive(Deserialize)]
 struct DeriveTouchCalibrationReq {
     samples: Vec<TouchSampleWire>,
@@ -651,13 +670,14 @@ fn handle_set_touch_calibration(
 /// it.
 ///
 /// The derivation and the write are both
-/// `evo_kiosk_config::derive_and_apply_touch_calibration` — the
-/// same function the on-glass WebKit handler calls, so glass and
-/// wire cannot drift and no second overlay format exists. What
-/// this path adds is the dispatcher: the framework has already
-/// checked `write:system_admin` (and, where a household policy
-/// protects that scope, refused with `household_policy_locked`)
-/// before the request arrives here.
+/// `evo_kiosk_config::derive_and_apply_touch_calibration`, the
+/// same function the retired WebKit handler used to call
+/// in-process — so the overlay bytes are unchanged by the move,
+/// and there is no second format. What this path adds is the
+/// dispatcher: the framework has already checked
+/// `write:system_admin` (and, where a household policy protects
+/// that scope, refused with `household_policy_locked`) before
+/// the request arrives here.
 ///
 /// Refuses a sample count other than four and coordinates
 /// outside [0, 1] — both as `Permanent`, since a retry with the
