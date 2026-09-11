@@ -1320,11 +1320,14 @@ count_expected_plugins_from_stage() {
 # install; it is the worse half of the same bug.
 #
 #   Database corrupted                - database unusable
-#   Failed to bind socket             - could not take the socket
-#   Failed to bind to '<addr>'        - could not take the address
+#   exception: Failed to bind socket  - could not take the socket
+#   exception: Failed to bind to '<addr>'
+#                                     - could not take the address
 #   unrecognized parameter: <name>    - mpd.conf has a bad setting
 #   Error in <file> line <n>          - mpd.conf failed to parse
-#   configuration file does not exist - mpd.conf absent
+#   configuration file does not exist: /etc/mpd.conf
+#                                     - the distribution's config
+#                                       pin is absent
 #   Failed to listen on socket        - no socket to serve on
 #   Failed to listen on *:<port>      - no TCP port to serve on
 #   Failed to listen on <addr> (line <n>)
@@ -1348,6 +1351,37 @@ count_expected_plugins_from_stage() {
 #   we have a $XDG_RUNTIME_DIR listener
 #                             - mpd says so itself
 #
+# THE TOKEN IS THE OUTER FACT, NOT THE INNER THROW. MPD composes
+# benign lines that quote a fatal-sounding exception inside them:
+#
+#   bind to '<a>' failed (continuing anyway, because binding to
+#   '<b>' succeeded): Failed to bind socket: Address already in use
+#   Decoder plugin "wildmidi" is unavailable: configuration file
+#   does not exist: /etc/timidity/timidity.cfg
+#   Input plugin "<x>" is unavailable: <same shape>
+#
+# The first is the ordinary dual-stack case on Linux with
+# bindv6only=0 — MPD bound v4, could not also bind v6, says so,
+# and serves. The second is an optional decoder declining because
+# ITS OWN config is missing; nothing about evo is wrong. A bare
+# `Failed to bind socket` or `configuration file does not exist:`
+# matches inside both, so the naive tokens turned two normal
+# startup lines into a failed install.
+#
+# So: the bind tokens are anchored to `exception: `, which is how
+# MPD prefixes the line's OWN uncaught exception — inside a
+# composed line the throw is preceded by `): `, not by
+# `exception: `. And the config token is keyed to the path the
+# distribution pins, /etc/mpd.conf, so another component's config
+# cannot answer for ours. Neither is a subtraction.
+#
+# Residual, stated rather than hidden: anchoring on `exception: `
+# means a fatal bind logged WITHOUT that prefix would not count.
+# Every fatal form observed on 0.24.4 carries it, and the
+# alternative — matching the bare token and subtracting the
+# composed lines — is the whitelist shape this function exists to
+# avoid.
+#
 # The listen family is why this is an allowlist of SHAPES rather
 # than of prefixes. `Failed to listen on` alone matches the fatal
 # three AND the benign one, which would force a subtraction — a
@@ -1367,11 +1401,11 @@ count_expected_plugins_from_stage() {
 mpd_journal_defects() {
     grep -E \
         -e 'Database corrupted' \
-        -e 'Failed to bind socket' \
-        -e "Failed to bind to '" \
+        -e 'exception: Failed to bind socket' \
+        -e "exception: Failed to bind to '" \
         -e 'unrecognized parameter:' \
         -e 'Error in .+ line [0-9]' \
-        -e 'configuration file does not exist:' \
+        -e 'configuration file does not exist: /etc/mpd\.conf' \
         -e 'Failed to listen on socket' \
         -e 'Failed to listen on \*:' \
         -e 'Failed to listen on .+ \(line [0-9]+\)' \

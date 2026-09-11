@@ -86,7 +86,7 @@ assert_count "fresh /var/lib/mpd: state absent is ignored" \
 # lie. A predicate built on them let a real bind failure PASS.
 assert_count "fatal token: Database corrupted" \
     1 'mpd[1]: Database corrupted'
-assert_count "fatal token: Failed to bind socket" \
+assert_count "fatal token: Failed to bind socket (standalone, the outer exception)" \
     1 'mpd[1]: exception: Failed to bind socket'
 assert_count "fatal token: Failed to bind to '<addr>'" \
     1 "mpd[1]: exception: Failed to bind to '0.0.0.0:6600'"
@@ -94,7 +94,7 @@ assert_count "fatal token: unrecognized parameter" \
     1 'mpd[1]: unrecognized parameter: "not_a_setting"'
 assert_count "fatal token: Error in <file> line <n>" \
     1 'mpd[1]: Error in "/etc/mpd.conf" line 3'
-assert_count "fatal token: configuration file does not exist" \
+assert_count "fatal token: configuration file does not exist (mpd.conf, path-keyed)" \
     1 'mpd[1]: configuration file does not exist: /etc/mpd.conf'
 assert_count "fatal token: missing music directory (path-keyed)" \
     1 'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory'
@@ -115,8 +115,18 @@ assert_count "fatal token: Failed to listen on <addr> (line <n>)" \
 # ---- non-fatal neighbours in the SAME binary: must not count ----
 # MPD says these and keeps running. Counting them would be the
 # false-FAIL defect again, wearing bind's clothes.
-assert_count "non-fatal neighbour: bind to one address failed, another succeeded" \
-    0 "mpd[1]: bind to '1.2.3.4' failed (continuing anyway, because binding to '0.0.0.0' succeeded): Cannot assign requested address"
+# MPD composes this as `bind to '{}' failed (continuing anyway,
+# because binding to '{}' succeeded): {}` and the inner {} is
+# routinely the SocketUtil throw `Failed to bind socket: Address
+# already in use` — the dual-stack case on Linux with
+# bindv6only=0. A fixture with an invented suffix passed while the
+# line MPD actually prints did not. The real wording is used here.
+assert_count "non-fatal neighbour: dual-bind, inner exception is Failed to bind socket" \
+    0 "mpd[1]: bind to '[::]:6600' failed (continuing anyway, because binding to '0.0.0.0:6600' succeeded): Failed to bind socket: Address already in use"
+assert_count "non-fatal neighbour: optional decoder plugin embeds a config-missing exception" \
+    0 'mpd[1]: Decoder plugin "wildmidi" is unavailable: configuration file does not exist: /etc/timidity/timidity.cfg'
+assert_count "non-fatal neighbour: optional input plugin, same composition" \
+    0 'mpd[1]: Input plugin "cdio_paranoia" is unavailable: configuration file does not exist: /etc/foo.cfg' 
 assert_count "non-fatal neighbour: Failed to listen (not fatal)" \
     0 'mpd[1]: Failed to listen on /run/mpd/socket (not fatal)'
 assert_count "non-fatal neighbour: (not fatal) with MPD's quoted path form" \
