@@ -1310,23 +1310,52 @@ count_expected_plugins_from_stage() {
 # adding it here, deliberately; it does not mean widening a
 # whitelist until the gate means nothing.
 #
-#   Database corrupted   - the database mpd needs is unusable
-#   Bind failed          - mpd could not take its socket/port
-#   Config error         - /etc/mpd.conf is not loadable
-#   music directory      - the library path the distribution pins
-#                          (/var/lib/evo/music) did not open.
-#                          Keyed on the PATH, not the phrase:
-#                          mpd words a missing music directory
-#                          exactly as it words the absent
-#                          tag_cache/state files on first boot,
-#                          which are normal and stay ignored.
+# TOKENS COME FROM THE BINARY, NOT FROM PROSE. Every string
+# below was read out of `strings /usr/bin/mpd` on a 0.24.4 host.
+# The first version of this predicate was filled from the comment
+# that preceded it, which named `Bind failed` and `Config error`.
+# Neither is in the binary. MPD cannot emit them, so a genuine
+# bind failure — which the retired fail(ed|ure)? scan WOULD have
+# caught — sailed through as a PASS. A false PASS hides a broken
+# install; it is the worse half of the same bug.
+#
+#   Database corrupted                - database unusable
+#   Failed to bind socket             - could not take the socket
+#   Failed to bind to '<addr>'        - could not take the address
+#   unrecognized parameter: <name>    - mpd.conf has a bad setting
+#   Error in <file> line <n>          - mpd.conf failed to parse
+#   configuration file does not exist - mpd.conf absent
+#   Failed to open "/var/lib/evo/music"
+#                                     - the library path the
+#                          distribution pins did not open. Keyed
+#                          on the PATH, not the phrase: mpd words
+#                          a missing music directory exactly as it
+#                          words the absent tag_cache/state files
+#                          on first boot, which are normal.
+#
+# Deliberately NOT counted, and present in the same binary:
+#
+#   bind to '<a>' failed (continuing anyway, because binding to
+#   '<b>' succeeded)          - mpd bound elsewhere and runs
+#   Failed to listen on <x> (not fatal)
+#                             - mpd says so itself
+#
+# Matching is case-sensitive: these are fixed strings in the
+# binary, and exactness is what keeps the two non-fatal
+# neighbours above out.
 #
 # Extracted so the test suite evaluates THIS function rather than
 # a copy of the predicate — dist/scripts/tests/mpd-journal-classifier.test.sh
 # pulls it out of this shipped file.
 mpd_journal_defects() {
-    grep -iE \
-        'Database corrupted|Bind failed|Config error|Failed to open "/var/lib/evo/music"' \
+    grep -E \
+        -e 'Database corrupted' \
+        -e 'Failed to bind socket' \
+        -e "Failed to bind to '" \
+        -e 'unrecognized parameter:' \
+        -e 'Error in .+ line [0-9]' \
+        -e 'configuration file does not exist:' \
+        -e 'Failed to open "/var/lib/evo/music"' \
         || true
 }
 
@@ -1392,28 +1421,23 @@ verify_post_condition() {
     NOT_DECLARED=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -c 'not declared in the catalogue' || true)
     CATALOGUE_SOURCE=$(journalctl -u evo --since "60 seconds ago" --no-pager -o json 2>/dev/null | grep 'catalogue loaded' 2>/dev/null | grep -oE '"F_SOURCE":"[a-z]+"' 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//' || true)
 
-    # Strict: any line containing "fail" (case-insensitive)
-    # in the evo journal, OR in the journal of any service
-    # the install touched (mpd), is treated as install
-    # failure. The operator's engineering bar: zero "fail"
-    # across every consumer of the install's output.
+    # Two journals, two owners.
     #
-    # Calibrated exclusions — narrow whitelist of documented
-    # baseline mpd first-boot behaviour that is NOT a failure:
+    # evo: any line matching fail(ed|ure)? is an install failure.
+    # The steward is ours; it does not log that word in normal
+    # operation, so the strict scan is honest there.
     #
-    #   exception: Failed to open "/var/lib/mpd/tag_cache": No such file or directory
-    #   exception: Failed to open "/var/lib/mpd/state":     No such file or directory
+    # mpd: NOT the same rule. mpd is a third-party daemon whose
+    # normal first boot says `fail` about things that are not
+    # failures, and whose real defects mostly do not say it at
+    # all. `mpd_journal_defects` names the fatal strings instead;
+    # see the comment on that function for why each one is there
+    # and where it was read from.
     #
-    # mpd's `db_file` + `state_file` configuration references
-    # paths that do not yet exist on a fresh install; mpd logs
-    # these as `exception:` at startup, then creates the files
-    # itself on the first `update` and next graceful stop
-    # respectively. Every mpd deployment on Debian/Ubuntu with
-    # a fresh `/var/lib/mpd` logs exactly these two lines once.
-    # They are not evo-specific. Any OTHER `fail(ed|ure)?` line
-    # from mpd — including `Database corrupted`, `Bind failed`,
-    # `Config error`, missing music directory, etc. — still
-    # counts as a real journal-fail hit.
+    # Whether audio opened is NOT decided here. That fact has one
+    # owner — verify_pcm_playback, below — which records it as
+    # evidence and does not fail the install, because the
+    # listening device is chosen in Settings -> System -> Audio.
     local fail_evo fail_mpd
     fail_evo=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -iE 'fail(ed|ure)?\b' || true)
     fail_mpd=$(journalctl -u mpd --since "60 seconds ago" --no-pager 2>/dev/null \

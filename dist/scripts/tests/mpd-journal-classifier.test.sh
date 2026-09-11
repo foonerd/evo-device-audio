@@ -79,25 +79,52 @@ assert_count "fresh /var/lib/mpd: tag_cache absent is ignored" \
 assert_count "fresh /var/lib/mpd: state absent is ignored" \
     0 'mpd[1]: exception: Failed to open "/var/lib/mpd/state": No such file or directory'
 
-# ---- named install defects still fail the install ----
-assert_count "named defect: Database corrupted" \
+# ---- fatal defects, in MPD 0.24.4's OWN words ----
+# Every token below was read out of `strings /usr/bin/mpd` on the
+# VM. `Bind failed` and `Config error` are NOT in that binary —
+# they came from a comment, and fixtures asserting them taught the
+# lie. A predicate built on them let a real bind failure PASS.
+assert_count "fatal token: Database corrupted" \
     1 'mpd[1]: Database corrupted'
-assert_count "named defect: Bind failed" \
-    1 'mpd[1]: Bind failed: Address already in use'
-assert_count "named defect: Config error" \
-    1 'mpd[1]: Config error: line 3: unknown setting'
-assert_count "named defect: missing music directory" \
+assert_count "fatal token: Failed to bind socket" \
+    1 'mpd[1]: exception: Failed to bind socket'
+assert_count "fatal token: Failed to bind to '<addr>'" \
+    1 "mpd[1]: exception: Failed to bind to '0.0.0.0:6600'"
+assert_count "fatal token: unrecognized parameter" \
+    1 'mpd[1]: unrecognized parameter: "not_a_setting"'
+assert_count "fatal token: Error in <file> line <n>" \
+    1 'mpd[1]: Error in "/etc/mpd.conf" line 3'
+assert_count "fatal token: configuration file does not exist" \
+    1 'mpd[1]: configuration file does not exist: /etc/mpd.conf'
+assert_count "fatal token: missing music directory (path-keyed)" \
     1 'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory'
+
+# ---- non-fatal neighbours in the SAME binary: must not count ----
+# MPD says these and keeps running. Counting them would be the
+# false-FAIL defect again, wearing bind's clothes.
+assert_count "non-fatal neighbour: bind to one address failed, another succeeded" \
+    0 "mpd[1]: bind to '1.2.3.4' failed (continuing anyway, because binding to '0.0.0.0' succeeded): Cannot assign requested address"
+assert_count "non-fatal neighbour: Failed to listen (not fatal)" \
+    0 'mpd[1]: Failed to listen on /run/mpd/socket (not fatal)'
 
 # ---- mixed: the audio-open line must not mask a real defect ----
 assert_count "audio-open alongside a real defect: only the defect counts" \
     1 "$(printf '%s\n%s\n' "$VM_LINE" 'mpd[1]: Database corrupted')"
-assert_count "every named defect at once" \
-    4 "$(printf '%s\n%s\n%s\n%s\n' \
+assert_count "every fatal token at once" \
+    7 "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         'mpd[1]: Database corrupted' \
-        'mpd[1]: Bind failed: Address already in use' \
-        'mpd[1]: Config error: line 3' \
+        'mpd[1]: exception: Failed to bind socket' \
+        "mpd[1]: exception: Failed to bind to '0.0.0.0:6600'" \
+        'mpd[1]: unrecognized parameter: "not_a_setting"' \
+        'mpd[1]: Error in "/etc/mpd.conf" line 3' \
+        'mpd[1]: configuration file does not exist: /etc/mpd.conf' \
         'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory')"
+
+# The regression this row exists for: the retired fail(ed|ure)?
+# scan WOULD have counted a real bind failure. eff8ade's predicate
+# did not. A false PASS is the worse half of the same bug.
+assert_count "bind failure alongside the benign audio-open line: bind still counts" \
+    1 "$(printf '%s\n%s\n' "$VM_LINE" 'mpd[1]: exception: Failed to bind socket')"
 
 # ---- the whole VM journal, as it actually read ----
 assert_count "the 2026-09-11 VM journal in full → install is not failed" \
@@ -113,6 +140,26 @@ if grep -qE "fail_evo=\\\$\\(journalctl -u evo .* \\| grep -iE 'fail\\(ed\\|ure\
 else
     echo "FAIL  the evo journal arm changed shape"
     FAIL=$((FAIL + 1))
+fi
+
+# ---- the fictional tokens must never return ----
+# Scope this to the predicate BODY. The function's comment names
+# both fictional tokens on purpose, to record why they are not
+# there; asserting against the whole file would match that prose.
+CLASSIFIER_BODY="$(printf '%s\n' "$CLASSIFIER" | sed '/^#/d')"
+if printf '%s\n' "$CLASSIFIER_BODY" | grep -qE "Bind failed|Config error"; then
+    echo "FAIL  a token that is not in the MPD binary is back in the predicate"
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS  Bind failed / Config error absent from the predicate: it speaks MPD's words"
+    PASS=$((PASS + 1))
+fi
+if printf '%s\n' "$CLASSIFIER_BODY" | grep -qE "fail\(ed\|ure\)\?"; then
+    echo "FAIL  the fail(ed|ure)? substring scan is back in the predicate"
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS  fail(ed|ure)? substring scan absent from the predicate"
+    PASS=$((PASS + 1))
 fi
 
 # ---- the old path must be gone, not merely bypassed ----
