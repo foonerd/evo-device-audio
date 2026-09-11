@@ -1276,6 +1276,60 @@ count_expected_plugins_from_stage() {
     echo "${count}"
 }
 
+# mpd journal lines that are real install defects.
+#
+# Reads mpd journal text on stdin, writes the offending lines on
+# stdout. Empty output means nothing in mpd's journal is an
+# install failure. The count of those lines is what the
+# post-condition gate fails on.
+#
+# NAMED DEFECTS, not "anything saying fail". This predicate used
+# to be the inverse: match any line containing `fail`, then
+# subtract a whitelist of two known-benign first-boot lines. That
+# shape was wrong in both directions.
+#
+#   False FAIL. `exception: Failed to open audio output` matched.
+#   Whether audio opened already has exactly one owner —
+#   verify_pcm_playback, which records it as evidence and
+#   deliberately does not fail the install, because the listening
+#   device is chosen in Settings -> System -> Audio and an
+#   HDMI-only or Pulse-held host is installed correctly. Two
+#   evaluators, one fact, opposite verdicts: a live VM
+#   wipe-config on 2026-09-11 came out pcm.evo=ok, 19/19
+#   admitted, music hash preserved, all services active, and
+#   exited 5 on that single line — sending an operator toward
+#   --mode=reinstall on a machine that was fine.
+#
+#   False PASS. The comment above the old predicate claimed
+#   `Database corrupted` and `Config error` still counted. Read
+#   them: neither string contains `fail`. They never matched, so
+#   two of the four named defects were invisible to the gate the
+#   whole time.
+#
+# So the predicate names what a defect IS. Adding a defect means
+# adding it here, deliberately; it does not mean widening a
+# whitelist until the gate means nothing.
+#
+#   Database corrupted   - the database mpd needs is unusable
+#   Bind failed          - mpd could not take its socket/port
+#   Config error         - /etc/mpd.conf is not loadable
+#   music directory      - the library path the distribution pins
+#                          (/var/lib/evo/music) did not open.
+#                          Keyed on the PATH, not the phrase:
+#                          mpd words a missing music directory
+#                          exactly as it words the absent
+#                          tag_cache/state files on first boot,
+#                          which are normal and stay ignored.
+#
+# Extracted so the test suite evaluates THIS function rather than
+# a copy of the predicate — dist/scripts/tests/mpd-journal-classifier.test.sh
+# pulls it out of this shipped file.
+mpd_journal_defects() {
+    grep -iE \
+        'Database corrupted|Bind failed|Config error|Failed to open "/var/lib/evo/music"' \
+        || true
+}
+
 verify_post_condition() {
     local deadline
     deadline=$(( $(date +%s) + 60 ))
@@ -1363,9 +1417,7 @@ verify_post_condition() {
     local fail_evo fail_mpd
     fail_evo=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -iE 'fail(ed|ure)?\b' || true)
     fail_mpd=$(journalctl -u mpd --since "60 seconds ago" --no-pager 2>/dev/null \
-        | grep -iE 'fail(ed|ure)?\b' \
-        | grep -vE 'exception: Failed to open "/var/lib/mpd/(tag_cache|state)": No such file or directory' \
-        || true)
+        | mpd_journal_defects)
     JOURNAL_FAIL_HITS="${fail_evo}"
     if [[ -n "${fail_mpd}" ]]; then
         JOURNAL_FAIL_HITS="${JOURNAL_FAIL_HITS}${JOURNAL_FAIL_HITS:+$'\n'}${fail_mpd}"
