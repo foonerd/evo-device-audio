@@ -69,19 +69,30 @@
 //! which screen the operator is looking at, not in the path the
 //! write takes.
 //!
-//! That is a statement about the source, NOT about any
-//! particular device. The playground glass still runs an older
-//! browser binary that carries the old handlers; overlaying it
-//! is a held row. Until that lands, a script inside that binary
-//! can still write these overlays ungated.
+//! Which devices that is true OF is a separate question, and
+//! the answer is per-box. The two playground rigs — the glass
+//! and the VM — now run the browser built from `75796d9`: the
+//! two touch handlers are absent from the shipped image and the
+//! rotation name is a presence probe whose handler only logs. On
+//! those two boxes this plugin is the writer, and a script in
+//! the glass has no ungated path to the overlays.
+//!
+//! The third playground rig was deliberately not overlaid, and
+//! testers on `Latest` still run the older piece, which carries
+//! the old handlers — on those, a script inside the browser can
+//! still write these overlays ungated. Closing that is a remint,
+//! and a remint is not named. Do not read this crate's docs as a
+//! claim about every device in the field.
 //!
 //! ## One writer
 //!
 //! This plugin calls [`evo_kiosk_config`] for the actual
-//! filesystem work, and it is now the only caller on the write
-//! path. The wizard's derivation math lives there too, so there
-//! is no second overlay format and no second validator to drift
-//! from.
+//! filesystem work. In the current source it is the only caller
+//! on the write path — on a box running that source, the only
+//! one at all. The wizard's derivation math lives in the same
+//! crate, so there is no second overlay format and no second
+//! validator to drift from, whichever browser build a box
+//! happens to carry.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
