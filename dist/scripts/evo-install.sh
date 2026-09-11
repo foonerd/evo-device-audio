@@ -1325,6 +1325,11 @@ count_expected_plugins_from_stage() {
 #   unrecognized parameter: <name>    - mpd.conf has a bad setting
 #   Error in <file> line <n>          - mpd.conf failed to parse
 #   configuration file does not exist - mpd.conf absent
+#   Failed to listen on socket        - no socket to serve on
+#   Failed to listen on *:<port>      - no TCP port to serve on
+#   Failed to listen on <addr> (line <n>)
+#                                     - a configured listener
+#                                       address could not be taken
 #   Failed to open "/var/lib/evo/music"
 #                                     - the library path the
 #                          distribution pins did not open. Keyed
@@ -1339,6 +1344,18 @@ count_expected_plugins_from_stage() {
 #   '<b>' succeeded)          - mpd bound elsewhere and runs
 #   Failed to listen on <x> (not fatal)
 #                             - mpd says so itself
+#   Default TCP listener setup failed, but this is okay because
+#   we have a $XDG_RUNTIME_DIR listener
+#                             - mpd says so itself
+#
+# The listen family is why this is an allowlist of SHAPES rather
+# than of prefixes. `Failed to listen on` alone matches the fatal
+# three AND the benign one, which would force a subtraction — a
+# whitelist wearing a different hat, and the exact shape retired
+# from this function. Each fatal listen shape is named tightly
+# enough that the `(not fatal)` line cannot satisfy any of them:
+# the literal `socket`, the literal `*:`, and a trailing
+# `(line <n>)` are all absent from it.
 #
 # Matching is case-sensitive: these are fixed strings in the
 # binary, and exactness is what keeps the two non-fatal
@@ -1355,6 +1372,9 @@ mpd_journal_defects() {
         -e 'unrecognized parameter:' \
         -e 'Error in .+ line [0-9]' \
         -e 'configuration file does not exist:' \
+        -e 'Failed to listen on socket' \
+        -e 'Failed to listen on \*:' \
+        -e 'Failed to listen on .+ \(line [0-9]+\)' \
         -e 'Failed to open "/var/lib/evo/music"' \
         || true
 }

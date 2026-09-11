@@ -99,6 +99,19 @@ assert_count "fatal token: configuration file does not exist" \
 assert_count "fatal token: missing music directory (path-keyed)" \
     1 'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory'
 
+# ---- fatal listen failures: MPD cannot serve without a socket ----
+# Three fatal shapes in the 0.24.4 binary, and one benign that
+# says so itself. A naive 'Failed to listen on' matches all four,
+# so the benign one would have to be subtracted again — a
+# whitelist in disguise. Each fatal shape is named instead, and
+# none of them can match the "(not fatal)" line.
+assert_count "fatal token: Failed to listen on socket" \
+    1 'mpd[1]: exception: Failed to listen on socket'
+assert_count "fatal token: Failed to listen on *:<port>" \
+    1 'mpd[1]: exception: Failed to listen on *:6600'
+assert_count "fatal token: Failed to listen on <addr> (line <n>)" \
+    1 'mpd[1]: exception: Failed to listen on 127.0.0.1:6600 (line 12)'
+
 # ---- non-fatal neighbours in the SAME binary: must not count ----
 # MPD says these and keeps running. Counting them would be the
 # false-FAIL defect again, wearing bind's clothes.
@@ -106,19 +119,33 @@ assert_count "non-fatal neighbour: bind to one address failed, another succeeded
     0 "mpd[1]: bind to '1.2.3.4' failed (continuing anyway, because binding to '0.0.0.0' succeeded): Cannot assign requested address"
 assert_count "non-fatal neighbour: Failed to listen (not fatal)" \
     0 'mpd[1]: Failed to listen on /run/mpd/socket (not fatal)'
+assert_count "non-fatal neighbour: (not fatal) with MPD's quoted path form" \
+    0 'mpd[1]: Failed to listen on "/run/mpd/socket" (not fatal): Address in use'
+assert_count "non-fatal neighbour: default TCP listener setup failed but XDG socket exists" \
+    0 'mpd[1]: Default TCP listener setup failed, but this is okay because we have a $XDG_RUNTIME_DIR listener'
 
 # ---- mixed: the audio-open line must not mask a real defect ----
 assert_count "audio-open alongside a real defect: only the defect counts" \
     1 "$(printf '%s\n%s\n' "$VM_LINE" 'mpd[1]: Database corrupted')"
 assert_count "every fatal token at once" \
-    7 "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    10 "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         'mpd[1]: Database corrupted' \
         'mpd[1]: exception: Failed to bind socket' \
         "mpd[1]: exception: Failed to bind to '0.0.0.0:6600'" \
         'mpd[1]: unrecognized parameter: "not_a_setting"' \
         'mpd[1]: Error in "/etc/mpd.conf" line 3' \
         'mpd[1]: configuration file does not exist: /etc/mpd.conf' \
-        'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory')"
+        'mpd[1]: exception: Failed to open "/var/lib/evo/music": No such file or directory' \
+        'mpd[1]: exception: Failed to listen on socket' \
+        'mpd[1]: exception: Failed to listen on *:6600' \
+        'mpd[1]: exception: Failed to listen on 127.0.0.1:6600 (line 12)')"
+
+# A dead listen next to the benign lines must still be caught.
+assert_count "fatal listen alongside the benign listen and audio-open: only the fatal counts" \
+    1 "$(printf '%s\n%s\n%s\n' \
+        "$VM_LINE" \
+        'mpd[1]: Failed to listen on /run/mpd/socket (not fatal)' \
+        'mpd[1]: exception: Failed to listen on socket')"
 
 # The regression this row exists for: the retired fail(ed|ure)?
 # scan WOULD have counted a real bind failure. eff8ade's predicate
