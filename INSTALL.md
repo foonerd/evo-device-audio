@@ -115,7 +115,7 @@ If a device is already installed and you want to start over:
 | Mode | Command | What it does |
 |---|---|---|
 | `install` (default) | `curl -fsSL <URL> \| sudo bash` | First-time install. Refuses if already installed. |
-| `reinstall` | `curl -fsSL <URL> \| sudo bash -s -- --mode=reinstall` | Full wipe and re-install. Deletes prior state. Preserves the music library at `/var/lib/evo/music`. |
+| `reinstall` | `curl -fsSL <URL> \| sudo bash -s -- --mode=reinstall` | Full wipe and re-install. **Deletes everything, including the music library at `/var/lib/evo/music`.** The host returns to its pre-evo state. To start over and keep your music, use `wipe-config`. |
 | `wipe-config` | `curl -fsSL <URL> \| sudo bash -s -- --mode=wipe-config` | Wipes binaries and config only. Keeps the music library untouched. |
 | `wipe-user-data` | `curl -fsSL <URL> \| sudo bash -s -- --mode=wipe-user-data` | Vacuums operator-generated state (queues, saved playlists, favourites). |
 
