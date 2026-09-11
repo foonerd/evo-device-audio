@@ -232,6 +232,87 @@ mod tests {
         }
     }
 
+    /// The other half of the wizard-gate proof.
+    ///
+    /// The `system.kiosk` shelf declares every write at one scope
+    /// — `system_admin` — and the plugin crate pins that with
+    /// `every_write_on_this_shelf_rides_the_one_scope`. This
+    /// asserts the half that lives here: that scope sits inside
+    /// the `system` group, so an operator who protects system
+    /// settings protects the whole shelf, including the touch
+    /// wizard's `derive_touch_calibration_from_corners`. The
+    /// framework then refuses it at dispatch with
+    /// `household_policy_locked`, exactly as it refuses
+    /// `set_touch_calibration`.
+    ///
+    /// If a future verb on that shelf were declared at another
+    /// scope it would escape this group; the plugin-side test is
+    /// what catches that, and this is the pointer to it.
+    #[test]
+    fn the_system_group_protects_every_system_kiosk_write() {
+        const SHELF_WRITE_SCOPE: &str = "system_admin";
+        let table: evo::household_protection::GroupTable =
+            std::sync::Arc::new(AudioHouseholdGroups);
+        let boot = evo::https_boot::operator_bootstrap_capability_set();
+        let protected =
+            |policy: &evo::household_protection::HouseholdProtectionPolicy| {
+                evo::household_protection::is_scope_protected(
+                    policy,
+                    Some(&table),
+                    &boot,
+                    SHELF_WRITE_SCOPE,
+                )
+            };
+        let at = |level: ProtectionLevel, groups: Vec<String>| {
+            evo::household_protection::HouseholdProtectionPolicy {
+                chosen: true,
+                level,
+                protected_groups: groups,
+                ..Default::default()
+            }
+        };
+
+        assert_eq!(
+            AudioHouseholdGroups.scopes_for_group(SYSTEM),
+            vec![SHELF_WRITE_SCOPE],
+            "the system group is what carries the kiosk shelf"
+        );
+
+        // Marked explicitly by the operator.
+        assert!(
+            protected(&at(ProtectionLevel::Standard, vec![SYSTEM.to_owned()])),
+            "an explicit system mark must protect the kiosk shelf"
+        );
+
+        // And by the ladder's own defaults, from standard upward.
+        for level in [ProtectionLevel::Standard, ProtectionLevel::Strict] {
+            assert!(
+                protected(&at(
+                    level,
+                    AudioHouseholdGroups.groups_for_level(level)
+                )),
+                "{level:?} must protect the kiosk shelf"
+            );
+        }
+
+        // Controls - without these the assertions above prove
+        // nothing. Open protects nothing at all (marks included:
+        // the framework short-circuits an unlent Open), and low
+        // protects the network groups but deliberately not this
+        // one, so the operator can still align their own screen.
+        assert!(
+            !protected(&at(ProtectionLevel::Open, vec![SYSTEM.to_owned()])),
+            "open is the home player: nothing is protected"
+        );
+        assert!(
+            !protected(&at(
+                ProtectionLevel::Low,
+                AudioHouseholdGroups.groups_for_level(ProtectionLevel::Low)
+            )),
+            "low protects networking, not the screen"
+        );
+    }
+
     #[test]
     fn playback_is_never_protected_at_any_level() {
         // No level on this table may reach the transport scopes.

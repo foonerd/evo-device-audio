@@ -60,6 +60,7 @@ request_types = [
   "set_display_rotation",
   "set_touch_calibration",
   "launch_touch_calibration",
+  "derive_touch_calibration_from_corners",
   "set_enabled",
   "set_brightness",
   "set_sleep_timeout",
@@ -84,6 +85,13 @@ response_budget_ms = 5000
 "set_display_rotation" = { kind = "write", scope = "system_admin" }
 "set_touch_calibration" = { kind = "write", scope = "system_admin" }
 "launch_touch_calibration" = { kind = "write", scope = "system_admin" }
+# The wizard's own write. Same scope, same kind, no step-up: it is
+# the identical overlay the on-glass WebKit handler writes, and a
+# step-up prompt on a mis-calibrated touchscreen is exactly the
+# recursive breakage the rest of this shelf avoids. Declared here
+# so the wizard is refused by a household policy that protects
+# system settings, instead of bypassing it through the compositor.
+"derive_touch_calibration_from_corners" = { kind = "write", scope = "system_admin" }
 "set_enabled" = { kind = "write", scope = "system_admin" }
 "set_brightness" = { kind = "write", scope = "system_admin" }
 "set_sleep_timeout" = { kind = "write", scope = "system_admin" }

@@ -19,6 +19,21 @@
 //!   wizard on-glass. Remote-driven wizard launch, on-glass
 //!   completion — the operator walks to the device to tap the
 //!   corners.
+//! - `derive_touch_calibration_from_corners` — takes the four
+//!   `(target, actual)` samples the wizard captured, derives the
+//!   best rotation/flip triple and persists it, returning the
+//!   winning triple and its mean residual.
+//!
+//!   This verb exists so the wizard's own write is gated. The
+//!   kiosk-browser exposes the same operation as the
+//!   `evo_sample_touch_calibration_from_corners` WebKit handler,
+//!   which calls `evo_kiosk_config::derive_and_apply_touch_calibration`
+//!   in-process: same math, same overlay files, but it never
+//!   reaches the framework dispatcher, so no capability gate and
+//!   no household policy can refuse it. A box whose household
+//!   level protects system settings would still have its touch
+//!   matrix rewritten from its own glass. Routed through here it
+//!   is refused like every other write on this shelf.
 //!
 //! All three verbs are gated at the framework dispatcher's
 //! per-verb capability gate as `write:system_admin` (no
@@ -81,6 +96,15 @@ pub const VERB_SET_TOUCH_CALIBRATION: &str = "set_touch_calibration";
 
 /// Verb name — signal the on-glass browser to open the wizard.
 pub const VERB_LAUNCH_TOUCH_CALIBRATION: &str = "launch_touch_calibration";
+
+/// Verb name — derive the touch triple from four corner samples
+/// and persist it.
+///
+/// Same derivation and same overlay write as the on-glass
+/// WebKit handler; the difference is that this one passes the
+/// dispatcher's `write:system_admin` gate first.
+pub const VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS: &str =
+    "derive_touch_calibration_from_corners";
 
 /// Verb name — enable or disable the evo-kiosk.service unit.
 pub const VERB_SET_ENABLED: &str = "set_enabled";
@@ -197,6 +221,7 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_DISPLAY_ROTATION.to_string(),
                         VERB_SET_TOUCH_CALIBRATION.to_string(),
                         VERB_LAUNCH_TOUCH_CALIBRATION.to_string(),
+                        VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS.to_string(),
                         VERB_SET_ENABLED.to_string(),
                         VERB_SET_BRIGHTNESS.to_string(),
                         VERB_SET_SLEEP_TIMEOUT.to_string(),
@@ -469,6 +494,9 @@ impl Respondent for SystemKioskPlugin {
                 VERB_LAUNCH_TOUCH_CALIBRATION => {
                     handle_launch_touch_calibration(req)
                 }
+                VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS => {
+                    handle_derive_touch_calibration_from_corners(req)
+                }
                 VERB_SET_ENABLED => handle_set_enabled(req).await,
                 VERB_SET_BRIGHTNESS => handle_set_brightness(req),
                 VERB_SET_SLEEP_TIMEOUT => handle_set_sleep_timeout(req),
@@ -500,26 +528,46 @@ struct TouchCalibrationReq {
     vflip: bool,
 }
 
+/// `launch_touch_calibration` carries nothing: it is a signal to
+/// the on-glass browser to open the wizard. It used to reserve an
+/// ignored `samples` field for a direct-samples path; that path
+/// now exists as its own gated verb
+/// (`derive_touch_calibration_from_corners`), so the dead field
+/// is gone rather than sitting behind an `allow`.
 #[derive(Deserialize, Default)]
-struct LaunchTouchCalibrationReq {
-    /// Optional sample set — if present, framework skips the
-    /// on-glass wizard and applies the derived matrix directly.
-    /// Reserved for a future path where a remote-tap flow can
-    /// pipe samples through without on-glass involvement; for
-    /// this cut the field is accepted but ignored (samples
-    /// captured on-glass only).
-    #[serde(default)]
-    #[allow(dead_code)]
-    samples: Option<Vec<TouchSampleWire>>,
+struct LaunchTouchCalibrationReq {}
+
+/// Payload for `derive_touch_calibration_from_corners`.
+///
+/// Exactly four samples, in the order the wizard drew the
+/// targets. The count and coordinate range are enforced by
+/// `evo_kiosk_config::derive_touch_calibration`, so this struct
+/// deliberately does not re-check them: one validator, shared
+/// with the on-glass path.
+#[derive(Deserialize)]
+struct DeriveTouchCalibrationReq {
+    samples: Vec<TouchSampleWire>,
 }
 
+/// One `(target, actual)` pair in normalised output space, as it
+/// arrives on the wire.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct TouchSampleWire {
     target_x: f64,
     target_y: f64,
     actual_x: f64,
     actual_y: f64,
+}
+
+impl From<TouchSampleWire> for TouchSample {
+    fn from(w: TouchSampleWire) -> Self {
+        TouchSample {
+            target_x: w.target_x,
+            target_y: w.target_y,
+            actual_x: w.actual_x,
+            actual_y: w.actual_y,
+        }
+    }
 }
 
 fn parse_payload<T: for<'de> Deserialize<'de>>(
@@ -591,6 +639,53 @@ fn handle_set_touch_calibration(
         "touch_rotation": rot,
         "touch_hflip": hf,
         "touch_vflip": vf,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+/// Derive the touch triple from four corner samples and persist
+/// it.
+///
+/// The derivation and the write are both
+/// `evo_kiosk_config::derive_and_apply_touch_calibration` — the
+/// same function the on-glass WebKit handler calls, so glass and
+/// wire cannot drift and no second overlay format exists. What
+/// this path adds is the dispatcher: the framework has already
+/// checked `write:system_admin` (and, where a household policy
+/// protects that scope, refused with `household_policy_locked`)
+/// before the request arrives here.
+///
+/// Refuses a sample count other than four and coordinates
+/// outside [0, 1] — both as `Permanent`, since a retry with the
+/// same payload cannot succeed.
+fn handle_derive_touch_calibration_from_corners(
+    req: &Request,
+) -> Result<Response, PluginError> {
+    let parsed: DeriveTouchCalibrationReq =
+        parse_payload(req, VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS)?;
+    let samples: Vec<TouchSample> =
+        parsed.samples.into_iter().map(TouchSample::from).collect();
+    let derived =
+        evo_kiosk_config::derive_and_apply_touch_calibration(&samples)
+            .map_err(|e| {
+                kiosk_config_error(
+                    VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS,
+                    e,
+                )
+            })?;
+    let body = serde_json::json!({
+        "ok": true,
+        "touch_rotation": derived.rotation,
+        "touch_hflip": derived.hflip,
+        "touch_vflip": derived.vflip,
+        // Mean per-sample residual in normalised units. The
+        // operator surface uses it to offer "this looks off,
+        // try again" rather than to gate the write.
+        "mean_error": derived.mean_error,
     });
     Ok(Response::for_request(
         req,
@@ -934,14 +1029,6 @@ fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
     ))
 }
 
-/// Silence the compiler about the `TouchSample` re-import
-/// staying pinned even though the current implementation does
-/// not use it server-side; keeps the type available for a
-/// direct-samples path that pipes samples through this plugin
-/// rather than via the on-glass wizard.
-#[allow(dead_code)]
-fn _touch_sample_type_pinned(_s: TouchSample) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1131,222 @@ mod tests {
                 other => {
                     panic!("{label}: {VERB_SET_OSK} must be write/system_admin, got {other:?}")
                 }
+            }
+        }
+    }
+
+    /// The wizard's write must be declared exactly like the
+    /// control it sits beside. If the two ever differ, one of
+    /// them is reachable under a policy that refuses the other.
+    #[test]
+    fn derive_from_corners_is_declared_exactly_like_set_touch_calibration() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types
+                    .iter()
+                    .any(|v| v == VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS),
+                "{label} manifest must stock \
+                 {VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS}"
+            );
+            let derived = r
+                .verb_capabilities
+                .get(VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS);
+            let sibling = r.verb_capabilities.get(VERB_SET_TOUCH_CALIBRATION);
+            assert_eq!(
+                format!("{derived:?}"),
+                format!("{sibling:?}"),
+                "{label}: the wizard write must carry the same capability \
+                 as {VERB_SET_TOUCH_CALIBRATION}"
+            );
+            match derived {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => panic!(
+                    "{label}: \
+                     {VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS} must be \
+                     write/system_admin, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Every write on this shelf rides ONE scope. That is what
+    /// lets a distribution protect the whole surface by putting a
+    /// single scope in one household group: a verb added later at
+    /// a different scope would silently escape the group, and
+    /// this fails before it ships.
+    #[test]
+    fn every_write_on_this_shelf_rides_the_one_scope() {
+        use evo_plugin_sdk::manifest::VerbCapability;
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml).expect("manifest parses");
+            let r = m.capabilities.respondent.as_ref().expect("respondent");
+            let mut writes = 0usize;
+            for (verb, cap) in r.verb_capabilities.iter() {
+                if let VerbCapability::Write { scope } = cap {
+                    writes += 1;
+                    assert_eq!(
+                        scope, "system_admin",
+                        "{label}: write verb {verb} escapes the shelf scope"
+                    );
+                }
+            }
+            assert!(writes >= 10, "{label}: expected the full write surface");
+        }
+    }
+
+    fn corner_samples(invert: bool) -> serde_json::Value {
+        // The four targets the wizard draws, in its own order.
+        let corners = [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)];
+        let samples: Vec<serde_json::Value> = corners
+            .iter()
+            .map(|(tx, ty)| {
+                let (ax, ay) = if invert {
+                    (1.0 - tx, 1.0 - ty)
+                } else {
+                    (*tx, *ty)
+                };
+                serde_json::json!({
+                    "target_x": tx, "target_y": ty,
+                    "actual_x": ax, "actual_y": ay
+                })
+            })
+            .collect();
+        serde_json::json!({ "samples": samples })
+    }
+
+    fn derive(payload: serde_json::Value) -> Result<Response, PluginError> {
+        handle_derive_touch_calibration_from_corners(&request(
+            VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS,
+            payload,
+        ))
+    }
+
+    /// The wizard verb writes the SAME three overlay files, with
+    /// the same bytes, that set_touch_calibration writes. No
+    /// second format, no second applier.
+    #[test]
+    fn derive_from_corners_writes_the_set_touch_calibration_overlays() {
+        let ov = ScratchOverlays::new("derive-corners");
+        let read = |ov: &ScratchOverlays| {
+            (
+                ov.bytes("touch_rotation"),
+                ov.bytes("touch_hflip"),
+                ov.bytes("touch_vflip"),
+            )
+        };
+
+        // Start from a deliberately non-identity state so a
+        // derive that wrote nothing would be visible.
+        handle_set_touch_calibration(&request(
+            VERB_SET_TOUCH_CALIBRATION,
+            serde_json::json!({"rotation":"90","hflip":true,"vflip":true}),
+        ))
+        .expect("seed write");
+        let seeded = read(&ov);
+        assert_eq!(seeded.0.as_deref(), Some("90"));
+
+        // Operator tapped exactly on the targets: identity.
+        let b = body(&derive(corner_samples(false)).expect("derive applies"));
+        assert_eq!(b["ok"], serde_json::json!(true));
+        assert_eq!(b["touch_rotation"], serde_json::json!("0"));
+        assert_eq!(b["touch_hflip"], serde_json::json!(false));
+        assert_eq!(b["touch_vflip"], serde_json::json!(false));
+        assert!(
+            b["mean_error"].as_f64().expect("mean_error is a number") < 1e-9,
+            "a clean fit must report ~0 residual, got {}",
+            b["mean_error"]
+        );
+        let after_derive = read(&ov);
+        assert_ne!(after_derive, seeded, "derive must have written");
+
+        // The same triple through the plain setter must produce
+        // byte-identical overlays.
+        handle_set_touch_calibration(&request(
+            VERB_SET_TOUCH_CALIBRATION,
+            serde_json::json!({"rotation":"0","hflip":false,"vflip":false}),
+        ))
+        .expect("equivalent write");
+        assert_eq!(
+            read(&ov),
+            after_derive,
+            "the wizard verb and set_touch_calibration must write the same \
+             overlay bytes"
+        );
+    }
+
+    /// The derivation is real, not a fixed answer: inverted taps
+    /// resolve to a non-identity triple that still fits cleanly.
+    #[test]
+    fn derive_from_corners_actually_derives() {
+        let _ov = ScratchOverlays::new("derive-corners-inverted");
+        let b = body(&derive(corner_samples(true)).expect("derive applies"));
+        let triple = (
+            b["touch_rotation"].as_str().expect("rotation"),
+            b["touch_hflip"].as_bool().expect("hflip"),
+            b["touch_vflip"].as_bool().expect("vflip"),
+        );
+        assert_ne!(
+            triple,
+            ("0", false, false),
+            "inverted taps must not resolve to identity"
+        );
+        assert!(
+            b["mean_error"].as_f64().expect("mean_error") < 1e-9,
+            "the inverted set has an exact fit"
+        );
+    }
+
+    /// Count and range are enforced by the shared crate, and a
+    /// bad payload is Permanent - retrying it cannot help.
+    #[test]
+    fn derive_from_corners_refuses_a_short_sample_set() {
+        let _ov = ScratchOverlays::new("derive-corners-short");
+        let three = serde_json::json!({"samples": [
+            {"target_x":0.1,"target_y":0.1,"actual_x":0.1,"actual_y":0.1},
+            {"target_x":0.9,"target_y":0.1,"actual_x":0.9,"actual_y":0.1},
+            {"target_x":0.9,"target_y":0.9,"actual_x":0.9,"actual_y":0.9}
+        ]});
+        match derive(three) {
+            Err(PluginError::Permanent(_)) => {}
+            other => panic!("a 3-sample set must be Permanent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_from_corners_refuses_out_of_range_coordinates() {
+        let _ov = ScratchOverlays::new("derive-corners-range");
+        let mut payload = corner_samples(false);
+        payload["samples"][0]["actual_x"] = serde_json::json!(1.5);
+        match derive(payload) {
+            Err(PluginError::Permanent(_)) => {}
+            other => {
+                panic!("an out-of-range tap must be Permanent, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn derive_from_corners_refuses_an_empty_payload() {
+        // Unlike launch_touch_calibration, this verb has no
+        // defaultable shape: samples are required.
+        let _ov = ScratchOverlays::new("derive-corners-empty");
+        match derive(serde_json::json!({})) {
+            Err(PluginError::Permanent(_)) => {}
+            other => {
+                panic!("a missing sample set must be Permanent, got {other:?}")
             }
         }
     }
