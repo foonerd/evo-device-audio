@@ -794,13 +794,16 @@ pub fn render_smb_conf(
     out.push_str("printcap name = /dev/null\n");
     out.push_str("disable spoolss = yes\n");
     out.push_str("usershare max shares = 0\n");
-    // Guest shares below rely on `force user = root` +
+    // The share sections below rely on `force user = root` +
     // `force group = root` so writes land under a stable
-    // identity regardless of which client (guest or
-    // authenticated) sent them. Files land under the music /
-    // uploads plane; the steward + MPD run under the service
-    // user which is either root or in the file group by
-    // bootstrap contract.
+    // identity regardless of which client sent them. Files
+    // land under the music / uploads plane; the steward + MPD
+    // run under the service user which is either root or in
+    // the file group by bootstrap contract. `map to guest =
+    // Bad User` above still maps an unknown login to the guest
+    // account, but no stock share admits it: every section
+    // this renderer emits for the inventory is `guest ok =
+    // no`, so an unknown user reaches nothing.
     out.push('\n');
 
     let mut applied: Vec<String> = Vec::new();
@@ -819,7 +822,7 @@ pub fn render_smb_conf(
         "Internal Storage",
         "/var/lib/evo/music/INTERNAL",
         "evo local music library",
-        true,
+        false,
     );
     push_stock_share(
         &mut out,
@@ -827,7 +830,7 @@ pub fn render_smb_conf(
         "USB",
         "/var/lib/evo/music/USB",
         "evo removable-media library",
-        true,
+        false,
     );
     push_stock_share(
         &mut out,
@@ -835,21 +838,21 @@ pub fn render_smb_conf(
         "NAS",
         "/var/lib/evo/music/NAS",
         "evo NAS mount parent",
-        true,
+        false,
     );
 
-    // Delivery shares — `Uploads` (guest) + `evo-plugins-stage`
-    // (authenticated). The authenticated share does not set
-    // `guest ok = yes`; smb clients that do not present
-    // credentials are refused at the SMB layer and the share
-    // does not accept anonymous writes.
+    // Delivery shares — `Uploads` + `evo-plugins-stage`, both
+    // authenticated. Neither sets `guest ok = yes`; smb
+    // clients that do not present credentials are refused at
+    // the SMB layer and neither share accepts anonymous
+    // writes.
     push_stock_share(
         &mut out,
         &mut applied,
         "Uploads",
         "/var/lib/evo/uploads",
         "evo generic upload target",
-        true,
+        false,
     );
     push_stock_share(
         &mut out,
@@ -916,9 +919,12 @@ pub fn render_smb_conf(
 /// conf. Shape is identical across every share the inventory
 /// pins: `read only = no`, `force user = root`, `force group =
 /// root`, `create mask = 0664`, `directory mask = 0775`.
-/// `guest ok` is the per-share knob — stock music shares +
-/// Uploads are guest-writable; `evo-plugins-stage` is
-/// authenticated.
+/// `guest ok` is the per-share knob. Every share in the
+/// inventory — the music shares, `Uploads` and
+/// `evo-plugins-stage` — is authenticated: the parameter
+/// stays so the emitter keeps one shape, and so an
+/// operator-defined extra share can still carry its own
+/// `guest_ok`.
 fn push_stock_share(
     out: &mut String,
     applied: &mut Vec<String>,
@@ -2844,9 +2850,12 @@ mod tests {
         assert!(rendered.contains("[NAS]"));
         assert!(rendered.contains("[Uploads]"));
         assert!(rendered.contains("[evo-plugins-stage]"));
-        // Operator extra share also rendered.
+        // Operator extra share also rendered — and still
+        // carries the flag the operator set, which the stock
+        // shares no longer offer.
         assert!(rendered.contains("[Studio]"));
         assert!(rendered.contains("path = /var/lib/evo/music/NAS/studio"));
+        assert!(section_body(&rendered, "Studio").contains("guest ok = yes"));
         // `applied` carries every share the caller can inspect
         // for the wire response — stock + delivery + operator
         // extras.
@@ -2958,9 +2967,21 @@ mod tests {
         assert!(applied.contains(&"NAS".to_string()));
     }
 
+    /// Text of one rendered `smb.conf` section: everything
+    /// after the `[name]` header up to the next section
+    /// header. Section-scoped so an assertion cannot be
+    /// satisfied by a neighbouring share's line.
+    fn section_body<'a>(rendered: &'a str, name: &str) -> &'a str {
+        let after = rendered
+            .split(&format!("[{name}]\n"))
+            .nth(1)
+            .unwrap_or_default();
+        after.split("\n[").next().unwrap_or_default()
+    }
+
     #[test]
-    fn render_emits_delivery_shares_with_correct_guest_split() {
-        // Uploads is guest-writable; evo-plugins-stage is
+    fn render_emits_delivery_shares_both_authenticated() {
+        // `Uploads` and `evo-plugins-stage` are both
         // authenticated. Both always rendered when enabled.
         let (rendered, applied, _) = render_smb_conf(
             &SmbServerState::empty(),
@@ -2973,27 +2994,61 @@ mod tests {
         assert!(rendered.contains("path = /var/lib/evo/uploads"));
         assert!(rendered.contains("[evo-plugins-stage]"));
         assert!(rendered.contains("path = /var/lib/evo/plugins/stage"));
-        // Split assertion: after the [Uploads] header the next
-        // `guest ok = yes` is expected; after
-        // [evo-plugins-stage] we expect `guest ok = no`. Slice
-        // the rendered text at each section to check.
-        let uploads_section =
-            rendered.split("[Uploads]").nth(1).unwrap_or_default();
-        let uploads_section = uploads_section
-            .split("[evo-plugins-stage]")
-            .next()
-            .unwrap_or_default();
-        assert!(uploads_section.contains("guest ok = yes"));
-        let stage_section = rendered
-            .split("[evo-plugins-stage]")
-            .nth(1)
-            .unwrap_or_default();
-        // The stage section is the last stock section — take
-        // everything after its header. `guest ok = no` MUST
-        // appear before the next section (if any).
-        assert!(stage_section.contains("guest ok = no"));
+        assert!(section_body(&rendered, "Uploads").contains("guest ok = no"));
+        assert!(section_body(&rendered, "evo-plugins-stage")
+            .contains("guest ok = no"));
         assert!(applied.contains(&"Uploads".to_string()));
         assert!(applied.contains(&"evo-plugins-stage".to_string()));
+    }
+
+    #[test]
+    fn render_pins_every_inventory_share_to_no_guest() {
+        // The inventory in `docs/SAMBA-SHARES.md`: no share
+        // this renderer emits for it admits an unauthenticated
+        // client. Paths and the on-disk identity shape are
+        // pinned alongside, because tightening access must not
+        // move where files land or who owns them.
+        let (rendered, applied, refused) = render_smb_conf(
+            &SmbServerState::empty(),
+            "EvoTest",
+            "WG",
+            &test_allowlist(),
+            &test_denylist(),
+        );
+        for (name, path) in [
+            ("Internal Storage", "/var/lib/evo/music/INTERNAL"),
+            ("USB", "/var/lib/evo/music/USB"),
+            ("NAS", "/var/lib/evo/music/NAS"),
+            ("Uploads", "/var/lib/evo/uploads"),
+            ("evo-plugins-stage", "/var/lib/evo/plugins/stage"),
+        ] {
+            let body = section_body(&rendered, name);
+            assert!(
+                body.contains("guest ok = no"),
+                "[{name}] must render guest ok = no, got:\n{body}"
+            );
+            assert!(
+                !body.contains("guest ok = yes"),
+                "[{name}] still admits guests:\n{body}"
+            );
+            assert!(
+                body.contains(&format!("path = {path}\n")),
+                "[{name}] path moved:\n{body}"
+            );
+            assert!(body.contains("read only = no"));
+            assert!(body.contains("force user = root"));
+            assert!(body.contains("force group = root"));
+            assert!(body.contains("create mask = 0664"));
+            assert!(body.contains("directory mask = 0775"));
+            assert!(applied.contains(&name.to_string()));
+        }
+        // With no operator extras in state, nothing anywhere in
+        // the rendered conf may admit a guest.
+        assert!(
+            !rendered.contains("guest ok = yes"),
+            "a guest-ok section survived:\n{rendered}"
+        );
+        assert!(refused.is_empty());
     }
 
     #[test]

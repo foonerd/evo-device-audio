@@ -39,15 +39,22 @@ LAN share list for this device.
 ## Stock shares (always present when SMB enabled)
 
 These are **not** `extra_shares`. The renderer MUST emit them
-whenever `enabled = true`. Guest-friendly, read-write — same
-product reason as Volumio / volumio-evo: LAN push into the music
-library roots MPD already browses.
+whenever `enabled = true`. Read-write, and **authenticated** —
+LAN push into the music library roots MPD already browses, but
+only for a client that presents SMB credentials.
 
 | SMB share name | Path | Guest | Read-only | Purpose |
 |----------------|------|-------|-----------|---------|
-| `Internal Storage` | `/var/lib/evo/music/INTERNAL` | yes | no | Local music library. Drop files here → appear under INTERNAL in My Music. |
-| `USB` | `/var/lib/evo/music/USB` | yes | no | Removable-media library segment. |
-| `NAS` | `/var/lib/evo/music/NAS` | yes | no | Parent of inbound network mounts (`…/NAS/<alias>`). |
+| `Internal Storage` | `/var/lib/evo/music/INTERNAL` | **no** | no | Local music library. Drop files here → appear under INTERNAL in My Music. |
+| `USB` | `/var/lib/evo/music/USB` | **no** | no | Removable-media library segment. |
+| `NAS` | `/var/lib/evo/music/NAS` | **no** | no | Parent of inbound network mounts (`…/NAS/<alias>`). |
+
+Every stock share renders `guest ok = no`. An unauthenticated
+client on the LAN reaches none of them; see **SMB users** for
+how an operator is provisioned. Path, `read only = no`, and the
+`force user` / `force group` / mask shape are unchanged by this:
+tightening who may connect does not move where files land or who
+owns them.
 
 Bootstrap MUST ensure the three directories exist (already does for
 the music triad). Paths are the **evo music plane**, not classic
@@ -83,7 +90,7 @@ lands in this plugin's renderer instead.
 |-------|--------|
 | SMB share name | `Uploads` |
 | Path | `/var/lib/evo/uploads` |
-| Guest | yes |
+| Guest | **no** (authenticated SMB user) |
 | Read-only | no |
 | Purpose | Designated upload root beyond the music triad (schema: “music library root + upload target”). |
 
@@ -132,11 +139,17 @@ match this table.
 
 ## SMB users (authenticated access)
 
-Named SMB users are how an operator authenticates to
-non-guest shares (today: `evo-plugins-stage`) without ever
-using a shell on the device. Guest-ok stock shares
-(`Internal Storage`, `USB`, `NAS`, `Uploads`) do not require
-a named user; authenticated shares do.
+Named SMB users are how an operator authenticates to this
+device's shares without ever using a shell on it. Every share
+in this inventory — `Internal Storage`, `USB`, `NAS`,
+`Uploads` and `evo-plugins-stage` — requires a named user.
+A device with SMB enabled and no SMB user provisioned exports
+nothing an operator can reach; provisioning one is part of
+bring-up, not an optional extra.
+
+Operator-defined `extra_shares` are the exception: each
+carries its own `guest_ok` and an operator may still choose
+guest access for one.
 
 The File Sharing UI (`network.smb_server.user_add` /
 `user_revoke`) is the only supported management path.
@@ -380,9 +393,10 @@ With SMB enabled on a cold or warm apply:
 1. Browse `\\<device>` / `smb://<device>/`.
 2. **Must** list: `Internal Storage`, `USB`, `NAS`, `evo-plugins-stage`, `Uploads`.
 3. **Must not** list: `print$`, `nobody`, `homes`, `printers`, or any share not in this inventory / operator extras.
-4. Drop a signed plugin bundle on `evo-plugins-stage` → stage watcher admits (or rejects into `rejected/` with reason). Authenticated drop requires an SMB user provisioned per **SMB users** above.
+4. Drop a signed plugin bundle on `evo-plugins-stage` → stage watcher admits (or rejects into `rejected/` with reason).
 5. Drop a music file on `Internal Storage` → visible under INTERNAL in the library after MPD update.
-6. SMB user add/revoke acceptance: see **SMB users → Acceptance**.
+6. Every share in step 2 requires an SMB user provisioned per **SMB users** above. Connecting without credentials MUST be refused at the SMB layer, on the music shares as well as the stage share.
+7. SMB user add/revoke acceptance: see **SMB users → Acceptance**.
 
 ---
 
@@ -390,14 +404,15 @@ With SMB enabled on a cold or warm apply:
 
 | Surface | Behaviour |
 |---------|-----------|
-| Stock + delivery shares | Shown as fixed (not editable path/name); clarify guest vs auth for `evo-plugins-stage`. |
+| Stock + delivery shares | Shown as fixed (not editable path/name); all are authenticated, so the UI MUST make clear that an SMB user is required to reach any of them. |
 | Extra shares | List editor (name, path, guest_ok) per `shares.v1.toml`. |
 | Enable / min_protocol | Existing File Sharing controls. |
 | Device name | The device's LAN identity IS the OS hostname. There is **no** separate netbios-name storage on the runtime or in the plugin state file. `network.smb_server.apply()` reads `/proc/sys/kernel/hostname` at render time and writes it into `smb.conf` as `netbios name`. Read `envelope.hostname` from `network.smb_server.get_state` on load; refresh on every `system_smb_server` subject update. Write via `network.smb_server.apply(system_hostname = <new>)` — that call runs `hostnamectl set-hostname <new>` and then re-renders `smb.conf`, so the next render's `netbios name` reflects the new hostname without a steward restart. Empty string on the envelope is a diagnostic signal (procfs I/O failure) — render the field placeholder, never the empty value. |
 | SMB users | Add/list/revoke by username; password via device vault prompt only. UI does not create Unix accounts — the device provision path does. No need to "pick a running system user." |
 
 Copy that claims "share this device's library" is true only while
-the stock music shares exist in the rendered conf.
+the stock music shares exist in the rendered conf, and MUST NOT
+imply the library is reachable without credentials.
 
 ---
 
