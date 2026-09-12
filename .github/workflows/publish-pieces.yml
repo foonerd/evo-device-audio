@@ -355,6 +355,10 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.build_kiosk == 'true'
     runs-on: ubuntu-latest
+    # Kiosk lock (icu 2.2) needs rustc 1.86+. Kiosk host CI is
+    # stable. Workflow RUST_TOOLCHAIN stays 1.85 for steward/plugins.
+    env:
+      RUST_TOOLCHAIN: stable
     steps:
       - name: Check out audio
         uses: actions/checkout@v5
@@ -391,6 +395,7 @@ jobs:
       - name: Mint kiosk piece
         env:
           PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          RUSTUP_TOOLCHAIN: stable
         run: |
           set -euo pipefail
           if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
