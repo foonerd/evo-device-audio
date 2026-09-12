@@ -1,6 +1,6 @@
 [plugin]
 name = "org.evoframework.system.kiosk"
-version = "0.1.0"
+version = "0.1.1"
 contract = 1
 
 [target]
