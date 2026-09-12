@@ -357,11 +357,22 @@ jobs:
       - name: Check out audio
         uses: actions/checkout@v5
 
+      - name: Require KIOSK_ENG_READ_TOKEN
+        env:
+          TOKEN: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TOKEN" ]; then
+            echo "::error::KIOSK_ENG_READ_TOKEN is empty — scope=kiosk reads foonerd/evo-kiosk-eng"
+            exit 1
+          fi
+
       - name: Check out evo-kiosk-eng
         uses: actions/checkout@v5
         with:
           repository: foonerd/evo-kiosk-eng
           ref: ${{ inputs.kiosk_ref }}
+          token: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
           path: evo-kiosk-eng
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
