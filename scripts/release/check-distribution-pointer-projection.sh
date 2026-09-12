@@ -76,4 +76,22 @@ printf '%s' "${prot_err}" | grep -q 'v0.1.13' \
     || fail "protected-release error unclear: ${prot_err}"
 pass "refuses to project protected GitHub Release v0.1.13"
 
+# --- artefacts commit: add before the first rebase ---
+# The pointer write dirties the clone. `git pull --rebase` on that
+# dirty tree is the 128 this check exists to keep closed.
+COMMIT_BLOCK="$(
+    awk '/Artefacts commit \(pointer only\)/,0' \
+        "${ROOT}/publish-distribution-bundle.sh"
+)"
+printf '%s' "${COMMIT_BLOCK}" | grep -q 'git add' \
+    || fail "pointer commit block must git add"
+ADD_LINE="$(printf '%s\n' "${COMMIT_BLOCK}" | grep -n 'git add' | head -1 | cut -d: -f1)"
+REBASE_LINE="$(printf '%s\n' "${COMMIT_BLOCK}" | grep -n 'pull --rebase' | head -1 | cut -d: -f1)"
+COMMIT_LINE="$(printf '%s\n' "${COMMIT_BLOCK}" | grep -n 'git commit' | head -1 | cut -d: -f1)"
+[[ -n "${ADD_LINE}" && -n "${REBASE_LINE}" && -n "${COMMIT_LINE}" ]] \
+    || fail "pointer commit block missing add / commit / rebase"
+[[ "${ADD_LINE}" -lt "${COMMIT_LINE}" && "${COMMIT_LINE}" -lt "${REBASE_LINE}" ]] \
+    || fail "pointer commit must add, then commit, then rebase (got add=${ADD_LINE} commit=${COMMIT_LINE} rebase=${REBASE_LINE})"
+pass "pointer commit adds and commits before rebase"
+
 pass "distribution pointer projection checks"

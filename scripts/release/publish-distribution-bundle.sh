@@ -283,11 +283,12 @@ if [[ -n "${EVO_PLUGIN_SIGNING_KEY:-}" && -r "${EVO_PLUGIN_SIGNING_KEY}" ]]; the
 fi
 
 log_step "Artefacts commit (pointer only)"
+# The pointer write above dirties this clone. Rebase-before-add
+# exits 128 (unstaged changes). Stage and commit first; rebase
+# only a clean HEAD onto origin; then push.
 (
     cd "${ARTEFACTS_REPO}"
     branch="$(git rev-parse --abbrev-ref HEAD)"
-    git fetch origin
-    git pull --rebase "origin" "${branch}"
     git add "${POINTER_REL}"
     if [[ -f "${POINTER_PATH%.toml}.sig" ]]; then
         git add "${POINTER_REL%.toml}.sig"
@@ -296,6 +297,8 @@ log_step "Artefacts commit (pointer only)"
         log_ok "artefacts already contain ${POINTER_REL}; no new commit"
     else
         git commit --signoff -m "release ${TAG} distribution pointer"
+        git fetch origin
+        git pull --rebase "origin" "${branch}"
         if [[ "${NO_PUSH}" -eq 1 ]]; then
             log_ok "--no-push set; review and push ${ARTEFACTS_REPO} by hand"
         else
