@@ -40,6 +40,7 @@ const SMART_HOME: &str = "smart-home";
 const NETWORK_ADMIN: &str = "network_admin";
 const SYSTEM_ADMIN: &str = "system_admin";
 const ONLINE_PROVIDERS: &str = "online_providers";
+const CREDENTIALS: &str = "credentials";
 
 /// The audio appliance's Settings groups.
 ///
@@ -74,8 +75,14 @@ impl HouseholdGroupTable for AudioHouseholdGroups {
             // care that two keys resolve alike.
             SYSTEM | SMART_HOME => vec![SYSTEM_ADMIN.to_owned()],
             // Online providers and the credential writers behind
-            // them.
-            METADATA => vec![ONLINE_PROVIDERS.to_owned()],
+            // them. Last.fm keys ride `credential_put`
+            // (`write:credentials`); provider toggles ride
+            // `online_providers`. Both must sit in this group or
+            // Play only marks Metadata and the key writer stays
+            // open.
+            METADATA => {
+                vec![ONLINE_PROVIDERS.to_owned(), CREDENTIALS.to_owned()]
+            }
             // An unknown key — a stale mark left by an older
             // release, say — resolves to nothing rather than
             // panicking the gate.
@@ -167,11 +174,67 @@ mod tests {
     }
 
     #[test]
-    fn metadata_rides_online_providers() {
+    fn metadata_rides_online_providers_and_the_credential_writer() {
         assert_eq!(
             AudioHouseholdGroups.scopes_for_group("metadata"),
-            vec!["online_providers"]
+            vec!["online_providers", "credentials"]
         );
+    }
+
+    #[test]
+    fn metadata_scopes_follow_the_ladder() {
+        let table: evo::household_protection::GroupTable =
+            std::sync::Arc::new(AudioHouseholdGroups);
+        let boot = evo::https_boot::operator_bootstrap_capability_set();
+        let protected =
+            |policy: &evo::household_protection::HouseholdProtectionPolicy| {
+                (
+                    evo::household_protection::is_scope_protected(
+                        policy,
+                        Some(&table),
+                        &boot,
+                        "online_providers",
+                    ),
+                    evo::household_protection::is_scope_protected(
+                        policy,
+                        Some(&table),
+                        &boot,
+                        "credentials",
+                    ),
+                )
+            };
+        let at = |level: ProtectionLevel, groups: Vec<String>| {
+            evo::household_protection::HouseholdProtectionPolicy {
+                chosen: true,
+                level,
+                protected_groups: groups,
+                ..Default::default()
+            }
+        };
+
+        assert_eq!(
+            protected(&at(ProtectionLevel::Open, vec![METADATA.to_owned()])),
+            (false, false),
+            "open protects nothing, marks included"
+        );
+        assert_eq!(
+            protected(&at(
+                ProtectionLevel::Low,
+                AudioHouseholdGroups.groups_for_level(ProtectionLevel::Low)
+            )),
+            (false, false),
+            "low protects networking, not metadata"
+        );
+        for level in [ProtectionLevel::Standard, ProtectionLevel::Strict] {
+            assert_eq!(
+                protected(&at(
+                    level,
+                    AudioHouseholdGroups.groups_for_level(level)
+                )),
+                (true, true),
+                "{level:?} must protect both metadata writers"
+            );
+        }
     }
 
     #[test]
@@ -224,7 +287,12 @@ mod tests {
             Some(&table),
             &evo::https_boot::operator_bootstrap_capability_set(),
         );
-        for expected in ["network_admin", "system_admin", "online_providers"] {
+        for expected in [
+            "network_admin",
+            "system_admin",
+            "online_providers",
+            "credentials",
+        ] {
             assert!(
                 scopes.contains(expected),
                 "strict must protect {expected}"
@@ -422,7 +490,7 @@ mod catalog_shape {
         // paints marks without a second map.
         assert_eq!(
             wire["catalog"]["groups"][4]["scopes"],
-            serde_json::json!(["online_providers"])
+            serde_json::json!(["online_providers", "credentials"])
         );
     }
 }
