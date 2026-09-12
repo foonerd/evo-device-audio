@@ -9,7 +9,9 @@
 #   plugin   — one plugin from dist/scripts/lib/oop-plugins.sh
 #   dist     — evo-device-audio-dist placement tree
 #   kiosk    — evo-kiosk piece, built from an evo-kiosk-eng
-#              checkout (program stored; sources alone refused)
+#              checkout (program stored; sources alone refused).
+#              Checkout uses ARTEFACTS_PUSH_TOKEN; that PAT already
+#              lists evo-kiosk-eng.
 #
 # all does not imply kiosk. Kiosk mint needs the kiosk-eng
 # tree and three WebKit cross-builds; it is dispatched on
@@ -357,13 +359,13 @@ jobs:
       - name: Check out audio
         uses: actions/checkout@v5
 
-      - name: Require KIOSK_ENG_READ_TOKEN
+      - name: Require ARTEFACTS_PUSH_TOKEN
         env:
-          TOKEN: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
+          TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "$TOKEN" ]; then
-            echo "::error::KIOSK_ENG_READ_TOKEN is empty — scope=kiosk reads foonerd/evo-kiosk-eng"
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty — scope=kiosk reads foonerd/evo-kiosk-eng with the same PAT that writes artefacts"
             exit 1
           fi
 
@@ -372,7 +374,7 @@ jobs:
         with:
           repository: foonerd/evo-kiosk-eng
           ref: ${{ inputs.kiosk_ref }}
-          token: ${{ secrets.KIOSK_ENG_READ_TOKEN }}
+          token: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
           path: evo-kiosk-eng
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
