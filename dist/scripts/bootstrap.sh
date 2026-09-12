@@ -123,6 +123,8 @@ SAMBA_SERVER_SUDOERS_FILE="/etc/sudoers.d/evo-samba-server"
 SMB_USER_SYNC_WRAPPER_DST="/usr/local/bin/evo-smb-user-sync"
 STORAGE_USB_SUDOERS_FILE="/etc/sudoers.d/evo-storage-usb"
 STORAGE_USB_WRAPPER_DST="/usr/local/bin/evo-usb-mount"
+RTC_WAKE_SUDOERS_FILE="/etc/sudoers.d/evo-rtc-wake"
+RTC_WAKE_WRAPPER_DST="/usr/local/bin/evo-rtc-wake"
 STORAGE_USB_STATE_DIR="/var/lib/evo/plugins/org.evoframework.storage.usb"
 DACS_CATALOGUE_DIR="/usr/share/evo-device-audio"
 DACS_CATALOGUE_PATH="${DACS_CATALOGUE_DIR}/dacs.json"
@@ -339,16 +341,25 @@ echo "[bootstrap] systemctl binary: $SYSTEMCTL_BIN"
 # script.
 # shellcheck source=lib/detect-audio-card.sh
 . "$SCRIPT_DIR/lib/detect-audio-card.sh"
+# shellcheck source=lib/chown-tree-same-fs.sh
+. "$SCRIPT_DIR/lib/chown-tree-same-fs.sh"
+# shellcheck source=lib/chown-tenant-state-trees.sh
+. "$SCRIPT_DIR/lib/chown-tenant-state-trees.sh"
 
 if [[ -z "$AUDIO_CARD" ]]; then
     if ! command -v aplay >/dev/null 2>&1; then
         echo "aplay not found on PATH; install alsa-utils or pass --card <NAME>" >&2
         exit 1
     fi
-    if ! AUDIO_CARD="$(aplay -l 2>/dev/null | detect_audio_card_from_aplay_output)"; then
+    # LC_ALL=C: alsa-utils translates the card line, so a
+    # French host emits `carte 0:` and a German one `Karte 0:`.
+    # Pinning the locale keeps the parser reading the shape it
+    # was written against, and keeps the operator-facing dump
+    # below in the same language as this script's own messages.
+    if ! AUDIO_CARD="$(LC_ALL=C aplay -l 2>/dev/null | detect_audio_card_from_aplay_output)"; then
         echo "no ALSA playback card detected via aplay -l; pass --card <NAME> to override" >&2
         echo "  (current aplay -l output:)" >&2
-        aplay -l 2>&1 | sed 's/^/  /' >&2
+        LC_ALL=C aplay -l 2>&1 | sed 's/^/  /' >&2
         exit 2
     fi
     echo "[bootstrap] detected ALSA playback card: $AUDIO_CARD"
@@ -796,6 +807,34 @@ else
 fi
 
 # ----------------------------------------------------------
+# Step 1h: /usr/local/bin/evo-rtc-wake +
+#          /etc/sudoers.d/evo-rtc-wake (narrow NOPASSWD)
+# ----------------------------------------------------------
+# The steward service user cannot write the kernel RTC sysfs
+# node directly. This root-owned wrapper is the only privileged
+# target and performs the required clear-then-program sequence.
+RTC_WAKE_WRAPPER_SRC="$DIST_DIR/bin/evo-rtc-wake"
+RTC_WAKE_SUDOERS_TEMPLATE="$DIST_DIR/sudoers.d/evo-rtc-wake.in"
+if [[ ! -f "$RTC_WAKE_WRAPPER_SRC" || ! -f "$RTC_WAKE_SUDOERS_TEMPLATE" ]]; then
+    echo "RTC wake wrapper or sudoers template missing under $DIST_DIR" >&2
+    exit 2
+fi
+install -m 0755 -o root -g root "$RTC_WAKE_WRAPPER_SRC" "$RTC_WAKE_WRAPPER_DST"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+sed -e "s|@EVO_SERVICE_USER@|$SERVICE_USER|g" \
+    "$RTC_WAKE_SUDOERS_TEMPLATE" > "$TMP"
+if ! visudo -c -f "$TMP" >/dev/null; then
+    echo "RTC wake sudoers fragment failed visudo -c; refusing to install" >&2
+    trap - EXIT
+    exit 2
+fi
+install -m 0440 -o root -g root "$TMP" "$RTC_WAKE_SUDOERS_FILE"
+rm -f "$TMP"
+trap - EXIT
+echo "[bootstrap] installed $RTC_WAKE_WRAPPER_DST and $RTC_WAKE_SUDOERS_FILE"
+
+# ----------------------------------------------------------
 # Step 1d: /usr/share/evo-device-audio/dacs.json
 # ----------------------------------------------------------
 # The hardware.audio-config plugin embeds the catalogue at build
@@ -948,10 +987,23 @@ MDROP
     # time). Without this chown the new tenant cannot read its
     # own signing key, subject state, ledger, or persistence
     # chain. Idempotent: chowning to the same owner is a no-op.
+    #
+    # The walk stays on the filesystem that holds /var/lib/evo.
+    # USB and NAS adopts are other filesystems; a recursive
+    # chown descends into them, fails EROFS on a read-only
+    # share, and under set -e dies before asound is rendered.
+    #
+    # Mode must match StateDirectoryMode=0755 (state-dir-mode
+    # .conf). ProtectSystem=strict remounts the unit namespace
+    # read-only; systemd will only hand /var/lib/evo to User=
+    # if the host inode already matches that user and mode.
+    # A 0750 here, or a later reparent to root, forces an
+    # adjustment that returns EROFS and the unit dies
+    # 238/STATE_DIRECTORY before the binary starts.
     if [[ -d /var/lib/evo ]]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
-        chmod 0750 /var/lib/evo
-        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0750)"
+        chown_tree_same_fs /var/lib/evo "$SERVICE_USER"
+        chmod 0755 /var/lib/evo
+        echo "[bootstrap] chowned /var/lib/evo -> $SERVICE_USER:$SERVICE_USER (mode 0755, same-filesystem)"
     fi
 
 else
@@ -1462,7 +1514,10 @@ fi
 # SERVICE_USER:SERVICE_USER fallback for hosts where the
 # `audio` group does not exist.
 if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
-    install -d -m 0755 -o root -g root /var/lib/evo
+    # Parent must stay the tenant. `install -d -o root` on an
+    # existing /var/lib/evo reparents it and arms the
+    # 238/STATE_DIRECTORY path under ProtectSystem=strict.
+    install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" /var/lib/evo
     if ! install -d -m 0755 -o "$SERVICE_USER" -g audio \
             /var/lib/evo/music \
             /var/lib/evo/music/INTERNAL \
@@ -1510,6 +1565,12 @@ if [[ "${EVO_INSTALL_MUSIC_LIBRARY:-1}" != "0" ]]; then
             /var/lib/evo/plugins/stage
     fi
     echo "[bootstrap] /var/lib/evo/plugins/stage ensured (mode 0775, group $SERVICE_USER)"
+
+    # Re-assert the StateDirectory inode only. Children keep
+    # their own owners (music:audio, uploads root, plugin
+    # stage). Do not walk.
+    chown "$SERVICE_USER:$SERVICE_USER" /var/lib/evo
+    chmod 0755 /var/lib/evo
 
     # mpd's music_directory must point at /var/lib/evo/music
     # before the restart later in this script. The line is
@@ -2374,6 +2435,19 @@ EOF
     fi
 else
     echo "[bootstrap] Step 4b: EVO_INSTALL_KIOSK_LAYER=0 — skipping kiosk session install"
+fi
+
+# The kiosk layer mkdir -p's /var/lib/evo/settings/kiosk and
+# /var/lib/evo/ui as root, after chown_tree_same_fs has
+# already run. A single wipe+bootstrap (the tester path)
+# therefore leaves those trees root:root and the steward
+# cannot seed kiosk overlays (sleep_inhibit_active → journal
+# fail, installer rc=5). A second bootstrap hides it because
+# chown_tree_same_fs then sees the dirs. Tenant-own those
+# trees now. Do not walk: uploads and music keep their owners.
+if [[ -n "${SERVICE_USER:-}" ]]; then
+    chown_tenant_state_trees "$SERVICE_USER"
+    echo "[bootstrap] tenant-owned /var/lib/evo/{settings,settings/kiosk,ui} -> $SERVICE_USER (after layer installers)"
 fi
 
 echo

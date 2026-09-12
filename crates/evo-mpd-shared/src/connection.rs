@@ -379,7 +379,7 @@ impl MpdConnection {
     }
 
     /// Enable an MPD output by index, opening a fresh
-    /// `snd_pcm_t` handle. Paired with [`disable_output`] to
+    /// `snd_pcm_t` handle. Paired with [`Self::disable_output`] to
     /// cycle MPD's ALSA output so the next PCM open re-resolves
     /// `pcm.evo` against the current `/etc/asound.d/`
     /// composition.

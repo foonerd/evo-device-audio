@@ -10,22 +10,18 @@
 //! album / track lookups. This client uses only that endpoint
 //! surface, so no operator credential is ever needed.
 //!
-//! ## The live-fetch invariant (Deezer ToS)
-//!
-//! Deezer's Terms of Use permit device-side rendering of image
-//! URLs returned by the API but explicitly forbid persisting the
-//! response body. This client's contract with its callers is
-//! therefore:
+//! ## Client contract
 //!
 //! - The response type [`ArtistImageHit`] is `#[must_use]` and
-//!   does not derive `Serialize`. Callers cannot accidentally
-//!   round-trip it through a JSON cache layer.
-//! - Every call performs a fresh outbound request. There is no
-//!   client-side cache in this module.
-//! - Callers that layer their own cache MUST NOT invoke the
-//!   plugin cache's `put` path for a Deezer response. Enforced
-//!   in the cascade wiring, not the client (the client cannot
-//!   see the plugin's cache layer).
+//!   does not derive `Serialize`, so a whole response body
+//!   cannot be round-tripped through a JSON layer by accident.
+//!   Type-level hygiene, not a storage restriction.
+//! - Every call performs a fresh outbound request; this module
+//!   holds no cache of its own. Callers layer their own.
+//!
+//! Whether a caller stores the image it fetches is the
+//! operator's decision, surfaced through the device's artwork
+//! caching setting rather than decided here.
 //!
 //! ## Endpoint
 //!
@@ -98,14 +94,18 @@ pub struct ArtistImageHit {
     /// The artist's Deezer display name (echoes the resolved
     /// match, may differ subtly from the query).
     pub artist_name: String,
-    /// Highest-resolution artist image URL (`picture_xl`).
-    /// The URL itself is served from Deezer's CDN and is stable
-    /// per artist; consumers may render it inline. The JSON
-    /// response body carrying it must NOT be persisted.
+    /// Highest-resolution artist image URL (`picture_xl`),
+    /// served from Deezer's CDN. Consumers may render it inline
+    /// or fetch and store the image behind it, per the device's
+    /// artwork caching setting.
+    ///
+    /// The link is comparatively short-lived: re-derive it per
+    /// resolve rather than memoising the URL, or an expired one
+    /// serves a 404 instead of a picture.
     pub picture_xl_url: String,
     /// Additional lower-resolution image URLs Deezer returns
     /// (`picture_big`, `picture_medium`, `picture_small`). Same
-    /// live-fetch invariant applies.
+    /// short-lived-link caveat applies.
     pub picture_big_url: Option<String>,
     pub picture_medium_url: Option<String>,
     pub picture_small_url: Option<String>,

@@ -594,7 +594,7 @@ fn parse_sta_link_info(raw: &str) -> StaLinkInfo {
             info.connected = true;
         }
         if let Some(rest) = lt.strip_prefix("freq:") {
-            if let Ok(v) = rest.trim().parse::<u32>() {
+            if let Some(v) = parse_freq_mhz(rest) {
                 info.freq_mhz = Some(v);
                 info.channel = freq_to_channel(v);
                 info.band = freq_to_band(v);
@@ -602,6 +602,23 @@ fn parse_sta_link_info(raw: &str) -> StaLinkInfo {
         }
     }
     info
+}
+
+/// Whole MHz from an `iw … link` frequency field.
+///
+/// `iw` prints this as a bare integer on some releases and with a
+/// fractional part on others — the Pi's build reports
+/// `freq: 5240.0`. Parsing it as an integer therefore failed on
+/// exactly the hosts the AP most needed to follow, leaving the
+/// channel unknown on a station that was perfectly associated,
+/// and the hotspot deferred for a reason that did not exist.
+///
+/// Wi-Fi centre frequencies are whole MHz, so the fraction
+/// carries no information and is dropped rather than rounded.
+fn parse_freq_mhz(raw: &str) -> Option<u32> {
+    let t = raw.trim();
+    let whole = t.split_once('.').map(|(head, _)| head).unwrap_or(t);
+    whole.trim().parse::<u32>().ok()
 }
 
 /// Convert a centre-frequency in MHz to its NM channel number.
@@ -678,6 +695,51 @@ pub async fn sta_phy_supports_concurrent_sta_ap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sta_link_parses_a_fractional_frequency() {
+        // The Pi's iw prints `freq: 5240.0`. Parsed as an integer
+        // this failed, so a station that was plainly associated
+        // reported no channel — and the AP deferred on a radio it
+        // could have followed.
+        let raw = "Connected to a2:05:d6:d9:99:ef (on wlan0)\n\
+                   \tSSID: Guest (Lobby) Net\n\
+                   \tfreq: 5240.0\n\
+                   \tsignal: -48 dBm\n";
+        let info = parse_sta_link_info(raw);
+        assert!(info.connected);
+        assert_eq!(info.freq_mhz, Some(5240));
+        assert_eq!(info.channel, Some(48));
+        assert_eq!(info.band.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn sta_link_parses_an_integer_frequency() {
+        // The other iw build. Both must work; this is the one
+        // every existing rig was read with.
+        let raw = "Connected to a2:05:d6:d9:99:ef (on wlan0)\n\
+                   \tSSID: Guest (Lobby) Net\n\
+                   \tfreq: 2437\n";
+        let info = parse_sta_link_info(raw);
+        assert!(info.connected);
+        assert_eq!(info.freq_mhz, Some(2437));
+        assert_eq!(info.channel, Some(6));
+    }
+
+    #[test]
+    fn sta_link_reports_not_connected() {
+        let info = parse_sta_link_info("Not connected.\n");
+        assert!(!info.connected);
+        assert_eq!(info.freq_mhz, None);
+    }
+
+    #[test]
+    fn freq_mhz_ignores_junk() {
+        assert_eq!(parse_freq_mhz(" 5240.0 "), Some(5240));
+        assert_eq!(parse_freq_mhz("2437"), Some(2437));
+        assert_eq!(parse_freq_mhz(""), None);
+        assert_eq!(parse_freq_mhz("not-a-number"), None);
+    }
 
     const PI5_PHY_INFO: &str = r#"
 Wiphy phy0

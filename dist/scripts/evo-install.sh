@@ -51,7 +51,8 @@
 # Channel selection:
 #
 #   EVO_BUNDLE_URL_BASE selects the artefact source. The
-#   default points at the project's STABLE artefact channel.
+#   default is the artefacts GitHub Release Latest asset
+#   (the first-boot tarball is not a git blob).
 #   Override the value to point at a developer-side HTTP
 #   server hosting an unreleased bundle during release-cut
 #   preparation.
@@ -64,6 +65,7 @@
 #   sudo bash evo-install.sh --mode=reinstall
 #   sudo bash evo-install.sh --mode=wipe-config
 #   sudo bash evo-install.sh --mode=wipe-user-data
+#   sudo bash evo-install.sh --piece evo-ui-shell --version 0.1.13
 #
 # Env tunables (apply across modes):
 #   EVO_BUNDLE_URL_BASE         Channel-base URL.
@@ -111,10 +113,12 @@ MCowBQYDK2VwAyEAvJqIhluihUhLY435rJZnIjskDS9affTKSDUIYVIjVE0=
 EVO_BUNDLE_TRUST_ROOT_PEM="${EVO_BUNDLE_TRUST_ROOT_PEM:-${EVO_BUNDLE_TRUST_ROOT_PEM_DEFAULT}}"
 
 # -------- Defaults --------
-# Default URL points at the public artefact channel for the
-# stable distribution. Set EVO_BUNDLE_URL_BASE to override
-# (e.g. point at a developer-side HTTP server hosting an
-# unreleased bundle during release-cut preparation).
+# Default URL is the artefacts GitHub Release Latest asset.
+# The first-boot tarball is ~110 MB; it is not a git blob
+# (GitHub rejects files over 100 MB). Pin a cut with
+# EVO_BUNDLE_URL_BASE=.../releases/download/<tag>.
+# Override to point at a developer-side HTTP server during
+# release-cut preparation.
 EVO_BUNDLE_URL_BASE="${EVO_BUNDLE_URL_BASE:-https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download}"
 EVO_BUNDLE_VERSION="${EVO_BUNDLE_VERSION:-0.1.13}"
 EVO_INSTALL_MUSIC_LIBRARY="${EVO_INSTALL_MUSIC_LIBRARY:-1}"
@@ -123,6 +127,8 @@ EVO_ACCEPTANCE_SIGNING_KEY="${EVO_ACCEPTANCE_SIGNING_KEY:-}"
 
 # -------- Argument parsing --------
 MODE="install"
+PIECE=""
+PIECE_VERSION=""
 # Flags relayed to bootstrap.sh's placement primitive. evo-
 # install.sh delegates ALL /etc placement (asound.conf,
 # sudoers, systemd drop-ins, mpd include, plugins.d defaults,
@@ -154,6 +160,14 @@ while [[ $# -gt 0 ]]; do
             MODE="$2"
             shift 2
             ;;
+        --piece)
+            PIECE="$2"; shift 2 ;;
+        --piece=*)
+            PIECE="${1#--piece=}"; shift ;;
+        --version)
+            PIECE_VERSION="$2"; shift 2 ;;
+        --version=*)
+            PIECE_VERSION="${1#--version=}"; shift ;;
         --card)
             EVO_INSTALL_AUDIO_CARD="$2" ; shift 2 ;;
         --card=*)
@@ -193,6 +207,15 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "${PIECE}" ]]; then
+    if [[ -z "${PIECE_VERSION}" ]]; then
+        echo "FAIL: --piece requires --version" >&2
+        exit 1
+    fi
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    exec bash "${SCRIPT_DIR}/apply-piece.sh" --piece "${PIECE}" --version "${PIECE_VERSION}"
+fi
 
 case "${MODE}" in
     install|reinstall|wipe-config|wipe-user-data) ;;
@@ -710,9 +733,23 @@ extract_bundle() {
 }
 
 # -------- Music library hash discipline --------
+# Preserve-music is a local-library contract. USB volumes and
+# NAS/SMB/NFS adopts under music/USB and music/NAS are other
+# filesystems: wipe-config does not write them, and hashing
+# them makes MUSIC_HASH_PRESERVED a race against the NAS.
+# `find -xdev` keeps the snapshot on the filesystem that
+# holds the music root (INTERNAL and any local files there).
 snapshot_music_hashes() {
-    if [[ -d /var/lib/evo/music ]]; then
-        find /var/lib/evo/music -type f -print0 2>/dev/null \
+    local root="$1"
+    if [[ -z "${root}" ]]; then
+        echo "no_music_library"
+        return 0
+    fi
+    if [[ -d "${root}" ]]; then
+        local count
+        count="$(find "${root}" -xdev -type f 2>/dev/null | wc -l)"
+        printf '  local music files (this filesystem only): %s\n' "${count}" >&2
+        find "${root}" -xdev -type f -print0 2>/dev/null \
             | sort -z | xargs -0 -r sha256sum 2>/dev/null \
             | sha256sum | awk '{print $1}'
     else
@@ -1078,11 +1115,36 @@ invoke_bootstrap_placement() {
         args+=(--multiroom-group-member-addresses "${MULTIROOM_GROUP_MEMBER_ADDRESSES}")
     fi
     # EVO_DIST_DIR points bootstrap.sh at the bundle-staged tree
-    # instead of its own script-relative dist/ parent. Subprocess
-    # exit status propagates back via `set -e` — bootstrap.sh
-    # exits 2 on placeholder-residue or visudo failure; the
-    # install primitive surfaces that to the operator.
-    EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}"
+    # instead of its own script-relative dist/ parent.
+    # bootstrap.sh exits 2 on placeholder-residue, visudo
+    # failure, or no detectable playback card; the install
+    # primitive surfaces that to the operator.
+    local rc=0
+    EVO_DIST_DIR="${STAGE_DIR}/dist" bash "${bootstrap_path}" "${args[@]}" \
+        || rc=$?
+    if (( rc != 0 )); then
+        # install_main_systemd_unit ran immediately before this
+        # and placed the framework reference unit, which carries
+        # no concrete ExecStart on purpose — the distribution's
+        # exec-start.conf drop-in supplies it. bootstrap.sh
+        # writes that drop-in, so an abort before it leaves a
+        # unit systemd refuses to load, and every later
+        # `systemctl` on the box reports bad-setting instead of
+        # the real reason the install stopped.
+        #
+        # Take the half-placed unit back out. The decision is
+        # in lib/ so the regression suite can drive it against a
+        # temp root; see that file for why the drop-in is the
+        # discriminator.
+        # shellcheck source=lib/unwind-half-placed-unit.sh
+        . "${STAGE_DIR}/dist/scripts/lib/unwind-half-placed-unit.sh"
+        if unwind_half_placed_unit ""; then
+            systemctl daemon-reload || true
+            echo "  removed half-placed evo.service (no ExecStart drop-in;" >&2
+            echo "  leaving it would report bad-setting instead of this error)" >&2
+        fi
+        return "$rc"
+    fi
 }
 
 purge_evo_mpd_includes() {
@@ -1111,10 +1173,63 @@ purge_evo_mpd_includes() {
     sed -i -e ':a' -e '/^$/{$d;N;ba' -e '}' /etc/mpd.conf
 }
 
+unit_exists() {
+    systemctl cat "$1" >/dev/null 2>&1
+}
+
+wait_for_local_shell() {
+    # evo-ui binds :80/:443. The kiosk unit's ExecStartPre
+    # waits on this URL; starting kiosk before the shell
+    # answers leaves glass on a connection-refused page.
+    local deadline code
+    deadline=$(( $(date +%s) + 30 ))
+    while [[ $(date +%s) -lt ${deadline} ]]; do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 1 http://127.0.0.1/ 2>/dev/null || true)"
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            return 0
+        fi
+        code="$(curl -skS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 1 https://127.0.0.1/ 2>/dev/null || true)"
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 start_steward() {
     systemctl daemon-reload
     systemctl enable evo.service >/dev/null 2>&1 || true
     systemctl restart evo.service
+}
+
+# stop_prior_steward stops evo-ui and evo-kiosk so a wipe
+# cannot 209/STDOUT-loop on a missing log dir. The other
+# half: after step 7 has placed the units and trees, start
+# them again in dependency order. Without this, wipe-config
+# reports rc=0 and hands back a box with no browser and no
+# glass — both units stay enabled, so only a reboot hid it.
+start_operator_surface() {
+    start_steward
+    if unit_exists evo-ui.service; then
+        systemctl enable evo-ui.service >/dev/null 2>&1 || true
+        systemctl restart evo-ui.service
+        echo "  started evo-ui.service"
+        if ! wait_for_local_shell; then
+            echo "  WARN: evo-ui started but http://127.0.0.1/ did not answer yet" >&2
+        fi
+    else
+        echo "  evo-ui.service absent — no browser session to start"
+    fi
+    if unit_exists evo-kiosk.service; then
+        systemctl enable evo-kiosk.service >/dev/null 2>&1 || true
+        systemctl restart evo-kiosk.service
+        echo "  started evo-kiosk.service"
+    else
+        echo "  evo-kiosk.service absent — no glass session to start"
+    fi
 }
 
 # -------- Post-condition verification --------
@@ -1127,11 +1242,21 @@ CATALOGUE_SOURCE=""
 
 JOURNAL_FAIL_HITS=""
 JOURNAL_FAIL_COUNT=0
+# Operator surface. wipe-config used to leave these stopped
+# and still exit 0. Values: ok / inactive / absent (units)
+# and ok / refused / skipped (shell fetch).
+EVO_UI_CHECK="not_run"
+EVO_KIOSK_CHECK="not_run"
+SHELL_FETCH="not_run"
 # Active PCM playback probe state. Set by verify_pcm_playback().
 # Values: not_run / ok / busy / fail / skipped_no_aplay /
-# skipped_no_probe_wav. Only `fail` participates in POST_OK
-# gating; `busy` is evidence the chain works (MPD has the
-# device).
+# skipped_no_probe_wav. No value gates POST_OK — the probe is
+# evidence, not a verdict on the install. `busy` means the chain
+# works and MPD already holds the device; `fail` means the card
+# written into asound.conf will not open for playback right
+# now, which is an audio-output problem the operator resolves by
+# choosing their listening device, not a reason to leave them
+# without a running system to choose it on.
 PCM_PLAYBACK_PROBE="not_run"
 
 # Count functional plugin bundles staged in the extracted
@@ -1149,6 +1274,143 @@ count_expected_plugins_from_stage() {
         count=$((count + 1))
     done
     echo "${count}"
+}
+
+# mpd journal lines that are real install defects.
+#
+# Reads mpd journal text on stdin, writes the offending lines on
+# stdout. Empty output means nothing in mpd's journal is an
+# install failure. The count of those lines is what the
+# post-condition gate fails on.
+#
+# NAMED DEFECTS, not "anything saying fail". This predicate used
+# to be the inverse: match any line containing `fail`, then
+# subtract a whitelist of two known-benign first-boot lines. That
+# shape was wrong in both directions.
+#
+#   False FAIL. `exception: Failed to open audio output` matched.
+#   Whether audio opened already has exactly one owner —
+#   verify_pcm_playback, which records it as evidence and
+#   deliberately does not fail the install, because the listening
+#   device is chosen in Settings -> System -> Audio and an
+#   HDMI-only or Pulse-held host is installed correctly. Two
+#   evaluators, one fact, opposite verdicts: a live VM
+#   wipe-config on 2026-09-11 came out pcm.evo=ok, 19/19
+#   admitted, music hash preserved, all services active, and
+#   exited 5 on that single line — sending an operator toward
+#   --mode=reinstall on a machine that was fine.
+#
+#   False PASS. The comment above the old predicate claimed
+#   `Database corrupted` and `Config error` still counted. Read
+#   them: neither string contains `fail`. They never matched, so
+#   two of the four named defects were invisible to the gate the
+#   whole time.
+#
+# So the predicate names what a defect IS. Adding a defect means
+# adding it here, deliberately; it does not mean widening a
+# whitelist until the gate means nothing.
+#
+# TOKENS COME FROM THE BINARY, NOT FROM PROSE. Every string
+# below was read out of `strings /usr/bin/mpd` on a 0.24.4 host.
+# The first version of this predicate was filled from the comment
+# that preceded it, which named `Bind failed` and `Config error`.
+# Neither is in the binary. MPD cannot emit them, so a genuine
+# bind failure — which the retired fail(ed|ure)? scan WOULD have
+# caught — sailed through as a PASS. A false PASS hides a broken
+# install; it is the worse half of the same bug.
+#
+#   Database corrupted                - database unusable
+#   exception: Failed to bind socket  - could not take the socket
+#   exception: Failed to bind to '<addr>'
+#                                     - could not take the address
+#   unrecognized parameter: <name>    - mpd.conf has a bad setting
+#   Error in <file> line <n>          - mpd.conf failed to parse
+#   configuration file does not exist: /etc/mpd.conf
+#                                     - the distribution's config
+#                                       pin is absent
+#   Failed to listen on socket        - no socket to serve on
+#   Failed to listen on *:<port>      - no TCP port to serve on
+#   Failed to listen on <addr> (line <n>)
+#                                     - a configured listener
+#                                       address could not be taken
+#   Failed to open "/var/lib/evo/music"
+#                                     - the library path the
+#                          distribution pins did not open. Keyed
+#                          on the PATH, not the phrase: mpd words
+#                          a missing music directory exactly as it
+#                          words the absent tag_cache/state files
+#                          on first boot, which are normal.
+#
+# Deliberately NOT counted, and present in the same binary:
+#
+#   bind to '<a>' failed (continuing anyway, because binding to
+#   '<b>' succeeded)          - mpd bound elsewhere and runs
+#   Failed to listen on <x> (not fatal)
+#                             - mpd says so itself
+#   Default TCP listener setup failed, but this is okay because
+#   we have a $XDG_RUNTIME_DIR listener
+#                             - mpd says so itself
+#
+# THE TOKEN IS THE OUTER FACT, NOT THE INNER THROW. MPD composes
+# benign lines that quote a fatal-sounding exception inside them:
+#
+#   bind to '<a>' failed (continuing anyway, because binding to
+#   '<b>' succeeded): Failed to bind socket: Address already in use
+#   Decoder plugin "wildmidi" is unavailable: configuration file
+#   does not exist: /etc/timidity/timidity.cfg
+#   Input plugin "<x>" is unavailable: <same shape>
+#
+# The first is the ordinary dual-stack case on Linux with
+# bindv6only=0 — MPD bound v4, could not also bind v6, says so,
+# and serves. The second is an optional decoder declining because
+# ITS OWN config is missing; nothing about evo is wrong. A bare
+# `Failed to bind socket` or `configuration file does not exist:`
+# matches inside both, so the naive tokens turned two normal
+# startup lines into a failed install.
+#
+# So: the bind tokens are anchored to `exception: `, which is how
+# MPD prefixes the line's OWN uncaught exception — inside a
+# composed line the throw is preceded by `): `, not by
+# `exception: `. And the config token is keyed to the path the
+# distribution pins, /etc/mpd.conf, so another component's config
+# cannot answer for ours. Neither is a subtraction.
+#
+# Residual, stated rather than hidden: anchoring on `exception: `
+# means a fatal bind logged WITHOUT that prefix would not count.
+# Every fatal form observed on 0.24.4 carries it, and the
+# alternative — matching the bare token and subtracting the
+# composed lines — is the whitelist shape this function exists to
+# avoid.
+#
+# The listen family is why this is an allowlist of SHAPES rather
+# than of prefixes. `Failed to listen on` alone matches the fatal
+# three AND the benign one, which would force a subtraction — a
+# whitelist wearing a different hat, and the exact shape retired
+# from this function. Each fatal listen shape is named tightly
+# enough that the `(not fatal)` line cannot satisfy any of them:
+# the literal `socket`, the literal `*:`, and a trailing
+# `(line <n>)` are all absent from it.
+#
+# Matching is case-sensitive: these are fixed strings in the
+# binary, and exactness is what keeps the two non-fatal
+# neighbours above out.
+#
+# Extracted so the test suite evaluates THIS function rather than
+# a copy of the predicate — dist/scripts/tests/mpd-journal-classifier.test.sh
+# pulls it out of this shipped file.
+mpd_journal_defects() {
+    grep -E \
+        -e 'Database corrupted' \
+        -e 'exception: Failed to bind socket' \
+        -e "exception: Failed to bind to '" \
+        -e 'unrecognized parameter:' \
+        -e 'Error in .+ line [0-9]' \
+        -e 'configuration file does not exist: /etc/mpd\.conf' \
+        -e 'Failed to listen on socket' \
+        -e 'Failed to listen on \*:' \
+        -e 'Failed to listen on .+ \(line [0-9]+\)' \
+        -e 'Failed to open "/var/lib/evo/music"' \
+        || true
 }
 
 verify_post_condition() {
@@ -1213,34 +1475,27 @@ verify_post_condition() {
     NOT_DECLARED=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -c 'not declared in the catalogue' || true)
     CATALOGUE_SOURCE=$(journalctl -u evo --since "60 seconds ago" --no-pager -o json 2>/dev/null | grep 'catalogue loaded' 2>/dev/null | grep -oE '"F_SOURCE":"[a-z]+"' 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//' || true)
 
-    # Strict: any line containing "fail" (case-insensitive)
-    # in the evo journal, OR in the journal of any service
-    # the install touched (mpd), is treated as install
-    # failure. The operator's engineering bar: zero "fail"
-    # across every consumer of the install's output.
+    # Two journals, two owners.
     #
-    # Calibrated exclusions — narrow whitelist of documented
-    # baseline mpd first-boot behaviour that is NOT a failure:
+    # evo: any line matching fail(ed|ure)? is an install failure.
+    # The steward is ours; it does not log that word in normal
+    # operation, so the strict scan is honest there.
     #
-    #   exception: Failed to open "/var/lib/mpd/tag_cache": No such file or directory
-    #   exception: Failed to open "/var/lib/mpd/state":     No such file or directory
+    # mpd: NOT the same rule. mpd is a third-party daemon whose
+    # normal first boot says `fail` about things that are not
+    # failures, and whose real defects mostly do not say it at
+    # all. `mpd_journal_defects` names the fatal strings instead;
+    # see the comment on that function for why each one is there
+    # and where it was read from.
     #
-    # mpd's `db_file` + `state_file` configuration references
-    # paths that do not yet exist on a fresh install; mpd logs
-    # these as `exception:` at startup, then creates the files
-    # itself on the first `update` and next graceful stop
-    # respectively. Every mpd deployment on Debian/Ubuntu with
-    # a fresh `/var/lib/mpd` logs exactly these two lines once.
-    # They are not evo-specific. Any OTHER `fail(ed|ure)?` line
-    # from mpd — including `Database corrupted`, `Bind failed`,
-    # `Config error`, missing music directory, etc. — still
-    # counts as a real journal-fail hit.
+    # Whether audio opened is NOT decided here. That fact has one
+    # owner — verify_pcm_playback, below — which records it as
+    # evidence and does not fail the install, because the
+    # listening device is chosen in Settings -> System -> Audio.
     local fail_evo fail_mpd
     fail_evo=$(journalctl -u evo --since "60 seconds ago" --no-pager 2>/dev/null | grep -iE 'fail(ed|ure)?\b' || true)
     fail_mpd=$(journalctl -u mpd --since "60 seconds ago" --no-pager 2>/dev/null \
-        | grep -iE 'fail(ed|ure)?\b' \
-        | grep -vE 'exception: Failed to open "/var/lib/mpd/(tag_cache|state)": No such file or directory' \
-        || true)
+        | mpd_journal_defects)
     JOURNAL_FAIL_HITS="${fail_evo}"
     if [[ -n "${fail_mpd}" ]]; then
         JOURNAL_FAIL_HITS="${JOURNAL_FAIL_HITS}${JOURNAL_FAIL_HITS:+$'\n'}${fail_mpd}"
@@ -1255,6 +1510,55 @@ verify_post_condition() {
     verify_smb_netbios_matches_hostname
     verify_lan_discovery_daemons_up
     verify_storage_usb_provisioning
+    verify_operator_surface
+}
+
+# Glass and browser session. The install is not complete if
+# the steward is up and the operator cannot open the shell.
+# Absent units (a headless compose without those layers) are
+# not a failure. Present-but-inactive is.
+verify_operator_surface() {
+    local code=""
+
+    if unit_exists evo-ui.service; then
+        if systemctl is-active evo-ui >/dev/null 2>&1; then
+            EVO_UI_CHECK="ok"
+        else
+            EVO_UI_CHECK="inactive"
+        fi
+        code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 2 http://127.0.0.1/ 2>/dev/null || true)"
+        if [[ ! "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            code="$(curl -skS -o /dev/null -w '%{http_code}' \
+                --connect-timeout 2 https://127.0.0.1/ 2>/dev/null || true)"
+        fi
+        if [[ "${code}" =~ ^[23][0-9][0-9]$ ]]; then
+            SHELL_FETCH="ok"
+        else
+            SHELL_FETCH="refused"
+        fi
+    else
+        EVO_UI_CHECK="absent"
+        SHELL_FETCH="skipped"
+    fi
+
+    if unit_exists evo-kiosk.service; then
+        local deadline
+        deadline=$(( $(date +%s) + 30 ))
+        while [[ $(date +%s) -lt ${deadline} ]]; do
+            if systemctl is-active evo-kiosk >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+        if systemctl is-active evo-kiosk >/dev/null 2>&1; then
+            EVO_KIOSK_CHECK="ok"
+        else
+            EVO_KIOSK_CHECK="inactive"
+        fi
+    else
+        EVO_KIOSK_CHECK="absent"
+    fi
 }
 
 # Storage-USB provisioning invariant: bootstrap Step 1g must
@@ -1435,6 +1739,29 @@ verify_smb_netbios_matches_hostname() {
     fi
 }
 
+# Path the rendered ALSA config landed at. bootstrap.sh owns
+# writing it; the post-condition only reads it back.
+ASOUND_CONF_PATH_POST="/etc/asound.conf"
+
+# The card that was actually written, read back from the
+# rendered asound.conf rather than re-derived. If the probe is
+# going to tell the operator their output does not open, it has
+# to name the card the system is really pointed at — a second
+# detection run here could disagree with what bootstrap wrote
+# and send them chasing the wrong device. Falls back to an
+# explicit --card override, then to empty.
+chosen_audio_card() {
+    local card=""
+    if [[ -r "${ASOUND_CONF_PATH_POST}" ]]; then
+        card="$(awk -F'"' '/^[[:space:]]*card[[:space:]]+"/ { print $2; exit }' \
+            "${ASOUND_CONF_PATH_POST}" 2>/dev/null)"
+    fi
+    if [[ -z "${card}" ]]; then
+        card="${EVO_INSTALL_AUDIO_CARD}"
+    fi
+    printf '%s' "${card}"
+}
+
 # Active PCM playback-path probe at post-condition time. The
 # bootstrap-tier probe runs against pcm.evo before the steward
 # starts; this one runs AFTER the steward + plugin admission +
@@ -1470,8 +1797,21 @@ verify_pcm_playback() {
         PCM_PLAYBACK_PROBE="busy"
     else
         PCM_PLAYBACK_PROBE="fail"
-        echo "FAIL: pcm.evo playback probe (aplay --dump-hw-params -D evo) failed:" >&2
-        printf '%s\n' "${probe_out}" | head -5 | sed 's/^/  /' >&2
+        local chosen_card
+        chosen_card="$(chosen_audio_card)"
+        echo "WARN: pcm.evo did not open for playback on this host." >&2
+        echo "      card written into ${ASOUND_CONF_PATH_POST}: ${chosen_card:-<unreadable>}" >&2
+        printf '%s\n' "${probe_out}" | head -5 | sed 's/^/      /' >&2
+        echo "      playback devices this host reports:" >&2
+        if command -v aplay >/dev/null 2>&1; then
+            # Same locale rule as the detector: parse and show
+            # the C-locale output, not the host's translation.
+            LC_ALL=C aplay -l 2>&1 | sed 's/^/        /' >&2
+        else
+            echo "        (aplay not on PATH)" >&2
+        fi
+        echo "      The install continues. Choose the listening device in" >&2
+        echo "      Settings → System → Audio, or re-run with --card <NAME>." >&2
     fi
 }
 
@@ -1482,7 +1822,7 @@ MUSIC_HASH_PRESERVED="true"
 MUSIC_HASH_CHANGED="false"
 
 verify_music_hashes_preserved() {
-    MUSIC_HASH_POST="$(snapshot_music_hashes)"
+    MUSIC_HASH_POST="$(snapshot_music_hashes /var/lib/evo/music)"
     if [[ "${MUSIC_HASH_PRE}" == "${MUSIC_HASH_POST}" ]]; then
         MUSIC_HASH_PRESERVED="true"
     else
@@ -1611,7 +1951,7 @@ case "${MODE}" in
         echo "[4/7] stop prior steward ..." ; stop_prior_steward    ; echo "  ok"
         echo "[5/7] /opt/evo (binaries + plugins + catalogue) ..." ; place_opt_evo  ; echo "  ok"
         echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/7] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[7/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         ;;
     reinstall)
         echo "[1/7] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
@@ -1621,11 +1961,11 @@ case "${MODE}" in
         wipe_full ; echo "  ok"
         echo "[5/7] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
         echo "[6/7] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[7/7] start + verify ..."  ; start_steward ; verify_post_condition
+        echo "[7/7] start + verify ..."  ; start_operator_surface ; verify_post_condition
         MUSIC_HASH_CHANGED="true"
         ;;
     wipe-config)
-        echo "[1/8] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[1/8] snapshot music library hashes (local filesystem; USB/NAS mounts excluded) ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes /var/lib/evo/music)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
         echo "[2/8] fetch bundle ..."    ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
         echo "[3/8] extract bundle ..."  ; extract_bundle          ; echo "  ok"
         echo "[4/8] system packages (baseline + per-plugin prerequisites, parity-verified) ..." ; ensure_system_packages ; echo "  ok"
@@ -1633,16 +1973,16 @@ case "${MODE}" in
         wipe_config ; echo "  ok"
         echo "[6/8] /opt/evo ..."        ; place_opt_evo           ; echo "  ok"
         echo "[7/8] /etc/evo + sudoers + drop-ins + trust roots + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[8/8] start + verify + music library byte-equal ..."  ; start_steward ; verify_post_condition ; verify_music_hashes_preserved
+        echo "[8/8] start + verify + music library byte-equal ..."  ; start_operator_surface ; verify_post_condition ; verify_music_hashes_preserved
         ;;
     wipe-user-data)
-        echo "[1/7] snapshot music library hashes ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
+        echo "[1/7] snapshot music library hashes (local filesystem; USB/NAS mounts excluded) ..." ; MUSIC_HASH_PRE="$(snapshot_music_hashes /var/lib/evo/music)" ; echo "  ok (sha256: ${MUSIC_HASH_PRE})"
         echo "[2/7] fetch bundle (for /etc/evo baseline) ..." ; fetch_and_verify_bundle ; echo "  ok (sha256: ${BUNDLE_SHA256})"
         echo "[3/7] extract bundle ..."   ; extract_bundle          ; echo "  ok"
         echo "[4/7] USER-DATA VACUUM (operator-generated state, /etc/evo overrides reset; binaries + music preserved) ..."
         wipe_user_data ; echo "  ok"
         echo "[5/7] /etc/evo baseline (re-apply) + drop-ins + sudoers + music-library boilerplate ..." ; install_main_systemd_unit ; invoke_bootstrap_placement ; echo "  ok"
-        echo "[6/7] start + verify ..."   ; start_steward ; verify_post_condition
+        echo "[6/7] start + verify ..."   ; start_operator_surface ; verify_post_condition
         echo "[7/7] verify music library byte-equal ..." ; verify_music_hashes_preserved
         ;;
 esac
@@ -1655,6 +1995,9 @@ echo "  not-declared warnings: ${NOT_DECLARED}"
 echo "  catalogue source:      ${CATALOGUE_SOURCE:-unknown}"
 echo "  journal fail hits:     ${JOURNAL_FAIL_COUNT}"
 echo "  pcm.evo playback:      ${PCM_PLAYBACK_PROBE}"
+echo "  evo-ui:                ${EVO_UI_CHECK}"
+echo "  evo-kiosk:             ${EVO_KIOSK_CHECK}"
+echo "  shell fetch:           ${SHELL_FETCH}"
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     echo "  music library hash:    ${MUSIC_HASH_PRESERVED} (pre=${MUSIC_HASH_PRE} post=${MUSIC_HASH_POST})"
 fi
@@ -1677,14 +2020,25 @@ if [[ "${PLUGINS_ADMITTED}" -lt "${PLUGINS_EXPECTED}" ]]; then POST_OK=0; fi
 if [[ "${ADMISSION_FAILURES}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${NOT_DECLARED}" -ne 0 ]]; then POST_OK=0; fi
 if [[ "${JOURNAL_FAIL_COUNT}" -gt 0 ]]; then POST_OK=0; fi
-# The PCM playback-path probe is the dedicated catch for the
-# regression class that the old gate missed: a placement that
-# leaves pcm.evo unopenable for playback while the steward +
-# plugin admission look healthy. `fail` is the only state that
-# breaks the gate; `busy` is positive evidence (MPD has the
-# device); the `skipped_*` states are documented gaps the
-# evidence record carries forward.
-if [[ "${PCM_PLAYBACK_PROBE}" == "fail" ]]; then POST_OK=0; fi
+# The PCM playback-path probe is evidence, not a gate. It was
+# a gate, and it cost a working install: a box whose only
+# enumerated output is HDMI can have the steward active and
+# every declared plugin admitted, and still not open pcm.evo —
+# so the operator got a FAIL banner and a pointer back to curl
+# for a machine that was, in fact, installed and running. The
+# listening device is an operator choice made in Settings →
+# System → Audio; the install's job is to leave them a system
+# on which to make it.
+#
+# What still fails the primitive is unchanged and sits above and
+# below this line: a steward that is not active, short or failed
+# admission, journal failures, a netbios mismatch, degraded LAN
+# discovery, degraded USB provisioning. Those are the install
+# not having worked. A DAC that is not plugged in is not.
+#
+# The probe's verdict rides the evidence record either way, and
+# `fail` prints a WARN naming the card and what the host does
+# report — see verify_pcm_playback.
 # LAN-identity invariant. `mismatch` is a wire-visible defect
 # (the fleet would collide on `netbios name = EvoDevice` or on
 # any other stale value). The `skipped_*` states name a
@@ -1706,6 +2060,12 @@ if [[ "${LAN_DISCOVERY_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
 # the install so the deploy cannot silently declare success on
 # a rig where the block-storage privilege path is broken.
 if [[ "${STORAGE_USB_PROVISIONING_CHECK:-unknown}" == "degraded" ]]; then POST_OK=0; fi
+# Glass and browser. A present unit that is not active, or a
+# shell that refuses, is the install handing back a box the
+# operator cannot use. Absent units are a headless compose.
+if [[ "${EVO_UI_CHECK:-absent}" == "inactive" ]]; then POST_OK=0; fi
+if [[ "${SHELL_FETCH:-skipped}" == "refused" ]]; then POST_OK=0; fi
+if [[ "${EVO_KIOSK_CHECK:-absent}" == "inactive" ]]; then POST_OK=0; fi
 if [[ "${MODE}" == "wipe-config" || "${MODE}" == "wipe-user-data" ]]; then
     if [[ "${MUSIC_HASH_PRESERVED}" != "true" ]]; then POST_OK=0; fi
 fi

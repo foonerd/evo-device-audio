@@ -13,7 +13,7 @@
 //!
 //! - Welcome banner on connect: `OK MPD <major>.<minor>.<patch>\n`.
 //! - Commands: `<name>[ "<arg>"[ "<arg>"...]]\n`, with argument
-//!   quoting per [`encode_argument`].
+//!   quoting per `encode_argument`.
 //! - Responses: a sequence of `<Key>: <value>\n` lines followed by
 //!   a terminator, either `OK\n` for success or
 //!   `ACK [<code>@<cmd_list_num>] {<command>} <message>\n` for

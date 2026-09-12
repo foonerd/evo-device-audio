@@ -133,18 +133,24 @@ time per plugin instance) and follows this sequence:
 4. **Wi-Fi role branch**:
    - `Disabled` — bring STA and hotspot down; remove the virtual
      AP vif if it exists on a shared PHY.
-   - `Sta` — pre-tear hotspot + STA profile (avoids brcmfmac AP
-     channel pinning); attempt STA association; if PHY supports
-     concurrent `managed + AP`, create the `ap0` virtual vif via
-     `iw dev <sta> interface add ap0 type __ap`; adopt the STA's
-     channel + band for the AP when same-PHY; ensure the hotspot
-     profile; attempt `connection up` with retries; on retry
-     exhaustion attempt critical recovery (see below);
-     restore-after-hotspot on shared radio.
+   - `Sta` — empty `sta_ssid` is Forget-STA only: purge the STA
+     profile + PSK. If `fallback.hotspot_enabled` is off, bring
+     the hotspot down and stop. If it is on, do **not** return
+     — the hotspot tail below still runs (AP name/enable with
+     no saved STA). Non-empty SSID: pre-tear hotspot + STA
+     profile (avoids brcmfmac AP channel pinning); attempt STA
+     association; if PHY supports concurrent `managed + AP`,
+     create the `ap0` virtual vif via `iw dev <sta> interface
+     add ap0 type __ap`; adopt the STA's channel + band for the
+     AP when same-PHY; ensure the hotspot profile (`ensure_wifi_ap`
+     already `connection up` with retries). Do **not** `connection
+     up` the hotspot a second time — that is `new-activation`,
+     AP-DISABLED, brcmf `-52`, then wpa AP-scan. Restore-after-
+     hotspot on shared radio only when a STA SSID is still declared.
    - `Ap` — bring STA down; ensure the hotspot profile on the AP
-     interface.
-5. **Hotspot connection up with retries**: bounded retry loop
-   around `nmcli connection up <hotspot>`. On exhaustion + no
+     interface (one `connection up`).
+5. **Hotspot connection up with retries**: lives inside
+   `ensure_wifi_ap` only. One raise per apply. On exhaustion + no
    Ethernet carrier, the open critical-recovery path runs.
 6. **Critical open hotspot recovery**: when AP `connection up`
    fails AND `intent.ethernet.enabled && !ethernet_carrier_up`,
@@ -436,8 +442,8 @@ Single-claimant respondent on `networking.link`. Verbs:
 
 | Request type | Read/write | Returns |
 |--------------|------------|---------|
-| `network.nm.status` | read | NM device table + active connections + connectivity + captive-portal phase + radio state |
-| `network.nm.scan` | read | Wi-Fi scan rows + STA candidates + cache hit flag |
+| `network.nm.status` | read | NM device table + active connections + connectivity + captive-portal phase + radio state. Does **not** scan. |
+| `network.nm.scan` | read | Wi-Fi scan rows + STA candidates + cache hit flag. STA iface only — never `ap*` / `p2p-dev-*`. |
 | `network.nm.intent.get` | read | Current persisted `NetworkIntent` + PSK-configured flags |
 | `network.nm.intent.set` | write | Persists a new intent + optional PSKs; optional immediate apply |
 | `network.nm.intent.apply` | write | Replays the apply pipeline; returns the steps + ok flag |

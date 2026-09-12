@@ -23,7 +23,7 @@
 //! ## Operator configuration
 //!
 //! The schema, defaults, validation rules, and error hierarchy
-//! live in the [`config`] module. In brief:
+//! live in the `config` module. In brief:
 //!
 //! ```toml
 //! [endpoint]
@@ -61,7 +61,7 @@
 //! announcer errors are logged but do not disrupt playback. A
 //! song whose `Album` tag is missing or empty produces only a
 //! track subject (no album, no relation). See the
-//! [`playback_supervisor::subject_emitter`] module for details.
+//! `playback_supervisor::subject_emitter` module for details.
 //!
 //! ## Course-correction payload encoding
 //!
@@ -71,7 +71,7 @@
 //!
 //! | `correction_type` | payload              | maps to                     |
 //! |-------------------|----------------------|-----------------------------|
-//! | `play`            | empty                | [`PlaybackCommand::Play`]   |
+//! | `play`            | empty                | `PlaybackCommand::Play`     |
 //! | `play`            | `"3"` (u32)          | `PlayPosition(3)`           |
 //! | `pause`           | `"1"` / `"true"`     | `Pause(true)`               |
 //! | `pause`           | `"0"` / `"false"`   | `Pause(false)`              |
@@ -383,12 +383,12 @@ struct TrackedCustody {
 /// `127.0.0.1:6600`, default timeouts, no subject emitter).
 /// [`Plugin::load`] replaces the defaults with values from
 /// [`LoadContext::config`] if the operator has supplied a config
-/// file, and populates the [`SubjectEmitter`] from the load
+/// file, and populates the `SubjectEmitter` from the load
 /// context's announcer handles. Tests may also use
-/// [`MpdPlaybackPlugin::with_endpoint`] to construct a plugin
+/// `MpdPlaybackPlugin::with_endpoint` to construct a plugin
 /// pointing at a specific endpoint without going through the
-/// `load` path; such tests set [`Self::subject_emitter`]
-/// directly (typically to [`SubjectEmitter::null`]) before
+/// `load` path; such tests set `Self::subject_emitter`
+/// directly (typically to `SubjectEmitter::null`) before
 /// exercising custody verbs.
 pub struct MpdPlaybackPlugin {
     loaded: bool,

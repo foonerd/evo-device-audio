@@ -93,7 +93,7 @@ pub enum CardKind {
     /// `Realtek ALC650`, `Sigmatel STAC9750`) is exposed under
     /// `/proc/asound/cardN/codec97#N/ac97#0-0` — distinct from
     /// HDA's `codec#N` files in path + format. Operator-facing
-    /// classification is [`OutputClass::Analog`] (AC97 is an
+    /// classification is `OutputClass::Analog` (AC97 is an
     /// analog-output bus by design). Detection is presence-
     /// driven: any card with a `codec97#N` directory in its
     /// procfs node classifies AC97 regardless of the driver
@@ -104,7 +104,7 @@ pub enum CardKind {
     Loopback,
     /// Driver the framework does not yet classify. Surfaces with
     /// the driver string for diagnostic; downstream layers treat
-    /// as [`OutputClass::Unknown`].
+    /// as `OutputClass::Unknown`.
     Unknown,
 }
 
@@ -161,8 +161,8 @@ pub struct CodecIdentity {
     /// Whether this codec drives an HDMI output node. Determined
     /// by chip name containing `HDMI` (Intel / NVIDIA / AMD HDMI
     /// codecs all expose this in their reported chip name). When
-    /// true and the card's [`CardKind`] is [`Hda`], the card's
-    /// classification widens to [`Hdmi`] for THIS codec's PCM
+    /// true and the card's [`CardKind`] is `Hda`, the card's
+    /// classification widens to `Hdmi` for THIS codec's PCM
     /// devices.
     pub is_hdmi: bool,
 }
@@ -720,7 +720,7 @@ fn classify_kind(
 }
 
 /// Classify a [`CardIdentity`] into the operator-facing
-/// [`OutputClass`] consumed by the UI's Destination chips and
+/// `OutputClass` consumed by the UI's Destination chips and
 /// downstream classification surface. Pure function — Layer 2 of
 /// the kernel-introspection pipeline. Deterministic over `CardIdentity`; no
 /// side effects, no fallback inference at the join site.
@@ -730,7 +730,7 @@ fn classify_kind(
 /// regardless of whether the underlying hardware is on the
 /// motherboard or a discrete card). HDA controllers whose every
 /// codec is HDMI (discrete-GPU audio paths) are upstream-
-/// classified as [`CardKind::Hdmi`] by [`classify_kind`], so they
+/// classified as [`CardKind::Hdmi`] by `classify_kind`, so they
 /// surface here as `Hdmi`.
 ///
 /// Loopback cards surface as `Unknown` so the existing

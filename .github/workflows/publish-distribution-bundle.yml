@@ -1,0 +1,160 @@
+# First-boot composition only. Bake and publish the installer
+# tarball. Not everyday CI and not the in-product updater
+# (that inventories plugin-bundle and core-binaries). Fires on
+# the public audio tag (the cut attribute). Ordinary main
+# pushes do not run this job.
+#
+# ubuntu-latest: this repository is public. Do not send this
+# train to the self-hosted pool.
+#
+# Pieces first, then this job. Compose from published slots
+# (piece-pins.toml). Does not cargo/npm/cross UI, kiosk, boot,
+# steward, or plugins. Three triples including armv7.
+#
+# The tarball is a GitHub Release asset, not a git blob.
+# GitHub rejects files over 100 MB; these tarballs are ~110 MB.
+# Testers already curl releases/latest/download. Git on
+# artefacts holds only bundles/distribution/<version>.toml.
+# Creates GitHub Release <tag> with --latest=false and does
+# not modify GitHub Release v0.1.13. Testers curl Latest; the
+# operator marks the remint release Latest after this job is
+# green so they stop installing the previous cut's tarball.
+name: publish-distribution-bundle
+
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing public audio tag to bake (must already be on origin)"
+        type: string
+        required: true
+        default: v0.1.13.0
+
+env:
+  COMMIT_USER: evo-device-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+  RUST_TOOLCHAIN: "1.85"
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Determine cut
+        id: cut
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            if [ "$REF_TYPE" != "tag" ]; then
+              echo "::error::publish-distribution-bundle.yml requires a tag push or workflow_dispatch"
+              exit 1
+            fi
+            tag="$REF_NAME"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$tag' does not match v<MAJOR>.<MINOR>.<PATCH>[.<N>][-<pre>]"
+            exit 1
+          fi
+          echo "cut=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out audio at the cut tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.cut.outputs.cut }}
+          fetch-depth: 0
+          path: evo-device-audio
+
+      - name: Check out artefacts (piece slots)
+        env:
+          TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty"
+            exit 1
+          fi
+          git clone --filter=blob:none \
+            "https://x-access-token:${TOKEN}@github.com/foonerd/evo-device-audio-artefacts.git" \
+            evo-device-audio-artefacts
+
+      - name: Materialise plugin signing key
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty"
+            exit 1
+          fi
+          printf '%s\n' "$PLUGIN_SIGNING_KEY_PEM" > "$RUNNER_TEMP/plugin.pem"
+
+      - name: Use publish script from the workflow ref
+        run: |
+          set -euo pipefail
+          git -C evo-device-audio fetch origin "${{ github.sha }}"
+          # checkout preserves the tree's mode (100755). `git show >`
+          # does not; that was exit 126 on compose.
+          git -C evo-device-audio checkout "${{ github.sha }}" -- \
+            scripts/release/publish-distribution-bundle.sh \
+            scripts/release/write-distribution-pointer.sh \
+            scripts/release/compose-distribution-from-pieces.sh \
+            scripts/release/piece-pins.toml \
+            scripts/release/pack-signed-tree.sh \
+            scripts/release/stage-audio-dist-tree.sh
+          for f in \
+            scripts/release/publish-distribution-bundle.sh \
+            scripts/release/write-distribution-pointer.sh \
+            scripts/release/compose-distribution-from-pieces.sh \
+            scripts/release/pack-signed-tree.sh \
+            scripts/release/stage-audio-dist-tree.sh; do
+            if [ ! -x "evo-device-audio/${f}" ]; then
+              echo "::error::${f} is not executable after checkout from ${{ github.sha }}"
+              exit 1
+            fi
+          done
+
+      - name: Bake and publish
+        env:
+          CUT: ${{ steps.cut.outputs.cut }}
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+          EVO_PLUGIN_SIGNING_KEY: ${{ runner.temp }}/plugin.pem
+          EVO_BUNDLE_OUT_DIR: ${{ runner.temp }}/distribution-bundles
+        run: |
+          set -euo pipefail
+          unset CARGO_TARGET_DIR
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty"
+            exit 1
+          fi
+          mkdir -p "$EVO_BUNDLE_OUT_DIR"
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+          bash evo-device-audio/scripts/release/publish-distribution-bundle.sh \
+            --tag "$CUT" \
+            --artefacts-repo "${GITHUB_WORKSPACE}/evo-device-audio-artefacts" \
+            --bundle-dir "$EVO_BUNDLE_OUT_DIR"
+
+      - name: Rescue distribution tarballs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distribution-bundles
+          path: ${{ runner.temp }}/distribution-bundles/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Wipe signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/plugin.pem" || true

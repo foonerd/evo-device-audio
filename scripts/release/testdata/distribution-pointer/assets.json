@@ -1,0 +1,40 @@
+{
+  "assets": [
+    {
+      "name": "evo-device-audio-aarch64-unknown-linux-gnu-0.1.13.tar.gz",
+      "size": 114214769
+    },
+    {
+      "name": "evo-device-audio-aarch64-unknown-linux-gnu-0.1.13.tar.gz.sha256",
+      "size": 123
+    },
+    {
+      "name": "evo-device-audio-aarch64-unknown-linux-gnu-0.1.13.tar.gz.sig",
+      "size": 64
+    },
+    {
+      "name": "evo-device-audio-armv7-unknown-linux-gnueabihf-0.1.13.tar.gz",
+      "size": 115772626
+    },
+    {
+      "name": "evo-device-audio-armv7-unknown-linux-gnueabihf-0.1.13.tar.gz.sha256",
+      "size": 127
+    },
+    {
+      "name": "evo-device-audio-armv7-unknown-linux-gnueabihf-0.1.13.tar.gz.sig",
+      "size": 64
+    },
+    {
+      "name": "evo-device-audio-x86_64-unknown-linux-gnu-0.1.13.tar.gz",
+      "size": 119639520
+    },
+    {
+      "name": "evo-device-audio-x86_64-unknown-linux-gnu-0.1.13.tar.gz.sha256",
+      "size": 122
+    },
+    {
+      "name": "evo-device-audio-x86_64-unknown-linux-gnu-0.1.13.tar.gz.sig",
+      "size": 64
+    }
+  ]
+}

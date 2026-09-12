@@ -218,6 +218,12 @@ lint_sudoers_binaries() {
         # documentation references in the drop-in comments.
         "/usr/local/bin/evo-captive-probe"
         "/bin/evo-captive-probe"
+        # RTC wake wrapper installed by bootstrap.sh from
+        # dist/bin/evo-rtc-wake to /usr/local/bin/evo-rtc-wake.
+        # The extractor also reports the /bin/ suffix of that
+        # path, same shape as the captive-probe pair.
+        "/usr/local/bin/evo-rtc-wake"
+        "/bin/evo-rtc-wake"
         "/usr/bin/curl"
         "/usr/local"
     )

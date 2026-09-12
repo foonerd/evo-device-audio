@@ -41,6 +41,7 @@ pub mod reconcile;
 pub mod rfkill;
 pub mod source;
 pub mod supervisor;
+pub mod wifi_acquire;
 pub mod wifi_phy;
 pub mod wifi_radio;
 pub mod wifi_roles;
@@ -234,6 +235,15 @@ struct PluginConfig {
     rfkill_timeout_ms: u64,
     curl_timeout_ms: u64,
     scan_cache_ttl_ms: u64,
+    /// Where an imaging tool may have left Wi-Fi credentials on the
+    /// boot partition, most specific first. Read once at load by
+    /// the acquisition step and retired on success. Overridable via
+    /// `EVO_NETWORK_BOOT_WIFI_CONF` (comma-separated) or
+    /// `boot_wifi_conf_paths` (plugin TOML array); an empty list
+    /// turns the file source off and leaves profile adoption as the
+    /// only route. Defaults to
+    /// [`wifi_acquire::DEFAULT_BOOT_WIFI_CONF_PATHS`].
+    boot_wifi_conf_paths: Vec<String>,
 }
 
 #[derive(
@@ -308,6 +318,22 @@ impl PluginConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v >= 100)
             .unwrap_or(2000);
+        // An explicitly empty override turns the file source off,
+        // which is distinct from an absent override falling back to
+        // the shipped locations.
+        let boot_wifi_conf_paths =
+            match std::env::var("EVO_NETWORK_BOOT_WIFI_CONF") {
+                Ok(v) => v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Err(_) => wifi_acquire::DEFAULT_BOOT_WIFI_CONF_PATHS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
         Self {
             nmcli_path: "/usr/bin/nmcli".to_string(),
             iw_path,
@@ -323,6 +349,7 @@ impl PluginConfig {
             rfkill_timeout_ms,
             curl_timeout_ms: 30000,
             scan_cache_ttl_ms: 3000,
+            boot_wifi_conf_paths,
         }
     }
 
@@ -462,6 +489,20 @@ impl PluginConfig {
             .and_then(|v| v.as_bool())
         {
             out.require_encrypted_secrets = v;
+        }
+        // An array that is present but empty turns the boot-file
+        // source off deliberately, so it replaces the default rather
+        // than being treated as "nothing was configured".
+        if let Some(arr) =
+            table.get("boot_wifi_conf_paths").and_then(|v| v.as_array())
+        {
+            out.boot_wifi_conf_paths = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
         }
         Ok(out)
     }
@@ -778,6 +819,30 @@ fn default_ap_ssid() -> String {
         .unwrap_or_else(|| "evo".to_string())
 }
 
+/// AP vif names the apply pipeline creates on a shared PHY —
+/// `ap`, `ap0`, `ap1`. Such an interface beacons rather than
+/// associates, so `iw dev <name> link` answers `Not connected.`
+/// for it by design and its live SSID is only readable from
+/// `iw dev <name> info`.
+fn is_ap_vif_ifname(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    match n.strip_prefix("ap") {
+        Some(rest) => {
+            rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// AP vifs and their P2P companions are not scan targets.
+/// `nmcli device wifi list` on `ap0` (or a bare list that
+/// includes it) fights the beacon on brcmfmac: AP-DISABLED,
+/// driver `-52`, `Failed to initiate AP scan`, escan timeout.
+fn is_ap_scan_ifname(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n.starts_with("p2p-dev-") || is_ap_vif_ifname(&n)
+}
+
 /// Last three MAC octets of the first usable host netdev, upper-hex,
 /// no separators (e.g. `7B6816`). Used to derive a per-device
 /// hotspot SSID without leaking serial numbers.
@@ -961,6 +1026,85 @@ fn parse_iw_link(raw: &str) -> WifiInfo {
     w
 }
 
+/// Parsed `iw dev <ifname> info`. `iftype` is the mode the
+/// driver reports for the interface (`AP` / `managed` /
+/// `monitor`); `wifi` carries the runtime fields that reach
+/// the wire.
+struct IwDevInfo {
+    iftype: String,
+    wifi: WifiInfo,
+}
+
+/// Pure parser for `iw dev <ifname> info` — the only call that
+/// reports the SSID an AP vif is broadcasting, since an AP
+/// beacons rather than associates and so has no `link` to read.
+///
+/// Field shape of `iw dev ap0 info` for a beaconing AP vif
+/// (identifiers below are illustrative, not from any device):
+///
+/// ```text
+/// Interface ap0
+///     ifindex 8
+///     wdev 0x2
+///     addr aa:11:22:33:44:66
+///     ssid evo-4466
+///     type AP
+///     channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz
+/// ```
+///
+/// An SSID may contain spaces and punctuation, so the `ssid`
+/// value is everything to end of line rather than the first
+/// token. In AP mode the vif's own MAC is the BSSID
+/// clients see, so `addr` populates `bssid`. Signal and bitrate
+/// describe an association the AP side does not have and stay
+/// `None`.
+fn parse_iw_dev_info(raw: &str) -> IwDevInfo {
+    let mut out = IwDevInfo {
+        iftype: String::new(),
+        wifi: WifiInfo::default(),
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ssid ") {
+            out.wifi.ssid = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("type ") {
+            out.iftype = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("addr ") {
+            out.wifi.bssid = rest.trim().to_ascii_lowercase();
+        } else if let Some(rest) = trimmed.strip_prefix("channel ") {
+            parse_iw_channel_line(rest, &mut out.wifi);
+        }
+    }
+    out
+}
+
+/// Fill channel / frequency / band from the tail of an `iw`
+/// `channel` line — `36 (5180 MHz), width: 80 MHz, center1:
+/// 5210 MHz`. The reported channel number is taken verbatim;
+/// the band label is derived from the frequency in parentheses
+/// so it agrees with what the `link` path produces.
+fn parse_iw_channel_line(rest: &str, w: &mut WifiInfo) {
+    let rest = rest.trim();
+    let chan: String =
+        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(n) = chan.parse::<u32>() {
+        w.channel = Some(n);
+    }
+    let Some(open) = rest.find('(') else {
+        return;
+    };
+    let Some(close) = rest[open..].find(')') else {
+        return;
+    };
+    let inner = rest[open + 1..open + close].trim();
+    let mhz: String =
+        inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(mhz) = mhz.parse::<u32>() {
+        w.freq_mhz = Some(mhz);
+        w.band = band_label_from_freq(mhz);
+    }
+}
+
 fn channel_from_freq_mhz(mhz: u32) -> Option<u32> {
     // Standard 2.4 GHz + 5 GHz + 6 GHz channel derivations.
     if (2412..=2472).contains(&mhz) {
@@ -1025,6 +1169,19 @@ fn nm_state_text(raw: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Word-boundary test for NM's connected state text, as
+/// normalised by [`nm_state_text`]. NM emits `connected`,
+/// `connected (site only)` and `connected (local only)` — and
+/// `disconnected`, which a naive `contains("connected")`
+/// predicate false-positives on. Single truth for every
+/// association gate in this plugin.
+fn nm_state_is_connected(state: &str) -> bool {
+    let s = state.trim();
+    s == "connected"
+        || s.starts_with("connected ")
+        || s.starts_with("connected(")
 }
 
 /// Last two octets of a MAC address, lowercase hex, no
@@ -1313,6 +1470,24 @@ async fn run_command_stdin_with_timeout(
     }
 }
 
+/// What acquisition did, for the caller's log line.
+///
+/// Carries no passphrase — the whole point of naming the outcome
+/// rather than returning the acquired network is that this value is
+/// safe to print.
+#[derive(Debug, PartialEq, Eq)]
+enum AcquireOutcome {
+    /// A station was already recorded; nothing was touched.
+    AlreadyDeclared,
+    /// Taken from a credentials file on the boot partition.
+    FromBootFile { ssid: String, secured: bool },
+    /// Taken over from a NetworkManager profile this plugin did not
+    /// create.
+    FromForeignProfile { ssid: String, previous_name: String },
+    /// Neither source had anything to offer.
+    NothingToAcquire,
+}
+
 /// Universal per-interface device row surfaced on
 /// `network.nm.status.devices[]`. Covers every kind
 /// NetworkManager can enumerate — ethernet, wifi (STA + AP
@@ -1355,9 +1530,14 @@ struct DeviceRow {
     ip6: Option<Ip6Info>,
     /// Wi-Fi runtime — SSID / BSSID / signal / bitrate /
     /// band / channel / frequency / security. Present only
-    /// when kind == "wifi" AND the interface is associated
-    /// (STA connected, or AP up). Sourced from `iw dev
-    /// <ifname> link` + `iw dev <ifname> info`.
+    /// when kind == "wifi" AND the interface is carrying a
+    /// network: a STA that is associated, or an AP vif that is
+    /// beaconing. The two are read by different calls because
+    /// they are different facts — a STA from `iw dev <ifname>
+    /// link`, a connected `ap*` from `iw dev <ifname> info`,
+    /// which is the only call that reports the SSID an AP
+    /// broadcasts. An AP row carries no signal or bitrate:
+    /// those describe an association the AP side does not have.
     #[serde(skip_serializing_if = "Option::is_none")]
     wifi: Option<WifiInfo>,
 }
@@ -2851,12 +3031,7 @@ impl NmInner {
         };
         rows.iter()
             .find(|r| r.device == ifname)
-            .map(|r| {
-                let s = r.state.trim();
-                s == "connected"
-                    || s.starts_with("connected ")
-                    || s.starts_with("connected(")
-            })
+            .map(|r| nm_state_is_connected(&r.state))
             .unwrap_or(false)
     }
 
@@ -3573,6 +3748,39 @@ impl NmInner {
         }
     }
 
+    /// Write a passphrase the caller supplied, and leave the
+    /// stored one alone when they supplied none.
+    ///
+    /// Omitting a field is not the same as clearing it. Every
+    /// settings write that is not a join — a country change, an AP
+    /// toggle, a radio switch, an address edit — arrives without
+    /// the passphrase, and treating that as "delete" wiped the
+    /// stored one each time. NetworkManager kept its own copy, so
+    /// the device stayed on the network and the loss only surfaced
+    /// later, when something needed the passphrase and found none.
+    ///
+    /// An explicitly empty value is refused rather than treated as
+    /// a clear: it is far more often a form submitting a blank box
+    /// than an operator asking to forget a network. Forgetting has
+    /// its own verb, and that verb stays the only way to clear.
+    async fn write_secret_if_supplied(
+        &self,
+        path: PathBuf,
+        value: Option<&str>,
+        field: &str,
+    ) -> Result<(), PluginError> {
+        match value {
+            None => Ok(()),
+            Some(v) if v.trim().is_empty() => {
+                Err(PluginError::Permanent(format!(
+                    "{field} was supplied empty; omit it to keep the saved \
+                     passphrase, or use the forget verb to clear it"
+                )))
+            }
+            Some(v) => self.write_optional_secret(path, Some(v)).await,
+        }
+    }
+
     async fn write_optional_secret(
         &self,
         path: PathBuf,
@@ -3991,6 +4199,333 @@ impl NmInner {
         rows
     }
 
+    /// SSID recorded on an existing NM profile, if it has one.
+    async fn nm_profile_ssid(&self, name: &str) -> Option<String> {
+        self.nm_profile_field(name, "802-11-wireless.ssid").await
+    }
+
+    /// Read one field from an NM connection profile. `None` when
+    /// nmcli fails or the field is empty.
+    ///
+    /// Only ever called for fields that are not secrets. nmcli
+    /// withholds secret values unless asked with `-s`, and this
+    /// deliberately does not ask — see
+    /// [`NmInner::adopt_foreign_wifi_profile`] for why a passphrase
+    /// held by NetworkManager is never read out.
+    async fn nm_profile_field(
+        &self,
+        name: &str,
+        field: &str,
+    ) -> Option<String> {
+        let out = self
+            .dispatcher
+            .dispatch(
+                &self.config.nmcli_path,
+                &["-g", field, "connection", "show", name],
+                Duration::from_millis(self.config.nmcli_timeout_ms),
+            )
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Take ownership of a Wi-Fi network the operator configured
+    /// before this plugin ever ran. Called once, at load.
+    ///
+    /// A device is usually flashed with a network already chosen, so
+    /// it boots onto a network the plugin does not know about: the
+    /// settings page shows no station, there is nothing to move away
+    /// from, and a profile nobody owns decides what happens at the
+    /// next reboot.
+    ///
+    /// A recorded station always wins. If `wifi.sta_ssid` is set,
+    /// the operator has spoken through the interface and acquisition
+    /// does nothing at all — it exists to fill a gap, never to
+    /// overwrite an answer.
+    ///
+    /// Otherwise two sources are tried in order. A credentials file
+    /// on the boot partition comes first: it is the more specific
+    /// statement of intent, and it is the only one of the two that
+    /// carries a passphrase this plugin can store. Failing that, a
+    /// NetworkManager profile this plugin did not create is taken
+    /// over in place.
+    ///
+    /// Nothing here brings an interface up. Acquisition records what
+    /// is already true; changing the radio is what apply is for.
+    async fn acquire_operator_wifi(
+        &self,
+    ) -> Result<AcquireOutcome, PluginError> {
+        let intent = self.load_intent().await?;
+        if !intent.wifi.sta_ssid.trim().is_empty() {
+            return Ok(AcquireOutcome::AlreadyDeclared);
+        }
+
+        if let Some((path, net)) = self.read_boot_wifi_conf().await {
+            // Order matters: everything that must survive is
+            // written before the file that holds the only copy of
+            // the passphrase is removed. A failure here leaves the
+            // file in place for the next boot to try again.
+            let mut adopted = intent.clone();
+            adopted.wifi.sta_ssid = net.ssid.clone();
+            adopted.wifi.sta_open = net.open;
+            adopted.wifi.sta_hidden = net.hidden;
+            self.save_intent(&adopted).await?;
+            if let Some(psk) = net.psk.as_deref() {
+                let psk_path = self.sta_psk_path()?;
+                self.write_optional_secret(psk_path, Some(psk)).await?;
+            }
+            self.write_acquired_sta_profile(&net).await?;
+            self.retire_boot_wifi_conf(&path).await;
+            return Ok(AcquireOutcome::FromBootFile {
+                ssid: net.ssid,
+                secured: !net.open,
+            });
+        }
+
+        let hotspot = NmInner::hotspot_connection_name(&intent);
+        if let Some(row) = self.find_foreign_wifi_profile(&hotspot).await {
+            if let Some(ssid) = self.nm_profile_ssid(&row.name).await {
+                let secured = self
+                    .nm_profile_field(
+                        &row.name,
+                        "802-11-wireless-security.key-mgmt",
+                    )
+                    .await
+                    .is_some();
+                self.adopt_foreign_wifi_profile(&row.name).await?;
+                let mut adopted = intent.clone();
+                adopted.wifi.sta_ssid = ssid.clone();
+                adopted.wifi.sta_open = !secured;
+                self.save_intent(&adopted).await?;
+                return Ok(AcquireOutcome::FromForeignProfile {
+                    ssid,
+                    previous_name: row.name,
+                });
+            }
+        }
+
+        Ok(AcquireOutcome::NothingToAcquire)
+    }
+
+    /// Read the first boot-partition credentials file that parses
+    /// into a usable network.
+    ///
+    /// A path that does not exist is the ordinary case, not a
+    /// failure — most devices have no such file. A path that exists
+    /// but cannot be read or parsed is logged and skipped so one bad
+    /// file does not hide a good one after it.
+    async fn read_boot_wifi_conf(
+        &self,
+    ) -> Option<(PathBuf, wifi_acquire::WpaNetwork)> {
+        for candidate in &self.config.boot_wifi_conf_paths {
+            let path = PathBuf::from(candidate);
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        error = %e,
+                        "boot wifi credentials file present but unreadable"
+                    );
+                    continue;
+                }
+            };
+            match wifi_acquire::parse_wpa_supplicant_conf(&raw) {
+                Some(net) => return Some((path, net)),
+                None => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "boot wifi credentials file declares no usable network"
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Write the station profile for an acquired network.
+    ///
+    /// Deliberately does not bind the profile to an interface name.
+    /// Acquisition runs before anything has established which radio
+    /// this device has, and the name differs between machines; an
+    /// unbound profile attaches to whichever Wi-Fi device is
+    /// present. Apply binds it later, when the radio is known.
+    ///
+    /// Never overwrites an existing profile of ours. If one is
+    /// there, it is either already this network or something the
+    /// operator arranged, and neither is ours to replace from a file
+    /// on a removable card.
+    async fn write_acquired_sta_profile(
+        &self,
+        net: &wifi_acquire::WpaNetwork,
+    ) -> Result<(), PluginError> {
+        if self.nm_connection_exists(NM_CON_WIFI_STA).await {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                connection = NM_CON_WIFI_STA,
+                "station profile already present; acquisition left it alone"
+            );
+            return Ok(());
+        }
+        let mut args: Vec<String> = vec![
+            "connection".into(),
+            "add".into(),
+            "type".into(),
+            "wifi".into(),
+            "con-name".into(),
+            NM_CON_WIFI_STA.into(),
+            "ssid".into(),
+            net.ssid.clone(),
+            "802-11-wireless.hidden".into(),
+            if net.hidden {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        ];
+        if let Some(psk) = net.psk.as_deref() {
+            args.extend([
+                "wifi-sec.key-mgmt".into(),
+                "wpa-psk".into(),
+                "wifi-sec.psk-flags".into(),
+                "0".into(),
+                "wifi-sec.psk".into(),
+                psk.to_string(),
+            ]);
+        }
+        self.nmcli_output_owned(&args).await?;
+        Ok(())
+    }
+
+    /// Remove a boot-partition credentials file once its contents
+    /// are held somewhere better.
+    ///
+    /// The file sits in the clear on a partition that any reader of
+    /// the card can mount, and it is re-applied on every boot by
+    /// whatever wrote it. Leaving it would keep a passphrase
+    /// readable for the life of the device and leave a second owner
+    /// of the network configuration. Best-effort: a read-only or
+    /// already-absent boot partition is not a reason to fail a load
+    /// whose real work has already succeeded.
+    async fn retire_boot_wifi_conf(&self, path: &Path) {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => tracing::info!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                "retired boot wifi credentials file after acquisition"
+            ),
+            Err(e) => tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                error = %e,
+                "could not retire boot wifi credentials file; \
+                 the passphrase remains readable on the boot partition"
+            ),
+        }
+    }
+
+    /// Find a Wi-Fi profile this plugin did not create.
+    async fn find_foreign_wifi_profile(
+        &self,
+        hotspot: &str,
+    ) -> Option<wifi_acquire::NmProfileRow> {
+        let raw = self
+            .nmcli_output(&["-t", "-f", "NAME,TYPE", "connection", "show"])
+            .await
+            .ok()?;
+        let rows = wifi_acquire::parse_nm_profile_rows(&raw);
+        wifi_acquire::pick_foreign_wifi_profile(&rows, NM_CON_WIFI_STA, hotspot)
+            .cloned()
+    }
+
+    /// Take over a foreign profile by renaming it to ours.
+    ///
+    /// Renaming rather than copying is the whole point. The
+    /// passphrase NetworkManager holds stays where it is: it is
+    /// never read out, never passes through this process, and so can
+    /// never reach a log or a crash dump. The profile keeps its
+    /// UUID and its active state, so a device connected through it
+    /// right now stays connected — which matters, because the
+    /// operator may be reaching this device over that very network.
+    ///
+    /// Afterwards the profile is ours by every test the rest of the
+    /// plugin applies, including the one that lets apply reuse a
+    /// passphrase already on our profile instead of demanding a new
+    /// one.
+    ///
+    /// Refuses if a profile of ours already exists, rather than
+    /// colliding two profiles on one name.
+    async fn adopt_foreign_wifi_profile(
+        &self,
+        name: &str,
+    ) -> Result<(), PluginError> {
+        if self.nm_connection_exists(NM_CON_WIFI_STA).await {
+            return Err(PluginError::Transient(format!(
+                "cannot adopt {name}: {NM_CON_WIFI_STA} already exists"
+            )));
+        }
+        self.nmcli_output_owned(&[
+            "connection".to_string(),
+            "modify".to_string(),
+            name.to_string(),
+            "connection.id".to_string(),
+            NM_CON_WIFI_STA.to_string(),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// May this station be brought up without a passphrase of our
+    /// own, by leaving the one NetworkManager already holds?
+    ///
+    /// True only when there is nothing to supply and nothing to
+    /// change: the network is not open, we hold no passphrase, a
+    /// profile already exists, and it is for the same SSID. Then
+    /// NM's stored secret is still the right secret and rewriting
+    /// `wifi-sec.psk` would replace a working credential with
+    /// nothing.
+    ///
+    /// A different SSID is a different network — NM's secret does
+    /// not apply and there is nothing to reuse.
+    /// `None` and whitespace-only are the same: nothing to write to NM.
+    fn sta_psk_is_blank(sta_psk: Option<&str>) -> bool {
+        sta_psk.map(str::trim).is_none_or(|s| s.is_empty())
+    }
+
+    async fn sta_secret_is_reusable(
+        &self,
+        wifi: &WifiIntent,
+        sta_psk: Option<&str>,
+    ) -> bool {
+        if wifi.sta_open {
+            return false;
+        }
+        if !Self::sta_psk_is_blank(sta_psk) {
+            return false;
+        }
+        let wanted = wifi.sta_ssid.trim();
+        if wanted.is_empty() {
+            return false;
+        }
+        match self.nm_profile_ssid(NM_CON_WIFI_STA).await {
+            Some(existing) => existing == wanted,
+            None => false,
+        }
+    }
+
     async fn nm_connection_exists(&self, name: &str) -> bool {
         let out = self
             .dispatcher
@@ -4239,7 +4774,21 @@ impl NmInner {
                 }
             }
             if row.kind == "wifi" {
-                if let Some(wifi) = self.wifi_runtime_for(&row.device).await {
+                // An AP vif carries no upstream association, so
+                // `link` answers `Not connected.` for it by
+                // design and the STA path drops the row's wifi
+                // block entirely — the beaconing SSID never
+                // reached the wire. Read a connected `ap*` from
+                // `info` instead. STA rows keep the `link` path
+                // unchanged.
+                let runtime = if is_ap_vif_ifname(&row.device)
+                    && nm_state_is_connected(&row.state)
+                {
+                    self.wifi_ap_runtime_for(&row.device).await
+                } else {
+                    self.wifi_runtime_for(&row.device).await
+                };
+                if let Some(wifi) = runtime {
                     row.wifi = Some(wifi);
                 }
             }
@@ -4283,11 +4832,12 @@ impl NmInner {
         (m4, m6)
     }
 
-    /// Fetch wifi runtime info via `iw dev <ifname> link` +
-    /// `iw dev <ifname> info`. Only invoked when the device
-    /// row's kind is `wifi`. Returns `None` when the interface
-    /// is not associated or `iw` refuses (unauthorised /
-    /// missing binary).
+    /// Fetch STA wifi runtime info via `iw dev <ifname> link`.
+    /// Invoked for a `wifi` device row that is not a connected
+    /// AP vif — see [`NmInner::wifi_ap_runtime_for`] for that
+    /// path. Returns `None` when the interface is not
+    /// associated or `iw` refuses (unauthorised / missing
+    /// binary).
     async fn wifi_runtime_for(&self, ifname: &str) -> Option<WifiInfo> {
         let timeout = Duration::from_millis(self.config.iw_timeout_ms);
         let iw_exec = self.effective_iw_exec();
@@ -4308,11 +4858,63 @@ impl NmInner {
         Some(parse_iw_link(&link_raw))
     }
 
+    /// Fetch AP wifi runtime info via `iw dev <ifname> info`.
+    /// An AP vif beacons rather than associates: `link` answers
+    /// `Not connected.` for it by design and carries no SSID,
+    /// so `info` is the only call that reports the network the
+    /// device is actually broadcasting.
+    ///
+    /// Returns `None` unless the interface really is in AP mode
+    /// (`type AP`) and really is beaconing (a non-empty `ssid`
+    /// line). The name shape alone does not make a row an AP,
+    /// and a created-but-idle vif still prints its `Interface`
+    /// block — two independent guarantees, so a quiet AP never
+    /// paints a stale SSID on the wire.
+    async fn wifi_ap_runtime_for(&self, ifname: &str) -> Option<WifiInfo> {
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let info_raw = wifi_phy::iw_output(
+            iw_exec.as_ref(),
+            &self.config.iw_path,
+            &["dev", ifname, "info"],
+            timeout,
+        )
+        .await
+        .ok()?;
+        let info = parse_iw_dev_info(&info_raw);
+        if !info.iftype.eq_ignore_ascii_case("ap") || info.wifi.ssid.is_empty()
+        {
+            return None;
+        }
+        Some(info.wifi)
+    }
+
+    /// STA iface to scan, or `None` when the only wifi ifaces
+    /// are AP. Never an AP/p2p name. `None` means do not call
+    /// `nmcli device wifi list` — a bare list scans every wifi
+    /// device, including `ap0`.
+    async fn scan_target_ifname(
+        &self,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if let Some(n) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+            if !is_ap_scan_ifname(n) {
+                return Some(n.to_string());
+            }
+        }
+        self.resolve_wifi_sta_ifname(None)
+            .await
+            .filter(|n| !is_ap_scan_ifname(n))
+    }
+
     async fn wifi_scan(
         &self,
         ifname: Option<&str>,
     ) -> Result<Vec<ScanRow>, PluginError> {
-        let mut args: Vec<String> = vec![
+        let Some(target) = self.scan_target_ifname(ifname).await else {
+            return Ok(Vec::new());
+        };
+        let args: Vec<String> = vec![
             "-t".into(),
             "-f".into(),
             // FREQ appended so the scan handler can filter rows
@@ -4322,11 +4924,9 @@ impl NmInner {
             "dev".into(),
             "wifi".into(),
             "list".into(),
+            "ifname".into(),
+            target,
         ];
-        if let Some(i) = ifname.map(str::trim).filter(|s| !s.is_empty()) {
-            args.push("ifname".into());
-            args.push(i.to_string());
-        }
         let raw = self.nmcli_output_owned(&args).await?;
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -4362,18 +4962,19 @@ impl NmInner {
         &self,
         ifname: Option<&str>,
     ) -> Result<Vec<WifiStaCandidate>, PluginError> {
-        let mut args: Vec<String> = vec![
+        let Some(target) = self.scan_target_ifname(ifname).await else {
+            return Ok(Vec::new());
+        };
+        let args: Vec<String> = vec![
             "-t".into(),
             "-f".into(),
             "BSSID,SSID,SIGNAL,FREQ,ACTIVE".into(),
             "dev".into(),
             "wifi".into(),
             "list".into(),
+            "ifname".into(),
+            target,
         ];
-        if let Some(i) = ifname.map(str::trim).filter(|s| !s.is_empty()) {
-            args.push("ifname".into());
-            args.push(i.to_string());
-        }
         let raw = self.nmcli_output_owned(&args).await?;
         let mut out = Vec::new();
         for line in raw.lines() {
@@ -4503,6 +5104,81 @@ impl NmInner {
         }
     }
 
+    /// Which interface a scan or a publish should name, given
+    /// what the caller asked for.
+    ///
+    /// An operator pin wins untouched — `Some(non-empty)` is a
+    /// deliberate choice and this does not second-guess it.
+    ///
+    /// Everything else resolves against the radios actually on
+    /// this host. The configured default is `wlan0`, and
+    /// `WifiIntent::ifname` carries the same string as a serde
+    /// default, so a request that named no interface still
+    /// arrived at nmcli as `ifname wlan0`. On a box whose only
+    /// radio is `wlp0s20f3` that is a name for nothing: nmcli
+    /// refuses outright and the operator gets a failure where a
+    /// list of networks belonged. A default that does not exist
+    /// is not a pin — it is a stale guess, and it is dropped.
+    ///
+    /// `None` means "name no interface at all". With no radio
+    /// inventory there is nothing honest to pin, and letting
+    /// nmcli answer for every interface returns rows rather than
+    /// an error.
+    async fn resolve_wifi_sta_ifname(
+        &self,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if let Some(pinned) = requested.map(str::trim) {
+            if !pinned.is_empty() && !is_ap_scan_ifname(pinned) {
+                return Some(pinned.to_string());
+            }
+        }
+        let inventory = self.enumerate_wifi_radios().await;
+        if inventory.is_empty() {
+            return None;
+        }
+        let assignment = wifi_roles::assign_wifi_roles(
+            &inventory,
+            &[],
+            wifi_roles::RoleOverrides {
+                explicit_sta: "",
+                explicit_ap: "",
+                default_sta_fallback: self.config.default_wifi_iface.as_str(),
+            },
+        );
+        // The assigner falls back to the configured default when
+        // no radio can bear STA duty, so the name it returns is
+        // not guaranteed to be on the box. Only pin one that is.
+        if inventory.iter().any(|r| r.ifname == assignment.sta_ifname) {
+            Some(assignment.sta_ifname)
+        } else {
+            None
+        }
+    }
+
+    /// The STA interface worth publishing, given what the intent
+    /// currently records.
+    ///
+    /// A recorded name that is on this host is kept — that is an
+    /// operator's choice and it is live. Anything else, including
+    /// the `wlan0` serde default on a host that has no `wlan0`,
+    /// is replaced by whatever radio is actually here. `None`
+    /// when there is no inventory to speak from, in which case
+    /// the caller leaves the record alone rather than inventing.
+    async fn live_sta_ifname(&self, recorded: &str) -> Option<String> {
+        let inventory = self.enumerate_wifi_radios().await;
+        if inventory.is_empty() {
+            return None;
+        }
+        let recorded = recorded.trim();
+        if !recorded.is_empty()
+            && inventory.iter().any(|r| r.ifname == recorded)
+        {
+            return Some(recorded.to_string());
+        }
+        self.resolve_wifi_sta_ifname(None).await
+    }
+
     fn effective_wifi_ifname(&self, intent: &NetworkIntent) -> String {
         let t = intent.wifi.ifname.trim();
         if !t.is_empty() {
@@ -4545,6 +5221,97 @@ impl NmInner {
         }
     }
 
+    /// Is this profile currently activated?
+    ///
+    /// NetworkManager reports `GENERAL.STATE` as `activated` for a
+    /// profile that is up and returns nothing at all for one that is
+    /// not, so absence is the negative rather than a separate
+    /// question.
+    async fn nm_profile_is_active(&self, name: &str) -> bool {
+        self.nm_profile_field(name, "GENERAL.STATE")
+            .await
+            .is_some_and(|s| s.trim() == "activated")
+    }
+
+    /// Does the profile NetworkManager holds already carry
+    /// everything this apply would write to it?
+    ///
+    /// Takes the very argument list that would be written, so the
+    /// question asked is exactly the change proposed and the two
+    /// cannot drift apart.
+    ///
+    /// Returns false for anything it cannot prove. An unreadable
+    /// field, a value that does not compare, a profile that is not
+    /// up: all of them mean "not known to match", and the caller
+    /// goes on to assert the profile as it always did.
+    async fn nm_live_profile_satisfies(
+        &self,
+        name: &str,
+        props: &[String],
+    ) -> bool {
+        if !self.nm_profile_is_active(name).await {
+            return false;
+        }
+        for pair in props.chunks(2) {
+            let [key, want] = pair else {
+                // An odd trailing element means the caller built the
+                // list differently than assumed; refuse to guess.
+                return false;
+            };
+            let read_as = match nm_prop_read_name(key) {
+                NmPropRead::Field(f) => f,
+                // nmcli withholds secrets and this never asks; the
+                // caller handles them separately.
+                NmPropRead::Secret => continue,
+                // Nothing is assumed about a key this does not know.
+                NmPropRead::Unknown => return false,
+            };
+            let live = self
+                .nm_profile_field(name, read_as)
+                .await
+                .unwrap_or_default();
+            if !nm_prop_values_match(want, &live) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Was the passphrase written after the profile last came up?
+    ///
+    /// A running access point keeps the key it was raised with, so a
+    /// changed passphrase is stored but not on the air until the
+    /// profile is raised again. NetworkManager will not hand back
+    /// the stored key to compare, and asking for it is forbidden, so
+    /// the comparison is by time instead: the sidecar's last write
+    /// against the profile's last activation, both of which are
+    /// already recorded.
+    ///
+    /// True — meaning "re-raise it" — for anything unprovable.
+    async fn nm_secret_is_newer_than_activation(
+        &self,
+        name: &str,
+        secret_path: &Path,
+    ) -> bool {
+        let Ok(meta) = tokio::fs::metadata(secret_path).await else {
+            return true;
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        let Ok(written) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            return true;
+        };
+        let Some(activated) = self
+            .nm_profile_field(name, "connection.timestamp")
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
+            return true;
+        };
+        activated == 0 || written.as_secs() > activated
+    }
+
     async fn ensure_ethernet(
         &self,
         intent: &NetworkIntent,
@@ -4579,6 +5346,18 @@ impl NmInner {
         } else {
             eth.device.trim().to_string()
         };
+        // Loopback is never an ethernet target. `first_ethernet_device`
+        // already filters it out, but an operator-supplied
+        // `ethernet.device` reaches here unfiltered, and binding the
+        // profile to `lo` guarantees the activation below fails.
+        if ifname == "lo" {
+            steps.push(
+                "warning: ethernet device resolved to loopback; skipping \
+                 ethernet profile"
+                    .to_string(),
+            );
+            return Ok(());
+        }
         let props = Self::nm_ipv4_args(
             &eth.ipv4_mode,
             &eth.ipv4_address,
@@ -4587,14 +5366,38 @@ impl NmInner {
         );
 
         if self.nm_connection_exists(NM_CON_ETHERNET).await {
+            // What this apply is asking of the profile, as one list:
+            // written below, and compared against the live profile
+            // to decide whether raising it would change anything.
+            let mut ask: Vec<String> =
+                vec!["connection.interface-name".into(), ifname.clone()];
+            ask.extend(props.clone());
+
+            // A link that is already up and already carries this
+            // exact configuration has nothing to gain from being
+            // raised again, and something to lose: `connection up`
+            // on an active profile is a fresh activation, so the
+            // link drops and returns. On a wired device that is the
+            // operator's session going away mid-save, for no change
+            // at all.
+            //
+            // Ethernet carries no secret, so everything asked of it
+            // can be read back and the answer is either proven or
+            // the profile is asserted as before.
+            if self.nm_live_profile_satisfies(NM_CON_ETHERNET, &ask).await {
+                steps.push(format!(
+                    "{NM_CON_ETHERNET} is already up and already matches \
+                     the intent; left alone"
+                ));
+                return Ok(());
+            }
+
             let mut args = vec![
                 "connection".into(),
                 "modify".into(),
                 NM_CON_ETHERNET.into(),
-                "connection.interface-name".into(),
-                ifname.clone(),
             ];
-            args.extend(props);
+            args.extend(ask);
             self.nmcli_output_owned(&args).await?;
             steps.push(format!("modified {NM_CON_ETHERNET}"));
         } else {
@@ -4613,9 +5416,34 @@ impl NmInner {
             steps.push(format!("added {NM_CON_ETHERNET}"));
         }
 
-        self.nmcli_output(&["connection", "up", NM_CON_ETHERNET])
-            .await?;
-        steps.push(format!("brought up {NM_CON_ETHERNET}"));
+        match self
+            .nmcli_output(&["connection", "up", NM_CON_ETHERNET])
+            .await
+        {
+            Ok(_) => {
+                steps.push(format!("brought up {NM_CON_ETHERNET}"));
+            }
+            Err(e) if is_no_bindable_device_failure(&e.to_string()) => {
+                // Nothing to bind to. Same outcome as finding no
+                // ethernet device at all, and the same treatment:
+                // the profile is saved and will activate when a
+                // cable appears. Failing here would throw away a
+                // country change that already succeeded earlier in
+                // this apply.
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    connection = NM_CON_ETHERNET,
+                    error = %e,
+                    "ethernet profile has no bindable device; leaving it \
+                     saved and continuing the apply"
+                );
+                steps.push(format!(
+                    "warning: {NM_CON_ETHERNET} saved but not activated \
+                     (no bindable ethernet device)"
+                ));
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 
@@ -4871,12 +5699,12 @@ impl NmInner {
         &self,
         con_name: &str,
         steps: &mut Vec<String>,
-    ) -> bool {
+    ) -> HotspotBringUp {
         const HOTSPOT_BRINGUP_ATTEMPTS: u32 = 4;
         const HOTSPOT_BRINGUP_DELAY_MS: u64 = 400;
 
         if con_name.trim().is_empty() {
-            return false;
+            return HotspotBringUp::Failed;
         }
         for attempt in 1..=HOTSPOT_BRINGUP_ATTEMPTS {
             match self
@@ -4892,7 +5720,18 @@ impl NmInner {
                     } else {
                         steps.push(format!("brought up {con_name}"));
                     }
-                    return true;
+                    return HotspotBringUp::Up;
+                }
+                Ok(out) => {
+                    // The radio refusing to carry an AP next to
+                    // the STA is not a transient. Retrying it
+                    // pulls the STA down once per attempt, which
+                    // is what the operator sees as the join
+                    // dropping and coming back.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if is_phy_exclusive_failure(&stderr) {
+                        return HotspotBringUp::PhyExclusive;
+                    }
                 }
                 _ => {}
             }
@@ -4907,7 +5746,7 @@ impl NmInner {
             "warning: {} did not come up after {} attempts",
             con_name, HOTSPOT_BRINGUP_ATTEMPTS
         ));
-        false
+        HotspotBringUp::Failed
     }
 
     async fn ensure_wifi_sta(
@@ -5030,15 +5869,9 @@ impl NmInner {
                 ));
             }
             // No wifi-sec.* args on `base`.
-        } else {
-            let psk = sta_psk
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    PluginError::Permanent(
-                        "wifi-sta.psk missing while sta_open=false".to_string(),
-                    )
-                })?;
+        } else if let Some(psk) =
+            sta_psk.map(str::trim).filter(|s| !s.is_empty())
+        {
             base.extend([
                 "wifi-sec.key-mgmt".into(),
                 "wpa-psk".into(),
@@ -5047,6 +5880,20 @@ impl NmInner {
                 "wifi-sec.psk".into(),
                 psk.to_string(),
             ]);
+        } else if self.sta_secret_is_reusable(wifi, sta_psk).await {
+            // We hold no passphrase, but this profile is already
+            // for this SSID and NetworkManager still has the one
+            // that worked. Touch every other field and leave
+            // `wifi-sec.psk` alone — rewriting it here is what
+            // replaced a working credential with nothing.
+            steps.push(format!(
+                "reusing the saved passphrase already on {NM_CON_WIFI_STA} \
+                 (none supplied, same network)"
+            ));
+        } else {
+            return Err(PluginError::Permanent(
+                "wifi-sta.psk missing while sta_open=false".to_string(),
+            ));
         }
         base.extend(Self::nm_ipv4_args(
             &wifi.sta_ipv4_mode,
@@ -5245,7 +6092,55 @@ impl NmInner {
             ]);
         }
 
+        // Asked before anything is written, because the question is
+        // whether the profile NetworkManager holds *right now*
+        // already matches — not whether it will once this apply has
+        // rewritten it, which it always would.
         if self.nm_connection_exists(hotspot_name).await {
+            let mut already_satisfied = self
+                .nm_live_profile_satisfies(hotspot_name, &modify[3..])
+                .await;
+            if already_satisfied && psk.is_some() {
+                // Everything readable matches, so the one thing that
+                // could still differ is the passphrase — which
+                // NetworkManager will not show and this will not
+                // ask for. A running access point keeps the key it
+                // was raised with, so a passphrase written since
+                // then is stored but not yet on the air, and the
+                // profile does have to be raised again.
+                let psk_path = self.ap_psk_path()?;
+                if self
+                    .nm_secret_is_newer_than_activation(hotspot_name, &psk_path)
+                    .await
+                {
+                    already_satisfied = false;
+                }
+            }
+
+            // Leave it alone means leave it alone: nothing is
+            // written and nothing is raised.
+            //
+            // An access point that is already up and already
+            // beaconing this configuration has nothing to gain from
+            // any of the three writes below. Storing the same values
+            // back is not free — it moves the profile under
+            // NetworkManager for no change — and the security strip
+            // on the open path is a second write that takes the
+            // setting off the stored profile while the air keeps
+            // whatever it was raised with. Skipping only the raise
+            // would leave both of those, which is the disturbance
+            // this exists to remove, arriving by a different door.
+            //
+            // When the check says raise, everything below runs
+            // exactly as it did: write, then raise.
+            if already_satisfied {
+                steps.push(format!(
+                    "hotspot {hotspot_name} is already up and already \
+                     matches the intent; left alone"
+                ));
+                return Ok(());
+            }
+
             self.nmcli_output_owned(&modify).await?;
             if psk.is_none() {
                 let _ = self
@@ -5302,13 +6197,29 @@ impl NmInner {
             self.nmcli_output_owned(&add).await?;
             steps.push(format!("added hotspot profile {hotspot_name}"));
         }
-        if !self
+
+        match self
             .connection_up_hotspot_with_retries(hotspot_name, steps)
             .await
         {
-            return Err(PluginError::Transient(
-                "nmcli connection up wifi AP failed after retries".to_string(),
-            ));
+            HotspotBringUp::Up => {}
+            HotspotBringUp::PhyExclusive => {
+                // AP-only role on a radio that will not carry one
+                // beside whatever is already on it. Permanent, not
+                // transient: retrying is what costs the operator
+                // their STA.
+                return Err(PluginError::Permanent(
+                    "this radio will not carry an AP alongside the station \
+                     already on it; a second radio is needed for a hotspot"
+                        .to_string(),
+                ));
+            }
+            HotspotBringUp::Failed => {
+                return Err(PluginError::Transient(
+                    "nmcli connection up wifi AP failed after retries"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -5792,11 +6703,7 @@ impl NmInner {
             if row.kind != "wifi" {
                 continue;
             }
-            let s = row.state.trim();
-            let associated = s == "connected"
-                || s.starts_with("connected ")
-                || s.starts_with("connected(");
-            if associated {
+            if nm_state_is_connected(&row.state) {
                 return Ok(false);
             }
         }
@@ -5809,9 +6716,26 @@ impl NmInner {
         hs_name: &str,
         steps: &mut Vec<String>,
     ) -> Result<bool, PluginError> {
-        if !intent.fallback.hotspot_enabled || hs_name.trim().is_empty() {
+        if hs_name.trim().is_empty() {
             return Ok(false);
         }
+        // `fallback.hotspot_enabled` is deliberately not consulted.
+        //
+        // It is the standing-AP switch: whether this device offers
+        // an access point as part of how it normally runs. It is not
+        // a statement that the operator would rather the device be
+        // unreachable. Treating "no standing AP" as "stay dark when
+        // you fall off the network" left the only recovery route
+        // vetoed by a setting about something else, on exactly the
+        // devices that needed it — a Wi-Fi-only box that loses its
+        // network has no other way to be reached.
+        //
+        // The switch keeps its meaning everywhere it means
+        // something: apply still raises and lowers the standing AP
+        // by it, and a profile raised here does not become a
+        // standing one — see the autoconnect note in
+        // `write_open_recovery_ap_profile`.
+        //
         // Broad uplink check. Previously gated on
         // `ethernet_intent_has_no_carrier` alone, which failed
         // Wi-Fi-only deployments (never raised) and "all radios
@@ -5821,22 +6745,148 @@ impl NmInner {
         if !self.no_serviceable_uplink(intent).await? {
             return Ok(false);
         }
-        let _ = self
-            .nmcli_output(&[
-                "connection",
-                "modify",
-                hs_name,
-                "remove",
-                "802-11-wireless-security",
-            ])
-            .await;
+
+        // There may be no profile to raise. The standing AP is
+        // written by apply only when the switch is on, so a device
+        // that never offered one has nothing here — which is
+        // precisely the device that has just run out of ways to be
+        // reached.
+        if self.nm_connection_exists(hs_name).await {
+            let _ = self
+                .nmcli_output(&[
+                    "connection",
+                    "modify",
+                    hs_name,
+                    "remove",
+                    "802-11-wireless-security",
+                ])
+                .await;
+            // The same distinction the write path draws, drawn on a
+            // profile that was already here.
+            //
+            // A device that once offered a standing access point
+            // still carries its profile, autoconnect and all, after
+            // the switch is turned off. Opening that profile for
+            // recovery and leaving autoconnect alone would bring it
+            // back at the next boot — open, and standing — which is
+            // the back door the write path was careful to close,
+            // reached instead through a leftover.
+            //
+            // Only when the switch is off. With it on, autoconnect
+            // belongs to the operator's standing access point and
+            // recovery has no business touching it.
+            if !intent.fallback.hotspot_enabled {
+                self.nm_set_autoconnect(hs_name, false).await;
+                steps.push(format!(
+                    "critical: {hs_name} opened for recovery with \
+                     autoconnect no (no standing AP is offered, so it \
+                     must not return after a reboot)"
+                ));
+            }
+        } else {
+            self.write_open_recovery_ap_profile(intent, hs_name, steps)
+                .await?;
+        }
+
+        // Free the radio before asking it to beacon.
+        //
+        // On a single-radio chipset an AP cannot come up while the
+        // station still holds the PHY: the activation is refused
+        // busy and nothing beacons. Nothing is lost by taking the
+        // station down here, because reaching this point has already
+        // established that no Wi-Fi device is associated — that is
+        // what `no_serviceable_uplink` tested. What the station may
+        // still be doing is holding the radio while it retries a
+        // network that is not answering, and that is the state which
+        // refuses the AP.
+        //
+        // This is a down, not a delete: the profile, its passphrase
+        // and its autoconnect all survive, so the station comes back
+        // on its own the moment its network does.
+        self.connection_down_lossy(NM_CON_WIFI_STA).await;
+        steps.push(format!(
+            "critical: released {NM_CON_WIFI_STA} so the radio can carry \
+             the recovery AP (profile and secret untouched)"
+        ));
+
         steps.push(format!(
             "critical: no serviceable uplink past grace; forcing open AP fallback on {}",
             hs_name
         ));
-        Ok(self
-            .connection_up_hotspot_with_retries(hs_name, steps)
-            .await)
+        Ok(matches!(
+            self.connection_up_hotspot_with_retries(hs_name, steps)
+                .await,
+            HotspotBringUp::Up
+        ))
+    }
+
+    /// Write an open access point for a device that has run out of
+    /// ways to be reached.
+    ///
+    /// Open by construction: this exists so somebody standing next
+    /// to the device can connect to it and fix the network, and a
+    /// passphrase nobody has been told is the same as no access
+    /// point at all.
+    ///
+    /// **`connection.autoconnect` is `no`, and that is the whole
+    /// distinction between recovery and policy.** The standing AP
+    /// that apply writes autoconnects, because the operator asked
+    /// for an access point. This one is raised now, by this call,
+    /// and does not return after a reboot. Otherwise a device that
+    /// was briefly offline would come back permanently beaconing an
+    /// open network the operator never asked for — which would make
+    /// `fallback.hotspot_enabled` mean nothing, by the back door,
+    /// on exactly the devices this is trying to help.
+    ///
+    /// Not bound to an interface name. Recovery has no idea what
+    /// this device calls its radio, and the station has just been
+    /// released, so the profile attaches to whichever Wi-Fi device
+    /// is free.
+    async fn write_open_recovery_ap_profile(
+        &self,
+        intent: &NetworkIntent,
+        hs_name: &str,
+        steps: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        let ssid_owned;
+        let ssid = if intent.wifi.ap_ssid.trim().is_empty() {
+            ssid_owned = default_ap_ssid();
+            ssid_owned.as_str()
+        } else {
+            intent.wifi.ap_ssid.trim()
+        };
+        if ssid.is_empty() {
+            steps.push(
+                "warning: no name available for a recovery AP; \
+                 skipping"
+                    .to_string(),
+            );
+            return Ok(());
+        }
+        self.nmcli_output_owned(&[
+            "connection".to_string(),
+            "add".to_string(),
+            "type".to_string(),
+            "wifi".to_string(),
+            "con-name".to_string(),
+            hs_name.to_string(),
+            "ssid".to_string(),
+            ssid.to_string(),
+            "wifi.mode".to_string(),
+            "ap".to_string(),
+            "ipv4.method".to_string(),
+            "shared".to_string(),
+            "ipv6.method".to_string(),
+            "ignore".to_string(),
+            "autoconnect".to_string(),
+            "no".to_string(),
+        ])
+        .await?;
+        steps.push(format!(
+            "critical: wrote open recovery AP profile {hs_name} \
+             (autoconnect no; raised now, not standing)"
+        ));
+        Ok(())
     }
 
     async fn nm_active_connection_names_on_device(
@@ -6062,68 +7112,106 @@ impl NmInner {
                 steps.push("wifi role disabled; brought down STA and hotspot (best effort)".to_string());
             }
             WifiRole::Sta => {
-                // Empty `sta_ssid` under `WifiRole::Sta` is the
-                // Forget semantic: operator declared "no saved
-                // network" while keeping the STA role. Rather
-                // than surfacing "wifi.sta_ssid is required"
-                // from ensure_wifi_sta (which would leave the
-                // NM profile intact and NM would autoconnect
-                // right back), tear down the profile + PSK
-                // sidecar here and return ok. `wifi.forget`
-                // wire-op is the operator-explicit path; this
-                // branch closes the gap for UIs that Forget by
-                // saving an empty-SSID intent + calling
-                // intent.apply.
-                if intent.wifi.sta_ssid.trim().is_empty() {
-                    self.connection_down_lossy(&hs_name).await;
-                    self.purge_wifi_sta(&mut steps).await;
-                    steps.push(
-                        "wifi.sta_ssid empty under role=Sta \
-                         — treated as forget; NM STA profile + \
-                         PSK sidecar purged"
-                            .to_string(),
-                    );
-                    steps
-                        .push("hotspot brought down (best effort)".to_string());
-                    return Ok(ApplyReport { ok: true, steps });
-                }
-
                 let same_iface = sta_ifname == resolved_ap_ifname;
                 let concurrent_vif = !same_iface
                     && !intent_hotspot_if_is_explicit
                     && phy_supports_concurrent;
 
-                self.connection_down_lossy(&hs_name).await;
-                if concurrent_vif {
-                    let _ =
-                        self.ensure_ap_vif_absent(&resolved_ap_ifname).await;
-                    steps.push(format!(
+                // An empty `sta_ssid` under `WifiRole::Sta` is an
+                // absent station, not an instruction to delete
+                // one. Forgetting is a verb —
+                // `network.nm.wifi.forget` — and only that verb
+                // removes the NM profile and the PSK sidecar.
+                //
+                // Apply carries the whole intent, so every save
+                // that never touched the station fields arrives
+                // here with an empty SSID: an AP rename, a
+                // hotspot enable toggle, any glass Save from a
+                // page that does not own the station. Deleting
+                // on those was forget-by-apply — it took out a
+                // live association and its secret, and the
+                // operator had no way back because the secret
+                // was gone with it. With no station present it
+                // is equally a no-op: nothing to write, nothing
+                // to delete.
+                //
+                // Control must still reach the hotspot tail
+                // below. `fallback.hotspot_enabled` owns the AP,
+                // and returning from here is what downed the
+                // hotspot on an AP-only save and never wrote it
+                // back.
+                if intent.wifi.sta_ssid.trim().is_empty() {
+                    steps.push(
+                        "wifi.sta_ssid empty under role=Sta \
+                         — no station in intent; NM STA profile \
+                         and PSK sidecar left untouched \
+                         (forgetting is the wifi.forget verb)"
+                            .to_string(),
+                    );
+                    if !intent.fallback.hotspot_enabled {
+                        self.connection_down_lossy(&hs_name).await;
+                        steps.push(
+                            "hotspot disabled in intent; brought down \
+                             (best effort)"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    self.connection_down_lossy(&hs_name).await;
+                    if concurrent_vif {
+                        let _ = self
+                            .ensure_ap_vif_absent(&resolved_ap_ifname)
+                            .await;
+                        steps.push(format!(
                         "pre-STA: removed AP vif {resolved_ap_ifname} to free phy for STA association"
                     ));
-                }
-                self.connection_down_lossy(NM_CON_WIFI_STA).await;
-                steps.push(
+                    }
+                    // Do not take down what cannot be put back.
+                    //
+                    // The station comes down here so the profile can be
+                    // rewritten and brought up again. If we have no
+                    // passphrase and NetworkManager's stored one cannot
+                    // be reused — a different SSID, or no profile at
+                    // all — then the bring-up will refuse, and refusing
+                    // after the disconnect leaves the operator with no
+                    // network and no way back. Refuse first instead.
+                    if !intent.wifi.sta_open
+                        && Self::sta_psk_is_blank(sta_psk)
+                        && !self
+                            .sta_secret_is_reusable(&intent.wifi, sta_psk)
+                            .await
+                    {
+                        return Err(PluginError::Permanent(format!(
+                            "no passphrase for {:?} and no matching saved \
+                         network to reuse one from; refusing before taking \
+                         the station down",
+                            intent.wifi.sta_ssid.trim()
+                        )));
+                    }
+                    self.connection_down_lossy(NM_CON_WIFI_STA).await;
+                    steps.push(
                     "pre-STA: nmcli connection down STA profile (best effort before modify/up)"
                         .to_string(),
                 );
 
-                let sta_up_nonfatal = intent.fallback.hotspot_enabled;
-                self.ensure_wifi_sta(
-                    &sta_ifname,
-                    &intent.wifi,
-                    &intent.radio_policy,
-                    sta_psk,
-                    sta_up_nonfatal,
-                    &mut steps,
-                )
-                .await?;
-                // Restore autoconnect on the STA profile so a
-                // subsequent apply after a `wifi.disconnect`
-                // hold undoes the hold. Best-effort.
-                self.nm_set_autoconnect(NM_CON_WIFI_STA, true).await;
-                steps.push(format!(
+                    let sta_up_nonfatal = intent.fallback.hotspot_enabled;
+                    self.ensure_wifi_sta(
+                        &sta_ifname,
+                        &intent.wifi,
+                        &intent.radio_policy,
+                        sta_psk,
+                        sta_up_nonfatal,
+                        &mut steps,
+                    )
+                    .await?;
+                    // Restore autoconnect on the STA profile so a
+                    // subsequent apply after a `wifi.disconnect`
+                    // hold undoes the hold. Best-effort.
+                    self.nm_set_autoconnect(NM_CON_WIFI_STA, true).await;
+                    steps.push(format!(
                     "restored connection.autoconnect=yes on {NM_CON_WIFI_STA}"
                 ));
+                }
 
                 // Captive-hold gate: while a captive sign-in
                 // is in progress (session open, or `is_captive`
@@ -6205,13 +7293,25 @@ impl NmInner {
                     let is_shared_phy = same_iface || concurrent_vif;
                     let mut wifi_for_ap = intent.wifi.clone();
                     let mut channel_synced = false;
-                    if sta_ifname != resolved_ap_ifname
-                        && !intent_hotspot_if_is_explicit
+                    // Is anything actually on this radio? The
+                    // deferral below exists to avoid racing a live
+                    // STA onto a foreign channel, so it has to
+                    // know whether there is a live STA — not
+                    // whether the AP happens to have its own
+                    // interface name. No configured SSID means
+                    // nothing to wait for and no reason to pay the
+                    // association timeout on every apply.
+                    let mut sta_link_up = false;
+                    if is_shared_phy && !intent.wifi.sta_ssid.trim().is_empty()
                     {
                         let link = self
                             .wait_for_sta_association(&sta_ifname, 10_000)
                             .await;
-                        if link.connected {
+                        sta_link_up = link.connected;
+                        if link.connected
+                            && sta_ifname != resolved_ap_ifname
+                            && !intent_hotspot_if_is_explicit
+                        {
                             if let (Some(ch), Some(band)) =
                                 (link.channel, link.band.clone())
                             {
@@ -6223,7 +7323,7 @@ impl NmInner {
                                     wifi_for_ap.ap_band, wifi_for_ap.ap_channel
                                 ));
                             }
-                        } else {
+                        } else if !link.connected {
                             tracing::debug!(
                                 plugin = PLUGIN_NAME,
                                 sta_if = %sta_ifname,
@@ -6244,7 +7344,22 @@ impl NmInner {
                     // the next apply cycle picks up the correct
                     // channel and restores autoconnect via
                     // `ensure_wifi_ap` + `connection_up`.
-                    let defer_ap_shared_phy = is_shared_phy && !channel_synced;
+                    // Defer only when there is something to race.
+                    //
+                    // The channel read runs only where the AP has
+                    // its own interface, so on a single-radio box
+                    // `channel_synced` could never become true and
+                    // this gate deferred every apply, forever —
+                    // the hotspot profile was not merely down, it
+                    // was never written, and the operator's glass
+                    // said Enabled over a radio that had never
+                    // been asked to beacon.
+                    //
+                    // With no STA on the radio there is no channel
+                    // to collide with: write the profile and bring
+                    // the AP up on the operator's own channel.
+                    let defer_ap_shared_phy =
+                        is_shared_phy && sta_link_up && !channel_synced;
 
                     if defer_ap_shared_phy {
                         if !hs_name.trim().is_empty() {
@@ -6258,6 +7373,13 @@ impl NmInner {
                             ));
                         }
                     } else if intent.fallback.hotspot_enabled {
+                        // `ensure_hotspot_profile` → `ensure_wifi_ap`
+                        // already `connection up`. A second up here
+                        // is `new-activation`: AP-DISABLED, brcmf
+                        // -52, then wpa AP-scan on the same PHY.
+                        // Phy-exclusive / failed raise already
+                        // returned from ensure. Restore-after-
+                        // hotspot is the only remaining work.
                         self.ensure_hotspot_profile(
                             &resolved_ap_ifname,
                             &wifi_for_ap,
@@ -6267,43 +7389,27 @@ impl NmInner {
                         )
                         .await?;
 
-                        if !hs_name.trim().is_empty() {
-                            let ok = self
-                                .connection_up_hotspot_with_retries(
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await;
-                            let recovered = if !ok {
-                                self.try_critical_open_hotspot_recovery(
-                                    intent,
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await?
-                            } else {
-                                false
-                            };
-                            if sta_ifname == resolved_ap_ifname {
-                                self.restore_sta_after_hotspot_on_shared_radio(
-                                    intent,
-                                    sta_ifname.as_str(),
-                                    hs_name.as_str(),
-                                    &mut steps,
-                                )
-                                .await?;
-                            } else {
-                                steps.push(format!(
-                                    "intent: hotspot on {}, STA on {}",
-                                    resolved_ap_ifname, sta_ifname
-                                ));
-                            }
-                            if !ok && !recovered {
-                                steps.push(
-                                    "warning: hotspot did not activate after retries (and critical open recovery if applicable)"
-                                        .to_string(),
-                                );
-                            }
+                        if sta_ifname == resolved_ap_ifname
+                            && !intent.wifi.sta_ssid.trim().is_empty()
+                        {
+                            self.restore_sta_after_hotspot_on_shared_radio(
+                                intent,
+                                sta_ifname.as_str(),
+                                hs_name.as_str(),
+                                &mut steps,
+                            )
+                            .await?;
+                        } else if sta_ifname == resolved_ap_ifname {
+                            steps.push(
+                                "shared iface: no station in intent to \
+                                 restore; hotspot left up"
+                                    .to_string(),
+                            );
+                        } else {
+                            steps.push(format!(
+                                "intent: hotspot on {}, STA on {}",
+                                resolved_ap_ifname, sta_ifname
+                            ));
                         }
                     }
                 }
@@ -6573,6 +7679,43 @@ impl Plugin for NetworkPlugin {
                 );
             }
 
+            // Take ownership of a network the operator configured
+            // before this plugin existed, before anything reads the
+            // intent for real. Best-effort by design: a device that
+            // cannot be acquired is a device that works exactly as
+            // it did before, so a failure here is reported and the
+            // load continues.
+            match self.acquire_operator_wifi().await {
+                Ok(AcquireOutcome::AlreadyDeclared)
+                | Ok(AcquireOutcome::NothingToAcquire) => {}
+                Ok(AcquireOutcome::FromBootFile { ssid, secured }) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        ssid = %ssid,
+                        secured,
+                        "acquired operator wifi from the boot partition"
+                    );
+                }
+                Ok(AcquireOutcome::FromForeignProfile {
+                    ssid,
+                    previous_name,
+                }) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        ssid = %ssid,
+                        adopted_from = %previous_name,
+                        "adopted an existing NetworkManager wifi profile"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "wifi acquisition failed; continuing load"
+                    );
+                }
+            }
+
             let intent = self.load_intent().await?;
             self.wifi_flight_mode_enabled
                 .store(intent.radio_policy.flight_mode, Relaxed);
@@ -6721,12 +7864,6 @@ impl Respondent for NetworkPlugin {
                         }
                         Err(e) => (None, Some(format!("{e}"))),
                     };
-                    let scan_if = self.config.default_wifi_iface.clone();
-                    let wifi_scan_error = self
-                        .wifi_scan(Some(scan_if.as_str()))
-                        .await
-                        .err()
-                        .map(|e| format!("{e}"));
                     let radio_out = self.nm_radio_state().await;
                     let (radio, radio_error) = match radio_out {
                         Ok(v) => (Some(v), Option::<String>::None),
@@ -6748,7 +7885,6 @@ impl Respondent for NetworkPlugin {
                         );
                     let degraded = devices_error.is_some()
                         || general_error.is_some()
-                        || wifi_scan_error.is_some()
                         || radio_error.is_some()
                         || (radio_blocked && !radio_blocked_intentional);
                     NmInner::response_json(
@@ -6765,8 +7901,8 @@ impl Respondent for NetworkPlugin {
                                 "radios": {
                                     "wifi": wifi_radio_view,
                                 },
-                                "scan_ifname": scan_if,
-                                "wifi_scan_error": wifi_scan_error,
+                                "scan_ifname": serde_json::Value::Null,
+                                "wifi_scan_error": serde_json::Value::Null,
                                 "flight_mode": {
                                     "configured_enabled": configured_flight_mode,
                                     "wifi_blocked": radio_blocked,
@@ -6790,8 +7926,9 @@ impl Respondent for NetworkPlugin {
                                         "error": general_error,
                                     },
                                     "wifi_scan": {
-                                        "ok": wifi_scan_error.is_none(),
-                                        "error": wifi_scan_error,
+                                        "ok": true,
+                                        "skipped": true,
+                                        "error": serde_json::Value::Null,
                                     },
                                     "radio": {
                                         "ok": radio_error.is_none()
@@ -6815,15 +7952,10 @@ impl Respondent for NetworkPlugin {
                     } else {
                         NmInner::parse_request_json::<ScanRequest>(req)?
                     };
-                    let ifname_owned = scan_req.ifname.unwrap_or_else(|| {
-                        self.config.default_wifi_iface.clone()
-                    });
-                    let ifname_trimmed = ifname_owned.trim().to_string();
-                    let ifname = if ifname_trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(ifname_trimmed.as_str())
-                    };
+                    let ifname_owned = self
+                        .resolve_wifi_sta_ifname(scan_req.ifname.as_deref())
+                        .await;
+                    let ifname = ifname_owned.as_deref();
                     let scan_cache_key =
                         ifname.unwrap_or_default().trim().to_string();
                     let scan_result = self
@@ -6900,7 +8032,17 @@ impl Respondent for NetworkPlugin {
                     )
                 }
                 REQUEST_NETWORK_INTENT_GET => {
-                    let intent = self.load_intent().await?;
+                    let mut intent = self.load_intent().await?;
+                    // `WifiIntent::ifname` defaults to `wlan0`, so a
+                    // device that never had one published a radio it
+                    // does not own — and the UI sent that name back
+                    // on every scan and apply. Publish what is
+                    // actually on the box.
+                    if let Some(live) =
+                        self.live_sta_ifname(&intent.wifi.ifname).await
+                    {
+                        intent.wifi.ifname = live;
+                    }
                     let sta_psk = self
                         .read_optional_secret(&self.sta_psk_path()?)
                         .await?
@@ -6928,14 +8070,16 @@ impl Respondent for NetworkPlugin {
                         NmInner::parse_request_json::<IntentSetRequest>(req)?;
                     self.scan_cache.lock().await.clear();
                     self.save_intent(&body.intent).await?;
-                    self.write_optional_secret(
+                    self.write_secret_if_supplied(
                         self.sta_psk_path()?,
                         body.sta_psk.as_deref(),
+                        "sta_psk",
                     )
                     .await?;
-                    self.write_optional_secret(
+                    self.write_secret_if_supplied(
                         self.ap_psk_path()?,
                         body.ap_psk.as_deref(),
+                        "ap_psk",
                     )
                     .await?;
                     let report = if body.apply {
@@ -7730,6 +8874,62 @@ impl Respondent for NetworkPlugin {
     }
 }
 
+/// Does this `nmcli connection up` failure mean NetworkManager
+/// had no interface to bind the profile to?
+///
+/// The shape that matters: NM falls back to considering `lo`,
+/// then refuses it because a loopback interface cannot carry an
+/// ethernet profile — "No suitable device found for this
+/// connection (device lo not available because ... connection
+/// type is not loopback)".
+///
+/// That is the same condition as having found no ethernet device
+/// at all, and it must not fail an apply. A country write that
+/// already succeeded cannot be undone by an ethernet profile that
+/// has nothing to bind to.
+///
+/// Deliberately narrow: a real activation failure — bad
+/// credentials, carrier down, a refused address — is still an
+/// error, because those are things the operator can act on.
+fn is_no_bindable_device_failure(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("no suitable device found")
+        || m.contains("connection type is not loopback")
+}
+
+/// What a hotspot bring-up attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotspotBringUp {
+    /// The hotspot is up.
+    Up,
+    /// The radio will not carry an AP alongside the STA that is
+    /// already on it. Retrying cannot change that, and each
+    /// attempt drags the STA down with it.
+    PhyExclusive,
+    /// Did not come up for some other reason. Worth the existing
+    /// retries and the critical-open recovery.
+    Failed,
+}
+
+/// Does this bring-up failure mean the radio cannot carry an AP
+/// while the STA is on it?
+///
+/// The kernel refuses to set the vif's UP flag and NetworkManager
+/// surfaces it as "Could not set interface ap0 flags (UP): Device
+/// or resource busy". The PHY on the reference NUC advertises
+/// `managed` and `AP` in one combination, so the capability read
+/// says concurrency is legal — but only at `#channels <= 1`, with
+/// a P2P-device already holding one of three slots. The mode list
+/// cannot see that; the driver's refusal can.
+///
+/// Narrow on purpose: a busy message without the flag-set failure
+/// is some other contention, and still worth a retry.
+fn is_phy_exclusive_failure(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("device or resource busy")
+        && (s.contains("flags (up)") || s.contains("set interface"))
+}
+
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
     devices
         .iter()
@@ -8294,6 +9494,90 @@ fn sta_candidate_score(
         StaSelectionMode::PreferBand => (signal * 2) + pref,
         StaSelectionMode::LockBssid => signal,
     }
+}
+
+/// How a written property can be read back for comparison.
+#[derive(Debug, PartialEq, Eq)]
+enum NmPropRead {
+    /// Read it back under this field name and compare.
+    Field(&'static str),
+    /// A secret. Never read, never compared — the caller decides
+    /// separately what to do about secrets.
+    Secret,
+    /// Not a key this comparison knows how to read back. The
+    /// comparison fails rather than guessing, so the profile is
+    /// asserted as it always was.
+    Unknown,
+}
+
+/// The name a written property answers to when read back.
+///
+/// nmcli accepts short aliases when writing — `wifi.mode`,
+/// `wifi-sec.key-mgmt` — and rejects those same names when reading,
+/// where only the long form is a field. Measured, not assumed:
+/// `nmcli -g wifi.mode connection show <id>` answers
+/// `invalid field 'wifi.mode'`. Comparing by the written name would
+/// therefore never match on an aliased key, and a check that never
+/// matches is a check that does nothing.
+///
+/// Secrets are [`NmPropRead::Secret`]. NetworkManager withholds
+/// them unless asked with `-s` — a passphrase reads back as
+/// `<hidden>` — and asking is not something this plugin does.
+fn nm_prop_read_name(write_key: &str) -> NmPropRead {
+    match write_key {
+        k if k.starts_with("wifi-sec.")
+            || k.starts_with("802-11-wireless-security.") =>
+        {
+            NmPropRead::Secret
+        }
+        "wifi.mode" | "802-11-wireless.mode" => {
+            NmPropRead::Field("802-11-wireless.mode")
+        }
+        "wifi.ssid" | "802-11-wireless.ssid" => {
+            NmPropRead::Field("802-11-wireless.ssid")
+        }
+        "wifi.hidden" | "802-11-wireless.hidden" => {
+            NmPropRead::Field("802-11-wireless.hidden")
+        }
+        "wifi.band" | "802-11-wireless.band" => {
+            NmPropRead::Field("802-11-wireless.band")
+        }
+        "wifi.channel" | "802-11-wireless.channel" => {
+            NmPropRead::Field("802-11-wireless.channel")
+        }
+        "autoconnect" | "connection.autoconnect" => {
+            NmPropRead::Field("connection.autoconnect")
+        }
+        "connection.interface-name" => {
+            NmPropRead::Field("connection.interface-name")
+        }
+        "connection.autoconnect-priority" => {
+            NmPropRead::Field("connection.autoconnect-priority")
+        }
+        "ipv4.method" => NmPropRead::Field("ipv4.method"),
+        "ipv4.addresses" => NmPropRead::Field("ipv4.addresses"),
+        "ipv4.gateway" => NmPropRead::Field("ipv4.gateway"),
+        "ipv4.dns" => NmPropRead::Field("ipv4.dns"),
+        "ipv6.method" => NmPropRead::Field("ipv6.method"),
+        _ => NmPropRead::Unknown,
+    }
+}
+
+/// Do a written value and a read-back value say the same thing?
+///
+/// Lists survive the round trip in a different shape — several DNS
+/// servers are written separated by spaces and come back separated
+/// by commas — so both sides are reduced to their elements before
+/// being compared. Everything else compares as trimmed text.
+fn nm_prop_values_match(want: &str, live: &str) -> bool {
+    let split = |s: &str| -> Vec<String> {
+        s.split([',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    split(want) == split(live)
 }
 
 fn push_nm_ap_channel(seq: &mut Vec<String>, wifi: &WifiIntent) {
@@ -9316,6 +10600,1190 @@ version = 1
         assert!(sta_psk_raw.contains("\"cipher\": \"xchacha20poly1305\""));
     }
 
+    #[test]
+    fn no_bindable_device_failure_recognises_the_loopback_refusal() {
+        // The exact shape NetworkManager emits when it falls back
+        // to considering lo for an ethernet profile.
+        assert!(is_no_bindable_device_failure(
+            "nmcli failed (args [\"connection\", \"up\"], strategy sudo): \
+             Error: Connection activation failed: No suitable device found \
+             for this connection (device lo not available because \
+             profile connection type is not loopback)."
+        ));
+        assert!(is_no_bindable_device_failure(
+            "No suitable device found for this connection"
+        ));
+    }
+
+    #[test]
+    fn no_bindable_device_failure_leaves_real_failures_alone() {
+        // A failure the operator can act on must stay an error.
+        for msg in [
+            "Error: Connection activation failed: IP configuration could not \
+             be reserved (no available address, timeout, or no DHCP server)",
+            "Error: Connection activation failed: Secrets were required but \
+             not provided",
+            "Error: unknown connection 'evo-network-ethernet'",
+            "Error: Connection activation failed: The device carrier is off",
+        ] {
+            assert!(
+                !is_no_bindable_device_failure(msg),
+                "must stay an error: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_continues_when_ethernet_cannot_bind_to_a_device() {
+        // The defect: apply_regdomain runs first and succeeds, then
+        // ensure_ethernet's activation fails because NM can only
+        // offer lo, and the `?` threw the whole apply away — taking
+        // the country write with it. A country change must not die
+        // because an ethernet profile has nothing to bind to.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:eth0\\nGENERAL.TYPE:ethernet\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:--\\nGENERAL.HWADDR:AA:BB:CC:DD:EE:01\\nGENERAL.MTU:1500\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo \"Error: Connection activation failed: No suitable device found for this connection (device lo not available because profile connection type is not loopback).\" >&2\n\
+  exit 4\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let apply_req = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": true },
+                    "wifi": { "role": "disabled", "ifname": "wlan0" },
+                    "fallback": { "hotspot_enabled": false },
+                    "radio_policy": { "country": "GB" }
+                }
+            }),
+            1601,
+        );
+        let out = p
+            .handle_request(&apply_req)
+            .await
+            .expect("apply must not fail because ethernet could not bind");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("GB")),
+            "the country step must survive the ethernet failure: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("not activated")),
+            "the un-bindable ethernet profile must be reported, not \
+             swallowed: {steps:?}"
+        );
+    }
+
+    /// Mock `iw` presenting one STA-capable radio under the given
+    /// ifname, plus a mock `nmcli` that refuses any scan pinned to
+    /// an interface the mock `iw` did not list — the way the real
+    /// nmcli refuses a name that is not on the box.
+    fn write_wifi_mocks(
+        dir: &std::path::Path,
+        live_ifname: &str,
+    ) -> (String, String) {
+        let iw_path = dir.join("iw-mock.sh");
+        std::fs::write(
+            &iw_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface {live}\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                live = live_ifname
+            ),
+        )
+        .expect("write iw mock");
+        let nmcli_path = dir.join("nmcli-scan-mock.sh");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+args=\"$*\"\n\
+# Refuse a pin naming an interface this host does not have,\n\
+# which is what the field hit with `ifname wlan0`.\n\
+if [[ \"$args\" == *\"ifname \"* && \"$args\" != *\"ifname {live}\"* ]]; then\n\
+  echo \"Error: Device '' not found.\" >&2\n\
+  exit 10\n\
+fi\n\
+if [[ \"$args\" == *\"SSID,SIGNAL,SECURITY,ACTIVE\"* ]]; then\n\
+  echo 'Guest (Lobby) Net:78:WPA2:no'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$args\" == *\"BSSID,SSID,SIGNAL,FREQ,ACTIVE\"* ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$args\" == *\"general status\"* ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                live = live_ifname
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod iw");
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod nmcli");
+        }
+        (
+            iw_path.to_string_lossy().to_string(),
+            nmcli_path.to_string_lossy().to_string(),
+        )
+    }
+
+    fn wifi_mock_plugin(
+        dir: &std::path::Path,
+        live_ifname: &str,
+    ) -> NetworkPlugin {
+        let (iw_path, nmcli_path) = write_wifi_mocks(dir, live_ifname);
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.iw_path = iw_path;
+        p.inner_mut().config.nmcli_path = nmcli_path;
+        // The configured default is the stale one on this host.
+        p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
+        p
+    }
+
+    /// nmcli mock that answers as a host with an existing STA
+    /// profile for `profile_ssid`, and logs every argv line.
+    fn write_sta_profile_mock(
+        dir: &std::path::Path,
+        profile_ssid: &str,
+    ) -> (String, std::path::PathBuf) {
+        let path = dir.join("nmcli-sta.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"-g\" && \"$2\" == \"802-11-wireless.ssid\" ]]; then\n\
+  echo '{ssid}'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                ssid = profile_ssid
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        (path.to_string_lossy().to_string(), log)
+    }
+
+    #[tokio::test]
+    async fn a_settings_write_without_the_passphrase_keeps_it() {
+        // Every settings write that is not a join omits the
+        // passphrase — a country change, an AP toggle, a radio
+        // switch. Treating that as "clear" wiped the stored one on
+        // each of them, and nothing noticed until something needed
+        // it and found none.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+
+        let base = serde_json::json!({
+            "version": 1,
+            "ethernet": { "enabled": false },
+            "wifi": { "role": "sta", "ifname": "wlan0",
+                      "sta_ssid": "Guest (Lobby) Net" },
+            "fallback": { "hotspot_enabled": false }
+        });
+
+        // A join: the passphrase is supplied and stored.
+        let set_with = req(
+            REQUEST_NETWORK_INTENT_SET,
+            serde_json::json!({ "intent": base, "sta_psk": "correct horse",
+                                "apply": false }),
+            2701,
+        );
+        p.handle_request(&set_with).await.expect("set with psk");
+        let after_join: Value = serde_json::from_slice(
+            &p.handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                2702,
+            ))
+            .await
+            .expect("get")
+            .payload,
+        )
+        .expect("json");
+        assert_eq!(after_join["sta_psk_configured"], true);
+
+        // A later settings write that simply omits the field.
+        let set_without = req(
+            REQUEST_NETWORK_INTENT_SET,
+            serde_json::json!({ "intent": base, "apply": false }),
+            2703,
+        );
+        p.handle_request(&set_without)
+            .await
+            .expect("set without psk");
+        let after_settings: Value = serde_json::from_slice(
+            &p.handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                2704,
+            ))
+            .await
+            .expect("get")
+            .payload,
+        )
+        .expect("json");
+        assert_eq!(
+            after_settings["sta_psk_configured"], true,
+            "omitting the field must not clear the stored passphrase"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_empty_passphrase_is_refused_not_a_clear() {
+        // An empty box on a form is far more often a mistake than
+        // an operator asking to forget a network. Forgetting has
+        // its own verb.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_SET,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "Guest (Lobby) Net" },
+                        "fallback": { "hotspot_enabled": false }
+                    },
+                    "sta_psk": "",
+                    "apply": false
+                }),
+                2705,
+            ))
+            .await;
+        assert!(
+            matches!(out, Err(PluginError::Permanent(ref m))
+                     if m.contains("supplied empty")),
+            "empty must be refused, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_reuses_the_saved_passphrase_instead_of_downing_the_station()
+    {
+        // The failure this exists for: no sidecar, a profile
+        // already on this SSID, and the apply took the station
+        // down before discovering it had no passphrase to put it
+        // back with. The operator lost the network and the box
+        // went Offline.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli_path, log) =
+            write_sta_profile_mock(dir.path(), "Guest (Lobby) Net");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli_path;
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_APPLY,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "Guest (Lobby) Net",
+                                  "sta_open": false },
+                        "fallback": { "hotspot_enabled": false }
+                    }
+                }),
+                2706,
+            ))
+            .await
+            .expect("apply must not refuse when the saved passphrase fits");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-wifi-sta")),
+            "the station must be brought up: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.contains("wifi-sec.psk")),
+            "the saved passphrase must be left alone, not rewritten: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_changed_ssid_before_touching_the_station() {
+        // A different SSID is a different network; the saved
+        // passphrase does not apply. Refuse while the operator
+        // still has their connection.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli_path, log) =
+            write_sta_profile_mock(dir.path(), "Guest (Lobby) Net");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli_path;
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_APPLY,
+                serde_json::json!({
+                    "intent": {
+                        "version": 1,
+                        "ethernet": { "enabled": false },
+                        "wifi": { "role": "sta", "ifname": "wlan0",
+                                  "sta_ssid": "A Different Network",
+                                  "sta_open": false },
+                        "fallback": { "hotspot_enabled": false }
+                    }
+                }),
+                2707,
+            ))
+            .await;
+        assert!(
+            matches!(out, Err(PluginError::Permanent(_))),
+            "a changed SSID with no passphrase must refuse, got {out:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.starts_with("connection down evo-network-wifi-sta")),
+            "the live station must not be taken down before the refusal: \
+             {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hotspot_profile_is_written_when_the_sta_is_down_on_one_radio() {
+        // The hole: the channel read runs only where the AP has
+        // its own interface, so on a single-radio box the sync
+        // flag could never become true and the deferral fired on
+        // every apply — the profile was never written at all, and
+        // the glass said Enabled over a radio that had never been
+        // asked to beacon. With no STA on the air there is no
+        // channel to race, so the AP must go up on the operator's
+        // own channel.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-ap.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        // `iw` reports one radio and no association: the STA is
+        // configured but not on the air.
+        let iw_path = dir.path().join("iw-down.sh");
+        std::fs::write(
+            &iw_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" && \"$3\" == \"link\" ]]; then\n\
+  echo 'Not connected.'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        // Same-iface: no explicit hotspot ifname, so the AP lands
+        // on the STA's own radio — the single-radio shape.
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "Guest (Lobby) Net",
+                        "sta_open": true,
+                        "ap_ssid": "evo-4466",
+                        "ap_channel": 4
+                    },
+                    "fallback": {
+                        "hotspot_enabled": true,
+                        "hotspot_ifname": ""
+                    }
+                }
+            }),
+            1901,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().any(|l| l.starts_with("connection add")
+                || l.starts_with("connection modify")),
+            "the hotspot profile must be written, not deferred forever: \
+             {calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-hotspot")),
+            "the AP must be brought up once the profile exists: {calls}"
+        );
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !steps.iter().any(|s| s.contains("shared-PHY defer")),
+            "a radio with no STA on it has nothing to defer for: {steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_empty_sta_ssid_still_raises_an_enabled_hotspot() {
+        // Glass AP Save with no saved STA writes empty sta_ssid +
+        // hotspot_enabled. Forget-STA must not return before the
+        // hotspot tail — that left the AP Off after a name change.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-ap-forget.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"show\" ]]; then\n\
+  exit 1\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw_path = dir.path().join("iw-down.sh");
+        std::fs::write(
+            &iw_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"dev\" && \"$3\" == \"link\" ]]; then\n\
+  echo 'Not connected.'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"dev\" ]]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"$2\" == \"info\" ]]; then\n\
+  printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "",
+                        "sta_open": true,
+                        "ap_ssid": "evo-renamed",
+                        "ap_channel": 4
+                    },
+                    "fallback": {
+                        "hotspot_enabled": true,
+                        "hotspot_ifname": ""
+                    }
+                }
+            }),
+            1902,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let steps: Vec<String> = v["apply"]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|s| s.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("no station in intent")),
+            "empty STA must be reported as absent, not forgotten: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.contains("hotspot brought down")),
+            "enabled hotspot must not be torn down by an AP save: {steps:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let hotspot_ups = calls
+            .lines()
+            .filter(|l| l.starts_with("connection up evo-network-hotspot"))
+            .count();
+        assert_eq!(
+            hotspot_ups, 1,
+            "AP Save must raise the hotspot once, not bounce it: {calls}"
+        );
+        // Profile survival is asserted by
+        // `apply_with_empty_sta_ssid_keeps_a_saved_station_and_its_secret`,
+        // whose mock reports the profile present. Asserting it here
+        // would be vacuous: this mock answers `connection show` with
+        // nothing, so a purge would find nothing to delete and the
+        // assertion could not fail.
+    }
+
+    /// An apply whose intent carries no station SSID must leave a
+    /// saved station and its secret exactly where they are.
+    ///
+    /// Apply ships the whole intent, so any save from a page that
+    /// does not own the station fields arrives with an empty SSID.
+    /// Treating that as a forget deleted the NM profile and the PSK
+    /// sidecar together, which is unrecoverable from the glass: the
+    /// association is gone and so is the passphrase needed to
+    /// rebuild it. Forgetting is the `wifi.forget` verb, and only
+    /// the verb.
+    #[tokio::test]
+    async fn apply_with_empty_sta_ssid_keeps_a_saved_station_and_its_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-keep-sta.sh");
+        let log = dir.path().join("nmcli.log");
+
+        // `connection show` reports the station profile present, so
+        // a purge would find something to delete and the assertion
+        // below is not vacuous.
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  *connection\\ show*) printf 'evo-network-wifi-sta\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        std::fs::write(&psk_path, "supersecret").expect("write PSK");
+
+        // An AP-only save: the station fields are untouched and so
+        // arrive empty.
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": {
+                        "role": "sta",
+                        "ifname": "wlan0",
+                        "sta_ssid": "",
+                        "ap_ssid": "evo-4466",
+                        "ap_channel": 4
+                    },
+                    "fallback": { "hotspot_enabled": true }
+                }
+            }),
+            1904,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.lines().any(
+                |l| l.starts_with("connection delete evo-network-wifi-sta")
+            ),
+            "the station profile must survive an empty-SSID apply: {calls}"
+        );
+        assert!(
+            psk_path.exists(),
+            "the PSK sidecar must survive an empty-SSID apply"
+        );
+    }
+
+    /// The counterpart: the verb still purges both. If this ever
+    /// fails alongside the test above passing, forgetting has been
+    /// removed rather than moved.
+    #[tokio::test]
+    async fn wifi_forget_verb_still_purges_the_profile_and_the_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-forget-verb.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  *connection\\ show*) printf 'evo-network-wifi-sta\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        std::fs::write(&psk_path, "supersecret").expect("write PSK");
+        let mut seeded = NetworkIntent::default();
+        seeded.wifi.sta_ssid = "Guest (Lobby) Net".to_string();
+        p.save_intent(&seeded).await.expect("save intent");
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_WIFI_FORGET,
+                serde_json::json!({}),
+                1905,
+            ))
+            .await
+            .expect("forget");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert_eq!(v["forgotten"], true);
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().any(
+                |l| l.starts_with("connection delete evo-network-wifi-sta")
+            ),
+            "the verb must delete the station profile: {calls}"
+        );
+        assert!(!psk_path.exists(), "the verb must remove the PSK sidecar");
+        let after = p.load_intent().await.expect("load intent");
+        assert!(
+            after.wifi.sta_ssid.is_empty(),
+            "the verb must blank the persisted SSID"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_empty_sta_ssid_downs_hotspot_when_intent_disables_it() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-forget-off.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let apply = req(
+            REQUEST_NETWORK_INTENT_APPLY,
+            serde_json::json!({
+                "intent": {
+                    "version": 1,
+                    "ethernet": { "enabled": false },
+                    "wifi": { "role": "sta", "ifname": "wlan0", "sta_ssid": "" },
+                    "fallback": { "hotspot_enabled": false }
+                }
+            }),
+            1903,
+        );
+        let out = p.handle_request(&apply).await.expect("apply");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("connection down evo-network-hotspot")),
+            "disabled hotspot must still come down: {calls}"
+        );
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.starts_with("connection up evo-network-hotspot")),
+            "disabled hotspot must not be raised: {calls}"
+        );
+    }
+
+    #[test]
+    fn phy_exclusive_failure_recognises_the_flag_refusal() {
+        // The line the NUC's journal actually carried.
+        assert!(is_phy_exclusive_failure(
+            "Error: Connection activation failed: Could not set interface \
+             ap0 flags (UP): Device or resource busy"
+        ));
+        assert!(is_phy_exclusive_failure(
+            "could not set interface ap0 flags (up): device or resource busy"
+        ));
+    }
+
+    #[test]
+    fn phy_exclusive_failure_leaves_other_contention_alone() {
+        // Busy without the flag-set refusal is some other
+        // contention and still worth the existing retries.
+        for msg in [
+            "Error: Connection activation failed: Device or resource busy",
+            "Error: Connection activation failed: Secrets were required but \
+             not provided",
+            "Error: Connection activation failed: The Wi-Fi network could \
+             not be found",
+            "Error: Connection activation failed: IP configuration could \
+             not be reserved",
+        ] {
+            assert!(
+                !is_phy_exclusive_failure(msg),
+                "must stay retryable / a normal failure: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hotspot_bringup_stops_on_an_exclusive_radio_instead_of_retrying() {
+        // The NUC. Its PHY advertises managed and AP in one
+        // combination, so the capability read says concurrency is
+        // legal — but the driver refuses the vif's UP flag, and
+        // the old loop retried four times, dragging the STA down
+        // on each attempt. One attempt, one verdict, STA left
+        // alone.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-excl.sh");
+        let call_log = dir.path().join("up-calls.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo up >> \"{log}\"\n\
+  echo \"Error: Connection activation failed: Could not set interface ap0 flags (UP): Device or resource busy\" >&2\n\
+  exit 4\n\
+fi\n\
+exit 0\n",
+                log = call_log.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let mut steps: Vec<String> = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(
+            verdict,
+            HotspotBringUp::PhyExclusive,
+            "the driver's refusal must be read as an exclusive radio"
+        );
+        let attempts = std::fs::read_to_string(&call_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "an exclusive radio must be concluded on the first attempt, not \
+             retried — each retry is what pulled the STA down"
+        );
+    }
+
+    #[tokio::test]
+    async fn hotspot_bringup_still_retries_an_ordinary_failure() {
+        // The counterpart: a failure that is not the exclusive
+        // signature keeps the existing retry budget.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-retry.sh");
+        let call_log = dir.path().join("up-calls.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"connection\" && \"$2\" == \"up\" ]]; then\n\
+  echo up >> \"{log}\"\n\
+  echo \"Error: Connection activation failed: The Wi-Fi network could not be found\" >&2\n\
+  exit 4\n\
+fi\n\
+exit 0\n",
+                log = call_log.display()
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let mut steps: Vec<String> = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let attempts = std::fs::read_to_string(&call_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            attempts > 1,
+            "an ordinary failure must keep its retries, saw {attempts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_without_ifname_uses_the_live_radio_not_wlan0() {
+        // The field case: the only STA radio is wlp0s20f3, the UI
+        // sends {refresh:true} and no ifname, and the configured
+        // default pinned `wlan0` — a name for nothing — so nmcli
+        // refused and the operator got a 400 instead of a list.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+
+        // Pin the resolution itself: without this the test would
+        // also pass on an empty inventory, where scan omits the
+        // ifname and the mock answers anyway.
+        assert_eq!(
+            p.inner_mut().resolve_wifi_sta_ifname(None).await.as_deref(),
+            Some("wlp0s20f3"),
+            "the resolver must name the radio that is on the box"
+        );
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_SCAN,
+                serde_json::json!({ "refresh": true }),
+                1701,
+            ))
+            .await
+            .expect("scan must not fail on a host without wlan0");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        let rows = v["available"].as_array().expect("available rows");
+        assert!(
+            rows.iter().any(|r| r["ssid"] == "Guest (Lobby) Net"),
+            "the live radio's networks must come back: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_still_works_where_wlan0_is_the_live_radio() {
+        // The Pi. Same path, and the answer must not change.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlan0");
+
+        assert_eq!(
+            p.inner_mut().resolve_wifi_sta_ifname(None).await.as_deref(),
+            Some("wlan0"),
+            "the Pi's real wlan0 must still resolve"
+        );
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_SCAN,
+                serde_json::json!({ "refresh": true }),
+                1702,
+            ))
+            .await
+            .expect("scan must still work where wlan0 is real");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert!(v["available"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|r| r["ssid"] == "Guest (Lobby) Net"));
+    }
+
+    #[tokio::test]
+    async fn scan_honours_an_explicit_operator_pin() {
+        // An operator naming a radio is a choice, not a stale
+        // default, and it is passed through untouched.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+        let resolved =
+            p.inner_mut().resolve_wifi_sta_ifname(Some("wlan1")).await;
+        assert_eq!(resolved.as_deref(), Some("wlan1"));
+    }
+
+    #[tokio::test]
+    async fn scan_names_no_interface_when_there_are_no_radios() {
+        // No inventory means nothing honest to pin. Naming a ghost
+        // guarantees a refusal; naming nothing does not scan.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let iw_path = dir.path().join("iw-empty.sh");
+        std::fs::write(&iw_path, "#!/usr/bin/env bash\nexit 0\n")
+            .expect("write");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &iw_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        assert_eq!(p.inner_mut().resolve_wifi_sta_ifname(None).await, None);
+    }
+
+    #[tokio::test]
+    async fn intent_get_publishes_the_live_sta_ifname() {
+        // The intent's serde default is wlan0, so a device that
+        // never had one published a radio it does not own — and
+        // the UI sent that name straight back on every scan.
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = wifi_mock_plugin(dir.path(), "wlp0s20f3");
+
+        let out = p
+            .handle_request(&req(
+                REQUEST_NETWORK_INTENT_GET,
+                serde_json::json!({}),
+                1703,
+            ))
+            .await
+            .expect("intent.get");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(
+            v["intent"]["wifi"]["ifname"], "wlp0s20f3",
+            "intent.get must publish the radio on the box: {v}"
+        );
+    }
+
     #[tokio::test]
     async fn request_flow_apply_works_with_mock_nmcli() {
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
@@ -9675,6 +12143,113 @@ exit 0\n",
         assert_eq!(status_v["degraded"], true);
         assert_eq!(status_v["domain_health"]["device_table"]["ok"], false);
         assert_eq!(status_v["domain_health"]["general_status"]["ok"], true);
+        assert_eq!(status_v["domain_health"]["wifi_scan"]["skipped"], true);
+    }
+
+    #[tokio::test]
+    async fn status_does_not_scan() {
+        // Glass polls status every few seconds. Scanning the PHY
+        // from look-only fights a live AP (brcmf -52 / AP scan).
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-status-noscans.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$3\" == GENERAL.DEVICE* ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"general\" && \"$2\" == \"status\" ]]; then\n\
+  echo connected\n\
+  exit 0\n\
+fi\n\
+if [[ \"$1\" == \"-t\" && \"$2\" == \"-f\" && \"$4\" == \"radio\" ]]; then\n\
+  echo \"enabled:enabled:enabled:enabled\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+
+        let status_req =
+            req(REQUEST_NETWORK_STATUS, serde_json::json!({}), 1910);
+        let out = p.handle_request(&status_req).await.expect("status");
+        let v: Value = serde_json::from_slice(&out.payload).expect("json");
+        assert_eq!(v["status"], "ok", "payload: {v}");
+        assert_eq!(v["domain_health"]["wifi_scan"]["skipped"], true);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("wifi list"),
+            "status must not scan: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_scan_does_not_target_an_ap_iface() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-no-ap-scan.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli_path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw_path = dir.path().join("iw-empty.sh");
+        std::fs::write(&iw_path, "#!/usr/bin/env bash\nexit 0\n")
+            .expect("write iw");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(
+                &nmcli_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                &iw_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().loaded.store(true, Relaxed);
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().to_string();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().to_string();
+
+        let rows = p.inner_mut().wifi_scan(Some("ap0")).await.expect("scan");
+        assert!(rows.is_empty(), "AP iface is not a scan target");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("ifname ap0") && !calls.contains("wifi list"),
+            "must not nmcli-scan ap0 or every wifi device: {calls}"
+        );
     }
 
     #[tokio::test]
@@ -9716,13 +12291,21 @@ exit 0\n",
             nmcli_path.to_string_lossy().to_string();
         p.inner_mut().config.scan_cache_ttl_ms = 60000;
 
-        let scan_req_1 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1101);
+        let scan_req_1 = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "ifname": "wlan0" }),
+            1101,
+        );
         p.handle_request(&scan_req_1).await.expect("scan-1");
-        let scan_req_2 = req(REQUEST_NETWORK_SCAN, serde_json::json!({}), 1102);
+        let scan_req_2 = req(
+            REQUEST_NETWORK_SCAN,
+            serde_json::json!({ "ifname": "wlan0" }),
+            1102,
+        );
         p.handle_request(&scan_req_2).await.expect("scan-2");
         let scan_req_3 = req(
             REQUEST_NETWORK_SCAN,
-            serde_json::json!({ "refresh": true }),
+            serde_json::json!({ "ifname": "wlan0", "refresh": true }),
             1103,
         );
         p.handle_request(&scan_req_3).await.expect("scan-3");
@@ -10182,6 +12765,17 @@ exit 0\n",
     }
 
     #[test]
+    fn ap_ifnames_are_not_scan_targets() {
+        assert!(is_ap_scan_ifname("ap0"));
+        assert!(is_ap_scan_ifname("AP0"));
+        assert!(is_ap_scan_ifname("ap"));
+        assert!(is_ap_scan_ifname("p2p-dev-ap0"));
+        assert!(!is_ap_scan_ifname("wlan0"));
+        assert!(!is_ap_scan_ifname("wlp0s20f3"));
+        assert!(!is_ap_scan_ifname("aphost"));
+    }
+
+    #[test]
     fn parse_iw_link_full_associated() {
         let raw = "Connected to aa:11:22:33:44:55 (on wlan0)\n\
                    \tSSID: example-network\n\
@@ -10212,6 +12806,102 @@ exit 0\n",
         assert_eq!(w.band, "2.4ghz");
         assert!(w.bitrate_mbps.is_none());
         assert!(w.signal_dbm.is_none());
+    }
+
+    /// A beaconing AP vif must yield its live SSID.
+    /// The block below is the field shape `iw dev ap0 info`
+    /// prints on a brcmfmac AP vif with the hotspot up
+    /// (identifiers synthetic): the AP reports its SSID here
+    /// and nowhere else, because `iw dev ap0 link` answers
+    /// `Not connected.` for an interface that beacons instead
+    /// of associating.
+    #[test]
+    fn parse_iw_dev_info_reads_a_beaconing_ap() {
+        let raw = "Interface ap0\n\
+                   \tifindex 8\n\
+                   \twdev 0x2\n\
+                   \taddr AA:11:22:33:44:66\n\
+                   \tssid evo-4466\n\
+                   \ttype AP\n\
+                   \twiphy 0\n\
+                   \tchannel 36 (5180 MHz), width: 80 MHz, \
+                   center1: 5210 MHz\n\
+                   \ttxpower 31.00 dBm\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.iftype, "AP");
+        assert_eq!(info.wifi.ssid, "evo-4466");
+        // In AP mode the vif's own MAC is the BSSID clients see.
+        assert_eq!(info.wifi.bssid, "aa:11:22:33:44:66");
+        assert_eq!(info.wifi.channel, Some(36));
+        assert_eq!(info.wifi.freq_mhz, Some(5180));
+        assert_eq!(info.wifi.band, "5ghz");
+        // An AP has no association, so no signal and no
+        // bitrate — those must stay absent rather than zero.
+        assert!(info.wifi.signal_dbm.is_none());
+        assert!(info.wifi.bitrate_mbps.is_none());
+    }
+
+    /// An SSID is free text. `iw` prints it unquoted to end of
+    /// line, so a name carrying a space and parentheses must
+    /// survive intact — a first-token parse would truncate
+    /// `Guest (Lobby) Net` to `Guest`.
+    #[test]
+    fn parse_iw_dev_info_keeps_an_ssid_with_spaces() {
+        let raw = "Interface wlan1\n\
+                   \tifindex 3\n\
+                   \twdev 0x1\n\
+                   \taddr aa:11:22:33:44:77\n\
+                   \tssid Guest (Lobby) Net\n\
+                   \ttype managed\n\
+                   \twiphy 0\n\
+                   \tchannel 48 (5240 MHz), width: 80 MHz, \
+                   center1: 5210 MHz\n\
+                   \ttxpower 22.00 dBm\n\
+                   \tmulticast TXQ:\n\
+                   \t\tqsz-byt\tqsz-pkt\tflows\tdrops\n\
+                   \t\t0\t0\t0\t0\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.wifi.ssid, "Guest (Lobby) Net");
+        assert_eq!(info.iftype, "managed");
+        assert_eq!(info.wifi.channel, Some(48));
+        assert_eq!(info.wifi.freq_mhz, Some(5240));
+    }
+
+    /// A created-but-idle AP vif still prints its `Interface`
+    /// block. With no `ssid` line there is nothing on the air,
+    /// so nothing may reach the wire.
+    #[test]
+    fn parse_iw_dev_info_on_an_idle_ap_has_no_ssid() {
+        let raw = "Interface ap0\n\
+                   \tifindex 8\n\
+                   \twdev 0x2\n\
+                   \taddr aa:11:22:33:44:66\n\
+                   \ttype AP\n";
+        let info = parse_iw_dev_info(raw);
+        assert_eq!(info.iftype, "AP");
+        assert!(
+            info.wifi.ssid.is_empty(),
+            "an idle AP must not report an SSID"
+        );
+    }
+
+    /// The AP-vif name shape is its own predicate: `ap*` picks
+    /// the beaconing vif, and must not swallow a STA radio or
+    /// the P2P companion device (which is `wifi-p2p`, never a
+    /// `wifi` row). `is_ap_scan_ifname` keeps covering both.
+    #[test]
+    fn is_ap_vif_ifname_separates_ap_vifs_from_sta_and_p2p() {
+        for name in ["ap", "ap0", "ap1", "AP0", " ap0 "] {
+            assert!(is_ap_vif_ifname(name), "{name} is an AP vif");
+            assert!(is_ap_scan_ifname(name), "{name} is not a scan target");
+        }
+        for name in ["wlan0", "wlp2s0", "apple0", "eth0", "p2p-dev-wlan0"] {
+            assert!(!is_ap_vif_ifname(name), "{name} is not an AP vif");
+        }
+        // The P2P companion is still excluded from scans, just
+        // not by the AP-vif rule.
+        assert!(is_ap_scan_ifname("p2p-dev-wlan0"));
+        assert!(!is_ap_scan_ifname("wlan0"));
     }
 
     #[test]
@@ -10490,16 +13180,10 @@ exit 0\n",
     /// disconnected radio as associated.
     #[tokio::test]
     async fn wifi_interface_is_associated_word_boundary() {
-        // Rebuild the predicate inline against the NM state
-        // vocabulary rather than mocking `nm_device_table`.
-        // The check is what matters — same logic that
-        // `wifi_interface_is_associated` uses.
-        let is_associated = |s: &str| -> bool {
-            let s = s.trim();
-            s == "connected"
-                || s.starts_with("connected ")
-                || s.starts_with("connected(")
-        };
+        // Bound to the real predicate every association gate
+        // in this plugin now calls, so a regression in it fails
+        // here rather than passing against a copy.
+        let is_associated = nm_state_is_connected;
         assert!(is_associated("connected"));
         assert!(is_associated("connected (site only)"));
         assert!(is_associated("connected (local only)"));
@@ -10948,6 +13632,1040 @@ exit 0\n",
             elapsed < Duration::from_millis(3000),
             "waited {:?}; timeout guard did not fire in bounded time",
             elapsed
+        );
+    }
+
+    /// The device table must carry a connected AP vif's live
+    /// SSID, and must still read a STA from `link` alone.
+    ///
+    /// Both halves are pinned by the recorded `iw` argv: `ap0`
+    /// is asked `info` and never `link` (which would answer
+    /// `Not connected.` and drop the row's wifi block, the
+    /// defect), and `wlan0` is asked `link` and never `info`
+    /// (the STA path does not move).
+    #[tokio::test]
+    async fn connected_ap_row_carries_the_beaconing_ssid() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = dir.path().join("nmcli-mock.sh");
+        let iw_path = dir.path().join("iw-mock.sh");
+        let iw_log = dir.path().join("iw.log");
+
+        // Shared-PHY shape: hotspot on `ap0`, STA on `wlan0`.
+        std::fs::write(
+            &nmcli_path,
+            "#!/usr/bin/env bash\n\
+if [[ \"$1\" == \"-t\" && \"$4\" == \"device\" && \"$5\" == \"show\" ]]; then\n\
+  printf 'GENERAL.DEVICE:ap0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-hotspot\\nGENERAL.HWADDR:AA:11:22:33:44:66\\nGENERAL.MTU:1500\\n\\nGENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:100 (connected)\\nGENERAL.CONNECTION:evo-network-wifi-sta\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        )
+        .expect("write nmcli mock");
+
+        std::fs::write(
+            &iw_path,
+            format!(
+                r#"#!/usr/bin/env bash
+echo "$@" >> "{}"
+if [[ "$1" == "dev" && "$2" == "ap0" && "$3" == "info" ]]; then
+  printf 'Interface ap0\n\tifindex 8\n\twdev 0x2\n\taddr aa:11:22:33:44:66\n\tssid evo-4466\n\ttype AP\n\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n'
+  exit 0
+fi
+if [[ "$1" == "dev" && "$2" == "wlan0" && "$3" == "link" ]]; then
+  printf 'Connected to aa:11:22:33:44:55 (on wlan0)\n\tSSID: Guest (Lobby) Net\n\tfreq: 5180\n\tsignal: -58 dBm\n'
+  exit 0
+fi
+exit 1
+"#,
+                iw_log.display()
+            ),
+        )
+        .expect("write iw mock");
+
+        #[cfg(unix)]
+        for path in [&nmcli_path, &iw_path] {
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_path = iw_path.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let rows = p.inner_mut().nm_device_table().await.expect("device table");
+
+        let ap = rows
+            .iter()
+            .find(|r| r.device == "ap0")
+            .expect("ap0 row present");
+        let ap_wifi = ap
+            .wifi
+            .as_ref()
+            .expect("connected ap0 must carry a wifi block");
+        assert_eq!(
+            ap_wifi.ssid, "evo-4466",
+            "ap0 must carry the SSID it is beaconing"
+        );
+        assert_eq!(ap_wifi.channel, Some(36));
+        assert_eq!(ap_wifi.band, "5ghz");
+
+        let sta = rows
+            .iter()
+            .find(|r| r.device == "wlan0")
+            .expect("wlan0 row present");
+        let sta_wifi = sta
+            .wifi
+            .as_ref()
+            .expect("associated wlan0 must carry a wifi block");
+        assert_eq!(sta_wifi.ssid, "Guest (Lobby) Net");
+        assert_eq!(sta_wifi.signal_dbm, Some(-58));
+
+        let log = std::fs::read_to_string(&iw_log).expect("iw log");
+        assert!(
+            log.contains("dev ap0 info"),
+            "ap0 must be read with `info`: {log}"
+        );
+        assert!(
+            !log.contains("dev ap0 link"),
+            "`link` on an AP vif answers Not connected. — never ask it: {log}"
+        );
+        assert!(
+            log.contains("dev wlan0 link"),
+            "the STA path must still read `link`: {log}"
+        );
+        assert!(
+            !log.contains("dev wlan0 info"),
+            "the STA path must not move to `info`: {log}"
+        );
+    }
+
+    // --- acquisition of a pre-existing operator network ---
+
+    /// nmcli mock for the acquisition tests. Reports our station
+    /// profile absent, lists whatever `profiles` says, and answers
+    /// the two non-secret field reads. Every invocation is logged so
+    /// a test can assert on what was *not* run.
+    fn acquire_nmcli_mock(dir: &Path, profiles: &str, ssid: &str) -> PathBuf {
+        let path = dir.join("nmcli-acquire.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection show evo-network-wifi-sta\") exit 1 ;;\n\
+  \"-t -f NAME,TYPE connection show\") printf '{profiles}' ;;\n\
+  \"-g 802-11-wireless.ssid connection show \"*) printf '{ssid}\\n' ;;\n\
+  \"-g 802-11-wireless-security.key-mgmt connection show \"*)\n\
+      printf 'wpa-psk\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                profiles = profiles,
+                ssid = ssid,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    /// A device flashed with a network by an imaging tool boots onto
+    /// it while this plugin knows nothing about it. Acquisition
+    /// takes the network over: name recorded, passphrase moved into
+    /// the sidecar, our profile written — and the file that held the
+    /// passphrase in the clear on a removable card is retired.
+    ///
+    /// Nothing is brought up. Acquisition records what is already
+    /// true; changing the radio is what apply is for.
+    #[tokio::test]
+    async fn acquires_the_network_an_imager_left_on_the_boot_partition() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boot_conf = dir.path().join("wpa_supplicant.conf");
+        std::fs::write(
+            &boot_conf,
+            "country=GB\n\
+             ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n\
+             update_config=1\n\
+             \n\
+             network={\n\
+             \tssid=\"Guest (Lobby) Net\"\n\
+             \tpsk=\"correct horse battery\"\n\
+             }\n",
+        )
+        .expect("write boot conf");
+        let nmcli_path = acquire_nmcli_mock(dir.path(), "", "");
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.boot_wifi_conf_paths =
+            vec![boot_conf.to_string_lossy().into_owned()];
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::FromBootFile {
+                ssid: "Guest (Lobby) Net".to_string(),
+                secured: true,
+            }
+        );
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(intent.wifi.sta_ssid, "Guest (Lobby) Net");
+        assert!(!intent.wifi.sta_open);
+
+        let psk_path = p.sta_psk_path().expect("sta_psk_path");
+        let stored = p
+            .read_secret_value_permissive(&psk_path)
+            .await
+            .expect("read sidecar");
+        assert_eq!(stored.as_deref(), Some("correct horse battery"));
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection add type wifi con-name \
+                            evo-network-wifi-sta ssid Guest (Lobby) Net"
+            ),
+            "our profile must be written: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection up")),
+            "acquisition must not bring anything up: {calls}"
+        );
+        assert!(
+            !boot_conf.exists(),
+            "the credentials file must not be left readable on the card"
+        );
+    }
+
+    /// The current imaging tool writes a NetworkManager profile
+    /// rather than a file. Acquisition takes that profile over by
+    /// renaming it, which carries the passphrase without this
+    /// process ever reading it — so there is nothing to leak, by
+    /// construction rather than by care.
+    #[tokio::test]
+    async fn adopts_a_foreign_profile_without_ever_reading_its_secret() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli_path = acquire_nmcli_mock(
+            dir.path(),
+            "evo-network-hotspot:802-11-wireless\\n\
+             Wired connection 1:802-3-ethernet\\n\
+             preconfigured:802-11-wireless\\n",
+            "Guest (Lobby) Net",
+        );
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        // No file source: the boot partition has nothing.
+        p.inner_mut().config.boot_wifi_conf_paths = vec![dir
+            .path()
+            .join("absent.conf")
+            .to_string_lossy()
+            .into_owned()];
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::FromForeignProfile {
+                ssid: "Guest (Lobby) Net".to_string(),
+                previous_name: "preconfigured".to_string(),
+            },
+            "the foreign wifi profile must be the one adopted"
+        );
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(intent.wifi.sta_ssid, "Guest (Lobby) Net");
+        assert!(!intent.wifi.sta_open, "key-mgmt present means secured");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection modify preconfigured connection.id \
+                 evo-network-wifi-sta"
+            ),
+            "adoption must rename the profile in place: {calls}"
+        );
+        // The passphrase stays with NetworkManager. nmcli withholds
+        // secrets unless asked with `-s`, and asking is the only way
+        // one could ever reach this process.
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.split_whitespace().any(|a| a == "-s")),
+            "acquisition must never ask nmcli for secrets: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection up")),
+            "acquisition must not bring anything up: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "adoption must not delete the operator's profile: {calls}"
+        );
+    }
+
+    /// A station the operator has already declared through the
+    /// interface is the answer. Acquisition exists to fill a gap and
+    /// must not overwrite one — not from a stale file left on the
+    /// boot partition, and not from some other profile.
+    #[tokio::test]
+    async fn acquisition_never_overwrites_a_declared_station() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let boot_conf = dir.path().join("wpa_supplicant.conf");
+        std::fs::write(
+            &boot_conf,
+            "network={\n\tssid=\"Stale From Card\"\n\tpsk=\"old\"\n}\n",
+        )
+        .expect("write boot conf");
+        let nmcli_path = acquire_nmcli_mock(
+            dir.path(),
+            "preconfigured:802-11-wireless\\n",
+            "Some Other Net",
+        );
+
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.path().to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path =
+            nmcli_path.to_string_lossy().into_owned();
+        p.inner_mut().config.boot_wifi_conf_paths =
+            vec![boot_conf.to_string_lossy().into_owned()];
+
+        let mut declared = NetworkIntent::default();
+        declared.wifi.sta_ssid = "Chosen On The Glass".to_string();
+        p.save_intent(&declared).await.expect("save intent");
+
+        let outcome = p.acquire_operator_wifi().await.expect("acquire");
+        assert_eq!(outcome, AcquireOutcome::AlreadyDeclared);
+
+        let intent = p.load_intent().await.expect("load intent");
+        assert_eq!(
+            intent.wifi.sta_ssid, "Chosen On The Glass",
+            "a declared station must survive acquisition untouched"
+        );
+        assert!(
+            boot_conf.exists(),
+            "a file that was not consumed must not be retired"
+        );
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.trim().is_empty(),
+            "a declared station must cost no nmcli calls at all: {calls}"
+        );
+    }
+
+    // --- recovery access point for an unreachable device ---
+
+    /// nmcli mock for the recovery tests. Reports one wifi device in
+    /// the state named by `wifi_state`, reports the hotspot profile
+    /// present or absent per `hotspot_exists`, and succeeds at
+    /// everything else. Every invocation is logged in order, so a
+    /// test can assert on sequence as well as content.
+    fn recovery_nmcli_mock(
+        dir: &Path,
+        wifi_state: &str,
+        hotspot_exists: bool,
+    ) -> PathBuf {
+        let path = dir.join("nmcli-recovery.sh");
+        let log = dir.join("nmcli.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection show evo-network-hotspot\") exit {hs_rc} ;;\n\
+  \"-t -f GENERAL.DEVICE\"*)\n\
+      printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 ({state})\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                hs_rc = if hotspot_exists { 0 } else { 1 },
+                state = wifi_state,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    fn recovery_plugin(dir: &Path, nmcli: &Path) -> NetworkPlugin {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli.to_string_lossy().into_owned();
+        // No `iw` on the box under test: the device-table read
+        // tolerates its absence, which keeps this fixture about
+        // recovery rather than about radio introspection.
+        p.inner_mut().config.iw_path =
+            dir.join("no-such-iw").to_string_lossy().into_owned();
+        p
+    }
+
+    /// A device with no way to be reached must raise an access point
+    /// even though it offers no standing one.
+    ///
+    /// `fallback.hotspot_enabled` says whether an access point is
+    /// part of how this device normally runs. It does not say the
+    /// operator would rather the device stayed dark after falling
+    /// off the network. Reading it as a veto left a Wi-Fi-only box
+    /// that lost its network with no route back at all.
+    #[tokio::test]
+    async fn recovery_raises_an_ap_even_when_no_standing_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(raised, "the recovery AP must come up: {steps:?}");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "the AP must be raised: {calls}"
+        );
+    }
+
+    /// A profile recovery writes is open, and does **not** become a
+    /// standing access point. Autoconnect is the whole distinction:
+    /// without it a device that was briefly offline would come back
+    /// permanently beaconing an open network nobody asked for, which
+    /// would make the standing-AP switch meaningless by the back
+    /// door.
+    #[tokio::test]
+    async fn a_recovery_profile_is_open_and_does_not_autoconnect() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        let add = calls
+            .lines()
+            .find(|l| l.starts_with("connection add type wifi"))
+            .expect("a profile must be written when none exists");
+        assert!(add.contains("wifi.mode ap"), "{add}");
+        assert!(add.contains("ssid evo-4466"), "{add}");
+        assert!(
+            add.contains("autoconnect no"),
+            "a recovery AP must not return after a reboot: {add}"
+        );
+        assert!(
+            !add.contains("wifi-sec"),
+            "a recovery AP must be open — a passphrase nobody has \
+             been told is the same as no AP at all: {add}"
+        );
+    }
+
+    /// On a single-radio chipset the AP cannot come up while the
+    /// station still holds the radio. The station goes down first,
+    /// and it is a down and not a delete: nothing about the saved
+    /// network changes, so it returns on its own when its network
+    /// does.
+    #[tokio::test]
+    async fn recovery_releases_the_station_before_raising_the_ap() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        let lines: Vec<&str> = calls.lines().collect();
+        let down = lines
+            .iter()
+            .position(|l| *l == "connection down evo-network-wifi-sta")
+            .expect("the station must be released");
+        let up = lines
+            .iter()
+            .position(|l| l.starts_with("connection up evo-network-hotspot"))
+            .expect("the AP must be raised");
+        assert!(
+            down < up,
+            "the station must be released before the AP is raised: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "recovery must never delete the saved station: {calls}"
+        );
+        // An existing profile is opened rather than replaced.
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot remove \
+                 802-11-wireless-security"
+            ),
+            "an existing hotspot profile must be opened: {calls}"
+        );
+    }
+
+    /// Recovery is for a device that cannot be reached. A device
+    /// with a working uplink is reachable, so nothing is raised and
+    /// nothing is taken down — least of all the station carrying
+    /// that uplink.
+    #[tokio::test]
+    async fn recovery_stays_out_of_the_way_while_an_uplink_is_serving() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(!raised, "an associated station is a serviceable uplink");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-hotspot"),
+            "no AP may be raised while the uplink works: {calls}"
+        );
+        assert!(
+            !calls.contains("connection down evo-network-wifi-sta"),
+            "a serving station must never be taken down: {calls}"
+        );
+    }
+
+    /// A device that once offered a standing access point still
+    /// carries its profile after the switch is turned off,
+    /// autoconnect and all. Opening that leftover for recovery and
+    /// leaving autoconnect alone would bring it back at the next
+    /// boot — open, and standing. Same back door the write path
+    /// closes, reached through a profile that was already here.
+    #[tokio::test]
+    async fn recovery_disarms_a_leftover_profile_when_no_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = false;
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot \
+                 connection.autoconnect no"
+            ),
+            "a leftover profile must not return after a reboot: {calls}"
+        );
+        assert!(
+            !calls.contains("connection delete"),
+            "the profile is disarmed, not replaced: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "an existing profile must not be rewritten: {calls}"
+        );
+    }
+
+    /// With a standing access point offered, autoconnect belongs to
+    /// the operator's profile and recovery has no business touching
+    /// it. Recovery still opens the profile and raises it.
+    #[tokio::test]
+    async fn recovery_leaves_autoconnect_alone_when_an_ap_is_offered() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+        assert!(raised, "recovery still raises the AP: {steps:?}");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection.autoconnect"),
+            "a standing AP's autoconnect is the operator's: {calls}"
+        );
+        assert!(
+            calls.contains(
+                "connection modify evo-network-hotspot remove \
+                 802-11-wireless-security"
+            ),
+            "the profile is still opened for recovery: {calls}"
+        );
+    }
+
+    // --- not re-raising a profile that already satisfies the ask ---
+
+    /// nmcli mock that answers field reads from a table of
+    /// `field=value` pairs, reports both profiles present, and logs
+    /// every invocation. Any field not in the table reads empty,
+    /// which is how a real profile answers for a property it does
+    /// not carry.
+    fn satisfies_nmcli_mock(dir: &Path, fields: &[(&str, &str)]) -> PathBuf {
+        let path = dir.join("nmcli-satisfies.sh");
+        let log = dir.join("nmcli.log");
+        let mut cases = String::new();
+        for (field, value) in fields {
+            // `printf '%s\n' <value>`, not `printf '<value>\n'`: a
+            // value like the autoconnect priority `-100` is read as
+            // an option by printf and prints nothing, which would
+            // make the fixture disagree with the code for a reason
+            // that has nothing to do with the code.
+            cases.push_str(&format!(
+                "  \"-g {field} connection show \"*) \
+                 printf '%s\\n' '{value}' ;;\n"
+            ));
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+{cases}\
+esac\n\
+exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    fn satisfies_plugin(dir: &Path, nmcli: &Path) -> NetworkPlugin {
+        let mut p = NetworkPlugin::new();
+        p.inner_mut().state_dir = Some(dir.to_path_buf());
+        p.inner_mut().config = PluginConfig::defaults();
+        p.inner_mut().config.nmcli_path = nmcli.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_path =
+            dir.join("no-such-iw").to_string_lossy().into_owned();
+        p
+    }
+
+    fn dhcp_ethernet_intent() -> NetworkIntent {
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = true;
+        intent.ethernet.device = "eth0".to_string();
+        intent.ethernet.ipv4_mode = Ipv4Mode::Dhcp;
+        intent
+    }
+
+    /// A wired link that is already up and already carries exactly
+    /// this configuration must not be raised again.
+    ///
+    /// `connection up` on an active profile is a fresh activation:
+    /// the link drops and returns. On the wire that is the
+    /// operator's own session going away in the middle of a save
+    /// that changed nothing.
+    #[tokio::test]
+    async fn a_live_matching_ethernet_is_not_raised_again() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-ethernet"),
+            "a live matching link must not be re-raised: {calls}"
+        );
+        // Left alone means no write either. A store write moves the
+        // profile under NetworkManager for no change, and a fixture
+        // that only watches the raise cannot see that happen.
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection modify")),
+            "a live matching link must not be written back: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "a live matching link must not be recreated: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("already matches")),
+            "the outcome must be reported, not silent: {steps:?}"
+        );
+    }
+
+    /// Down is not satisfied. A profile that exists but is not up
+    /// still comes up — the whole point of apply.
+    #[tokio::test]
+    async fn a_down_ethernet_profile_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // No GENERAL.STATE: NetworkManager reports nothing for a
+        // profile that is not activated.
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a down profile must still be raised: {calls}"
+        );
+    }
+
+    /// Live but different is not satisfied either. Here the live
+    /// profile is on DHCP while the operator asked for a static
+    /// address, so the ask has to be asserted.
+    #[tokio::test]
+    async fn a_live_but_mismatched_ethernet_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "eth0"),
+                ("ipv4.method", "auto"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut intent = dhcp_ethernet_intent();
+        intent.ethernet.ipv4_mode = Ipv4Mode::Static;
+        intent.ethernet.ipv4_address = "192.0.2.10/24".to_string();
+
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&intent, &mut steps)
+            .await
+            .expect("ensure_ethernet");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a changed address must be asserted: {calls}"
+        );
+    }
+
+    fn open_ap_intent() -> WifiIntent {
+        WifiIntent {
+            ap_ssid: "evo-4466".to_string(),
+            // Channel 0 leaves band and channel out of the ask,
+            // keeping this fixture about the re-raise rather than
+            // about channel selection.
+            ap_channel: 0,
+            ..WifiIntent::default()
+        }
+    }
+
+    /// An access point that is already up and already beaconing
+    /// this configuration must not be raised again. A fresh
+    /// activation stops and restarts the beacon: every client
+    /// drops, and on a shared radio the station goes with it.
+    #[tokio::test]
+    async fn a_live_matching_hotspot_is_not_raised_again() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up evo-network-hotspot"),
+            "a live matching AP must not be re-raised: {calls}"
+        );
+        // Left alone means no write either — neither the store
+        // write nor the security strip. Skipping only the raise
+        // would leave both, which is the same disturbance arriving
+        // by a different door, and a fixture watching only the
+        // raise cannot see it.
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection modify")),
+            "a live matching AP must not be written back, and its \
+             security must not be stripped: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|l| l.starts_with("connection add")),
+            "a live matching AP must not be recreated: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("already matches")),
+            "the outcome must be reported, not silent: {steps:?}"
+        );
+    }
+
+    /// A renamed access point is a different ask, so it is asserted.
+    #[tokio::test]
+    async fn a_live_but_mismatched_hotspot_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-was-called-this"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a renamed AP must be asserted: {calls}"
+        );
+    }
+
+    /// A down access point is still raised. This is also the pin
+    /// that recovery keeps working: a recovery profile is not up
+    /// when recovery needs it, and nothing here may teach the raise
+    /// to skip it.
+    #[tokio::test]
+    async fn a_down_hotspot_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            None,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a down AP must still be raised: {calls}"
+        );
+    }
+
+    /// Everything readable matches, but the passphrase was written
+    /// after the access point was last raised — so what is on the
+    /// air is the old key and the profile has to be raised again.
+    ///
+    /// NetworkManager will not show a stored passphrase and this
+    /// never asks, so the comparison is by time: the sidecar's last
+    /// write against the profile's last activation.
+    #[tokio::test]
+    async fn a_hotspot_whose_passphrase_changed_is_still_raised() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = satisfies_nmcli_mock(
+            dir.path(),
+            &[
+                ("GENERAL.STATE", "activated"),
+                ("connection.interface-name", "wlan0"),
+                ("802-11-wireless.mode", "ap"),
+                ("802-11-wireless.ssid", "evo-4466"),
+                ("ipv4.method", "shared"),
+                ("ipv6.method", "ignore"),
+                ("connection.autoconnect", "yes"),
+                ("connection.autoconnect-priority", "-100"),
+                // Last raised at the epoch; the sidecar written just
+                // now is necessarily newer.
+                ("connection.timestamp", "1"),
+            ],
+        );
+        let p = satisfies_plugin(dir.path(), &nmcli);
+        let ap_psk_path = p.ap_psk_path().expect("ap_psk_path");
+        std::fs::write(&ap_psk_path, "a-new-passphrase").expect("write psk");
+
+        let mut steps = Vec::new();
+        p.ensure_wifi_ap(
+            "wlan0",
+            &open_ap_intent(),
+            Some("a-new-passphrase"),
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("ensure_wifi_ap");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up evo-network-hotspot"),
+            "a changed passphrase must reach the air: {calls}"
+        );
+        // And it was never read back out of NetworkManager.
+        assert!(
+            !calls
+                .lines()
+                .any(|l| l.split_whitespace().any(|a| a == "-s")),
+            "the stored passphrase must never be read: {calls}"
         );
     }
 }

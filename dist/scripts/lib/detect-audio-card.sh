@@ -31,6 +31,15 @@
 # first-card to keep the install primitive working — but the
 # operator gets a visible WARN that lists what was filtered,
 # so the silent-wrong-card class of regression cannot recur.
+#
+# Locale: alsa-utils translates the leading word of a card
+# line, so a French host emits `carte 0:` and a German one
+# `Karte 0:`. Matching the literal English `card` meant a
+# non-English install found no playback device and aborted.
+# Callers should still pin `LC_ALL=C` on the `aplay` they feed
+# in; this parser does not rely on them doing so, and matches
+# the line SHAPE — one unspaced word, an index, a colon —
+# which holds in every translation including non-Latin ones.
 
 detect_audio_card_from_aplay_output() {
     local aplay_output
@@ -44,7 +53,7 @@ detect_audio_card_from_aplay_output() {
     # registered as HDMI). tolower() + lowercase regex is
     # portable across both implementations.
     card="$(printf '%s\n' "$aplay_output" | awk -F'[: ]+' '
-        /^card [0-9]+/ {
+        /^[^ ]+ [0-9]+:/ {
             name = $3
             lname = tolower(name)
             if (lname !~ /^vc4hdmi/ \
@@ -60,7 +69,7 @@ detect_audio_card_from_aplay_output() {
         return 0
     fi
     card="$(printf '%s\n' "$aplay_output" \
-        | awk -F'[: ]+' '/^card [0-9]+/ { print $3; exit }')"
+        | awk -F'[: ]+' '/^[^ ]+ [0-9]+:/ { print $3; exit }')"
     if [[ -n "$card" ]]; then
         echo "[bootstrap] WARN: only filtered cards detected (HDMI / Loopback);" >&2
         echo "                  fell back to first card '$card'. Override" >&2

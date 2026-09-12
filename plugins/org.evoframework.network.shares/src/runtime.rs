@@ -50,8 +50,10 @@ use evo_plugin_sdk::contract::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -76,6 +78,51 @@ pub const NETWORK_SHARES_SCHEMA_VERSION: u32 = 1;
 /// that a modern-first ladder can regress.
 pub const CIFS_VERS_PROBE_LADDER: &[&str] =
     &["2.0", "2.1", "3.0", "3.02", "3.1.1"];
+
+/// Probe that answers whether a share host is listening on a
+/// port. Injected so a unit suite never opens a socket.
+pub type HostReachableProbe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+
+/// Production host-reachability probe: a short-timeout TCP
+/// connect to the share host's service port.
+///
+/// Deliberately a connect and nothing more. It answers "is
+/// something listening", which is the question that decides
+/// whether a mount attempt is worth making; it does not
+/// negotiate, authenticate, or infer anything about the share.
+pub fn default_host_reachable(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let timeout = std::time::Duration::from_millis(1500);
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The port a share host must answer on before this runtime will
+/// spend a mount attempt on it.
+///
+/// Carrier is not reachability. A device can hold a link, an
+/// address and a default route while the NAS is off, still
+/// booting, or on a subnet the device cannot route to. The boot
+/// gate answers "has this device got a network"; this answers
+/// "is the server there", and only the second one justifies
+/// walking a dialect ladder.
+///
+/// Total over [`FsType`] rather than over a string: a new
+/// filesystem type is a compile error here, so whoever adds one
+/// chooses its port instead of inheriting SMB's by default.
+pub fn probe_port_for_fstype(fstype: FsType) -> u16 {
+    match fstype {
+        FsType::Cifs => 445,
+        FsType::Nfs => 2049,
+    }
+}
 
 /// The path under `<state_dir>/` this module owns.
 pub const NETWORK_SHARES_FILE: &str = "network_shares.toml";
@@ -239,7 +286,7 @@ pub struct ShareRecord {
     /// `/var/lib/evo/music/NAS/<sanitized_alias>` at record-creation time.
     pub mount_root: PathBuf,
     /// Wall-clock millis when this record was first created.
-    /// Used by operator UI for "added <n> ago" freshness.
+    /// Used by operator UI for "added `<n>` ago" freshness.
     pub created_at_ms: i64,
     /// Wall-clock millis of the last successful mount. `None`
     /// means the share has never been successfully mounted.
@@ -706,12 +753,100 @@ pub struct MountReport {
     pub elapsed_ms: u64,
 }
 
+/// Whether waiting can change the outcome of a failed mount.
+///
+/// The remount pass runs on a cadence, so it needs to know the
+/// difference between "the NAS was still booting" and "the
+/// password is wrong". Re-attempting the second every few
+/// minutes is a credential storm against the server, and it
+/// buries the real state under a churn of identical failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Conditions outside this device may change on their own —
+    /// a cable goes back in, a NAS finishes booting, the station
+    /// reassociates. Worth another attempt.
+    Transient,
+    /// Nothing changes by waiting. The operator has to act:
+    /// fix the credential, restore the share on the server,
+    /// answer the prompt.
+    Permanent,
+    /// The host has not answered yet. Worth retrying, but by
+    /// asking the host again rather than by re-running a mount:
+    /// a mount attempt against an absent server burns the whole
+    /// dialect ladder and its timeouts before failing, which is
+    /// how a five-minute remount silence appears to an operator
+    /// whose NAS came back thirty seconds ago.
+    Unreachable,
+}
+
+impl MountError {
+    /// Whether the remount pass should try this share again.
+    ///
+    /// Matched exhaustively on purpose: a new error variant is a
+    /// compile error here, so the person adding it decides what
+    /// the retry loop does with it rather than inheriting a
+    /// default that quietly storms someone's NAS.
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            // The credential family. Every one of these needs a
+            // person, and re-attempting is exactly the storm
+            // this classification exists to stop.
+            Self::AuthenticationRefused { .. }
+            | Self::CredentialMissing { .. }
+            | Self::CredentialStoreUnavailable
+            | Self::CredentialPromptCancelled { .. }
+            | Self::CredentialPromptFailed { .. }
+            | Self::NoResponderAvailable { .. } => FailureClass::Permanent,
+
+            // No record to mount. A retry cannot invent one.
+            Self::ShareNotFound { .. } => FailureClass::Permanent,
+
+            // Wire, protocol and host-reachability failures. A
+            // NAS that was not answering may be answering now.
+            // Dialect exhaustion is explicitly the non-auth
+            // branch — auth short-circuits above — so it belongs
+            // here rather than with the credential family.
+            Self::HostUnreachable { .. } => FailureClass::Unreachable,
+
+            Self::DialectProbeExhausted { .. }
+            | Self::Timeout { .. }
+            | Self::SubprocessIo(_)
+            | Self::MountFailed { .. } => FailureClass::Transient,
+
+            // Local conditions that clear on their own: a raced
+            // directory removal the next attempt re-creates, a
+            // full disk, a filesystem that was briefly read-only.
+            Self::MountDirectoryMissing { .. }
+            | Self::CredentialStoreWriteFailed { .. }
+            | Self::Persistence(_) => FailureClass::Transient,
+        }
+    }
+}
+
 /// Errors surfaced by [`NetworkSharesHandle::mount_share`].
 /// Distinct classes so operator UI can render the right
 /// remediation ("check credentials" vs "check host is
 /// reachable" vs "share path missing on server").
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
+    /// The share host did not answer on its service port, so no
+    /// mount was attempted.
+    ///
+    /// Distinct from [`Self::DialectProbeExhausted`] on purpose:
+    /// exhaustion means every dialect was offered and refused,
+    /// which is a statement about the server's SMB support. A
+    /// host that never answered has said nothing about dialects,
+    /// and reporting exhaustion there sends an operator to look
+    /// at their NAS configuration over what is usually a NAS that
+    /// is simply off.
+    #[error("share host {host}:{port} did not answer")]
+    HostUnreachable {
+        /// The host this runtime tried to reach.
+        host: String,
+        /// The service port for the share's filesystem type.
+        port: u16,
+    },
+
     /// Look-up failed — no share record for this ID.
     #[error("share {id} not found")]
     ShareNotFound {
@@ -778,7 +913,7 @@ pub enum MountError {
     },
     /// The password prompt could not be issued — the framework's
     /// user-interaction responder returned a
-    /// [`ReportError`](evo_plugin_sdk::contract::ReportError).
+    /// [`ReportError`].
     /// The reason is preserved verbatim for operator visibility.
     #[error("password prompt failed for key {key}: {reason}")]
     CredentialPromptFailed {
@@ -976,7 +1111,7 @@ impl MountExecutor for SubprocessMountExecutor {
 
 /// Look up the bytes for a credential key. Trait so tests can
 /// mock the credential vault interaction without pulling in the
-/// full [`crate::credentials::CredentialVault`] fixture.
+/// full `crate::credentials::CredentialVault` fixture.
 #[async_trait]
 pub trait CredentialFetcher: Send + Sync {
     /// Return the password bytes for `credential_key`, or
@@ -1674,7 +1809,7 @@ pub fn systemd_mount_unit_name(mount_root: &Path) -> String {
 
 /// True when the mount helper's stderr indicates the target
 /// directory is absent (ENOENT). Read by
-/// [`NetworkSharesRuntime::mount_cifs`] to short-circuit the
+/// `NetworkSharesRuntime::mount_cifs` to short-circuit the
 /// dialect probe on a missing-directory error rather than
 /// walking the full ladder and mislabelling five ENOENTs as
 /// "dialect probe exhausted".
@@ -1692,7 +1827,7 @@ pub fn is_mount_directory_missing(stderr: &str) -> bool {
 
 /// True when the mount.cifs exit code + stderr fragment indicate
 /// an authentication failure rather than a dialect / protocol
-/// failure. Read by [`NetworkSharesRuntime::mount_cifs`] to
+/// failure. Read by `NetworkSharesRuntime::mount_cifs` to
 /// short-circuit the dialect probe on auth-refusal.
 ///
 /// The canonical CIFS auth-refusal signals:
@@ -1719,6 +1854,35 @@ pub fn is_cifs_auth_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
         || s.contains("STATUS_LOGON_FAILURE")
         || s.contains("STATUS_ACCOUNT_LOCKED_OUT")
         || s.contains("STATUS_PASSWORD_EXPIRED")
+}
+
+/// Pure check: does this `mount.nfs` failure mean the server
+/// refused the caller, rather than a condition that may clear on
+/// its own?
+///
+/// NFS has no credential exchange the way CIFS does — the server
+/// authorises by client address, export list and, under Kerberos,
+/// by principal. All three are operator-side facts that do not
+/// change because a retry timer fired, which is why they belong
+/// with the refusals rather than with the reachable-later class.
+///
+/// The signals, as `mount.nfs` renders them:
+/// - `access denied by server while mounting` — the export list
+///   does not admit this client.
+/// - `Permission denied` — same refusal, terser rendering.
+/// - `RPC: Authentication error` — the RPC layer rejected the
+///   caller's credential, typically under `sec=krb5`.
+/// - `no permission to mount` — older servers' phrasing.
+///
+/// Deliberately narrow. `Connection refused`, `No route to host`
+/// and timeouts are NOT here: those are exactly the case a
+/// remount pass exists to recover.
+pub fn is_nfs_auth_refusal(stderr: &str) -> bool {
+    let s = stderr.to_ascii_uppercase();
+    s.contains("ACCESS DENIED BY SERVER")
+        || s.contains("PERMISSION DENIED")
+        || s.contains("RPC: AUTHENTICATION ERROR")
+        || s.contains("NO PERMISSION TO MOUNT")
 }
 
 /// Pure check: does `proc_mounts` contents list `mount_root` as
@@ -2300,6 +2464,10 @@ struct ShareStateEntry {
     alias: String,
     state: MountState,
     reason: Option<String>,
+    /// Set alongside a failure so the remount pass can tell a
+    /// NAS that was still booting from a password that is wrong.
+    /// `None` for every non-failure state.
+    failure_class: Option<FailureClass>,
     negotiated_vers: Option<String>,
     last_transition_at_ms: u64,
 }
@@ -2389,6 +2557,18 @@ pub struct NetworkSharesRuntime {
     /// `mount_share` adopts an already-active host mount instead
     /// of re-running the dialect probe.
     mount_point_check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// Asks whether a share host answers on its service port.
+    /// Production opens a short-timeout TCP connection; tests
+    /// inject a fixture so unit suites never touch a socket.
+    /// Consulted before any mount work, so an absent server costs
+    /// one refused connection instead of a full dialect ladder.
+    host_reachable: HostReachableProbe,
+    /// Asks whether the device has L3. `None` means no gate is
+    /// installed and boot-mount proceeds immediately, which is
+    /// the behaviour a runtime built without one has always had.
+    l3_gate: Option<L3Gate>,
+    /// How long boot-mount waits for L3 before giving up.
+    l3_wait_ms: u64,
     /// Deduplication map for in-flight credential prompts. Keyed
     /// on `credential_key` so multiple concurrent mount / add
     /// attempts against the same missing credential collapse to
@@ -2517,6 +2697,9 @@ impl NetworkSharesRuntime {
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
             mount_point_check: Arc::new(|p: &Path| is_path_mounted(p)),
+            host_reachable: Arc::new(|_: &str, _: u16| true),
+            l3_gate: None,
+            l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -2541,6 +2724,7 @@ impl NetworkSharesRuntime {
             path,
             executor: None,
             credentials: None,
+            host_reachable: None,
             credential_store: None,
             prompter: None,
             mount_program: None,
@@ -2554,6 +2738,8 @@ impl NetworkSharesRuntime {
             smbclient_timeout_ms: None,
             now_fn: None,
             mount_point_check: None,
+            l3_gate: None,
+            l3_wait_ms: None,
         })
     }
 
@@ -2588,6 +2774,9 @@ impl NetworkSharesRuntime {
             // suites cannot accidentally adopt a host mount from
             // the machine running `cargo test`.
             mount_point_check: Arc::new(|_: &Path| false),
+            host_reachable: Arc::new(|_: &str, _: u16| true),
+            l3_gate: None,
+            l3_wait_ms: DEFAULT_L3_WAIT_MS,
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -3032,7 +3221,7 @@ impl ShareEvent {
 pub struct ShareEventsEnvelope {
     /// Last N lifecycle events in insertion order (oldest
     /// first). Empty at boot until the first mount / unmount
-    /// attempt completes; bounded by [`SHARE_EVENTS_RING_CAPACITY`]
+    /// attempt completes; bounded by `SHARE_EVENTS_RING_CAPACITY`
     /// so a long-lived runtime does not grow the payload
     /// without bound.
     pub events: Vec<ShareEvent>,
@@ -3083,6 +3272,10 @@ pub struct NetworkSharesRuntimeBuilder {
     // factoring a one-off type alias.
     #[allow(clippy::type_complexity)]
     mount_point_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
+    // Same shape as the runtime struct's `host_reachable`.
+    host_reachable: Option<HostReachableProbe>,
+    l3_gate: Option<L3Gate>,
+    l3_wait_ms: Option<u64>,
 }
 
 impl NetworkSharesRuntimeBuilder {
@@ -3094,7 +3287,7 @@ impl NetworkSharesRuntimeBuilder {
     }
 
     /// Install a custom [`CredentialFetcher`] (typically the
-    /// framework's [`crate::credentials::CredentialVault`]
+    /// framework's `crate::credentials::CredentialVault`
     /// bridged through a small adapter).
     pub fn with_credentials(
         mut self,
@@ -3191,6 +3384,14 @@ impl NetworkSharesRuntimeBuilder {
         self
     }
 
+    /// Inject the host-reachability probe. Production installs
+    /// [`default_host_reachable`] at plugin load; tests use this
+    /// to hold a NAS down without opening a socket.
+    pub fn with_host_reachable(mut self, probe: HostReachableProbe) -> Self {
+        self.host_reachable = Some(probe);
+        self
+    }
+
     /// Override the mount-point probe (test path). Production
     /// defaults to [`is_path_mounted`]. Tests that exercise the
     /// already-mounted adopt path inject a closure returning
@@ -3200,6 +3401,19 @@ impl NetworkSharesRuntimeBuilder {
         check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
     ) -> Self {
         self.mount_point_check = Some(check);
+        self
+    }
+
+    /// Install the L3 gate boot-mount waits on. Without one,
+    /// boot-mount proceeds immediately.
+    pub fn with_l3_gate(mut self, gate: L3Gate) -> Self {
+        self.l3_gate = Some(gate);
+        self
+    }
+
+    /// Override how long boot-mount waits for L3.
+    pub fn with_l3_wait_ms(mut self, ms: u64) -> Self {
+        self.l3_wait_ms = Some(ms);
         self
     }
 
@@ -3252,6 +3466,15 @@ impl NetworkSharesRuntimeBuilder {
                 state: self.state,
                 path: self.path,
             })),
+            // No probe installed means "assume reachable", which is
+            // the behaviour a runtime built without one has always
+            // had. Production installs `default_host_reachable`
+            // explicitly at plugin load, the same way the L3 gate is
+            // installed; a unit suite that never asks for one never
+            // opens a socket.
+            host_reachable: self
+                .host_reachable
+                .unwrap_or_else(|| Arc::new(|_: &str, _: u16| true)),
             executor: self
                 .executor
                 .unwrap_or_else(|| Arc::new(SubprocessMountExecutor)),
@@ -3316,6 +3539,8 @@ impl NetworkSharesRuntimeBuilder {
                     Arc::new(|p: &Path| is_path_mounted(p))
                 }
             }),
+            l3_gate: self.l3_gate,
+            l3_wait_ms: self.l3_wait_ms.unwrap_or(DEFAULT_L3_WAIT_MS),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
                 HashMap::new(),
             )),
@@ -3347,6 +3572,7 @@ fn seed_share_states(
                     alias: r.alias.clone(),
                     state: MountState::Unmounted,
                     reason: None,
+                    failure_class: None,
                     negotiated_vers: None,
                     last_transition_at_ms: now_ms,
                 },
@@ -3397,7 +3623,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         share_id: &ShareId,
         edits: ShareEdits,
     ) -> Result<bool, SharesStateError> {
-        let (changed, material, alias, configured_envelope) = {
+        let (changed, material, alias, mount_root, configured_envelope) = {
             let mut g = self.inner.lock().await;
             let record = g.state.find_mut(share_id).ok_or_else(|| {
                 SharesStateError::ShareNotFound {
@@ -3409,6 +3635,9 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             // edits (alias only) do not need a remount; material
             // edits (host / path / fstype / creds / options) do.
             let material = edits.is_material_against(record);
+            // The mount point is not editable, so this is the
+            // same path before and after the mutation.
+            let mount_root = record.mount_root.clone();
             let changed = edits.apply_to(record);
             let alias = record.alias.clone();
             if changed {
@@ -3418,31 +3647,38 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 shares: g.state.shares.clone(),
                 last_update_at: SystemTime::now(),
             };
-            (changed, material, alias, envelope)
+            (changed, material, alias, mount_root, envelope)
         };
         if changed {
             self.update_share_state_alias(share_id, &alias).await;
             self.schedule_republish_configured(configured_envelope);
         }
-        // Material change on a currently-mounted share: unmount +
-        // remount so the OS-side mount reflects the edited record.
-        // Silent no-op when the share is not currently mounted;
-        // the next mount attempt naturally picks up the new record.
-        // Errors from the cycle are logged but do NOT fail the
-        // edit — the persisted state is authoritative and the
-        // operator can retry mount from the UI. Fire the cycle
-        // via `mount_share` / `unmount_share` so the F1.1 / F1.2
+        // Material change on a share the OS still has mounted:
+        // unmount + remount so the OS-side mount reflects the
+        // edited record.
+        //
+        // Keyed on the host mount table, not on what the subject
+        // says. A share can be recorded Failed while its mount is
+        // still up — a probe that failed after the mount landed,
+        // or a state that has not reconciled yet — and editing
+        // the credentials of a share in that condition has to
+        // cycle the real mount, or the operator changes a
+        // password and the old mount keeps serving. The converse
+        // matters too: a subject still claiming Mounted over a
+        // path the OS no longer has must not fire a cycle against
+        // nothing.
+        //
+        // Silent no-op when the path is not mounted; the next
+        // mount attempt naturally picks up the new record. Errors
+        // from the cycle are logged but do NOT fail the edit —
+        // the persisted state is authoritative and the operator
+        // can retry mount from the UI. Fire the cycle via
+        // `mount_share` / `unmount_share` so the F1.1 / F1.2
         // hooks (MPD library update + queue safety + event ring)
         // apply uniformly.
         if changed && material {
-            let is_mounted = {
-                let g = self.share_states.lock().await;
-                matches!(
-                    g.get(share_id).map(|e| &e.state),
-                    Some(MountState::Mounted)
-                )
-            };
-            if is_mounted {
+            let os_has_mount = (self.mount_point_check)(&mount_root);
+            if os_has_mount {
                 if let Err(e) = self.unmount_share(share_id).await {
                     tracing::warn!(
                         share_id = %share_id,
@@ -3587,6 +3823,49 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             return Ok(report);
         }
 
+        // Reachability before effort. The boot gate asks whether
+        // this device has a network; it cannot ask whether the
+        // server is there, and carrier has never implied that. A
+        // NAS that is off, still booting, or on an unroutable
+        // subnet answers nothing, and every mount attempt against
+        // it walks the whole dialect ladder and its timeouts
+        // before failing — minutes of silence, then a verdict
+        // about SMB dialects that the server never participated
+        // in.
+        //
+        // One refused connection replaces that. It also makes the
+        // retry cadence honest: a share waiting on an absent host
+        // now costs a poll per tick instead of a ladder burn, so
+        // the pass returns in time to notice the moment the NAS
+        // comes back.
+        //
+        // Placed after the OS-truth adopt so a live mount is never
+        // second-guessed by a probe, and before credential work so
+        // an absent server cannot raise a password prompt.
+        {
+            let host = record.host.trim().to_string();
+            if !host.is_empty() {
+                let port = probe_port_for_fstype(record.fstype);
+                if !(self.host_reachable)(&host, port) {
+                    let err = MountError::HostUnreachable { host, port };
+                    // Classified, not bare: the short poll selects
+                    // on this class, so a state written without it
+                    // would leave the share on the remount cadence
+                    // — the very wait this cut removes.
+                    let class = err.failure_class();
+                    self.set_share_state_classified(
+                        share_id,
+                        MountState::Failed,
+                        Some(err.to_string()),
+                        Some(class),
+                        None,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        }
+
         // Prompt-on-mount: for UserPassword shares whose
         // credential_key is not in the vault, raise a password
         // prompt via the framework's user-interaction responder
@@ -3681,13 +3960,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                         }
                     }
                 }
-                self.set_share_state(
-                    share_id,
-                    MountState::Failed,
-                    Some(format!("{e}")),
-                    None,
-                )
-                .await;
+                self.set_share_failed(share_id, e).await;
             }
         }
 
@@ -3753,13 +4026,38 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
             }
             Err(e) => {
-                self.set_share_state(
-                    share_id,
-                    MountState::Failed,
-                    Some(format!("{e}")),
-                    None,
-                )
-                .await;
+                // A failed unmount says nothing about whether the
+                // share is mounted. `umount` refuses a busy target
+                // routinely — something is reading a file, MPD is
+                // mid-scan — and the mount is left exactly as it
+                // was: healthy, serving, still in the mount table.
+                //
+                // Recording Failed there is a lie the operator can
+                // see: the tile reads Failed over a share they are
+                // listening to, and the remount pass then treats a
+                // live mount as something to retry.
+                //
+                // The OS is the authority. If the path is still a
+                // mount point, the state stays Mounted and only the
+                // event reports the refusal.
+                if (self.mount_point_check)(&record.mount_root) {
+                    // Keep the negotiated dialect: nothing about it
+                    // changed, and dropping it would make the next
+                    // mount re-walk the ladder for no reason.
+                    let negotiated = {
+                        let g = self.share_states.lock().await;
+                        g.get(share_id).and_then(|e| e.negotiated_vers.clone())
+                    };
+                    self.set_share_state(
+                        share_id,
+                        MountState::Mounted,
+                        None,
+                        negotiated,
+                    )
+                    .await;
+                } else {
+                    self.set_share_failed(share_id, e).await;
+                }
                 self.publish_share_event(ShareEvent::unmount_failed(
                     share_id.clone(),
                     format!("{e}"),
@@ -4285,10 +4583,29 @@ impl NetworkSharesRuntime {
         })
     }
 
-    /// Walk configured shares and adopt any whose mount_root is
-    /// already active in the host mount table. Upward-only:
-    /// never marks a share Unmounted/Failed based on a missing
-    /// OS mount (that needs reachability gating — follow-on).
+    /// Walk configured shares and make the recorded state agree
+    /// with the host mount table, in both directions.
+    ///
+    /// Upward: a share whose `mount_root` is already active is
+    /// adopted, so an OS mount that survived a restart is not
+    /// re-mounted underneath itself.
+    ///
+    /// Downward: a share recorded `Mounted` whose mount point is
+    /// no longer in the table is marked `Unmounted` with a reason
+    /// saying so. Without this the subject keeps claiming a share
+    /// is mounted after the cable came out or the NAS went away,
+    /// and the operator is told a working library is there while
+    /// every read fails. `Unmounted` is also where the remount
+    /// pass looks, so a mount that vanished for a transient
+    /// reason comes back on its own.
+    ///
+    /// `Mounting` is left alone in both directions. The mount
+    /// point legitimately does not exist yet while the helper is
+    /// running — marking it down there would flap the subject on
+    /// every reconcile that lands mid-attempt.
+    ///
+    /// Filesystem-agnostic: NFS and CIFS both reconcile from the
+    /// same mount-table truth.
     ///
     /// Safe to call before the subject publisher is attached
     /// (updates the in-memory state map so the initial announce
@@ -4299,17 +4616,47 @@ impl NetworkSharesRuntime {
             g.state.shares.clone()
         };
         for record in records {
+            let recorded = {
+                let g = self.share_states.lock().await;
+                g.get(&record.share_id).map(|e| e.state)
+            };
             if !(self.mount_point_check)(&record.mount_root) {
+                // The OS says this path is not a mount point.
+                // Only a share we are claiming is Mounted needs
+                // correcting; Mounting is in flight, and the
+                // other states already agree.
+                if recorded == Some(MountState::Mounted) {
+                    tracing::info!(
+                        plugin = crate::PLUGIN_NAME,
+                        share_id = %record.share_id,
+                        mount_root = %record.mount_root.display(),
+                        "mount point vanished; marking share unmounted"
+                    );
+                    self.set_share_state(
+                        &record.share_id,
+                        MountState::Unmounted,
+                        Some(format!(
+                            "mount point {} is no longer present in the \
+                             host mount table",
+                            record.mount_root.display()
+                        )),
+                        None,
+                    )
+                    .await;
+                    self.publish_share_event(ShareEvent::unmounted(
+                        record.share_id.clone(),
+                        (self.now_fn)(),
+                    ))
+                    .await;
+                }
                 continue;
             }
-            let already_mounted = {
-                let g = self.share_states.lock().await;
-                matches!(
-                    g.get(&record.share_id).map(|e| &e.state),
-                    Some(MountState::Mounted)
-                )
-            };
-            if already_mounted {
+            if recorded == Some(MountState::Mounted) {
+                continue;
+            }
+            if recorded == Some(MountState::Mounting) {
+                // A mount is in flight against this path. Let it
+                // finish and record its own outcome.
                 continue;
             }
             let start_ms = (self.now_fn)();
@@ -4379,6 +4726,17 @@ impl NetworkSharesRuntime {
             // mount root doesn't exist, mount.nfs errors at
             // chdir before touching the network. Report as
             // MountDirectoryMissing, not MountFailed.
+            // A server that refused this client will refuse it
+            // again in five minutes. Raise the same typed refusal
+            // the CIFS path raises so the remount pass leaves it
+            // alone instead of re-probing on every tick.
+            if is_nfs_auth_refusal(&classify_stderr) {
+                return Err(MountError::AuthenticationRefused {
+                    id: record.share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr: classify_stderr,
+                });
+            }
             if is_mount_directory_missing(&classify_stderr) {
                 return Err(MountError::MountDirectoryMissing {
                     id: record.share_id.clone(),
@@ -4733,6 +5091,40 @@ impl NetworkSharesRuntime {
         reason: Option<String>,
         negotiated_vers: Option<String>,
     ) {
+        self.set_share_state_classified(
+            share_id,
+            state,
+            reason,
+            None,
+            negotiated_vers,
+        )
+        .await;
+    }
+
+    /// Record a failure together with whether it is worth
+    /// retrying. Split from [`Self::set_share_state`] rather than
+    /// widening it, because every other transition has no failure
+    /// to classify and passing `None` at a dozen call sites is
+    /// how the classification would drift out of step.
+    async fn set_share_failed(&self, share_id: &ShareId, e: &MountError) {
+        self.set_share_state_classified(
+            share_id,
+            MountState::Failed,
+            Some(format!("{e}")),
+            Some(e.failure_class()),
+            None,
+        )
+        .await;
+    }
+
+    async fn set_share_state_classified(
+        &self,
+        share_id: &ShareId,
+        state: MountState,
+        reason: Option<String>,
+        failure_class: Option<FailureClass>,
+        negotiated_vers: Option<String>,
+    ) {
         let now_ms = (self.now_fn)();
         let envelope_opt = {
             let mut g = self.share_states.lock().await;
@@ -4740,11 +5132,16 @@ impl NetworkSharesRuntime {
                 alias: String::new(),
                 state,
                 reason: None,
+                failure_class: None,
                 negotiated_vers: None,
                 last_transition_at_ms: now_ms,
             });
             entry.state = state;
             entry.reason = reason;
+            // Cleared on every non-failure transition, so a share
+            // that mounts after a permanent failure is retryable
+            // again if it later drops out.
+            entry.failure_class = failure_class;
             entry.negotiated_vers = negotiated_vers;
             entry.last_transition_at_ms = now_ms;
             Some(entry.to_envelope(share_id))
@@ -4762,6 +5159,7 @@ impl NetworkSharesRuntime {
                 alias: record.alias.clone(),
                 state: MountState::Unmounted,
                 reason: None,
+                failure_class: None,
                 negotiated_vers: None,
                 last_transition_at_ms: now_ms,
             };
@@ -4803,12 +5201,51 @@ fn envelope_to_json<T: Serialize>(envelope: &T) -> serde_json::Value {
 // Mount lifecycle (Ship 2g)
 // --------------------------------------------------------------
 
+/// How long boot-mount waits for the network to reach L3 before
+/// giving up on this pass (60 seconds).
+///
+/// Giving up is not a failure: the remount task runs on its own
+/// cadence and picks the shares up once the link is there. This
+/// bound exists so the boot task does not sit forever on a device
+/// that has no network at all.
+pub const DEFAULT_L3_WAIT_MS: u64 = 60 * 1_000;
+
+/// Interval between L3 checks while boot-mount is waiting.
+const L3_POLL_INTERVAL_MS: u64 = 500;
+
+/// Asks whether the device has L3 connectivity — a carrier and an
+/// address. Injected so the runtime does not have to know how
+/// that fact is published, and so the tests can drive both
+/// answers without a network.
+///
+/// Deliberately not `internet_reachable`: a NAS on the LAN is
+/// reachable with no route to the internet at all, and gating
+/// mounts on a captive portal or a DNS probe would strand a
+/// perfectly good local share.
+pub type L3Gate =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
 /// Default cadence for the background remount task (5 minutes).
 /// Every tick, the runtime walks its per-share state map and
-/// retries any share in [`MountState::Failed`] or
-/// [`MountState::Unmounted`] — matches the volumio-evo reference
-/// 5-min re-mount cadence.
+/// retries the shares in [`MountState::Failed`] or
+/// [`MountState::Unmounted`] whose failure could clear on its own
+/// — matches the volumio-evo reference 5-min re-mount cadence.
+/// A refused credential is not retried on this cadence; see
+/// [`FailureClass`].
 pub const DEFAULT_REMOUNT_CADENCE_MS: u64 = 5 * 60 * 1_000;
+
+/// Cadence for polling shares whose host has not answered
+/// (5 seconds).
+///
+/// Separate from [`DEFAULT_REMOUNT_CADENCE_MS`] because the two
+/// waits mean different things. A dialect failure, a bad option,
+/// a busy server — those are answers, and re-asking every few
+/// seconds is a storm against a NAS that already replied. A host
+/// that has not answered has given no answer to respect, the
+/// question costs one refused connection, and the operator who
+/// just switched their NAS on is standing in front of the device
+/// waiting for the share to appear.
+pub const DEFAULT_UNREACHABLE_POLL_MS: u64 = 5_000;
 
 /// Default cadence for the background discovery task (5 minutes).
 /// Aligns with the operator-widgets contract's
@@ -4852,6 +5289,32 @@ impl BootMountReport {
 }
 
 impl NetworkSharesRuntime {
+    /// Wait for the device to reach L3, up to the configured
+    /// bound. Returns whether it got there.
+    ///
+    /// No gate installed means yes immediately — a runtime built
+    /// without one behaves as it always did.
+    async fn await_l3(&self) -> bool {
+        let Some(gate) = self.l3_gate.as_ref() else {
+            return true;
+        };
+        if gate().await {
+            return true;
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.l3_wait_ms);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                L3_POLL_INTERVAL_MS,
+            ))
+            .await;
+            if gate().await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Attempt to mount every configured share. Runs
     /// sequentially (not concurrently) — CIFS probe ladders can
     /// take up to 150 s each and firing them concurrently would
@@ -4859,7 +5322,31 @@ impl NetworkSharesRuntime {
     /// startup surfaces the sequential progression also renders
     /// cleaner. Publishes per-share state transitions via the
     /// Ship 2f subject substrate.
+    ///
+    /// Waits for L3 first when a gate is installed, and mounts
+    /// nothing if the link never arrives within the bound.
     pub async fn boot_mount_all(&self) -> BootMountReport {
+        // Mounting before the link is up spends the whole CIFS
+        // dialect ladder failing against a host that is not
+        // reachable yet, marks every share Failed, and leaves the
+        // operator looking at a broken library on a device that
+        // was merely booting faster than its network.
+        //
+        // Waiting costs nothing: this runs detached, so plugin
+        // readiness is not behind it, and giving up after the
+        // bound is safe because the remount task picks the shares
+        // up on its own cadence.
+        if !self.await_l3().await {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                waited_ms = self.l3_wait_ms,
+                "no L3 connectivity; skipping boot mount. Shares will \
+                 mount from the remount pass once the link is up"
+            );
+            return BootMountReport {
+                outcomes: Vec::new(),
+            };
+        }
         // Reconcile first so already-active host mounts become
         // Mounted before we spend probe-ladder budget on them.
         self.reconcile_os_mount_states().await;
@@ -4907,10 +5394,52 @@ impl NetworkSharesRuntime {
         BootMountReport { outcomes }
     }
 
-    /// Retry every share currently in [`MountState::Failed`] or
-    /// [`MountState::Unmounted`]. Called by the background
-    /// remount task and directly by tests to exercise the retry
-    /// path without spawning a task.
+    /// Retry only the shares whose last failure was
+    /// [`FailureClass::Unreachable`] — the ones waiting on a host
+    /// that has not answered.
+    ///
+    /// Runs on its own short cadence so a NAS coming back is
+    /// noticed in seconds rather than at the next remount tick.
+    /// It is affordable precisely because those shares short-
+    /// circuit on one refused connection: no dialect ladder, no
+    /// subprocess, no credential work. Shares in any other class
+    /// are untouched here and keep the remount cadence.
+    pub async fn unreachable_poll_pass(&self) -> Vec<BootMountOutcome> {
+        // Adopt any host mounts that came back first, exactly as
+        // the remount pass does: a share whose OS mount is live
+        // must not sit in a retry set.
+        self.reconcile_os_mount_states().await;
+
+        let candidates: Vec<ShareId> = {
+            let g = self.share_states.lock().await;
+            g.iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e.state,
+                        MountState::Failed | MountState::Unmounted
+                    )
+                })
+                .filter(|(_, e)| {
+                    e.failure_class == Some(FailureClass::Unreachable)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut outcomes = Vec::with_capacity(candidates.len());
+        for share_id in candidates {
+            let result = self.mount_share(&share_id).await;
+            outcomes.push(BootMountOutcome { share_id, result });
+        }
+        outcomes
+    }
+
+    /// Retry the shares in [`MountState::Failed`] or
+    /// [`MountState::Unmounted`] whose last failure could plausibly
+    /// clear on its own, on the remount cadence.
+    ///
+    /// A [`FailureClass::Permanent`] failure — a refused password
+    /// above all — is left alone: it will not mount because the
+    /// cadence ticked, and re-attempting is a credential storm.
     pub async fn remount_retry_pass(&self) -> Vec<BootMountOutcome> {
         // Adopt any host mounts that came back (or survived)
         // before selecting Failed/Unmounted candidates — a share
@@ -4926,6 +5455,17 @@ impl NetworkSharesRuntime {
                         e.state,
                         MountState::Failed | MountState::Unmounted
                     )
+                })
+                // A share that refused authentication will not
+                // start accepting it because five minutes
+                // passed. Re-attempting on every tick is a
+                // credential storm against someone's NAS, and it
+                // buries the real state under identical
+                // failures. Entries with no recorded class —
+                // a fresh boot, an operator unmount — keep the
+                // behaviour they had.
+                .filter(|(_, e)| {
+                    e.failure_class != Some(FailureClass::Permanent)
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -4963,6 +5503,30 @@ pub fn spawn_remount_task(
             ticker.tick().await;
             let Some(rt) = weak.upgrade() else { return };
             let _ = rt.remount_retry_pass().await;
+        }
+    })
+}
+
+/// Spawn a background task that polls only the shares waiting on
+/// an unanswered host, on a short cadence.
+///
+/// Deliberately its own task rather than a faster shared ticker:
+/// the remount cadence still governs every other failure class,
+/// so a dialect failure is not re-attempted every few seconds.
+pub fn spawn_unreachable_poll_task(
+    runtime: Arc<NetworkSharesRuntime>,
+    cadence: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(&runtime);
+    drop(runtime);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(rt) = weak.upgrade() else { return };
+            let _ = rt.unreachable_poll_pass().await;
         }
     })
 }
@@ -5825,7 +6389,7 @@ mod tests {
     // Ship 2c: CIFS mount + probe ladder tests (mock executor)
     // -----------------------------------------------------------
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// One recorded subprocess invocation: `(program, args)`.
     type RecordedCall = (String, Vec<String>);
@@ -6000,6 +6564,40 @@ mod tests {
             Some(32),
             "Job failed.\nmount error(13): Permission denied"
         ));
+    }
+
+    #[test]
+    fn is_nfs_auth_refusal_recognises_server_refusals() {
+        for stderr in [
+            "mount.nfs: access denied by server while mounting 192.0.2.1:/vol",
+            "mount.nfs: Permission denied",
+            "mount.nfs: RPC: Authentication error; why = Client credential too weak",
+            "mount.nfs: no permission to mount",
+        ] {
+            assert!(
+                is_nfs_auth_refusal(stderr),
+                "should be a refusal: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_nfs_auth_refusal_rejects_reachability_failures() {
+        // The whole point of the remount pass. If any of these
+        // classify as a refusal, a NAS that was rebooting never
+        // comes back without the operator.
+        for stderr in [
+            "mount.nfs: Connection refused",
+            "mount.nfs: No route to host",
+            "mount.nfs: Connection timed out",
+            "mount.nfs: Network is unreachable",
+            "mount.nfs: Stale file handle",
+        ] {
+            assert!(
+                !is_nfs_auth_refusal(stderr),
+                "should NOT be a refusal: {stderr}"
+            );
+        }
     }
 
     #[test]
@@ -6301,6 +6899,238 @@ tmpfs /tmp tmpfs rw 0 0\n";
 
         let after = rt.get_share(&id).await.unwrap().unwrap();
         assert_eq!(after.persisted_vers.as_deref(), Some("2.1"));
+    }
+
+    /// Build a runtime whose share host never answers.
+    fn build_runtime_host_down(
+        dir: &Path,
+        executor: Arc<dyn MountExecutor>,
+    ) -> NetworkSharesRuntime {
+        NetworkSharesRuntime::builder(dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| false))
+            .build()
+    }
+
+    #[test]
+    fn probe_port_is_total_over_filesystem_type() {
+        assert_eq!(probe_port_for_fstype(FsType::Cifs), 445);
+        assert_eq!(probe_port_for_fstype(FsType::Nfs), 2049);
+    }
+
+    #[tokio::test]
+    async fn a_failed_unmount_over_a_live_mount_stays_mounted() {
+        // umount refuses a busy target routinely and leaves the
+        // mount exactly as it was. Reporting Failed there puts the
+        // tile in a failed state over a share the operator is
+        // listening to, and hands the retry pass a live mount to
+        // re-attempt.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /mnt/x: target is busy",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            // The OS still has the path: this is the authority the
+            // state must follow.
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("busy_share", "192.0.2.28");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.unmount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::MountFailed { .. }),
+            "the caller is still told the unmount failed: {err:?}"
+        );
+        let g = rt.share_states.lock().await;
+        let entry = g.get(&id).expect("share state recorded");
+        assert_eq!(
+            entry.state,
+            MountState::Mounted,
+            "a live OS mount must not be reported Failed because umount refused"
+        );
+        assert_eq!(
+            entry.failure_class, None,
+            "a share that is still mounted carries no failure class"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_unmount_with_no_live_mount_is_still_failed() {
+        // The other direction. If the path is genuinely not a
+        // mount point, the failure is real and must not be
+        // softened into Mounted.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /mnt/x: not mounted",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("gone_share", "192.0.2.29");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.unmount_share(&id).await.unwrap_err();
+        let g = rt.share_states.lock().await;
+        assert_eq!(
+            g.get(&id).expect("share state recorded").state,
+            MountState::Failed,
+            "with no live mount the failure is real and stays Failed"
+        );
+    }
+
+    #[test]
+    fn the_unreachable_poll_is_faster_than_the_remount_cadence() {
+        // The whole point of the separate task. If these ever
+        // converge, a dialect failure starts storming a NAS.
+        // A const block, so converging cadences are a compile
+        // error rather than a test that someone can delete.
+        const {
+            assert!(DEFAULT_UNREACHABLE_POLL_MS < DEFAULT_REMOUNT_CADENCE_MS);
+            assert!(DEFAULT_UNREACHABLE_POLL_MS == 5_000);
+            assert!(DEFAULT_REMOUNT_CADENCE_MS == 5 * 60 * 1_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_poll_pass_retries_an_unreachable_share() {
+        // A NAS that comes back must be picked up by the short
+        // poll, not waited on for the remount tick.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor);
+        let record = built_record("nas_off", "192.0.2.26");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let _ = rt.mount_share(&id).await;
+
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the share waiting on an unanswered host is the poll's business"
+        );
+        assert_eq!(outcomes[0].share_id, id);
+    }
+
+    #[tokio::test]
+    async fn the_poll_pass_leaves_every_other_failure_class_alone() {
+        // A dialect failure already got an answer from the server.
+        // Re-asking it every 5 s is the storm this task must not
+        // become, so the poll must not select it.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("cifs: bad option 'vers=2.0'"),
+            failure_output("cifs: bad option 'vers=2.1'"),
+            failure_output("cifs: bad option 'vers=3.0'"),
+            failure_output("cifs: bad option 'vers=3.02'"),
+            failure_output("cifs: bad option 'vers=3.1.1'"),
+        ]);
+        // Host answers; the ladder runs and is exhausted.
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| true))
+            .build();
+        let record = built_record("bad_dialects", "192.0.2.27");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert_eq!(err.failure_class(), FailureClass::Transient);
+
+        let outcomes = rt.unreachable_poll_pass().await;
+        assert!(
+            outcomes.is_empty(),
+            "a share that already got an answer keeps the remount cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_is_not_dialect_exhaustion() {
+        // The field case: carrier up, NAS off. The old path walked
+        // all five dialects and reported exhaustion, which is a
+        // verdict about SMB support the server never gave.
+        let dir = tempdir();
+        // A ladder that would succeed if it ran at all — so a
+        // failure here can only come from the reachability gate.
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor.clone());
+        let record = built_record("nas_off", "192.0.2.23");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        match err {
+            MountError::HostUnreachable { ref host, port } => {
+                assert_eq!(host, "192.0.2.23");
+                assert_eq!(port, 445, "CIFS probes the SMB port");
+            }
+            other => panic!("expected HostUnreachable, got {other:?}"),
+        }
+        assert_eq!(
+            err.failure_class(),
+            FailureClass::Unreachable,
+            "an absent host is its own class: retry by asking the host, \
+             not by burning a ladder"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_costs_no_mount_attempt() {
+        // The reason the retry cadence stopped being honest: every
+        // tick against an absent NAS spent the full ladder and its
+        // timeouts. The executor must not be called at all.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = build_runtime_host_down(&dir, executor.clone());
+        let record = built_record("nas_off", "192.0.2.24");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            0,
+            "no mount subprocess may run against a host that has not answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_host_still_mounts_normally() {
+        // The gate must not become the thing that breaks mounting.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![success_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| true))
+            .build();
+        let record = built_record("nas_up", "192.0.2.25");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.mount_share(&id).await.expect("reachable host mounts");
+        assert!(
+            !executor.calls.lock().await.is_empty(),
+            "the ladder still runs when the host answers"
+        );
     }
 
     #[tokio::test]
@@ -8328,30 +9158,42 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
-    async fn remount_retry_pass_targets_failed_and_unmounted_only() {
+    async fn remount_retry_pass_retries_a_transient_failure() {
         let dir = tempdir();
-        // Sequence: fail on first boot attempt (probe exhausted),
-        // succeed on retry.
+        // Probe ladder exhausted on the first attempt — a wire /
+        // negotiation failure, not an auth one — then succeeds.
+        // A NAS that was still booting is exactly this shape, and
+        // it must come back without the operator.
         let mut outputs = Vec::new();
         for _ in 0..CIFS_VERS_PROBE_LADDER.len() {
             outputs.push(err_mount_output());
         }
         outputs.push(ok_mount_output());
         let executor = ScriptedExecutor::new(outputs);
+        // Model the mount table: the path becomes a mount point
+        // once the successful mount call has been consumed.
+        // Without this the reconcile pass would correctly read a
+        // share it just mounted as vanished.
+        let exec_for_check = Arc::clone(&executor);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
             .with_mount_timeout_ms(1_000)
             .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                exec_for_check.cursor.load(Ordering::SeqCst)
+                    > CIFS_VERS_PROBE_LADDER.len()
+            }))
             .build();
         let record = built_record("Retry", "192.0.2.22");
         let id = rt.add_share(record).await.unwrap();
 
         let _ = rt.mount_share(&id).await;
-        // After the first attempt: Failed.
         {
             let g = rt.share_states.lock().await;
-            assert_eq!(g.get(&id).unwrap().state, MountState::Failed);
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Transient));
         }
 
         let outcomes = rt.remount_retry_pass().await;
@@ -8359,13 +9201,751 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert!(outcomes[0].is_ok());
         {
             let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            // Mounting clears the class, so a later drop-out is
+            // retryable again.
+            assert_eq!(e.failure_class, None);
+        }
+
+        // Nothing left in a retryable state.
+        assert!(rt.remount_retry_pass().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_leaves_an_auth_refusal_alone() {
+        let dir = tempdir();
+        // One permission-denied response. Auth refusal short-
+        // circuits the ladder, so this is the only mount call the
+        // share should ever generate: the retry pass must not add
+        // more. Re-probing a rejected password every cadence tick
+        // is a credential storm against the server.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let store = Arc::new(FileCredentialStore::new(dir.clone()));
+        store.store_password("storm_key", b"wrong").await.unwrap();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_888_000))
+            .build();
+        let mut record = built_record("AuthShare", "192.0.2.24");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "storm_key".to_string(),
+            domain: None,
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(err, MountError::AuthenticationRefused { .. }));
+        let calls_after_first = executor.calls.lock().await.len();
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Permanent));
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert!(
+            outcomes.is_empty(),
+            "auth-refused share must not be retried, got {outcomes:?}"
+        );
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls_after_first,
+            "retry pass issued a mount call for an auth-refused share"
+        );
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_retries_a_transient_nfs_failure() {
+        // The other half of the NFS retry contract. A refusal is
+        // left alone; a server that was not answering has to come
+        // back without the operator, exactly as for CIFS.
+        //
+        // NFS mounts in a single attempt — no dialect ladder — so
+        // this is one failure then one success.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            failure_output("mount.nfs: Connection refused"),
+            ok_mount_output(),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_005_000_000))
+            .build();
+        let mut record = built_record("NfsTransient", "192.0.2.60");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(
+                e.failure_class,
+                Some(FailureClass::Transient),
+                "a refused connection is reachability, not authorisation"
+            );
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert_eq!(outcomes.len(), 1, "a transient NFS failure must retry");
+        assert!(outcomes[0].is_ok());
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            assert_eq!(e.failure_class, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_leaves_an_nfs_auth_refusal_alone() {
+        let dir = tempdir();
+        // NFS refuses with exit 32 / access denied. Same class,
+        // same treatment — the retry filter is not a CIFS-only
+        // rule.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount.nfs: access denied by server while mounting",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_999_000))
+            .build();
+        let mut record = built_record("NfsShare", "192.0.2.25");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        let calls_after_first = executor.calls.lock().await.len();
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Permanent));
+        }
+
+        assert!(rt.remount_retry_pass().await.is_empty());
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls_after_first,
+            "retry pass issued a mount call for an NFS auth refusal"
+        );
+    }
+
+    /// A mount table that follows an unmount/mount cycle.
+    ///
+    /// The path starts out mounted, stops being a mount point
+    /// once the umount call has run, and is a mount point again
+    /// after the remount. Without this the check would still say
+    /// "mounted" immediately after the unmount, and `mount_share`
+    /// would adopt the phantom mount instead of issuing one —
+    /// which is the fixture lying, not the code being wrong.
+    fn cycling_mount_table(
+        executor: &Arc<ScriptedExecutor>,
+    ) -> Arc<dyn Fn(&Path) -> bool + Send + Sync> {
+        let exec = Arc::clone(executor);
+        Arc::new(move |_: &Path| {
+            let calls = exec.cursor.load(Ordering::SeqCst);
+            calls == 0 || calls >= 2
+        })
+    }
+
+    /// Programs the executor was asked to run, in order, so a
+    /// fixture can say "unmount then mount" rather than "some
+    /// number of calls happened".
+    async fn programs_run(executor: &Arc<ScriptedExecutor>) -> Vec<String> {
+        executor
+            .calls
+            .lock()
+            .await
+            .iter()
+            .map(|(program, _)| program.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_a_mount_the_os_still_has_despite_failed() {
+        // The case this exists for: the subject says Failed while
+        // the mount is still up. Editing the credentials of a
+        // share in that condition has to cycle the real mount, or
+        // the operator changes a password and the old mount keeps
+        // serving.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            ok_mount_output(), // umount
+            ok_mount_output(), // remount
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_000_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let record = built_record("EditFailed", "192.0.2.40");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::Timeout {
+                id: id.clone(),
+                timeout_ms: 1_000,
+            },
+        )
+        .await;
+
+        let changed = rt
+            .edit_share(
+                &id,
+                ShareEdits {
+                    host: Some("192.0.2.41".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+
+        let programs = programs_run(&executor).await;
+        assert_eq!(
+            programs,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()],
+            "a material edit over a live OS mount must cycle it"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_the_happy_path_too() {
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![ok_mount_output(), ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_100_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let record = built_record("EditMounted", "192.0.2.42");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                path: Some("Media".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_does_not_cycle_when_the_os_has_no_mount() {
+        // The converse. A subject still claiming Mounted over a
+        // path the OS no longer has must not fire a cycle against
+        // nothing.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_200_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("EditStale", "192.0.2.43");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                host: Some("192.0.2.44".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no OS mount means nothing to cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_material_edit_does_not_cycle() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_300_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("EditAlias", "192.0.2.45");
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounted, None, None)
+            .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                alias: Some("Renamed".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "an alias change is cosmetic; the mount must not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_edit_cycles_an_nfs_mount_the_os_still_has() {
+        // Same gate, no filesystem-specific branch.
+        let dir = tempdir();
+        let executor =
+            ScriptedExecutor::new(vec![ok_mount_output(), ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_003_400_000))
+            .with_mount_point_check(cycling_mount_table(&executor))
+            .build();
+        let mut record = built_record("EditNfs", "192.0.2.46");
+        record.fstype = FsType::Nfs;
+        let id = rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::Timeout {
+                id: id.clone(),
+                timeout_ms: 1_000,
+            },
+        )
+        .await;
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                path: Some("/export/media".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/umount".to_string(), "/bin/mount".to_string()]
+        );
+    }
+
+    /// An L3 gate with a fixed answer.
+    fn l3_gate_fixed(up: bool) -> L3Gate {
+        Arc::new(move || Box::pin(async move { up }))
+    }
+
+    #[tokio::test]
+    async fn boot_mount_skips_every_share_when_there_is_no_l3() {
+        // Mounting before the link is up spends the whole dialect
+        // ladder failing against a host that is not reachable
+        // yet, and leaves the operator looking at a broken
+        // library on a device that was merely booting faster than
+        // its network.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_000_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            // Short bound so the fixture does not sit for a
+            // minute proving a negative.
+            .with_l3_wait_ms(0)
+            .build();
+        rt.add_share(built_record("NoLink", "192.0.2.50"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert!(report.outcomes.is_empty(), "no L3 means no boot mount");
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no L3 must mean zero mount helper calls, got {:?}",
+            programs_run(&executor).await
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_skips_an_nfs_share_when_there_is_no_l3() {
+        // The gate sits above the filesystem split, so this is
+        // the same assertion as the CIFS case: without a link,
+        // zero mount helper calls. Pinned separately so a future
+        // per-filesystem boot path cannot quietly bypass it.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_005_100_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            .with_l3_wait_ms(0)
+            .build();
+        let mut record = built_record("NfsNoLink", "192.0.2.61");
+        record.fstype = FsType::Nfs;
+        rt.add_share(record).await.unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert!(report.outcomes.is_empty());
+        assert!(
+            programs_run(&executor).await.is_empty(),
+            "no L3 must mean zero mount helper calls for NFS too"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_runs_the_normal_path_once_l3_is_up() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_100_000))
+            .with_l3_gate(l3_gate_fixed(true))
+            .build();
+        let id = rt
+            .add_share(built_record("HasLink", "192.0.2.51"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/mount".to_string()]
+        );
+        let g = rt.share_states.lock().await;
+        assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+    }
+
+    #[tokio::test]
+    async fn boot_mount_proceeds_when_l3_arrives_during_the_wait() {
+        // The ordinary boot race: the plugin is up before the
+        // link is. The wait is the point — the shares must mount
+        // once it lands, not be skipped because the first check
+        // was early.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let up = Arc::new(AtomicBool::new(false));
+        let up_for_gate = Arc::clone(&up);
+        let gate: L3Gate = Arc::new(move || {
+            let flag = Arc::clone(&up_for_gate);
+            Box::pin(async move { flag.load(Ordering::SeqCst) })
+        });
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_200_000))
+            .with_l3_gate(gate)
+            .with_l3_wait_ms(5_000)
+            .build();
+        rt.add_share(built_record("LateLink", "192.0.2.52"))
+            .await
+            .unwrap();
+
+        // Link comes up shortly after boot-mount starts waiting.
+        let flip = Arc::clone(&up);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            flip.store(true, Ordering::SeqCst);
+        });
+
+        let report = rt.boot_mount_all().await;
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            programs_run(&executor).await,
+            vec!["/bin/mount".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_gives_up_within_its_bound() {
+        // The wait is bounded, so the detached boot task cannot
+        // sit forever on a device with no network. Readiness is
+        // never behind it either way — boot-mount is spawned
+        // detached — but an unbounded wait would leak a task per
+        // restart.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_300_000))
+            .with_l3_gate(l3_gate_fixed(false))
+            .with_l3_wait_ms(1_200)
+            .build();
+        rt.add_share(built_record("NeverLink", "192.0.2.53"))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let report = rt.boot_mount_all().await;
+        let waited = started.elapsed();
+
+        assert!(report.outcomes.is_empty());
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "boot-mount must give up on its bound, waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_mount_without_a_gate_is_unchanged() {
+        // A runtime built without a gate behaves as it always
+        // did. Every existing fixture depends on this.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_004_400_000))
+            .build();
+        rt.add_share(built_record("NoGate", "192.0.2.54"))
+            .await
+            .unwrap();
+
+        let report = rt.boot_mount_all().await;
+        assert_eq!(report.outcomes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_a_vanished_mount_unmounted() {
+        // The cable came out, or the NAS went away. The subject
+        // must stop claiming the share is mounted — otherwise the
+        // operator is told a working library is there while every
+        // read fails.
+        let dir = tempdir();
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_check = Arc::clone(&live);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_000_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                live_for_check.load(Ordering::SeqCst)
+            }))
+            .build();
+        let record = built_record("Vanish", "192.0.2.30");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        // Adopted from the live mount table.
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
             assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
         }
 
-        // Second retry: nothing to do — no candidates in Failed
-        // or Unmounted.
-        let outcomes2 = rt.remount_retry_pass().await;
-        assert!(outcomes2.is_empty());
+        // The mount goes away underneath us.
+        live.store(false, Ordering::SeqCst);
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Unmounted);
+            assert!(
+                e.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no longer present"),
+                "reason must say why, got {:?}",
+                e.reason
+            );
+            // Not a failure — nothing to skip on the retry pass,
+            // so a transient disappearance recovers on its own.
+            assert_eq!(e.failure_class, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_live_mount_alone() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let record = built_record("Live", "192.0.2.31");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.reconcile_os_mount_states().await;
+        let first = {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            (e.state, e.last_transition_at_ms)
+        };
+        assert_eq!(first.0, MountState::Mounted);
+
+        // A second pass over an unchanged mount table must not
+        // transition anything.
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Mounted);
+            assert_eq!(e.last_transition_at_ms, first.1);
+            assert_eq!(e.reason, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_flip_a_share_that_is_mounting() {
+        // The mount point legitimately does not exist yet while
+        // the helper is running. Marking it down here would flap
+        // the subject on every reconcile landing mid-attempt.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_200_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("InFlight", "192.0.2.32");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.set_share_state(&id, MountState::Mounting, None, None)
+            .await;
+
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounting);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_a_vanished_nfs_mount_unmounted() {
+        // Same truth source, same treatment. A stale Mounted is
+        // as much a lie for NFS as for CIFS.
+        let dir = tempdir();
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_check = Arc::clone(&live);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(ScriptedExecutor::new(vec![ok_mount_output()]))
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_002_300_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                live_for_check.load(Ordering::SeqCst)
+            }))
+            .build();
+        let mut record = built_record("VanishNfs", "192.0.2.33");
+        record.fstype = FsType::Nfs;
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+        }
+
+        live.store(false, Ordering::SeqCst);
+        rt.reconcile_os_mount_states().await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Unmounted);
+        }
+    }
+
+    #[tokio::test]
+    async fn remount_retry_pass_adopt_wins_over_a_stale_failed() {
+        let dir = tempdir();
+        // The share is recorded Failed, but the OS says the mount
+        // is live. Adoption runs before candidate selection, so
+        // the share must come out Mounted and generate no mount
+        // call — regardless of how it failed.
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "mount error(13): NT_STATUS_LOGON_FAILURE",
+        )]);
+        let record = built_record("Adopted", "192.0.2.26");
+        let mount_root = record.mount_root.clone();
+        let id = record.share_id.clone();
+        // The OS reports this share's mount point as live.
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_001_000_000))
+            .with_mount_point_check(Arc::new(move |p: &Path| {
+                p == mount_root.as_path()
+            }))
+            .build();
+        rt.add_share(record).await.unwrap();
+        rt.set_share_failed(
+            &id,
+            &MountError::AuthenticationRefused {
+                id: id.clone(),
+                exit_code: Some(13),
+                stderr: "NT_STATUS_LOGON_FAILURE".to_string(),
+            },
+        )
+        .await;
+
+        let calls_before = executor.calls.lock().await.len();
+        let outcomes = rt.remount_retry_pass().await;
+        assert!(outcomes.is_empty(), "adopted share must not be retried");
+        assert_eq!(executor.calls.lock().await.len(), calls_before);
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
+        }
     }
 
     #[tokio::test]
@@ -8377,12 +9957,21 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         }
         outputs.push(ok_mount_output());
         let executor = ScriptedExecutor::new(outputs);
+        // Same mount-table model as the retry fixture: once the
+        // successful mount is consumed the path is live, so later
+        // cadence ticks reconcile it as mounted rather than
+        // re-mounting a share that is already up.
+        let exec_for_check = Arc::clone(&executor);
         let rt = Arc::new(
             NetworkSharesRuntime::builder(&dir)
                 .unwrap()
                 .with_executor(executor)
                 .with_mount_timeout_ms(1_000)
                 .with_now_fn(Arc::new(|| 1_700_000_777_000))
+                .with_mount_point_check(Arc::new(move |_: &Path| {
+                    exec_for_check.cursor.load(Ordering::SeqCst)
+                        > CIFS_VERS_PROBE_LADDER.len()
+                }))
                 .build(),
         );
         let record = built_record("SpawnRetry", "192.0.2.23");

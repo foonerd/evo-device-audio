@@ -27,9 +27,9 @@
 //! The state machine is pure: it advances phase-by-phase by
 //! calling injected step functions (the
 //! [`TransitionExecutor`] trait). For unit tests, the
-//! [`CapturingTransitionHappener`] records lifecycle
+//! `CapturingTransitionHappener` records lifecycle
 //! emissions in-memory; the
-//! [`StubTransitionExecutor`] implements deterministic step
+//! `StubTransitionExecutor` implements deterministic step
 //! outcomes. For the runtime (P1), a `LiveTransitionExecutor`
 //! will coordinate delivery.alsa + playback.mpd via the
 //! framework's cross-plugin reactive substrate.

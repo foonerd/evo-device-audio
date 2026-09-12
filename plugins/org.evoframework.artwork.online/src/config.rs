@@ -163,10 +163,10 @@ impl PluginConfig {
     ///   307-redirect through the Internet Archive).
     /// - **Providers**: `cover_art_archive` and `itunes`
     ///   enabled by default (no-auth, canonical, byte-cache
-    ///   safe); `deezer` toggle is retained for the artist
-    ///   path's live-fetch channel — the album cascade
-    ///   deliberately does not consult Deezer per its
-    ///   live-fetch ToS invariant; `lastfm` disabled unless
+    ///   safe); the `deezer` toggle governs the artist path —
+    ///   the album cascade does not consult Deezer, a
+    ///   provider-set choice rather than a caching
+    ///   restriction; `lastfm` disabled unless
     ///   the operator supplies a key; `volumio_meta`
     ///   disabled by default (operator-opt-in only —
     ///   historical primary that shipped 500s).

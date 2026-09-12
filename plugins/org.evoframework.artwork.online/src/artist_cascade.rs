@@ -38,14 +38,12 @@
 //!   verb consumes the bio; this cascade consumes the thumb).
 //!   Cache-safe.
 //! - **deezer** — anonymous keyless. Provides four resolution
-//!   tiers of the artist portrait via the public API. **Live-
-//!   fetch invariant, ToS-mandated**: the response body must
-//!   NEVER be persisted. Enforced at the type level by
-//!   `ArtistImageHit`'s deliberate absence of `Serialize`; the
-//!   fetch helper extracts URLs into a local JSON payload
-//!   inline. The URLs themselves are stable metadata and
-//!   render-time links; the images they point at are what the
-//!   ToS restricts.
+//!   tiers of the artist portrait via the public API. Its
+//!   bytes are cached like any other provider's, governed by
+//!   the operator's artwork-caching setting. `ArtistImageHit`
+//!   still lacks `Serialize`, which keeps the response body
+//!   from leaking into a JSON payload wholesale — a type-level
+//!   hygiene property, not a caching restriction.
 //! - **fanart.tv** — identity-bearing, keyed by operator's
 //!   fanart.tv personal API key from the framework credential
 //!   vault. Provides HD music logos, HD artist logos,
@@ -59,9 +57,11 @@
 //! (matches the transient-not-cached discipline the album
 //! cascade already enforces). Only structural misses (clean
 //! 404, empty result) or successful hits touch the cache.
-//! Deezer additionally never caches its response body
-//! regardless of outcome — enforced structurally by
-//! `ArtistImageHit`'s missing `Serialize`.
+//! Deezer's URL is re-derived per resolve rather than memoised
+//! with the others: its CDN links are the shortest-lived of the
+//! set, and a stored link that has since expired serves a 404
+//! instead of a picture. The image bytes behind it are cached
+//! like any other provider's.
 //!
 //! ## Enable + priority
 //!
@@ -82,6 +82,7 @@ use std::sync::Arc;
 
 use evo_online_providers::{
     deezer::DeezerClient,
+    discogs::{ArtistImageAttempt, DiscogsClient},
     fanart::FanartClient,
     musicbrainz::{
         parse_deezer_artist_id, MusicBrainzClient, MusicBrainzError,
@@ -102,6 +103,20 @@ pub(crate) enum ArtistProviderId {
     Deezer,
     // Identity-bearing — API key required.
     FanartTv,
+    /// Discogs artist photography.
+    ///
+    /// Closes the artist class every other provider here misses:
+    /// fanart is MBID-gated and skips anyone MusicBrainz cannot
+    /// reconcile (most `feat.` credits, composer-conductor
+    /// entries, solo instrumentalists), and anonymous Deezer
+    /// answers those same artists with an empty body. Discogs
+    /// holds real images for them.
+    ///
+    /// The credential is the operator's Discogs token, owned by
+    /// `org.evoframework.metadata.online` and read here through
+    /// the framework's governed provider-credential grant — the
+    /// operator enters it once, for both surfaces.
+    Discogs,
 }
 
 impl ArtistProviderId {
@@ -111,6 +126,7 @@ impl ArtistProviderId {
             ArtistProviderId::TheAudioDb => "theaudiodb",
             ArtistProviderId::Deezer => "deezer",
             ArtistProviderId::FanartTv => "fanart_tv",
+            ArtistProviderId::Discogs => "discogs",
         }
     }
 
@@ -120,6 +136,7 @@ impl ArtistProviderId {
             "theaudiodb" => Some(ArtistProviderId::TheAudioDb),
             "deezer" => Some(ArtistProviderId::Deezer),
             "fanart_tv" => Some(ArtistProviderId::FanartTv),
+            "discogs" => Some(ArtistProviderId::Discogs),
             _ => None,
         }
     }
@@ -129,12 +146,72 @@ impl ArtistProviderId {
             ArtistProviderId::VolumioMeta
             | ArtistProviderId::TheAudioDb
             | ArtistProviderId::Deezer => ArtistPrivacyClass::Anonymous,
-            ArtistProviderId::FanartTv => ArtistPrivacyClass::IdentityBearing,
+            ArtistProviderId::FanartTv | ArtistProviderId::Discogs => {
+                ArtistPrivacyClass::IdentityBearing
+            }
         }
     }
 }
 
 /// Whether a provider requires operator credentials to query.
+/// Why a provider is or is not dispatching on this resolve.
+///
+/// Exists so the journal names the real cause. The two
+/// non-dispatching cases point an operator at different settings
+/// — a per-provider toggle versus the device privacy posture —
+/// and conflating them sends them to the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderGate {
+    /// Permitted; the provider's own preconditions still apply.
+    Dispatch,
+    /// The operator turned this provider off.
+    OperatorDisabled,
+    /// The device's privacy posture suppresses it, regardless of
+    /// the operator's per-provider setting or whether its
+    /// credential is wired.
+    SuppressedByPrivacyMode,
+}
+
+impl ProviderGate {
+    /// Stable `reason` value for the journal.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            ProviderGate::Dispatch => "dispatch",
+            ProviderGate::OperatorDisabled => "operator_disabled",
+            ProviderGate::SuppressedByPrivacyMode => "privacy_mode",
+        }
+    }
+
+    /// Operator-readable explanation for the journal line.
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            ProviderGate::Dispatch => "permitted",
+            ProviderGate::OperatorDisabled => {
+                "operator disabled the provider in the artist-artwork config \
+                 (no network call fired)"
+            }
+            ProviderGate::SuppressedByPrivacyMode => {
+                "suppressed by the device privacy mode, which outranks the \
+                 per-provider setting and credential presence (no network \
+                 call fired); change it with the privacy-mode operator \
+                 gesture, not the provider toggle"
+            }
+        }
+    }
+
+    /// Whether the cascade should dispatch.
+    pub(crate) fn permits(self) -> bool {
+        matches!(self, ProviderGate::Dispatch)
+    }
+}
+
+/// The device's privacy posture, as read from the framework.
+///
+/// Deliberately the SDK type rather than a plugin-local copy —
+/// a second definition is exactly how the text cascade and this
+/// one came to disagree about whether the posture applied at all.
+pub(crate) use evo_plugin_sdk::contract::context::PrivacyPosture as ArtistPrivacyPosture;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ArtistPrivacyClass {
@@ -167,6 +244,7 @@ pub(crate) struct ArtistProviderConfig {
     pub(crate) theaudiodb: ArtistProviderFlags,
     pub(crate) deezer: ArtistProviderFlags,
     pub(crate) fanart_tv: ArtistProviderFlags,
+    pub(crate) discogs: ArtistProviderFlags,
 }
 
 impl ArtistProviderConfig {
@@ -175,6 +253,17 @@ impl ArtistProviderConfig {
             fanart_tv: ArtistProviderFlags {
                 enabled: true,
                 priority: 40,
+            },
+            // Between fanart (40) and Deezer (45), deliberately.
+            // Discogs covers exactly the artists fanart's MBID
+            // gate skips, and Deezer answers those same artists
+            // with an empty body — so a real Discogs image must
+            // beat Deezer's blank. Combined with the
+            // placeholder-hash skip in the cascade walk, this is
+            // what makes that artist class actually paint.
+            discogs: ArtistProviderFlags {
+                enabled: true,
+                priority: 42,
             },
             deezer: ArtistProviderFlags {
                 enabled: true,
@@ -200,6 +289,7 @@ impl ArtistProviderConfig {
             ArtistProviderId::TheAudioDb => self.theaudiodb,
             ArtistProviderId::Deezer => self.deezer,
             ArtistProviderId::FanartTv => self.fanart_tv,
+            ArtistProviderId::Discogs => self.discogs,
         }
     }
 
@@ -213,11 +303,75 @@ impl ArtistProviderConfig {
             ArtistProviderId::TheAudioDb => self.theaudiodb = flags,
             ArtistProviderId::Deezer => self.deezer = flags,
             ArtistProviderId::FanartTv => self.fanart_tv = flags,
+            ArtistProviderId::Discogs => self.discogs = flags,
         }
     }
 
     pub(crate) fn is_enabled(&self, provider: ArtistProviderId) -> bool {
         self.flags(provider).enabled
+    }
+
+    /// Why a provider is or is not dispatching, accounting for
+    /// the device's privacy posture.
+    ///
+    /// No posture gate existed here at all: `is_enabled` was the
+    /// whole test, so this cascade dispatched identity-bearing
+    /// providers — fanart.tv, and Discogs since this release —
+    /// regardless of the operator's posture, while the text
+    /// cascade suppressed its own. An operator selecting
+    /// `anonymous_only` was protected on one surface and leaked
+    /// on the other.
+    ///
+    /// The posture is non-bypassable and outranks both the
+    /// per-provider enable flag and credential presence.
+    /// `offline` suppresses every provider here, since all of
+    /// them are network sources and this cascade has no local
+    /// provider. `anonymous_only` suppresses the
+    /// identity-bearing ones and leaves the keyless ones
+    /// reachable, so the operator still gets artwork, just
+    /// nothing tied to an account. `enhanced` defers entirely to
+    /// the per-provider selection.
+    ///
+    /// Returns the reason as well as the verdict, because the two
+    /// non-dispatching cases point an operator at different
+    /// settings and conflating them sends them to the wrong one.
+    /// Use [`Self::is_dispatchable`] where only the verdict is
+    /// needed.
+    pub(crate) fn gate(
+        &self,
+        provider: ArtistProviderId,
+        posture: ArtistPrivacyPosture,
+    ) -> ProviderGate {
+        if !posture.permits_network() {
+            return ProviderGate::SuppressedByPrivacyMode;
+        }
+        if !posture.permits_identity_bearing()
+            && matches!(
+                provider.privacy_class(),
+                ArtistPrivacyClass::IdentityBearing
+            )
+        {
+            return ProviderGate::SuppressedByPrivacyMode;
+        }
+        if !self.flags(provider).enabled {
+            return ProviderGate::OperatorDisabled;
+        }
+        ProviderGate::Dispatch
+    }
+
+    /// Whether the provider may dispatch under this posture.
+    ///
+    /// The verdict half of [`Self::gate`], which is the single
+    /// source of the decision — this delegates rather than
+    /// re-deriving it, so the two can never drift and leave the
+    /// cascade dispatching on one answer while the journal
+    /// explains the other.
+    pub(crate) fn is_dispatchable(
+        &self,
+        provider: ArtistProviderId,
+        posture: ArtistPrivacyPosture,
+    ) -> bool {
+        self.gate(provider, posture).permits()
     }
 
     /// Merge a runtime operator override on top of the current
@@ -643,6 +797,55 @@ fn is_real_image_url(url: &str) -> bool {
     true
 }
 
+/// Whether a live Deezer fetch could still win, given the
+/// non-Deezer outcomes already in hand.
+///
+/// Returns `true` only when some other provider both outranks
+/// Deezer under the operator's priority config **and** carries a
+/// payload the portrait picker accepts. Both halves are load
+/// bearing: a better-ranked source whose payload holds no
+/// photograph is skipped by the picker during the source walk, so
+/// Deezer could still win behind it and must not be suppressed.
+///
+/// Deezer is the only artist provider exempt from the result
+/// cache — its CDN links expire too quickly to memoise — so it
+/// is the one leg that costs a network round on an otherwise warm
+/// resolve. Suppressing calls that provably cannot win is what
+/// keeps a warm browse grid off Deezer's 1 req/s budget.
+fn deezer_is_outranked(
+    non_deezer: [(&ProviderOutcome, usize); 4],
+    deezer_dispatch_index: usize,
+    config: &ArtistProviderConfig,
+) -> bool {
+    // Mirror the selection rule exactly: sources are ordered by a
+    // STABLE sort on operator priority and the first one whose
+    // payload yields a portrait wins. Under a stable sort, equal
+    // priorities keep dispatch order, so the real rank of a source
+    // is the pair (priority, dispatch index) — comparing priority
+    // alone would miss every tie.
+    //
+    // Ties are not hypothetical: a device whose operator config
+    // assigns every provider the same priority leaves dispatch
+    // order as the sole tiebreak, and a priority-only test would
+    // then never suppress anything.
+    let deezer_rank = (
+        config.flags(ArtistProviderId::Deezer).priority,
+        deezer_dispatch_index,
+    );
+    non_deezer
+        .into_iter()
+        .filter_map(|(out, idx)| match out {
+            ProviderOutcome::Hit(entry) => Some((entry, idx)),
+            _ => None,
+        })
+        .any(|(entry, idx)| {
+            ArtistProviderId::from_wire(&entry.provider_id).is_some_and(|p| {
+                (config.flags(p).priority, idx) < deezer_rank
+                    && pick_canonical_image_url(&entry.payload).is_some()
+            })
+        })
+}
+
 /// Sort a `sources` slice in place by operator priority
 /// (ascending — lower wins). Unknown provider ids sink to the
 /// tail. Stable sort preserves input order for ties.
@@ -681,6 +884,25 @@ pub(crate) struct ArtistCatalogue {
     pub(crate) theaudiodb: Option<Arc<TheAudioDbClient>>,
     pub(crate) deezer: Option<Arc<DeezerClient>>,
     pub(crate) fanart: Option<Arc<FanartClient>>,
+    /// Discogs client for artist photography. `None` when the
+    /// operator has stored no Discogs token, or the framework
+    /// refused this plugin's provider-credential grant — both
+    /// cases disable the source and the cascade walks on.
+    pub(crate) discogs: Option<Arc<DiscogsClient>>,
+    /// The device's privacy posture, read from the framework at
+    /// the start of each resolve.
+    ///
+    /// Carried on the catalogue rather than re-read per provider
+    /// so one resolve sees one consistent posture: re-reading
+    /// mid-cascade could let an operator's mid-flight change
+    /// suppress some providers and not others, producing a
+    /// half-applied posture that is exactly the kind of state
+    /// nobody can reason about.
+    ///
+    /// Populated fail-safe: a read error or an unrecognised value
+    /// resolves to the most restrictive posture, never the
+    /// permissive default.
+    pub(crate) privacy_posture: ArtistPrivacyPosture,
     /// MusicBrainz client used to reconcile the artist's
     /// canonical MBID before dispatching identity-bearing
     /// providers. Always present when the plugin has loaded
@@ -821,19 +1043,6 @@ pub(crate) async fn query_artist_artwork(
     }
 }
 
-/// Deezer CDN host token used to identify URLs whose bytes
-/// MUST NOT be cached durably by this device per Deezer's
-/// terms of service (live-fetch invariant, mirrored
-/// structurally by [`evo_online_providers::deezer::ArtistImageHit`]'s
-/// missing `Serialize`). Any winning image URL whose host
-/// matches this token is refused at the byte-caching path;
-/// the endpoint returns `not_found` on the artist scheme,
-/// which drives the source-walk to the next cacheable
-/// provider on the next resolve if one is available, and
-/// stays honest (no ToS-violating byte copy on disk) if
-/// Deezer was the only source.
-const DEEZER_CDN_HOST_TOKEN: &str = "dzcdn.net";
-
 /// Wire request for the endpoint-facing artist byte-resolve
 /// path — mirrors the shape the framework's `artwork.resolve`
 /// / `artwork.resolve_online` dispatch already uses so the
@@ -959,22 +1168,6 @@ fn artist_bytes_unavailable(
 /// `/api/v1/audio/artwork/{content_hash}` — same local serve
 /// path album covers already use.
 ///
-/// ## Deezer live-fetch invariant
-///
-/// Deezer's terms of service prohibit persisting image bytes.
-/// The plugin's byte-cache path refuses any winning URL whose
-/// host matches [`DEEZER_CDN_HOST_TOKEN`] — the response
-/// becomes `not_found` (with the Deezer `provider_id` echoed
-/// for observability), so the endpoint surfaces a 404 rather
-/// than storing ToS-restricted bytes locally. Deezer remains
-/// available to callers of [`query_artist_artwork`] over the
-/// WebSocket verb (which returns URLs, not bytes) — this
-/// carve-out only applies to the durable local pipeline.
-///
-/// The rig proof (2026-07-28) shows fanart_tv wins for the
-/// overwhelming majority of artists with a fanart photo, so
-/// this Deezer-refusal leaves the fleet portrait coverage
-/// essentially unchanged in practice.
 pub(crate) async fn resolve_artist_bytes_to_hash(
     payload: &[u8],
     catalogue: &ArtistCatalogue,
@@ -1096,41 +1289,163 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
         }
     }
 
-    let Some(image_url) = cascade_response.image_url else {
-        return artist_bytes_not_found(
-            "cascade returned Ok but no image_url".into(),
+    // Walk the sources list in priority order (already sorted by
+    // `sort_sources_by_priority` inside `query_artist_artwork`).
+    // For each source: pick a canonical portrait URL, fetch, and
+    // transcode. If the resulting content_hash matches the known-
+    // placeholder set (Deezer's empty-MD5 blank silhouette is the
+    // recurring example — an initial URL that looks valid to
+    // `is_real_image_url` but whose CDN 302-redirects to
+    // `.../artist/d41d8cd98…/…`, so the placeholder only becomes
+    // detectable after the bytes arrive), CONTINUE the cascade to
+    // the next source instead of returning the blank as a
+    // "resolved" outcome. Same for a fetch or transcode error:
+    // the provider is not usable, try the next.
+    //
+    // Every source that produces real bytes gets cached uniformly;
+    // legal-risk trade-off at the distribution boundary. The
+    // sibling `is_real_image_url` filter at the picker layer
+    // rejects blank-shaped URLs before we ever fetch them; this
+    // loop is the belt-and-braces for blanks whose payload only
+    // reveals itself after the download.
+    //
+    // If the initial `cascade_response.image_url` was the winner
+    // and it's still usable, this loop finds it on iteration 1 —
+    // the cost of walking is a single pick_canonical_image_url on
+    // hit-path, no extra network round-trip in the common case.
+    if cascade_response.sources.is_empty() {
+        // Legacy path: no sources list, fall back to the single-
+        // winner url. Preserves callers that don't populate
+        // sources but do populate image_url.
+        let Some(image_url) = cascade_response.image_url else {
+            return artist_bytes_not_found(
+                "cascade returned Ok but no image_url".into(),
+                cascade_response.provider_id,
+            );
+        };
+        return fetch_and_transcode_single(
+            http,
+            &image_url,
             cascade_response.provider_id,
-        );
-    };
-    let provider_id = cascade_response.provider_id.clone();
-
-    // Deezer live-fetch invariant — refuse to persist bytes
-    // whose host matches Deezer's CDN. The check is on the
-    // URL host, not the provider_id, so a Volumio meta source
-    // that proxies a Deezer URL is caught too.
-    if image_url_host_is_deezer(&image_url) {
-        tracing::info!(
-            plugin = crate::PLUGIN_NAME,
-            provider = ?provider_id,
-            image_url = %image_url,
-            outcome = "not_found",
-            reason = "deezer_live_fetch_only",
-            "artist byte-cache path refuses Deezer-CDN bytes (ToS live-fetch invariant); \
-             endpoint surfaces 404 rather than caching a copy locally"
-        );
-        return artist_bytes_not_found(
-            format!(
-                "winning provider is Deezer-hosted \
-                 ({image_url}); the endpoint's byte-cache \
-                 path refuses Deezer bytes per its ToS \
-                 live-fetch invariant"
-            ),
-            provider_id,
-        );
+            size,
+        )
+        .await;
     }
 
-    // Fetch the bytes.
-    let (bytes, source_mime) = match fetch_image_bytes(http, &image_url).await {
+    let mut last_provider_id: Option<String> = cascade_response.provider_id;
+    let mut last_detail: Option<String> = None;
+    for source in &cascade_response.sources {
+        let Some(url) = pick_canonical_image_url(&source.payload) else {
+            // Picker rejected this source (empty URL / blank-shaped
+            // URL per is_real_image_url). Move on.
+            continue;
+        };
+        last_provider_id = Some(source.provider_id.clone());
+        let (bytes, source_mime) = match fetch_image_bytes(http, &url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                last_detail = Some(format!(
+                    "artist image download failed for {url}: {e}"
+                ));
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = %source.provider_id,
+                    error = %e,
+                    "artist source fetch failed; trying next source"
+                );
+                continue;
+            }
+        };
+        let evo_device_audio_shared::transcode::TranscodedArtwork {
+            bytes: transcoded_bytes,
+            content_hash,
+            mime,
+            flat_tone_ratio,
+        } = match evo_device_audio_shared::transcode::transcode(
+            bytes,
+            &source_mime,
+            size,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                last_detail = Some(format!(
+                    "transcode of {source_mime} bytes from artist provider \
+                     {source_provider} failed: {e}",
+                    source_provider = source.provider_id
+                ));
+                tracing::debug!(
+                    plugin = crate::PLUGIN_NAME,
+                    provider = %source.provider_id,
+                    error = %e,
+                    "artist source transcode failed; trying next source"
+                );
+                continue;
+            }
+        };
+        if is_not_a_photograph(flat_tone_ratio) {
+            // A provider's generic "no image" silhouette. The URL
+            // was structurally valid and the bytes decode as an
+            // image, so nothing upstream of here could reject it;
+            // the pixels are the only honest signal. Provider is
+            // effectively-empty for this artist, so the cascade
+            // continues and a real portrait behind it can win.
+            let ratio = flat_tone_ratio.unwrap_or(0.0);
+            last_detail = Some(format!(
+                "provider {} returned a flat non-photographic image \
+                 (two tones cover {pct:.0}% of pixels, \
+                 content_hash={content_hash}); continuing cascade",
+                source.provider_id,
+                pct = ratio * 100.0,
+            ));
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider = %source.provider_id,
+                content_hash = %content_hash,
+                flat_tone_ratio = ratio,
+                "artist source produced a placeholder (non-photographic) image; trying next source"
+            );
+            continue;
+        }
+        // First real winner — return.
+        return ResolveArtistBytesOutput {
+            response: ResolveArtistBytesResponse {
+                v: 1,
+                status: crate::resolve::ResponseStatus::Ok,
+                content_hash: Some(content_hash.clone()),
+                mime: Some(mime),
+                size: Some(size.as_str().to_string()),
+                provider_id: Some(source.provider_id.clone()),
+                detail: None,
+            },
+            cache_payload: Some((content_hash, transcoded_bytes)),
+        };
+    }
+
+    // Every source was skipped (picker refused / fetch failed /
+    // transcode failed / placeholder hash). Surface NotFound so
+    // the framework endpoint returns a clean 404 for the
+    // operator UI's placeholder floor rather than a stale winner.
+    artist_bytes_not_found(
+        last_detail.unwrap_or_else(|| {
+            "artist cascade exhausted every source (no usable portrait bytes)"
+                .into()
+        }),
+        last_provider_id,
+    )
+}
+
+/// Single-URL fetch + transcode, used as the legacy fall-back
+/// when a cascade response carries no `sources` list (only the
+/// legacy `image_url` single-winner shape). New paths iterate
+/// sources through the loop in `resolve_artist_bytes_to_hash`
+/// so a placeholder-hash winner cascades to next.
+async fn fetch_and_transcode_single(
+    http: &reqwest::Client,
+    image_url: &str,
+    provider_id: Option<String>,
+    size: evo_device_audio_shared::transcode::ArtworkSize,
+) -> ResolveArtistBytesOutput {
+    let (bytes, source_mime) = match fetch_image_bytes(http, image_url).await {
         Ok(pair) => pair,
         Err(e) => {
             return artist_bytes_unavailable(
@@ -1139,12 +1454,11 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
             );
         }
     };
-
-    // Transcode via the shared pipeline.
     let evo_device_audio_shared::transcode::TranscodedArtwork {
         bytes: transcoded_bytes,
         content_hash,
         mime,
+        flat_tone_ratio,
     } = match evo_device_audio_shared::transcode::transcode(
         bytes,
         &source_mime,
@@ -1160,14 +1474,24 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
             );
             return artist_bytes_unavailable(
                 format!(
-                    "transcode of {source_mime} bytes from artist provider {provider_id:?} \
-                     failed: {e}"
+                    "transcode of {source_mime} bytes from artist provider \
+                     {provider_id:?} failed: {e}"
                 ),
                 provider_id,
             );
         }
     };
-
+    if is_not_a_photograph(flat_tone_ratio) {
+        return artist_bytes_not_found(
+            format!(
+                "single-source path produced a flat non-photographic image \
+                 (two tones cover {pct:.0}% of pixels, \
+                 content_hash={content_hash}); no other source to cascade to",
+                pct = flat_tone_ratio.unwrap_or(0.0) * 100.0,
+            ),
+            provider_id,
+        );
+    }
     ResolveArtistBytesOutput {
         response: ResolveArtistBytesResponse {
             v: 1,
@@ -1182,20 +1506,42 @@ pub(crate) async fn resolve_artist_bytes_to_hash(
     }
 }
 
-fn image_url_host_is_deezer(url: &str) -> bool {
-    // Parse enough of the URL to grab the host portion. Cheap
-    // string split — no full URL parser needed for the ToS
-    // check.
-    let rest = match url.split_once("://") {
-        Some((_, r)) => r,
-        None => url,
-    };
-    let host_and_rest = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
-    let host = host_and_rest
-        .split_once('?')
-        .map(|(h, _)| h)
-        .unwrap_or(host_and_rest);
-    host.to_ascii_lowercase().contains(DEEZER_CDN_HOST_TOKEN)
+/// Fraction of the frame that two colours must cover before the
+/// image is judged a flat graphic rather than a photograph.
+///
+/// Measured against real provider output: every observed
+/// silhouette — all four sizes Deezer serves, and both CDN
+/// byte-variants seen at 500x500 — lands between 0.91 and 0.99,
+/// while genuine artist portraits land between 0.13 and 0.40.
+/// The threshold sits in the empty half of that gap, more than
+/// ten points clear of the flattest real photograph observed and
+/// fifty clear of the busiest silhouette.
+const NON_PHOTOGRAPH_FLAT_TONE_RATIO: f32 = 0.80;
+
+/// Whether decoded pixels say "this is not a photograph of
+/// anybody" — a provider's generic no-image silhouette, a
+/// wordmark, a solid fill.
+///
+/// This replaced a content-hash comparison that could never
+/// match: it tested a SHA-256 (64 hex chars) against the MD5 of
+/// the empty string (32 hex chars), so the guard never fired
+/// once and every placeholder that cleared the URL filter won
+/// its cascade outright.
+///
+/// Hashes were the wrong instrument regardless of that defect.
+/// The silhouette is served from per-artist URLs that carry a
+/// real-looking entity segment, so no URL rule reaches it, and
+/// it exists in several byte-variants per size, so an exact-hash
+/// list would need an entry per variant and would silently lag
+/// every CDN re-encode. The pixels are stable where the bytes
+/// are not.
+///
+/// `None` — an `Original`-size passthrough, which is never
+/// decoded — reads as "not measured" and never rejects. An
+/// unmeasurable image must not be discarded on the strength of
+/// a statistic that was never taken.
+fn is_not_a_photograph(flat_tone_ratio: Option<f32>) -> bool {
+    flat_tone_ratio.is_some_and(|r| r >= NON_PHOTOGRAPH_FLAT_TONE_RATIO)
 }
 
 async fn fetch_image_bytes(
@@ -1445,23 +1791,50 @@ async fn run_cascade(
         }
     };
 
-    let want_theaudiodb =
-        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some();
-    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+    // Every gate below runs through `is_dispatchable`, which
+    // applies the device's privacy posture ahead of the
+    // per-provider enable flag. The posture is non-bypassable:
+    // `offline` suppresses all of these (every provider in this
+    // cascade is a network source) and `anonymous_only`
+    // suppresses the identity-bearing ones.
+    let posture = catalogue.privacy_posture;
+    let want_theaudiodb = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::TheAudioDb, posture)
+        && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Deezer, posture)
         && catalogue.deezer.is_some()
         && reconciled.deezer_artist_url.is_some();
-    let want_fanart = catalogue.config.is_enabled(ArtistProviderId::FanartTv)
-        && catalogue.fanart.is_some();
+    // Carry the gate, not just a bool, so the provider's journal
+    // line names whether the operator turned it off or the
+    // privacy posture suppressed it.
+    let gate_fanart =
+        catalogue.config.gate(ArtistProviderId::FanartTv, posture);
+    let want_fanart = gate_fanart.permits() && catalogue.fanart.is_some();
+    // Discogs is name-keyed, so unlike fanart it carries no MBID
+    // pre-condition — which is exactly why it earns its place:
+    // the artists fanart's MBID gate skips are the ones Discogs
+    // can still answer.
+    let gate_discogs =
+        catalogue.config.gate(ArtistProviderId::Discogs, posture);
+    let want_discogs = gate_discogs.permits() && catalogue.discogs.is_some();
     // volumio_meta remains a name-only source; it takes no MBID
     // and no way to validate against a canonical identity. The
     // MBID reconcile above already confirmed the artist exists
     // (we would not be here otherwise); volumio_meta fires only
     // as one of the enabled providers.
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    let want_volumio = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, posture);
 
-    if !(want_volumio || want_theaudiodb || want_deezer || want_fanart) {
+    if !(want_volumio
+        || want_theaudiodb
+        || want_deezer
+        || want_fanart
+        || want_discogs)
+    {
         // Reconcile succeeded but no provider is enabled /
         // available. Not the "reconcile-absent" case above.
         return Ok(ArtistArtworkResponse::not_configured(
@@ -1483,117 +1856,246 @@ async fn run_cascade(
     // memoising the `SourceEntry` snapshot lets a browse of the
     // same artist set after the first cascade skip every non-
     // Deezer network round. Deezer is deliberately excluded —
-    // its live-fetch invariant remains structurally enforced by
-    // `ArtistImageHit`'s missing `Serialize`, and every request
-    // still fires `deezer.get_artist_image_by_id(id)` fresh
+    // its CDN links are the shortest-lived of the set, so a
+    // memoised URL would serve a 404 rather than a picture, and
+    // every request still fires `deezer.get_artist_image_by_id(id)` fresh
     // (using the id memoised via the reconcile cache).
-    let cached_non_deezer: Option<Vec<SourceEntry>> = if can_cache {
-        catalogue
-            .caches
-            .get_provider(&fold_key)
-            .await
-            .map(|entry| deserialize_provider_entries(&entry.sources))
+    let cached_entry = if can_cache {
+        catalogue.caches.get_provider(&fold_key).await
     } else {
         None
     };
-    let (volumio_out, tadb_out, fanart_out) =
-        if let Some(sources) = cached_non_deezer.as_ref() {
-            // Warm cache — re-hydrate cached entries as Hits. The
-            // cache only ever stores successful entries (see the
-            // cold-path serialisation below); an absent provider
-            // in the snapshot is a definitive absence at reconcile
-            // time and stays Absent on warm calls. Transients are
-            // never cached, so no Unavailable can come from cache.
-            let mut v = ProviderOutcome::Absent;
-            let mut t = ProviderOutcome::Absent;
-            let mut f = ProviderOutcome::Absent;
-            for src in sources {
-                match src.provider_id.as_str() {
-                    "volumio_meta" => v = ProviderOutcome::Hit(src.clone()),
-                    "theaudiodb" => t = ProviderOutcome::Hit(src.clone()),
-                    "fanart_tv" => f = ProviderOutcome::Hit(src.clone()),
-                    _ => {}
+    let cached_sources: Vec<SourceEntry> = cached_entry
+        .as_ref()
+        .map(|entry| deserialize_provider_entries(&entry.sources))
+        .unwrap_or_default();
+    // Re-hydrate only the legs the snapshot durably speaks for.
+    // A provider the snapshot covers but does not list settled as
+    // a definitive absence and stays Absent; one it does not cover
+    // was never asked, so it yields `None` here and is dispatched
+    // below. That distinction is the whole point of tracking
+    // coverage: it lets a partial snapshot be trusted for what it
+    // does say without inventing answers for what it does not.
+    let hydrate = |provider_id: &str| -> Option<ProviderOutcome> {
+        let entry = cached_entry.as_ref()?;
+        if !entry.covers(provider_id) {
+            return None;
+        }
+        Some(
+            cached_sources
+                .iter()
+                .find(|s| s.provider_id == provider_id)
+                .map_or(ProviderOutcome::Absent, |s| {
+                    ProviderOutcome::Hit(s.clone())
+                }),
+        )
+    };
+    let hit_volumio = hydrate("volumio_meta");
+    let hit_tadb = hydrate("theaudiodb");
+    let hit_fanart = hydrate("fanart_tv");
+    let hit_discogs = hydrate("discogs");
+    // Whether this wave learned anything new. A fully-covered
+    // snapshot dispatches nothing and must not rewrite the entry,
+    // or a hot artist would refresh its own TTL on every request
+    // and never re-fetch.
+    let dispatched_any = hit_volumio.is_none()
+        || hit_tadb.is_none()
+        || hit_fanart.is_none()
+        || hit_discogs.is_none();
+    // Each arm yields the final outcome directly: the memoised
+    // one when the snapshot covers it, otherwise a live fetch.
+    // Suppressing a covered leg here rather than at its gate
+    // keeps the fetch's own diagnostics honest — a skipped call
+    // reports nothing rather than claiming a false absence.
+    let (volumio_out, tadb_out, fanart_out, discogs_out) = tokio::join!(
+        async {
+            match hit_volumio {
+                Some(out) => out,
+                None => {
+                    fetch_volumio_meta_artist(
+                        &artist,
+                        &catalogue.volumio_meta_http,
+                        &catalogue.volumio_meta_variant,
+                        want_volumio,
+                    )
+                    .await
                 }
             }
-            (v, t, f)
-        } else {
-            // Cold cache — hit every enabled non-Deezer provider
-            // and cache only the Hits. Absent/Unavailable never
-            // enter the cache: absence gets re-tried next request
-            // (cheap) and unavailable MUST NOT durably poison.
-            let (v, t, f) = tokio::join!(
-                fetch_volumio_meta_artist(
-                    &artist,
-                    &catalogue.volumio_meta_http,
-                    &catalogue.volumio_meta_variant,
-                    want_volumio,
-                ),
-                fetch_theaudiodb_artist(
-                    effective_mbid,
-                    &artist,
-                    catalogue,
-                    want_theaudiodb,
-                ),
-                fetch_fanart_artist(effective_mbid, catalogue, want_fanart),
-            );
-            // Cache-write policy: only write the aggregate provider
-            // snapshot when EVERY non-Deezer outcome is non-transient
-            // (Hit or Absent). A single Unavailable in the wave means
-            // the memoised set would be incomplete — a subsequent
-            // read would treat the missing entry as a durable Absent,
-            // reproducing the bug we just fixed. Keep the cold cost
-            // and re-fetch next call.
-            let all_non_transient =
-                matches!(v, ProviderOutcome::Hit(_) | ProviderOutcome::Absent)
-                    && matches!(
-                        t,
-                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
+        },
+        async {
+            match hit_tadb {
+                Some(out) => out,
+                None => {
+                    fetch_theaudiodb_artist(
+                        effective_mbid,
+                        &artist,
+                        catalogue,
+                        want_theaudiodb,
                     )
-                    && matches!(
-                        f,
-                        ProviderOutcome::Hit(_) | ProviderOutcome::Absent
-                    );
-            if can_cache && all_non_transient {
-                let snapshot: Vec<serde_json::Value> = [&v, &t, &f]
-                    .into_iter()
-                    .filter_map(|out| match out {
-                        ProviderOutcome::Hit(entry) => {
-                            serialize_source_entry(entry)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                catalogue
-                    .caches
-                    .put_provider(
-                        fold_key.clone(),
-                        crate::artwork_caches::ProviderEntry::new(snapshot),
-                    )
-                    .await;
+                    .await
+                }
             }
-            (v, t, f)
-        };
+        },
+        async {
+            match hit_fanart {
+                Some(out) => out,
+                None => {
+                    fetch_fanart_artist(
+                        effective_mbid,
+                        catalogue,
+                        if catalogue.fanart.is_some() {
+                            gate_fanart
+                        } else {
+                            // Client absent: the fetch reports its own
+                            // no-key-wired reason, which is a distinct
+                            // cause from either gate.
+                            ProviderGate::Dispatch
+                        },
+                    )
+                    .await
+                }
+            }
+        },
+        async {
+            match hit_discogs {
+                Some(out) => out,
+                None => {
+                    fetch_discogs_artist(
+                        &artist,
+                        catalogue,
+                        if catalogue.discogs.is_some() {
+                            gate_discogs
+                        } else {
+                            ProviderGate::Dispatch
+                        },
+                    )
+                    .await
+                }
+            }
+        },
+    );
+    // Cache-write policy: memoise every leg that settled and
+    // record exactly which those were. A transient leg is simply
+    // left uncovered, so the next request retries that provider
+    // alone instead of re-running the whole wave.
+    //
+    // The predecessor policy wrote only when EVERY leg was
+    // non-transient. That looked conservative and was in fact
+    // catastrophic: one rate-limited provider anywhere in the
+    // wave suppressed the write for every artist, so the snapshot
+    // was never written at all and every tile re-resolved cold
+    // forever. Partial coverage is safe precisely because the
+    // reader above consults `covers()` before trusting a leg.
+    if can_cache && dispatched_any {
+        let mut snapshot: Vec<serde_json::Value> = Vec::new();
+        let mut covered: Vec<String> = Vec::new();
+        for (provider_id, out) in [
+            ("volumio_meta", &volumio_out),
+            ("theaudiodb", &tadb_out),
+            ("fanart_tv", &fanart_out),
+            ("discogs", &discogs_out),
+        ] {
+            match out {
+                ProviderOutcome::Hit(entry) => {
+                    // Only claim coverage for content we can
+                    // actually round-trip; an entry that fails to
+                    // serialise stays uncovered and is re-fetched.
+                    if let Some(value) = serialize_source_entry(entry) {
+                        snapshot.push(value);
+                        covered.push(provider_id.to_string());
+                    }
+                }
+                ProviderOutcome::Absent => {
+                    covered.push(provider_id.to_string())
+                }
+                ProviderOutcome::Unavailable => {}
+            }
+        }
+        if !covered.is_empty() {
+            let entry = match cached_entry.as_ref() {
+                // Widening an existing snapshot inherits its
+                // expiry: filling in a flaky leg must not extend
+                // the life of the data already held.
+                Some(prev) => {
+                    crate::artwork_caches::ProviderEntry::with_expiry(
+                        snapshot,
+                        covered,
+                        prev.expires_at,
+                    )
+                }
+                None => {
+                    crate::artwork_caches::ProviderEntry::new(snapshot, covered)
+                }
+            };
+            catalogue.caches.put_provider(fold_key.clone(), entry).await;
+        }
+    }
 
-    // Deezer always fires live — the by-id fetch is cheap
-    // (single HTTPS round on a known id) and the URL is under
-    // the live-fetch invariant.
-    let deezer_out = fetch_deezer_artist_by_id(
-        deezer_artist_id,
-        &artist,
-        catalogue,
-        want_deezer,
-    )
-    .await;
+    // Deezer fires live — the by-id fetch is cheap (single HTTPS
+    // round on a known id) and its URL sits under the live-fetch
+    // invariant, so it is never memoised. That last part also
+    // makes it the only provider still costing a network round on
+    // an otherwise fully-warm resolve, and its 1 req/s budget then
+    // sets the pace of a whole browse grid: twelve warm tiles
+    // measured 9.2s, of which the two carrying no Deezer source
+    // returned in 2ms.
+    //
+    // So skip it when a better-ranked provider has already
+    // produced a usable portrait. The cascade sorts sources by
+    // operator priority and takes the first whose payload yields a
+    // portrait URL, so an outranked Deezer result cannot win and
+    // the call would be spent for nothing. Both halves of that
+    // test matter: priority alone is not enough, because a
+    // better-ranked source whose payload carries no photograph
+    // (fanart with only logo/banner classes, say) is skipped by
+    // the picker and Deezer could still win behind it.
+    //
+    // When nothing better-ranked answered with a portrait, Deezer
+    // may itself be the winner and is fetched exactly as before.
+    // Indices are the dispatch positions used when the outcomes
+    // are aggregated below, which is what the stable sort falls
+    // back to when priorities tie.
+    let outranked_by_usable_portrait = deezer_is_outranked(
+        [
+            (&volumio_out, 0),
+            (&tadb_out, 1),
+            (&fanart_out, 3),
+            (&discogs_out, 4),
+        ],
+        2,
+        &catalogue.config,
+    );
+    let deezer_out = if outranked_by_usable_portrait {
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "deezer",
+            artist,
+            outcome = "absent",
+            reason = "outranked_by_usable_portrait",
+            "Deezer artist image: a better-ranked provider already yielded a portrait, so the live fetch is skipped (its result could not have won)"
+        );
+        ProviderOutcome::Absent
+    } else {
+        fetch_deezer_artist_by_id(
+            deezer_artist_id,
+            &artist,
+            catalogue,
+            want_deezer,
+        )
+        .await
+    };
 
-    // Aggregate over all four provider outcomes. `from_provider_outcomes`
-    // implements the three-way rule: any Hit wins → Ok; otherwise
-    // any Unavailable → Unavailable (retry-safe, no negative cache);
-    // otherwise all Absent → NotFound.
+    // Aggregate over all five provider outcomes.
+    // `from_provider_outcomes` implements the three-way rule: any
+    // Hit wins → Ok; otherwise any Unavailable → Unavailable
+    // (retry-safe, no negative cache); otherwise all Absent →
+    // NotFound.
     let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
         volumio_out,
         tadb_out,
         deezer_out,
         fanart_out,
+        discogs_out,
     ]);
     if matches!(response.status, CascadeStatus::Ok) {
         sort_sources_by_priority(&mut response.sources, &catalogue.config);
@@ -1606,13 +2108,30 @@ async fn run_cascade(
 }
 
 fn any_provider_configured(catalogue: &ArtistCatalogue) -> bool {
-    catalogue.config.is_enabled(ArtistProviderId::VolumioMeta)
-        || (catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
+    // Posture-aware, like every other gate. Under `offline` this
+    // answers false for the whole cascade, so the caller reports
+    // "no provider available" honestly instead of dispatching and
+    // discovering the suppression one provider at a time.
+    let p = catalogue.privacy_posture;
+    catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, p)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::TheAudioDb, p)
             && catalogue.theaudiodb.is_some())
-        || (catalogue.config.is_enabled(ArtistProviderId::Deezer)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::Deezer, p)
             && catalogue.deezer.is_some())
-        || (catalogue.config.is_enabled(ArtistProviderId::FanartTv)
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::FanartTv, p)
             && catalogue.fanart.is_some())
+        || (catalogue
+            .config
+            .is_dispatchable(ArtistProviderId::Discogs, p)
+            && catalogue.discogs.is_some())
 }
 
 // ---------------------------------------------------------------
@@ -1663,22 +2182,51 @@ async fn name_search_safety_net(
     artist: &str,
     catalogue: &ArtistCatalogue,
 ) -> ArtistArtworkResponse {
-    let want_theaudiodb =
-        catalogue.config.is_enabled(ArtistProviderId::TheAudioDb)
-            && catalogue.theaudiodb.is_some();
-    let want_deezer = catalogue.config.is_enabled(ArtistProviderId::Deezer)
+    // Posture-aware, exactly as the main cascade is. This path is
+    // reached when MusicBrainz cannot reconcile the artist, which
+    // must not become a way around the operator's privacy
+    // posture — a suppression that holds on the main path and
+    // leaks on the fallback is not a suppression.
+    let posture = catalogue.privacy_posture;
+    let want_theaudiodb = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::TheAudioDb, posture)
+        && catalogue.theaudiodb.is_some();
+    let want_deezer = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::Deezer, posture)
         && catalogue.deezer.is_some();
-    let want_volumio =
-        catalogue.config.is_enabled(ArtistProviderId::VolumioMeta);
+    let want_volumio = catalogue
+        .config
+        .is_dispatchable(ArtistProviderId::VolumioMeta, posture);
+    // Discogs belongs in the safety net for the same reason
+    // TheAudioDB and Deezer do — it is name-keyed and returns the
+    // artist id + canonical entity alongside the image, so a
+    // wrong-entity picture cannot come out of a name-search hit.
+    //
+    // It matters here more than anywhere else in the cascade.
+    // This path runs precisely when MusicBrainz could not
+    // reconcile the artist, which is the population fanart's MBID
+    // gate skips — `feat.` credits, composer-conductor entries,
+    // solo instrumentalists. Of the three providers that were
+    // here before, Deezer answers that population with an empty
+    // body and the other two frequently have nothing. Discogs
+    // does have them. Leaving it out of this path would have left
+    // the feature working everywhere except the one place it was
+    // built for.
+    let gate_discogs =
+        catalogue.config.gate(ArtistProviderId::Discogs, posture);
+    let want_discogs = gate_discogs.permits() && catalogue.discogs.is_some();
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
         artist,
         theaudiodb_enabled = want_theaudiodb,
         deezer_enabled = want_deezer,
         volumio_meta_enabled = want_volumio,
+        discogs_enabled = want_discogs,
         "artwork.online.artist.name_search_safety_net.begin",
     );
-    let (tadb_out, deezer_out, volumio_out) = tokio::join!(
+    let (tadb_out, deezer_out, volumio_out, discogs_out) = tokio::join!(
         fetch_theaudiodb_artist(None, artist, catalogue, want_theaudiodb),
         fetch_deezer_artist_by_name(artist, catalogue, want_deezer),
         fetch_volumio_meta_artist(
@@ -1687,11 +2235,21 @@ async fn name_search_safety_net(
             &catalogue.volumio_meta_variant,
             want_volumio,
         ),
+        fetch_discogs_artist(
+            artist,
+            catalogue,
+            if catalogue.discogs.is_some() {
+                gate_discogs
+            } else {
+                ProviderGate::Dispatch
+            },
+        ),
     );
     let mut response = ArtistArtworkResponse::from_provider_outcomes(vec![
         tadb_out,
         deezer_out,
         volumio_out,
+        discogs_out,
     ]);
     if matches!(response.status, CascadeStatus::Ok) {
         sort_sources_by_priority(&mut response.sources, &catalogue.config);
@@ -1893,20 +2451,21 @@ async fn fetch_deezer_artist_by_id(
     let Some(id) = deezer_artist_id else {
         return ProviderOutcome::Absent;
     };
-    // Deezer live-fetch invariant (ToS-mandated):
-    // ------------------------------------------------------------
-    // `ArtistImageHit` deliberately does NOT derive `Serialize`.
-    // The compiler refuses any code path that would round-trip
-    // the hit through JSON — so persisting the response body is
-    // structurally impossible, not merely policy. This fetch
-    // extracts URL fields into a plain serde_json::json! payload
-    // one field at a time; the hit itself is never serialised
-    // and never leaves this function.
+    // `ArtistImageHit` deliberately does NOT derive `Serialize`,
+    // so the compiler refuses any path that would round-trip the
+    // whole hit through JSON. This fetch extracts URL fields into
+    // a plain serde_json::json! payload one field at a time; the
+    // hit itself never leaves this function.
     //
-    // What DOES cross the wire: URL strings that the operator UI
-    // resolves inline against Deezer's CDN on render. Every
-    // render is a live fetch. No plugin-side cache; no framework
-    // asset-cache push; no persistence layer touches the bytes.
+    // Type-level hygiene, not a caching restriction: Deezer bytes
+    // are cached like any other provider's, governed by the
+    // operator's artwork-caching setting.
+    //
+    // What crosses the wire: URL strings. The framework fetches
+    // and stores the image behind them like any other
+    // provider's, per the operator's artwork caching setting.
+    // The URL itself is re-derived per resolve rather than
+    // memoised, because these CDN links expire quickly.
     //
     // This entry's presence in `sources[]` implicitly declares
     // to the UI: "render live from these URLs; do not persist
@@ -1944,7 +2503,6 @@ async fn fetch_deezer_artist_by_id(
         "deezer_artist_id": hit.deezer_artist_id,
         "artist_name": hit.artist_name,
         "source_url": hit.source_url.clone(),
-        "cache_policy": "live_fetch_only",
     });
     let source_url = hit.source_url.clone();
     // `hit` drops here — the ArtistImageHit type is un-Serialize,
@@ -1957,8 +2515,7 @@ async fn fetch_deezer_artist_by_id(
         attribution: Attribution {
             source_name: "Deezer".into(),
             source_url: Some(source_url),
-            license: "Deezer terms of use (live-fetch only, no persistence)"
-                .into(),
+            license: "Deezer terms of use".into(),
         },
     })
 }
@@ -1971,9 +2528,9 @@ async fn fetch_deezer_artist_by_id(
 /// does not clear MB's ≥90 % confidence threshold or when MB is
 /// transiently unreachable.
 ///
-/// Same Deezer live-fetch invariant as
-/// [`fetch_deezer_artist_by_id`]: the `ArtistImageHit` is never
-/// serialised; only URL strings cross the wire.
+/// Same shape as [`fetch_deezer_artist_by_id`]: the
+/// `ArtistImageHit` is never serialised whole; only URL strings
+/// cross the wire.
 async fn fetch_deezer_artist_by_name(
     artist: &str,
     catalogue: &ArtistCatalogue,
@@ -2009,7 +2566,6 @@ async fn fetch_deezer_artist_by_name(
         "deezer_artist_id": hit.deezer_artist_id,
         "artist_name": hit.artist_name,
         "source_url": hit.source_url.clone(),
-        "cache_policy": "live_fetch_only",
     });
     let source_url = hit.source_url.clone();
     ProviderOutcome::Hit(SourceEntry {
@@ -2019,8 +2575,7 @@ async fn fetch_deezer_artist_by_name(
         attribution: Attribution {
             source_name: "Deezer".into(),
             source_url: Some(source_url),
-            license: "Deezer terms of use (live-fetch only, no persistence)"
-                .into(),
+            license: "Deezer terms of use".into(),
         },
     })
 }
@@ -2028,22 +2583,25 @@ async fn fetch_deezer_artist_by_name(
 async fn fetch_fanart_artist(
     artist_mbid: Option<&str>,
     catalogue: &ArtistCatalogue,
-    enabled: bool,
+    gate: ProviderGate,
 ) -> ProviderOutcome {
-    // Three silent pre-conditions that used to return Absent
+    // Four silent pre-conditions that used to return Absent
     // without any journal breadcrumb — operators triaging "why
     // is fanart never firing?" had to code-read to know these
     // gates existed. Each emits one INFO line naming exactly
     // which gate refused, so a single journal grep answers the
-    // question.
-    if !enabled {
+    // question — and the gate reason distinguishes an operator
+    // toggle from a privacy-mode suppression, which point at
+    // different settings.
+    if !gate.permits() {
         tracing::info!(
             plugin = crate::PLUGIN_NAME,
             provider = "fanart_tv",
             artist_mbid,
             outcome = "absent",
-            reason = "operator_disabled",
-            "fanart.tv artist images: operator disabled the provider in the artist-artwork config (no network call fired)"
+            reason = gate.reason(),
+            "fanart.tv artist images: {}",
+            gate.detail()
         );
         return ProviderOutcome::Absent;
     }
@@ -2147,6 +2705,128 @@ async fn fetch_fanart_artist(
             source_name: "fanart.tv".into(),
             source_url: Some(hit.source_url),
             license: "fanart.tv terms of use".into(),
+        },
+    })
+}
+
+/// Fetch a Discogs artist photograph.
+///
+/// Name-keyed, unlike fanart.tv — and that is the whole point of
+/// having it here. fanart is MBID-gated, so it silently skips
+/// every artist MusicBrainz cannot reconcile: most `feat.`
+/// credits, composer-conductor entries, solo instrumentalists.
+/// Anonymous Deezer answers those same artists with an empty
+/// body. Discogs searches by name and holds real images for them,
+/// which is why it sits at priority 42 — ahead of Deezer's blank,
+/// behind fanart's higher-quality set when fanart can answer at
+/// all.
+///
+/// Costs two rate-limited upstream requests on a hit (search,
+/// then artist detail). Both share the client's single 1 req/s
+/// limiter, and the artwork resolve contract is fetch-once-and-
+/// persist, so an artist is looked up at most once ever rather
+/// than once per paint.
+///
+/// Every refusal path emits one INFO line naming the exact gate,
+/// mirroring the fanart handler — an operator triaging "why is
+/// Discogs never firing?" gets the answer from one journal grep
+/// instead of a code read.
+async fn fetch_discogs_artist(
+    artist: &str,
+    catalogue: &ArtistCatalogue,
+    gate: ProviderGate,
+) -> ProviderOutcome {
+    if !gate.permits() {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            artist,
+            outcome = "absent",
+            reason = gate.reason(),
+            "Discogs artist images: {}",
+            gate.detail()
+        );
+        return ProviderOutcome::Absent;
+    }
+    let Some(discogs) = catalogue.discogs.as_ref() else {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            artist,
+            outcome = "absent",
+            reason = "no_token_wired",
+            "Discogs artist images: no Personal Access Token resolved at plugin load, so the client is not wired (no network call fired); the token is owned by org.evoframework.metadata.online and read here through the framework's provider-credential grant — store it once under `discogs_personal_access_token` and both the text and artwork surfaces light up"
+        );
+        return ProviderOutcome::Absent;
+    };
+    if artist.trim().is_empty() {
+        tracing::info!(
+            plugin = crate::PLUGIN_NAME,
+            provider = "discogs",
+            outcome = "absent",
+            reason = "empty_artist_name",
+            "Discogs artist images: artist name is empty and Discogs is name-keyed (no network call fired)"
+        );
+        return ProviderOutcome::Absent;
+    }
+    // Non-blocking on purpose. Discogs shares a 1 req/s budget
+    // with the text surface; waiting for a slot here would make
+    // that ceiling the page latency of any browse resolving
+    // several artists at once, because every tile's wave would
+    // queue behind the one before it. A spent budget is reported
+    // as transient, which leaves Discogs uncovered in the
+    // snapshot so a later pass picks the artist up while the
+    // other providers cache immediately.
+    let hit = match discogs.try_get_artist_image(artist).await {
+        Ok(ArtistImageAttempt::RateLimited) => {
+            tracing::debug!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                outcome = "unavailable",
+                reason = "rate_budget_spent",
+                next_attempt = "on_next_demand",
+                "Discogs artist images: no rate-limit slot free, nothing dispatched; leg left uncovered so a later request retries it"
+            );
+            return ProviderOutcome::Unavailable;
+        }
+        Ok(ArtistImageAttempt::Completed(Some(h))) => h,
+        Ok(ArtistImageAttempt::Completed(None)) => {
+            tracing::info!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                outcome = "absent",
+                reason = "no_search_match_or_no_images",
+                "Discogs artist images: search resolved no artist, or the resolved artist carries no imagery (structural absence, not a token / endpoint problem)"
+            );
+            return ProviderOutcome::Absent;
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                provider = "discogs",
+                artist,
+                error = %e,
+                outcome = "unavailable",
+                next_attempt = "on_next_demand",
+                "Discogs artist images transient; response=Unavailable, no cache write, retry fires on next request for this artist (no scheduled background retry)"
+            );
+            return ProviderOutcome::Unavailable;
+        }
+    };
+    let payload = serde_json::json!({
+        "image_url": hit.image_url,
+        "source_url": hit.source_url,
+    });
+    ProviderOutcome::Hit(SourceEntry {
+        provider_id: ArtistProviderId::Discogs.as_str().to_string(),
+        privacy_class: ArtistPrivacyClass::IdentityBearing.as_str().to_string(),
+        payload,
+        attribution: Attribution {
+            source_name: "Discogs".into(),
+            source_url: hit.source_url.clone(),
+            license: "Discogs terms of use".into(),
         },
     })
 }
@@ -2479,6 +3159,174 @@ mod tests {
         assert_eq!(cfg.flags(ArtistProviderId::Deezer).priority, 3);
     }
 
+    /// Diagnostic pin for the rig observation that fanart_tv, at
+    /// the best default priority and carrying a real portrait,
+    /// was ordered last and lost to Deezer.
+    #[test]
+    fn fanart_sorts_ahead_of_deezer_under_defaults() {
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "volumio_meta",
+                serde_json::json!({"image_url": "https://m.example/v.jpg"}),
+            ),
+            source_of(
+                "theaudiodb",
+                serde_json::json!({"thumb_url": "https://t.example/t.jpg"}),
+            ),
+            source_of(
+                "deezer",
+                serde_json::json!({"picture_xl_url": "https://d.example/d.jpg"}),
+            ),
+            source_of(
+                "fanart_tv",
+                serde_json::json!({
+                    "artist_thumb_urls": ["https://f.example/f.jpg"],
+                    "artist_background_urls": [],
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        let order: Vec<&str> =
+            sources.iter().map(|s| s.provider_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["fanart_tv", "deezer", "theaudiodb", "volumio_meta"],
+            "priority order must place fanart_tv (40) ahead of deezer (45)"
+        );
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(
+            resp.provider_id.as_deref(),
+            Some("fanart_tv"),
+            "fanart carries a populated artist_thumb_urls, so it must win"
+        );
+    }
+
+    /// The warm-browse win: a better-ranked provider carrying a
+    /// real portrait makes a Deezer call unwinnable, so it is not
+    /// made. Deezer is the only artist provider exempt from the
+    /// result cache, so this is what keeps a warm grid off its
+    /// 1 req/s budget.
+    #[test]
+    fn deezer_skipped_when_outranked_by_a_usable_portrait() {
+        let cfg = ArtistProviderConfig::defaults();
+        let fanart = ProviderOutcome::Hit(source_of(
+            "fanart_tv",
+            serde_json::json!({
+                "artist_thumb_urls": ["https://fanart.example/a.jpg"],
+            }),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&fanart, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// The case observed on every rig: operator config assigns
+    /// every provider the same priority, so the stable sort leaves
+    /// dispatch order as the only tiebreak. A provider dispatched
+    /// ahead of Deezer therefore wins, and Deezer's call is
+    /// unwinnable — a priority-only test would have missed this
+    /// entirely and suppressed nothing.
+    #[test]
+    fn deezer_skipped_under_flat_priorities_by_dispatch_order() {
+        let mut cfg = ArtistProviderConfig::defaults();
+        for p in [
+            ArtistProviderId::VolumioMeta,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+        ] {
+            cfg.merge_override(p, Some(true), Some(100));
+        }
+        let volumio = ProviderOutcome::Hit(source_of(
+            "volumio_meta",
+            serde_json::json!({"image_url": "https://m.example/v.jpg"}),
+        ));
+        let absent = ProviderOutcome::Absent;
+        // volumio_meta dispatches at 0, Deezer at 2 — same
+        // priority, so volumio_meta wins and Deezer cannot.
+        assert!(deezer_is_outranked(
+            [(&volumio, 0), (&absent, 1), (&absent, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+        // A provider dispatched *after* Deezer at equal priority
+        // loses the tie, so Deezer may still win and must fire.
+        let discogs_late = ProviderOutcome::Hit(source_of(
+            "discogs",
+            serde_json::json!({"image_url": "https://d.example/x.jpg"}),
+        ));
+        assert!(!deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&absent, 3), (&discogs_late, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Guardrail: priority alone must not suppress Deezer. A
+    /// better-ranked source whose payload holds no photograph —
+    /// fanart carrying only logo/banner classes — is skipped by
+    /// the picker during the source walk, so Deezer can still win
+    /// behind it and must still be fetched.
+    #[test]
+    fn deezer_still_fetched_when_better_ranked_source_has_no_portrait() {
+        let cfg = ArtistProviderConfig::defaults();
+        let logos_only = ProviderOutcome::Hit(source_of(
+            "fanart_tv",
+            serde_json::json!({
+                "hd_music_logo_urls": ["https://fanart.example/logo.png"],
+            }),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(!deezer_is_outranked(
+            [(&absent, 0), (&absent, 1), (&logos_only, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Guardrail: when Deezer outranks everything that answered,
+    /// it may be the winner and must fire. Skipping it here would
+    /// blank the tile.
+    #[test]
+    fn deezer_still_fetched_when_it_outranks_every_answer() {
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Deezer, Some(true), Some(1));
+        let volumio = ProviderOutcome::Hit(source_of(
+            "volumio_meta",
+            serde_json::json!({"image_url": "https://meta.example/v.jpg"}),
+        ));
+        let absent = ProviderOutcome::Absent;
+        assert!(!deezer_is_outranked(
+            [(&volumio, 0), (&absent, 1), (&absent, 3), (&absent, 4)],
+            2,
+            &cfg
+        ));
+    }
+
+    /// Nothing answered at all — Deezer is the only remaining
+    /// chance and must fire.
+    #[test]
+    fn deezer_still_fetched_when_no_other_provider_hit() {
+        let cfg = ArtistProviderConfig::defaults();
+        let absent = ProviderOutcome::Absent;
+        let unavailable = ProviderOutcome::Unavailable;
+        assert!(!deezer_is_outranked(
+            [
+                (&absent, 0),
+                (&unavailable, 1),
+                (&absent, 3),
+                (&unavailable, 4)
+            ],
+            2,
+            &cfg
+        ));
+    }
+
     #[test]
     fn from_sources_top_level_payload_verbatim_from_primary() {
         // Attribution unity — see cascade.rs docstring.
@@ -2520,16 +3368,259 @@ mod tests {
             source_of("theaudiodb", serde_json::json!({})),
             source_of("volumio_meta", serde_json::json!({})),
             source_of("fanart_tv", serde_json::json!({})),
+            source_of("discogs", serde_json::json!({})),
         ];
         sort_sources_by_priority(&mut sources, &cfg);
-        // Priority order (lower wins): fanart 40, deezer 45,
-        // theaudiodb 50, volumio 55. fanart wins when its key
-        // is present and it produced a source; deezer stays
-        // the keyless fallback.
+        // Priority order (lower wins): fanart 40, discogs 42,
+        // deezer 45, theaudiodb 50, volumio 55. fanart wins when
+        // its key is present and it produced a source; discogs
+        // sits directly behind it and ahead of Deezer because
+        // Deezer answers the fanart-miss artist class with an
+        // empty body while Discogs has a real image; deezer stays
+        // the keyless fallback below both.
         assert_eq!(sources[0].provider_id, "fanart_tv");
-        assert_eq!(sources[1].provider_id, "deezer");
-        assert_eq!(sources[2].provider_id, "theaudiodb");
-        assert_eq!(sources[3].provider_id, "volumio_meta");
+        assert_eq!(sources[1].provider_id, "discogs");
+        assert_eq!(sources[2].provider_id, "deezer");
+        assert_eq!(sources[3].provider_id, "theaudiodb");
+        assert_eq!(sources[4].provider_id, "volumio_meta");
+    }
+
+    #[test]
+    fn anonymous_only_suppresses_every_identity_bearing_artwork_provider() {
+        // The invariant this cascade was missing. fanart.tv and
+        // Discogs both authenticate with an operator-owned
+        // credential; under `anonymous_only` neither may dispatch,
+        // regardless of its enable flag or whether its key is
+        // wired. Before this gate they dispatched anyway, so an
+        // operator who set the posture was protected on the text
+        // surface and leaked on the artwork one.
+        let cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::AnonymousOnly;
+
+        assert!(!cfg.is_dispatchable(ArtistProviderId::FanartTv, p));
+        assert!(!cfg.is_dispatchable(ArtistProviderId::Discogs, p));
+
+        // The keyless baseline stays reachable — the operator
+        // still gets artwork, just nothing tied to an account.
+        assert!(cfg.is_dispatchable(ArtistProviderId::Deezer, p));
+        assert!(cfg.is_dispatchable(ArtistProviderId::TheAudioDb, p));
+        assert!(cfg.is_dispatchable(ArtistProviderId::VolumioMeta, p));
+    }
+
+    #[test]
+    fn gate_names_the_real_cause_not_the_operator() {
+        // A provider suppressed by the device posture was logged
+        // as `reason="operator_disabled"`, telling an operator
+        // they had switched something off when they had not, and
+        // pointing them at the wrong setting to undo it.
+        let mut cfg = ArtistProviderConfig::defaults();
+
+        // Posture suppression on a provider the operator has ON.
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
+        let g = cfg.gate(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::AnonymousOnly,
+        );
+        assert_eq!(g, ProviderGate::SuppressedByPrivacyMode);
+        assert_eq!(g.reason(), "privacy_mode");
+        assert!(!g.permits());
+
+        // Operator suppression under a permissive posture.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(false), None);
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Enhanced);
+        assert_eq!(g, ProviderGate::OperatorDisabled);
+        assert_eq!(g.reason(), "operator_disabled");
+
+        // Posture outranks: even operator-disabled, a restrictive
+        // posture is the cause the operator must address first.
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Offline);
+        assert_eq!(g, ProviderGate::SuppressedByPrivacyMode);
+
+        // Permitted.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(true), None);
+        let g =
+            cfg.gate(ArtistProviderId::Discogs, ArtistPrivacyPosture::Enhanced);
+        assert_eq!(g, ProviderGate::Dispatch);
+        assert!(g.permits());
+    }
+
+    #[test]
+    fn gate_and_is_dispatchable_never_disagree() {
+        // Two entry points onto the same decision. If they drift,
+        // the cascade dispatches on one answer while the journal
+        // explains the other.
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Deezer, Some(false), None);
+        for posture in [
+            ArtistPrivacyPosture::Enhanced,
+            ArtistPrivacyPosture::AnonymousOnly,
+            ArtistPrivacyPosture::Offline,
+        ] {
+            for provider in [
+                ArtistProviderId::FanartTv,
+                ArtistProviderId::Discogs,
+                ArtistProviderId::Deezer,
+                ArtistProviderId::TheAudioDb,
+                ArtistProviderId::VolumioMeta,
+            ] {
+                assert_eq!(
+                    cfg.gate(provider, posture).permits(),
+                    cfg.is_dispatchable(provider, posture),
+                    "gate and is_dispatchable disagree for {} under {}",
+                    provider.as_str(),
+                    posture.as_wire()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offline_suppresses_every_provider_in_this_cascade() {
+        // Every provider here is a network source; there is no
+        // local artist-artwork provider. `offline` therefore
+        // suppresses all of them.
+        let cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::Offline;
+        for provider in [
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::VolumioMeta,
+        ] {
+            assert!(
+                !cfg.is_dispatchable(provider, p),
+                "{} must not dispatch under offline",
+                provider.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn enhanced_defers_entirely_to_the_operator_selection() {
+        // Under the default posture the gate adds nothing — the
+        // per-provider flag is the whole answer, so the posture
+        // cannot become a hidden second switch the operator
+        // cannot see.
+        let mut cfg = ArtistProviderConfig::defaults();
+        let p = ArtistPrivacyPosture::Enhanced;
+        for provider in [
+            ArtistProviderId::FanartTv,
+            ArtistProviderId::Discogs,
+            ArtistProviderId::Deezer,
+            ArtistProviderId::TheAudioDb,
+            ArtistProviderId::VolumioMeta,
+        ] {
+            assert_eq!(
+                cfg.is_dispatchable(provider, p),
+                cfg.is_enabled(provider),
+                "{} under enhanced must track its enable flag exactly",
+                provider.as_str()
+            );
+        }
+        // And an operator-disabled provider stays disabled.
+        cfg.merge_override(ArtistProviderId::Discogs, Some(false), None);
+        assert!(!cfg.is_dispatchable(ArtistProviderId::Discogs, p));
+    }
+
+    #[test]
+    fn posture_outranks_an_enabled_flag_and_a_present_credential() {
+        // Non-bypassable means non-bypassable. A provider the
+        // operator explicitly enabled, whose credential is wired,
+        // still must not dispatch under a restrictive posture —
+        // otherwise "anonymous_only" would mean "anonymous unless
+        // you happened to configure something", which is not a
+        // privacy guarantee.
+        let mut cfg = ArtistProviderConfig::defaults();
+        cfg.merge_override(ArtistProviderId::Discogs, Some(true), None);
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
+
+        assert!(!cfg.is_dispatchable(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::AnonymousOnly
+        ));
+        assert!(!cfg.is_dispatchable(
+            ArtistProviderId::Discogs,
+            ArtistPrivacyPosture::Offline
+        ));
+    }
+
+    #[test]
+    fn discogs_outranks_deezer_so_a_real_image_beats_a_blank() {
+        // The operator-visible reason Discogs exists here. For the
+        // artist class fanart's MBID gate skips, Deezer is the
+        // only other provider that answers — and it answers with
+        // an empty body. If Deezer sorted first its blank would
+        // become the primary and the tile would stay a glyph.
+        let cfg = ArtistProviderConfig::defaults();
+        let mut sources = vec![
+            source_of(
+                "deezer",
+                serde_json::json!({
+                    "picture_xl_url": "https://cdn.deezer.example/xl.jpg",
+                }),
+            ),
+            source_of(
+                "discogs",
+                serde_json::json!({
+                    "image_url": "https://img.discogs.example/artist.jpg",
+                    "source_url": "https://www.discogs.com/artist/12345",
+                }),
+            ),
+        ];
+        sort_sources_by_priority(&mut sources, &cfg);
+        assert_eq!(sources[0].provider_id, "discogs");
+        let resp = ArtistArtworkResponse::from_sources(sources);
+        assert_eq!(resp.provider_id.as_deref(), Some("discogs"));
+    }
+
+    #[test]
+    fn discogs_payload_resolves_through_the_byte_path_picker() {
+        // The byte-fetch path calls pick_canonical_image_url on
+        // the winning source. Discogs emits its URL under
+        // `image_url`, which the picker's string-key list already
+        // covers — this pins that alignment so a payload-shape
+        // change cannot silently strand the provider with a
+        // cascade hit that yields no bytes.
+        let payload = serde_json::json!({
+            "image_url": "https://img.discogs.example/artist.jpg",
+            "source_url": "https://www.discogs.com/artist/12345",
+        });
+        assert_eq!(
+            pick_canonical_image_url(&payload).as_deref(),
+            Some("https://img.discogs.example/artist.jpg")
+        );
+    }
+
+    #[test]
+    fn discogs_is_identity_bearing_and_round_trips_on_the_wire() {
+        assert_eq!(ArtistProviderId::Discogs.as_str(), "discogs");
+        assert_eq!(
+            ArtistProviderId::from_wire("discogs"),
+            Some(ArtistProviderId::Discogs)
+        );
+        // Identity-bearing alongside fanart: both consume an
+        // operator-owned credential to authenticate.
+        assert_eq!(
+            ArtistProviderId::Discogs.privacy_class(),
+            ArtistPrivacyClass::IdentityBearing
+        );
+    }
+
+    #[test]
+    fn discogs_defaults_sit_between_fanart_and_deezer() {
+        let cfg = ArtistProviderConfig::defaults();
+        let fanart = cfg.flags(ArtistProviderId::FanartTv).priority;
+        let discogs = cfg.flags(ArtistProviderId::Discogs).priority;
+        let deezer = cfg.flags(ArtistProviderId::Deezer).priority;
+        assert!(
+            fanart < discogs && discogs < deezer,
+            "discogs ({discogs}) must sit strictly between fanart \
+             ({fanart}) and deezer ({deezer})"
+        );
+        assert!(cfg.is_enabled(ArtistProviderId::Discogs));
     }
 
     #[test]
@@ -2817,6 +3908,54 @@ mod tests {
         );
     }
 
+    /// The regression that made tiles look empty: the guard this
+    /// replaced compared a SHA-256 against an MD5 constant, so it
+    /// never fired and a provider silhouette won its cascade
+    /// outright, outranking a real portrait behind it.
+    #[test]
+    fn flat_silhouette_ratio_is_rejected_as_non_photographic() {
+        // Real provider silhouettes measure 0.911-0.988 through
+        // the transcode path at every size Deezer serves, and in
+        // both CDN byte-variants observed at 500x500.
+        for r in [0.911_f32, 0.949, 0.962, 0.974, 0.988] {
+            assert!(
+                is_not_a_photograph(Some(r)),
+                "measured silhouette ratio {r} must be rejected"
+            );
+        }
+    }
+
+    /// The other half: real portraits must survive. These are the
+    /// measured ratios of genuine artist images through the same
+    /// path, including the flattest one observed.
+    #[test]
+    fn real_portrait_ratios_are_accepted() {
+        for r in [0.133_f32, 0.239, 0.245, 0.357, 0.395] {
+            assert!(
+                !is_not_a_photograph(Some(r)),
+                "measured real-portrait ratio {r} must be accepted"
+            );
+        }
+    }
+
+    /// An unmeasured image (`Original` passthrough, never decoded)
+    /// must never be rejected on the strength of a statistic that
+    /// was not taken. Failing open here is correct: the cost is a
+    /// possible placeholder, the cost of failing closed is
+    /// discarding a real portrait.
+    #[test]
+    fn unmeasured_ratio_is_never_rejected() {
+        assert!(!is_not_a_photograph(None));
+    }
+
+    #[test]
+    fn threshold_sits_between_the_measured_populations() {
+        // Flattest real portrait observed, busiest silhouette
+        // observed. The threshold must fall strictly between.
+        const { assert!(NON_PHOTOGRAPH_FLAT_TONE_RATIO > 0.395) };
+        const { assert!(NON_PHOTOGRAPH_FLAT_TONE_RATIO < 0.911) };
+    }
+
     #[test]
     fn is_real_image_url_accepts_normal_shapes() {
         assert!(is_real_image_url(
@@ -2972,10 +4111,13 @@ mod tests {
     }
 
     /// Compile-fence attestation: ArtistImageHit MUST NOT derive
-    /// Serialize. If a future refactor accidentally adds
-    /// Serialize to it, the plugin's Deezer helper would be able
-    /// to round-trip the hit through JSON — which would let a
-    /// caller persist it in violation of Deezer's ToS.
+    /// Serialize.
+    ///
+    /// Type-level hygiene, not a storage restriction. The helper
+    /// lifts the URL fields it needs into a payload one at a
+    /// time; without this fence a refactor could round-trip the
+    /// whole response body through JSON by accident, carrying
+    /// provider-internal fields into a cache nobody inspected.
     ///
     /// This test doesn't run Deezer; it asserts the type-level
     /// invariant by relying on trait bounds. If ArtistImageHit

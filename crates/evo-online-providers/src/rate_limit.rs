@@ -74,19 +74,60 @@ impl RateLimiter {
     /// any overhead. On a cold limiter (no prior grant), the
     /// first caller returns immediately.
     pub async fn acquire(&self) {
-        // Compute the deadline BEFORE releasing the lock so a
-        // second caller waiting behind us can start their own
-        // deadline calculation the moment we drop the guard.
+        // Reserve this caller's slot and drop the guard BEFORE
+        // sleeping. Holding the mutex across the sleep would
+        // serialise the *lock* as well as the request rate: a
+        // second caller could not even compute its own deadline
+        // until the first had finished waiting, so N callers cost
+        // N sequential lock hand-offs rather than N slots on one
+        // shared timeline. Stamping `last_granted` forward to the
+        // reserved instant keeps the 1-per-interval guarantee
+        // while letting every waiter sleep concurrently.
+        let deadline = {
+            let mut inner = self.inner.lock().await;
+            let now = Instant::now();
+            let slot = match inner.last_granted {
+                Some(last) => (last + self.min_interval).max(now),
+                None => now,
+            };
+            inner.last_granted = Some(slot);
+            slot
+        };
+        let now = Instant::now();
+        if deadline > now {
+            tokio::time::sleep(deadline - now).await;
+        }
+    }
+
+    /// Take a slot only if one is available *right now*.
+    ///
+    /// Never sleeps and never blocks. Returns `true` when the
+    /// caller may dispatch immediately (the slot is consumed),
+    /// `false` when the budget is spent and the caller should
+    /// treat the provider as transiently unavailable instead of
+    /// queueing behind it.
+    ///
+    /// This is the variant latency-sensitive fan-outs use. A
+    /// cascade that serves a browse grid cannot afford to hold a
+    /// whole provider wave open waiting for a 1 req/s budget:
+    /// the slow leg would set the latency for every tile. Such
+    /// callers take a slot when one is free and record a
+    /// transient miss otherwise, leaving that provider uncovered
+    /// so a later pass retries it.
+    pub async fn try_acquire(&self) -> bool {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
-        if let Some(last) = inner.last_granted {
-            let elapsed = now.saturating_duration_since(last);
-            if elapsed < self.min_interval {
-                let wait = self.min_interval - elapsed;
-                tokio::time::sleep(wait).await;
+        match inner.last_granted {
+            Some(last)
+                if now.saturating_duration_since(last) < self.min_interval =>
+            {
+                false
+            }
+            _ => {
+                inner.last_granted = Some(now);
+                true
             }
         }
-        inner.last_granted = Some(Instant::now());
     }
 }
 
@@ -148,6 +189,64 @@ mod tests {
             elapsed >= Duration::from_millis(35),
             "concurrent acquires must serialise — got {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_grants_cold_then_refuses_within_interval() {
+        let lim = RateLimiter::new(Duration::from_millis(40));
+        assert!(lim.try_acquire().await, "cold limiter must grant");
+        assert!(
+            !lim.try_acquire().await,
+            "a second slot inside the interval must be refused, not queued"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            lim.try_acquire().await,
+            "the budget must replenish after the interval"
+        );
+    }
+
+    /// The property the cascade depends on: a refused slot costs
+    /// no wall-clock. If `try_acquire` ever waited, a browse
+    /// resolving many artists would inherit this limiter's
+    /// ceiling as its page latency — which is exactly the
+    /// regression this variant exists to prevent.
+    #[tokio::test]
+    async fn try_acquire_never_blocks_when_budget_is_spent() {
+        let lim = RateLimiter::new(Duration::from_secs(5));
+        assert!(lim.try_acquire().await);
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert!(!lim.try_acquire().await);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "20 refused attempts must be effectively free — got {elapsed:?}"
+        );
+    }
+
+    /// A blocking waiter must not stop an unrelated caller from
+    /// taking its own decision. Before the guard was released
+    /// ahead of the sleep, a single in-flight `acquire` held the
+    /// mutex for the whole wait, so even a non-blocking probe
+    /// queued behind it.
+    #[tokio::test]
+    async fn a_waiting_acquire_does_not_hold_the_lock() {
+        let lim =
+            std::sync::Arc::new(RateLimiter::new(Duration::from_millis(200)));
+        assert!(lim.try_acquire().await, "take the first slot");
+        let waiter = std::sync::Arc::clone(&lim);
+        let h = tokio::spawn(async move { waiter.acquire().await });
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        let _ = lim.try_acquire().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "probe must not block behind a sleeping waiter — got {elapsed:?}"
+        );
+        let _ = h.await;
     }
 
     #[tokio::test]

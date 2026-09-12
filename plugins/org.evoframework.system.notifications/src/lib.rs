@@ -13,7 +13,7 @@
 //! On [`Plugin::load`] the plugin:
 //!
 //! 1. Constructs a fresh [`runtime::NotificationDispatcher`]
-//!    with the default base mode ([`NotificationMode::DisplayOnly`])
+//!    with the default base mode (`NotificationMode::DisplayOnly`)
 //!    and no quiet-hours window. Persistence is not in scope for
 //!    notifications — they are ephemeral by charter; restart drops
 //!    the active list. Operator base-mode + quiet-hours settings

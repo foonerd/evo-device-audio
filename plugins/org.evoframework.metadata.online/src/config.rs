@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::cascade::{PrivacyMode, ProviderConfig, ProviderId};
+use crate::cascade::{ProviderConfig, ProviderId};
 
 /// Canonical User-Agent used against MusicBrainz. Includes
 /// product name, version, and contact URL per MB's Terms of
@@ -177,20 +177,31 @@ impl PluginConfig {
                 out.lrclib_min_interval = Duration::from_millis(millis);
             }
         }
-        if let Some(mode) = cfg.privacy_mode {
-            out.provider_config.privacy_mode =
-                match mode.to_ascii_lowercase().as_str() {
-                    "enhanced" => PrivacyMode::Enhanced,
-                    "anonymous_only" => PrivacyMode::AnonymousOnly,
-                    "offline" => PrivacyMode::Offline,
-                    other => {
-                        return Err(format!(
-                            "privacy_mode must be one of \
-                         \"enhanced\" | \"anonymous_only\" | \"offline\"; \
-                         got {other:?}"
-                        ));
-                    }
-                };
+        // `privacy_mode` is NO LONGER read from this plugin's
+        // TOML. It is a device-level setting owned by the
+        // framework and read through the provider-config handle
+        // at request time, so every cascade — text and artwork —
+        // sees one posture.
+        //
+        // A local copy here is precisely what produced the
+        // divergence this retirement fixes: this plugin honoured
+        // its own copy while the artwork plugin, having none,
+        // enforced nothing. Re-introducing the key would
+        // re-introduce the divergence.
+        //
+        // A stale `privacy_mode` left in an operator's TOML is
+        // refused rather than ignored: silently accepting a file
+        // that no longer does anything would let an operator
+        // believe they had set a posture they had not.
+        if cfg.privacy_mode.is_some() {
+            return Err(
+                "privacy_mode is no longer a plugin setting — it is a \
+                 device-level setting owned by the framework. Remove it from \
+                 this file and set it with the `online_providers_set_privacy_mode` \
+                 operator gesture, which applies to every cascade rather than \
+                 this plugin alone."
+                    .to_string(),
+            );
         }
         if let Some(providers) = cfg.providers {
             for (id_raw, flags_raw) in providers {
@@ -344,43 +355,49 @@ mod tests {
     }
 
     #[test]
-    fn privacy_mode_defaults_to_enhanced() {
-        let raw: toml::value::Table = toml::from_str("").unwrap();
-        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
-        assert_eq!(cfg.provider_config.privacy_mode, PrivacyMode::Enhanced);
+    fn privacy_mode_is_no_longer_a_plugin_setting() {
+        // The key is REFUSED, not ignored. Privacy mode is a
+        // device-level setting owned by the framework and read at
+        // request time; a local copy here is exactly what let this
+        // plugin enforce a posture the artwork cascade knew
+        // nothing about.
+        //
+        // Silently ignoring a stale key would be worse than
+        // refusing it: an operator would keep a privacy_mode line
+        // in their file and believe a posture was in force that
+        // this plugin was no longer reading.
+        for value in ["enhanced", "anonymous_only", "offline", "silent"] {
+            let raw: toml::value::Table =
+                toml::from_str(&format!("privacy_mode = {value:?}")).unwrap();
+            let err = PluginConfig::from_toml_table(&raw)
+                .expect_err("privacy_mode in plugin TOML must be refused");
+            assert!(
+                err.contains("device-level"),
+                "refusal must tell the operator where the setting moved to,                  got: {err}"
+            );
+        }
     }
 
     #[test]
-    fn privacy_mode_anonymous_only_parses() {
-        let raw: toml::value::Table =
-            toml::from_str(r#"privacy_mode = "anonymous_only""#).unwrap();
+    fn config_without_privacy_mode_defaults_to_enhanced() {
+        // A file that does not mention it parses, and the posture
+        // starts at the framework default. The real value is
+        // overwritten from the framework on every request.
+        let raw: toml::value::Table = toml::from_str("").unwrap();
         let cfg = PluginConfig::from_toml_table(&raw).unwrap();
         assert_eq!(
             cfg.provider_config.privacy_mode,
-            PrivacyMode::AnonymousOnly
+            crate::cascade::PrivacyMode::Enhanced
         );
     }
 
     #[test]
-    fn privacy_mode_offline_parses() {
-        let raw: toml::value::Table =
-            toml::from_str(r#"privacy_mode = "offline""#).unwrap();
-        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
-        assert_eq!(cfg.provider_config.privacy_mode, PrivacyMode::Offline);
-    }
-
-    #[test]
-    fn privacy_mode_unknown_rejected() {
-        let raw: toml::value::Table =
-            toml::from_str(r#"privacy_mode = "silent""#).unwrap();
-        assert!(PluginConfig::from_toml_table(&raw).is_err());
-    }
-
-    #[test]
-    fn privacy_mode_offline_disables_every_provider() {
-        let raw: toml::value::Table =
-            toml::from_str(r#"privacy_mode = "offline""#).unwrap();
-        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
+    fn offline_posture_disables_every_provider() {
+        // Behaviour preserved from the retired TOML-driven test;
+        // the posture is now set directly, as the framework sets
+        // it at request time.
+        let mut pc = ProviderConfig::defaults();
+        pc.privacy_mode = crate::cascade::PrivacyMode::Offline;
         for p in [
             ProviderId::MusicBrainz,
             ProviderId::Wikipedia,
@@ -391,19 +408,16 @@ mod tests {
             ProviderId::Genius,
         ] {
             assert!(
-                !cfg.provider_config.is_effectively_enabled(p),
-                "provider {:?} must be effectively disabled under offline",
-                p
+                !pc.is_effectively_enabled(p),
+                "provider {p:?} must be effectively disabled under offline"
             );
         }
     }
 
     #[test]
-    fn privacy_mode_anonymous_only_disables_identity_bearing() {
-        let raw: toml::value::Table =
-            toml::from_str(r#"privacy_mode = "anonymous_only""#).unwrap();
-        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
-        // Anonymous providers remain enabled.
+    fn anonymous_only_posture_disables_identity_bearing_only() {
+        let mut pc = ProviderConfig::defaults();
+        pc.privacy_mode = crate::cascade::PrivacyMode::AnonymousOnly;
         for p in [
             ProviderId::MusicBrainz,
             ProviderId::Wikipedia,
@@ -411,18 +425,15 @@ mod tests {
             ProviderId::Lrclib,
         ] {
             assert!(
-                cfg.provider_config.is_effectively_enabled(p),
-                "anonymous provider {:?} must remain effectively enabled",
-                p
+                pc.is_effectively_enabled(p),
+                "anonymous provider {p:?} must remain effectively enabled"
             );
         }
-        // Identity-bearing providers are disabled en masse.
         for p in [ProviderId::Lastfm, ProviderId::Discogs, ProviderId::Genius] {
             assert!(
-                !cfg.provider_config.is_effectively_enabled(p),
-                "identity-bearing provider {:?} must be effectively \
-                 disabled under anonymous_only",
-                p
+                !pc.is_effectively_enabled(p),
+                "identity-bearing provider {p:?} must be effectively \
+                 disabled under anonymous_only"
             );
         }
     }
@@ -472,21 +483,31 @@ mod tests {
 
     #[test]
     fn privacy_mode_wins_over_per_provider_enable_for_identity_bearing() {
+        // The operator explicitly enables Last.fm in their file…
         let raw: toml::value::Table = toml::from_str(
             r#"
-            privacy_mode = "anonymous_only"
-
             [providers.lastfm]
             enabled = true
             "#,
         )
         .unwrap();
-        let cfg = PluginConfig::from_toml_table(&raw).unwrap();
-        // Even though the operator explicitly enabled Last.fm,
-        // anonymous_only overrides it — the preset is
-        // non-bypassable.
+        let mut cfg = PluginConfig::from_toml_table(&raw).unwrap();
+        assert!(cfg.provider_config.flags(ProviderId::Lastfm).enabled);
+
+        // …and the device posture, set by the framework at request
+        // time, overrides it anyway. Non-bypassable means the
+        // per-provider enable cannot buy its way past the posture;
+        // otherwise `anonymous_only` would mean "anonymous unless
+        // something was configured", which is not a guarantee.
+        cfg.provider_config.privacy_mode =
+            crate::cascade::PrivacyMode::AnonymousOnly;
         assert!(!cfg
             .provider_config
             .is_effectively_enabled(ProviderId::Lastfm));
+
+        // And the operator's raw intent survives underneath, so
+        // leaving the posture restores their choice rather than
+        // silently losing it.
+        assert!(cfg.provider_config.flags(ProviderId::Lastfm).enabled);
     }
 }

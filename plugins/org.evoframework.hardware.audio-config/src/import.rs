@@ -80,7 +80,7 @@ pub enum ImportError {
 /// output (after `toml::to_string_pretty` serialisation). The
 /// `regen_evo_catalog` example invokes this once with the embedded
 /// import sources; the regression-guard test in this module's
-/// [`tests`] section asserts the output matches the checked-in
+/// `tests` section asserts the output matches the checked-in
 /// `data/evo-catalog.toml` byte-equal.
 pub fn import_volumio_to_evo_catalog(
     volumio_dacs_json: &str,

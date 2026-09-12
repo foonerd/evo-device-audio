@@ -114,40 +114,72 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+mod household_groups;
+mod rtc_wake;
+
 use clap::Parser as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use evo::admission::AdmissionEngine;
 use evo::config::StewardConfig;
 use evo::{AdmissionSetup, RuntimeSetup, RuntimeSetupContext};
 
+/// The topology store, shared between this distribution's two
+/// boot hooks. Written once during runtime setup; read by the
+/// post-admission hook that seeds the default chain.
+type SharedTopologyStore =
+    Arc<OnceLock<Arc<evo_audio_topology::audio_topology::AudioTopologyStore>>>;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = evo::cli::Args::parse();
+    // The topology store is this distribution's, so this
+    // distribution holds it. Runtime setup builds it and fills
+    // this cell; the post-admission hook reads it back out.
+    // Nothing hands it to the steward and nothing hands it back.
+    let topology_store: SharedTopologyStore = Arc::new(OnceLock::new());
     let opts = evo::RunOptions::new(args, audio_distribution_admission())
-        .with_post_admission(audio_distribution_post_admission())
-        .with_runtime_setup(audio_distribution_runtime_setup());
+        .with_rtc_wake(Arc::new(rtc_wake::SysfsRtcWake::new()))
+        .with_post_admission(audio_distribution_post_admission(Arc::clone(
+            &topology_store,
+        )))
+        .with_runtime_setup(audio_distribution_runtime_setup(topology_store))
+        .with_https_setup(audio_distribution_https_setup())
+        // This product's Settings groups. The framework owns the
+        // protection mechanism; the group names are ours, on the
+        // documented seam, so the steward stays domain-neutral.
+        .with_household_groups(Arc::new(
+            household_groups::AudioHouseholdGroups,
+        ));
     evo::run(opts).await
 }
 
-/// Build the audio distribution's runtime-setup closure. The
-/// framework invokes this once during boot after its data-
-/// plane substrates exist and the audio plane has started but
-/// before admission begins. We construct the multi-room
-/// crate's `ElectionRuntime` against the framework substrates
-/// exposed in [`RuntimeSetupContext`], rehydrate it from
-/// persistence, attach the audio-plane runtime (so election's
-/// liveness predicate sees in-flight channel activity), start
-/// it, install it into the framework's shared election-state
-/// handle, and register an async shutdown closure into the
-/// supplied registry. From this point every framework consumer
-/// (audio_plane, group_topology, server wire ops) reads
-/// election state through the multi-room runtime; the
-/// framework crate itself has no production dep on
-/// `evo-multiroom`.
-fn audio_distribution_runtime_setup() -> RuntimeSetup {
-    Box::new(|ctx: RuntimeSetupContext| {
+/// Build the audio distribution's runtime-setup closure.
+///
+/// The framework invokes this once during boot, after its own
+/// substrates and the witness / announce runtimes exist and
+/// before admission begins. This callback is where the audio
+/// plane starts — the framework builds none, because a plane
+/// only makes sense on a device that moves audio.
+///
+/// It constructs and starts the plane, writes both faces into
+/// `AudioPlaneSlot` so the steward can answer its own wire ops
+/// and plugins receive the SDK handle, bridges the plane into
+/// the witness chain, then builds the multi-room crate's
+/// `ElectionRuntime` against the framework substrates exposed in
+/// [`RuntimeSetupContext`], rehydrates it, attaches the plane so
+/// election's liveness predicate sees in-flight channel
+/// activity, starts it, and installs it into the shared
+/// election-state handle.
+///
+/// Shutdown hooks are registered plane-first so peers receive
+/// goodbyes while the transport is still up. The framework crate
+/// has no production dep on `evo-multiroom`.
+fn audio_distribution_runtime_setup(
+    topology_store_cell: SharedTopologyStore,
+) -> RuntimeSetup {
+    Box::new(move |ctx: RuntimeSetupContext| {
         Box::pin(async move {
             let RuntimeSetupContext {
                 bus,
@@ -157,10 +189,212 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
                 shared_election_state,
                 shared_role_store,
                 multiroom_substrate_slot,
-                audio_plane_runtime,
+                audio_plane_slot,
+                domain_witness_runtime,
+                announce_runtime,
+                discovery_runtime,
+                clock_sync_runtime,
+                multiroom_control_port,
                 shutdown_registry,
+                audio_topology_slot,
                 ..
             } = ctx;
+
+            // The audio product plane. Same reasoning as the
+            // transport plane below it: a topology store, a
+            // routing broker, an operator-policy store and a
+            // hardware-profile override store only mean
+            // something on a device that moves audio, so they
+            // are built here and reached through the slot.
+            let audio_policy_store = Arc::new(
+                evo_audio_topology::audio_policy::AudioPolicyStore::new(
+                    Arc::clone(&persistence),
+                ),
+            );
+            let audio_routing_runtime = Arc::new(
+                evo_audio_topology::audio_routing::AudioRoutingRuntime::new(),
+            );
+            // The override layer of the four-source hardware
+            // profile the scorer composes. The other three —
+            // live probe, plugin-declared, database lookup —
+            // are computed on demand; only the operator's
+            // overrides are durable.
+            let hardware_profile_store = Arc::new(
+                evo_audio_topology::hardware_profile::HardwareProfileStore::new(
+                    Arc::clone(&persistence),
+                ),
+            );
+            match hardware_profile_store.list_overrides().await {
+                Ok(rows) => tracing::info!(
+                    entries = rows.len(),
+                    "hardware profile store: rehydrated from substrate"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "hardware profile store: list failed; substrate may be \
+                     uninitialised or corrupt"
+                ),
+            }
+
+            let audio_topology_store = Arc::new(
+                evo_audio_topology::audio_topology::AudioTopologyStore::new(
+                    Arc::clone(&persistence),
+                    Arc::clone(&audio_routing_runtime),
+                    Arc::clone(&bus),
+                ),
+            );
+
+            // Re-publish every persisted chain so the per-plugin
+            // routing handles resolve from the moment plugins
+            // admit, rather than reading EndpointNotConfigured
+            // until an operator republishes by hand. Whether a
+            // stored chain should be re-asserted on boot is a
+            // decision about audio, which is why it happens here.
+            match audio_topology_store.list().await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    for topology in rows {
+                        let target = topology.target_key.clone();
+                        if let Err(e) = audio_topology_store
+                            .publish(topology, "system:rehydrate")
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                target_key = %target,
+                                "audio topology store: re-publish on \
+                                 rehydrate failed"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        topologies = count,
+                        "audio topology store: rehydrated from substrate"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "audio topology store: list failed; substrate may be \
+                     uninitialised or corrupt"
+                ),
+            }
+
+            audio_topology_slot.set(
+                Arc::new(evo_audio_topology::control::TopologyControl::new(
+                    Arc::clone(&audio_topology_store),
+                )),
+                Arc::new(evo_audio_topology::control::RoutingControl::new(
+                    audio_routing_runtime,
+                )),
+                Arc::new(evo_audio_topology::control::PolicyControl::new(
+                    audio_policy_store,
+                )),
+                Arc::new(evo_audio_topology::control::HardwareControl::new(
+                    hardware_profile_store,
+                )),
+            );
+
+            // Hand the store to the post-admission hook, which
+            // seeds the default chain once every plugin has
+            // admitted.
+            let _ = topology_store_cell.set(audio_topology_store);
+
+            // The audio plane. It belongs here, not in the
+            // steward: it exists to move audio between a source
+            // host and receivers, which is a fact about this
+            // distribution rather than about running a device.
+            // The steward advertises the control port; the plane
+            // binds the one it was told, so the record and the
+            // listener cannot disagree.
+            let audio_plane =
+                Arc::new(evo_multiroom::audio_plane::AudioPlaneRuntime::new(
+                    evo_multiroom::audio_plane::AudioPlaneConfig {
+                        control_port: multiroom_control_port,
+                        ..Default::default()
+                    },
+                    Arc::clone(&bus),
+                    Arc::clone(&discovery_runtime),
+                    shared_election_state.clone(),
+                    Arc::clone(&clock_sync_runtime),
+                    Arc::clone(&group_store),
+                    device_id.clone(),
+                ));
+            if let Err(e) = audio_plane.start().await {
+                tracing::warn!(
+                    error = %e,
+                    "audio-plane runtime: start failed; multi-room \
+                     transport will not function on this boot"
+                );
+            } else {
+                tracing::info!(
+                    control_port = multiroom_control_port,
+                    "audio-plane runtime: ready"
+                );
+            }
+
+            // Both faces of the one runtime, so the steward can
+            // answer its own wire ops and plugins get the SDK
+            // contract. Written together; a half-filled slot
+            // would leave one op working and its sibling
+            // refusing.
+            let plane_handle: Arc<
+                dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+            > = Arc::new(
+                evo_multiroom::audio_plane_handle::RuntimeAudioPlaneHandle::new(
+                    Arc::clone(&audio_plane),
+                    Arc::clone(&group_store),
+                ),
+            );
+            audio_plane_slot.set(
+                Arc::clone(&audio_plane) as Arc<dyn evo::AudioPlaneControl>,
+                Arc::clone(&plane_handle),
+            );
+
+            // Held so they can be aborted on drain. Dropping a
+            // `JoinHandle` detaches the task rather than stopping
+            // it, and the plane's shutdown does not close the
+            // channels these read, so an unheld pump would
+            // outlive the plane it bridges with no way to reach
+            // it.
+            let mut inbound_pump = None;
+            let mut announce_pump = None;
+
+            // Bridge the plane into the witness chain: carry
+            // witnesses out, drain inbound chain traffic in, and
+            // reconcile against peers the announce carrier saw.
+            // The framework ships no transport, so if it booted a
+            // witness runtime it is sitting on null carriers until
+            // this binds real ones.
+            if let Some(witness) = domain_witness_runtime.as_ref() {
+                use evo_multiroom::audio_plane_integration::AudioPlaneWitnessBroadcaster;
+                // One bridge in both roles, as the framework wired
+                // it before the plane moved out.
+                let bridge = Arc::new(AudioPlaneWitnessBroadcaster::new(
+                    Arc::clone(&audio_plane),
+                ));
+                witness.set_broadcaster(Arc::clone(&bridge)
+                    as Arc<
+                        dyn evo::domain_witness::runtime::WitnessBroadcaster,
+                    >);
+                witness.set_requester(
+                    bridge
+                        as Arc<
+                            dyn evo::domain_witness::runtime::ChainRequester,
+                        >,
+                );
+                inbound_pump =
+                    Some(evo_multiroom::inbound_pump::InboundPump::spawn(
+                        Arc::clone(&audio_plane),
+                        Arc::clone(witness),
+                    ));
+                announce_pump = announce_runtime.as_ref().map(|ar| {
+                    evo_multiroom::announce_pump::AnnouncePump::spawn(
+                        Arc::clone(&audio_plane),
+                        Arc::clone(ar),
+                        Arc::clone(witness),
+                    )
+                });
+            }
 
             let election_runtime =
                 Arc::new(evo_multiroom::ElectionRuntime::new(
@@ -184,7 +418,7 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // audio-plane TCP connection as alive even when
             // mDNS-SD record freshness has aged past the
             // liveness window.
-            election_runtime.with_audio_plane(Arc::clone(&audio_plane_runtime));
+            election_runtime.with_audio_plane(Arc::clone(&audio_plane));
 
             if let Err(e) = election_runtime.start().await {
                 tracing::warn!(
@@ -205,6 +439,29 @@ fn audio_distribution_runtime_setup() -> RuntimeSetup {
             // rewiring is needed.
             shared_election_state.set(Arc::clone(&election_runtime)
                 as Arc<dyn evo_primitives::ElectionState>);
+
+            // Plane first, so peers get their goodbyes while the
+            // transport is still up, and only then the tasks that
+            // ride it. Registered before election because drain
+            // runs in registration order and a receiver should
+            // learn we are leaving before the election that named
+            // us stops answering.
+            let plane_for_shutdown = Arc::clone(&audio_plane);
+            shutdown_registry.register(Box::new(move || {
+                let plane = Arc::clone(&plane_for_shutdown);
+                let inbound = inbound_pump.take();
+                let announce = announce_pump.take();
+                Box::pin(async move {
+                    plane.shutdown().await;
+                    if let Some(p) = inbound {
+                        p.shutdown();
+                    }
+                    if let Some(p) = announce {
+                        p.shutdown();
+                    }
+                    tracing::info!("audio-plane runtime: stopped");
+                })
+            }));
 
             // Register the shutdown closure. The framework's
             // drain path invokes every registered hook in
@@ -326,7 +583,7 @@ fn audio_distribution_admission() -> AdmissionSetup {
 ///
 /// Invoked by `evo::run` after every plugin has admitted. The
 /// hook publishes a default `ActiveAudioTopology` against the
-/// framework's audio_topology_store so the reconciliation
+/// topology store runtime setup built, so the reconciliation
 /// cycle (route-change reactor in playback.mpd +
 /// fragment-writer worker) fires from boot. Without this, the
 /// audio_routing handles each plugin receives return
@@ -355,11 +612,94 @@ fn audio_distribution_admission() -> AdmissionSetup {
 /// delivery.alsa consumes the happening once the consumer
 /// path is wired, re-derives the topology from the operator's
 /// settings, and re-publishes via the same store.
-fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
-    Box::new(|ctx: evo::PostAdmissionContext| {
+/// Claimant this distribution announces its own happenings under.
+///
+/// The framework mints a token for whatever string it is given and
+/// invents no actor of its own. This must not borrow the name of a
+/// plugin that merely fetches on the hookup's behalf — the artwork
+/// plugins are providers, and the composition is this binary's.
+/// Naming the wrong actor is a lie the operator cannot see through.
+const HTTPS_CLAIMANT: &str = "org.evoframework.device.audio.http";
+
+/// Announces a landed artwork resolve on the happenings bus.
+///
+/// Carried as a plugin event with an opaque `event_type` rather
+/// than a variant on the steward's own vocabulary: the framework
+/// stores strings and enumerates nothing about artwork.
+struct ArtworkLandingAnnouncer {
+    bus: std::sync::Arc<evo::happenings::HappeningBus>,
+}
+
+impl evo_device_audio_http::ArtworkResolvedNotifier
+    for ArtworkLandingAnnouncer
+{
+    fn artwork_resolved(
+        &self,
+        scheme: &str,
+        value: &str,
+        size: &str,
+        content_hash: &str,
+    ) {
+        self.bus.emit(evo::happenings::Happening::PluginEvent {
+            plugin: HTTPS_CLAIMANT.to_string(),
+            event_type: "artwork_resolved".to_string(),
+            payload: serde_json::json!({
+                "scheme": scheme,
+                "value": value,
+                "size": size,
+                "content_hash": content_hash,
+            }),
+            at: std::time::SystemTime::now(),
+        });
+    }
+}
+
+/// Mounts this distribution's own HTTP surfaces.
+///
+/// Artwork resolve and serve, and track-detail aggregation. They
+/// are product — they know about albums, artists, cover files and
+/// named online services — so they attach here, on the router the
+/// framework hands over, rather than being compiled into the
+/// steward. The framework keeps the substrate underneath and knows
+/// nothing about what is served over it.
+fn audio_distribution_https_setup() -> evo::HttpsSetup {
+    evo::HttpsSetup {
+        claimant_name: HTTPS_CLAIMANT.to_string(),
+        hook: Box::new(|ctx: evo::HttpsSetupContext| {
+            Box::pin(async move {
+                let notifier: std::sync::Arc<
+                    dyn evo_device_audio_http::ArtworkResolvedNotifier,
+                > = std::sync::Arc::new(ArtworkLandingAnnouncer {
+                    bus: std::sync::Arc::clone(&ctx.bus),
+                });
+                let router = evo_device_audio_http::mount(
+                    ctx.router,
+                    evo_device_audio_http::MountConfig {
+                        api_prefix: ctx.api_prefix,
+                        dispatcher: ctx.dispatcher,
+                        asset_cache: ctx.asset_cache,
+                        validator: ctx.validator,
+                        tier_provider: ctx.tier_provider,
+                        lan_trust_caps: ctx.lan_trust_caps,
+                        state_dir: ctx.state_dir,
+                        resolved_notifier: Some(notifier),
+                    },
+                )?;
+                Ok(router)
+            })
+        }),
+    }
+}
+
+fn audio_distribution_post_admission(
+    topology_store_cell: SharedTopologyStore,
+) -> evo::PostAdmissionSetup {
+    Box::new(move |_ctx: evo::PostAdmissionContext| {
         Box::pin(async move {
-            use evo::audio_topology::{ActiveAudioTopology, ActiveChainStage};
-            use evo::topology_scoring::{ScoreBreakdown, VolumeMode};
+            use evo::server::{
+                ActiveAudioTopology, ActiveChainStage, ScoreBreakdown,
+                VolumeMode,
+            };
             use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
             use evo_plugin_sdk::contract::audio_routing::EndpointKind;
             use std::path::PathBuf;
@@ -422,8 +762,16 @@ fn audio_distribution_post_admission() -> evo::PostAdmissionSetup {
                 delivery = "org.evoframework.delivery.alsa",
                 "post-admission: publishing role-agnostic default audio topology"
             );
-            ctx.audio
-                .topology_store
+            let Some(store) = topology_store_cell.get() else {
+                // Runtime setup did not run, so there is no
+                // store to seed. Nothing to publish into.
+                tracing::warn!(
+                    "post-admission: no topology store; default chain not \
+                     published"
+                );
+                return Ok(());
+            };
+            store
                 .publish(topology, "evo-device-audio:post-admission")
                 .await
                 .context("publishing default audio topology")?;

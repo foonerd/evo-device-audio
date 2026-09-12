@@ -3,7 +3,8 @@
 //! # org-evoframework-system-kiosk
 //!
 //! Framework-reserved kiosk operator-settings plugin. Stocks the
-//! `system.kiosk` shelf with three operator-gestured verbs:
+//! `system.kiosk` shelf with eleven operator-gestured verbs: ten
+//! writes and one read. Display and touch alignment:
 //!
 //! - `set_display_rotation` — persists the compositor display
 //!   rotation overlay so the kiosk's in-session watcher picks
@@ -19,10 +20,30 @@
 //!   wizard on-glass. Remote-driven wizard launch, on-glass
 //!   completion — the operator walks to the device to tap the
 //!   corners.
+//! - `derive_touch_calibration_from_corners` — takes the four
+//!   `(target, actual)` samples the wizard captured, derives the
+//!   best rotation/flip triple and persists it, returning the
+//!   winning triple and its mean residual.
 //!
-//! All three verbs are gated at the framework dispatcher's
-//! per-verb capability gate as `write:system_admin` (no
-//! step-up). Rationale: rotation is a cosmetic-visible change,
+//!   This verb exists so the wizard's own write is gated. The
+//!   kiosk-browser used to do this in-process through an
+//!   `evo_sample_touch_calibration_from_corners` WebKit handler
+//!   that never reached the framework dispatcher, so nothing
+//!   could refuse it — a box whose household level protects
+//!   system settings would still have its touch matrix rewritten
+//!   from its own glass. That handler is gone from the browser
+//!   source; this verb is where the operation lives.
+//!
+//! The rest of the shelf is the per-device physical settings the
+//! same operator flow reaches: `set_enabled`, `set_brightness`,
+//! `set_sleep_timeout`, `set_sleep_inhibit_while_playing`,
+//! `set_osk`, `set_cursor`, and the read companion
+//! `get_display_state`.
+//!
+//! Every write is gated at the framework dispatcher's per-verb
+//! capability gate as `write:system_admin` (no step-up);
+//! `get_display_state` is `read:system`. Rationale for no
+//! step-up: rotation is a cosmetic-visible change,
 //! not a credential mint. A step-up gate would require the
 //! operator to enter the kiosk password on the very glass they
 //! are trying to fix — recursive breakage. The bootstrap-
@@ -31,24 +52,47 @@
 //!
 //! ## Why this plugin exists
 //!
-//! The kiosk-browser (`evo-kiosk-browser`) exposes the same
-//! writes via WebKit script-message handlers on its
-//! UserContentManager. Those handlers are reachable only from
-//! JavaScript running inside the kiosk-browser process — a
-//! paired laptop or phone browser loading the same UI over WSS
-//! cannot reach them (per-webview surface). The initial-
-//! alignment recovery case is exactly the scenario where the
-//! on-glass touch is unusable, so the on-glass UI cannot drive
-//! the fix. This plugin exposes the same writes over WSS so a
-//! remote paired browser can drive them.
+//! It is the writer. The kiosk-browser
+//! (`evo-kiosk-browser`) once exposed these writes as WebKit
+//! script-message handlers on its UserContentManager, reachable
+//! from JavaScript inside the browser process and from nowhere
+//! else. Those handlers called [`evo_kiosk_config`] directly, so
+//! they bypassed the framework dispatcher entirely: no
+//! capability gate, no household policy, no refusal possible.
 //!
-//! ## Byte parity with the on-glass path
+//! The browser source no longer registers the two touch
+//! handlers, and the one name it still registers —
+//! `evo_set_display_rotation` — is a presence probe whose
+//! handler only logs. The UI reads that name to tell "am I on
+//! the glass" and nothing more. Both the glass UI and a remote
+//! paired browser now dispatch the verbs below; they differ in
+//! which screen the operator is looking at, not in the path the
+//! write takes.
 //!
-//! Both paths call into [`evo_kiosk_config`] for the actual
-//! filesystem work. A drift between them (different overlay
-//! bytes for the same operator intent) would surface as a
-//! difference in what the kiosk-side apply machinery does. One
-//! source of truth eliminates that class.
+//! Which devices that is true OF is a separate question, and
+//! the answer is per-box. The two playground rigs — the glass
+//! and the VM — now run the browser built from `75796d9`: the
+//! two touch handlers are absent from the shipped image and the
+//! rotation name is a presence probe whose handler only logs. On
+//! those two boxes this plugin is the writer, and a script in
+//! the glass has no ungated path to the overlays.
+//!
+//! The third playground rig was deliberately not overlaid, and
+//! testers on `Latest` still run the older piece, which carries
+//! the old handlers — on those, a script inside the browser can
+//! still write these overlays ungated. Closing that is a remint,
+//! and a remint is not named. Do not read this crate's docs as a
+//! claim about every device in the field.
+//!
+//! ## One writer
+//!
+//! This plugin calls [`evo_kiosk_config`] for the actual
+//! filesystem work. In the current source it is the only caller
+//! on the write path — on a box running that source, the only
+//! one at all. The wizard's derivation math lives in the same
+//! crate, so there is no second overlay format and no second
+//! validator to drift from, whichever browser build a box
+//! happens to carry.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -82,6 +126,16 @@ pub const VERB_SET_TOUCH_CALIBRATION: &str = "set_touch_calibration";
 /// Verb name — signal the on-glass browser to open the wizard.
 pub const VERB_LAUNCH_TOUCH_CALIBRATION: &str = "launch_touch_calibration";
 
+/// Verb name — derive the touch triple from four corner samples
+/// and persist it.
+///
+/// The wizard's own write. It replaces an in-process WebKit
+/// handler that performed the same derivation without passing
+/// the dispatcher; this one is gated `write:system_admin` like
+/// every other write on the shelf.
+pub const VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS: &str =
+    "derive_touch_calibration_from_corners";
+
 /// Verb name — enable or disable the evo-kiosk.service unit.
 pub const VERB_SET_ENABLED: &str = "set_enabled";
 
@@ -94,6 +148,23 @@ pub const VERB_SET_SLEEP_TIMEOUT: &str = "set_sleep_timeout";
 /// Verb name — toggle "keep the screen awake while playing."
 pub const VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING: &str =
     "set_sleep_inhibit_while_playing";
+
+/// Verb name — turn the on-screen keyboard on or off.
+pub const VERB_SET_OSK: &str = "set_osk";
+
+/// Verb name — show or hide the mouse pointer.
+///
+/// Takes effect immediately. Pointer visibility is decided by
+/// which cursor theme the compositor loads, and a compositor
+/// reads that once at startup, so the verb persists the choice
+/// and then restarts the kiosk session to apply it. The operator
+/// sees a brief flash as the session comes back.
+///
+/// The restart is the whole applier. There is no compositor
+/// action that hides a pointer durably — labwc's `HideCursor`
+/// gives it back on the next pointer motion, and does not exist
+/// at all on the older labwc in the field.
+pub const VERB_SET_CURSOR: &str = "set_cursor";
 
 /// Verb name — read the complete persisted operator-visible state
 /// (display rotation, touch triple, brightness, sleep, inhibit-
@@ -180,10 +251,13 @@ impl Plugin for SystemKioskPlugin {
                         VERB_SET_DISPLAY_ROTATION.to_string(),
                         VERB_SET_TOUCH_CALIBRATION.to_string(),
                         VERB_LAUNCH_TOUCH_CALIBRATION.to_string(),
+                        VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS.to_string(),
                         VERB_SET_ENABLED.to_string(),
                         VERB_SET_BRIGHTNESS.to_string(),
                         VERB_SET_SLEEP_TIMEOUT.to_string(),
                         VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING.to_string(),
+                        VERB_SET_OSK.to_string(),
+                        VERB_SET_CURSOR.to_string(),
                         VERB_GET_DISPLAY_STATE.to_string(),
                     ],
                     accepts_custody: false,
@@ -450,12 +524,17 @@ impl Respondent for SystemKioskPlugin {
                 VERB_LAUNCH_TOUCH_CALIBRATION => {
                     handle_launch_touch_calibration(req)
                 }
+                VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS => {
+                    handle_derive_touch_calibration_from_corners(req)
+                }
                 VERB_SET_ENABLED => handle_set_enabled(req).await,
                 VERB_SET_BRIGHTNESS => handle_set_brightness(req),
                 VERB_SET_SLEEP_TIMEOUT => handle_set_sleep_timeout(req),
                 VERB_SET_SLEEP_INHIBIT_WHILE_PLAYING => {
                     handle_set_sleep_inhibit_while_playing(req)
                 }
+                VERB_SET_OSK => handle_set_osk(req),
+                VERB_SET_CURSOR => handle_set_cursor(req).await,
                 VERB_GET_DISPLAY_STATE => handle_get_display_state(req),
                 other => Err(PluginError::Permanent(format!(
                     "system.kiosk: unknown verb {other:?}"
@@ -479,26 +558,46 @@ struct TouchCalibrationReq {
     vflip: bool,
 }
 
+/// `launch_touch_calibration` carries nothing: it is a signal to
+/// the on-glass browser to open the wizard. It used to reserve an
+/// ignored `samples` field for a direct-samples path; that path
+/// now exists as its own gated verb
+/// (`derive_touch_calibration_from_corners`), so the dead field
+/// is gone rather than sitting behind an `allow`.
 #[derive(Deserialize, Default)]
-struct LaunchTouchCalibrationReq {
-    /// Optional sample set — if present, framework skips the
-    /// on-glass wizard and applies the derived matrix directly.
-    /// Reserved for a future path where a remote-tap flow can
-    /// pipe samples through without on-glass involvement; for
-    /// this cut the field is accepted but ignored (samples
-    /// captured on-glass only).
-    #[serde(default)]
-    #[allow(dead_code)]
-    samples: Option<Vec<TouchSampleWire>>,
+struct LaunchTouchCalibrationReq {}
+
+/// Payload for `derive_touch_calibration_from_corners`.
+///
+/// Exactly four samples, in the order the wizard drew the
+/// targets. The count and coordinate range are enforced by
+/// `evo_kiosk_config::derive_touch_calibration`, so this struct
+/// deliberately does not re-check them: one validator, in the
+/// crate that owns the math.
+#[derive(Deserialize)]
+struct DeriveTouchCalibrationReq {
+    samples: Vec<TouchSampleWire>,
 }
 
+/// One `(target, actual)` pair in normalised output space, as it
+/// arrives on the wire.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct TouchSampleWire {
     target_x: f64,
     target_y: f64,
     actual_x: f64,
     actual_y: f64,
+}
+
+impl From<TouchSampleWire> for TouchSample {
+    fn from(w: TouchSampleWire) -> Self {
+        TouchSample {
+            target_x: w.target_x,
+            target_y: w.target_y,
+            actual_x: w.actual_x,
+            actual_y: w.actual_y,
+        }
+    }
 }
 
 fn parse_payload<T: for<'de> Deserialize<'de>>(
@@ -527,7 +626,9 @@ fn kiosk_config_error(
     match &err {
         KioskConfigError::InvalidRotation(_)
         | KioskConfigError::SampleCountMismatch(_)
-        | KioskConfigError::SampleOutOfRange(_) => {
+        | KioskConfigError::SampleOutOfRange(_)
+        | KioskConfigError::InvalidOsk(_)
+        | KioskConfigError::InvalidCursor(_) => {
             PluginError::Permanent(format!("{verb}: {err}"))
         }
         KioskConfigError::Io(_) => {
@@ -568,6 +669,54 @@ fn handle_set_touch_calibration(
         "touch_rotation": rot,
         "touch_hflip": hf,
         "touch_vflip": vf,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+/// Derive the touch triple from four corner samples and persist
+/// it.
+///
+/// The derivation and the write are both
+/// `evo_kiosk_config::derive_and_apply_touch_calibration`, the
+/// same function the retired WebKit handler used to call
+/// in-process — so the overlay bytes are unchanged by the move,
+/// and there is no second format. What this path adds is the
+/// dispatcher: the framework has already checked
+/// `write:system_admin` (and, where a household policy protects
+/// that scope, refused with `household_policy_locked`) before
+/// the request arrives here.
+///
+/// Refuses a sample count other than four and coordinates
+/// outside [0, 1] — both as `Permanent`, since a retry with the
+/// same payload cannot succeed.
+fn handle_derive_touch_calibration_from_corners(
+    req: &Request,
+) -> Result<Response, PluginError> {
+    let parsed: DeriveTouchCalibrationReq =
+        parse_payload(req, VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS)?;
+    let samples: Vec<TouchSample> =
+        parsed.samples.into_iter().map(TouchSample::from).collect();
+    let derived =
+        evo_kiosk_config::derive_and_apply_touch_calibration(&samples)
+            .map_err(|e| {
+                kiosk_config_error(
+                    VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS,
+                    e,
+                )
+            })?;
+    let body = serde_json::json!({
+        "ok": true,
+        "touch_rotation": derived.rotation,
+        "touch_hflip": derived.hflip,
+        "touch_vflip": derived.vflip,
+        // Mean per-sample residual in normalised units. The
+        // operator surface uses it to offer "this looks off,
+        // try again" rather than to gate the write.
+        "mean_error": derived.mean_error,
     });
     Ok(Response::for_request(
         req,
@@ -747,6 +896,121 @@ fn handle_set_sleep_inhibit_while_playing(
     ))
 }
 
+// ------------------------------ set_osk -------------------------------
+
+#[derive(Deserialize)]
+struct SetOskReq {
+    enabled: bool,
+}
+
+fn handle_set_osk(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetOskReq = parse_payload(req, VERB_SET_OSK)?;
+    // The overlay write is the whole action. The kiosk-side
+    // watcher owns starting and stopping the keyboard when the
+    // overlay changes, so this verb never spawns or kills a
+    // process itself — one writer, one applier.
+    let applied = evo_kiosk_config::set_osk(parsed.enabled)
+        .map_err(|e| kiosk_config_error(VERB_SET_OSK, e))?;
+    let body = serde_json::json!({
+        "ok": true,
+        "osk_enabled": applied,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
+// ------------------------------ set_cursor ----------------------------
+
+#[derive(Deserialize)]
+struct SetCursorReq {
+    visible: bool,
+}
+
+async fn handle_set_cursor(req: &Request) -> Result<Response, PluginError> {
+    let parsed: SetCursorReq = parse_payload(req, VERB_SET_CURSOR)?;
+    // Persist first, so a read taken while the session is
+    // bouncing already reports the operator's choice.
+    let applied = evo_kiosk_config::set_cursor(parsed.visible)
+        .map_err(|e| kiosk_config_error(VERB_SET_CURSOR, e))?;
+
+    // A stopped session is left stopped. `systemctl restart`
+    // would start it, so an operator who has turned the kiosk
+    // off would find a pointer preference had switched their
+    // screen back on. The overlay is already written and
+    // `evo-kiosk-launch` exports the theme at exec, so the
+    // choice still applies whenever the session next starts.
+    if !kiosk_session_running().await {
+        tracing::info!(
+            plugin = PLUGIN_NAME,
+            cursor_visible = applied,
+            "set_cursor: session not running; persisted for next start"
+        );
+        return cursor_response(req, applied);
+    }
+
+    // Sudo grant is enumerated by the paired
+    // /etc/sudoers.d/evo-system-kiosk drop-in as
+    // EVO_SYSTEM_KIOSK_RESTART. Argv must match the alias
+    // exactly; no shell interpolation, and deliberately no
+    // `--now` — this restarts a session, it never changes
+    // whether the unit is enabled.
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .arg("-n")
+        .arg("/usr/bin/systemctl")
+        .arg("restart")
+        .arg("evo-kiosk.service")
+        .output()
+        .await
+        .map_err(|e| {
+            PluginError::Transient(format!(
+                "set_cursor: spawning sudo systemctl failed: {e}"
+            ))
+        })?;
+    if !output.status.success() {
+        // Roll the overlay back: the pointer on screen did not
+        // change, so the read must not claim it did.
+        let _ = evo_kiosk_config::set_cursor(!parsed.visible);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PluginError::Transient(format!(
+            "set_cursor: systemctl restart evo-kiosk.service exited {:?}: {stderr}",
+            output.status.code()
+        )));
+    }
+    cursor_response(req, applied)
+}
+
+/// Is the kiosk session currently up? Read-only and unprivileged
+/// — `is-active` needs no grant, and its exit status is the
+/// answer.
+async fn kiosk_session_running() -> bool {
+    tokio::process::Command::new("/usr/bin/systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg("evo-kiosk.service")
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn cursor_response(
+    req: &Request,
+    cursor_visible: bool,
+) -> Result<Response, PluginError> {
+    let body = serde_json::json!({
+        "ok": true,
+        "cursor_visible": cursor_visible,
+    });
+    Ok(Response::for_request(
+        req,
+        serde_json::to_vec(&body)
+            .expect("system.kiosk response JSON always serialises"),
+    ))
+}
+
 // ------------------------------ get_display_state ---------------------
 
 fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
@@ -786,6 +1050,8 @@ fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
         "sleep_timeout_seconds": state.sleep_timeout_seconds,
         "sleep_inhibit_while_playing": state.sleep_inhibit_while_playing,
         "enabled": state.enabled,
+        "osk_enabled": state.osk_enabled,
+        "cursor_visible": state.cursor_visible,
     });
     Ok(Response::for_request(
         req,
@@ -793,14 +1059,6 @@ fn handle_get_display_state(req: &Request) -> Result<Response, PluginError> {
             .expect("system.kiosk response JSON always serialises"),
     ))
 }
-
-/// Silence the compiler about the `TouchSample` re-import
-/// staying pinned even though the current implementation does
-/// not use it server-side; keeps the type available for a
-/// direct-samples path that pipes samples through this plugin
-/// rather than via the on-glass wizard.
-#[allow(dead_code)]
-fn _touch_sample_type_pinned(_s: TouchSample) {}
 
 #[cfg(test)]
 mod tests {
@@ -811,6 +1069,606 @@ mod tests {
         let m = manifest();
         assert_eq!(m.plugin.name, PLUGIN_NAME);
         assert_eq!(m.plugin.version, plugin_crate_version());
+    }
+
+    /// The out-of-process manifest is the one that ships. A verb
+    /// declared in only one of the two manifests is a verb the
+    /// device refuses, so both are parsed and compared here.
+    const MANIFEST_OOP_TOML: &str = include_str!("../manifest.oop.toml");
+
+    static OVERLAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points the kiosk-settings read/write surface at a scratch
+    /// directory so a fixture can drive the real verb handler and
+    /// then read the bytes it actually wrote.
+    struct ScratchOverlays {
+        dir: std::path::PathBuf,
+        previous: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchOverlays {
+        fn new(tag: &str) -> Self {
+            let guard = OVERLAY_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = std::env::temp_dir()
+                .join(format!("evo-kiosk-plugin-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let previous = std::env::var("KIOSK_SETTINGS_DIR").ok();
+            std::env::set_var("KIOSK_SETTINGS_DIR", &dir);
+            Self {
+                dir,
+                previous,
+                _guard: guard,
+            }
+        }
+
+        fn bytes(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir.join(name)).ok()
+        }
+    }
+
+    impl Drop for ScratchOverlays {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KIOSK_SETTINGS_DIR", v),
+                None => std::env::remove_var("KIOSK_SETTINGS_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn request(verb: &str, payload: serde_json::Value) -> Request {
+        Request {
+            request_type: verb.to_string(),
+            payload: serde_json::to_vec(&payload).unwrap(),
+            correlation_id: 1,
+            deadline: None,
+            instance_id: None,
+            principal_scope: Some("system_admin".to_string()),
+            has_step_up: false,
+        }
+    }
+
+    fn body(resp: &Response) -> serde_json::Value {
+        serde_json::from_slice(&resp.payload).expect("response is JSON")
+    }
+
+    #[test]
+    fn set_osk_is_declared_and_scoped_in_both_manifests() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types.iter().any(|v| v == VERB_SET_OSK),
+                "{label} manifest must stock {VERB_SET_OSK}"
+            );
+            // Write scope, not step-up: the on-screen keyboard is
+            // how a touch operator would type a step-up password,
+            // so gating it behind step-up can lock them out.
+            match r.verb_capabilities.get(VERB_SET_OSK) {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => {
+                    panic!("{label}: {VERB_SET_OSK} must be write/system_admin, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The wizard's write must be declared exactly like the
+    /// control it sits beside. If the two ever differ, one of
+    /// them is reachable under a policy that refuses the other.
+    #[test]
+    fn derive_from_corners_is_declared_exactly_like_set_touch_calibration() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types
+                    .iter()
+                    .any(|v| v == VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS),
+                "{label} manifest must stock \
+                 {VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS}"
+            );
+            let derived = r
+                .verb_capabilities
+                .get(VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS);
+            let sibling = r.verb_capabilities.get(VERB_SET_TOUCH_CALIBRATION);
+            assert_eq!(
+                format!("{derived:?}"),
+                format!("{sibling:?}"),
+                "{label}: the wizard write must carry the same capability \
+                 as {VERB_SET_TOUCH_CALIBRATION}"
+            );
+            match derived {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => panic!(
+                    "{label}: \
+                     {VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS} must be \
+                     write/system_admin, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Every write on this shelf rides ONE scope. That is what
+    /// lets a distribution protect the whole surface by putting a
+    /// single scope in one household group: a verb added later at
+    /// a different scope would silently escape the group, and
+    /// this fails before it ships.
+    #[test]
+    fn every_write_on_this_shelf_rides_the_one_scope() {
+        use evo_plugin_sdk::manifest::VerbCapability;
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml).expect("manifest parses");
+            let r = m.capabilities.respondent.as_ref().expect("respondent");
+            let mut writes = 0usize;
+            for (verb, cap) in r.verb_capabilities.iter() {
+                if let VerbCapability::Write { scope } = cap {
+                    writes += 1;
+                    assert_eq!(
+                        scope, "system_admin",
+                        "{label}: write verb {verb} escapes the shelf scope"
+                    );
+                }
+            }
+            assert!(writes >= 10, "{label}: expected the full write surface");
+        }
+    }
+
+    fn corner_samples(invert: bool) -> serde_json::Value {
+        // The four targets the wizard draws, in its own order.
+        let corners = [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)];
+        let samples: Vec<serde_json::Value> = corners
+            .iter()
+            .map(|(tx, ty)| {
+                let (ax, ay) = if invert {
+                    (1.0 - tx, 1.0 - ty)
+                } else {
+                    (*tx, *ty)
+                };
+                serde_json::json!({
+                    "target_x": tx, "target_y": ty,
+                    "actual_x": ax, "actual_y": ay
+                })
+            })
+            .collect();
+        serde_json::json!({ "samples": samples })
+    }
+
+    fn derive(payload: serde_json::Value) -> Result<Response, PluginError> {
+        handle_derive_touch_calibration_from_corners(&request(
+            VERB_DERIVE_TOUCH_CALIBRATION_FROM_CORNERS,
+            payload,
+        ))
+    }
+
+    /// The wizard verb writes the SAME three overlay files, with
+    /// the same bytes, that set_touch_calibration writes. No
+    /// second format, no second applier.
+    #[test]
+    fn derive_from_corners_writes_the_set_touch_calibration_overlays() {
+        let ov = ScratchOverlays::new("derive-corners");
+        let read = |ov: &ScratchOverlays| {
+            (
+                ov.bytes("touch_rotation"),
+                ov.bytes("touch_hflip"),
+                ov.bytes("touch_vflip"),
+            )
+        };
+
+        // Start from a deliberately non-identity state so a
+        // derive that wrote nothing would be visible.
+        handle_set_touch_calibration(&request(
+            VERB_SET_TOUCH_CALIBRATION,
+            serde_json::json!({"rotation":"90","hflip":true,"vflip":true}),
+        ))
+        .expect("seed write");
+        let seeded = read(&ov);
+        assert_eq!(seeded.0.as_deref(), Some("90"));
+
+        // Operator tapped exactly on the targets: identity.
+        let b = body(&derive(corner_samples(false)).expect("derive applies"));
+        assert_eq!(b["ok"], serde_json::json!(true));
+        assert_eq!(b["touch_rotation"], serde_json::json!("0"));
+        assert_eq!(b["touch_hflip"], serde_json::json!(false));
+        assert_eq!(b["touch_vflip"], serde_json::json!(false));
+        assert!(
+            b["mean_error"].as_f64().expect("mean_error is a number") < 1e-9,
+            "a clean fit must report ~0 residual, got {}",
+            b["mean_error"]
+        );
+        let after_derive = read(&ov);
+        assert_ne!(after_derive, seeded, "derive must have written");
+
+        // The same triple through the plain setter must produce
+        // byte-identical overlays.
+        handle_set_touch_calibration(&request(
+            VERB_SET_TOUCH_CALIBRATION,
+            serde_json::json!({"rotation":"0","hflip":false,"vflip":false}),
+        ))
+        .expect("equivalent write");
+        assert_eq!(
+            read(&ov),
+            after_derive,
+            "the wizard verb and set_touch_calibration must write the same \
+             overlay bytes"
+        );
+    }
+
+    /// The derivation is real, not a fixed answer: inverted taps
+    /// resolve to a non-identity triple that still fits cleanly.
+    #[test]
+    fn derive_from_corners_actually_derives() {
+        let _ov = ScratchOverlays::new("derive-corners-inverted");
+        let b = body(&derive(corner_samples(true)).expect("derive applies"));
+        let triple = (
+            b["touch_rotation"].as_str().expect("rotation"),
+            b["touch_hflip"].as_bool().expect("hflip"),
+            b["touch_vflip"].as_bool().expect("vflip"),
+        );
+        assert_ne!(
+            triple,
+            ("0", false, false),
+            "inverted taps must not resolve to identity"
+        );
+        assert!(
+            b["mean_error"].as_f64().expect("mean_error") < 1e-9,
+            "the inverted set has an exact fit"
+        );
+    }
+
+    /// Count and range are enforced by the shared crate, and a
+    /// bad payload is Permanent - retrying it cannot help.
+    #[test]
+    fn derive_from_corners_refuses_a_short_sample_set() {
+        let _ov = ScratchOverlays::new("derive-corners-short");
+        let three = serde_json::json!({"samples": [
+            {"target_x":0.1,"target_y":0.1,"actual_x":0.1,"actual_y":0.1},
+            {"target_x":0.9,"target_y":0.1,"actual_x":0.9,"actual_y":0.1},
+            {"target_x":0.9,"target_y":0.9,"actual_x":0.9,"actual_y":0.9}
+        ]});
+        match derive(three) {
+            Err(PluginError::Permanent(_)) => {}
+            other => panic!("a 3-sample set must be Permanent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_from_corners_refuses_out_of_range_coordinates() {
+        let _ov = ScratchOverlays::new("derive-corners-range");
+        let mut payload = corner_samples(false);
+        payload["samples"][0]["actual_x"] = serde_json::json!(1.5);
+        match derive(payload) {
+            Err(PluginError::Permanent(_)) => {}
+            other => {
+                panic!("an out-of-range tap must be Permanent, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn derive_from_corners_refuses_an_empty_payload() {
+        // Unlike launch_touch_calibration, this verb has no
+        // defaultable shape: samples are required.
+        let _ov = ScratchOverlays::new("derive-corners-empty");
+        match derive(serde_json::json!({})) {
+            Err(PluginError::Permanent(_)) => {}
+            other => {
+                panic!("a missing sample set must be Permanent, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_and_the_manifests_declare_the_same_verbs() {
+        // The steward refuses admission when the manifest and the
+        // runtime describe() disagree, so a verb added to one and
+        // not the other unloads the plugin on the device. This
+        // pins all three lists to each other.
+        let described: std::collections::BTreeSet<String> =
+            SystemKioskPlugin::default()
+                .describe()
+                .await
+                .runtime_capabilities
+                .request_types
+                .into_iter()
+                .collect();
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml).expect("manifest parses");
+            let declared: std::collections::BTreeSet<String> = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .expect("respondent")
+                .request_types
+                .iter()
+                .cloned()
+                .collect();
+            assert_eq!(
+                declared, described,
+                "{label} manifest and describe() must stock the same verbs; \
+                 a mismatch fails admission on the device"
+            );
+        }
+    }
+
+    #[test]
+    fn set_osk_writes_the_overlay_and_echoes_the_applied_state() {
+        let scratch = ScratchOverlays::new("setosk");
+
+        let resp = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": false}),
+        ))
+        .expect("set_osk false");
+        assert_eq!(body(&resp)["ok"], true);
+        assert_eq!(body(&resp)["osk_enabled"], false);
+        assert_eq!(
+            scratch.bytes("osk").as_deref(),
+            Some("none"),
+            "the verb must write the bytes the session script reads"
+        );
+
+        let resp = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": true}),
+        ))
+        .expect("set_osk true");
+        assert_eq!(body(&resp)["osk_enabled"], true);
+        assert_eq!(scratch.bytes("osk").as_deref(), Some("squeekboard"));
+    }
+
+    #[test]
+    fn set_osk_refuses_a_malformed_payload() {
+        let _scratch = ScratchOverlays::new("badpayload");
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": "yes"}),
+            serde_json::json!({"enable": true}),
+        ] {
+            assert!(
+                handle_set_osk(&request(VERB_SET_OSK, payload.clone()))
+                    .is_err(),
+                "must refuse {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_osk_refuses_an_unrecognised_overlay_rather_than_clobbering() {
+        let scratch = ScratchOverlays::new("clobber");
+        std::fs::write(scratch.dir.join("osk"), "some-future-engine").unwrap();
+        let err = handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": true}),
+        ))
+        .expect_err("must refuse");
+        assert!(
+            matches!(err, PluginError::Permanent(_)),
+            "an unparseable overlay is permanent, not retryable: {err:?}"
+        );
+        assert_eq!(
+            scratch.bytes("osk").as_deref(),
+            Some("some-future-engine"),
+            "the refused write must leave the overlay untouched"
+        );
+    }
+
+    #[test]
+    fn set_cursor_is_declared_and_scoped_in_both_manifests() {
+        for (label, toml) in
+            [("manifest", MANIFEST_TOML), ("oop", MANIFEST_OOP_TOML)]
+        {
+            let m = Manifest::from_toml(toml)
+                .unwrap_or_else(|e| panic!("{label} manifest parses: {e}"));
+            let r = m
+                .capabilities
+                .respondent
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} declares a respondent"));
+            assert!(
+                r.request_types.iter().any(|v| v == VERB_SET_CURSOR),
+                "{label} manifest must stock {VERB_SET_CURSOR}"
+            );
+            match r.verb_capabilities.get(VERB_SET_CURSOR) {
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => assert_eq!(scope, "system_admin", "{label}"),
+                other => panic!(
+                    "{label}: {VERB_SET_CURSOR} must be write/system_admin, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The sudoers template that grants this plugin its three
+    /// systemctl invocations. Read here so the argv the code
+    /// builds and the alias the drop-in authorises are pinned to
+    /// each other: a mismatch is invisible until a device denies
+    /// the sudo call at the moment an operator presses the
+    /// button.
+    const SUDOERS_TEMPLATE: &str =
+        include_str!("../../../dist/sudoers.d/evo-system-kiosk.in");
+
+    #[test]
+    fn sudoers_authorises_exactly_the_restart_argv_the_verb_uses() {
+        // The argv in handle_set_cursor, as a single line.
+        let argv = "/usr/bin/systemctl restart evo-kiosk.service";
+        let alias = format!("Cmnd_Alias EVO_SYSTEM_KIOSK_RESTART = {argv}");
+        assert!(
+            SUDOERS_TEMPLATE.lines().any(|l| l.trim() == alias),
+            "sudoers must authorise exactly `{argv}`; sudo matches argv \
+             literally, so any drift denies the operator's toggle"
+        );
+        assert!(
+            SUDOERS_TEMPLATE.lines().any(|l| l
+                .trim()
+                .ends_with("NOPASSWD: EVO_SYSTEM_KIOSK_RESTART")),
+            "the restart alias must be granted, not merely defined"
+        );
+        // No `--now` on the restart alias: this restarts a
+        // session and must never change whether the unit is
+        // enabled.
+        assert!(
+            !SUDOERS_TEMPLATE
+                .lines()
+                .any(|l| l.contains("EVO_SYSTEM_KIOSK_RESTART =")
+                    && l.contains("--now")),
+            "the restart alias must not carry --now"
+        );
+    }
+
+    /// These fixtures drive the real verb, which restarts the
+    /// kiosk session when one is running. A build host has no
+    /// such unit, so the verb takes its persist-and-return path
+    /// and spawns nothing. Asserted rather than assumed: running
+    /// the suite on a device would otherwise bounce the
+    /// operator's screen.
+    async fn refuse_if_a_live_session_would_be_restarted() {
+        assert!(
+            !kiosk_session_running().await,
+            "evo-kiosk.service is active here; these fixtures would \
+             restart a live session. Run them on a build host."
+        );
+    }
+
+    #[tokio::test]
+    async fn set_cursor_writes_the_policy_the_session_script_reads() {
+        refuse_if_a_live_session_would_be_restarted().await;
+        // `evo-kiosk-session` matches the literal `hide`, so the
+        // bool has to land as those exact bytes to have any effect
+        // at the next session start.
+        let scratch = ScratchOverlays::new("setcursor");
+
+        let resp = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": false}),
+        ))
+        .await
+        .expect("set_cursor false");
+        assert_eq!(body(&resp)["ok"], true);
+        assert_eq!(body(&resp)["cursor_visible"], false);
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("hide"));
+
+        let resp = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": true}),
+        ))
+        .await
+        .expect("set_cursor true");
+        assert_eq!(body(&resp)["cursor_visible"], true);
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("show"));
+    }
+
+    #[tokio::test]
+    async fn set_cursor_refuses_a_malformed_payload() {
+        refuse_if_a_live_session_would_be_restarted().await;
+        let _scratch = ScratchOverlays::new("badcursor");
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"visible": "yes"}),
+            serde_json::json!({"show": true}),
+        ] {
+            assert!(
+                handle_set_cursor(&request(VERB_SET_CURSOR, payload.clone()))
+                    .await
+                    .is_err(),
+                "must refuse {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_cursor_refuses_an_unrecognised_overlay_rather_than_clobbering()
+    {
+        refuse_if_a_live_session_would_be_restarted().await;
+        let scratch = ScratchOverlays::new("cursorclobber");
+        std::fs::write(scratch.dir.join("cursor"), "dim").unwrap();
+        let err = handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": true}),
+        ))
+        .await
+        .expect_err("must refuse");
+        assert!(
+            matches!(err, PluginError::Permanent(_)),
+            "an unparseable overlay is permanent, not retryable: {err:?}"
+        );
+        assert_eq!(scratch.bytes("cursor").as_deref(), Some("dim"));
+    }
+
+    #[tokio::test]
+    async fn set_cursor_round_trips_through_get_display_state() {
+        refuse_if_a_live_session_would_be_restarted().await;
+        let _scratch = ScratchOverlays::new("cursorroundtrip");
+        handle_set_cursor(&request(
+            VERB_SET_CURSOR,
+            serde_json::json!({"visible": false}),
+        ))
+        .await
+        .unwrap();
+        let resp = handle_get_display_state(&request(
+            VERB_GET_DISPLAY_STATE,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        assert_eq!(body(&resp)["cursor_visible"], false);
+    }
+
+    #[test]
+    fn get_display_state_reports_the_keyboard_and_pointer_axes() {
+        let _scratch = ScratchOverlays::new("getstate");
+        handle_set_osk(&request(
+            VERB_SET_OSK,
+            serde_json::json!({"enabled": false}),
+        ))
+        .unwrap();
+
+        let resp = handle_get_display_state(&request(
+            VERB_GET_DISPLAY_STATE,
+            serde_json::json!({}),
+        ))
+        .expect("get_display_state");
+        let b = body(&resp);
+        assert_eq!(b["osk_enabled"], false);
+        // No cursor overlay was written, so this is the documented
+        // default rather than a stale value.
+        assert_eq!(b["cursor_visible"], true);
+        // The pre-existing surface must not have shifted.
+        for key in [
+            "display_rotation",
+            "brightness_percent",
+            "sleep_timeout_seconds",
+            "sleep_inhibit_while_playing",
+            "enabled",
+        ] {
+            assert!(!b[key].is_null(), "{key} missing from get_display_state");
+        }
     }
 
     #[test]

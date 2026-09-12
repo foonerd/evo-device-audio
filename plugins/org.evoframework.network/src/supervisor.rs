@@ -19,7 +19,7 @@
 //! 2. Compose a [`SupervisorObservations`] snapshot from the
 //!    NetworkManager connectivity surface + a `curl` reachability
 //!    probe (RFC 8910 / HTTP 204 style).
-//! 3. Drive the [`SupervisorState`] state machine; publish the
+//! 3. Drive the `SupervisorState` state machine; publish the
 //!    new [`SupervisorView`] on a `tokio::sync::watch` channel so
 //!    wire-op handlers and reactive subscribers read consistent
 //!    state.
@@ -27,7 +27,7 @@
 //!    trigger critical-recovery action (caller-supplied). On
 //!    return-from-`Offline`, trigger the STA-restore action.
 //!
-//! All I/O is routed through the [`PrivilegedExec`] dispatchers
+//! All I/O is routed through the `PrivilegedExec` dispatchers
 //! the plugin holds; the supervisor never spawns commands
 //! directly. The probe / recovery actions are passed in as boxed
 //! futures so unit tests can substitute deterministic fakes.

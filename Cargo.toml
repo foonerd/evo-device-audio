@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/evo-device-audio-shared",
     "crates/evo-device-audio-distribution",
+    "crates/evo-device-audio-http",
     "crates/evo-mpd-shared",
+    "crates/evo-audio-topology",
     "crates/evo-multiroom",
     "crates/evo-online-providers",
     "crates/evo-parity-harness",
@@ -26,8 +28,7 @@ members = [
     "plugins/org.evoframework.network.smb-server",
     "plugins/org.evoframework.system.notifications",
     "plugins/org.evoframework.system.kiosk",
-    "plugins/org.evoframework.storage.usb",
-]
+    "plugins/org.evoframework.storage.usb",]
 
 # Each plugin crate lives under plugins/<full.dotted.name>/ matching
 # its manifest plugin name. New plugins are added to the members
@@ -52,21 +53,26 @@ repository = "https://github.com/foonerd/evo-device-audio"
 # across the plugin population; individual crates pay only for what
 # they actually import.
 #
-# During pre-release development the SDK pin resolves via a sibling
-# path-dep on the framework's working tree (the SDK substrate this
-# branch reshapes plugins against — typed audio data plane,
-# AudioRouting trait, CompositionCapabilities at shape 2 — ships
-# unreleased on that branch). At release cut the pin flips back to
-# `git = "...evo-core.git", tag = "..."` against the matching
-# published framework tag before the branch merges to main.
+# Release-cut pin. Playground sittings may reintroduce a sibling
+# [patch] for unreleased framework work; the published tree and
+# GHA mint resolve only this git+tag.
 [workspace.dependencies]
-# Framework pins — flipped from sibling path-deps to git+tag at release
-# cut. Every framework crate this workspace links resolves through
-# these three entries so a version bump is one edit, not many.
-evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
-evo = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
-evo-primitives = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13" }
+# Framework pins — git+tag against the matching published
+# framework tag. Every framework crate this workspace links
+# resolves through these entries so a version bump is one edit.
+evo-plugin-sdk = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+evo = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+evo-primitives = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+evo-witness = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+# Consumed by the distribution's HTTPS hookup. Mounting product
+# routes on the router the framework hands back means naming its
+# types and gating on its auth; these are that surface.
+evo-runtime-http = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+evo-auth-bearer = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
+evo-projection-core = { git = "https://github.com/foonerd/evo-core.git", tag = "v0.1.13.0" }
 evo-device-audio-shared = { path = "crates/evo-device-audio-shared", version = "0.1.0" }
+evo-device-audio-http = { path = "crates/evo-device-audio-http", version = "0.1.0" }
+async-trait = "0.1"
 evo-mpd-shared = { path = "crates/evo-mpd-shared", version = "0.1.0" }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
@@ -124,3 +130,4 @@ missing_docs = "warn"
 # workspace level.
 [workspace.lints.clippy]
 manual_async_fn = "allow"
+

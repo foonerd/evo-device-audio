@@ -1,23 +1,27 @@
-# Promote: move a channel pointer to a (piece, version) that is
-# already published in pieces/. No rebuild; no signing of the piece
-# itself. The channel-pointer file is signed with the commons key
-# so consumers can verify which version a channel points at.
+# Promote: move a channel pointer to a piece version that is
+# already published. No rebuild; no re-sign of the piece.
+# The channel-pointer file is signed with the commons key so
+# consumers can verify which version a channel points at.
 #
-# Format is v0. When the framework ships its release-plane contract
-# in `evo-core/docs/engineering/RELEASE_PLANE.md`, the channel-
-# pointer file shape will reshape to match; the migration is
-# in-place.
+# Piece is either:
+#   evo-device-audio
+#     -> binaries/evo-device-audio/<version>/ must exist
+#   org.evoframework.<plugin>
+#     -> bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
+#
+# Manifest-only stubs under pieces/ do not count. Rollback is
+# the same pointer move, back to a version that is still on disk.
 name: promote
 
 "on":
   workflow_dispatch:
     inputs:
       piece:
-        description: "Piece name (e.g. org.evoframework.playback.mpd)"
+        description: "Piece name (evo-device-audio, evo-ui-shell, evo-ui-runtime, evo-kiosk, evo-device-boot, evo-device-audio-dist, or a plugin)"
         type: string
         required: true
       version:
-        description: "Version already published under pieces/<piece>/<version>/"
+        description: "Version already published for that piece"
         type: string
         required: true
       channel:
@@ -30,6 +34,7 @@ env:
   ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
   COMMIT_USER: evo-device-audio CI
   COMMIT_EMAIL: ci@evoframework.org
+  STEWARD_PIECE: evo-device-audio
 
 jobs:
   promote:
@@ -46,13 +51,17 @@ jobs:
           VERSION: ${{ inputs.version }}
           CHANNEL: ${{ inputs.channel }}
         run: |
-          set -e
+          set -euo pipefail
           if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
             echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
             exit 1
           fi
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::version is empty"
             exit 1
           fi
           umask 077
@@ -65,9 +74,18 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
           cd "$ART"
 
-          if [ ! -d "pieces/${PIECE}/${VERSION}" ]; then
-            echo "::error::pieces/${PIECE}/${VERSION} not found in ${ARTEFACTS_REPO}; cannot promote a version that has not been published"
-            exit 1
+          if [ -d "binaries/${PIECE}/${VERSION}" ]; then
+            echo "found binaries/${PIECE}/${VERSION}"
+          elif [ -d "bundles/${PIECE}/${VERSION}" ]; then
+            echo "found bundles/${PIECE}/${VERSION}"
+          else
+            shopt -s nullglob
+            found=(bundles/"${PIECE}"/*/"${PIECE}-${VERSION}"-*.tar.gz)
+            trees=(bundles/"${PIECE}"/"${VERSION}"/tree.tar.gz)
+            if [ ${#found[@]} -eq 0 ] && [ ${#trees[@]} -eq 0 ]; then
+              echo "::error::no published slot for ${PIECE} ${VERSION} (binaries/ or bundles/); mint the piece first"
+              exit 1
+            fi
           fi
 
           mkdir -p channels

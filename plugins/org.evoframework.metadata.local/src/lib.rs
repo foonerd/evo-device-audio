@@ -73,7 +73,7 @@ fn plugin_crate_version() -> semver::Version {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
-/// Local file-tag metadata respondent: [`PluginConfig::library_roots`] and
+/// Local file-tag metadata respondent: `PluginConfig::library_roots` and
 /// `metadata.query` for `mpd-path` values.
 pub struct MetadataLocalPlugin {
     loaded: bool,
