@@ -1644,6 +1644,35 @@ impl SambaServerRuntime {
         Ok(adopted)
     }
 
+    /// Reconcile `/etc/samba/smb.conf` and the `smbd` lifecycle
+    /// against persisted state at plugin load.
+    ///
+    /// Runs the persisted `enabled` value back through
+    /// [`Self::apply`], so load takes exactly the path the
+    /// operator's own gesture takes — there is no second
+    /// lifecycle here to drift from it. Enabled re-renders and
+    /// restarts; disabled re-renders and **stops** `smbd`.
+    ///
+    /// Stopping on the disabled path is the point. `smbd` is a
+    /// unit the OS enables at boot, so a box whose persisted
+    /// state says File Sharing is off would otherwise come back
+    /// from a reboot with `smbd` live against whatever conf was
+    /// last written — exporting shares the operator had turned
+    /// off. `SAMBA-SHARES.md` requires disable to stop the
+    /// daemon; before this, that only held from the moment of
+    /// the gesture until the next boot.
+    ///
+    /// The caller treats failure as non-fatal: plugin admission
+    /// must not hinge on it, so the dispatch surface stays
+    /// reachable for the operator to inspect and retry.
+    pub async fn reconcile_smb_conf_on_load(
+        &self,
+    ) -> Result<ApplyReport, ApplyError> {
+        let state = self.get_state().await;
+        self.apply(state.enabled, state.min_protocol, state.extra_shares)
+            .await
+    }
+
     /// Apply new server-side settings. Steps: swap in the new
     /// enabled + min_protocol + extra_shares (users are
     /// managed separately via add_user / revoke_user), render
@@ -3640,6 +3669,53 @@ mod tests {
         assert!(calls[2].1[1].ends_with("/systemctl"));
         assert_eq!(calls[2].1[2], "stop");
         assert_eq!(calls[2].1[3], "smbd");
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_load_when_disabled_stops_smbd() {
+        // A fresh runtime persists `enabled = false`. Load must
+        // not leave that parked: smbd is unit-enabled and comes
+        // back at boot, so a disabled box would serve the last
+        // conf written until someone gestured. Load takes the
+        // same stop path apply(false) takes.
+        let dir = tempdir();
+        let (rt, executor) =
+            built_runtime(&dir, vec![ok(), ok(), ok()], HashMap::new());
+        assert!(!rt.get_state().await.enabled);
+        let report = rt.reconcile_smb_conf_on_load().await.unwrap();
+        assert!(!report.smbd_restarted);
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].1[1].ends_with("/testparm"));
+        assert!(calls[1].1[1].ends_with("/install"));
+        assert!(calls[2].1[1].ends_with("/systemctl"));
+        assert_eq!(calls[2].1[2], "stop");
+        assert_eq!(calls[2].1[3], "smbd");
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_load_when_enabled_restarts_smbd() {
+        // The enabled path is unchanged: load still re-renders
+        // and restarts, which is what keeps the conf in step
+        // with the live hostname and the current renderer.
+        let dir = tempdir();
+        let (rt, executor) = built_runtime(
+            &dir,
+            // three for the apply(true) that sets the state,
+            // three for the reconcile under test.
+            vec![ok(), ok(), ok(), ok(), ok(), ok()],
+            HashMap::new(),
+        );
+        rt.apply(true, MinProtocol::Default, Vec::new())
+            .await
+            .unwrap();
+        let report = rt.reconcile_smb_conf_on_load().await.unwrap();
+        assert!(report.smbd_restarted);
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls.len(), 6);
+        assert!(calls[5].1[1].ends_with("/systemctl"));
+        assert_eq!(calls[5].1[2], "restart");
+        assert_eq!(calls[5].1[3], "smbd");
     }
 
     #[tokio::test]
