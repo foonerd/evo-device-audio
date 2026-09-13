@@ -1820,9 +1820,76 @@ pub fn systemd_mount_unit_name(mount_root: &Path) -> String {
 /// generic mount rendering is `mount: <path>: No such file or
 /// directory`. Matching case-insensitively on either phrase
 /// covers both helpers.
-pub fn is_mount_directory_missing(stderr: &str) -> bool {
-    let s = stderr.to_ascii_uppercase();
-    s.contains("NO SUCH FILE OR DIRECTORY")
+pub fn is_mount_directory_missing(stderr: &str, mount_root: &Path) -> bool {
+    let root = mount_root.to_string_lossy().to_ascii_uppercase();
+    stderr.lines().any(|line| {
+        let l = line.to_ascii_uppercase();
+        if !l.contains("NO SUCH FILE OR DIRECTORY") {
+            return false;
+        }
+        // The ENOENT has to be about the share's own mount point.
+        // `systemd-mount` writes its own ENOENT about the
+        // transient unit file under /run/systemd/transient when a
+        // job fails for an unrelated reason - a refused password,
+        // for one. That line says nothing about the music
+        // directory and must never be read as if it did.
+        l.contains("CHDIR") || (!root.is_empty() && l.contains(&root))
+    })
+}
+
+/// Both stderr sources for one failed mount attempt, together.
+///
+/// `systemd-mount` prints an opaque "Job failed" on stdout while
+/// the helper's real words land in the transient unit's journal -
+/// but the reverse also happens, and the two carry different
+/// halves of the truth. Taking one and discarding the other is
+/// how a refused password ends up hidden behind a systemd
+/// bookkeeping line.
+fn combine_mount_stderr(helper: &str, unit: &str) -> String {
+    match (helper.trim().is_empty(), unit.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => helper.to_owned(),
+        (true, false) => unit.to_owned(),
+        (false, false) => format!("{helper}\n{unit}"),
+    }
+}
+
+/// What a failed mount attempt actually reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountFailureKind {
+    /// The server refused the credential. Permanent: the same
+    /// secret will be refused again in five minutes.
+    AuthRefused,
+    /// The share's own mount point is not there.
+    DirectoryMissing,
+    /// Anything else - the caller decides (ladder step or
+    /// MountFailed).
+    Other,
+}
+
+/// One classify truth for a failed mount, CIFS and NFS alike.
+///
+/// Reads helper stderr and unit journal **together**, and asks
+/// the auth question first: when a refusal and an ENOENT are both
+/// present, the refusal is the one that matters. An ENOENT about
+/// the mount point clears on its own; a refused password does
+/// not, and must reach `AuthenticationRefused` so the vault entry
+/// is dropped and the next mount can prompt.
+fn classify_mount_failure(
+    exit_code: Option<i32>,
+    helper_stderr: &str,
+    unit_stderr: &str,
+    mount_root: &Path,
+    is_auth_refusal: impl Fn(Option<i32>, &str) -> bool,
+) -> (MountFailureKind, String) {
+    let combined = combine_mount_stderr(helper_stderr, unit_stderr);
+    if is_auth_refusal(exit_code, &combined) {
+        return (MountFailureKind::AuthRefused, combined);
+    }
+    if is_mount_directory_missing(&combined, mount_root) {
+        return (MountFailureKind::DirectoryMissing, combined);
+    }
+    (MountFailureKind::Other, combined)
 }
 
 /// True when the mount.cifs exit code + stderr fragment indicate
@@ -4313,27 +4380,33 @@ impl NetworkSharesRuntime {
             self.fetch_mount_unit_stderr(&record.mount_root).await;
         let helper_stderr =
             String::from_utf8_lossy(&output.stderr).into_owned();
-        let classify_stderr = if unit_stderr.is_empty() {
-            helper_stderr
-        } else {
-            unit_stderr
-        };
+        let (kind, classify_stderr) = classify_mount_failure(
+            output.exit_code,
+            &helper_stderr,
+            &unit_stderr,
+            &record.mount_root,
+            is_cifs_auth_refusal,
+        );
         *last_error = classify_stderr.clone();
-        if is_mount_directory_missing(&classify_stderr) {
-            return Err(MountError::MountDirectoryMissing {
-                id: record.share_id.clone(),
-                mount_root: record.mount_root.clone(),
-                reason: classify_stderr,
-            });
+        match kind {
+            MountFailureKind::AuthRefused => {
+                Err(MountError::AuthenticationRefused {
+                    id: record.share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr: classify_stderr,
+                })
+            }
+            MountFailureKind::DirectoryMissing => {
+                Err(MountError::MountDirectoryMissing {
+                    id: record.share_id.clone(),
+                    mount_root: record.mount_root.clone(),
+                    reason: classify_stderr,
+                })
+            }
+            // Not a refusal and not a missing mount point: let the
+            // dialect ladder take its next step.
+            MountFailureKind::Other => Ok(None),
         }
-        if is_cifs_auth_refusal(output.exit_code, &classify_stderr) {
-            return Err(MountError::AuthenticationRefused {
-                id: record.share_id.clone(),
-                exit_code: output.exit_code,
-                stderr: classify_stderr,
-            });
-        }
-        Ok(None)
     }
 
     /// Read the transient systemd .mount unit's recent journal
@@ -4717,11 +4790,16 @@ impl NetworkSharesRuntime {
                 self.fetch_mount_unit_stderr(&record.mount_root).await;
             let stderr_owned =
                 String::from_utf8_lossy(&output.stderr).into_owned();
-            let classify_stderr = if unit_stderr.is_empty() {
-                stderr_owned
-            } else {
-                unit_stderr
-            };
+            // Same combiner as CIFS: the unit journal never hides
+            // the helper's words. NFS already asked the auth
+            // question first and still does.
+            let (kind, classify_stderr) = classify_mount_failure(
+                output.exit_code,
+                &stderr_owned,
+                &unit_stderr,
+                &record.mount_root,
+                |_exit, stderr| is_nfs_auth_refusal(stderr),
+            );
             // Same ENOENT short-circuit as the CIFS path: if the
             // mount root doesn't exist, mount.nfs errors at
             // chdir before touching the network. Report as
@@ -4730,25 +4808,27 @@ impl NetworkSharesRuntime {
             // again in five minutes. Raise the same typed refusal
             // the CIFS path raises so the remount pass leaves it
             // alone instead of re-probing on every tick.
-            if is_nfs_auth_refusal(&classify_stderr) {
-                return Err(MountError::AuthenticationRefused {
+            return match kind {
+                MountFailureKind::AuthRefused => {
+                    Err(MountError::AuthenticationRefused {
+                        id: record.share_id.clone(),
+                        exit_code: output.exit_code,
+                        stderr: classify_stderr,
+                    })
+                }
+                MountFailureKind::DirectoryMissing => {
+                    Err(MountError::MountDirectoryMissing {
+                        id: record.share_id.clone(),
+                        mount_root: record.mount_root.clone(),
+                        reason: classify_stderr,
+                    })
+                }
+                MountFailureKind::Other => Err(MountError::MountFailed {
                     id: record.share_id.clone(),
                     exit_code: output.exit_code,
                     stderr: classify_stderr,
-                });
-            }
-            if is_mount_directory_missing(&classify_stderr) {
-                return Err(MountError::MountDirectoryMissing {
-                    id: record.share_id.clone(),
-                    mount_root: record.mount_root.clone(),
-                    reason: classify_stderr,
-                });
-            }
-            return Err(MountError::MountFailed {
-                id: record.share_id.clone(),
-                exit_code: output.exit_code,
-                stderr: classify_stderr,
-            });
+                }),
+            };
         }
         // Best-effort read of /proc/mounts for the negotiated
         // version. Absent /proc/mounts (test envs, non-Linux)
@@ -6652,14 +6732,129 @@ tmpfs /tmp tmpfs rw 0 0\n";
 
     #[test]
     fn is_mount_directory_missing_matches_common_enoent_renderings() {
+        let root = Path::new("/var/lib/evo/music/NAS/foo");
         assert!(is_mount_directory_missing(
-            "Couldn't chdir to /var/lib/evo/music/NAS/foo: No such file or directory"
+            "Couldn't chdir to /var/lib/evo/music/NAS/foo: No such file or directory",
+            root
         ));
         assert!(is_mount_directory_missing(
-            "mount: /var/lib/evo/music/NAS/foo: No such file or directory"
+            "mount: /var/lib/evo/music/NAS/foo: No such file or directory",
+            root
         ));
-        assert!(!is_mount_directory_missing("Permission denied"));
-        assert!(!is_mount_directory_missing("cifs: bad option"));
+        assert!(!is_mount_directory_missing("Permission denied", root));
+        assert!(!is_mount_directory_missing("cifs: bad option", root));
+    }
+
+    #[test]
+    fn is_mount_directory_missing_ignores_the_systemd_transient_unit_file() {
+        // systemd-mount's own bookkeeping ENOENT
+        // is about a unit file under /run/systemd/transient, not
+        // about the share's mount point. Reading it as a missing
+        // music directory is what kept the bad password alive.
+        let root = Path::new("/var/lib/evo/music/NAS/audio");
+        let transient = "Failed to open /run/systemd/transient/\
+var-lib-evo-music-NAS-audio.mount: No such file or directory";
+        assert!(!is_mount_directory_missing(transient, root));
+    }
+
+    #[test]
+    fn classify_cifs_auth_wins_over_a_transient_unit_enoent() {
+        // The field case: the unit journal carries systemd's
+        // transient ENOENT, the helper carries mount error(13).
+        // Both are present; the refusal is the one that matters.
+        let root = Path::new("/var/lib/evo/music/NAS/audio");
+        let unit = "Failed to open /run/systemd/transient/\
+var-lib-evo-music-NAS-audio.mount: No such file or directory";
+        let helper = "mount error(13): Permission denied";
+        let (kind, combined) = classify_mount_failure(
+            Some(32),
+            helper,
+            unit,
+            root,
+            is_cifs_auth_refusal,
+        );
+        assert_eq!(kind, MountFailureKind::AuthRefused);
+        // Neither source is discarded - the operator sees both.
+        assert!(combined.contains("mount error(13)"));
+        assert!(combined.contains("/run/systemd/transient/"));
+    }
+
+    #[test]
+    fn classify_cifs_chdir_enoent_is_still_directory_missing() {
+        let root = Path::new("/var/lib/evo/music/NAS/target");
+        let (kind, _) = classify_mount_failure(
+            Some(32),
+            "Couldn't chdir to /var/lib/evo/music/NAS/target: \
+No such file or directory",
+            "",
+            root,
+            is_cifs_auth_refusal,
+        );
+        assert_eq!(kind, MountFailureKind::DirectoryMissing);
+    }
+
+    #[test]
+    fn classify_cifs_clean_logon_failure_is_auth_refused() {
+        let root = Path::new("/var/lib/evo/music/NAS/audio");
+        let (kind, _) = classify_mount_failure(
+            Some(32),
+            "mount error: NT_STATUS_LOGON_FAILURE",
+            "",
+            root,
+            is_cifs_auth_refusal,
+        );
+        assert_eq!(kind, MountFailureKind::AuthRefused);
+    }
+
+    #[test]
+    fn classify_nfs_keeps_auth_ahead_of_directory_missing() {
+        // NFS already asked the auth question first. The shared
+        // combiner must not invert that.
+        let root = Path::new("/var/lib/evo/music/NAS/export");
+        let (kind, _) = classify_mount_failure(
+            Some(32),
+            "mount.nfs: access denied by server while mounting",
+            "Failed to open /run/systemd/transient/x.mount: \
+No such file or directory",
+            root,
+            |_exit, stderr| is_nfs_auth_refusal(stderr),
+        );
+        assert_eq!(kind, MountFailureKind::AuthRefused);
+    }
+
+    #[test]
+    fn classify_unrecognised_failure_stays_other() {
+        let root = Path::new("/var/lib/evo/music/NAS/audio");
+        let (kind, _) = classify_mount_failure(
+            Some(32),
+            "mount error(112): Host is down",
+            "",
+            root,
+            is_cifs_auth_refusal,
+        );
+        assert_eq!(kind, MountFailureKind::Other);
+    }
+
+    #[test]
+    fn refused_password_is_permanent_and_missing_directory_is_transient() {
+        assert_eq!(
+            MountError::AuthenticationRefused {
+                id: ShareId::new_v4(),
+                exit_code: Some(32),
+                stderr: String::new(),
+            }
+            .failure_class(),
+            FailureClass::Permanent
+        );
+        assert_eq!(
+            MountError::MountDirectoryMissing {
+                id: ShareId::new_v4(),
+                mount_root: PathBuf::from("/var/lib/evo/music/NAS/x"),
+                reason: String::new(),
+            }
+            .failure_class(),
+            FailureClass::Transient
+        );
     }
 
     #[tokio::test]
@@ -6733,6 +6928,56 @@ tmpfs /tmp tmpfs rw 0 0\n";
         );
     }
 
+    #[tokio::test]
+    async fn transient_unit_enoent_beside_mount_error_13_clears_the_vault() {
+        // The field case, reproduced. A failed attempt carries
+        // systemd's transient-unit ENOENT
+        // AND mount error(13). Before the combiner, the ENOENT
+        // was read first, the attempt was filed Transient as
+        // MountDirectoryMissing, the vault entry survived, and
+        // the five-minute remount pass kept re-sending the
+        // rejected password with no prompt ever raised.
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root.clone()));
+        store.store_password("live_key", b"wrong").await.unwrap();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "Failed to open /run/systemd/transient/\
+var-lib-evo-music-NAS-audio.mount: No such file or directory\n\
+mount error(13): Permission denied",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .build();
+        let mut record = built_record("audio", "192.0.2.1");
+        record.credentials = Credentials::UserPassword {
+            username: "operator".to_string(),
+            credential_key: "live_key".to_string(),
+            domain: None,
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let err = rt.mount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(err, MountError::AuthenticationRefused { .. }),
+            "transient-unit ENOENT must not hide mount error(13); got {err:?}",
+        );
+        assert_eq!(err.failure_class(), FailureClass::Permanent);
+        assert!(
+            store.fetch_password("live_key").await.is_none(),
+            "the refused secret must leave the vault so the next \
+             mount can prompt",
+        );
+    }
+
     #[test]
     fn systemd_mount_unit_name_matches_systemd_escape() {
         // Canonical case: /var/lib/evo/music/NAS/alias
@@ -6784,12 +7029,18 @@ tmpfs /tmp tmpfs rw 0 0\n";
     #[tokio::test]
     async fn mount_nfs_directory_missing_maps_to_directory_missing_variant() {
         let dir = tempdir();
-        let executor = ScriptedExecutor::new(vec![failure_output(
-            "mount: /var/lib/evo/music/NAS/nfs: No such file or directory",
-        )]);
-        let rt = build_runtime_with_executor(&dir, executor);
         let mut record = built_record("nfs", "192.0.2.100");
         record.fstype = FsType::Nfs;
+        // mount.nfs names the mount point it actually tried, so
+        // the fixture has to name this record's own mount_root.
+        // The previous fixture quoted the production path while
+        // the record pointed at a tempdir - a rendering the
+        // helper could never emit for this share.
+        let executor = ScriptedExecutor::new(vec![failure_output(&format!(
+            "mount: {}: No such file or directory",
+            record.mount_root.display()
+        ))]);
+        let rt = build_runtime_with_executor(&dir, executor);
         let id = record.share_id.clone();
         rt.add_share(record).await.unwrap();
 
