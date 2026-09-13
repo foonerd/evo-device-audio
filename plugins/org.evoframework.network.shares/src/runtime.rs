@@ -499,6 +499,21 @@ pub enum SharesStateError {
     /// is written.
     #[error("share alias must not be blank")]
     BlankAlias,
+    /// The supplied host was empty or whitespace only.
+    ///
+    /// A share with no host names nothing to reach. The mount
+    /// helper would be handed a source with no server in it and
+    /// fail at the OS layer with a message about syntax, rather
+    /// than about the field the operator left empty.
+    #[error("share host must not be blank")]
+    BlankHost,
+    /// The supplied remote path was empty or whitespace only.
+    ///
+    /// The path is the CIFS share name or the NFS export. Both
+    /// are required to name a target; neither has a meaningful
+    /// default this plugin could supply.
+    #[error("share path must not be blank")]
+    BlankPath,
     /// Insertion collided with an existing record's identifier.
     /// Signals a caller who is minting IDs incorrectly (should
     /// only happen for direct-import flows; the standard mint
@@ -519,6 +534,25 @@ pub enum SharesStateError {
 fn refuse_blank_alias(alias: &str) -> Result<(), SharesStateError> {
     if alias.trim().is_empty() {
         return Err(SharesStateError::BlankAlias);
+    }
+    Ok(())
+}
+
+/// Refuse a value that is empty or whitespace only, naming the
+/// field through the error the caller supplies.
+///
+/// One predicate for both writers and both fields: `add_share`
+/// asks it for the host and the path it was handed, `edit_share`
+/// asks it for whichever of the two the edit actually carries.
+/// Like the alias rule it only refuses — the stored value is
+/// never trimmed and no default is composed, so a record that is
+/// accepted holds exactly what the operator typed.
+fn refuse_blank_field(
+    value: &str,
+    blank: SharesStateError,
+) -> Result<(), SharesStateError> {
+    if value.trim().is_empty() {
+        return Err(blank);
     }
     Ok(())
 }
@@ -3728,8 +3762,11 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         record: ShareRecord,
     ) -> Result<ShareId, SharesStateError> {
         // Refuse before the record reaches the store: a share
-        // that cannot be named is not created.
+        // that cannot be named, or that names no target, is not
+        // created.
         refuse_blank_alias(&record.alias)?;
+        refuse_blank_field(&record.host, SharesStateError::BlankHost)?;
+        refuse_blank_field(&record.path, SharesStateError::BlankPath)?;
         let id = record.share_id.clone();
         let record_clone = record.clone();
         let configured_envelope = {
@@ -3751,11 +3788,17 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         share_id: &ShareId,
         edits: ShareEdits,
     ) -> Result<bool, SharesStateError> {
-        // Refuse before the lock is taken, so a blank rename
-        // never reaches the record or the state file. Omitting
-        // the alias is still a no-op on it.
+        // Refuse before the lock is taken, so a blank rename or
+        // retarget never reaches the record or the state file.
+        // A field the edit omits is still a no-op on it.
         if let Some(alias) = edits.alias.as_deref() {
             refuse_blank_alias(alias)?;
+        }
+        if let Some(host) = edits.host.as_deref() {
+            refuse_blank_field(host, SharesStateError::BlankHost)?;
+        }
+        if let Some(path) = edits.path.as_deref() {
+            refuse_blank_field(path, SharesStateError::BlankPath)?;
         }
         let (changed, material, alias, mount_root, configured_envelope) = {
             let mut g = self.inner.lock().await;
@@ -6795,6 +6838,121 @@ tmpfs /tmp tmpfs rw 0 0\n";
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_blank_host_and_writes_nothing() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        for blank in ["", "   "] {
+            let mut record = built_record("target", blank);
+            record.alias = "Family NAS".to_string();
+            let err = rt.add_share(record).await.unwrap_err();
+            assert!(matches!(err, SharesStateError::BlankHost));
+            assert!(
+                rt.list_configured().await.unwrap().is_empty(),
+                "a refused add must leave the store empty",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_blank_path_and_writes_nothing() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        for blank in ["", "   "] {
+            let mut record = built_record("target", "192.0.2.44");
+            record.alias = "Family NAS".to_string();
+            record.path = blank.to_string();
+            let err = rt.add_share(record).await.unwrap_err();
+            assert!(matches!(err, SharesStateError::BlankPath));
+            assert!(rt.list_configured().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn add_still_accepts_a_real_host_and_path() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        record.path = "multimedia/audio".to_string();
+
+        rt.add_share(record).await.unwrap();
+        let configured = rt.list_configured().await.unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].host, "192.0.2.44");
+        assert_eq!(configured[0].path, "multimedia/audio");
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_a_blank_retarget_and_keeps_the_old_values() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        record.path = "multimedia/audio".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        for blank in ["", "   "] {
+            let err = rt
+                .edit_share(
+                    &id,
+                    ShareEdits {
+                        host: Some(blank.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SharesStateError::BlankHost));
+
+            let err = rt
+                .edit_share(
+                    &id,
+                    ShareEdits {
+                        path: Some(blank.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SharesStateError::BlankPath));
+
+            let configured = rt.list_configured().await.unwrap();
+            assert_eq!(
+                configured[0].host, "192.0.2.44",
+                "a refused retarget must leave the record alone",
+            );
+            assert_eq!(configured[0].path, "multimedia/audio");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_without_a_host_or_path_is_still_a_no_op_on_them() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        record.path = "multimedia/audio".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                alias: Some("Attic NAS".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let configured = rt.list_configured().await.unwrap();
+        assert_eq!(configured[0].alias, "Attic NAS");
+        assert_eq!(configured[0].host, "192.0.2.44");
+        assert_eq!(configured[0].path, "multimedia/audio");
     }
 
     #[tokio::test]
