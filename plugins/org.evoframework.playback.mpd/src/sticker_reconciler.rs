@@ -297,7 +297,7 @@ async fn reconcile_all(
 /// MPD's `lsinfo` recursively via `listallinfo PATH` would be
 /// ideal but is heavy; for now use a `find file <prefix>` query
 /// which MPD evaluates against its database.
-async fn enumerate_songs_under_mount(
+pub(crate) async fn enumerate_songs_under_mount(
     conn: &mut MpdConnection,
     mount_path: &str,
 ) -> Result<Vec<String>, MpdError> {
@@ -350,7 +350,7 @@ async fn write_stickers_batched(
 
 /// Open an MPD connection with bounded backoff retry. Used at
 /// the start of each reconcile cycle.
-async fn open_connection(
+pub(crate) async fn open_connection(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
 ) -> Result<MpdConnection, MpdError> {
