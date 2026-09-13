@@ -9,7 +9,7 @@
 //! progress on the wire — the framework knows the scan
 //! started (from an `update_source` verb call or from an idle
 //! `Update` wake) and knows the total songs count on
-//! completion (from the next `stats` read), but the operator
+//! completion, but the operator
 //! UI sees nothing move between "scan started" and "scan
 //! completed". On a rescan of thousands of tracks the panel
 //! sits idle for minutes.
@@ -25,7 +25,9 @@
 //! 2. Polls MPD `status` every ~500 ms; when
 //!    `status.updating_db` is `Some(job_id)`, emits an
 //!    `audio_library_scan_progress` frame carrying the
-//!    per-source `scanned_tracks` (from `stats.songs`),
+//!    per-source `scanned_tracks` (0 while in flight — MPD
+//!    has no per-source progress counter and the database
+//!    total is not this source's),
 //!    `estimated_total`, and `phase = "scanning"`.
 //! 3. When `updating_db` returns to `None`, emits ONE
 //!    terminal frame with `phase = "complete"` carrying the
@@ -120,6 +122,23 @@ fn idle_envelope() -> serde_json::Value {
         "scans": Vec::<serde_json::Value>::new(),
     })
 }
+
+/// What the in-flight frames report as `scanned_tracks`.
+///
+/// MPD has no per-source progress counter. `stats.songs` is the
+/// whole database, so on a device carrying a local library and a
+/// NAS it is mostly songs the running scan will never touch;
+/// publishing it as this source's progress told the operator
+/// "Indexing <the database> of <this source>".
+///
+/// There is no cheap honest per-source count on the poll path:
+/// `find base` every tick is a second enumerator under load, and
+/// a fabricated number is the same lie in a different hat. So
+/// the in-flight frames carry zero and the denominator carries
+/// the walker's per-source estimate — "Indexing 0 of M", which
+/// is true, or "Indexing 0" when the walker missed. The settled
+/// count lands on the card the moment the scan completes.
+const SCANNED_TRACKS_IN_FLIGHT: u32 = 0;
 
 /// The active-scan envelope: one entry describing the
 /// in-flight (or just-completed) scan.
@@ -220,22 +239,21 @@ async fn run(
     let estimated_total =
         estimate_source_track_count(&library, &source_id).await;
 
-    // Initial frame — publishes phase=scanning with 0 scanned
-    // so the UI can render "Indexing 0 of M" immediately.
+    // Initial frame — publishes phase=scanning so the UI can
+    // render "Indexing 0 of M" immediately.
     publish(
         &subjects,
         active_envelope(
             &source_id,
             kind,
             started_at_ms,
-            0,
+            SCANNED_TRACKS_IN_FLIGHT,
             estimated_total,
             "scanning",
         ),
     )
     .await;
 
-    let mut last_scanned: u32 = 0;
     let mut last_updating_db: Option<u32> = None;
 
     loop {
@@ -251,7 +269,7 @@ async fn run(
                 source_id: &source_id,
                 kind,
                 started_at_ms,
-                final_scanned: last_scanned,
+                final_scanned: SCANNED_TRACKS_IN_FLIGHT,
                 estimated_total,
                 endpoint: &endpoint,
                 timeouts,
@@ -294,19 +312,9 @@ async fn run(
                 continue;
             }
         };
-        let stats = match conn.stats().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    plugin = PLUGIN_NAME,
-                    error = %e,
-                    "scan_progress: poll stats failed; retrying"
-                );
-                continue;
-            }
-        };
-
-        last_scanned = stats.songs;
+        // No stats read here. Its only use was the database song
+        // total, which is not this source's progress. `status()`
+        // and `updating_db` carry everything the watcher needs.
         let now_updating = status.updating_db;
 
         // MPD reports updating_db while a scan is in flight.
@@ -324,7 +332,7 @@ async fn run(
                         &source_id,
                         kind,
                         started_at_ms,
-                        last_scanned,
+                        SCANNED_TRACKS_IN_FLIGHT,
                         estimated_total,
                         "scanning",
                     ),
@@ -341,7 +349,7 @@ async fn run(
                     source_id: &source_id,
                     kind,
                     started_at_ms,
-                    final_scanned: last_scanned,
+                    final_scanned: SCANNED_TRACKS_IN_FLIGHT,
                     estimated_total,
                     endpoint: &endpoint,
                     timeouts,
@@ -362,7 +370,7 @@ async fn run(
                     source_id: &source_id,
                     kind,
                     started_at_ms,
-                    final_scanned: last_scanned,
+                    final_scanned: SCANNED_TRACKS_IN_FLIGHT,
                     estimated_total,
                     endpoint: &endpoint,
                     timeouts,
@@ -402,7 +410,10 @@ async fn emit_terminal(scan: TerminalScan<'_>) {
     let subjects = library.subjects.clone();
     // Terminal frame carries the final counts + phase=complete.
     // UI keys on phase=complete for its settle logic.
-    let final_total = estimated_total.or(Some(final_scanned));
+    // The walker's per-source estimate, or nothing. It must NOT
+    // fall back to `final_scanned`: that is zero by the rule
+    // above, and "0 of 0" reads as a finished, empty source.
+    let final_total = estimated_total;
     publish(
         &subjects,
         active_envelope(
@@ -759,6 +770,77 @@ mod tests {
         )
     }
 
+    #[test]
+    fn in_flight_frames_report_zero_not_a_database_total() {
+        // "Indexing 0 of M" is true. "Indexing <database> of M"
+        // was not.
+        assert_eq!(SCANNED_TRACKS_IN_FLIGHT, 0);
+        let env = active_envelope(
+            "nas",
+            ScanKind::Update,
+            1_700_000_000_000,
+            SCANNED_TRACKS_IN_FLIGHT,
+            Some(42),
+            "scanning",
+        );
+        let scan = &env["scans"][0];
+        assert_eq!(scan["scanned_tracks"], 0);
+        // The denominator is the walker's per-source estimate
+        // and is untouched by this row.
+        assert_eq!(scan["estimated_total"], 42);
+        assert_eq!(scan["phase"], "scanning");
+    }
+
+    #[test]
+    fn a_missed_walker_leaves_the_denominator_absent_not_zero() {
+        // "Indexing 0" — indeterminate. Never "0 of 0", which
+        // reads as a finished, empty source.
+        let env = active_envelope(
+            "nas",
+            ScanKind::Update,
+            1_700_000_000_000,
+            SCANNED_TRACKS_IN_FLIGHT,
+            None,
+            "complete",
+        );
+        let scan = &env["scans"][0];
+        assert_eq!(scan["scanned_tracks"], 0);
+        assert!(
+            scan["estimated_total"].is_null(),
+            "a missing estimate must stay missing, not become 0",
+        );
+    }
+
+    #[test]
+    fn the_poll_path_takes_no_database_song_total() {
+        // Anti-drift: the watcher must not reacquire the
+        // database-wide count. The needle is built at runtime so
+        // this assertion does not match itself, and the prose
+        // elsewhere in the file that explains WHY the total is
+        // wrong stays readable.
+        let src = include_str!("scan_progress.rs");
+        let stats_read = format!("conn.{}()", "stats");
+        assert!(
+            !src.contains(&stats_read),
+            "the poll path must not read MPD's database stats",
+        );
+        let db_total = format!("{}.songs", "stats");
+        let code_hits = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.starts_with("//!")
+            })
+            .filter(|l| l.contains(&db_total))
+            .count();
+        assert_eq!(
+            code_hits, 0,
+            "no code line in this file may take the database song total",
+        );
+    }
+
     #[tokio::test]
     async fn terminal_settle_rewrites_only_the_scanned_source() {
         let ctx = ctx_with(vec![
@@ -808,7 +890,6 @@ mod tests {
             .unwrap()
             .last_scan_at_ms
             .is_none());
-        apply_settled_counts(&ctx, "3", 3).await;
         apply_settled_counts(&ctx, "nas", 3).await;
         assert!(ctx
             .registry
