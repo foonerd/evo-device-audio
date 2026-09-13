@@ -490,6 +490,15 @@ pub enum SharesStateError {
         /// The identifier the caller asked for.
         id: ShareId,
     },
+    /// The supplied alias was empty or whitespace only.
+    ///
+    /// The alias is the only handle an operator has on a share
+    /// once it is in the list; a blank one cannot be pointed at,
+    /// and composing a substitute would name the share something
+    /// the operator never typed. The verb refuses and no record
+    /// is written.
+    #[error("share alias must not be blank")]
+    BlankAlias,
     /// Insertion collided with an existing record's identifier.
     /// Signals a caller who is minting IDs incorrectly (should
     /// only happen for direct-import flows; the standard mint
@@ -499,6 +508,19 @@ pub enum SharesStateError {
         /// The colliding identifier.
         id: ShareId,
     },
+}
+
+/// Refuse an alias that is empty or whitespace only.
+///
+/// One rule, both writers: `add_share` and `edit_share` ask it
+/// before anything is inserted or saved. It only refuses — it
+/// never trims the stored value or substitutes a name, so the
+/// record keeps exactly what the operator typed.
+fn refuse_blank_alias(alias: &str) -> Result<(), SharesStateError> {
+    if alias.trim().is_empty() {
+        return Err(SharesStateError::BlankAlias);
+    }
+    Ok(())
 }
 
 /// The on-disk root. One instance per host.
@@ -3705,6 +3727,9 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         &self,
         record: ShareRecord,
     ) -> Result<ShareId, SharesStateError> {
+        // Refuse before the record reaches the store: a share
+        // that cannot be named is not created.
+        refuse_blank_alias(&record.alias)?;
         let id = record.share_id.clone();
         let record_clone = record.clone();
         let configured_envelope = {
@@ -3726,6 +3751,12 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         share_id: &ShareId,
         edits: ShareEdits,
     ) -> Result<bool, SharesStateError> {
+        // Refuse before the lock is taken, so a blank rename
+        // never reaches the record or the state file. Omitting
+        // the alias is still a no-op on it.
+        if let Some(alias) = edits.alias.as_deref() {
+            refuse_blank_alias(alias)?;
+        }
         let (changed, material, alias, mount_root, configured_envelope) = {
             let mut g = self.inner.lock().await;
             let record = g.state.find_mut(share_id).ok_or_else(|| {
@@ -6764,6 +6795,99 @@ tmpfs /tmp tmpfs rw 0 0\n";
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_empty_alias_and_writes_nothing() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = String::new();
+
+        let err = rt.add_share(record).await.unwrap_err();
+        assert!(matches!(err, SharesStateError::BlankAlias));
+        assert!(
+            rt.list_configured().await.unwrap().is_empty(),
+            "a refused add must leave the store empty",
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_whitespace_only_alias_and_writes_nothing() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "   ".to_string();
+
+        let err = rt.add_share(record).await.unwrap_err();
+        assert!(matches!(err, SharesStateError::BlankAlias));
+        assert!(rt.list_configured().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_still_accepts_a_real_alias() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+
+        rt.add_share(record).await.unwrap();
+        let configured = rt.list_configured().await.unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].alias, "Family NAS");
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_a_blank_rename_and_keeps_the_old_alias() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        for blank in ["", "   "] {
+            let err = rt
+                .edit_share(
+                    &id,
+                    ShareEdits {
+                        alias: Some(blank.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SharesStateError::BlankAlias));
+            let configured = rt.list_configured().await.unwrap();
+            assert_eq!(
+                configured[0].alias, "Family NAS",
+                "a refused rename must leave the record alone",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_without_an_alias_is_still_a_no_op_on_the_name() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.edit_share(
+            &id,
+            ShareEdits {
+                host: Some("192.0.2.55".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let configured = rt.list_configured().await.unwrap();
+        assert_eq!(configured[0].alias, "Family NAS");
+        assert_eq!(configured[0].host, "192.0.2.55");
     }
 
     #[tokio::test]
