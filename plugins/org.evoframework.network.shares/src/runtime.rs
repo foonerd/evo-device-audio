@@ -1837,6 +1837,29 @@ pub fn is_mount_directory_missing(stderr: &str, mount_root: &Path) -> bool {
     })
 }
 
+/// Compose the operator-facing title for a share's password
+/// prompt.
+///
+/// `host` and `path` are stored as the operator entered them:
+/// a CIFS share name usually carries no leading slash, an NFS
+/// export usually does. Concatenating the two put
+/// `user@hostshare` in front of the operator on the glass.
+///
+/// Join them with exactly one `/`, and with none at all when
+/// there is no path to name. This composes the title only —
+/// the mount builders keep their own per-fstype normalisation
+/// (CIFS trims the leading slash, NFS requires one) and are not
+/// touched by this.
+fn password_prompt_label(username: &str, host: &str, path: &str) -> String {
+    let host = host.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        format!("Password for {username}@{host}")
+    } else {
+        format!("Password for {username}@{host}/{path}")
+    }
+}
+
 /// Both stderr sources for one failed mount attempt, together.
 ///
 /// `systemd-mount` prints an opaque "Job failed" on stdout while
@@ -2933,8 +2956,7 @@ impl NetworkSharesRuntime {
         // OnceCell surfaces the panic to every waiter and drops
         // the cell state so the NEXT batch re-initialises — we
         // treat that as `CredentialPromptFailed`.
-        let label =
-            format!("Password for {}@{}{}", username, record.host, record.path);
+        let label = password_prompt_label(username, &record.host, &record.path);
         let key_for_closure = credential_key.clone();
         let prompter = Arc::clone(&self.prompter);
         let store_for_closure = Arc::clone(store);
@@ -6727,6 +6749,48 @@ tmpfs /tmp tmpfs rw 0 0\n";
                 Path::new("/var/lib/evo/music/NAS/Missing")
             ),
             None
+        );
+    }
+
+    #[test]
+    fn password_label_inserts_one_slash_when_the_path_has_none() {
+        // The live shape: a CIFS share name carries no leading
+        // slash, so concatenation read "operator@192.0.2.10share".
+        assert_eq!(
+            password_prompt_label("operator", "192.0.2.10", "multimedia/audio"),
+            "Password for operator@192.0.2.10/multimedia/audio"
+        );
+    }
+
+    #[test]
+    fn password_label_does_not_double_the_slash_when_the_path_has_one() {
+        // An NFS export already starts with a slash.
+        assert_eq!(
+            password_prompt_label("operator", "192.0.2.10", "/volume1/music"),
+            "Password for operator@192.0.2.10/volume1/music"
+        );
+    }
+
+    #[test]
+    fn password_label_omits_the_slash_when_there_is_no_path() {
+        assert_eq!(
+            password_prompt_label("operator", "192.0.2.10", ""),
+            "Password for operator@192.0.2.10"
+        );
+        // A path that is nothing but a slash names no path
+        // either.
+        assert_eq!(
+            password_prompt_label("operator", "192.0.2.10", "/"),
+            "Password for operator@192.0.2.10"
+        );
+    }
+
+    #[test]
+    fn password_label_emits_one_slash_even_if_the_host_carries_one() {
+        // Same contract from the other side: exactly one.
+        assert_eq!(
+            password_prompt_label("operator", "192.0.2.10/", "/music"),
+            "Password for operator@192.0.2.10/music"
         );
     }
 
