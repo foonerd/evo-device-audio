@@ -3226,6 +3226,16 @@ pub struct ShareEvent {
     /// Reverse-lookup id of the share the event describes.
     /// Matches [`ShareRecord::share_id`]'s inner string.
     pub share_id: String,
+    /// The share's operator-set display name, copied from the
+    /// record at the moment the event was written.
+    ///
+    /// Carried on the event rather than looked up by the
+    /// consumer: once the share is removed there is nothing left
+    /// to look up, and the line describing its last mount would
+    /// otherwise degrade to a bare UUID. The value is whatever
+    /// the record held — this never composes or substitutes a
+    /// name.
+    pub alias: String,
     /// One of `"mounted"`, `"mount_failed"`, `"unmounted"`,
     /// `"unmount_failed"`. Static string so the payload does
     /// not carry a heap allocation for the discriminator.
@@ -3248,12 +3258,13 @@ pub struct ShareEvent {
 
 impl ShareEvent {
     pub(crate) fn mounted(
-        share_id: ShareId,
+        record: &ShareRecord,
         negotiated_version: Option<String>,
         at_ms: u64,
     ) -> Self {
         Self {
-            share_id: share_id.0,
+            share_id: record.share_id.0.clone(),
+            alias: record.alias.clone(),
             kind: "mounted",
             detail: None,
             negotiated_version,
@@ -3262,12 +3273,13 @@ impl ShareEvent {
     }
 
     pub(crate) fn mount_failed(
-        share_id: ShareId,
+        record: &ShareRecord,
         detail: String,
         at_ms: u64,
     ) -> Self {
         Self {
-            share_id: share_id.0,
+            share_id: record.share_id.0.clone(),
+            alias: record.alias.clone(),
             kind: "mount_failed",
             detail: Some(detail),
             negotiated_version: None,
@@ -3275,9 +3287,10 @@ impl ShareEvent {
         }
     }
 
-    pub(crate) fn unmounted(share_id: ShareId, at_ms: u64) -> Self {
+    pub(crate) fn unmounted(record: &ShareRecord, at_ms: u64) -> Self {
         Self {
-            share_id: share_id.0,
+            share_id: record.share_id.0.clone(),
+            alias: record.alias.clone(),
             kind: "unmounted",
             detail: None,
             negotiated_version: None,
@@ -3286,12 +3299,13 @@ impl ShareEvent {
     }
 
     pub(crate) fn unmount_failed(
-        share_id: ShareId,
+        record: &ShareRecord,
         detail: String,
         at_ms: u64,
     ) -> Self {
         Self {
-            share_id: share_id.0,
+            share_id: record.share_id.0.clone(),
+            alias: record.alias.clone(),
             kind: "unmount_failed",
             detail: Some(detail),
             negotiated_version: None,
@@ -3903,7 +3917,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             if !was_mounted {
                 trigger_mpd_update_best_effort(&record.mount_root);
                 self.publish_share_event(ShareEvent::mounted(
-                    share_id.clone(),
+                    &record,
                     report.negotiated_version.clone(),
                     (self.now_fn)(),
                 ))
@@ -4004,7 +4018,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 // uses so the plugin has one MPD-side coupling point.
                 trigger_mpd_update_best_effort(&record.mount_root);
                 self.publish_share_event(ShareEvent::mounted(
-                    share_id.clone(),
+                    &record,
                     report.negotiated_version.clone(),
                     (self.now_fn)(),
                 ))
@@ -4012,7 +4026,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             }
             Err(e) => {
                 self.publish_share_event(ShareEvent::mount_failed(
-                    share_id.clone(),
+                    &record,
                     format!("{e}"),
                     (self.now_fn)(),
                 ))
@@ -4109,7 +4123,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 // dead entries until the next mount / restart.
                 trigger_mpd_update_best_effort(&record.mount_root);
                 self.publish_share_event(ShareEvent::unmounted(
-                    share_id.clone(),
+                    &record,
                     (self.now_fn)(),
                 ))
                 .await;
@@ -4148,7 +4162,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                     self.set_share_failed(share_id, e).await;
                 }
                 self.publish_share_event(ShareEvent::unmount_failed(
-                    share_id.clone(),
+                    &record,
                     format!("{e}"),
                     (self.now_fn)(),
                 ))
@@ -4739,7 +4753,7 @@ impl NetworkSharesRuntime {
                     )
                     .await;
                     self.publish_share_event(ShareEvent::unmounted(
-                        record.share_id.clone(),
+                        &record,
                         (self.now_fn)(),
                     ))
                     .await;
@@ -6750,6 +6764,86 @@ tmpfs /tmp tmpfs rw 0 0\n";
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_mounted_event_carries_the_alias_the_operator_typed() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Family NAS".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record.clone()).await.unwrap();
+
+        rt.publish_share_event(ShareEvent::mounted(
+            &record,
+            Some("3.1.1".to_string()),
+            1_700_000_000_000,
+        ))
+        .await;
+
+        let env = rt.compose_share_events_envelope();
+        let ev = env.events.last().expect("one event");
+        assert_eq!(ev.alias, "Family NAS");
+        assert_eq!(ev.share_id, id.0);
+        assert_eq!(ev.kind, "mounted");
+        // Serialised shape carries it too — the glass reads JSON.
+        let json = envelope_to_json(&env);
+        assert_eq!(json["events"][0]["alias"], "Family NAS");
+    }
+
+    #[tokio::test]
+    async fn a_mount_failed_event_keeps_its_detail_and_still_names_the_share() {
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Studio".to_string();
+        rt.add_share(record.clone()).await.unwrap();
+
+        rt.publish_share_event(ShareEvent::mount_failed(
+            &record,
+            "mount error(13): Permission denied".to_string(),
+            1_700_000_000_000,
+        ))
+        .await;
+
+        let env = rt.compose_share_events_envelope();
+        let ev = env.events.last().expect("one event");
+        assert_eq!(ev.alias, "Studio");
+        // detail stays the failure reason, untouched by the alias.
+        assert_eq!(
+            ev.detail.as_deref(),
+            Some("mount error(13): Permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ring_keeps_the_alias_after_the_record_is_removed() {
+        // The reason the alias rides on the event: once the
+        // share is gone there is nothing left to look up, and
+        // the line describing its last mount must still name it.
+        let dir = tempdir();
+        let rt = NetworkSharesRuntime::open(&dir).unwrap();
+        let mut record = built_record("target", "192.0.2.44");
+        record.alias = "Attic Drive".to_string();
+        let id = record.share_id.clone();
+        rt.add_share(record.clone()).await.unwrap();
+
+        rt.publish_share_event(ShareEvent::unmounted(
+            &record,
+            1_700_000_000_000,
+        ))
+        .await;
+        rt.remove_share(&id).await.unwrap();
+
+        assert!(
+            rt.list_configured().await.unwrap().is_empty(),
+            "record must be gone for this test to mean anything",
+        );
+        let env = rt.compose_share_events_envelope();
+        let ev = env.events.last().expect("event survives the record");
+        assert_eq!(ev.alias, "Attic Drive");
+        assert_eq!(ev.share_id, id.0);
     }
 
     #[test]
