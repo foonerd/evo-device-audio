@@ -4050,7 +4050,16 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // records short-circuit to Ok(()). Cancelled / timed-out
         // prompts surface as MountError variants the operator UI
         // renders per the mount_error contract on the wire.
-        self.ensure_credential_stocked(&record).await?;
+        //
+        // Publish the failure the same way a helper failure does.
+        // A prior HostUnreachable reason ("did not answer") must
+        // not stay painted when the operator cancelled or the
+        // prompt could not be issued. Permanent, so neither the
+        // remount cadence nor the unreachable poll storms.
+        if let Err(e) = self.ensure_credential_stocked(&record).await {
+            self.set_share_failed(share_id, &e).await;
+            return Err(e);
+        }
 
         // Ensure the per-share mount directory exists. The
         // distribution installer provisions the NAS root
@@ -8248,6 +8257,113 @@ mount error(13): Permission denied",
         assert!(
             matches!(&err, MountError::CredentialPromptCancelled { key } if key == "cancelled_key"),
             "expected CredentialPromptCancelled; got {err:?}"
+        );
+        let g = rt.share_states.lock().await;
+        let entry = g.get(&id).expect("share state recorded");
+        assert_eq!(entry.state, MountState::Failed);
+        assert_eq!(
+            entry.failure_class,
+            Some(FailureClass::Permanent),
+            "a cancelled prompt is not an unanswered host"
+        );
+        let reason = entry.reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("declined password prompt"),
+            "glass must show the credential miss: {reason}"
+        );
+        assert!(
+            !reason.contains("did not answer"),
+            "HostUnreachable must not be the painted reason: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prompt_does_not_leave_host_did_not_answer() {
+        // Field case: first mount wrote HostUnreachable. The host
+        // came back. The credential step then cancelled.
+        // `ensure_credential_stocked` used to return with `?` and
+        // never republish, so the subject kept "did not answer".
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+        let prompter = Arc::new(RecordingPrompter::default());
+        let executor = ScriptedExecutor::new(Vec::new());
+        let reachable = Arc::new(AtomicBool::new(false));
+        let probe_flag = Arc::clone(&reachable);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor.clone())
+            .with_credential_store(store as Arc<dyn CredentialStore>)
+            .with_password_prompter(prompter as Arc<dyn PasswordPrompter>)
+            .with_host_reachable(Arc::new(move |_: &str, _: u16| {
+                probe_flag.load(Ordering::SeqCst)
+            }))
+            .build();
+
+        let mut record = built_record("stale_host", "192.0.2.40");
+        record.credentials = Credentials::UserPassword {
+            username: "engineer".to_string(),
+            credential_key: "stale_host_key".to_string(),
+            domain: None,
+        };
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let first = rt.mount_share(&id).await.unwrap_err();
+        assert!(matches!(first, MountError::HostUnreachable { .. }));
+        {
+            let g = rt.share_states.lock().await;
+            let entry = g.get(&id).expect("first fail recorded");
+            assert_eq!(entry.failure_class, Some(FailureClass::Unreachable));
+            assert!(
+                entry
+                    .reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("did not answer"),
+                "{:?}",
+                entry.reason
+            );
+        }
+
+        reachable.store(true, Ordering::SeqCst);
+        let second = rt.mount_share(&id).await.unwrap_err();
+        assert!(
+            matches!(&second, MountError::CredentialPromptCancelled { key } if key == "stale_host_key"),
+            "expected CredentialPromptCancelled; got {second:?}"
+        );
+        {
+            let g = rt.share_states.lock().await;
+            let entry = g.get(&id).expect("credential fail recorded");
+            assert_eq!(entry.state, MountState::Failed);
+            assert_eq!(
+                entry.failure_class,
+                Some(FailureClass::Permanent),
+                "a cancelled prompt is not an unanswered host"
+            );
+            let reason = entry.reason.as_deref().unwrap_or("");
+            assert!(
+                reason.contains("declined password prompt"),
+                "glass must show the credential miss, not the stale host line: {reason}"
+            );
+            assert!(
+                !reason.contains("did not answer"),
+                "stale HostUnreachable must not survive the credential step: {reason}"
+            );
+        }
+        assert!(
+            rt.unreachable_poll_pass().await.is_empty(),
+            "Permanent credential miss is not the unreachable poll's business"
+        );
+        assert!(
+            rt.remount_retry_pass().await.is_empty(),
+            "Permanent credential miss must not remount-storm"
+        );
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            0,
+            "no mount helper after a cancelled prompt"
         );
     }
 
