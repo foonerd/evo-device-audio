@@ -32,9 +32,11 @@
 #
 # Mount options passed as a 4th positional argv on the `mount`
 # action are validated against a strict allowlist (alphanumeric
-# + '=' + ',' + '_' + '-') before being handed to mount(8).
-# The runtime's fs_matrix.rs builds these strings; the wrapper
-# validates + relays.
+# + '=' + ',' + '_' + '-') before being handed to
+# systemd-mount. The runtime's fs_matrix.rs builds these
+# strings; the wrapper validates + relays. PID 1 attaches the
+# volume in the host mount namespace so mpd and the operator
+# see the same tree.
 #
 # Exit codes:
 #   0  — action completed successfully
@@ -185,7 +187,7 @@ case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 3"
+        echo "evo-usb-mount 4"
         exit 0
         ;;
     --help|-h|"")
@@ -216,7 +218,15 @@ case "${1:-}" in
         if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
             die_subprocess "target '${target}' already has a different mount source"
         fi
-        mount -t "$3" -o "$5" "$4" "${target}" || die_subprocess "mount -t $3 -o $5 $4 ${target}"
+        # systemd-mount --collect asks PID 1 to attach the volume in
+        # the host mount namespace. Raw mount(8) from this wrapper
+        # runs inside the steward unit (ProtectSystem=strict), so
+        # mpd, the operator shell, and file sharing would see only
+        # the empty install(1) directory. --fsck=no: this wrapper
+        # owns dirty detection via fsck-check / fsck; do not let
+        # systemd-fsck take a second pass on NTFS/exFAT.
+        /usr/bin/systemd-mount --collect --fsck=no --type="$3" --options="$5" "$4" "${target}" \
+            || die_subprocess "systemd-mount --type=$3 $4 ${target}"
         exit 0
         ;;
     umount)
@@ -235,7 +245,7 @@ case "${1:-}" in
         # Try a clean umount first; distinguish EBUSY from other
         # failures so the runtime can decide whether to escalate
         # to umount-force.
-        umount_stderr="$(umount "${target}" 2>&1)" && rc=0 || rc=$?
+        umount_stderr="$(/usr/bin/systemd-umount "${target}" 2>&1)" && rc=0 || rc=$?
         if [[ $rc -eq 0 ]]; then
             # Empty-only rmdir cleanup so the leaf mount root
             # doesn't stay lingering.
@@ -249,7 +259,7 @@ case "${1:-}" in
            || [[ "${umount_stderr}" == *"device is busy"* ]]; then
             die_busy "${target}: ${umount_stderr}"
         fi
-        die_subprocess "umount ${target}: ${umount_stderr}"
+        die_subprocess "systemd-umount ${target}: ${umount_stderr}"
         ;;
     umount-force)
         [[ $# -eq 2 ]] || die_invocation "umount-force requires 1 arg: <stable-id>"
@@ -259,10 +269,12 @@ case "${1:-}" in
             rmdir "${target}" 2>/dev/null || true
             exit 0
         fi
-        # Lazy detach — the mount table clears when the last file
-        # handle closes. Operator has acknowledged the data-loss
-        # risk at the storage.usb.safe_remove verb layer.
-        umount -l "${target}" || die_subprocess "umount -l ${target}"
+        # Lazy detach via systemd-umount -l — same as
+        # network.shares. The mount table clears when the last
+        # file handle closes. Operator has acknowledged the
+        # data-loss risk at the storage.usb.safe_remove verb.
+        /usr/bin/systemd-umount -l "${target}" \
+            || die_subprocess "systemd-umount -l ${target}"
         rmdir "${target}" 2>/dev/null || true
         exit 0
         ;;

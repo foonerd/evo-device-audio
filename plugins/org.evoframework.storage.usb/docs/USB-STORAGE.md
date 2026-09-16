@@ -375,9 +375,9 @@ Wrapper actions:
 
 | Action | Invocation |
 |---|---|
-| `mount <stable-id> <fs-type> <device-node>` | `mount -t <fs> -o <options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` |
-| `umount <stable-id>` | `umount /var/lib/evo/music/USB/<stable-id>` |
-| `umount-force <stable-id>` | `umount -l /var/lib/evo/music/USB/<stable-id>` (only via `safe_remove force: true`) |
+| `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares) |
+| `umount <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>` |
+| `umount-force <stable-id>` | `systemd-umount -l /var/lib/evo/music/USB/<stable-id>` (only via `safe_remove force: true`) |
 | `fsck <stable-id> <fs-type> <device-node>` | dispatches per §2 repair-tool matrix |
 | `eject <parent-disk>` | `eject <parent-disk>` (best-effort; failure logged, not fatal) |
 

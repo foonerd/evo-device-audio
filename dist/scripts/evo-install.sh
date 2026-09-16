@@ -1587,19 +1587,19 @@ verify_storage_usb_provisioning() {
 
     # Wrapper — exists, mode 0755, --version returns exit 0 and
     # prints the stable version tag. Accepted versions:
-    #   evo-usb-mount 2 — current (Step 4, mount takes 4 argv +
-    #                     mount-opts allowlist; umount / umount-force
-    #                     / eject actions actually execute).
+    #   evo-usb-mount 4 — current (systemd-mount --collect so the
+    #                     volume is in the host mount namespace).
+    #   evo-usb-mount 3 — raw mount(8) inside the steward unit.
+    #   evo-usb-mount 2 — Step 4 argv + allowlist.
     #   evo-usb-mount 1 — Step 1 stub (argv-validate only, all
     #                     actions exit 42). Accepted so a rolling
-    #                     upgrade from a pre-Step-4 rig does not
-    #                     hard-fail; the newer wrapper installs
-    #                     over the older during the bootstrap
-    #                     apply phase.
+    #                     upgrade does not hard-fail; bootstrap
+    #                     installs the newer wrapper over the older.
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 3" ]] \
+        if [[ "${ver}" == "evo-usb-mount 4" ]] \
+           || [[ "${ver}" == "evo-usb-mount 3" ]] \
            || [[ "${ver}" == "evo-usb-mount 2" ]] \
            || [[ "${ver}" == "evo-usb-mount 1" ]]; then
             STORAGE_USB_WRAPPER_OK="ok"

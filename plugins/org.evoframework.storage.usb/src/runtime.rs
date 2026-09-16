@@ -24,9 +24,14 @@
 //!
 //! Every mount / umount / fsck / eject invocation dispatches
 //! through the narrow root-only wrapper at
-//! `/usr/local/bin/evo-usb-mount`. The plugin does NOT hold raw
-//! sudo grants on the underlying tools; the wrapper's argv
-//! allowlist is the last-mile runtime enforcement.
+//! `/usr/local/bin/evo-usb-mount`. The wrapper asks PID 1
+//! (`systemd-mount --collect`) so the volume is in the host
+//! mount namespace — visible to mpd, the operator, and file
+//! sharing. Raw `mount(8)` would stay inside the steward unit
+//! (`ProtectSystem=strict`) and leave an empty leaf directory
+//! on the host. The plugin does NOT hold raw sudo grants on
+//! the underlying tools; the wrapper's argv allowlist is the
+//! last-mile runtime enforcement.
 
 use crate::aliases::{AliasLookup, AliasStore};
 use crate::classifier::{
