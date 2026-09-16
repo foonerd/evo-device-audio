@@ -56,9 +56,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 
+use crate::library::LibraryContext;
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint, MpdError};
-use crate::source_registry::{SourceRegistry, SourceState, SourceStateChange};
-use std::path::{Path, PathBuf};
+use crate::source_registry::{SourceState, SourceStateChange};
 
 /// Sticker name the reconciler writes. Other plugins MUST NOT
 /// write under this name; the `evo:` namespace is reserved for
@@ -107,13 +107,12 @@ impl StickerReconcilerHandle {
 pub(crate) fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
-    registry: SourceRegistry,
-    music_directory: PathBuf,
+    library: LibraryContext,
 ) -> StickerReconcilerHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
-        run(endpoint, timeouts, registry, music_directory, task_shutdown).await;
+        run(endpoint, timeouts, library, task_shutdown).await;
     });
     StickerReconcilerHandle { task, shutdown }
 }
@@ -121,8 +120,7 @@ pub(crate) fn spawn(
 async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
-    registry: SourceRegistry,
-    music_directory: PathBuf,
+    library: LibraryContext,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -130,7 +128,7 @@ async fn run(
         endpoint = %endpoint,
         "sticker reconciler task started"
     );
-    let mut rx = registry.subscribe();
+    let mut rx = library.registry.subscribe();
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
@@ -146,8 +144,7 @@ async fn run(
                         if let Err(e) = reconcile_one(
                             &endpoint,
                             timeouts,
-                            &registry,
-                            &music_directory,
+                            &library,
                             &change,
                         )
                         .await
@@ -176,12 +173,8 @@ async fn run(
                             lagged_messages = n,
                             "sticker reconciler lagged; re-snapshotting"
                         );
-                        if let Err(e) = reconcile_all(
-                            &endpoint,
-                            timeouts,
-                            &registry,
-                            &music_directory,
-                        )
+                        if let Err(e) =
+                            reconcile_all(&endpoint, timeouts, &library)
                         .await
                         {
                             tracing::warn!(
@@ -212,11 +205,10 @@ async fn run(
 async fn reconcile_one(
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    registry: &SourceRegistry,
-    music_directory: &Path,
+    library: &LibraryContext,
     change: &SourceStateChange,
 ) -> Result<(), MpdError> {
-    let record = match registry.get(&change.source_id).await {
+    let record = match library.registry.get(&change.source_id).await {
         Some(r) => r,
         None => {
             // Source was removed between transition and reconcile;
@@ -229,7 +221,7 @@ async fn reconcile_one(
     // The absolute mount is a Bad URI to it, which is why this
     // cycle used to abort before writing a single sticker.
     let mount_path = match crate::library::mpd_database_relative_path(
-        music_directory,
+        &library.music_directory,
         &record.mount_path,
         "",
     ) {
@@ -262,23 +254,13 @@ async fn reconcile_one(
 
     write_stickers_batched(&mut conn, &songs, available_value).await?;
 
-    // Update the registry's track-count snapshot. Best-effort —
-    // a registry error doesn't roll back the sticker writes.
-    if let Err(e) = registry
-        .update_track_counts(
-            &change.source_id,
-            total as u32,
-            available_count as u32,
-        )
-        .await
-    {
-        tracing::debug!(
-            plugin = crate::PLUGIN_NAME,
-            source_id = %change.source_id,
-            error = %e,
-            "track-counts update failed; reconcile cycle still ok"
-        );
-    }
+    apply_reconciled_counts(
+        library,
+        &change.source_id,
+        total as u32,
+        available_count as u32,
+    )
+    .await;
 
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
@@ -290,29 +272,59 @@ async fn reconcile_one(
     Ok(())
 }
 
+/// Write one source's reconciled counts and put the result on
+/// the wire.
+///
+/// The registry is not the glass: `update_track_counts` moves the
+/// record, and nothing reaches the operator until the sources
+/// subject is republished. Scan-terminal already republishes this
+/// way after it settles; the reconciler is the writer for a
+/// source that never scans - an auto-adopt that only transitions
+/// - so it must do the same or its numbers stay invisible.
+///
+/// Uses `library::publish_subjects`, the same publisher, not a
+/// second one. Best-effort on the write, as before: a registry
+/// error does not roll back the sticker writes. Nothing is
+/// published when the write did not happen, so a failed cycle
+/// cannot put a fabricated count on the wire.
+async fn apply_reconciled_counts(
+    library: &LibraryContext,
+    source_id: &str,
+    total: u32,
+    available: u32,
+) {
+    if let Err(e) = library
+        .registry
+        .update_track_counts(source_id, total, available)
+        .await
+    {
+        tracing::debug!(
+            plugin = crate::PLUGIN_NAME,
+            source_id = %source_id,
+            error = %e,
+            "track-counts update failed; reconcile cycle still ok"
+        );
+        return;
+    }
+    crate::library::publish_subjects(library).await;
+}
+
 /// Re-snapshot every registered source and reconcile each.
 /// Used as the recovery path on broadcast-channel lag.
 async fn reconcile_all(
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    registry: &SourceRegistry,
-    music_directory: &Path,
+    library: &LibraryContext,
 ) -> Result<(), MpdError> {
-    for record in registry.snapshot().await {
+    for record in library.registry.snapshot().await {
         let change = SourceStateChange {
             source_id: record.id.clone(),
             old_state: record.state.clone(),
             new_state: record.state.clone(),
             at_ms: 0,
         };
-        if let Err(e) = reconcile_one(
-            endpoint,
-            timeouts,
-            registry,
-            music_directory,
-            &change,
-        )
-        .await
+        if let Err(e) =
+            reconcile_one(endpoint, timeouts, library, &change).await
         {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
@@ -481,9 +493,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciled_counts_reach_the_published_sources_envelope() {
+        // The registry is not the glass. Writing the counts and
+        // staying quiet is what left an auto-adopted source
+        // reading 0 of 0 on the operator surface.
+        let (library, published) = test_library();
+        let mut record = local_record("usb-audio");
+        record.mount_path = PathBuf::from("/var/lib/evo/music/USB/Audio");
+        record.kind = SourceKind::LocalUsb {
+            device_node: "/dev/disk/by-uuid/test".to_string(),
+            label: "STICK".to_string(),
+        };
+        library.registry.register(record).await.unwrap();
+
+        apply_reconciled_counts(&library, "usb-audio", 1513, 1513).await;
+
+        let rec = library.registry.get("usb-audio").await.unwrap();
+        assert_eq!(rec.track_count, 1513);
+        assert_eq!(rec.track_count_available, 1513);
+
+        let sent = published.lock().await.clone();
+        let env = sent
+            .iter()
+            .find(|e| e.get("sources").is_some())
+            .expect("the reconciler must republish the sources subject");
+        let row = &env["sources"][0];
+        assert_eq!(row["id"], "usb-audio");
+        assert_eq!(
+            row["track_count"], 1513,
+            "the published envelope must carry the counts just written, \
+             not the add-time zeros",
+        );
+        assert_eq!(row["track_count_available"], 1513);
+    }
+
+    #[tokio::test]
+    async fn a_failed_cycle_writes_no_zero_and_publishes_nothing() {
+        // Nothing listening on port 1: the connection fails
+        // before any enumerate. The record keeps the counts it
+        // had and nothing is put on the wire.
+        let (library, published) = test_library();
+        let mut record = local_record("usb-audio");
+        record.mount_path = PathBuf::from("/var/lib/evo/music/USB/Audio");
+        record.track_count = 42;
+        record.track_count_available = 42;
+        library.registry.register(record).await.unwrap();
+
+        let change = SourceStateChange {
+            source_id: "usb-audio".to_string(),
+            old_state: SourceState::Probing,
+            new_state: SourceState::Online,
+            at_ms: 0,
+        };
+        let endpoint = MpdEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        };
+        let timeouts = ConnectTimeouts {
+            connect: Duration::from_millis(50),
+            welcome: Duration::from_millis(50),
+            command: Duration::from_millis(50),
+        };
+        let res = reconcile_one(&endpoint, timeouts, &library, &change).await;
+        assert!(res.is_err(), "a dead endpoint must surface as an error");
+
+        let rec = library.registry.get("usb-audio").await.unwrap();
+        assert_eq!(rec.track_count, 42, "a failed cycle must not write zero");
+        assert_eq!(rec.track_count_available, 42);
+        assert!(
+            published.lock().await.is_empty(),
+            "a failed cycle must not publish a fabricated count",
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_one_skips_when_source_removed_between_event_and_handler()
     {
-        let r = SourceRegistry::new();
+        let (library, _published) = test_library();
         // Don't register; the reconcile_one path should observe
         // Registry::get returning None and return Ok without an
         // MPD connection attempt.
@@ -502,18 +588,85 @@ mod tests {
             welcome: Duration::from_millis(50),
             command: Duration::from_millis(50),
         };
-        let res = reconcile_one(
-            &endpoint,
-            timeouts,
-            &r,
-            Path::new("/var/lib/evo/music"),
-            &change,
-        )
-        .await;
+        let res = reconcile_one(&endpoint, timeouts, &library, &change).await;
         assert!(res.is_ok());
     }
 
-    #[allow(dead_code)]
+    /// Every `update_state` payload the context published.
+    type Published = Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// A context whose registry starts empty and whose announcer
+    /// records what it was asked to publish, so a test can read
+    /// the envelope that actually went out rather than a cache.
+    fn test_library() -> (LibraryContext, Published) {
+        let published: Published =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        struct RecordingAnn(Published);
+        impl evo_plugin_sdk::contract::SubjectAnnouncer for RecordingAnn {
+            fn announce<'a>(
+                &'a self,
+                _a: evo_plugin_sdk::contract::SubjectAnnouncement,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn retract<'a>(
+                &'a self,
+                _addressing: evo_plugin_sdk::contract::ExternalAddressing,
+                _reason: Option<String>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn update_state<'a>(
+                &'a self,
+                _addressing: evo_plugin_sdk::contract::ExternalAddressing,
+                state: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                let sink = Arc::clone(&self.0);
+                Box::pin(async move {
+                    sink.lock().await.push(state);
+                    Ok(())
+                })
+            }
+        }
+        let ctx = LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            crate::source_registry::SourceRegistry::new(),
+            Arc::new(RecordingAnn(Arc::clone(&published))),
+            None,
+        );
+        (ctx, published)
+    }
+
     fn local_record(id: &str) -> SourceRecord {
         SourceRecord {
             id: id.to_string(),

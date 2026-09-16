@@ -248,8 +248,7 @@ impl ShelfBundle {
         let sticker_reconciler = Some(sticker_reconciler::spawn(
             endpoint.clone(),
             timeouts,
-            registry.clone(),
-            music_directory.clone(),
+            library.clone(),
         ));
 
         // Warm-start probe — BLOCKING. Every registered source
