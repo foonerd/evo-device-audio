@@ -728,6 +728,13 @@ pub(crate) struct ProbeOutcome {
     pub(crate) elapsed: Duration,
 }
 
+/// Wall-clock ceiling for a single source probe.
+///
+/// Shared by the warm-start sweep at admission and the probe a
+/// mid-session `library.add_source` runs for the one source it
+/// just registered, so the two cannot drift apart.
+pub(crate) const PROBE_BUDGET: Duration = Duration::from_millis(3_000);
+
 /// Probe a source's reachability. The implementation is type-
 /// dispatched on `record.kind`:
 ///

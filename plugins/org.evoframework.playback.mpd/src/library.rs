@@ -929,6 +929,39 @@ pub(crate) async fn handle_add_source(
         .map_err(|e| VerbError::Register {
             reason: e.to_string(),
         })?;
+
+    // Probe this one source now, the same way warm-start probes
+    // every source at admission: same `probe_source`, same
+    // budget, same `transition`.
+    //
+    // `register` inserts Probing and is deliberately silent, and
+    // the other transition callers are load-only, DLNA-only, or
+    // operator verbs. Without this a source added mid-session
+    // would sit at Probing with no state change on the bus, so
+    // the sticker + track-count writer would never wake for it
+    // and the operator would read 0 of 0 until the next explicit
+    // probe or a steward restart.
+    //
+    // Blocking, as `run_warm_start_probes_blocking` is: one
+    // source, a bounded budget, and the response then carries a
+    // state that was actually observed rather than a placeholder.
+    if let Some(registered) = ctx.registry.get(&id).await {
+        let outcome = crate::source_registry::probe_source(
+            &registered,
+            crate::source_registry::PROBE_BUDGET,
+        )
+        .await;
+        if let Err(e) = ctx.registry.transition(&id, outcome.new_state).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %id,
+                error = %e,
+                "add_source: probe transition failed; source stays Probing \
+                 until the next probe"
+            );
+        }
+    }
+
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
     Ok(AddSourceResponse {
@@ -3651,6 +3684,90 @@ mod tests {
             err,
             VerbError::CloudEagerScanRequiresAcknowledgement
         ));
+    }
+
+    #[tokio::test]
+    async fn add_source_probes_a_reachable_usb_and_leaves_probing() {
+        // A mid-session adopt must end in an observed state, not
+        // the Probing placeholder, and must put exactly one
+        // change on the bus so the sticker + count writer wakes.
+        let ctx = ctx();
+        let mut rx = ctx.registry.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+
+        let res = handle_add_source(
+            &ctx,
+            AddSourcePayload {
+                v: 1,
+                display_name: "Audio".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/disk/by-uuid/test".into(),
+                    label: "STICK".into(),
+                },
+                mount_path: dir.path().to_path_buf(),
+                scan_policy: None,
+                probe_cadence_ms: None,
+                cloud_eager_scan_acknowledged: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rec = ctx.registry.get(&res.source_id).await.unwrap();
+        assert_eq!(
+            rec.state.discriminant(),
+            SourceState::Online.discriminant(),
+            "a reachable mount must be observed Online, not left Probing",
+        );
+
+        let change = rx.try_recv().expect("exactly one state change");
+        assert_eq!(change.source_id, res.source_id);
+        assert_eq!(
+            change.old_state.discriminant(),
+            SourceState::Probing.discriminant()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the adopt must fire one transition, not several",
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_with_an_absent_mount_still_leaves_probing() {
+        // A probe that fails is still an answer. Leaving the
+        // source at Probing forever would mean no broadcast, and
+        // no broadcast means nothing ever counts it.
+        let ctx = ctx();
+        let mut rx = ctx.registry.subscribe();
+
+        let res = handle_add_source(
+            &ctx,
+            AddSourcePayload {
+                v: 1,
+                display_name: "Gone".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/disk/by-uuid/absent".into(),
+                    label: "GONE".into(),
+                },
+                mount_path: PathBuf::from(
+                    "/var/lib/evo/music/USB/definitely-not-present",
+                ),
+                scan_policy: None,
+                probe_cadence_ms: None,
+                cloud_eager_scan_acknowledged: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rec = ctx.registry.get(&res.source_id).await.unwrap();
+        assert_ne!(
+            rec.state.discriminant(),
+            SourceState::Probing.discriminant(),
+            "a failed probe must still transition",
+        );
+        let change = rx.try_recv().expect("a failed probe still broadcasts");
+        assert_eq!(change.source_id, res.source_id);
     }
 
     #[tokio::test]

@@ -440,9 +440,11 @@ impl ShelfBundle {
                     Some(r) => r,
                     None => return, // removed mid-probe
                 };
-                let budget = std::time::Duration::from_millis(3_000);
-                let outcome =
-                    crate::source_registry::probe_source(&full, budget).await;
+                let outcome = crate::source_registry::probe_source(
+                    &full,
+                    crate::source_registry::PROBE_BUDGET,
+                )
+                .await;
                 if let Err(e) =
                     registry.transition(&source_id, outcome.new_state).await
                 {
