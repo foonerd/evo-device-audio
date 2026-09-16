@@ -1347,6 +1347,35 @@ async fn idle_task(
                             plugin = PLUGIN_NAME,
                             "idle connection re-established"
                         );
+                        // Whatever changed while the connection
+                        // was down was never queued for this new
+                        // one — MPD buffers idle events per
+                        // connection, and this connection did not
+                        // exist yet. Re-entering idle would sit
+                        // on the old envelope until the *next*
+                        // change, so a track started during the
+                        // outage stays invisible until something
+                        // else happens or the page is reloaded.
+                        //
+                        // The ambient observer already handles
+                        // this: it re-emits a snapshot after
+                        // every reconnect. Do the same here by
+                        // raising the event a wake raises, so
+                        // the actor re-reads through the
+                        // publisher it already uses. Not a
+                        // second publisher, and not a play.
+                        if tx
+                            .send(IdleEvent::Changed(IDLE_SUBSYSTEMS.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                "idle task: event receiver dropped after \
+                                 reconnect, exiting"
+                            );
+                            return;
+                        }
                     }
                     None => {
                         let _ = tx.send(IdleEvent::Exhausted).await;
@@ -1417,6 +1446,73 @@ mod tests {
         // don't poll for sender-drop here.
         Box::leak(Box::new(tx));
         rx
+    }
+
+    #[tokio::test]
+    async fn an_idle_reconnect_publishes_the_song_mpd_has_now() {
+        // The gap: the idle connection drops, the player moves on
+        // while nothing is listening, the connection comes back.
+        // MPD queues idle events per connection and this one did
+        // not exist when the change happened, so re-entering idle
+        // would sit on the old envelope until the next change or
+        // a page reload.
+        //
+        // cmd conn changes its current song after the first read,
+        // so a replayed envelope and a fresh read are
+        // distinguishable. The idle conn closes on its first
+        // command; the third connection is the reconnect.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::SongChangesAfterFirstRead {
+                first: "before-the-gap.flac".to_string(),
+                second: "started-during-the-gap.flac".to_string(),
+            },
+            ConnBehaviour::CloseOnNth { nth: 1 },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            emitter,
+            null_protocol_settings_rx(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Give the idle task time to fail, back off and reconnect.
+        let names_the_new_song = || {
+            (0..subjects.state_update_count()).any(|i| {
+                subjects
+                    .state_update_at(i)
+                    .map(|(_, v)| {
+                        v.to_string().contains("started-during-the-gap.flac")
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        for _ in 0..60 {
+            if names_the_new_song() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            names_the_new_song(),
+            "a reconnect must publish the song MPD has now, not replay the \
+             envelope from before the gap; {} update_state calls seen",
+            subjects.state_update_count(),
+        );
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]

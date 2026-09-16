@@ -375,6 +375,13 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// Like [`StandardWithSong`] but the current song changes
+    /// after the first `currentsong` read: the player moved on
+    /// while nobody was listening. Lets a test distinguish a
+    /// fresh read from a replayed envelope.
+    ///
+    /// [`StandardWithSong`]: Self::StandardWithSong
+    SongChangesAfterFirstRead { first: String, second: String },
 }
 
 /// Bind a loopback listener and serve incoming connections with
@@ -470,6 +477,47 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(b"OK\n").await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::SongChangesAfterFirstRead {
+            ref first,
+            ref second,
+        } => {
+            let song = |file: &str| {
+                format!(
+                    "file: {file}\nTitle: T\nArtist: A\nAlbum: X\n\
+                     Time: 180\nduration: 180.000\nOK\n"
+                )
+            };
+            let first_resp = song(first);
+            let second_resp = song(second);
+            let status_resp =
+                b"state: play\nsong: 0\nelapsed: 1.000\nduration: 180.000\nvolume: 50\nOK\n";
+            let mut reads = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if line.starts_with("status") {
+                    let _ = w.write_all(status_resp).await;
+                } else if line.starts_with("currentsong") {
+                    reads += 1;
+                    let body = if reads <= 1 {
+                        &first_resp
+                    } else {
+                        &second_resp
+                    };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }
