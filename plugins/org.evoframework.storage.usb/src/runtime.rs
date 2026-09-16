@@ -29,9 +29,12 @@
 //! mount namespace — visible to mpd, the operator, and file
 //! sharing. Raw `mount(8)` would stay inside the steward unit
 //! (`ProtectSystem=strict`) and leave an empty leaf directory
-//! on the host. The plugin does NOT hold raw sudo grants on
-//! the underlying tools; the wrapper's argv allowlist is the
-//! last-mile runtime enforcement.
+//! on the host. NTFS attach uses `--type=ntfs-3g` because the
+//! §2 option string is ntfs-3g; kernel `ntfs3` rejects it.
+//! Success is checked in PID 1's mount table. The plugin does
+//! NOT hold raw sudo grants on the underlying tools; the
+//! wrapper's argv allowlist is the last-mile runtime
+//! enforcement.
 
 use crate::aliases::{AliasLookup, AliasStore};
 use crate::classifier::{
@@ -500,7 +503,7 @@ impl StorageUsbRuntime {
             // Bypass the recursive reconcile_once call —
             // handle_mount would loop otherwise.
             if let Err(e) = self.mount_attempt_no_reconcile(&payload).await {
-                tracing::debug!(
+                tracing::warn!(
                     plugin = "storage.usb",
                     stable_id = %id,
                     error = %e,

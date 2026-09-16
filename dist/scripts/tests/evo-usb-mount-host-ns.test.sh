@@ -29,7 +29,7 @@ assert_ok() {
 }
 
 assert_ok "wrapper is present" "[[ -f \"\$WRAPPER\" ]]"
-assert_ok "version is 4" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 4\" ]]"
+assert_ok "version is 5" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 5\" ]]"
 assert_ok "mount uses systemd-mount --collect" \
     "grep -qE -- 'systemd-mount --collect --fsck=no' \"\$WRAPPER\""
 assert_ok "umount uses systemd-umount" \
@@ -38,6 +38,14 @@ assert_ok "force detach uses systemd-umount -l" \
     "grep -qE -- 'systemd-umount -l' \"\$WRAPPER\""
 assert_ok "mount action does not call raw mount -t" \
     "! grep -E '^[[:space:]]*mount -t ' \"\$WRAPPER\""
+assert_ok "host truth is PID 1 mount table" \
+    "grep -qE -- 'findmnt --task 1 --mountpoint' \"\$WRAPPER\""
+assert_ok "NTFS attach type is ntfs-3g" \
+    "grep -qE -- 'systemd_type=\"ntfs-3g\"' \"\$WRAPPER\""
+assert_ok "NTFS refuses without the ntfs-3g helper" \
+    "grep -qE -- 'ntfs-3g is required to mount NTFS' \"\$WRAPPER\""
+assert_ok "mount success is checked in the host namespace" \
+    "grep -qE -- 'host namespace does not show' \"\$WRAPPER\""
 
 echo
 echo "${PASS} passed, ${FAIL} failed"

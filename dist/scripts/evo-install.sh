@@ -1587,8 +1587,10 @@ verify_storage_usb_provisioning() {
 
     # Wrapper — exists, mode 0755, --version returns exit 0 and
     # prints the stable version tag. Accepted versions:
-    #   evo-usb-mount 4 — current (systemd-mount --collect so the
-    #                     volume is in the host mount namespace).
+    #   evo-usb-mount 5 — current (host-ns attach; NTFS via
+    #                     ntfs-3g, not kernel ntfs3).
+    #   evo-usb-mount 4 — systemd-mount --type as given (NTFS
+    #                     hits ntfs3 and rejects §2 options).
     #   evo-usb-mount 3 — raw mount(8) inside the steward unit.
     #   evo-usb-mount 2 — Step 4 argv + allowlist.
     #   evo-usb-mount 1 — Step 1 stub (argv-validate only, all
@@ -1598,7 +1600,8 @@ verify_storage_usb_provisioning() {
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 4" ]] \
+        if [[ "${ver}" == "evo-usb-mount 5" ]] \
+           || [[ "${ver}" == "evo-usb-mount 4" ]] \
            || [[ "${ver}" == "evo-usb-mount 3" ]] \
            || [[ "${ver}" == "evo-usb-mount 2" ]] \
            || [[ "${ver}" == "evo-usb-mount 1" ]]; then

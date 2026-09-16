@@ -96,7 +96,7 @@ Every rule in the role taxonomy has at least one fixture; see
 |---|---|---|---|---|---|
 | `vfat` (FAT16 / FAT32) | **2 TiB** (FAT32 on-disk cap; refuse at mount when device size > 2 TiB with a copy-string surfaced to the operator recommending exFAT / ext4 reformat) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.vfat -n <dev>` exit code 1 = dirty | `fsck.vfat -a <dev>` | `dosfstools` |
 | `exfat` | no practical limit (128 PiB spec ceiling; plugin does not cap) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.exfat -n <dev>` exit code non-zero = dirty | `fsck.exfat -a <dev>` | `exfatprogs` |
-| `ntfs` | no practical limit (256 TiB per volume; plugin does not cap) | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` |
+| `ntfs` | no practical limit (256 TiB per volume; plugin does not cap) | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` (ntfs-3g only; kernel `ntfs3` rejects these options) | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` (FUSE helper; wrapper passes `--type=ntfs-3g` to systemd-mount) |
 | `ext2` / `ext3` / `ext4` | no practical limit (1 EiB on ext4; plugin does not cap) | `noatime` | `dumpe2fs -h <dev>` needs_recovery flag OR feature-flag inspection | `e2fsck -p <dev>` (auto-repair; escalate to `-y` on operator confirm) | `e2fsprogs` |
 
 **Volume-size handling (large drives — > 2 TiB).** The
@@ -375,7 +375,7 @@ Wrapper actions:
 
 | Action | Invocation |
 |---|---|
-| `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares) |
+| `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares). For `ntfs`, `--type=ntfs-3g` so §2 options reach the FUSE helper, not kernel `ntfs3`. Success is checked in PID 1's mount table. |
 | `umount <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>` |
 | `umount-force <stable-id>` | `systemd-umount -l /var/lib/evo/music/USB/<stable-id>` (only via `safe_remove force: true`) |
 | `fsck <stable-id> <fs-type> <device-node>` | dispatches per §2 repair-tool matrix |

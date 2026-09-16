@@ -28,10 +28,12 @@
 //! through the narrow root-only wrapper at
 //! `/usr/local/bin/evo-usb-mount`. The wrapper asks PID 1
 //! (`systemd-mount --collect`) so the volume is in the host
-//! mount namespace. The plugin does NOT hold raw sudo grants
-//! on the underlying tools; the wrapper's argv allowlist
-//! (path allowlist for mount targets + block-device allowlist
-//! for source arguments) is the last-mile runtime enforcement.
+//! mount namespace. NTFS attach uses `--type=ntfs-3g` (the
+//! §2 option string is ntfs-3g, not kernel `ntfs3`). The
+//! plugin does NOT hold raw sudo grants on the underlying
+//! tools; the wrapper's argv allowlist (path allowlist for
+//! mount targets + block-device allowlist for source
+//! arguments) is the last-mile runtime enforcement.
 //! The bootstrap installs the wrapper + sudoers drop-in at
 //! install time (Step 1g).
 
