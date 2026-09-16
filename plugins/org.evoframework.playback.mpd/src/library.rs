@@ -1004,16 +1004,41 @@ pub(crate) async fn handle_remove_source(
         })?;
     // Optional MPD scrub: run `update PATH` after unmount so
     // MPD's database notices the songs are gone.
+    //
+    // The path is the source's mount expressed relative to
+    // music_directory, the same basis browse and the enumerator
+    // use. An absolute mount is a Bad URI to MPD, so the scrub
+    // silently did nothing and the stick's tracks stayed in the
+    // database — Local library > USB > Audio still listing a
+    // volume that had been detached.
     if payload.scrub_mpd_entries {
-        let path = record.mount_path.to_string_lossy().into_owned();
-        if let Err(e) = conn.update(Some(&path)).await {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                source_id = %payload.source_id,
-                error = %e,
-                "library.remove_source: MPD scrub update failed; \
-                 source removal still proceeds"
-            );
+        match mpd_database_relative_path(
+            &ctx.music_directory,
+            &record.mount_path,
+            "",
+        ) {
+            Ok(path) => {
+                if let Err(e) = conn.update(Some(&path)).await {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        source_id = %payload.source_id,
+                        mpd_base = %path,
+                        error = %e,
+                        "library.remove_source: MPD scrub update failed; \
+                         source removal still proceeds"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source_id = %payload.source_id,
+                    error = %e,
+                    "library.remove_source: source is not under \
+                     music_directory; MPD cannot address it, so there is \
+                     nothing to scrub"
+                );
+            }
         }
     }
     ctx.registry.remove(&payload.source_id).await.map_err(|e| {

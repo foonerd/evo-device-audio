@@ -533,16 +533,19 @@ Consumer-stop-before-mutation is normative — mirrors the
 ## 9 Safe-remove path (R4 — normative)
 
 1. UI operator gestures "Safe remove" on a `mounted-*` drive.
-2. Plugin refuses if `class: system-disk` (§1 invariant).
-3. Consumer-stop: `library.remove_source` for the drive's
-   `library_source_id` (MPD update).
-4. `sync` on the drive's parent disk.
-5. Wrapper `umount <stable-id>` (clean umount). On EBUSY:
-   - If `force: false` (default), return `Busy { holders }`
-     with the fuser-derived holder list. UI shows "Files are
-     in use — stop playback and try again" or "Force" button.
-   - If `force: true`, wrapper `umount-force <stable-id>` (lazy
-     detach `-l`). Warn logged, `removed: true` returned.
+2. Plugin refuses if the role is `system-*` live (§1 invariant).
+3. `sync` on the drive's parent disk.
+4. Wrapper `umount <stable-id>` (clean umount). Any non-zero —
+   EBUSY, `Device or resource busy`, systemd `Job failed` —
+   escalates to `umount-force` (lazy detach `-l`). Holders do
+   not veto. The `force` field is accepted on the wire and is
+   not a gate. A yank of a vanished `mounted-*` row takes the
+   same detach, then the scrub below.
+5. After the volume is detached: `library.remove_source` with
+   `scrub_mpd_entries: true`. The scrub is an MPD `update` over
+   the database-relative path (`USB/Audio`, not the absolute
+   mount). Run before detach it would reaffirm every still-
+   present file and prune nothing.
 6. Best-effort SCSI eject via wrapper `eject <parent-disk>`.
    Failure logged; not fatal (some drives ignore eject).
 7. Retract from factory subject list.
@@ -563,7 +566,7 @@ Consumer-stop-before-mutation is normative — mirrors the
 | Rename validation | Live inline: min 1 / max 32 chars; first char alphanumeric; subsequent chars alphanumeric / underscore / hyphen. Reserved names refused with copy string ("This name conflicts with another drive currently plugged in — pick another"): tests against current mount roots + system-disk stub rows. |
 | Rename confirm | Only when the drive currently has a `library_source_id` (i.e. is mounted and in the library): "Renaming will briefly stop playback if this drive is playing. The name change reflects immediately on the network share and file browser. Continue?" |
 | Repair confirm | Modal: "This will unmount and check <display_name>. Files must be unopened; playback stops. Continue?" |
-| Force remove | Only offered on `Busy` response; second modal: "Files are still open. Force eject may cause data loss. Continue?" |
+| Force remove | Not the truth path. Remove always detaches; holders do not open a second modal. |
 | `remount_usb` recovery hint | Wired to `storage.usb.mount` retry against the drive's stable-id. Consumed by disposition renderer per `playback.v1.toml:602`. |
 | Multiple identical drives | Enumeration suffixes (`Music`, `Music-2`, `Music-3`) render as distinct rows with a "1 of 3" / "2 of 3" / "3 of 3" subscript when the operator has not renamed any of them. Rename encouraged via the tooltip hint. |
 | Oversized-FAT32 copy | Modal (dismissable, non-actionable): "This drive is <size> — larger than the 2 TB FAT32 limit. To use it as a music source, reformat as exFAT (Windows / macOS compatible) or ext4 (Linux native). Formatting is not offered in the operator UI — use your desktop's disk utility."|

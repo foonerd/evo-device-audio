@@ -476,9 +476,62 @@ impl StorageUsbRuntime {
             fresh.insert(derived.stable_id.clone(), rec);
         }
 
+        // A row that was mounted and is no longer in the
+        // classifier output is a yank. Dropping it silently left
+        // the host carrying the mount point and MPD carrying the
+        // tracks, with no id left for the operator to act on.
+        // Collect them before the swap; detach after the lock is
+        // released so the dispatch cannot deadlock the registry.
+        let vanished: Vec<(String, Option<String>)> = inner
+            .drives
+            .iter()
+            .filter(|(id, r)| {
+                !fresh.contains_key(*id)
+                    && (r.class == DriveClass::MountedClean
+                        || r.class == DriveClass::MountedDirty)
+            })
+            .map(|(id, r)| (id.clone(), r.library_source_id.clone()))
+            .collect();
+
         inner.drives = fresh;
         inner.last_update_at_ms = now_ms();
         drop(inner);
+
+        for (stable_id, source_id) in &vanished {
+            tracing::warn!(
+                plugin = "storage.usb",
+                stable_id = %stable_id,
+                "mounted volume vanished from the host; detaching the \
+                 leftover mount then retracting the library source"
+            );
+            // Lazy-detach the leftover mount point first. The
+            // scrub that follows only prunes rows whose files
+            // have gone; running it against a still-mounted tree
+            // would prune nothing.
+            let force_argv =
+                vec!["umount-force".to_string(), stable_id.clone()];
+            match self
+                .command_runner
+                .run_wrapper(self.needs_sudo, &force_argv)
+                .await
+            {
+                Ok(o) if o.status == 0 => {}
+                Ok(o) => tracing::info!(
+                    plugin = "storage.usb",
+                    stable_id = %stable_id,
+                    exit_code = o.status,
+                    "vanished volume: nothing left to detach"
+                ),
+                Err(e) => tracing::warn!(
+                    plugin = "storage.usb",
+                    stable_id = %stable_id,
+                    error = %e,
+                    "vanished volume: detach not attempted"
+                ),
+            }
+            self.retract_library_source(stable_id, source_id.as_deref())
+                .await;
+        }
 
         // Auto-mount removable drives that are not yet mounted.
         let candidates: Vec<String> = {
@@ -677,26 +730,23 @@ impl StorageUsbRuntime {
     // safe_remove verb
     // ----------------------------------------------------------
 
-    /// `storage.usb.safe_remove` handler. Consumer-stop-first
-    /// discipline: dispatch `library.remove_source` before
-    /// touching the mount to give MPD time to release its
-    /// file handles.
+    /// `storage.usb.safe_remove` handler.
     ///
-    /// Sequence (per USB-STORAGE.md §9):
+    /// Remove is remove. Holders do not veto. Sequence
+    /// (USB-STORAGE.md §9):
     ///
     /// 1. Refuse if role is `system-*` live.
-    /// 2. If mounted: dispatch `library.remove_source` for the
-    ///    drive's `library_source_id` (best-effort — MPD not
-    ///    reachable is logged, not fatal).
-    /// 3. `sync` on the parent disk (flush kernel dirty pages).
-    /// 4. Wrapper `umount <stable-id>`. On EBUSY (wrapper exit 4):
-    ///      - `force: false` (default) → return `Busy { holders }`
-    ///        with a fuser-derived holder list.
-    ///      - `force: true` → wrapper `umount-force <stable-id>`
-    ///        (lazy detach `-l`).
-    /// 5. Wrapper `eject <parent-disk>` (best-effort — some
-    ///    drives ignore the ioctl; failure logged, not fatal).
-    /// 6. Retract from the in-memory registry + republish subject.
+    /// 2. Unknown id: lazy-detach whatever the host still
+    ///    carries and answer `removed: true`.
+    /// 3. `sync` on the parent disk.
+    /// 4. Wrapper `umount`. Any non-zero escalates to
+    ///    `umount-force`. The `force` field is on the wire and
+    ///    is not a gate.
+    /// 5. After the volume is detached: `library.remove_source`
+    ///    with `scrub_mpd_entries: true` so MPD prunes rows
+    ///    whose files are gone.
+    /// 6. Wrapper `eject` (best-effort).
+    /// 7. Retract from the in-memory registry + republish.
     ///
     /// Payload: `{ v: 1, stable_id, force?: bool }`
     /// Response: `{ v: 1, removed: true, forced?: bool, holders?: [...] }`
@@ -710,17 +760,49 @@ impl StorageUsbRuntime {
         // Refresh before decision.
         self.reconcile_once().await?;
 
-        let record = {
+        let known = {
             let inner = self.inner.lock().await;
             inner.drives.get(&req.stable_id).cloned()
-        }
-        .ok_or_else(|| {
-            VerbDispatchError::SafeRemoveRefused(
-                SafeRemoveRefuseClass::UnknownStableId {
-                    stable_id: req.stable_id.clone(),
-                },
-            )
-        })?;
+        };
+        let Some(record) = known else {
+            // The id is gone from the registry — typically a
+            // yank the reconciler already swept. Remove is still
+            // remove: lazy-detach whatever the host may still be
+            // carrying under that mount point and answer
+            // removed. Refusing here would leave a stale mount
+            // on the host with no operator gesture left that
+            // could clear it.
+            let force_argv =
+                vec!["umount-force".to_string(), req.stable_id.clone()];
+            match self
+                .command_runner
+                .run_wrapper(self.needs_sudo, &force_argv)
+                .await
+            {
+                Ok(o) if o.status == 0 => {}
+                Ok(o) => tracing::info!(
+                    plugin = "storage.usb",
+                    stable_id = %req.stable_id,
+                    exit_code = o.status,
+                    "safe-remove on an unknown id: nothing left to detach"
+                ),
+                Err(e) => tracing::info!(
+                    plugin = "storage.usb",
+                    stable_id = %req.stable_id,
+                    error = %e,
+                    "safe-remove on an unknown id: detach not attempted"
+                ),
+            }
+            let resp = SafeRemoveResponse {
+                v: 1,
+                removed: true,
+                forced: Some(true),
+                holders: None,
+            };
+            return serde_json::to_vec(&resp).map_err(|e| {
+                VerbDispatchError::ResponseSerialise(e.to_string())
+            });
+        };
 
         if record.role.is_system_live() {
             return Err(VerbDispatchError::SafeRemoveRefused(
@@ -758,37 +840,6 @@ impl StorageUsbRuntime {
             });
         }
 
-        // 1. Consumer-stop — library.remove_source. Best-effort;
-        //    MPD-unreachable is logged, not fatal.
-        if let Some(source_id) = record.library_source_id.as_ref() {
-            if let Some(dispatcher) = self.shelf_dispatcher_clone() {
-                let payload = serde_json::json!({
-                    "v": 1,
-                    "source_id": source_id,
-                });
-                if let Ok(bytes) = serde_json::to_vec(&payload) {
-                    if let Err(e) = dispatcher
-                        .dispatch(
-                            "audio.library",
-                            "library.remove_source",
-                            bytes,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            plugin = "storage.usb",
-                            stable_id = %req.stable_id,
-                            source_id = %source_id,
-                            error = %e,
-                            "library.remove_source dispatch failed; \
-                             proceeding with umount (best-effort)"
-                        );
-                    }
-                }
-            }
-        }
-
         // 2. sync — flush kernel dirty pages on the parent disk.
         //    Best-effort — we shell out to `sync <parent-disk>`
         //    directly since sync doesn't need the wrapper's
@@ -811,62 +862,67 @@ impl StorageUsbRuntime {
             .await
             .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
 
-        match umount_outcome.status {
-            0 => {
-                // Clean umount succeeded.
-            }
-            4 => {
-                // EBUSY. Populate holders (fuser -m best-effort)
-                // for operator diagnostics.
-                let derived = self.fuser_holders(&record.mount_root).await;
-                holders = Some(derived.clone());
-                if !req.force.unwrap_or(false) {
-                    return Err(VerbDispatchError::SafeRemoveRefused(
-                        SafeRemoveRefuseClass::Busy {
-                            stable_id: req.stable_id,
-                            holders: derived,
-                        },
-                    ));
-                }
-                // Force: escalate to lazy detach.
-                let force_argv =
-                    vec!["umount-force".to_string(), req.stable_id.clone()];
-                let force_outcome = self
-                    .command_runner
-                    .run_wrapper(self.needs_sudo, &force_argv)
-                    .await
-                    .map_err(|e| {
-                        VerbDispatchError::SubprocessIo(e.to_string())
-                    })?;
-                if force_outcome.status != 0 {
-                    return Err(VerbDispatchError::SafeRemoveRefused(
-                        SafeRemoveRefuseClass::UmountSubprocessFailed {
-                            stable_id: req.stable_id,
-                            exit_code: force_outcome.status,
-                            stderr: force_outcome.stderr,
-                        },
-                    ));
-                }
-                forced = true;
-                tracing::warn!(
-                    plugin = "storage.usb",
-                    stable_id = %req.stable_id,
-                    holders = ?holders,
-                    "safe-remove forced with lazy detach; \
-                     any open file handles will lose their \
-                     backing on the last close"
-                );
-            }
-            other => {
+        // Remove is remove. A clean umount is tried first, but
+        // any non-zero from it escalates to a lazy detach: the
+        // operator asked for the volume to be gone, and holders
+        // do not get a veto over that.
+        //
+        // Escalating on EVERY non-zero rather than only on the
+        // wrapper's EBUSY code is deliberate. The wrapper reads
+        // busy off `systemd-umount` stderr, which renders EBUSY
+        // as `Device or resource busy` or an opaque `Job
+        // failed` — neither matches the fragments it looks for.
+        // A real EBUSY therefore arrives here as the generic
+        // subprocess failure, and treating that as fatal is
+        // what left the stick mounted.
+        if umount_outcome.status != 0 {
+            // Holders are diagnostics for the log, not a gate.
+            let derived = self.fuser_holders(&record.mount_root).await;
+            holders = Some(derived.clone());
+            let force_argv =
+                vec!["umount-force".to_string(), req.stable_id.clone()];
+            let force_outcome = self
+                .command_runner
+                .run_wrapper(self.needs_sudo, &force_argv)
+                .await
+                .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
+            if force_outcome.status != 0 {
                 return Err(VerbDispatchError::SafeRemoveRefused(
                     SafeRemoveRefuseClass::UmountSubprocessFailed {
                         stable_id: req.stable_id,
-                        exit_code: other,
-                        stderr: umount_outcome.stderr,
+                        exit_code: force_outcome.status,
+                        stderr: force_outcome.stderr,
+                        holders: derived,
                     },
                 ));
             }
+            forced = true;
+            tracing::warn!(
+                plugin = "storage.usb",
+                stable_id = %req.stable_id,
+                clean_exit = umount_outcome.status,
+                holders = ?holders,
+                "safe-remove escalated to lazy detach; any open file \
+                 handles lose their backing on the last close"
+            );
         }
+
+        // Retract the library source now that the volume is
+        // actually gone, scrubbing the MPD rows with it.
+        //
+        // Order matters: the scrub is an `update` over the
+        // source's path, and MPD only prunes rows whose files
+        // have disappeared. Run before the detach it would walk
+        // a still-mounted tree, find every file present, and
+        // prune nothing — leaving Local library > USB listing a
+        // volume that is no longer there. Best-effort:
+        // MPD-unreachable is logged, never fatal, because the
+        // volume is already detached by this point.
+        self.retract_library_source(
+            &req.stable_id,
+            record.library_source_id.as_deref(),
+        )
+        .await;
 
         // 4. Best-effort SCSI eject via wrapper. Some drives
         //    (Samsung T7, many SSD enclosures) simply don't
@@ -1233,6 +1289,51 @@ impl StorageUsbRuntime {
     // ----------------------------------------------------------
     // repair_filesystem verb
     // ----------------------------------------------------------
+
+    /// Retract the drive's library source, scrubbing the MPD
+    /// rows with it.
+    ///
+    /// Called only after the volume has actually been detached:
+    /// the scrub is an `update` over the source's path and MPD
+    /// prunes a row when the file behind it is gone, so running
+    /// it while the tree is still mounted prunes nothing.
+    ///
+    /// Best-effort throughout. By the time this runs the volume
+    /// is already off the host, so an unreachable MPD must not
+    /// turn a completed detach into a failed verb.
+    async fn retract_library_source(
+        &self,
+        stable_id: &str,
+        source_id: Option<&str>,
+    ) {
+        let Some(source_id) = source_id else {
+            return;
+        };
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "source_id": source_id,
+            "scrub_mpd_entries": true,
+        });
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if let Err(e) = dispatcher
+            .dispatch("audio.library", "library.remove_source", bytes, None)
+            .await
+        {
+            tracing::warn!(
+                plugin = "storage.usb",
+                stable_id = %stable_id,
+                source_id = %source_id,
+                error = %e,
+                "library.remove_source dispatch failed after detach; \
+                 the volume is already gone from the host"
+            );
+        }
+    }
 
     /// `storage.usb.repair_filesystem` handler. Consumer-stop
     /// before fsck, mirroring the shares MPD-stop-before-mutation
@@ -1971,10 +2072,8 @@ pub struct RepairResponse {
 pub struct SafeRemoveRequest {
     /// Stable-id of the drive to safe-remove.
     pub stable_id: String,
-    /// Force lazy detach on EBUSY. Default false — first attempt
-    /// returns a `Busy` refusal with a fuser-derived holder
-    /// list; operator retries with `force: true` after
-    /// acknowledging the data-loss risk in the UI modal.
+    /// Accepted for wire compatibility. Not a gate: any
+    /// non-zero clean umount escalates to `umount-force`.
     #[serde(default)]
     pub force: Option<bool>,
 }
@@ -2328,8 +2427,10 @@ pub enum SafeRemoveRefuseClass {
         /// `/proc/<pid>/comm`.
         holders: Vec<String>,
     },
-    /// The wrapper's umount / umount-force subprocess exited
-    /// non-zero for a reason other than EBUSY.
+    /// The lazy detach itself failed. The only refuse this path
+    /// can still produce: a clean umount that fails escalates
+    /// rather than refusing, so reaching here means even
+    /// `umount-force` could not detach the volume.
     #[error(
         "stable_id {stable_id:?} umount subprocess exit {exit_code}: {stderr}"
     )]
@@ -2340,6 +2441,11 @@ pub enum SafeRemoveRefuseClass {
         exit_code: i32,
         /// Captured stderr.
         stderr: String,
+        /// Best-effort holder list from `fuser -m` +
+        /// `/proc/<pid>/comm`, carried so a refuse that survives
+        /// says who was holding the volume rather than only that
+        /// a subprocess failed.
+        holders: Vec<String>,
     },
 }
 
@@ -2807,11 +2913,13 @@ mod tests {
             "storage.usb.repair_filesystem",
             "storage.usb.rename",
         ] {
-            let err = rt
+            // safe_remove answers Ok on an unknown id now
+            // (remove is remove), so an Ok result is equally
+            // proof the verb is wired.
+            if let Err(VerbDispatchError::NotImplemented { .. }) = rt
                 .dispatch_verb(verb, br#"{"stable_id":"missing","alias":""}"#)
                 .await
-                .unwrap_err();
-            if let VerbDispatchError::NotImplemented { .. } = err {
+            {
                 panic!("verb {verb} still marked NotImplemented");
             }
         }
@@ -3198,23 +3306,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_remove_refuses_unknown_stable_id() {
-        let rt = build_runtime(r#"{"blockdevices":[]}"#, vec![]);
+    async fn safe_remove_on_an_unknown_id_detaches_and_reports_removed() {
+        // After a yank the reconciler has already swept the row.
+        // Refusing would leave any leftover host mount with no
+        // gesture left to clear it, so the verb lazy-detaches
+        // and answers removed.
+        let rt = build_runtime(
+            r#"{"blockdevices":[]}"#,
+            vec![CommandOutcome {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+        );
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "not-a-real-drive".to_string(),
             force: None,
         })
         .unwrap();
-        let err = rt
+        let bytes = rt
             .dispatch_verb("storage.usb.safe_remove", &payload)
             .await
-            .unwrap_err();
-        match err {
-            VerbDispatchError::SafeRemoveRefused(
-                SafeRemoveRefuseClass::UnknownStableId { .. },
-            ) => {}
-            other => panic!("expected UnknownStableId, got {other:?}"),
-        }
+            .expect("remove is remove: an unknown id is not a refuse");
+        let resp: SafeRemoveResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(resp.removed);
     }
 
     #[tokio::test]
@@ -3269,46 +3384,72 @@ mod tests {
         }
     }
 
+    /// Every shape a busy volume reaches the runtime as. The
+    /// wrapper reports EBUSY as exit 4 only when it recognises
+    /// the stderr fragment; `systemd-umount` renders it as
+    /// `Device or resource busy` or an opaque `Job failed`,
+    /// which arrive as the generic exit 3. All of them must end
+    /// in a lazy detach and `removed: true` — holders do not
+    /// veto a remove.
     #[tokio::test]
-    async fn safe_remove_umount_ebusy_returns_busy_without_force() {
-        // Reconcile auto-mount runs one wrapper call → success.
-        // Then explicit safe_remove umount → EBUSY (exit 4).
-        // Since force=false, the runtime returns Busy without
-        // calling umount-force.
-        let rt = build_runtime(
-            removable_stick_lsblk(),
-            vec![
-                CommandOutcome {
-                    status: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                },
-                CommandOutcome {
-                    status: 4,
-                    stdout: String::new(),
-                    stderr: "target is busy".to_string(),
-                },
-            ],
-        );
-        // Prime the registry — reconcile mounts MUSIC via first
-        // outcome (exit 0).
-        rt.dispatch_verb("storage.usb.list_drives", b"{}")
-            .await
+    async fn every_busy_shape_escalates_to_detach_and_reports_removed() {
+        for (status, stderr) in [
+            (4, "target is busy"),
+            (3, "systemd-umount /x: Device or resource busy"),
+            (3, "Job failed. See journalctl -xe for details."),
+        ] {
+            let rt = build_runtime(
+                removable_stick_lsblk(),
+                vec![
+                    // auto-mount during reconcile
+                    CommandOutcome {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                    // clean umount refuses
+                    CommandOutcome {
+                        status,
+                        stdout: String::new(),
+                        stderr: stderr.to_string(),
+                    },
+                    // umount-force succeeds
+                    CommandOutcome {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                    // eject, best-effort
+                    CommandOutcome {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                ],
+            );
+            rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap();
+            let payload = serde_json::to_vec(&SafeRemoveRequest {
+                stable_id: "MUSIC".to_string(),
+                // force is on the wire but is not a gate.
+                force: Some(false),
+            })
             .unwrap();
-        let payload = serde_json::to_vec(&SafeRemoveRequest {
-            stable_id: "MUSIC".to_string(),
-            force: Some(false),
-        })
-        .unwrap();
-        let err = rt
-            .dispatch_verb("storage.usb.safe_remove", &payload)
-            .await
-            .unwrap_err();
-        match err {
-            VerbDispatchError::SafeRemoveRefused(
-                SafeRemoveRefuseClass::Busy { .. },
-            ) => {}
-            other => panic!("expected Busy, got {other:?}"),
+            let bytes = rt
+                .dispatch_verb("storage.usb.safe_remove", &payload)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("exit {status} / {stderr:?} must not refuse: {e:?}")
+                });
+            let resp: SafeRemoveResponse =
+                serde_json::from_slice(&bytes).unwrap();
+            assert!(resp.removed, "exit {status} must report removed");
+            assert_eq!(
+                resp.forced,
+                Some(true),
+                "exit {status} must report the detach as forced"
+            );
         }
     }
 
@@ -3357,6 +3498,182 @@ mod tests {
         let resp: SafeRemoveResponse = serde_json::from_slice(&bytes).unwrap();
         assert!(resp.removed);
         assert_eq!(resp.forced, Some(true));
+    }
+
+    /// lsblk output the test can change between sweeps, so a
+    /// yank can be expressed: the stick is there, then it is not.
+    struct SwappableInputSource(Arc<StdMutex<String>>);
+
+    #[async_trait::async_trait]
+    impl ClassifierInputSource for SwappableInputSource {
+        async fn read_inputs(&self) -> anyhow::Result<ClassifierInputs> {
+            Ok(ClassifierInputs {
+                mountinfo: String::new(),
+                swaps: String::new(),
+                lsblk_json: self.0.lock().unwrap().clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vanished_mounted_volume_is_detached_on_the_next_sweep() {
+        // A yank: the volume was mounted, then it is gone from
+        // the classifier. Dropping the row silently left the
+        // host carrying the mount point. It must lazy-detach.
+        let lsblk =
+            Arc::new(StdMutex::new(removable_stick_lsblk().to_string()));
+        let ok = || CommandOutcome {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let runner = Arc::new(FakeCommandRunner::new(vec![ok(), ok(), ok()]));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(SwappableInputSource(Arc::clone(&lsblk))),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ));
+
+        // First sweep mounts it.
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        // The stick is pulled.
+        *lsblk.lock().unwrap() = r#"{"blockdevices":[]}"#.to_string();
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+
+        let seen = runner.seen_argv.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|a| a.first().map(String::as_str) == Some("umount-force")),
+            "a vanished mounted volume must be lazy-detached; saw {seen:?}",
+        );
+    }
+
+    /// Wrapper calls and shelf dispatches recorded into one
+    /// ordered log, so a test can assert which happened first.
+    #[derive(Clone)]
+    struct OrderLog(Arc<StdMutex<Vec<String>>>);
+
+    struct OrderedRunner {
+        log: OrderLog,
+        outcomes: Arc<StdMutex<Vec<CommandOutcome>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for OrderedRunner {
+        async fn run_wrapper(
+            &self,
+            _needs_sudo: bool,
+            argv: &[String],
+        ) -> anyhow::Result<CommandOutcome> {
+            self.log
+                .0
+                .lock()
+                .unwrap()
+                .push(argv.first().cloned().unwrap_or_default());
+            let mut q = self.outcomes.lock().unwrap();
+            if q.is_empty() {
+                Ok(CommandOutcome {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(q.remove(0))
+            }
+        }
+    }
+
+    struct OrderedDispatcher(OrderLog);
+
+    impl ShelfRequestDispatcher for OrderedDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.0 .0.lock().unwrap().push(request_type.to_string());
+            // add_source's response carries the id the runtime
+            // stores as `library_source_id`; without a parseable
+            // one the drive would never learn it has a source
+            // and the retraction under test could not fire.
+            let body = if request_type == "library.add_source" {
+                serde_json::json!({ "v": 1, "source_id": "usb-music" })
+            } else {
+                serde_json::json!({ "v": 1 })
+            };
+            Box::pin(async move {
+                Ok(serde_json::to_vec(&body).unwrap_or_default())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_scrub_is_not_dispatched_until_the_volume_is_detached() {
+        // The scrub is an `update` over the source's path and MPD
+        // only prunes rows whose files are gone. Dispatched
+        // before the detach it walks a still-mounted tree, finds
+        // everything present, and prunes nothing.
+        let log = OrderLog(Arc::new(StdMutex::new(Vec::new())));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: String::new(),
+                swaps: String::new(),
+                lsblk_json: removable_stick_lsblk().to_string(),
+            }),
+            Arc::new(OrderedRunner {
+                log: log.clone(),
+                outcomes: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        ));
+        rt.attach_shelf_dispatcher(Arc::new(OrderedDispatcher(log.clone())));
+
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("safe_remove");
+
+        let seen = log.0.lock().unwrap().clone();
+        let detach = seen
+            .iter()
+            .position(|c| c == "umount" || c == "umount-force")
+            .unwrap_or_else(|| panic!("no detach recorded: {seen:?}"));
+        let scrub = seen
+            .iter()
+            .position(|c| c == "library.remove_source")
+            .unwrap_or_else(|| panic!("no scrub dispatched: {seen:?}"));
+        assert!(
+            detach < scrub,
+            "the volume must be detached before the scrub is asked for; \
+             saw {seen:?}",
+        );
     }
 
     #[tokio::test]
