@@ -58,6 +58,7 @@ use tokio::task::JoinHandle;
 
 use crate::mpd::{ConnectTimeouts, MpdConnection, MpdEndpoint, MpdError};
 use crate::source_registry::{SourceRegistry, SourceState, SourceStateChange};
+use std::path::{Path, PathBuf};
 
 /// Sticker name the reconciler writes. Other plugins MUST NOT
 /// write under this name; the `evo:` namespace is reserved for
@@ -107,11 +108,12 @@ pub(crate) fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     registry: SourceRegistry,
+    music_directory: PathBuf,
 ) -> StickerReconcilerHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
-        run(endpoint, timeouts, registry, task_shutdown).await;
+        run(endpoint, timeouts, registry, music_directory, task_shutdown).await;
     });
     StickerReconcilerHandle { task, shutdown }
 }
@@ -120,6 +122,7 @@ async fn run(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
     registry: SourceRegistry,
+    music_directory: PathBuf,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -144,6 +147,7 @@ async fn run(
                             &endpoint,
                             timeouts,
                             &registry,
+                            &music_directory,
                             &change,
                         )
                         .await
@@ -176,6 +180,7 @@ async fn run(
                             &endpoint,
                             timeouts,
                             &registry,
+                            &music_directory,
                         )
                         .await
                         {
@@ -208,6 +213,7 @@ async fn reconcile_one(
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
     registry: &SourceRegistry,
+    music_directory: &Path,
     change: &SourceStateChange,
 ) -> Result<(), MpdError> {
     let record = match registry.get(&change.source_id).await {
@@ -219,11 +225,30 @@ async fn reconcile_one(
         }
     };
     let available_value = sticker_value_for(&change.new_state);
-    let mount_path = record.mount_path.to_string_lossy().into_owned();
+    // MPD addresses its database relative to music_directory.
+    // The absolute mount is a Bad URI to it, which is why this
+    // cycle used to abort before writing a single sticker.
+    let mount_path = match crate::library::mpd_database_relative_path(
+        music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = crate::PLUGIN_NAME,
+                source_id = %change.source_id,
+                error = %e,
+                "sticker reconcile: source is not under music_directory; \
+                 MPD cannot address it, so there are no stickers to write"
+            );
+            return Ok(());
+        }
+    };
     tracing::info!(
         plugin = crate::PLUGIN_NAME,
         source_id = %change.source_id,
-        mount_path = %mount_path,
+        mpd_base = %mount_path,
         new_state = ?change.new_state,
         sticker_value = available_value,
         "sticker reconcile cycle started"
@@ -271,6 +296,7 @@ async fn reconcile_all(
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
     registry: &SourceRegistry,
+    music_directory: &Path,
 ) -> Result<(), MpdError> {
     for record in registry.snapshot().await {
         let change = SourceStateChange {
@@ -279,8 +305,14 @@ async fn reconcile_all(
             new_state: record.state.clone(),
             at_ms: 0,
         };
-        if let Err(e) =
-            reconcile_one(endpoint, timeouts, registry, &change).await
+        if let Err(e) = reconcile_one(
+            endpoint,
+            timeouts,
+            registry,
+            music_directory,
+            &change,
+        )
+        .await
         {
             tracing::warn!(
                 plugin = crate::PLUGIN_NAME,
@@ -470,7 +502,14 @@ mod tests {
             welcome: Duration::from_millis(50),
             command: Duration::from_millis(50),
         };
-        let res = reconcile_one(&endpoint, timeouts, &r, &change).await;
+        let res = reconcile_one(
+            &endpoint,
+            timeouts,
+            &r,
+            Path::new("/var/lib/evo/music"),
+            &change,
+        )
+        .await;
         assert!(res.is_ok());
     }
 

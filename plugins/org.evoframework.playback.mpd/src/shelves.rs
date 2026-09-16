@@ -249,6 +249,7 @@ impl ShelfBundle {
             endpoint.clone(),
             timeouts,
             registry.clone(),
+            music_directory.clone(),
         ));
 
         // Warm-start probe — BLOCKING. Every registered source

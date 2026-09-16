@@ -459,9 +459,13 @@ async fn emit_terminal(scan: TerminalScan<'_>) {
 
 /// Rewrite one source's track counts from MPD's own database.
 ///
-/// The enumerator is the sticker reconciler's — `find base
-/// <mount>` asks MPD what it actually holds under this source's
-/// mount. It is deliberately NOT `stats.songs`: that counts the
+/// The enumerator is the sticker reconciler's — `find base`
+/// asks MPD what it actually holds under this source. The base
+/// is the source's mount expressed relative to
+/// `music_directory`, which is the only form MPD's database
+/// understands; an absolute mount is a Bad URI to it. Browse and
+/// update_source resolve it the same way, through the same
+/// helper. It is deliberately NOT `stats.songs`: that counts the
 /// whole database, so attributing it to a NAS or USB source
 /// states a number that was never that source's.
 ///
@@ -479,7 +483,23 @@ async fn settle_source_counts(
     let Some(record) = library.registry.get(source_id).await else {
         return;
     };
-    let mount_path = record.mount_path.to_string_lossy().into_owned();
+    let mpd_base = match crate::library::mpd_database_relative_path(
+        &library.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "scan terminal: source is not under music_directory; \
+                 keeping the counts already on the record"
+            );
+            return;
+        }
+    };
     let mut conn = match crate::sticker_reconciler::open_connection(
         endpoint.clone(),
         timeouts,
@@ -499,8 +519,7 @@ async fn settle_source_counts(
         }
     };
     let songs = match crate::sticker_reconciler::enumerate_songs_under_mount(
-        &mut conn,
-        &mount_path,
+        &mut conn, &mpd_base,
     )
     .await
     {
@@ -921,6 +940,32 @@ mod tests {
     async fn terminal_settle_on_an_unknown_source_is_a_noop() {
         let ctx = ctx_with(vec![]).await;
         assert!(!apply_settled_counts(&ctx, "gone", 5).await);
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_existing_counts_when_the_source_is_outside_music_directory(
+    ) {
+        // MPD can only address its own database. A mount outside
+        // music_directory has no relative URI, so there is no
+        // question to ask — and no answer to write. The counts
+        // already on the record stand.
+        let mut outside = record("elsewhere", nas_kind(), SourceState::Online);
+        outside.mount_path = PathBuf::from("/mnt/external/library");
+        let ctx = ctx_with(vec![outside]).await;
+        let endpoint = MpdEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        };
+        let timeouts = ConnectTimeouts {
+            connect: Duration::from_millis(50),
+            welcome: Duration::from_millis(50),
+            command: Duration::from_millis(50),
+        };
+        settle_source_counts(&ctx, "elsewhere", &endpoint, timeouts).await;
+
+        let r = ctx.registry.get("elsewhere").await.unwrap();
+        assert_eq!(r.track_count, 999);
+        assert_eq!(r.track_count_available, 999);
     }
 
     #[tokio::test]

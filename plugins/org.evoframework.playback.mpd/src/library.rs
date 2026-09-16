@@ -2371,7 +2371,7 @@ fn paginate(
 /// The operator-supplied path is taken as-is — separator
 /// normalisation is the caller's responsibility (the browse
 /// shelf's wire contract pins POSIX `/` separators).
-fn mpd_database_relative_path(
+pub(crate) fn mpd_database_relative_path(
     music_directory: &std::path::Path,
     mount_path: &std::path::Path,
     user_path: &str,
@@ -3789,6 +3789,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mpd_path, "INTERNAL/Albums/Album1");
+    }
+
+    #[test]
+    fn mpd_path_usb_source_is_the_alias_leaf_not_an_absolute_path() {
+        // What `find base` must be handed for a USB source. MPD
+        // addresses its database relative to music_directory; the
+        // absolute mount is a Bad URI to it.
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music/USB/Audio"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "USB/Audio");
     }
 
     #[test]
