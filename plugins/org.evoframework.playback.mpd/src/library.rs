@@ -1141,7 +1141,10 @@ async fn remove_usb_via_safe_remove(
             ),
         });
     };
-    let payload = serde_json::json!({ "stable_id": stable_id });
+    let payload = serde_json::json!({
+        "stable_id": stable_id,
+        "library_source_id": source_id,
+    });
     let bytes = serde_json::to_vec(&payload).map_err(|e| VerbError::Mpd {
         verb: "remove_source".into(),
         reason: e.to_string(),
@@ -3461,12 +3464,27 @@ mod tests {
     /// Records which peer-shelf verbs were dispatched.
     #[derive(Default)]
     struct RecordingDispatcher {
-        seen: std::sync::Mutex<Vec<String>>,
+        seen: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl RecordingDispatcher {
         fn seen(&self) -> Vec<String> {
-            self.seen.lock().unwrap().clone()
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(verb, _)| verb.clone())
+                .collect()
+        }
+
+        fn last_payload(&self, verb: &str) -> Option<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(v, _)| v == verb)
+                .map(|(_, payload)| payload.clone())
         }
     }
 
@@ -3475,7 +3493,7 @@ mod tests {
             &'a self,
             _shelf: &'a str,
             request_type: &'a str,
-            _payload: Vec<u8>,
+            payload: Vec<u8>,
             _instance_id: Option<&'a str>,
         ) -> std::pin::Pin<
             Box<
@@ -3488,7 +3506,11 @@ mod tests {
                     + 'a,
             >,
         > {
-            self.seen.lock().unwrap().push(request_type.to_string());
+            let body = String::from_utf8_lossy(&payload).into_owned();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request_type.to_string(), body));
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -3564,6 +3586,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(d.seen(), vec!["storage.usb.safe_remove".to_string()]);
+        let handed = d
+            .last_payload("storage.usb.safe_remove")
+            .expect("handover payload");
+        assert!(
+            handed.contains("\"library_source_id\":\"usb-audio\"")
+                || handed.contains("\"library_source_id\": \"usb-audio\""),
+            "glass source id must ride safe_remove or retract no-ops: {handed}"
+        );
         assert!(
             ctx.registry.get("usb-audio").await.is_some(),
             "the row must survive the hand-over; safe_remove's own call \

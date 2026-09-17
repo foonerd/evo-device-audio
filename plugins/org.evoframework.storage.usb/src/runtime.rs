@@ -117,6 +117,10 @@ struct RuntimeInner {
     /// (replug remounts) or when the operator Mounts, repairs,
     /// or renames.
     operator_held_out: BTreeSet<String>,
+    /// In-flight (or last completed) operator Remove. Carried
+    /// on `storage_usb_drives` so glass can name each real
+    /// stage instead of walking a timer.
+    removal: Option<RemovalProgress>,
 }
 
 struct StoragePublisher {
@@ -153,6 +157,7 @@ impl StorageUsbRuntime {
                 drives: BTreeMap::new(),
                 last_update_at_ms: 0,
                 operator_held_out: BTreeSet::new(),
+                removal: None,
             }),
             publisher: StdMutex::new(None),
             shelf_dispatcher: StdMutex::new(None),
@@ -434,7 +439,15 @@ impl StorageUsbRuntime {
     }
 
     async fn clear_operator_hold(&self, stable_id: &str) {
-        self.inner.lock().await.operator_held_out.remove(stable_id);
+        let mut inner = self.inner.lock().await;
+        inner.operator_held_out.remove(stable_id);
+        if inner
+            .removal
+            .as_ref()
+            .is_some_and(|r| r.stable_id == stable_id)
+        {
+            inner.removal = None;
+        }
     }
 
     async fn remember_operator_detach(&self, stable_id: &str) {
@@ -536,6 +549,18 @@ impl StorageUsbRuntime {
         // stays in the classifier.
         let present: BTreeSet<String> = inner.drives.keys().cloned().collect();
         inner.operator_held_out.retain(|id| present.contains(id));
+        // The removal banner goes with the hold. It reports a
+        // real stage of a real device; once that device has
+        // left, `safe` describes nothing, and leaving it up
+        // would put "safe to unplug" over the stick the
+        // operator plugs in next.
+        if inner
+            .removal
+            .as_ref()
+            .is_some_and(|r| !present.contains(&r.stable_id))
+        {
+            inner.removal = None;
+        }
         drop(inner);
 
         for (stable_id, source_id) in &vanished {
@@ -785,13 +810,15 @@ impl StorageUsbRuntime {
     /// 4. Wrapper `umount`. Any non-zero escalates to
     ///    `umount-force`. The `force` field is on the wire and
     ///    is not a gate.
-    /// 5. After the volume is detached: `library.remove_source`
+    /// 5. Wrapper `eject` (best-effort).
+    /// 6. After the volume is detached: `library.remove_source`
     ///    with `scrub_mpd_entries: true` so MPD prunes rows
     ///    whose files are gone.
-    /// 6. Wrapper `eject` (best-effort).
     /// 7. Retract from the in-memory registry + republish.
+    ///    Each of detach / eject / retract / safe is announced
+    ///    on `storage_usb_drives.removal` as that step starts.
     ///
-    /// Payload: `{ v: 1, stable_id, force?: bool }`
+    /// Payload: `{ v: 1, stable_id, force?: bool, library_source_id?: string }`
     /// Response: `{ v: 1, removed: true, forced?: bool, holders?: [...] }`
     async fn handle_safe_remove(
         &self,
@@ -840,6 +867,12 @@ impl StorageUsbRuntime {
                 ),
             }
             self.remember_operator_detach(&req.stable_id).await;
+            self.announce_removal(
+                &req.stable_id,
+                req.library_source_id.as_deref(),
+                RemovalStage::Safe,
+            )
+            .await;
             let resp = SafeRemoveResponse {
                 v: 1,
                 removed: true,
@@ -862,6 +895,11 @@ impl StorageUsbRuntime {
 
         // Idempotent: already unmounted → return success without
         // touching the wrapper.
+        let library_source_id = req
+            .library_source_id
+            .as_deref()
+            .or(record.library_source_id.as_deref());
+
         if record.class == DriveClass::Unmounted
             || record.class == DriveClass::Unsupported
             || record.class == DriveClass::MountFailedOversizedVfat
@@ -871,17 +909,25 @@ impl StorageUsbRuntime {
             // Already off the host. Still retract so MPD does
             // not keep the tracks, and hold Auto so the next
             // tick does not put the still-plugged stick back.
-            self.retract_library_source(
+            self.announce_removal(
                 &req.stable_id,
-                record.library_source_id.as_deref(),
+                library_source_id,
+                RemovalStage::Retract,
             )
             .await;
+            self.retract_library_source(&req.stable_id, library_source_id)
+                .await;
             {
                 let mut inner = self.inner.lock().await;
                 inner.operator_held_out.insert(req.stable_id.clone());
                 inner.drives.remove(&req.stable_id);
             }
-            self.republish_envelope().await;
+            self.announce_removal(
+                &req.stable_id,
+                library_source_id,
+                RemovalStage::Safe,
+            )
+            .await;
             let resp = SafeRemoveResponse {
                 v: 1,
                 removed: true,
@@ -892,6 +938,13 @@ impl StorageUsbRuntime {
                 VerbDispatchError::ResponseSerialise(e.to_string())
             });
         }
+
+        self.announce_removal(
+            &req.stable_id,
+            library_source_id,
+            RemovalStage::Detach,
+        )
+        .await;
 
         // 2. sync — flush kernel dirty pages on the parent disk.
         //    Best-effort — we shell out to `sync <parent-disk>`
@@ -960,26 +1013,15 @@ impl StorageUsbRuntime {
             );
         }
 
-        // Retract the library source now that the volume is
-        // actually gone, scrubbing the MPD rows with it.
-        //
-        // Order matters: the scrub is an `update` over the
-        // source's path, and MPD only prunes rows whose files
-        // have disappeared. Run before the detach it would walk
-        // a still-mounted tree, find every file present, and
-        // prune nothing — leaving Local library > USB listing a
-        // volume that is no longer there. Best-effort:
-        // MPD-unreachable is logged, never fatal, because the
-        // volume is already detached by this point.
-        self.retract_library_source(
-            &req.stable_id,
-            record.library_source_id.as_deref(),
-        )
-        .await;
-
         // 4. Best-effort SCSI eject via wrapper. Some drives
         //    (Samsung T7, many SSD enclosures) simply don't
         //    respond to the ioctl. Failure logged, not fatal.
+        self.announce_removal(
+            &req.stable_id,
+            library_source_id,
+            RemovalStage::Eject,
+        )
+        .await;
         let eject_argv = vec!["eject".to_string(), record.parent_disk.clone()];
         match self
             .command_runner
@@ -1004,6 +1046,25 @@ impl StorageUsbRuntime {
             ),
         }
 
+        // Retract the library source now that the volume is
+        // actually gone, scrubbing the MPD rows with it.
+        //
+        // Order matters: the scrub is an `update` over the
+        // source's path, and MPD only prunes rows whose files
+        // have disappeared. Run it after umount; a walk of a
+        // still-mounted tree would find every file present and
+        // prune nothing. Best-effort: MPD-unreachable is
+        // logged, never fatal, because the volume is already
+        // detached by this point.
+        self.announce_removal(
+            &req.stable_id,
+            library_source_id,
+            RemovalStage::Retract,
+        )
+        .await;
+        self.retract_library_source(&req.stable_id, library_source_id)
+            .await;
+
         // 5. Retract from the in-memory registry + republish.
         //    The periodic reconciler would do this on next detach
         //    event; explicit removal here keeps the subject
@@ -1014,7 +1075,12 @@ impl StorageUsbRuntime {
             inner.operator_held_out.insert(req.stable_id.clone());
             inner.drives.remove(&req.stable_id);
         }
-        self.republish_envelope().await;
+        self.announce_removal(
+            &req.stable_id,
+            library_source_id,
+            RemovalStage::Safe,
+        )
+        .await;
 
         let resp = SafeRemoveResponse {
             v: 1,
@@ -1072,7 +1138,28 @@ impl StorageUsbRuntime {
             v: 1,
             drives: inner.drives.values().cloned().collect(),
             last_update_at_ms: inner.last_update_at_ms,
+            removal: inner.removal.clone(),
         }
+    }
+
+    /// Publish one real Remove stage on `storage_usb_drives`.
+    /// The lock is dropped before republish so compose can
+    /// take it again.
+    async fn announce_removal(
+        &self,
+        stable_id: &str,
+        library_source_id: Option<&str>,
+        stage: RemovalStage,
+    ) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.removal = Some(RemovalProgress {
+                stable_id: stable_id.to_string(),
+                library_source_id: library_source_id.map(str::to_string),
+                stage,
+            });
+        }
+        self.republish_envelope().await;
     }
 
     // ----------------------------------------------------------
@@ -1795,6 +1882,39 @@ pub struct ListDrivesEnvelope {
     pub drives: Vec<DriveRecord>,
     /// Wall-clock ms of the last enumeration.
     pub last_update_at_ms: i64,
+    /// Operator Remove progress, when a detach is running or
+    /// has just finished. Absent on an idle envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<RemovalProgress>,
+}
+
+/// One stage of `storage.usb.safe_remove`, published as it
+/// starts so glass can name the work that is actually running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalStage {
+    /// Host umount / lazy detach.
+    Detach,
+    /// SCSI eject of the parent disk.
+    Eject,
+    /// `library.remove_source` with scrub.
+    Retract,
+    /// Detach and retract have finished; the volume is safe
+    /// to unplug.
+    Safe,
+}
+
+/// In-flight (or just-finished) operator Remove, on
+/// `storage_usb_drives`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovalProgress {
+    /// Drive stable-id being removed.
+    pub stable_id: String,
+    /// Library source the glass asked to drop, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_source_id: Option<String>,
+    /// Stage that has started (or `safe` when finished).
+    pub stage: RemovalStage,
 }
 
 /// One drive record.
@@ -2142,6 +2262,15 @@ pub struct SafeRemoveRequest {
     /// non-zero clean umount escalates to `umount-force`.
     #[serde(default)]
     pub force: Option<bool>,
+    /// Library source id to drop after detach.
+    ///
+    /// The glass Remove already knows this id. The drive
+    /// record's `library_source_id` is empty after a steward
+    /// restart that inherits a live systemd mount — add_source
+    /// is not run again — and retract then no-ops, leaving
+    /// Audio ONLINE at 1513 on an unmounted stick.
+    #[serde(default)]
+    pub library_source_id: Option<String>,
 }
 
 /// `storage.usb.safe_remove` response payload.
@@ -3539,6 +3668,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "not-a-real-drive".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         let bytes = rt
@@ -3587,6 +3717,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: root_id,
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         let err = rt
@@ -3651,6 +3782,7 @@ mod tests {
                 stable_id: "MUSIC".to_string(),
                 // force is on the wire but is not a gate.
                 force: Some(false),
+                library_source_id: None,
             })
             .unwrap();
             let bytes = rt
@@ -3706,6 +3838,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: Some(true),
+            library_source_id: None,
         })
         .unwrap();
         let bytes = rt
@@ -3813,6 +3946,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         let bytes = rt
@@ -3846,6 +3980,7 @@ mod tests {
         let remove = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -3884,6 +4019,7 @@ mod tests {
         let remove = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -3916,6 +4052,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         let bytes = rt
@@ -3939,6 +4076,7 @@ mod tests {
         let first = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &first)
@@ -3961,6 +4099,120 @@ mod tests {
         assert!(
             seen.len() >= before,
             "second Remove must not fail the dispatcher; saw {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_remove_retracts_the_id_the_library_handed_over() {
+        // After a steward restart the drive is mounted by
+        // systemd and library_source_id on the record is empty.
+        // Glass Remove still knows audio-701124. That id must
+        // ride the safe_remove payload or retract no-ops and
+        // the card stays ONLINE at 1513.
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let d = Arc::new(PayloadDispatcher::default());
+        rt.attach_shelf_dispatcher(
+            Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
+        );
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+            library_source_id: Some("audio-701124".to_string()),
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove");
+        let seen = d.seen();
+        let retract = seen
+            .iter()
+            .find(|(verb, _)| verb == "library.remove_source")
+            .unwrap_or_else(|| {
+                panic!("must retract the handed-over id: {seen:?}")
+            });
+        assert!(
+            retract.1.contains("\"source_id\":\"audio-701124\"")
+                || retract.1.contains("\"source_id\": \"audio-701124\""),
+            "retract must name the glass source, not skip: {}",
+            retract.1
+        );
+        assert!(
+            retract.1.contains("\"scrub_mpd_entries\":true")
+                || retract.1.contains("\"scrub_mpd_entries\": true"),
+            "retract must scrub: {}",
+            retract.1
+        );
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let rem = env
+            .removal
+            .expect("safe_remove must leave the last stage on the envelope");
+        assert_eq!(rem.stable_id, "MUSIC");
+        assert_eq!(rem.library_source_id.as_deref(), Some("audio-701124"));
+        assert_eq!(rem.stage, RemovalStage::Safe);
+    }
+
+    #[tokio::test]
+    async fn the_removal_banner_leaves_with_the_stick() {
+        // `safe` is a statement about a device. Once the stick
+        // is out, it describes nothing — and holding it would
+        // paint "safe to unplug" over whatever is plugged in
+        // next, which is the same lie this row removes.
+        let lsblk =
+            Arc::new(StdMutex::new(removable_stick_lsblk().to_string()));
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(SwappableInputSource(Arc::clone(&lsblk))),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+            library_source_id: Some("audio-701124".to_string()),
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove");
+
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            env.removal.is_some(),
+            "while the stick is still in, the last stage stands",
+        );
+
+        // Pulled.
+        *lsblk.lock().unwrap() = r#"{"blockdevices":[]}"#.to_string();
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            env.removal.is_none(),
+            "the banner must leave with the device; saw {:?}",
+            env.removal,
         );
     }
 
@@ -4064,6 +4316,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4114,6 +4367,7 @@ mod tests {
         let payload = serde_json::to_vec(&SafeRemoveRequest {
             stable_id: "MUSIC".to_string(),
             force: None,
+            library_source_id: None,
         })
         .unwrap();
         let bytes = rt
