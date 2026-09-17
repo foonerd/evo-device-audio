@@ -866,12 +866,12 @@ async fn handle_enqueue_selection_criteria(
     // as-is via findadd/searchadd for a single roundtrip.
     let materialise_needed = matches!(mode, EnqueueSelectionMode::Next);
     let uris: Vec<String> = if materialise_needed {
-        materialise_to_uris(conn, &resolved).await.map_err(|e| {
-            VerbError::Mpd {
+        materialise_to_uris(conn, &resolved, criteria.dimension)
+            .await
+            .map_err(|e| VerbError::Mpd {
                 verb: "enqueue_selection".to_string(),
                 reason: e.to_string(),
-            }
-        })?
+            })?
     } else {
         match &resolved {
             crate::selection::ResolvedSelection::UriList(list) => list.clone(),
@@ -1652,9 +1652,36 @@ async fn apply_replace(
 async fn materialise_to_uris(
     conn: &mut MpdConnection,
     resolved: &crate::selection::ResolvedSelection,
+    dimension: crate::selection::SelectionDimension,
 ) -> Result<Vec<String>, crate::mpd::MpdError> {
     match resolved {
-        crate::selection::ResolvedSelection::UriList(list) => Ok(list.clone()),
+        crate::selection::ResolvedSelection::UriList(list) => {
+            // `Folder` resolves to the directory itself, because
+            // Append and Replace hand it to MPD's `add DIR` and
+            // let MPD walk it in one command. `Next` cannot: it
+            // places each track with `addid <uri> <position>`,
+            // and `addid` takes a song, not a directory — MPD
+            // refuses the whole call and the operator gets a
+            // 400 on Play Next over a folder.
+            //
+            // So for this dimension, and only this one, ask MPD
+            // what the directory holds and place those. Every
+            // other `UriList` dimension already resolves to song
+            // or stream URIs; walking those would be a round
+            // trip per track to learn what we were told.
+            if dimension != crate::selection::SelectionDimension::Folder {
+                return Ok(list.clone());
+            }
+            let mut out = Vec::new();
+            for dir in list {
+                for entry in conn.listallinfo(dir).await? {
+                    if let MpdLibraryEntry::File { path, .. } = entry {
+                        out.push(path);
+                    }
+                }
+            }
+            Ok(out)
+        }
         crate::selection::ResolvedSelection::Filter { pairs, substring } => {
             let pairs_ref: Vec<(crate::mpd::MpdSearchField, &str)> = pairs
                 .iter()
@@ -1980,6 +2007,126 @@ mod tests {
             track_count_available: 0,
             last_scan_at_ms: None,
         }
+    }
+
+    async fn recording_conn(
+        files: Vec<String>,
+    ) -> (MpdConnection, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::RecordingLibrary {
+                commands: Arc::clone(&log),
+                files,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        (conn, log)
+    }
+
+    #[tokio::test]
+    async fn play_next_over_a_folder_places_files_never_the_directory() {
+        // `addid` takes a song. Handing it the directory is the
+        // 400 the operator sees on Play Next over a folder.
+        let (mut conn, log) = recording_conn(vec![
+            "USB/Audio/01.flac".to_string(),
+            "USB/Audio/02.flac".to_string(),
+        ])
+        .await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "USB/Audio".to_string(),
+        ]);
+
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Folder,
+        )
+        .await
+        .expect("materialise");
+
+        assert_eq!(
+            uris,
+            vec![
+                "USB/Audio/01.flac".to_string(),
+                "USB/Audio/02.flac".to_string()
+            ],
+            "Next must place the folder's files"
+        );
+        assert!(
+            !uris.iter().any(|u| u == "USB/Audio"),
+            "the directory itself must never reach addid: {uris:?}"
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("listallinfo")),
+            "the expansion must ask MPD what the folder holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_next_over_a_playlist_is_not_walked() {
+        // Every other UriList dimension already resolves to song
+        // or stream URIs. Walking them would be a round trip per
+        // track to learn what we were already told.
+        let (mut conn, log) = recording_conn(vec!["ignored".to_string()]).await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "http://stream.example/live".to_string(),
+        ]);
+
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Playlist,
+        )
+        .await
+        .expect("materialise");
+
+        assert_eq!(uris, vec!["http://stream.example/live".to_string()]);
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("listallinfo")),
+            "a non-folder dimension must not be walked: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn append_over_a_folder_is_still_one_add_of_the_directory() {
+        // Append and Replace hand the directory to MPD's
+        // `add DIR` and let MPD walk it in one command. This
+        // row must not turn that into a per-file addid storm.
+        let (mut conn, log) = recording_conn(Vec::new()).await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "USB/Audio".to_string(),
+        ]);
+
+        apply_append(&mut conn, &resolved, &["USB/Audio".to_string()])
+            .await
+            .expect("append");
+
+        let cmds = log.lock().unwrap().clone();
+        let adds: Vec<&String> =
+            cmds.iter().filter(|c| c.starts_with("add ")).collect();
+        assert_eq!(adds.len(), 1, "exactly one add: {cmds:?}");
+        assert!(
+            adds[0].contains("USB/Audio"),
+            "and it must name the directory: {:?}",
+            adds[0]
+        );
+        assert!(
+            !cmds.iter().any(|c| c.starts_with("addid")),
+            "Append must not addid: {cmds:?}"
+        );
     }
 
     #[tokio::test]

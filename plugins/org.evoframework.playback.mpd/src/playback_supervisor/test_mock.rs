@@ -375,6 +375,18 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// A library that records every command it is sent.
+    ///
+    /// `listallinfo <path>` answers with `files`, so a caller
+    /// that expands a directory sees its tracks; `status`
+    /// reports a playing queue so a position can be computed;
+    /// `addid` answers with an id. The recorded command lines
+    /// let a test assert what was actually asked of MPD —
+    /// whether a directory or its files reached the queue.
+    RecordingLibrary {
+        commands: Arc<Mutex<Vec<String>>>,
+        files: Vec<String>,
+    },
     /// A database that prunes only when the queued `update` job
     /// finishes.
     ///
@@ -491,6 +503,49 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(b"OK\n").await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::RecordingLibrary {
+            ref commands,
+            ref files,
+        } => {
+            let listing = {
+                let mut out = String::new();
+                for f in files {
+                    out.push_str(&format!("file: {f}\n"));
+                }
+                out.push_str("OK\n");
+                out
+            };
+            let mut next_id = 100u32;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                commands.lock().unwrap().push(line.trim_end().to_string());
+                if line.starts_with("status") {
+                    let _ = w
+                        .write_all(
+                            b"state: play\nsong: 0\nplaylistlength: 1\nOK\n",
+                        )
+                        .await;
+                } else if line.starts_with("listallinfo") {
+                    let _ = w.write_all(listing.as_bytes()).await;
+                } else if line.starts_with("addid") {
+                    let _ = w
+                        .write_all(format!("Id: {next_id}\nOK\n").as_bytes())
+                        .await;
+                    next_id += 1;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }
