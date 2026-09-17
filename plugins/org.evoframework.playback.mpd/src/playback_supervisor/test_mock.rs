@@ -375,6 +375,20 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// A database that prunes only when the queued `update` job
+    /// finishes.
+    ///
+    /// `find` answers with `internal` + `usb` until the job has
+    /// run, then with `internal` alone. `status` carries
+    /// `updating_db` for `in_flight_polls` reads after the
+    /// `update` command, then clears — so a caller that re-counts
+    /// on the update ACK sees the unpruned set and one that waits
+    /// sees the pruned one.
+    PrunesAfterUpdate {
+        internal: Vec<String>,
+        usb: Vec<String>,
+        in_flight_polls: usize,
+    },
     /// Like [`StandardWithSong`] but the current song changes
     /// after the first `currentsong` read: the player moved on
     /// while nobody was listening. Lets a test distinguish a
@@ -477,6 +491,61 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(b"OK\n").await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::PrunesAfterUpdate {
+            ref internal,
+            ref usb,
+            in_flight_polls,
+        } => {
+            let files = |v: &[String]| {
+                let mut out = String::new();
+                for f in v {
+                    out.push_str(&format!("file: {f}\n"));
+                }
+                out.push_str("OK\n");
+                out
+            };
+            let unpruned = {
+                let mut all = internal.clone();
+                all.extend(usb.iter().cloned());
+                files(&all)
+            };
+            let pruned = files(internal);
+            let mut update_seen = false;
+            let mut polls_after_update = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let job_done =
+                    update_seen && polls_after_update >= in_flight_polls;
+                if line.starts_with("update") {
+                    update_seen = true;
+                    polls_after_update = 0;
+                    let _ = w.write_all(b"updating_db: 1\nOK\n").await;
+                } else if line.starts_with("status") {
+                    if update_seen && polls_after_update < in_flight_polls {
+                        polls_after_update += 1;
+                        let _ = w
+                            .write_all(b"state: stop\nupdating_db: 1\nOK\n")
+                            .await;
+                    } else {
+                        let _ = w.write_all(b"state: stop\nOK\n").await;
+                    }
+                } else if line.starts_with("find") {
+                    let body = if job_done { &pruned } else { &unpruned };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }

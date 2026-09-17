@@ -50,6 +50,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use evo_plugin_sdk::contract::{
@@ -1002,6 +1003,29 @@ pub(crate) async fn handle_remove_source(
                 source_id: payload.source_id.clone(),
             }
         })?;
+
+    // A USB source's Remove is a detach, not a registry edit.
+    //
+    // Dropping the row here would take the card off the glass and
+    // leave the volume mounted and its tracks in MPD's database,
+    // so Local library would keep counting a stick the operator
+    // had just removed. `storage.usb.safe_remove` already owns
+    // that sequence — detach first, then dispatch this verb back
+    // with `scrub_mpd_entries: true` — so hand it over and let
+    // that second call do the registry drop.
+    //
+    // The scrub flag is what tells the two apart. The operator's
+    // Remove arrives with it false (the shell sends `source_id`
+    // only); safe_remove's own call sets it true, and that call
+    // must fall through to the removal below or the two would
+    // dispatch each other forever.
+    if !payload.scrub_mpd_entries
+        && matches!(record.kind, SourceKind::LocalUsb { .. })
+    {
+        return remove_usb_via_safe_remove(ctx, &payload.source_id, &record)
+            .await;
+    }
+
     // Optional MPD scrub: run `update PATH` after unmount so
     // MPD's database notices the songs are gone.
     //
@@ -1046,9 +1070,175 @@ pub(crate) async fn handle_remove_source(
             reason: e.to_string(),
         }
     })?;
+    // The floor source is mounted at `music_directory`, so its
+    // `find base` is the database root and its count includes
+    // every source underneath it. The scrub above just took a
+    // stick's tracks out of that database; without re-counting,
+    // the card would be gone while Local library still reported
+    // the songs that went with it.
+    // The scrub above only queued an update job. Wait for MPD to
+    // finish pruning before re-counting, or the floor is written
+    // from a database that still holds the removed rows.
+    if payload.scrub_mpd_entries && wait_for_scrub_to_settle(conn).await {
+        settle_local_internal_counts(ctx, conn).await;
+    }
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
     Ok(())
+}
+
+/// Hand a USB source's removal to the plugin that owns the
+/// volume.
+///
+/// The mount target is always `/var/lib/evo/music/USB/<stable-id>`
+/// (the wrapper composes it that way), so the leaf of the record's
+/// mount path is the id `storage.usb.safe_remove` expects.
+///
+/// Returns once safe_remove has answered. That call detaches the
+/// volume and then dispatches `library.remove_source` back with
+/// the scrub flag set, and it is that second call which drops the
+/// registry row — so nothing is removed here.
+async fn remove_usb_via_safe_remove(
+    ctx: &LibraryContext,
+    source_id: &str,
+    record: &SourceRecord,
+) -> Result<(), VerbError> {
+    let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+        return Err(VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!(
+                "remove_source: usb source {source_id} must be detached by                  storage.usb, but LoadContext.shelf_request_dispatcher was                  None at admission"
+            ),
+        });
+    };
+    let Some(stable_id) =
+        record.mount_path.file_name().map(|s| s.to_string_lossy())
+    else {
+        return Err(VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!(
+                "remove_source: usb source {source_id} has no mount leaf to                  name a volume with"
+            ),
+        });
+    };
+    let payload = serde_json::json!({ "stable_id": stable_id });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| VerbError::Mpd {
+        verb: "remove_source".into(),
+        reason: e.to_string(),
+    })?;
+    dispatcher
+        .dispatch("storage.usb", "storage.usb.safe_remove", bytes, None)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!("storage.usb.safe_remove refused: {e}"),
+        })?;
+    Ok(())
+}
+
+/// How long to wait for a scrub's `update` job to finish before
+/// giving up on re-counting the floor.
+const SCRUB_SETTLE_DEADLINE: Duration = Duration::from_millis(1_500);
+
+/// How often to ask MPD whether the update job is still running.
+const SCRUB_SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// Wait until the scrub's update job has left `updating_db`.
+///
+/// `MpdConnection::update` ACKs when the job is *queued*, not when
+/// it has run: MPD still holds every row under the scrubbed path
+/// until the job completes. Re-counting on the ACK reads a
+/// database that has not pruned, which is how the floor kept
+/// reporting songs that left with the stick.
+///
+/// The grace is the scan watcher's: `updating_db` missing on the
+/// first poll means MPD has not picked the job up yet, not that it
+/// has finished, so two consecutive clear polls are required.
+///
+/// Returns false on timeout or a transport error — the caller then
+/// leaves the counts alone rather than writing a number it could
+/// not verify.
+async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
+    let deadline = Instant::now() + SCRUB_SETTLE_DEADLINE;
+    let mut consecutive_clear = 0u8;
+    loop {
+        match conn.status().await {
+            Ok(status) => {
+                if status.updating_db.is_some() {
+                    consecutive_clear = 0;
+                } else {
+                    consecutive_clear = consecutive_clear.saturating_add(1);
+                    if consecutive_clear >= 2 {
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "remove_source: status read failed while waiting for \
+                     the scrub to settle"
+                );
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                "remove_source: scrub did not settle within the deadline; \
+                 leaving the floor count as it stands rather than writing \
+                 one read from an unpruned database"
+            );
+            return false;
+        }
+        tokio::time::sleep(SCRUB_SETTLE_POLL).await;
+    }
+}
+
+/// Re-count the floor source from MPD's database.
+///
+/// Uses the enumerator the reconciler and scan-terminal use, over
+/// the same database-relative base. Best-effort: a source whose
+/// count could not be re-read keeps the count it has rather than
+/// being written to zero.
+async fn settle_local_internal_counts(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+) {
+    let Some(record) = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await else {
+        return;
+    };
+    let Ok(base) = mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) else {
+        return;
+    };
+    let Ok(songs) =
+        crate::sticker_reconciler::enumerate_songs_under_mount(conn, &base)
+            .await
+    else {
+        return;
+    };
+    let total = songs.len().min(u32::MAX as usize) as u32;
+    let available = if record.state.is_reachable() {
+        total
+    } else {
+        0
+    };
+    if let Err(e) = ctx
+        .registry
+        .update_track_counts(LOCAL_INTERNAL_SOURCE_ID, total, available)
+        .await
+    {
+        tracing::debug!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "remove_source: local-internal re-count failed"
+        );
+    }
 }
 
 pub(crate) async fn handle_probe_source(
@@ -3241,6 +3431,214 @@ mod tests {
             Arc::new(NullAnn),
             None,
         )
+    }
+
+    /// Records which peer-shelf verbs were dispatched.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingDispatcher {
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl ShelfRequestDispatcher for RecordingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.seen.lock().unwrap().push(request_type.to_string());
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn ctx_with_dispatcher(d: Arc<RecordingDispatcher>) -> LibraryContext {
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(d as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    async fn mock_conn() -> MpdConnection {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::Standard]).await;
+        MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+            .await
+            .unwrap()
+    }
+
+    fn usb_record(id: &str, leaf: &str) -> SourceRecord {
+        SourceRecord {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            kind: SourceKind::LocalUsb {
+                device_node: "/dev/disk/by-uuid/test".to_string(),
+                label: "STICK".to_string(),
+            },
+            mount_path: PathBuf::from(format!("/var/lib/evo/music/USB/{leaf}")),
+            mpd_storage_name: None,
+            state: SourceState::Online,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 1513,
+            track_count_available: 1513,
+            last_scan_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_usb_source_hands_over_to_safe_remove() {
+        // The operator's Remove arrives with the scrub flag
+        // false. It must reach the plugin that owns the volume,
+        // and must NOT drop the registry row on the way — that
+        // drop belongs to the call safe_remove makes back.
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(d.seen(), vec!["storage.usb.safe_remove".to_string()]);
+        assert!(
+            ctx.registry.get("usb-audio").await.is_some(),
+            "the row must survive the hand-over; safe_remove's own call \
+             drops it after the detach",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_floor_is_recounted_only_after_the_prune_has_run() {
+        // `update` ACKs a queued job; MPD holds every USB row
+        // until it finishes. The floor must be counted from the
+        // pruned database, so INTERNAL survives and the stick's
+        // songs do not.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "the scrub call must not dispatch safe_remove back",
+        );
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must carry the two INTERNAL songs and neither of \
+             the three that left with the stick — counted after the prune, \
+             not on the update ACK",
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_non_usb_source_does_not_call_safe_remove() {
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut nas = usb_record("nas-music", "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/music");
+        ctx.registry.register(nas).await.unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "nas-music".to_string(),
+                scrub_mpd_entries: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(d.seen().is_empty(), "only a USB source hands over");
+        assert!(ctx.registry.get("nas-music").await.is_none());
     }
 
     #[test]
