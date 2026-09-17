@@ -279,4 +279,6 @@ request_types = [
     "library.get_triage",
     "library.reconcile_triage",
 ]
-response_budget_ms = 2000
+# USB Remove waits here for detach + MPD prune. See
+# manifest.toml for the 2 s → 30 s reason.
+response_budget_ms = 30000

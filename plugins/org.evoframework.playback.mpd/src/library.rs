@@ -1146,6 +1146,11 @@ async fn remove_usb_via_safe_remove(
         verb: "remove_source".into(),
         reason: e.to_string(),
     })?;
+    // plugin-system holds no scopes. safe_remove is admitted
+    // without step-up so this handoff is the same gesture the
+    // glass already ran (library.remove_source). A storage_admin
+    // gate here is the 8 ms 400: permission_denied, volume still
+    // mounted, toast `refused: 400 Bad Request`.
     dispatcher
         .dispatch("storage.usb", "storage.usb.safe_remove", bytes, None)
         .await

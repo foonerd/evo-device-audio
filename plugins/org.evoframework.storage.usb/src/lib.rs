@@ -371,4 +371,46 @@ mod tests {
         assert_eq!(m.target.shelf, "storage.usb");
         assert_eq!(m.target.shape, 1);
     }
+
+    #[test]
+    fn safe_remove_is_not_step_up_gated() {
+        // Glass library Remove dispatches this verb as
+        // plugin-system. That principal holds no scopes. A
+        // storage_admin step-up gate is the 8 ms 400 that left
+        // the stick mounted.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let m = manifest();
+        let caps = &m
+            .capabilities
+            .respondent
+            .as_ref()
+            .expect("respondent")
+            .verb_capabilities;
+        assert_eq!(
+            caps.get("storage.usb.safe_remove"),
+            Some(&VerbCapability::None)
+        );
+        assert!(
+            matches!(
+                caps.get("storage.usb.mount"),
+                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+            ),
+            "mount must stay household-gated: {:?}",
+            caps.get("storage.usb.mount")
+        );
+        assert!(
+            matches!(
+                caps.get("storage.usb.repair_filesystem"),
+                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+            ),
+            "repair must stay household-gated"
+        );
+        assert!(
+            matches!(
+                caps.get("storage.usb.rename"),
+                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+            ),
+            "rename must stay household-gated"
+        );
+    }
 }
