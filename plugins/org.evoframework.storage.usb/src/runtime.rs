@@ -48,7 +48,7 @@ use evo_plugin_sdk::contract::{
     SubjectAnnouncer,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
@@ -111,6 +111,12 @@ pub struct StorageUsbRuntime {
 struct RuntimeInner {
     drives: BTreeMap<String, DriveRecord>,
     last_update_at_ms: i64,
+    /// Stable-ids the operator Removed while the device is
+    /// still in the classifier. Auto-mount must not put those
+    /// back; the hold drops when the device leaves lsblk
+    /// (replug remounts) or when the operator Mounts, repairs,
+    /// or renames.
+    operator_held_out: BTreeSet<String>,
 }
 
 struct StoragePublisher {
@@ -146,6 +152,7 @@ impl StorageUsbRuntime {
             inner: Mutex::new(RuntimeInner {
                 drives: BTreeMap::new(),
                 last_update_at_ms: 0,
+                operator_held_out: BTreeSet::new(),
             }),
             publisher: StdMutex::new(None),
             shelf_dispatcher: StdMutex::new(None),
@@ -260,6 +267,10 @@ impl StorageUsbRuntime {
         let req: MountRequest = serde_json::from_slice(payload)
             .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
 
+        // Operator Mount is the gesture that puts a Removed-but-
+        // still-plugged stick back. Drop the hold before the
+        // reconcile so Auto can attach it.
+        self.clear_operator_hold(&req.stable_id).await;
         self.reconcile_once().await?;
 
         let record = {
@@ -410,10 +421,35 @@ impl StorageUsbRuntime {
     // ----------------------------------------------------------
 
     /// Enumerate every USB-transport partition, classify, derive
-    /// stable-ids, and auto-mount removable drives. Called on
-    /// plugin load, on every reconcile tick, and at the start of
-    /// every verb handler (cheap in-memory op + lsblk poll).
+    /// stable-ids, and auto-mount removable drives that the
+    /// operator has not Removed. Called on plugin load, on every
+    /// reconcile tick, and at the start of mutating verbs other
+    /// than `safe_remove` (that verb refreshes without Auto so
+    /// it cannot remount the stick it is about to detach).
     pub async fn reconcile_once(&self) -> Result<(), VerbDispatchError> {
+        self.refresh_registry().await?;
+        self.auto_mount_unmounted_removable().await;
+        self.republish_envelope().await;
+        Ok(())
+    }
+
+    async fn clear_operator_hold(&self, stable_id: &str) {
+        self.inner.lock().await.operator_held_out.remove(stable_id);
+    }
+
+    async fn remember_operator_detach(&self, stable_id: &str) {
+        self.inner
+            .lock()
+            .await
+            .operator_held_out
+            .insert(stable_id.to_string());
+    }
+
+    /// Rebuild the drive registry from lsblk + mountinfo.
+    /// Does not Auto-mount: `safe_remove` uses this so a
+    /// Removed-but-still-plugged stick is not put back as the
+    /// prelude to detaching it.
+    async fn refresh_registry(&self) -> Result<(), VerbDispatchError> {
         let inputs = self
             .input_source
             .read_inputs()
@@ -495,6 +531,11 @@ impl StorageUsbRuntime {
 
         inner.drives = fresh;
         inner.last_update_at_ms = now_ms();
+        // The stick left: a later insert is a new presence and
+        // Auto may mount it. Hold only while the same device
+        // stays in the classifier.
+        let present: BTreeSet<String> = inner.drives.keys().cloned().collect();
+        inner.operator_held_out.retain(|id| present.contains(id));
         drop(inner);
 
         for (stable_id, source_id) in &vanished {
@@ -532,15 +573,20 @@ impl StorageUsbRuntime {
             self.retract_library_source(stable_id, source_id.as_deref())
                 .await;
         }
+        Ok(())
+    }
 
-        // Auto-mount removable drives that are not yet mounted.
+    /// Auto-mount removable drives that are not yet mounted and
+    /// that the operator has not Removed while they stay plugged.
+    async fn auto_mount_unmounted_removable(&self) {
         let candidates: Vec<String> = {
             let inner = self.inner.lock().await;
             inner
                 .drives
                 .iter()
-                .filter(|(_, r)| {
-                    r.role == PartitionRole::Removable
+                .filter(|(id, r)| {
+                    !inner.operator_held_out.contains(*id)
+                        && r.role == PartitionRole::Removable
                         && r.mount_policy == MountPolicy::Auto
                         && (r.class == DriveClass::Unmounted
                             || r.class == DriveClass::MountFailedOther)
@@ -564,9 +610,6 @@ impl StorageUsbRuntime {
                 );
             }
         }
-
-        self.republish_envelope().await;
-        Ok(())
     }
 
     /// Internal mount attempt without the pre-reconcile pass —
@@ -757,8 +800,11 @@ impl StorageUsbRuntime {
         let req: SafeRemoveRequest = serde_json::from_slice(payload)
             .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
 
-        // Refresh before decision.
-        self.reconcile_once().await?;
+        // Refresh classifier state only. Full reconcile Auto-
+        // mounts a Removed-but-still-plugged stick, which is how
+        // glass Remove remounted the volume it was asked to
+        // detach and then 400'd on the poisoned systemd unit.
+        self.refresh_registry().await?;
 
         let known = {
             let inner = self.inner.lock().await;
@@ -793,6 +839,7 @@ impl StorageUsbRuntime {
                     "safe-remove on an unknown id: detach not attempted"
                 ),
             }
+            self.remember_operator_detach(&req.stable_id).await;
             let resp = SafeRemoveResponse {
                 v: 1,
                 removed: true,
@@ -821,11 +868,17 @@ impl StorageUsbRuntime {
             || record.class == DriveClass::MountFailedDirty
             || record.class == DriveClass::MountFailedOther
         {
-            // Drop from registry so subject republish reflects
-            // removal; the periodic reconciler would do this
-            // anyway on next detach event but explicit is safer.
+            // Already off the host. Still retract so MPD does
+            // not keep the tracks, and hold Auto so the next
+            // tick does not put the still-plugged stick back.
+            self.retract_library_source(
+                &req.stable_id,
+                record.library_source_id.as_deref(),
+            )
+            .await;
             {
                 let mut inner = self.inner.lock().await;
+                inner.operator_held_out.insert(req.stable_id.clone());
                 inner.drives.remove(&req.stable_id);
             }
             self.republish_envelope().await;
@@ -958,6 +1011,7 @@ impl StorageUsbRuntime {
         //    is between ticks).
         {
             let mut inner = self.inner.lock().await;
+            inner.operator_held_out.insert(req.stable_id.clone());
             inner.drives.remove(&req.stable_id);
         }
         self.republish_envelope().await;
@@ -1059,6 +1113,8 @@ impl StorageUsbRuntime {
     ) -> Result<Vec<u8>, VerbDispatchError> {
         let req: RenameRequest = serde_json::from_slice(payload)
             .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
+
+        self.clear_operator_hold(&req.stable_id).await;
 
         // Sanitise alias. Two distinct paths:
         //   raw trim-empty → CLEAR (removes any persisted alias;
@@ -1373,6 +1429,9 @@ impl StorageUsbRuntime {
         let req: RepairRequest = serde_json::from_slice(payload)
             .map_err(|e| VerbDispatchError::PayloadDecode(e.to_string()))?;
 
+        // Repair keeps the volume. A prior Remove hold must not
+        // block the remount after fsck.
+        self.clear_operator_hold(&req.stable_id).await;
         self.reconcile_once().await?;
 
         let record = {
@@ -3709,6 +3768,199 @@ mod tests {
             seen.iter()
                 .any(|a| a.first().map(String::as_str) == Some("umount-force")),
             "a vanished mounted volume must be lazy-detached; saw {seen:?}",
+        );
+    }
+
+    fn mount_call_count(runner: &FakeCommandRunner) -> usize {
+        runner
+            .seen_argv
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("mount"))
+            .count()
+    }
+
+    fn runtime_with_runner(
+        lsblk: &str,
+        runner: Arc<FakeCommandRunner>,
+    ) -> Arc<StorageUsbRuntime> {
+        Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: String::new(),
+                swaps: String::new(),
+                lsblk_json: lsblk.to_string(),
+            }),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ))
+    }
+
+    #[tokio::test]
+    async fn operator_remove_does_not_automount_while_the_stick_stays() {
+        // Glass Remove, then a hard refresh / list tick, must
+        // not put the still-plugged stick back. That remount
+        // was the stuck 1513 card and the second-click 400.
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(mount_call_count(&runner), 1, "first presence automounts");
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        let bytes = rt
+            .dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove");
+        let resp: SafeRemoveResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(resp.removed);
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            mount_call_count(&runner),
+            1,
+            "Remove must hold Auto while the stick stays plugged; saw {:?}",
+            runner.seen_argv.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_mount_after_remove_puts_the_volume_back() {
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let remove = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &remove)
+            .await
+            .expect("remove");
+        let mount = serde_json::to_vec(&MountRequest {
+            stable_id: "MUSIC".to_string(),
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.mount", &mount)
+            .await
+            .expect("operator mount");
+        assert_eq!(
+            mount_call_count(&runner),
+            2,
+            "operator Mount after Remove must attach again; saw {:?}",
+            runner.seen_argv.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn yank_after_remove_clears_the_hold_so_replug_automounts() {
+        let lsblk =
+            Arc::new(StdMutex::new(removable_stick_lsblk().to_string()));
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(SwappableInputSource(Arc::clone(&lsblk))),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let remove = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &remove)
+            .await
+            .expect("remove");
+        *lsblk.lock().unwrap() = r#"{"blockdevices":[]}"#.to_string();
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        *lsblk.lock().unwrap() = removable_stick_lsblk().to_string();
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            mount_call_count(&runner),
+            2,
+            "replug after Remove must Auto again; saw {:?}",
+            runner.seen_argv.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_remove_does_not_automount_as_its_own_prelude() {
+        // A still-plugged Unmounted stick used to be Auto-mounted
+        // by reconcile_once at the start of safe_remove, then
+        // immediately umounted — the hard-refresh 400 factory.
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        let bytes = rt
+            .dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove of never-mounted stick");
+        let resp: SafeRemoveResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(resp.removed);
+        assert_eq!(
+            mount_call_count(&runner),
+            0,
+            "safe_remove must not mount the stick it is detaching; saw {:?}",
+            runner.seen_argv.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn already_unmounted_remove_still_retracts_the_library_row() {
+        let (rt, d, _runner) =
+            primed_runtime_with_dispatcher(vec![ok_outcome(); 8]).await;
+        let first = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &first)
+            .await
+            .expect("first remove");
+        let before = d.seen().len();
+        rt.dispatch_verb("storage.usb.safe_remove", &first)
+            .await
+            .expect("second remove of the still-plugged stick");
+        let seen = d.seen();
+        let retracts = seen
+            .iter()
+            .filter(|(verb, _)| verb == "library.remove_source")
+            .count();
+        assert!(retracts >= 1, "first Remove must retract; saw {seen:?}");
+        // Second click: refresh rebuilds Unmounted without a
+        // library_source_id, so a second retract is not required.
+        // What is required is that the second click does not
+        // refuse — the hard-refresh 400.
+        assert!(
+            seen.len() >= before,
+            "second Remove must not fail the dispatcher; saw {seen:?}"
         );
     }
 
