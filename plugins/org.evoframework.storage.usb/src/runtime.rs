@@ -906,17 +906,15 @@ impl StorageUsbRuntime {
             || record.class == DriveClass::MountFailedDirty
             || record.class == DriveClass::MountFailedOther
         {
-            // Already off the host. Still retract so MPD does
-            // not keep the tracks, and hold Auto so the next
-            // tick does not put the still-plugged stick back.
-            self.announce_removal(
+            // Already off the host. Still name retract so the
+            // glass can walk; only dispatch when this verb
+            // owns the catalogue drop.
+            self.finish_catalogue_stage(
+                req.retract_library,
                 &req.stable_id,
                 library_source_id,
-                RemovalStage::Retract,
             )
             .await;
-            self.retract_library_source(&req.stable_id, library_source_id)
-                .await;
             {
                 let mut inner = self.inner.lock().await;
                 inner.operator_held_out.insert(req.stable_id.clone());
@@ -1046,24 +1044,16 @@ impl StorageUsbRuntime {
             ),
         }
 
-        // Retract the library source now that the volume is
-        // actually gone, scrubbing the MPD rows with it.
-        //
-        // Order matters: the scrub is an `update` over the
-        // source's path, and MPD only prunes rows whose files
-        // have disappeared. Run it after umount; a walk of a
-        // still-mounted tree would find every file present and
-        // prune nothing. Best-effort: MPD-unreachable is
-        // logged, never fatal, because the volume is already
-        // detached by this point.
-        self.announce_removal(
+        // Catalogue stage after the volume is actually gone.
+        // Sources-page Remove dispatches into audio.library.
+        // Library-page Remove (`retract_library: false`) must
+        // not: that plugin is on this call's stack.
+        self.finish_catalogue_stage(
+            req.retract_library,
             &req.stable_id,
             library_source_id,
-            RemovalStage::Retract,
         )
         .await;
-        self.retract_library_source(&req.stable_id, library_source_id)
-            .await;
 
         // 5. Retract from the in-memory registry + republish.
         //    The periodic reconciler would do this on next detach
@@ -1435,6 +1425,21 @@ impl StorageUsbRuntime {
     // ----------------------------------------------------------
     // repair_filesystem verb
     // ----------------------------------------------------------
+
+    /// Name retract on the subject, then dispatch only when
+    /// this verb owns the catalogue drop.
+    async fn finish_catalogue_stage(
+        &self,
+        retract_library: bool,
+        stable_id: &str,
+        source_id: Option<&str>,
+    ) {
+        self.announce_removal(stable_id, source_id, RemovalStage::Retract)
+            .await;
+        if retract_library {
+            self.retract_library_source(stable_id, source_id).await;
+        }
+    }
 
     /// Retract the drive's library source, scrubbing the MPD
     /// rows with it.
@@ -1899,8 +1904,13 @@ pub enum RemovalStage {
     Eject,
     /// `library.remove_source` with scrub.
     Retract,
-    /// Detach and retract have finished; the volume is safe
-    /// to unplug.
+    /// The volume is off the host and safe to unplug.
+    ///
+    /// Says nothing about who finishes the catalogue drop. A
+    /// Sources-page Remove has already done it by this point;
+    /// a Library-page Remove passed `retract_library: false`
+    /// and completes it in the caller once this verb returns.
+    /// Either way the operator can pull the stick.
     Safe,
 }
 
@@ -2271,6 +2281,19 @@ pub struct SafeRemoveRequest {
     /// Audio ONLINE at 1513 on an unmounted stick.
     #[serde(default)]
     pub library_source_id: Option<String>,
+    /// When false, the caller owns the catalogue drop. Default
+    /// true so a Sources-page Remove still retracts.
+    ///
+    /// Library-page Remove is already inside
+    /// `library.remove_source` on this OOP process. Dispatching
+    /// that verb back from here never runs: eject finishes,
+    /// retract hangs, `list_sources` never answers.
+    #[serde(default = "retract_library_default")]
+    pub retract_library: bool,
+}
+
+fn retract_library_default() -> bool {
+    true
 }
 
 /// `storage.usb.safe_remove` response payload.
@@ -3669,6 +3692,7 @@ mod tests {
             stable_id: "not-a-real-drive".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let bytes = rt
@@ -3718,6 +3742,7 @@ mod tests {
             stable_id: root_id,
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let err = rt
@@ -3783,6 +3808,7 @@ mod tests {
                 // force is on the wire but is not a gate.
                 force: Some(false),
                 library_source_id: None,
+                retract_library: true,
             })
             .unwrap();
             let bytes = rt
@@ -3839,6 +3865,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: Some(true),
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let bytes = rt
@@ -3947,6 +3974,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let bytes = rt
@@ -3981,6 +4009,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -4020,6 +4049,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -4053,6 +4083,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let bytes = rt
@@ -4077,6 +4108,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &first)
@@ -4123,6 +4155,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: Some("audio-701124".to_string()),
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4162,6 +4195,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_owned_remove_does_not_reenter_the_library_shelf() {
+        // Library Remove is already inside remove_source. A
+        // dispatch back into that OOP process is the 17:27:51
+        // hang: eject returns, retract never does, list_sources
+        // never answers.
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let d = Arc::new(PayloadDispatcher::default());
+        rt.attach_shelf_dispatcher(
+            Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
+        );
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+            library_source_id: Some("audio-701124".to_string()),
+            retract_library: false,
+        })
+        .unwrap();
+        rt.dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove");
+        let seen = d.seen();
+        assert!(
+            seen.iter().all(|(verb, _)| verb != "library.remove_source"),
+            "USB must not re-enter audio.library: {seen:?}"
+        );
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let rem = env.removal.expect("physical Safe still names the stick");
+        assert_eq!(rem.stage, RemovalStage::Safe);
+    }
+
+    #[tokio::test]
     async fn the_removal_banner_leaves_with_the_stick() {
         // `safe` is a statement about a device. Once the stick
         // is out, it describes nothing — and holding it would
@@ -4184,6 +4258,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: Some("audio-701124".to_string()),
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4317,6 +4392,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4368,6 +4444,7 @@ mod tests {
             stable_id: "MUSIC".to_string(),
             force: None,
             library_source_id: None,
+            retract_library: true,
         })
         .unwrap();
         let bytes = rt

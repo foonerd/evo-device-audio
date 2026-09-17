@@ -1017,33 +1017,31 @@ pub(crate) async fn handle_remove_source(
             }
         })?;
 
-    // A USB source's Remove is a detach, not a registry edit.
-    //
-    // Dropping the row here would take the card off the glass and
-    // leave the volume mounted and its tracks in MPD's database,
-    // so Local library would keep counting a stick the operator
-    // had just removed. `storage.usb.safe_remove` already owns
-    // that sequence — detach first, then dispatch this verb back
-    // with `scrub_mpd_entries: true` — so hand it over and let
-    // that second call do the registry drop.
+    // A USB source's Remove is a detach, then this same call
+    // drops the catalogue. USB must not dispatch this verb back:
+    // playback.mpd is one OOP process, and a nested
+    // library.remove_source never runs while this call is still
+    // waiting for safe_remove. Field 17:27:51 umount+eject then
+    // silence, glass stuck on retract, refresh Loading sources
+    // forever — that is this wait.
     //
     // Three callers reach this verb with a USB source and they
     // are told apart by two flags, not one:
     //
     //   - the operator's Remove: neither flag, from the shell as
-    //     `source_id` alone. Hands over.
-    //   - safe_remove's own call after the detach: scrub set.
-    //     Falls through, or the two would dispatch each other.
+    //     `source_id` alone. Hands the volume to USB
+    //     (`retract_library: false`), then falls through.
+    //   - Sources-page safe_remove after detach: scrub set.
+    //     Falls through. USB may call us; we do not call USB.
     //   - rename and repair stopping consumers before they touch
     //     the volume: consumer_stop set. Falls through, because
     //     detaching and ejecting a volume that is about to be
     //     fsck'd or remounted is not what they asked for.
-    if !payload.consumer_stop
+    let usb_handover = !payload.consumer_stop
         && !payload.scrub_mpd_entries
-        && matches!(record.kind, SourceKind::LocalUsb { .. })
-    {
-        return remove_usb_via_safe_remove(ctx, &payload.source_id, &record)
-            .await;
+        && matches!(record.kind, SourceKind::LocalUsb { .. });
+    if usb_handover {
+        remove_usb_via_safe_remove(ctx, &payload.source_id, &record).await?;
     }
 
     // Optional MPD scrub: run `update PATH` after unmount so
@@ -1055,7 +1053,8 @@ pub(crate) async fn handle_remove_source(
     // silently did nothing and the stick's tracks stayed in the
     // database — Local library > USB > Audio still listing a
     // volume that had been detached.
-    if payload.scrub_mpd_entries {
+    let scrub = payload.scrub_mpd_entries || usb_handover;
+    if scrub {
         match mpd_database_relative_path(
             &ctx.music_directory,
             &record.mount_path,
@@ -1099,7 +1098,7 @@ pub(crate) async fn handle_remove_source(
     // The scrub above only queued an update job. Wait for MPD to
     // finish pruning before re-counting, or the floor is written
     // from a database that still holds the removed rows.
-    if payload.scrub_mpd_entries && wait_for_scrub_to_settle(conn).await {
+    if scrub && wait_for_scrub_to_settle(conn).await {
         settle_local_internal_counts(ctx, conn).await;
     }
     let _ = ctx.registry.persist().await;
@@ -1114,10 +1113,8 @@ pub(crate) async fn handle_remove_source(
 /// (the wrapper composes it that way), so the leaf of the record's
 /// mount path is the id `storage.usb.safe_remove` expects.
 ///
-/// Returns once safe_remove has answered. That call detaches the
-/// volume and then dispatches `library.remove_source` back with
-/// the scrub flag set, and it is that second call which drops the
-/// registry row — so nothing is removed here.
+/// Returns once the volume is off the host. This caller then
+/// scrubs and drops the row — USB is told not to dispatch back.
 async fn remove_usb_via_safe_remove(
     ctx: &LibraryContext,
     source_id: &str,
@@ -1144,6 +1141,7 @@ async fn remove_usb_via_safe_remove(
     let payload = serde_json::json!({
         "stable_id": stable_id,
         "library_source_id": source_id,
+        "retract_library": false,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|e| VerbError::Mpd {
         verb: "remove_source".into(),
@@ -3559,18 +3557,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_usb_source_hands_over_to_safe_remove() {
+    async fn removing_a_usb_source_hands_over_then_drops_the_row() {
         // The operator's Remove arrives with the scrub flag
-        // false. It must reach the plugin that owns the volume,
-        // and must NOT drop the registry row on the way — that
-        // drop belongs to the call safe_remove makes back.
+        // false. USB owns the volume. This same call then
+        // scrubs and drops — USB must not dispatch back into
+        // this OOP process.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
         let d = Arc::new(RecordingDispatcher::default());
         let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
         ctx.registry
             .register(usb_record("usb-audio", "MUSIC"))
             .await
             .unwrap();
-        let mut conn = mock_conn().await;
 
         handle_remove_source(
             &ctx,
@@ -3592,12 +3615,21 @@ mod tests {
         assert!(
             handed.contains("\"library_source_id\":\"usb-audio\"")
                 || handed.contains("\"library_source_id\": \"usb-audio\""),
-            "glass source id must ride safe_remove or retract no-ops: {handed}"
+            "glass source id must ride safe_remove: {handed}"
         );
         assert!(
-            ctx.registry.get("usb-audio").await.is_some(),
-            "the row must survive the hand-over; safe_remove's own call \
-             drops it after the detach",
+            handed.contains("\"retract_library\":false")
+                || handed.contains("\"retract_library\": false"),
+            "USB must not re-enter this shelf: {handed}"
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "this call drops the row after the volume is gone",
+        );
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must lose the three songs that left with the stick"
         );
     }
 
