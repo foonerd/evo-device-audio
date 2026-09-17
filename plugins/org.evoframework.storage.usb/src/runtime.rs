@@ -1145,9 +1145,12 @@ impl StorageUsbRuntime {
         // 1. Consumer-stop (best-effort).
         if let Some(source_id) = record.library_source_id.as_ref() {
             if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+                // Consumer-stop, not Remove: the volume is
+                // remounted under the new id straight after.
                 let stop_payload = serde_json::json!({
                     "v": 1,
                     "source_id": source_id,
+                    "consumer_stop": true,
                 });
                 if let Ok(bytes) = serde_json::to_vec(&stop_payload) {
                     if let Err(e) = dispatcher
@@ -1414,9 +1417,13 @@ impl StorageUsbRuntime {
         // 1. Consumer-stop — library.remove_source.
         if let Some(source_id) = record.library_source_id.as_ref() {
             if let Some(dispatcher) = self.shelf_dispatcher_clone() {
+                // Consumer-stop, not Remove: fsck runs against
+                // this volume next, so it must not be detached
+                // and ejected on the way.
                 let payload = serde_json::json!({
                     "v": 1,
                     "source_id": source_id,
+                    "consumer_stop": true,
                 });
                 if let Ok(bytes) = serde_json::to_vec(&payload) {
                     if let Err(e) = dispatcher
@@ -3157,6 +3164,157 @@ mod tests {
             ) => {}
             other => panic!("expected SystemLivePartition, got {other:?}"),
         }
+    }
+
+    /// Records the payload of every shelf dispatch.
+    #[derive(Default)]
+    struct PayloadDispatcher {
+        seen: StdMutex<Vec<(String, String)>>,
+    }
+
+    impl PayloadDispatcher {
+        fn seen(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl ShelfRequestDispatcher for PayloadDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.seen.lock().unwrap().push((
+                request_type.to_string(),
+                String::from_utf8_lossy(&payload).into_owned(),
+            ));
+            let body = if request_type == "library.add_source" {
+                serde_json::json!({ "v": 1, "source_id": "usb-music" })
+            } else {
+                serde_json::json!({ "v": 1 })
+            };
+            Box::pin(async move {
+                Ok(serde_json::to_vec(&body).unwrap_or_default())
+            })
+        }
+    }
+
+    /// Build a runtime whose shelf dispatches are recorded, with
+    /// the stick already mounted and carrying a library source.
+    async fn primed_runtime_with_dispatcher(
+        outcomes: Vec<CommandOutcome>,
+    ) -> (
+        Arc<StorageUsbRuntime>,
+        Arc<PayloadDispatcher>,
+        Arc<FakeCommandRunner>,
+    ) {
+        let runner = Arc::new(FakeCommandRunner::new(outcomes));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: String::new(),
+                swaps: String::new(),
+                lsblk_json: removable_stick_lsblk().to_string(),
+            }),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ));
+        let d = Arc::new(PayloadDispatcher::default());
+        rt.attach_shelf_dispatcher(
+            Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
+        );
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        (rt, d, runner)
+    }
+
+    fn ok_outcome() -> CommandOutcome {
+        CommandOutcome {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_stops_consumers_without_removing_the_volume() {
+        // Rename remounts the same volume under a new id. If its
+        // consumer-stop reached safe_remove the volume would be
+        // detached and ejected out from under the remount.
+        let (rt, d, runner) =
+            primed_runtime_with_dispatcher(vec![ok_outcome(); 6]).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "stable_id": "MUSIC",
+            "alias": "Road Trip",
+        }))
+        .unwrap();
+        let _ = rt.dispatch_verb("storage.usb.rename", &payload).await;
+
+        let seen = d.seen();
+        let stop = seen
+            .iter()
+            .find(|(verb, _)| verb == "library.remove_source")
+            .unwrap_or_else(|| panic!("rename must stop consumers: {seen:?}"));
+        assert!(
+            stop.1.contains("\"consumer_stop\":true"),
+            "rename's stop must declare itself a consumer-stop, or the \
+             library side hands it to safe_remove: {}",
+            stop.1,
+        );
+        let argv = runner.seen_argv.lock().unwrap().clone();
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.first().map(String::as_str) == Some("eject")),
+            "rename must not eject the volume: {argv:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_stops_consumers_without_removing_the_volume() {
+        // Repair runs fsck against this volume next.
+        let (rt, d, runner) =
+            primed_runtime_with_dispatcher(vec![ok_outcome(); 6]).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "stable_id": "MUSIC",
+        }))
+        .unwrap();
+        let _ = rt
+            .dispatch_verb("storage.usb.repair_filesystem", &payload)
+            .await;
+
+        let seen = d.seen();
+        let stop = seen
+            .iter()
+            .find(|(verb, _)| verb == "library.remove_source")
+            .unwrap_or_else(|| panic!("repair must stop consumers: {seen:?}"));
+        assert!(
+            stop.1.contains("\"consumer_stop\":true"),
+            "repair's stop must declare itself a consumer-stop: {}",
+            stop.1,
+        );
+        let argv = runner.seen_argv.lock().unwrap().clone();
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.first().map(String::as_str) == Some("eject")),
+            "repair must not eject the volume it is about to fsck: {argv:?}",
+        );
     }
 
     #[tokio::test]

@@ -362,6 +362,19 @@ pub(crate) struct RemoveSourcePayload {
     pub(crate) source_id: String,
     #[serde(default)]
     pub(crate) scrub_mpd_entries: bool,
+    /// The caller is stopping consumers before it mutates the
+    /// volume itself, not removing the source.
+    ///
+    /// `storage.usb`'s rename and repair both drop the library
+    /// source so MPD lets go of the tree, then remount it under a
+    /// new id or run fsck against it. They are not Remove: the
+    /// volume must still be there afterwards.
+    ///
+    /// Defaults to false, so the operator's Remove — which the
+    /// shell sends as `source_id` alone — is unchanged and still
+    /// hands a USB source to `storage.usb.safe_remove`.
+    #[serde(default)]
+    pub(crate) consumer_stop: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1014,12 +1027,19 @@ pub(crate) async fn handle_remove_source(
     // with `scrub_mpd_entries: true` — so hand it over and let
     // that second call do the registry drop.
     //
-    // The scrub flag is what tells the two apart. The operator's
-    // Remove arrives with it false (the shell sends `source_id`
-    // only); safe_remove's own call sets it true, and that call
-    // must fall through to the removal below or the two would
-    // dispatch each other forever.
-    if !payload.scrub_mpd_entries
+    // Three callers reach this verb with a USB source and they
+    // are told apart by two flags, not one:
+    //
+    //   - the operator's Remove: neither flag, from the shell as
+    //     `source_id` alone. Hands over.
+    //   - safe_remove's own call after the detach: scrub set.
+    //     Falls through, or the two would dispatch each other.
+    //   - rename and repair stopping consumers before they touch
+    //     the volume: consumer_stop set. Falls through, because
+    //     detaching and ejecting a volume that is about to be
+    //     fsck'd or remounted is not what they asked for.
+    if !payload.consumer_stop
+        && !payload.scrub_mpd_entries
         && matches!(record.kind, SourceKind::LocalUsb { .. })
     {
         return remove_usb_via_safe_remove(ctx, &payload.source_id, &record)
@@ -3532,6 +3552,7 @@ mod tests {
                 v: LIBRARY_PAYLOAD_VERSION,
                 source_id: "usb-audio".to_string(),
                 scrub_mpd_entries: false,
+                consumer_stop: false,
             },
         )
         .await
@@ -3591,6 +3612,7 @@ mod tests {
                 v: LIBRARY_PAYLOAD_VERSION,
                 source_id: "usb-audio".to_string(),
                 scrub_mpd_entries: true,
+                consumer_stop: false,
             },
         )
         .await
@@ -3608,6 +3630,45 @@ mod tests {
             "the floor must carry the two INTERNAL songs and neither of \
              the three that left with the stick — counted after the prune, \
              not on the update ACK",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consumer_stop_drops_the_row_without_detaching_the_volume() {
+        // rename and repair stop consumers before they touch the
+        // volume: rename remounts it under a new id, repair runs
+        // fsck against it. Handing either to safe_remove would
+        // detach and eject the thing they are about to work on.
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: false,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "a consumer-stop must not reach storage.usb — no detach, no \
+             eject; saw {:?}",
+            d.seen(),
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "the row is dropped so MPD lets go of the tree",
         );
     }
 
@@ -3632,6 +3693,7 @@ mod tests {
                 v: LIBRARY_PAYLOAD_VERSION,
                 source_id: "nas-music".to_string(),
                 scrub_mpd_entries: false,
+                consumer_stop: false,
             },
         )
         .await
