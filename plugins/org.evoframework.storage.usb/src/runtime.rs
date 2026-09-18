@@ -900,6 +900,27 @@ impl StorageUsbRuntime {
             .as_deref()
             .or(record.library_source_id.as_deref());
 
+        // The queue release is the first stage of a Remove and
+        // the reason the umount below can be clean. The caller
+        // owns it; this verb only names it, and only when it was
+        // actually done.
+        if req.release_queue {
+            tracing::debug!(
+                plugin = "storage.usb",
+                stable_id = %req.stable_id,
+                "safe-remove: nothing released the operator queue for this \
+                 volume; a queued track on it holds the mount busy and the \
+                 detach escalates to lazy"
+            );
+        } else {
+            self.announce_removal(
+                &req.stable_id,
+                library_source_id,
+                RemovalStage::Queue,
+            )
+            .await;
+        }
+
         if record.class == DriveClass::Unmounted
             || record.class == DriveClass::Unsupported
             || record.class == DriveClass::MountFailedOversizedVfat
@@ -1898,6 +1919,16 @@ pub struct ListDrivesEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemovalStage {
+    /// The operator queue has been released of this volume's
+    /// tracks.
+    ///
+    /// Named first because it is what makes the detach clean: a
+    /// queued track under the volume is an open file, and an open
+    /// file is EBUSY. Only announced when the caller owns the
+    /// release and has already done it — see
+    /// [`SafeRemoveRequest::release_queue`]. This verb never
+    /// dispatches into `audio.queue` itself.
+    Queue,
     /// Host umount / lazy detach.
     Detach,
     /// SCSI eject of the parent disk.
@@ -2290,9 +2321,33 @@ pub struct SafeRemoveRequest {
     /// retract hangs, `list_sources` never answers.
     #[serde(default = "retract_library_default")]
     pub retract_library: bool,
+    /// Whether this verb owns releasing the operator queue of
+    /// the volume's tracks. Same shape as
+    /// [`Self::retract_library`]: default true, and the caller
+    /// sets false when it has done the work itself.
+    ///
+    /// Library-page Remove releases the queue on its own MPD
+    /// connection before it calls here, so it sends false and
+    /// this verb names [`RemovalStage::Queue`] as done.
+    ///
+    /// Sources-page Remove leaves it true. There is no route
+    /// from here that releases the queue before the detach: the
+    /// only one would be a new prefix-drop verb on
+    /// `audio.queue`, and admitting plugin-system to it means
+    /// `kind = "none"`, which is the reachability question held
+    /// open on `plugin_system_capabilities`. Until that row is
+    /// pulled, a true here releases nothing and no Queue stage
+    /// is announced — the detach on that path escalates to a
+    /// lazy umount exactly as it does today.
+    #[serde(default = "release_queue_default")]
+    pub release_queue: bool,
 }
 
 fn retract_library_default() -> bool {
+    true
+}
+
+fn release_queue_default() -> bool {
     true
 }
 
@@ -3693,6 +3748,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let bytes = rt
@@ -3743,6 +3799,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let err = rt
@@ -3809,6 +3866,7 @@ mod tests {
                 force: Some(false),
                 library_source_id: None,
                 retract_library: true,
+                release_queue: true,
             })
             .unwrap();
             let bytes = rt
@@ -3866,6 +3924,7 @@ mod tests {
             force: Some(true),
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let bytes = rt
@@ -3975,6 +4034,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let bytes = rt
@@ -4010,6 +4070,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -4050,6 +4111,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &remove)
@@ -4084,6 +4146,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let bytes = rt
@@ -4109,6 +4172,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &first)
@@ -4156,6 +4220,7 @@ mod tests {
             force: None,
             library_source_id: Some("audio-701124".to_string()),
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4194,6 +4259,165 @@ mod tests {
         assert_eq!(rem.stage, RemovalStage::Safe);
     }
 
+    /// Records every `removal.stage` the runtime publishes, in
+    /// order, so a test can read the walk the glass would see.
+    #[derive(Default)]
+    struct StageRecorder {
+        stages: StdMutex<Vec<String>>,
+    }
+
+    impl StageRecorder {
+        fn stages(&self) -> Vec<String> {
+            self.stages.lock().unwrap().clone()
+        }
+
+        fn note(&self, state: &serde_json::Value) {
+            if let Some(stage) =
+                state.pointer("/removal/stage").and_then(|s| s.as_str())
+            {
+                let mut g = self.stages.lock().unwrap();
+                if g.last().map(String::as_str) != Some(stage) {
+                    g.push(stage.to_string());
+                }
+            }
+        }
+    }
+
+    impl SubjectAnnouncer for StageRecorder {
+        fn announce<'a>(
+            &'a self,
+            announcement: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.note(&announcement.state);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.note(&state);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn stages_for_safe_remove(
+        release_queue: bool,
+    ) -> (Vec<String>, SafeRemoveResponse) {
+        let runner = Arc::new(FakeCommandRunner::new(Vec::new()));
+        let rt =
+            runtime_with_runner(removable_stick_lsblk(), Arc::clone(&runner));
+        rt.dispatch_verb("storage.usb.list_drives", b"{}")
+            .await
+            .unwrap();
+        let rec = Arc::new(StageRecorder::default());
+        rt.attach_subject_publisher(
+            Arc::clone(&rec) as Arc<dyn SubjectAnnouncer>
+        )
+        .await
+        .unwrap();
+        let payload = serde_json::to_vec(&SafeRemoveRequest {
+            stable_id: "MUSIC".to_string(),
+            force: None,
+            library_source_id: Some("audio-701124".to_string()),
+            retract_library: false,
+            release_queue,
+        })
+        .unwrap();
+        let bytes = rt
+            .dispatch_verb("storage.usb.safe_remove", &payload)
+            .await
+            .expect("remove");
+        (rec.stages(), serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn safe_remove_names_queue_first_when_the_caller_released_it() {
+        // Library Remove releases the operator queue on its own
+        // MPD connection and then calls here with
+        // `release_queue: false`. That release is the first
+        // stage of the Remove — it is what lets the umount below
+        // be clean — so the glass walks it first, and the umount
+        // comes back clean rather than escalating to lazy.
+        let (stages, resp) = stages_for_safe_remove(false).await;
+        assert_eq!(
+            stages,
+            vec![
+                "queue".to_string(),
+                "detach".to_string(),
+                "eject".to_string(),
+                "retract".to_string(),
+                "safe".to_string(),
+            ],
+            "the banner walks queue, then detach / eject / retract / safe",
+        );
+        assert!(resp.removed, "the volume comes off");
+        assert_eq!(
+            resp.forced,
+            Some(false),
+            "nothing of ours was still holding the mount, so the umount \
+             is clean — no lazy detach",
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_remove_does_not_name_a_queue_stage_it_did_not_do() {
+        // Sources-page Remove leaves `release_queue` at its
+        // default. Nothing has released the queue, and this verb
+        // has no route to — naming the stage would put a banner
+        // on work that never happened.
+        let (stages, _) = stages_for_safe_remove(true).await;
+        assert_eq!(
+            stages,
+            vec![
+                "detach".to_string(),
+                "eject".to_string(),
+                "retract".to_string(),
+                "safe".to_string(),
+            ],
+            "no queue stage without a queue release",
+        );
+    }
+
     #[tokio::test]
     async fn library_owned_remove_does_not_reenter_the_library_shelf() {
         // Library Remove is already inside remove_source. A
@@ -4215,6 +4439,7 @@ mod tests {
             force: None,
             library_source_id: Some("audio-701124".to_string()),
             retract_library: false,
+            release_queue: false,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4259,6 +4484,7 @@ mod tests {
             force: None,
             library_source_id: Some("audio-701124".to_string()),
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4393,6 +4619,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
@@ -4445,6 +4672,7 @@ mod tests {
             force: None,
             library_source_id: None,
             retract_library: true,
+            release_queue: true,
         })
         .unwrap();
         let bytes = rt

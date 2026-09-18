@@ -408,6 +408,22 @@ pub(crate) enum ConnBehaviour {
     ///
     /// [`StandardWithSong`]: Self::StandardWithSong
     SongChangesAfterFirstRead { first: String, second: String },
+    /// A live operator queue that can actually be mutated.
+    ///
+    /// `playlistinfo` lists what is in it with `Pos:` and `Id:`,
+    /// `deleteid` takes an entry out, `stop` stops the player,
+    /// and `status` names the current song by position. Every
+    /// command line is recorded, so a test can assert both what
+    /// survived and in which order the work was done.
+    ///
+    /// `items` is `(songid, mpd-relative path)` in queue order;
+    /// `playing` is the position MPD reports as current, or
+    /// `None` for a stopped player.
+    LiveQueue {
+        commands: Arc<Mutex<Vec<String>>>,
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    },
 }
 
 /// Bind a loopback listener and serve incoming connections with
@@ -596,6 +612,66 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     let body = if job_done { &pruned } else { &unpruned };
                     let _ = w.write_all(body.as_bytes()).await;
                 } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::LiveQueue {
+            ref commands,
+            ref items,
+            playing,
+        } => {
+            let mut queue = items.clone();
+            let mut current = playing;
+            let mut state = if playing.is_some() { "play" } else { "stop" };
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                commands.lock().unwrap().push(cmd.clone());
+                if cmd.starts_with("playlistinfo") {
+                    let mut out = String::new();
+                    for (pos, (id, path)) in queue.iter().enumerate() {
+                        out.push_str(&format!(
+                            "file: {path}\nPos: {pos}\nId: {id}\n"
+                        ));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("status") {
+                    let mut out = format!(
+                        "state: {state}\nplaylistlength: {}\n",
+                        queue.len()
+                    );
+                    if let Some(pos) = current {
+                        out.push_str(&format!("song: {pos}\n"));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("deleteid") {
+                    let id = cmd
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|t| t.trim_matches('"').parse::<u32>().ok());
+                    if let Some(id) = id {
+                        queue.retain(|(qid, _)| *qid != id);
+                    }
+                    if current.is_some_and(|p| p as usize >= queue.len()) {
+                        current = None;
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("stop") {
+                    state = "stop";
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("idle") {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
                 } else {

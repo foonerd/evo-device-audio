@@ -1003,6 +1003,7 @@ fn sanitise_id(name: &str) -> String {
 
 pub(crate) async fn handle_remove_source(
     ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
     conn: &mut MpdConnection,
     payload: RemoveSourcePayload,
 ) -> Result<(), VerbError> {
@@ -1041,6 +1042,12 @@ pub(crate) async fn handle_remove_source(
         && !payload.scrub_mpd_entries
         && matches!(record.kind, SourceKind::LocalUsb { .. });
     if usb_handover {
+        // MPD holds every queued track under the stick's tree as
+        // an open file, and an open file is what turns the clean
+        // umount into EBUSY and then a lazy detach. The queue is
+        // released here, before the volume is handed over, so the
+        // detach that follows has nothing of ours to fight.
+        release_queue_for_source(queue, ctx, conn, &record).await;
         remove_usb_via_safe_remove(ctx, &payload.source_id, &record).await?;
     }
 
@@ -1106,6 +1113,72 @@ pub(crate) async fn handle_remove_source(
     Ok(())
 }
 
+/// Release the operator queue of one source's tracks.
+///
+/// Best-effort throughout, and deliberately so: the operator
+/// asked for the volume to come off. A queue that could not be
+/// read is a dirtier detach — the wrapper escalates to a lazy
+/// umount — but it is not a reason to refuse the gesture and
+/// leave the stick stranded with nothing left to click. Same
+/// posture as the MPD scrub in [`handle_remove_source`].
+///
+/// A source whose mount is not under `music_directory` has no
+/// MPD-addressable prefix, so there is nothing of it in the
+/// queue to release.
+///
+/// The release has to happen before the detach is asked for —
+/// that is the whole point of it — so a detach that then
+/// refuses (a busy volume whose holders are not us, a
+/// system-live partition) leaves the operator with a queue that
+/// has already lost those tracks and a volume still mounted.
+/// The files are untouched and can be queued again; buying the
+/// alternative would mean releasing after the umount, which is
+/// exactly the ordering this exists to fix.
+async fn release_queue_for_source(
+    queue: &crate::queue::QueueContext,
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    record: &SourceRecord,
+) {
+    let prefix = match mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %record.id,
+                error = %e,
+                "library.remove_source: source is not under \
+                 music_directory; MPD cannot address it, so it has \
+                 nothing in the queue to release"
+            );
+            return;
+        }
+    };
+    match crate::queue::drop_queue_items_under(queue, conn, &prefix).await {
+        Ok(0) => {}
+        Ok(dropped) => tracing::info!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            dropped,
+            "library.remove_source: released the queue of this \
+             source's tracks before the detach"
+        ),
+        Err(e) => tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            error = %e,
+            "library.remove_source: queue release failed; the detach \
+             still proceeds and may escalate to a lazy umount"
+        ),
+    }
+}
+
 /// Hand a USB source's removal to the plugin that owns the
 /// volume.
 ///
@@ -1142,6 +1215,11 @@ async fn remove_usb_via_safe_remove(
         "stable_id": stable_id,
         "library_source_id": source_id,
         "retract_library": false,
+        // This call released the queue a moment ago, on its own
+        // connection. USB must not reach back for it: audio.queue
+        // is this same OOP process, and a dispatch into it from
+        // here is the nested-verb wait all over again.
+        "release_queue": false,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|e| VerbError::Mpd {
         verb: "remove_source".into(),
@@ -3533,6 +3611,61 @@ mod tests {
             .unwrap()
     }
 
+    /// A queue context over the same registry the library
+    /// context holds, so a queue item under a registered mount
+    /// resolves to that source the way it does in the process.
+    fn queue_ctx_for(ctx: &LibraryContext) -> crate::queue::QueueContext {
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::new(NullAnn) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            ctx.registry.clone(),
+            disposition,
+        );
+        crate::queue::QueueContext::new(
+            ctx.music_directory.clone(),
+            ctx.registry.clone(),
+            Arc::new(NullAnn),
+            skip,
+            None,
+        )
+    }
+
+    /// Connect to a mock serving one live operator queue and
+    /// hand back the connection plus the command log.
+    async fn live_queue_conn(
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    ) -> (MpdConnection, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items,
+                playing,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        (conn, commands)
+    }
+
+    /// What `playlistinfo` would answer now — the mock's queue
+    /// after whatever the call under test did to it.
+    async fn remaining_queue(conn: &mut MpdConnection) -> Vec<String> {
+        conn.playlistinfo()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.file_path)
+            .collect()
+    }
+
     fn usb_record(id: &str, leaf: &str) -> SourceRecord {
         SourceRecord {
             id: id.to_string(),
@@ -3597,6 +3730,7 @@ mod tests {
 
         handle_remove_source(
             &ctx,
+            &queue_ctx_for(&ctx),
             &mut conn,
             RemoveSourcePayload {
                 v: LIBRARY_PAYLOAD_VERSION,
@@ -3674,6 +3808,7 @@ mod tests {
 
         handle_remove_source(
             &ctx,
+            &queue_ctx_for(&ctx),
             &mut conn,
             RemoveSourcePayload {
                 v: LIBRARY_PAYLOAD_VERSION,
@@ -3716,6 +3851,7 @@ mod tests {
 
         handle_remove_source(
             &ctx,
+            &queue_ctx_for(&ctx),
             &mut conn,
             RemoveSourcePayload {
                 v: LIBRARY_PAYLOAD_VERSION,
@@ -3755,6 +3891,7 @@ mod tests {
 
         handle_remove_source(
             &ctx,
+            &queue_ctx_for(&ctx),
             &mut conn,
             RemoveSourcePayload {
                 v: LIBRARY_PAYLOAD_VERSION,
@@ -3768,6 +3905,290 @@ mod tests {
 
         assert!(d.seen().is_empty(), "only a USB source hands over");
         assert!(ctx.registry.get("nas-music").await.is_none());
+    }
+
+    /// A dispatcher that writes into the same log the mock MPD
+    /// records commands in, so one ordered sequence shows both
+    /// what was asked of MPD and when the volume was handed
+    /// over.
+    struct OrderedDispatcher {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ShelfRequestDispatcher for OrderedDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let body = String::from_utf8_lossy(&payload).into_owned();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("DISPATCH {request_type} {body}"));
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn ctx_logging_to(
+        log: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> LibraryContext {
+        let d = Arc::new(OrderedDispatcher {
+            log: Arc::clone(log),
+        });
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(d as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    fn remove_payload(
+        source_id: &str,
+        consumer_stop: bool,
+    ) -> RemoveSourcePayload {
+        RemoveSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            source_id: source_id.to_string(),
+            scrub_mpd_entries: false,
+            consumer_stop,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_drops_the_sticks_queue_items_before_the_handover() {
+        // Three tracks off the stick queued, the second of them
+        // playing. Remove takes all three out and stops the
+        // player before storage.usb is asked for the volume: a
+        // queued track is an open file, and an open file is the
+        // EBUSY that turns a clean umount into a lazy detach.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+                (13, "USB/MUSIC/c.flac".to_string()),
+            ],
+            Some(1),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            remaining_queue(&mut conn).await.is_empty(),
+            "every queue item under the stick must be gone",
+        );
+
+        let seen = log.lock().unwrap().clone();
+        let deletes = seen.iter().filter(|c| c.starts_with("deleteid")).count();
+        assert_eq!(deletes, 3, "one deleteid per queued track: {seen:?}");
+        let handover = seen
+            .iter()
+            .position(|c| c.starts_with("DISPATCH storage.usb.safe_remove"))
+            .expect("the volume must still be handed over");
+        let last_delete = seen
+            .iter()
+            .rposition(|c| c.starts_with("deleteid"))
+            .expect("deleteid");
+        assert!(
+            last_delete < handover,
+            "the queue is released before the detach, not after: {seen:?}",
+        );
+        let stop = seen
+            .iter()
+            .position(|c| c.starts_with("stop"))
+            .expect("the playing track was about to be deleted");
+        assert!(
+            stop < last_delete,
+            "stop the player before pulling its song out: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("clear")),
+            "clear would take INTERNAL with it: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usb_remove_leaves_the_internal_tracks_in_the_queue() {
+        // Mixed queue, INTERNAL playing. The stick's two tracks
+        // go; both INTERNAL tracks stay, in order, and the
+        // player is not stopped — it is not playing the thing
+        // that is leaving.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "INTERNAL/one.flac".to_string()),
+                (12, "USB/MUSIC/a.flac".to_string()),
+                (13, "INTERNAL/two.flac".to_string()),
+                (14, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/one.flac".to_string(),
+                "INTERNAL/two.flac".to_string(),
+            ],
+            "INTERNAL is not this source and does not leave with it",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "the current song was INTERNAL; nothing to stop for: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_one_stick_does_not_take_the_neighbours_tracks() {
+        // `USB/MUSIC` is not a string prefix of the queue — it
+        // is a path prefix. `USB/MUSIC2` is a different volume.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC2/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio-2", "MUSIC2"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["USB/MUSIC2/b.flac".to_string()],
+            "the neighbouring stick's track stays queued",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remove_on_an_empty_queue_still_hands_the_volume_over() {
+        let (mut conn, log) = live_queue_conn(vec![], None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("deleteid")),
+            "nothing was queued, so nothing is deleted: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c.starts_with("DISPATCH storage.usb.safe_remove")),
+            "an empty queue does not stop the detach: {seen:?}",
+        );
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_consumer_stop_leaves_the_operator_queue_alone() {
+        // rename and repair put the volume back. Emptying the
+        // operator's queue on the way through would be a Remove
+        // they did not ask for.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "USB/MUSIC/a.flac".to_string(),
+                "USB/MUSIC/b.flac".to_string(),
+            ],
+            "a consumer-stop is not a Remove; the queue is untouched",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "nor is the player stopped: {seen:?}",
+        );
     }
 
     #[test]

@@ -1050,9 +1050,14 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let payload: library::RemoveSourcePayload = parse_json(req)?;
         let mut conn = self.open_conn().await?;
-        library::handle_remove_source(&self.library, &mut conn, payload)
-            .await
-            .map_err(library_verb_to_plugin_error)?;
+        library::handle_remove_source(
+            &self.library,
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
         encode_ok_response(req)
     }
 

@@ -69,7 +69,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::library::LIBRARY_PAYLOAD_VERSION;
-use crate::mpd::{MpdConnection, MpdLibraryEntry};
+use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
 
@@ -1778,6 +1778,82 @@ pub(crate) async fn handle_clear_queue(
     Ok(())
 }
 
+/// Drop every queue item that lives under one source's
+/// MPD-relative prefix.
+///
+/// The operator's USB Remove takes the volume off the host, and
+/// MPD is a consumer of that volume: a queued track under the
+/// stick's tree is an open file, and an open file is what turns
+/// a clean umount into EBUSY and then a lazy detach. Releasing
+/// those items first is what lets the umount be clean.
+///
+/// Matching is on segment boundaries, not raw string prefix, so
+/// removing `USB/Stick` does not carry `USB/Stick2/track.flac`
+/// out with it. An empty prefix addresses the whole database and
+/// drops nothing: that gesture is [`handle_clear_queue`], which
+/// would take INTERNAL with it, and a source removal is never
+/// that.
+///
+/// When the current song is one of the doomed items the player
+/// is stopped first, so MPD does not auto-advance into whatever
+/// happens to follow while the tree is being pulled out from
+/// under it.
+///
+/// Returns how many items were dropped, and publishes the queue
+/// only when at least one was — a Remove of a source with
+/// nothing queued must not emit an envelope that says nothing
+/// new.
+pub(crate) async fn drop_queue_items_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    prefix: &str,
+) -> Result<usize, VerbError> {
+    if prefix.is_empty() {
+        return Ok(0);
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "remove_source".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let doomed: Vec<&MpdQueueItem> = items
+        .iter()
+        .filter(|i| queue_path_is_under(&i.file_path, prefix))
+        .collect();
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    if let Some(current) = status.song_position {
+        if doomed.iter().any(|i| i.position == current) {
+            conn.stop().await.map_err(|e| mpd(e, "stop"))?;
+        }
+    }
+    let dropped = doomed.len();
+    for item in doomed {
+        conn.deleteid(item.id)
+            .await
+            .map_err(|e| mpd(e, "deleteid"))?;
+    }
+    publish_queue(ctx, conn).await;
+    Ok(dropped)
+}
+
+/// True when `file_path` is `prefix` itself or sits beneath it.
+///
+/// Segment-aware: `USB/Stick` contains `USB/Stick/a.flac` but not
+/// `USB/Stick2/a.flac`. A raw `starts_with` would take the
+/// neighbouring stick's tracks out of the queue too.
+fn queue_path_is_under(file_path: &str, prefix: &str) -> bool {
+    match file_path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
 /// `queue.load_playlist_to_queue` — replace queue with stored
 /// playlist contents. Mixed-source playlists load full; the
 /// per-item availability flag handles runtime state.
@@ -2579,6 +2655,24 @@ mod tests {
             serde_json::from_value(json).unwrap();
         assert_eq!(payload.v, 1);
         assert_eq!(payload.position, 3);
+    }
+
+    #[test]
+    fn a_source_prefix_matches_on_path_segments_not_characters() {
+        // The stick being removed is `USB/MUSIC`. Everything
+        // under it goes; the neighbouring volume whose name
+        // merely starts with the same characters does not.
+        assert!(queue_path_is_under("USB/MUSIC/a.flac", "USB/MUSIC"));
+        assert!(queue_path_is_under("USB/MUSIC/sub/a.flac", "USB/MUSIC"));
+        assert!(queue_path_is_under("USB/MUSIC", "USB/MUSIC"));
+        assert!(!queue_path_is_under("USB/MUSIC2/a.flac", "USB/MUSIC"));
+        assert!(!queue_path_is_under("USB/MUSICAL/a.flac", "USB/MUSIC"));
+        assert!(!queue_path_is_under("INTERNAL/a.flac", "USB/MUSIC"));
+        // Stream URIs live under no mount at all.
+        assert!(!queue_path_is_under(
+            "http://example.com/a.flac",
+            "USB/MUSIC"
+        ));
     }
 
     #[test]
