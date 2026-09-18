@@ -411,10 +411,12 @@ pub(crate) enum ConnBehaviour {
     /// A live operator queue that can actually be mutated.
     ///
     /// `playlistinfo` lists what is in it with `Pos:` and `Id:`,
-    /// `deleteid` takes an entry out, `stop` stops the player,
-    /// and `status` names the current song by position. Every
-    /// command line is recorded, so a test can assert both what
-    /// survived and in which order the work was done.
+    /// `deleteid` takes an entry out, `play <pos>` selects and
+    /// starts, `stop` stops, `currentsong` answers with the
+    /// selected entry, and `status` names the current song by
+    /// position. Every command line is recorded, so a test can
+    /// assert both what survived and in which order the work was
+    /// done.
     ///
     /// `items` is `(songid, mpd-relative path)` in queue order;
     /// `playing` is the position MPD reports as current, or
@@ -670,6 +672,29 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     let _ = w.write_all(b"OK\n").await;
                 } else if cmd.starts_with("stop") {
                     state = "stop";
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("currentsong") {
+                    // Ordered after `playlistinfo` and before
+                    // `play`: MPD's queue verbs share prefixes
+                    // and the first match wins.
+                    let out =
+                        match current.and_then(|pos| queue.get(pos as usize)) {
+                            Some((_, path)) => format!(
+                                "file: {path}\nTitle: T\nArtist: A\nAlbum: X\n\
+                             Time: 180\nduration: 180.000\nOK\n"
+                            ),
+                            None => "OK\n".to_string(),
+                        };
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("play") {
+                    let pos = cmd
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|t| t.trim_matches('"').parse::<u32>().ok());
+                    if let Some(p) = pos {
+                        current = Some(p);
+                    }
+                    state = "play";
                     let _ = w.write_all(b"OK\n").await;
                 } else if cmd.starts_with("idle") {
                     tokio::time::sleep(Duration::from_secs(60)).await;

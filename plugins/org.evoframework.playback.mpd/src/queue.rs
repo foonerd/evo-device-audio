@@ -2022,11 +2022,20 @@ pub(crate) async fn handle_skip_to_next_available(
 /// regardless of prior state (Stop / Pause / already-Playing at
 /// a different position).
 ///
-/// After a successful dispatch, the queue subject is refreshed
-/// so the operator UI's Queue panel reflects the new
-/// `current_position` immediately (the `audio_now_playing`
-/// subject also republishes via the playback shelf's idle-wake
-/// path — no explicit fan-out is needed here).
+/// After a successful dispatch this call publishes both
+/// subjects on its own stack: now_playing first, because the
+/// track the operator just addressed is the hero surface, then
+/// the queue so the Queue panel's `current_position` follows.
+///
+/// The now_playing publish is not redundant with the idle-wake
+/// path. This verb drives MPD on the shelf's own connection, so
+/// the custody supervisor learns of the transport change only
+/// when MPD's `player` idle event reaches it — the operator taps
+/// a track and watches the now-playing surface sit on the
+/// previous one until that wake lands. Reading `status` +
+/// `currentsong` here and publishing through the warden's own
+/// renderer closes that gap without racing it: a later idle-wake
+/// publish carries the same state.
 ///
 /// Shuffle-active behaviour: MPD's `play <pos>` addresses the
 /// operator-facing queue position regardless of `random 1`; the
@@ -2051,8 +2060,62 @@ pub(crate) async fn handle_play_from_position(
             verb: "play_from_position".to_string(),
             reason: e.to_string(),
         })?;
+    publish_now_playing_after_transport(ctx, conn, "play_from_position").await;
     publish_queue(ctx, conn).await;
     Ok(())
+}
+
+/// Read the player and publish now_playing, for a verb that has
+/// just changed MPD's transport on this shelf's own connection.
+///
+/// Best-effort: the transport change has already happened and
+/// the verb has already succeeded. A failed read here costs the
+/// operator the prompt update, not the gesture — the next idle
+/// wake publishes the same state.
+///
+/// `muted` is the supervisor's task-local toggle and is not
+/// readable from MPD, so this publishes false exactly as the
+/// ambient observer does; the operator's mute intent reaches the
+/// subject from the custody-held supervisor's own reports.
+async fn publish_now_playing_after_transport(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    verb: &str,
+) {
+    let status = match conn.status().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb,
+                error = %e,
+                "status read failed after transport change; now_playing \
+                 waits for the next idle wake"
+            );
+            return;
+        }
+    };
+    let song = match conn.current_song().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb,
+                error = %e,
+                "currentsong read failed after transport change; \
+                 now_playing waits for the next idle wake"
+            );
+            return;
+        }
+    };
+    let muted_unknown_outside_the_supervisor = false;
+    crate::playback_supervisor::publish_now_playing_from_mpd(
+        &ctx.subjects,
+        status,
+        song,
+        muted_unknown_outside_the_supervisor,
+    )
+    .await;
 }
 
 // ----- tests -----
@@ -2655,6 +2718,243 @@ mod tests {
             serde_json::from_value(json).unwrap();
         assert_eq!(payload.v, 1);
         assert_eq!(payload.position, 3);
+    }
+
+    /// Records every subject state update in call order, so a
+    /// test can read what a verb published, on which subject,
+    /// and in which order.
+    #[derive(Default)]
+    struct RecordingAnn {
+        updates: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingAnn {
+        /// The addressing values published, in order.
+        fn subjects_touched(&self) -> Vec<String> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(v, _)| v.clone())
+                .collect()
+        }
+
+        /// The states published on one addressing value.
+        fn states_on(&self, value: &str) -> Vec<serde_json::Value> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(v, _)| v == value)
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+    }
+
+    impl SubjectAnnouncer for RecordingAnn {
+        fn announce<'a>(
+            &'a self,
+            _a: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.updates.lock().unwrap().push((addressing.value, state));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn play_from_position_publishes_now_playing_on_its_own_stack() {
+        // Tap-to-play drives MPD on the shelf's own connection,
+        // so the custody supervisor does not hear about the
+        // transport change until MPD's next `player` idle event.
+        // The verb publishes now_playing itself rather than
+        // leaving the hero surface on the previous track until
+        // that wake lands.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                    (13, "INTERNAL/c.flac".to_string()),
+                ],
+                playing: None,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+        );
+
+        handle_play_from_position(
+            &ctx,
+            &mut conn,
+            PlayFromPositionPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                position: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after play <pos>: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac",
+            "the track named is the one the operator addressed: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_play_from_position_publishes_nothing() {
+        // Out of range refuses before MPD is touched. A verb
+        // that changed nothing must not move either subject.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/a.flac".to_string())],
+                playing: None,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+        );
+
+        handle_play_from_position(
+            &ctx,
+            &mut conn,
+            PlayFromPositionPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                position: 7,
+            },
+        )
+        .await
+        .expect_err("position 7 of a one-item queue refuses");
+
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing changed, so nothing is published: {:?}",
+            ann.subjects_touched(),
+        );
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            // `playlistinfo` is the pre-validation read and also
+            // starts with "play" — match the command word, not
+            // its prefix.
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("play")),
+            "MPD is left untouched beyond the pre-validation read: {seen:?}",
+        );
     }
 
     #[test]

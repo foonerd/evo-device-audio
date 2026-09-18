@@ -54,4 +54,6 @@ pub(crate) use startup_volume::{
     spawn as spawn_startup_volume_applier, StartupVolume,
     StartupVolumeApplierHandle,
 };
-pub(crate) use subject_emitter::{render_now_playing_state, SubjectEmitter};
+pub(crate) use subject_emitter::{
+    publish_now_playing_from_mpd, render_now_playing_state, SubjectEmitter,
+};
