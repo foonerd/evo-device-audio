@@ -411,12 +411,13 @@ pub(crate) enum ConnBehaviour {
     /// A live operator queue that can actually be mutated.
     ///
     /// `playlistinfo` lists what is in it with `Pos:` and `Id:`,
-    /// `deleteid` takes an entry out, `play <pos>` selects and
-    /// starts, `stop` stops, `currentsong` answers with the
-    /// selected entry, and `status` names the current song by
-    /// position. Every command line is recorded, so a test can
-    /// assert both what survived and in which order the work was
-    /// done.
+    /// `addid` inserts (refusing a position past the end with
+    /// MPD's Bad song index ACK), `deleteid` takes an entry out,
+    /// `play <pos>` selects and starts, `stop` stops,
+    /// `currentsong` answers with the selected entry, and
+    /// `status` names the current song by position. Every
+    /// command line is recorded, so a test can assert both what
+    /// survived and in which order the work was done.
     ///
     /// `items` is `(songid, mpd-relative path)` in queue order;
     /// `playing` is the position MPD reports as current, or
@@ -630,6 +631,8 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
             let mut queue = items.clone();
             let mut current = playing;
             let mut state = if playing.is_some() { "play" } else { "stop" };
+            let mut next_id =
+                queue.iter().map(|(id, _)| *id).max().unwrap_or(99) + 1;
             let mut line = String::new();
             loop {
                 line.clear();
@@ -673,6 +676,32 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                 } else if cmd.starts_with("stop") {
                     state = "stop";
                     let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("addid") {
+                    // `addid "<uri>" ["<pos>"]`. MPD refuses a
+                    // position past the end with a Bad song
+                    // index ACK — the mock refuses it the same
+                    // way, so a test sees the operator's
+                    // refusal rather than a silent success.
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("addid")
+                    });
+                    let uri = args.next().unwrap_or_default().to_string();
+                    let pos =
+                        args.next().and_then(|t| t.trim().parse::<u32>().ok());
+                    let at = pos.unwrap_or(queue.len() as u32) as usize;
+                    if at > queue.len() {
+                        let _ = w
+                            .write_all(b"ACK [2@0] {addid} Bad song index\n")
+                            .await;
+                    } else {
+                        queue.insert(at, (next_id, uri));
+                        let _ = w
+                            .write_all(
+                                format!("Id: {next_id}\nOK\n").as_bytes(),
+                            )
+                            .await;
+                        next_id += 1;
+                    }
                 } else if cmd.starts_with("currentsong") {
                     // Ordered after `playlistinfo` and before
                     // `play`: MPD's queue verbs share prefixes

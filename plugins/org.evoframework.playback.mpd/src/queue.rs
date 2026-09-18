@@ -727,27 +727,27 @@ pub(crate) async fn handle_enqueue(
     for uri in &payload.uris {
         resolved.push(resolve_uri_for_mpd(ctx, "enqueue", uri).await?);
     }
-    if let Some(start_pos) = payload.position {
-        let mut current = start_pos;
-        for r in &resolved {
-            let id = conn.addid(&r.uri, Some(current)).await.map_err(|e| {
-                VerbError::Mpd {
-                    verb: "enqueue".to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
-            apply_resolved_tags(conn, id, r).await;
-            current = current.saturating_add(1);
-        }
-    } else {
-        for r in &resolved {
-            let id =
-                conn.addid(&r.uri, None).await.map_err(|e| VerbError::Mpd {
-                    verb: "enqueue".to_string(),
-                    reason: e.to_string(),
-                })?;
-            apply_resolved_tags(conn, id, r).await;
-        }
+    // A requested position is an insert after something. With
+    // no current index there is nothing to insert after: the
+    // queue is empty or stopped, `addid <uri> "1"` against it is
+    // a Bad song index ACK, and that ACK is the refusal the
+    // operator meets on Play Next into an empty queue. Fall back
+    // to the tail, which is where "next" lands when there is no
+    // current track. An omitted position still appends, as it
+    // always did, and costs no extra round-trip.
+    let mut at = match payload.position {
+        Some(requested) => next_insert_position(conn, "enqueue")
+            .await?
+            .map(|_| requested),
+        None => None,
+    };
+    for r in &resolved {
+        let id = conn.addid(&r.uri, at).await.map_err(|e| VerbError::Mpd {
+            verb: "enqueue".to_string(),
+            reason: e.to_string(),
+        })?;
+        apply_resolved_tags(conn, id, r).await;
+        at = at.map(|p| p.saturating_add(1));
     }
     publish_queue(ctx, conn).await;
     Ok(())
@@ -883,16 +883,14 @@ async fn handle_enqueue_selection_criteria(
             apply_append(conn, &resolved, &uris).await?;
         }
         EnqueueSelectionMode::Next => {
-            let start_pos = current_song_position(conn).await? + 1;
-            let mut current = start_pos;
+            let mut at =
+                next_insert_position(conn, "enqueue_selection").await?;
             for uri in &uris {
-                conn.addid(uri, Some(current)).await.map_err(|e| {
-                    VerbError::Mpd {
-                        verb: "enqueue_selection".to_string(),
-                        reason: e.to_string(),
-                    }
+                conn.addid(uri, at).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".to_string(),
+                    reason: e.to_string(),
                 })?;
-                current = current.saturating_add(1);
+                at = at.map(|p| p.saturating_add(1));
             }
         }
         EnqueueSelectionMode::Replace => {
@@ -1251,18 +1249,17 @@ async fn handle_enqueue_selection_container(
             }
         }
         EnqueueSelectionMode::Next => {
-            let start_pos = current_song_position(conn).await? + 1;
-            let mut current = start_pos;
+            let mut at =
+                next_insert_position(conn, "enqueue_selection").await?;
             for r in &resolved {
-                let id =
-                    conn.addid(&r.uri, Some(current)).await.map_err(|e| {
-                        VerbError::Mpd {
-                            verb: "enqueue_selection".into(),
-                            reason: e.to_string(),
-                        }
-                    })?;
+                let id = conn.addid(&r.uri, at).await.map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: e.to_string(),
+                    }
+                })?;
                 apply_resolved_tags(conn, id, r).await;
-                current = current.saturating_add(1);
+                at = at.map(|p| p.saturating_add(1));
             }
         }
         EnqueueSelectionMode::Replace => {
@@ -1721,14 +1718,28 @@ async fn materialise_to_uris(
     }
 }
 
-async fn current_song_position(
+/// Where a `Next` insert goes, given what the player is doing.
+///
+/// `Some(current + 1)` when MPD reports a current song: the
+/// insert lands directly after it. `None` when nothing is
+/// current — an empty or stopped queue has no "after this", and
+/// `addid <uri> "1"` against it is a Bad song index ACK. That
+/// ACK is the refusal the operator meets when they Play Next
+/// into an empty queue, and appending is what "next" means when
+/// there is no current track to follow.
+///
+/// `None` is also what the caller hands straight to `addid`, so
+/// the empty-queue case needs no second code path: the batch
+/// appends in selection order.
+async fn next_insert_position(
     conn: &mut MpdConnection,
-) -> Result<u32, VerbError> {
+    verb: &str,
+) -> Result<Option<u32>, VerbError> {
     let status = conn.status().await.map_err(|e| VerbError::Mpd {
-        verb: "enqueue_selection".to_string(),
+        verb: verb.to_string(),
         reason: e.to_string(),
     })?;
-    Ok(status.song_position.unwrap_or(0))
+    Ok(status.song_position.map(|p| p.saturating_add(1)))
 }
 
 /// `queue.remove_queue_item` — delete by songid.
@@ -2166,6 +2177,252 @@ mod tests {
                 .await
                 .unwrap();
         (conn, log)
+    }
+
+    /// A queue context over a live-queue mock, with the mock's
+    /// command log. Everything the Next proofs need and nothing
+    /// they do not.
+    async fn next_harness(
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    ) -> (
+        QueueContext,
+        MpdConnection,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items,
+                playing,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            ann as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+        );
+        (ctx, conn, commands)
+    }
+
+    /// The queue as the mock now holds it, in order.
+    async fn queue_paths(conn: &mut MpdConnection) -> Vec<String> {
+        conn.playlistinfo()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.file_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn play_next_on_a_file_places_it_after_the_current_track() {
+        // The row: the URI Add-to-queue takes must Play Next
+        // without a refusal, and it lands after the current
+        // track rather than at the tail.
+        let (ctx, mut conn, log) = next_harness(
+            vec![
+                (11, "INTERNAL/a.flac".to_string()),
+                (12, "INTERNAL/b.flac".to_string()),
+                (13, "INTERNAL/c.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec!["INTERNAL/new.flac".to_string()],
+                position: Some(1),
+            },
+        )
+        .await
+        .expect("Play Next on a file must not refuse");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/a.flac".to_string(),
+                "INTERNAL/new.flac".to_string(),
+                "INTERNAL/b.flac".to_string(),
+                "INTERNAL/c.flac".to_string(),
+            ],
+            "Next lands directly after the current track",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|c| c.contains("addid") && c.contains("\"1\"")),
+            "placed by position, not appended: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_file_uri_appends_when_no_position_is_given() {
+        // Add to queue is the same verb without a position. It
+        // must keep appending, and must not read status to do
+        // it.
+        let (ctx, mut conn, _log) =
+            next_harness(vec![(11, "INTERNAL/a.flac".to_string())], Some(0))
+                .await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec!["INTERNAL/new.flac".to_string()],
+                position: None,
+            },
+        )
+        .await
+        .expect("Add to queue");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/a.flac".to_string(),
+                "INTERNAL/new.flac".to_string(),
+            ],
+            "an omitted position still appends",
+        );
+    }
+
+    #[tokio::test]
+    async fn play_next_on_an_empty_queue_appends_and_never_addids_at_one() {
+        // Nothing is current, so there is no "after this". MPD
+        // answers `addid <uri> "1"` on an empty queue with a Bad
+        // song index ACK — that ACK is the refusal the operator
+        // meets. Next appends instead.
+        let (ctx, mut conn, log) = next_harness(Vec::new(), None).await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec![
+                    "INTERNAL/one.flac".to_string(),
+                    "INTERNAL/two.flac".to_string(),
+                ],
+                position: Some(1),
+            },
+        )
+        .await
+        .expect("Play Next into an empty queue must not refuse");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/one.flac".to_string(),
+                "INTERNAL/two.flac".to_string(),
+            ],
+            "both tracks land, in order",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .filter(|c| c.starts_with("addid"))
+                .all(|c| !c.contains("\"1\"")),
+            "no addid at position 1 against an empty queue: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_next_on_an_empty_queue_appends_the_files() {
+        // Album / artist / genre Next resolves to a file list
+        // and walks it with addid. The same empty-queue rule
+        // applies, or the operator gets the refusal on every
+        // facet as well as on a file.
+        let (_ctx, mut conn, log) = next_harness(Vec::new(), None).await;
+
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "INTERNAL/album/01.flac".to_string(),
+            "INTERNAL/album/02.flac".to_string(),
+        ]);
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Album,
+        )
+        .await
+        .expect("an album already resolves to files");
+
+        let mut at = next_insert_position(&mut conn, "enqueue_selection")
+            .await
+            .expect("status");
+        assert_eq!(at, None, "an empty queue has no track to follow");
+        for uri in &uris {
+            conn.addid(uri, at).await.expect("no refusal");
+            at = at.map(|p| p.saturating_add(1));
+        }
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/album/01.flac".to_string(),
+                "INTERNAL/album/02.flac".to_string(),
+            ],
+            "the album's files land in order",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("addid")),
+            "the files were placed: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("listallinfo")),
+            "an album is already a file list; do not walk it: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn next_insert_position_follows_the_current_track() {
+        // The whole rule in one read: a current index means
+        // insert after it; no current index means append.
+        let (_ctx, mut conn, _log) = next_harness(
+            vec![
+                (11, "INTERNAL/a.flac".to_string()),
+                (12, "INTERNAL/b.flac".to_string()),
+            ],
+            Some(1),
+        )
+        .await;
+        assert_eq!(
+            next_insert_position(&mut conn, "enqueue").await.unwrap(),
+            Some(2),
+            "after the current track, not at it",
+        );
+
+        let (_ctx2, mut stopped, _log2) =
+            next_harness(vec![(11, "INTERNAL/a.flac".to_string())], None).await;
+        assert_eq!(
+            next_insert_position(&mut stopped, "enqueue").await.unwrap(),
+            None,
+            "a stopped player has no track to follow, so append",
+        );
     }
 
     #[tokio::test]
