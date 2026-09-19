@@ -3953,6 +3953,225 @@ mod tests {
         assert_queue_was_never_touched(&seen, "container");
     }
 
+    /// A context and a connection onto MPD's stored-playlist
+    /// namespace with a live queue behind it, for the save-as
+    /// pins. `held` starts with whatever the test seeds.
+    async fn save_as_harness(
+        seeded: Vec<(String, Vec<String>)>,
+        queue: Vec<String>,
+    ) -> (
+        QueueContext,
+        MpdConnection,
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+        CommandLog,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let playlists = Arc::new(std::sync::Mutex::new(
+            seeded
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::clone(&playlists),
+                library: Vec::new(),
+                queue,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            ann as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        (ctx, conn, playlists, commands)
+    }
+
+    fn live_queue_uris() -> Vec<String> {
+        vec![
+            "INTERNAL/playing-one.flac".to_string(),
+            "INTERNAL/playing-two.flac".to_string(),
+        ]
+    }
+
+    fn already_held() -> Vec<(String, Vec<String>)> {
+        vec![(
+            "Road mix".to_string(),
+            vec!["INTERNAL/had-one.flac".to_string()],
+        )]
+    }
+
+    fn save_as(name: &str, overwrite: bool) -> SaveQueueAsPlaylistPayload {
+        SaveQueueAsPlaylistPayload {
+            v: QUEUE_PAYLOAD_VERSION,
+            playlist_name: name.to_string(),
+            overwrite,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_as_with_overwrite_rms_the_name_then_saves() {
+        // Overwrite is the operator saying "replace that one".
+        // MPD's `save` ACKs 56 on a name that exists, so the
+        // pre-delete is what makes the overwrite land at all.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Road mix", true),
+        )
+        .await
+        .expect("overwrite saves");
+
+        let seen = commands.lock().unwrap().clone();
+        let removed = seen
+            .iter()
+            .position(|c| c.split_whitespace().next() == Some("rm"))
+            .expect("overwrite deletes the old name first");
+        let saved = seen
+            .iter()
+            .position(|c| c.split_whitespace().next() == Some("save"))
+            .expect("then saves");
+        assert!(removed < saved, "rm precedes save: {seen:?}");
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&live_queue_uris()),
+            "the list now holds the queue",
+        );
+        assert_eq!(
+            conn.playlistinfo()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|i| i.file_path)
+                .collect::<Vec<_>>(),
+            live_queue_uris(),
+            "save-as does not mutate the queue it saved",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_without_overwrite_refuses_a_collision_and_keeps_the_list()
+    {
+        // Without overwrite the operator has not agreed to lose
+        // anything. MPD refuses the name, and nothing of theirs
+        // is deleted on the way to finding that out.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        let err = handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Road mix", false),
+        )
+        .await
+        .expect_err("a taken name refuses");
+        assert!(
+            matches!(err, VerbError::Mpd { .. }),
+            "the ACK reaches the caller: {err:?}",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("rm")),
+            "a refused overwrite must not delete the operator's list: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c.split_whitespace().next() == Some("save")),
+            "the save was still attempted: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec!["INTERNAL/had-one.flac".to_string()]),
+            "the list is exactly as it was",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_without_overwrite_saves_a_name_nobody_holds() {
+        // The common Save as: a fresh name, no collision, and
+        // no rm anywhere near it.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Brand new", false),
+        )
+        .await
+        .expect("a free name saves");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("rm")),
+            "a first-time name is not deleted first: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Brand new"),
+            Some(&live_queue_uris()),
+            "the new list holds the queue",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec!["INTERNAL/had-one.flac".to_string()]),
+            "and the unrelated list is untouched",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_with_overwrite_still_saves_a_name_nobody_holds() {
+        // Overwrite against a name that does not exist: MPD ACKs
+        // the rm, the handler swallows that one on purpose, and
+        // the save still lands.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Brand new", true),
+        )
+        .await
+        .expect("a missing name is not a failed save-as");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|c| c.split_whitespace().next() == Some("save")),
+            "the save still lands: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Brand new"),
+            Some(&live_queue_uris()),
+            "the new list holds the queue",
+        );
+    }
+
     #[tokio::test]
     async fn enqueue_selection_next_does_not_publish_now_playing() {
         // Play Next inserts after the current track. The hero

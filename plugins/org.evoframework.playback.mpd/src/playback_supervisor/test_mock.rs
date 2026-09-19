@@ -987,6 +987,33 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             }
                         }
                         "OK\n".to_string()
+                    } else if cmd.starts_with("save") {
+                        // MPD's `save` ACKs 56 on a name that
+                        // already exists; otherwise it writes
+                        // the current queue under that name.
+                        match args(&cmd).first() {
+                            Some(name) if held.contains_key(name) => {
+                                "ACK [56@0] {save} Playlist already exists\n"
+                                    .to_string()
+                            }
+                            Some(name) => {
+                                held.insert(name.clone(), queue.clone());
+                                "OK\n".to_string()
+                            }
+                            None => "OK\n".to_string(),
+                        }
+                    } else if cmd.starts_with("rm") {
+                        // And `rm` ACKs 50 on a name that is not
+                        // there, which the save-as path swallows
+                        // on purpose.
+                        match args(&cmd).first() {
+                            Some(name) if held.remove(name).is_some() => {
+                                "OK\n".to_string()
+                            }
+                            _ => {
+                                "ACK [50@0] {rm} No such playlist\n".to_string()
+                            }
+                        }
                     } else if cmd.starts_with("playlistinfo") {
                         let mut out = String::new();
                         for (pos, path) in queue.iter().enumerate() {
