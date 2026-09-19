@@ -874,7 +874,9 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                 // input before it can answer, so it is collected
                 // first and answered with the rest.
                 let mut block: Vec<String> = Vec::new();
-                if cmd.starts_with("command_list_ok_begin") {
+                if cmd.starts_with("command_list")
+                    && !cmd.starts_with("command_list_end")
+                {
                     loop {
                         line.clear();
                         match reader.read_line(&mut line).await {
@@ -895,24 +897,42 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                 // write below would make this future non-Send.
                 let reply = {
                     let mut held = playlists.lock().unwrap();
-                    if cmd.starts_with("command_list_ok_begin") {
+                    if cmd.starts_with("command_list") {
+                        // `command_list_ok_begin` separates each
+                        // command's reply with `list_OK`; plain
+                        // `command_list_begin` answers once at
+                        // the end. Both apply their writes.
+                        let separated = cmd.starts_with("command_list_ok");
                         let mut out = String::new();
                         for c in &block {
+                            let a = args(c);
                             if c.starts_with("listplaylist") {
-                                let name = args(c)
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_default();
+                                let name =
+                                    a.first().cloned().unwrap_or_default();
                                 if let Some(entries) = held.get(&name) {
                                     for e in entries {
                                         out.push_str(&format!("file: {e}\n"));
                                     }
                                 }
+                            } else if c.starts_with("playlistadd")
+                                && a.len() >= 2
+                            {
+                                held.entry(a[0].clone())
+                                    .or_default()
+                                    .push(a[1].clone());
                             }
-                            out.push_str("list_OK\n");
+                            if separated {
+                                out.push_str("list_OK\n");
+                            }
                         }
                         out.push_str("OK\n");
                         out
+                    } else if cmd.starts_with("count") {
+                        // Models a library that matches nothing,
+                        // the way MPD answers a filter with no
+                        // hits. A test needing a real count wants
+                        // its own behaviour.
+                        "songs: 0\nplaytime: 0\nOK\n".to_string()
                     } else if cmd.starts_with("listplaylists") {
                         let mut out = String::new();
                         for name in held.keys() {

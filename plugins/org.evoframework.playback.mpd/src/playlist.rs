@@ -1415,60 +1415,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        struct NullAnn;
-        impl SubjectAnnouncer for NullAnn {
-            fn announce<'a>(
-                &'a self,
-                _a: SubjectAnnouncement,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<
-                                (),
-                                evo_plugin_sdk::contract::ReportError,
-                            >,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-            fn retract<'a>(
-                &'a self,
-                _addressing: ExternalAddressing,
-                _reason: Option<String>,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<
-                                (),
-                                evo_plugin_sdk::contract::ReportError,
-                            >,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-            fn update_state<'a>(
-                &'a self,
-                _addressing: ExternalAddressing,
-                _state: serde_json::Value,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<
-                                (),
-                                evo_plugin_sdk::contract::ReportError,
-                            >,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-        }
-
         let ctx = PlaylistContext::new(
             PathBuf::from("/var/lib/evo/music"),
             SourceRegistry::new(),
@@ -1756,6 +1702,400 @@ mod tests {
                 && !c.starts_with("save")
                 && !c.starts_with("clear")),
             "drop is not a wipe: {seen:?}",
+        );
+    }
+
+    struct NullAnn;
+    impl SubjectAnnouncer for NullAnn {
+        fn announce<'a>(
+            &'a self,
+            _a: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A resolver that answers with whatever the test hands it,
+    /// so a save can be driven without an MPD library behind it.
+    struct FixedResolver(crate::selection::ResolvedSelection);
+
+    #[async_trait::async_trait]
+    impl crate::selection::SelectionResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _conn: &mut MpdConnection,
+            _criteria: &crate::selection::SelectionCriteria,
+        ) -> Result<
+            crate::selection::ResolvedSelection,
+            crate::selection::SelectionError,
+        > {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn album_criteria() -> crate::selection::SelectionCriteria {
+        crate::selection::SelectionCriteria {
+            dimension: crate::selection::SelectionDimension::Album,
+            value: "Some Album".to_string(),
+            parent: None,
+        }
+    }
+
+    /// A named list the operator already has rows in — what a
+    /// Create must replace and an Append must not.
+    const EXISTING: &str = "Road mix";
+
+    fn seed_existing(h: &CreateHarness) {
+        h.playlists.lock().unwrap().insert(
+            EXISTING.to_string(),
+            vec![
+                "INTERNAL/had-one.flac".to_string(),
+                "INTERNAL/had-two.flac".to_string(),
+            ],
+        );
+    }
+
+    /// Nothing that writes a playlist may have been sent.
+    fn assert_playlist_was_never_written(seen: &[String], what: &str) {
+        for forbidden in [
+            "playlistclear",
+            "playlistadd",
+            "searchaddpl",
+            "playlistdelete",
+            "command_list_begin",
+        ] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "{what}: a zero match must not send {forbidden:?}: {seen:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn save_selection_create_clears_the_named_list_then_adds() {
+        // Save as replaces what the list held. The clear is a
+        // standalone pre-op because MPD acks `playlistclear` on
+        // a list that does not exist yet, which would trap the
+        // whole command list.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        seed_existing(&h);
+
+        let body = handle_save_selection_criteria(
+            &h.ctx,
+            &mut h.conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/new-one.flac".to_string(),
+                "INTERNAL/new-two.flac".to_string(),
+            ])),
+            EXISTING.to_string(),
+            album_criteria(),
+            SaveSelectionMode::Create,
+        )
+        .await
+        .expect("create");
+
+        assert_eq!(body["status"], "ok", "{body}");
+        assert_eq!(body["mode"], "create", "{body}");
+        assert_eq!(
+            h.playlists.lock().unwrap().get(EXISTING),
+            Some(&vec![
+                "INTERNAL/new-one.flac".to_string(),
+                "INTERNAL/new-two.flac".to_string(),
+            ]),
+            "the list holds the new rows and only those",
+        );
+        let seen = h.commands.lock().unwrap().clone();
+        let cleared = seen
+            .iter()
+            .position(|c| c.starts_with("playlistclear"))
+            .expect("create clears first");
+        let added = seen
+            .iter()
+            .position(|c| c.starts_with("playlistadd"))
+            .expect("then adds");
+        assert!(cleared < added, "clear precedes the adds: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn save_selection_append_adds_without_clearing() {
+        // Add to playlist keeps what was there. Collapsing this
+        // into create wipes the operator's list on every add.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        seed_existing(&h);
+
+        let body = handle_save_selection_criteria(
+            &h.ctx,
+            &mut h.conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/new-one.flac".to_string(),
+            ])),
+            EXISTING.to_string(),
+            album_criteria(),
+            SaveSelectionMode::Append,
+        )
+        .await
+        .expect("append");
+
+        assert_eq!(body["status"], "ok", "{body}");
+        assert_eq!(body["mode"], "append", "{body}");
+        assert_eq!(
+            h.playlists.lock().unwrap().get(EXISTING),
+            Some(&vec![
+                "INTERNAL/had-one.flac".to_string(),
+                "INTERNAL/had-two.flac".to_string(),
+                "INTERNAL/new-one.flac".to_string(),
+            ]),
+            "the prior rows are still standing, the new one follows",
+        );
+        let seen = h.commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("playlistclear")),
+            "append never clears: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_selection_does_not_clear_the_named_list_on_create() {
+        // The guard that stands in front of Create's clear. A
+        // zero-match Save as must leave the operator's list
+        // exactly as it was.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        seed_existing(&h);
+
+        let body = handle_save_selection_criteria(
+            &h.ctx,
+            &mut h.conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(
+                Vec::new(),
+            )),
+            EXISTING.to_string(),
+            album_criteria(),
+            SaveSelectionMode::Create,
+        )
+        .await
+        .expect("zero match is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("playlist unchanged"),
+            "the body says so too: {body}",
+        );
+        assert_eq!(
+            h.playlists.lock().unwrap().get(EXISTING),
+            Some(&vec![
+                "INTERNAL/had-one.flac".to_string(),
+                "INTERNAL/had-two.flac".to_string(),
+            ]),
+            "the list is untouched",
+        );
+        assert_playlist_was_never_written(
+            &h.commands.lock().unwrap().clone(),
+            "empty create",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_does_not_clear_the_named_list() {
+        // The second door. A Filter does not know its own match
+        // count, so the guard pays for one MPD `count` to find
+        // out. Pinning only the UriList door leaves this open,
+        // and a facet Save as resolves as a Filter.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        seed_existing(&h);
+
+        let body = handle_save_selection_criteria(
+            &h.ctx,
+            &mut h.conn,
+            &FixedResolver(crate::selection::ResolvedSelection::Filter {
+                pairs: vec![("album".to_string(), "No Such Album".to_string())],
+                substring: false,
+            }),
+            EXISTING.to_string(),
+            album_criteria(),
+            SaveSelectionMode::Create,
+        )
+        .await
+        .expect("zero match is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        let seen = h.commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("count")),
+            "the count door is the one under test: {seen:?}",
+        );
+        assert_eq!(
+            h.playlists.lock().unwrap().get(EXISTING),
+            Some(&vec![
+                "INTERNAL/had-one.flac".to_string(),
+                "INTERNAL/had-two.flac".to_string(),
+            ]),
+            "the list is untouched",
+        );
+        assert_playlist_was_never_written(&seen, "empty filter create");
+    }
+
+    /// Answers one `source.dlna.browse` with a page that
+    /// carries no playable leaf — the third door.
+    #[derive(Debug)]
+    struct EmptyBrowseDispatcher;
+
+    impl evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher
+        for EmptyBrowseDispatcher
+    {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "status": "ok",
+                    "entries": [],
+                    "page": 0,
+                    "page_size": 50,
+                    "total": 0,
+                    "truncated": false,
+                    "next_page": serde_json::Value::Null,
+                }))
+                .unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_with_no_leaves_does_not_clear_the_named_list() {
+        // The third door. A DLNA page that carried nothing
+        // playable must not clear the target list either. Only
+        // the empty contract is held here; the full DLNA write
+        // path is its own sitting.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+        seed_existing(&h);
+        let dlna = crate::source_registry::SourceRecord {
+            id: "dlna-1".to_string(),
+            display_name: "A Server".to_string(),
+            kind: crate::source_registry::SourceKind::NetworkDlna {
+                service_id: "svc".to_string(),
+                control_url: String::new(),
+                base_url: String::new(),
+            },
+            mount_path: PathBuf::from("/unused"),
+            mpd_storage_name: None,
+            state: crate::source_registry::SourceState::Online,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: 60_000,
+            scan_policy: crate::source_registry::ScanPolicy::BrowseOnly,
+            track_count: 0,
+            track_count_available: 0,
+            last_scan_at_ms: None,
+        };
+        h.ctx.registry.register(dlna).await.unwrap();
+        let ctx = PlaylistContext::new(
+            h.ctx.music_directory.clone(),
+            h.ctx.registry.clone(),
+            Arc::new(NullAnn),
+            DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+            Some(Arc::new(EmptyBrowseDispatcher)
+                as Arc<
+                    dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+                >),
+        );
+
+        let body = handle_save_selection_container(
+            &ctx,
+            &mut h.conn,
+            EXISTING.to_string(),
+            Some("dlna-1".to_string()),
+            crate::queue::ContainerSelection {
+                kind: crate::queue::ContainerSelectionKind::Container,
+                uri: "empty-oid".to_string(),
+            },
+            SaveSelectionMode::Create,
+            None,
+            None,
+        )
+        .await
+        .expect("an empty container is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        assert_eq!(body["added"], 0, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("playlist unchanged"),
+            "the body says so too: {body}",
+        );
+        assert_eq!(
+            h.playlists.lock().unwrap().get(EXISTING),
+            Some(&vec![
+                "INTERNAL/had-one.flac".to_string(),
+                "INTERNAL/had-two.flac".to_string(),
+            ]),
+            "the list is untouched",
+        );
+        assert_playlist_was_never_written(
+            &h.commands.lock().unwrap().clone(),
+            "empty container create",
         );
     }
 
