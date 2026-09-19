@@ -3682,9 +3682,275 @@ mod tests {
             "replace is one atomic command list: {seen:?}",
         );
         assert!(
+            // `play "0"`, not a bare `play`. Plain `play` uses
+            // the queue's song_position pointer, which survives
+            // the clear and lands playback in the middle of the
+            // freshly-materialised selection.
+            seen.iter().any(|c| {
+                let mut w = c.split_whitespace();
+                w.next() == Some("play")
+                    && w.next().map(|a| a.trim_matches('"')) == Some("0")
+            }),
+            "replace starts at the head of the new queue: {seen:?}",
+        );
+        assert!(
             seen.iter().all(|c| !c.starts_with("idle")),
             "it does not wait for an idle wake: {seen:?}",
         );
+    }
+
+    /// Every command line the mock was sent, in order.
+    type CommandLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A live two-track queue, a context over it, and the
+    /// mock's command log — what a zero-match pin needs to show
+    /// the queue is still standing afterwards.
+    async fn zero_match_harness(
+    ) -> (QueueContext, MpdConnection, Arc<RecordingAnn>, CommandLog) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/keep-one.flac".to_string()),
+                    (12, "INTERNAL/keep-two.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        (ctx, conn, ann, commands)
+    }
+
+    /// Nothing that could mutate the queue may have been sent.
+    /// `clear` is the one that empties it; the rest would mean
+    /// the short-circuit did not short-circuit.
+    fn assert_queue_was_never_touched(seen: &[String], what: &str) {
+        for forbidden in ["clear", "command_list_begin", "addid", "findadd"] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "{what}: a zero match must not send {forbidden:?}: {seen:?}",
+            );
+        }
+        for word in ["add", "play"] {
+            assert!(
+                seen.iter()
+                    .all(|c| c.split_whitespace().next() != Some(word)),
+                "{what}: a zero match must not send {word:?}: {seen:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_criteria_selection_leaves_the_queue_in_every_mode() {
+        // The zero-match short-circuit is what stands between a
+        // selection that matched nothing and Replace's `clear`
+        // on a live queue. Every mode returns before the
+        // mutation, and before the now_playing publish: nothing
+        // was transported.
+        for mode in [
+            EnqueueSelectionMode::Replace,
+            EnqueueSelectionMode::Append,
+            EnqueueSelectionMode::Next,
+        ] {
+            let label = mode.as_str().to_string();
+            let (ctx, mut conn, ann, commands) = zero_match_harness().await;
+
+            let body = handle_enqueue_selection_criteria(
+                &ctx,
+                &mut conn,
+                &FixedResolver(crate::selection::ResolvedSelection::UriList(
+                    Vec::new(),
+                )),
+                crate::selection::SelectionCriteria {
+                    dimension: crate::selection::SelectionDimension::Album,
+                    value: "No Such Album".to_string(),
+                    parent: None,
+                },
+                mode,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{label}: zero match is not an error: {e:?}")
+            });
+
+            assert_eq!(body["status"], "empty", "{label}: {body}");
+            assert_eq!(body["added_uris_count"], 0, "{label}: {body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("queue unchanged"),
+                "{label}: the body says so too: {body}",
+            );
+            assert!(
+                ann.subjects_touched().is_empty(),
+                "{label}: nothing moved, so neither subject publishes: {:?}",
+                ann.subjects_touched(),
+            );
+            let seen = commands.lock().unwrap().clone();
+            assert_queue_was_never_touched(&seen, &label);
+            assert_eq!(
+                conn.playlistinfo()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.file_path)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "INTERNAL/keep-one.flac".to_string(),
+                    "INTERNAL/keep-two.flac".to_string(),
+                ],
+                "{label}: the operator's queue is still standing",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_leaves_the_queue_on_replace() {
+        // The second door. A `Filter` resolves without knowing
+        // its own match count, so the guard pays for one MPD
+        // `count` to find out. Pinning only the UriList door
+        // would leave this one open — and a facet Play Now is a
+        // Filter.
+        let (ctx, mut conn, ann, commands) = zero_match_harness().await;
+
+        let body = handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::Filter {
+                pairs: vec![("album".to_string(), "No Such Album".to_string())],
+                substring: false,
+            }),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Album,
+                value: "No Such Album".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Replace,
+        )
+        .await
+        .expect("zero match is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("count")),
+            "the count door is the one under test: {seen:?}",
+        );
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing transported, nothing published: {:?}",
+            ann.subjects_touched(),
+        );
+        assert_queue_was_never_touched(&seen, "filter");
+    }
+
+    #[tokio::test]
+    async fn a_container_with_no_leaves_leaves_the_queue_on_replace() {
+        // The third door. A DLNA container that carried no
+        // playable leaf must not clear the queue either.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/keep-one.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert("empty-oid".into(), browse_page_response(Vec::new()));
+        let dispatcher = Arc::new(ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let mut dlna = local_source("dlna-1", "/unused", SourceState::Online);
+        dlna.kind = SourceKind::NetworkDlna {
+            service_id: "svc".to_string(),
+            control_url: String::new(),
+            base_url: String::new(),
+        };
+        registry.register(dlna).await.unwrap();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            Some(dispatcher as Arc<dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher>),
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        let body = handle_enqueue_selection_container(
+            &ctx,
+            &mut conn,
+            Some("dlna-1".to_string()),
+            ContainerSelection {
+                kind: ContainerSelectionKind::Container,
+                uri: "empty-oid".to_string(),
+            },
+            EnqueueSelectionMode::Replace,
+            None,
+            None,
+        )
+        .await
+        .expect("an empty container is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        assert_eq!(body["enqueued_count"], 0, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("queue unchanged"),
+            "the body says so too: {body}",
+        );
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing transported, nothing published: {:?}",
+            ann.subjects_touched(),
+        );
+        let seen = commands.lock().unwrap().clone();
+        assert_queue_was_never_touched(&seen, "container");
     }
 
     #[tokio::test]

@@ -788,6 +788,13 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         cmd.split('"').nth(1).unwrap_or_default().to_string();
                     stored.remove(&name);
                     let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("count") {
+                    // This mock models a library that matches
+                    // nothing: every `count` answers zero, the
+                    // way MPD answers a filter with no hits. A
+                    // test that needs a real match count wants
+                    // its own behaviour rather than this one.
+                    let _ = w.write_all(b"songs: 0\nplaytime: 0\nOK\n").await;
                 } else if cmd.starts_with("currentsong") {
                     // Ordered after `playlistinfo` and before
                     // `play`: MPD's queue verbs share prefixes
