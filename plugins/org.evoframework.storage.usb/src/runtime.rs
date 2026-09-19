@@ -73,6 +73,61 @@ fn same_mount_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+/// MPD-relative prefix for a USB volume. `music_directory` is
+/// `/var/lib/evo/music`; the volume mounts at `USB/<stable-id>`.
+fn mpd_usb_uri_prefix(stable_id: &str) -> String {
+    format!("USB/{stable_id}")
+}
+
+/// Queue rows taken off MPD so rename can umount. Wire twin
+/// of playback's `ParkedQueue`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+struct ParkedQueue {
+    #[serde(default)]
+    items: Vec<ParkedQueueItem>,
+    #[serde(default)]
+    playing: bool,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    current: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ParkedQueueItem {
+    position: u32,
+    uri: String,
+}
+
+fn rewrite_parked_queue(
+    parked: &ParkedQueue,
+    from: &str,
+    to: &str,
+) -> ParkedQueue {
+    let items = parked
+        .items
+        .iter()
+        .map(|item| {
+            let uri = match item.uri.strip_prefix(from) {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                    format!("{to}{rest}")
+                }
+                _ => item.uri.clone(),
+            };
+            ParkedQueueItem {
+                position: item.position,
+                uri,
+            }
+        })
+        .collect();
+    ParkedQueue {
+        items,
+        playing: parked.playing,
+        paused: parked.paused,
+        current: parked.current,
+    }
+}
+
 /// Reactive subject type published by this plugin.
 pub const STORAGE_USB_DRIVES_SUBJECT_TYPE: &str = "storage_usb_drives";
 
@@ -1206,7 +1261,9 @@ impl StorageUsbRuntime {
     ///    Same physical volume aliasing back to its own current
     ///    id is a no-op success.
     /// 4. `sync` on the parent disk.
-    /// 5. Wrapper `umount <old-id>`.
+    /// 5. Park queue rows under `USB/<old>` so MPD closes those
+    ///    files (playing or not). Then wrapper `umount <old-id>`.
+    ///    A refused umount puts the parked rows back.
     /// 6. Consumer-stop + MPD scrub of the old name
     ///    (`library.remove_source` with `consumer_stop` and
     ///    `scrub_mpd_entries`). The files are already gone;
@@ -1219,6 +1276,8 @@ impl StorageUsbRuntime {
     ///    effect.
     /// 9. Wrapper `mount <new-id>` + `library.add_source
     ///    local_usb` + republish subject.
+    /// 10. Restore the parked queue rows under `USB/<new>`.
+    ///     Not Remove: the queue is not emptied.
     ///
     /// Payload: `{ v: 1, stable_id, alias, mount_policy?: string }`
     /// Response: `{ v: 1, new_stable_id, class }`
@@ -1313,10 +1372,19 @@ impl StorageUsbRuntime {
             }
         }
 
-        // 1. sync + umount OLD path (if mounted). The library
-        //    row stays until this tree is gone — a scrub while
-        //    Music is still mounted reaffirms every file and
-        //    leaves that name in the floor.
+        // 1. Park USB queue rows, then sync + umount. Those
+        //    rows are open files even when the player is
+        //    stopped. Umount first was the 12:08 / 12:10
+        //    EBUSY: glass "That didn't work", volume still
+        //    mounted. If umount still refuses, put the rows
+        //    back so the operator's queue is not a Remove.
+        let parked = if record.class == DriveClass::MountedClean
+            || record.class == DriveClass::MountedDirty
+        {
+            self.dispatch_library_park_uri_prefix(&req.stable_id).await
+        } else {
+            ParkedQueue::default()
+        };
         let _ = tokio::process::Command::new("sync")
             .arg(&record.parent_disk)
             .output()
@@ -1325,12 +1393,25 @@ impl StorageUsbRuntime {
             || record.class == DriveClass::MountedDirty
         {
             let umount_argv = vec!["umount".to_string(), req.stable_id.clone()];
-            let out = self
+            let mut out = self
                 .command_runner
                 .run_wrapper(self.needs_sudo, &umount_argv)
                 .await
                 .map_err(|e| VerbDispatchError::SubprocessIo(e.to_string()))?;
             if out.status != 0 {
+                // MPD closes the fd after deleteid; one short
+                // retry, then put the queue back and refuse.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                out = self
+                    .command_runner
+                    .run_wrapper(self.needs_sudo, &umount_argv)
+                    .await
+                    .map_err(|e| {
+                        VerbDispatchError::SubprocessIo(e.to_string())
+                    })?;
+            }
+            if out.status != 0 {
+                self.dispatch_library_restore_parked(&parked, None).await;
                 return Err(VerbDispatchError::RenameRefused(
                     RenameRefuseClass::UmountBeforeRenameFailed {
                         stable_id: req.stable_id,
@@ -1432,6 +1513,23 @@ impl StorageUsbRuntime {
             if let Some(old_root) = record.mount_root.as_deref() {
                 let _ = tokio::fs::remove_dir(old_root).await;
             }
+            let restored = rewrite_parked_queue(
+                &parked,
+                &mpd_usb_uri_prefix(&req.stable_id),
+                &mpd_usb_uri_prefix(&new_stable_id),
+            );
+            self.dispatch_library_restore_parked(
+                &restored,
+                Some(mpd_usb_uri_prefix(&new_stable_id)),
+            )
+            .await;
+            self.dispatch_library_rewrite_uri_prefix(
+                &req.stable_id,
+                &new_stable_id,
+            )
+            .await;
+        } else if !parked.items.is_empty() {
+            self.dispatch_library_restore_parked(&parked, None).await;
         }
 
         let resp = RenameResponse {
@@ -1544,6 +1642,122 @@ impl StorageUsbRuntime {
                 when,
                 error = %e,
                 "library.remove_source dispatch failed; proceeding (best-effort)"
+            );
+        }
+    }
+
+    /// Take USB queue rows off MPD so rename can umount.
+    /// Playing or stopped, those rows hold the tree open.
+    async fn dispatch_library_park_uri_prefix(
+        &self,
+        stable_id: &str,
+    ) -> ParkedQueue {
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return ParkedQueue::default();
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "prefix": mpd_usb_uri_prefix(stable_id),
+        });
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return ParkedQueue::default();
+        };
+        match dispatcher
+            .dispatch("audio.library", "library.park_uri_prefix", bytes, None)
+            .await
+        {
+            Ok(body) => serde_json::from_slice(&body).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = "storage.usb",
+                    stable_id,
+                    error = %e,
+                    "library.park_uri_prefix dispatch failed; umount \
+                     may still hit a busy volume"
+                );
+                ParkedQueue::default()
+            }
+        }
+    }
+
+    /// Put parked queue rows back. `update_prefix` is the new
+    /// leaf after remount; None on the umount-fail put-back.
+    async fn dispatch_library_restore_parked(
+        &self,
+        parked: &ParkedQueue,
+        update_prefix: Option<String>,
+    ) {
+        if parked.items.is_empty() {
+            return;
+        }
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "items": parked.items,
+            "playing": parked.playing,
+            "paused": parked.paused,
+            "current": parked.current,
+            "update_prefix": update_prefix,
+        });
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if let Err(e) = dispatcher
+            .dispatch(
+                "audio.library",
+                "library.restore_parked_uris",
+                bytes,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                plugin = "storage.usb",
+                error = %e,
+                "library.restore_parked_uris dispatch failed; the \
+                 operator queue is missing those USB rows"
+            );
+        }
+    }
+
+    /// Rewrite leftover favourites and stored-playlist URIs
+    /// onto the new USB name. The live queue was already
+    /// restored under the new leaf; this pass is curation.
+    async fn dispatch_library_rewrite_uri_prefix(
+        &self,
+        old_stable_id: &str,
+        new_stable_id: &str,
+    ) {
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "from_prefix": mpd_usb_uri_prefix(old_stable_id),
+            "to_prefix": mpd_usb_uri_prefix(new_stable_id),
+        });
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if let Err(e) = dispatcher
+            .dispatch(
+                "audio.library",
+                "library.rewrite_uri_prefix",
+                bytes,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                plugin = "storage.usb",
+                old_stable_id,
+                new_stable_id,
+                error = %e,
+                "library.rewrite_uri_prefix dispatch failed; \
+                 favourites and stored playlists may still hold \
+                 the old name"
             );
         }
     }
@@ -3572,6 +3786,7 @@ mod tests {
         seen: StdMutex<Vec<(String, String)>>,
         runner: Arc<FakeCommandRunner>,
         umount_before_library_stop: StdMutex<Option<bool>>,
+        park_before_umount: StdMutex<Option<bool>>,
         list_sources: StdMutex<serde_json::Value>,
     }
 
@@ -3581,6 +3796,7 @@ mod tests {
                 seen: StdMutex::new(Vec::new()),
                 runner,
                 umount_before_library_stop: StdMutex::new(None),
+                park_before_umount: StdMutex::new(None),
                 list_sources: StdMutex::new(serde_json::json!({
                     "v": 1,
                     "sources": []
@@ -3594,6 +3810,10 @@ mod tests {
 
         fn umount_before_library_stop(&self) -> Option<bool> {
             *self.umount_before_library_stop.lock().unwrap()
+        }
+
+        fn park_before_umount(&self) -> Option<bool> {
+            *self.park_before_umount.lock().unwrap()
         }
     }
 
@@ -3623,6 +3843,13 @@ mod tests {
                 *self.umount_before_library_stop.lock().unwrap() =
                     Some(had_umount);
             }
+            if request_type == "library.park_uri_prefix" {
+                let had_umount =
+                    self.runner.seen_argv.lock().unwrap().iter().any(|a| {
+                        a.first().map(String::as_str) == Some("umount")
+                    });
+                *self.park_before_umount.lock().unwrap() = Some(!had_umount);
+            }
             self.seen.lock().unwrap().push((
                 request_type.to_string(),
                 String::from_utf8_lossy(&payload).into_owned(),
@@ -3631,6 +3858,14 @@ mod tests {
                 serde_json::json!({ "v": 1, "source_id": "usb-music" })
             } else if request_type == "library.list_sources" {
                 self.list_sources.lock().unwrap().clone()
+            } else if request_type == "library.park_uri_prefix" {
+                serde_json::json!({
+                    "v": 1,
+                    "items": [],
+                    "playing": false,
+                    "paused": false,
+                    "current": null
+                })
             } else {
                 serde_json::json!({ "v": 1 })
             };
@@ -3729,6 +3964,99 @@ mod tests {
             "scrub while the old tree is still mounted leaves that \
              name in Local library",
         );
+        assert_eq!(
+            d.park_before_umount(),
+            Some(true),
+            "queued USB tracks hold the tree open; park must run \
+             before umount or rename is EBUSY playing or stopped",
+        );
+    }
+
+    #[test]
+    fn mpd_usb_uri_prefix_is_the_music_directory_relative_leaf() {
+        assert_eq!(mpd_usb_uri_prefix("MUSIC"), "USB/MUSIC");
+        assert_eq!(mpd_usb_uri_prefix("Audio"), "USB/Audio");
+    }
+
+    #[tokio::test]
+    async fn rename_rewrites_queue_uris_onto_the_new_name() {
+        // Park first so umount is not EBUSY, then restore under
+        // the new leaf. Not a Remove.
+        let (rt, d, _runner) =
+            primed_runtime_with_dispatcher(vec![ok_outcome(); 8]).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "stable_id": "MUSIC",
+            "alias": "Audio",
+        }))
+        .unwrap();
+        let result = rt.dispatch_verb("storage.usb.rename", &payload).await;
+        let seen = d.seen();
+        let park = seen
+            .iter()
+            .find(|(verb, _)| verb == "library.park_uri_prefix");
+        if result.is_err() {
+            assert!(
+                park.is_some(),
+                "even a refused rename must try to park before umount: {seen:?}"
+            );
+            return;
+        }
+        let park_body = &park
+            .unwrap_or_else(|| {
+                panic!("rename must park USB queue rows: {seen:?}")
+            })
+            .1;
+        assert!(
+            park_body.contains("USB/MUSIC"),
+            "park the old leaf: {park_body}"
+        );
+        assert_eq!(
+            d.park_before_umount(),
+            Some(true),
+            "park after umount is the 12:08 busy volume",
+        );
+        assert!(
+            seen.iter().all(|(v, _)| v != "queue.clear_queue"),
+            "rename must not empty the queue: {seen:?}"
+        );
+        let rewrite = seen
+            .iter()
+            .find(|(verb, _)| verb == "library.rewrite_uri_prefix")
+            .unwrap_or_else(|| {
+                panic!(
+                    "rename must rewrite leftover favourites and \
+                     stored-playlist URIs: {seen:?}"
+                )
+            });
+        assert!(
+            rewrite.1.contains("USB/MUSIC") && rewrite.1.contains("USB/Audio"),
+            "rewrite leftover curation onto the new leaf: {}",
+            rewrite.1
+        );
+    }
+
+    #[test]
+    fn rewrite_parked_queue_is_segment_aware() {
+        let parked = ParkedQueue {
+            items: vec![
+                ParkedQueueItem {
+                    position: 0,
+                    uri: "USB/MUSIC/a.flac".into(),
+                },
+                ParkedQueueItem {
+                    position: 1,
+                    uri: "USB/MUSIC2/b.flac".into(),
+                },
+            ],
+            playing: true,
+            paused: false,
+            current: Some(0),
+        };
+        let out = rewrite_parked_queue(&parked, "USB/MUSIC", "USB/Audio");
+        assert_eq!(out.items[0].uri, "USB/Audio/a.flac");
+        assert_eq!(out.items[1].uri, "USB/MUSIC2/b.flac");
+        assert_eq!(out.current, Some(0));
+        assert!(out.playing);
     }
 
     fn inherited_music_mountinfo() -> &'static str {

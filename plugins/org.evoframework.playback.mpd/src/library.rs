@@ -382,6 +382,66 @@ pub(crate) struct RemoveSourcePayload {
     pub(crate) consumer_stop: bool,
 }
 
+/// `library.rewrite_uri_prefix` — USB rename after remount.
+///
+/// Queue rows still hold `USB/<old>/…`. This rewrites them in
+/// place onto `USB/<new>/…`. It is not Remove: the queue is
+/// never cleared.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RewriteUriPrefixPayload {
+    pub(crate) v: u32,
+    pub(crate) from_prefix: String,
+    pub(crate) to_prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RewriteUriPrefixResponse {
+    pub(crate) v: u32,
+    pub(crate) rewritten: u32,
+}
+
+/// `library.park_uri_prefix` — take queue rows under a USB
+/// leaf off MPD so rename can umount. Playing or not, those
+/// rows are open files.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ParkUriPrefixPayload {
+    pub(crate) v: u32,
+    pub(crate) prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ParkUriPrefixResponse {
+    pub(crate) v: u32,
+    pub(crate) items: Vec<crate::queue::ParkedQueueItem>,
+    pub(crate) playing: bool,
+    pub(crate) paused: bool,
+    pub(crate) current: Option<u32>,
+}
+
+/// `library.restore_parked_uris` — put the parked rows back.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RestoreParkedUrisPayload {
+    pub(crate) v: u32,
+    pub(crate) items: Vec<crate::queue::ParkedQueueItem>,
+    #[serde(default)]
+    pub(crate) playing: bool,
+    #[serde(default)]
+    pub(crate) paused: bool,
+    #[serde(default)]
+    pub(crate) current: Option<u32>,
+    /// MPD `update` this path before `addid` so a remount's
+    /// new leaf is in the database. Absent on the umount-fail
+    /// put-back (files are still at the old path).
+    #[serde(default)]
+    pub(crate) update_prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RestoreParkedUrisResponse {
+    pub(crate) v: u32,
+    pub(crate) restored: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProbeSourcePayload {
     pub(crate) v: u32,
@@ -523,6 +583,19 @@ pub(crate) enum VerbError {
     WorkAggregateNotReady,
     #[error("library.get_work_recordings: work_id {work_id:?} not found in the current aggregate")]
     UnknownWork { work_id: String },
+    #[error(
+        "library.rewrite_uri_prefix: from_prefix and to_prefix must be \
+         non-empty MPD folder paths"
+    )]
+    RewritePrefixInvalid,
+    #[error(
+        "library.rewrite_uri_prefix: from_prefix and to_prefix must differ"
+    )]
+    RewritePrefixUnchanged,
+    #[error(
+        "library.park_uri_prefix: prefix must be a non-empty MPD folder path"
+    )]
+    ParkPrefixInvalid,
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -1119,6 +1192,162 @@ pub(crate) async fn handle_remove_source(
     Ok(())
 }
 
+/// Rewrite leftover queue URIs after a volume remounts under a
+/// new name.
+///
+/// USB rename umounts, scrubs the old leaf from the floor, then
+/// remounts. The operator queue still holds `USB/<old>/…`.
+/// `addid` of the new path needs those files in MPD's database,
+/// so this waits for `update` of the new prefix to settle, then
+/// rewrites in place. A failed `addid` leaves the old row —
+/// never `clear`, never `stop`.
+pub(crate) async fn handle_rewrite_uri_prefix(
+    _ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RewriteUriPrefixPayload,
+) -> Result<RewriteUriPrefixResponse, VerbError> {
+    check_version(payload.v, "library.rewrite_uri_prefix")?;
+    let from = payload.from_prefix.trim().trim_end_matches('/');
+    let to = payload.to_prefix.trim().trim_end_matches('/');
+    if from.is_empty()
+        || to.is_empty()
+        || !from.contains('/')
+        || !to.contains('/')
+        || from.contains("://")
+        || to.contains("://")
+    {
+        return Err(VerbError::RewritePrefixInvalid);
+    }
+    if from == to {
+        return Err(VerbError::RewritePrefixUnchanged);
+    }
+    if let Err(e) = conn.update(Some(to)).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            to_prefix = %to,
+            error = %e,
+            "library.rewrite_uri_prefix: update of the new name failed; \
+             rewrite still tries so a scan that already landed is not lost"
+        );
+    } else {
+        let _ = wait_for_update_to_settle(
+            conn,
+            REWRITE_SETTLE_DEADLINE,
+            "rewrite_uri_prefix",
+        )
+        .await;
+    }
+    let rewritten =
+        crate::queue::rewrite_queue_uris_under(queue, conn, from, to)
+            .await
+            .map_err(|e| VerbError::Mpd {
+                verb: "rewrite_uri_prefix".into(),
+                reason: e.to_string(),
+            })?;
+    if let Err(e) = crate::playlist::rewrite_stored_uris_under(
+        conn,
+        from,
+        to,
+        crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME,
+    )
+    .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            from_prefix = %from,
+            to_prefix = %to,
+            error = %e,
+            "library.rewrite_uri_prefix: stored playlist rewrite failed; \
+             queue rows already moved"
+        );
+    }
+    Ok(RewriteUriPrefixResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        rewritten: rewritten as u32,
+    })
+}
+
+fn usb_folder_prefix(raw: &str) -> Option<&str> {
+    let prefix = raw.trim().trim_end_matches('/');
+    if prefix.is_empty() || !prefix.contains('/') || prefix.contains("://") {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+/// Take queue rows under a USB leaf off MPD so the volume can
+/// umount. Playing or stopped, those rows hold the tree open.
+pub(crate) async fn handle_park_uri_prefix(
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: ParkUriPrefixPayload,
+) -> Result<ParkUriPrefixResponse, VerbError> {
+    check_version(payload.v, "library.park_uri_prefix")?;
+    let prefix = usb_folder_prefix(&payload.prefix)
+        .ok_or(VerbError::ParkPrefixInvalid)?;
+    let parked = crate::queue::park_queue_items_under(queue, conn, prefix)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "park_uri_prefix".into(),
+            reason: e.to_string(),
+        })?;
+    Ok(ParkUriPrefixResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        items: parked.items,
+        playing: parked.playing,
+        paused: parked.paused,
+        current: parked.current,
+    })
+}
+
+/// Put parked queue rows back after remount (new URIs) or
+/// after a refused umount (same URIs).
+pub(crate) async fn handle_restore_parked_uris(
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RestoreParkedUrisPayload,
+) -> Result<RestoreParkedUrisResponse, VerbError> {
+    check_version(payload.v, "library.restore_parked_uris")?;
+    if let Some(raw) = payload.update_prefix.as_deref() {
+        if let Some(prefix) = usb_folder_prefix(raw) {
+            if let Err(e) = conn.update(Some(prefix)).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    prefix,
+                    error = %e,
+                    "library.restore_parked_uris: update of the new name \
+                     failed; restore still tries"
+                );
+            } else {
+                let _ = wait_for_update_to_settle(
+                    conn,
+                    REWRITE_SETTLE_DEADLINE,
+                    "restore_parked_uris",
+                )
+                .await;
+            }
+        }
+    }
+    let parked = crate::queue::ParkedQueue {
+        items: payload.items,
+        playing: payload.playing,
+        paused: payload.paused,
+        current: payload.current,
+    };
+    let restored = crate::queue::restore_parked_queue(queue, conn, &parked)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "restore_parked_uris".into(),
+            reason: e.to_string(),
+        })?;
+    Ok(RestoreParkedUrisResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        restored: restored as u32,
+    })
+}
+
 /// Release the operator queue of one source's tracks.
 ///
 /// Best-effort throughout, and deliberately so: the operator
@@ -1250,16 +1479,23 @@ async fn remove_usb_via_safe_remove(
 /// giving up on re-counting the floor.
 const SCRUB_SETTLE_DEADLINE: Duration = Duration::from_millis(1_500);
 
+/// How long to wait for the new USB name to land in MPD before
+/// rewriting leftover queue URIs. `addid` needs the song in
+/// the database. The verb budget is 30 s; this leaves headroom
+/// for the rewrite itself.
+const REWRITE_SETTLE_DEADLINE: Duration = Duration::from_secs(20);
+
 /// How often to ask MPD whether the update job is still running.
 const SCRUB_SETTLE_POLL: Duration = Duration::from_millis(50);
 
-/// Wait until the scrub's update job has left `updating_db`.
+/// Wait until an `update` job has left `updating_db`.
 ///
 /// `MpdConnection::update` ACKs when the job is *queued*, not when
 /// it has run: MPD still holds every row under the scrubbed path
 /// until the job completes. Re-counting on the ACK reads a
 /// database that has not pruned, which is how the floor kept
-/// reporting songs that left with the stick.
+/// reporting songs that left with the stick. The same wait is
+/// what lets `addid` of a rewritten USB URI see the new name.
 ///
 /// The grace is the scan watcher's: `updating_db` missing on the
 /// first poll means MPD has not picked the job up yet, not that it
@@ -1268,8 +1504,12 @@ const SCRUB_SETTLE_POLL: Duration = Duration::from_millis(50);
 /// Returns false on timeout or a transport error — the caller then
 /// leaves the counts alone rather than writing a number it could
 /// not verify.
-async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
-    let deadline = Instant::now() + SCRUB_SETTLE_DEADLINE;
+async fn wait_for_update_to_settle(
+    conn: &mut MpdConnection,
+    budget: Duration,
+    why: &str,
+) -> bool {
+    let deadline = Instant::now() + budget;
     let mut consecutive_clear = 0u8;
     loop {
         match conn.status().await {
@@ -1286,9 +1526,9 @@ async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
             Err(e) => {
                 tracing::debug!(
                     plugin = PLUGIN_NAME,
+                    why,
                     error = %e,
-                    "remove_source: status read failed while waiting for \
-                     the scrub to settle"
+                    "status read failed while waiting for an update to settle"
                 );
                 return false;
             }
@@ -1296,14 +1536,18 @@ async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
         if Instant::now() >= deadline {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
-                "remove_source: scrub did not settle within the deadline; \
-                 leaving the floor count as it stands rather than writing \
-                 one read from an unpruned database"
+                why,
+                "update did not settle within the deadline"
             );
             return false;
         }
         tokio::time::sleep(SCRUB_SETTLE_POLL).await;
     }
+}
+
+async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
+    wait_for_update_to_settle(conn, SCRUB_SETTLE_DEADLINE, "remove_source")
+        .await
 }
 
 /// Re-count the floor source from MPD's database.
@@ -3917,8 +4161,9 @@ mod tests {
     #[tokio::test]
     async fn a_rename_scrub_leaves_the_operator_queue_alone() {
         // The old name's queue URIs go stale after remount.
-        // Rewriting them is not this row. Emptying the queue
-        // would be a Remove the operator did not ask for.
+        // Rewriting them is `library.rewrite_uri_prefix` after
+        // the new tree is back. Emptying the queue here would
+        // be a Remove the operator did not ask for.
         let (mut conn, log) = live_queue_conn(
             vec![
                 (11, "USB/MUSIC/a.flac".to_string()),
@@ -3964,6 +4209,230 @@ mod tests {
             seen.iter()
                 .all(|c| !c.starts_with("DISPATCH storage.usb.safe_remove")),
             "rename must not eject: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_park_releases_usb_rows_and_leaves_the_rest() {
+        // Playing or stopped, queued USB tracks hold the tree
+        // open. Park takes those rows off MPD so umount can
+        // run. INTERNAL and a neighbour stick stay.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (10, "INTERNAL/keep.flac".to_string()),
+                (11, "USB/Audio/a.flac".to_string()),
+                (12, "USB/Audio2/other.flac".to_string()),
+                (13, "USB/Audio/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+
+        let parked = handle_park_uri_prefix(
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            ParkUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parked.items.len(), 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Audio2/other.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("clear")),
+            "park is not a Remove of the whole queue: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_restore_puts_parked_rows_back_under_the_new_name() {
+        let (mut conn, log) =
+            live_queue_conn(vec![(10, "INTERNAL/keep.flac".to_string())], None)
+                .await;
+        let ctx = ctx_logging_to(&log);
+
+        let out = handle_restore_parked_uris(
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RestoreParkedUrisPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                items: vec![
+                    crate::queue::ParkedQueueItem {
+                        position: 1,
+                        uri: "USB/Road-Trip/a.flac".to_string(),
+                    },
+                    crate::queue::ParkedQueueItem {
+                        position: 2,
+                        uri: "USB/Road-Trip/b.flac".to_string(),
+                    },
+                ],
+                playing: false,
+                paused: false,
+                current: None,
+                update_prefix: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.restored, 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Road-Trip/a.flac".to_string(),
+                "USB/Road-Trip/b.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("clear") && !c.starts_with("stop")),
+            "restore is not a Remove: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_rewrite_moves_favourite_uris_onto_the_new_name() {
+        // Favourites and a stored playlist hold USB leftover
+        // URIs. They do not block umount; they go stale after
+        // remount unless this pass rewrites them. INTERNAL stays.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        conn.playlistadd("__favourites__", "USB/Audio/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/Audio/b.flac").await.unwrap();
+        conn.playlistadd("Road", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+
+        handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB/Audio".to_string(),
+                to_prefix: "USB/Road-Trip".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["USB/Road-Trip/loved.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(
+            road,
+            vec![
+                "USB/Road-Trip/b.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_rewrite_moves_queue_uris_onto_the_new_name() {
+        // After remount the files live under USB/Audio. The
+        // queue still holds USB/MUSIC. Rewrite in place: keep
+        // INTERNAL, leave the neighbour stick, never clear.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (10, "INTERNAL/keep.flac".to_string()),
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC2/other.flac".to_string()),
+                (13, "USB/MUSIC/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+
+        let out = handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB/MUSIC".to_string(),
+                to_prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.rewritten, 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Audio/a.flac".to_string(),
+                "USB/MUSIC2/other.flac".to_string(),
+                "USB/Audio/b.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("clear") && !c.starts_with("stop")),
+            "a rewrite is not a Remove: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("addid")),
+            "the new path is inserted before the old row is dropped: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_refuses_a_whole_tree_prefix() {
+        let (mut conn, log) =
+            live_queue_conn(vec![(11, "USB/MUSIC/a.flac".to_string())], None)
+                .await;
+        let ctx = ctx_logging_to(&log);
+        let err = handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB".to_string(),
+                to_prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, VerbError::RewritePrefixInvalid),
+            "USB alone would take every stick: {err}"
+        );
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["USB/MUSIC/a.flac".to_string()],
+            "a refused rewrite leaves the queue",
         );
     }
 

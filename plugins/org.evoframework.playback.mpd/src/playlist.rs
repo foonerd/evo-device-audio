@@ -1177,6 +1177,71 @@ pub(crate) async fn handle_move_in_playlist(
 
 // ----- tests -----
 
+/// Rewrite USB leftover URIs inside every stored playlist,
+/// including favourites. Add the new list first, then drop the
+/// old rows, so a failed `playlistadd` leaves the operator's
+/// list intact. Segment-aware: `USB/MUSIC` does not take
+/// `USB/MUSIC2`.
+pub(crate) async fn rewrite_stored_uris_under(
+    conn: &mut MpdConnection,
+    from: &str,
+    to: &str,
+    favourites_name: &str,
+) -> Result<u32, String> {
+    let mut names: Vec<String> = match conn.listplaylists().await {
+        Ok(summaries) => summaries.into_iter().map(|s| s.name).collect(),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !favourites_name.is_empty()
+        && !names.iter().any(|n| n == favourites_name)
+    {
+        names.push(favourites_name.to_string());
+    }
+    let mut rewritten = 0u32;
+    for name in names {
+        rewritten += rewrite_one_stored_playlist(conn, &name, from, to).await?;
+    }
+    Ok(rewritten)
+}
+
+async fn rewrite_one_stored_playlist(
+    conn: &mut MpdConnection,
+    name: &str,
+    from: &str,
+    to: &str,
+) -> Result<u32, String> {
+    let entries = match conn.listplaylistinfo(name).await {
+        Ok(e) => e,
+        Err(_) => return Ok(0),
+    };
+    let mut changed = 0u32;
+    let mut new_list = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        if let Some(new_uri) =
+            crate::queue::rewrite_queue_path(&entry.file_path, from, to)
+        {
+            new_list.push(new_uri);
+            changed += 1;
+        } else {
+            new_list.push(entry.file_path.clone());
+        }
+    }
+    if changed == 0 {
+        return Ok(0);
+    }
+    for uri in &new_list {
+        conn.playlistadd(name, uri)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for i in (0..entries.len()).rev() {
+        conn.playlistdelete(name, i as u32)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -52,11 +52,13 @@
 //! `source_id` for the wire envelope's per-item record, the
 //! module's source resolver combines MPD's `music_directory`
 //! with the file path to get an absolute path, then walks the
-//! source registry to find which source's `mount_path` is a
-//! prefix. The first match wins; items that don't resolve
-//! under any registered source carry `source_id: null` on the
-//! wire and are treated by the skip-traversal as `Probing`
-//! sources (try-MPD-and-classify).
+//! source registry and keeps the longest matching `mount_path`.
+//! The floor source is mounted at `music_directory`, so a first-
+//! match walk would claim every `USB/` / `NAS/` leftover as
+//! Internal. A URI under those sibling trees that has no
+//! matching source stays unresolved (`source_id: null`) so
+//! gone-curation retains it — a rename must not empty the
+//! queue. Skip-traversal treats unresolved items as `Probing`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +71,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::library::LIBRARY_PAYLOAD_VERSION;
-use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem};
+use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem, PlayState};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
 
@@ -379,12 +381,38 @@ pub(crate) async fn resolve_source(
         return None;
     }
     let absolute = music_directory.join(file_path);
+    let mut best: Option<(usize, String, std::path::PathBuf)> = None;
     for source in registry.snapshot().await {
         if absolute.starts_with(&source.mount_path) {
-            return Some(source.id);
+            let len = source.mount_path.as_os_str().len();
+            if best.as_ref().is_none_or(|(best_len, _, _)| len > *best_len) {
+                best =
+                    Some((len, source.id.clone(), source.mount_path.clone()));
+            }
         }
     }
-    None
+    match best {
+        Some((_, _, mount))
+            if first_segment_is_sibling_tree(file_path)
+                && mount == music_directory =>
+        {
+            // Floor is mounted at music_directory. After a USB
+            // rename the old `USB/<name>/…` rows are still in
+            // the queue and no USB source owns that name.
+            // Attributing them to Internal makes gone-curation
+            // treat a rename as a wipe.
+            None
+        }
+        Some((_, id, _)) => Some(id),
+        None => None,
+    }
+}
+
+/// Trees that sit next to Internal under `music_directory`.
+/// The floor source must not claim leftovers in these trees
+/// when their own source row is gone (rename / unmount window).
+fn first_segment_is_sibling_tree(file_path: &str) -> bool {
+    matches!(file_path.split('/').next(), Some("USB" | "NAS"))
 }
 
 /// Compute the per-item `available` flag — delegates to the
@@ -1870,16 +1898,279 @@ pub(crate) async fn drop_queue_items_under(
     Ok(dropped)
 }
 
+/// One queue row set aside so a USB rename can umount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedQueueItem {
+    pub(crate) position: u32,
+    pub(crate) uri: String,
+}
+
+/// Queue rows taken off MPD so it closes the files, to be put
+/// back after remount. Not a Remove: the operator's list is
+/// held here, not discarded.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedQueue {
+    pub(crate) items: Vec<ParkedQueueItem>,
+    pub(crate) playing: bool,
+    pub(crate) paused: bool,
+    pub(crate) current: Option<u32>,
+}
+
+/// Snapshot then drop every queue item under `prefix`.
+///
+/// Rename must umount the volume. A queued track under that
+/// tree is an open file, playing or not, and an open file is
+/// EBUSY. This takes those rows off MPD so the umount is
+/// clean. The caller puts them back after remount. INTERNAL
+/// and a neighbour stick stay in the queue.
+pub(crate) async fn park_queue_items_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    prefix: &str,
+) -> Result<ParkedQueue, VerbError> {
+    if prefix.is_empty() {
+        return Ok(ParkedQueue::default());
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "park_uri_prefix".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let parked_items: Vec<ParkedQueueItem> = items
+        .iter()
+        .filter(|i| queue_path_is_under(&i.file_path, prefix))
+        .map(|i| ParkedQueueItem {
+            position: i.position,
+            uri: i.file_path.clone(),
+        })
+        .collect();
+    if parked_items.is_empty() {
+        return Ok(ParkedQueue::default());
+    }
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    let current = status.song_position;
+    let on_parked = current
+        .is_some_and(|pos| parked_items.iter().any(|i| i.position == pos));
+    let (playing, paused) = if on_parked {
+        (
+            matches!(status.state, PlayState::Playing),
+            matches!(status.state, PlayState::Paused),
+        )
+    } else {
+        (false, false)
+    };
+    drop_queue_items_under(ctx, conn, prefix).await?;
+    Ok(ParkedQueue {
+        items: parked_items,
+        playing,
+        paused,
+        current: if on_parked { current } else { None },
+    })
+}
+
+/// Put parked rows back. `addid` at the original positions.
+/// Never `clear`. Transport is restored only when the parked
+/// current was playing or paused.
+pub(crate) async fn restore_parked_queue(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    parked: &ParkedQueue,
+) -> Result<usize, VerbError> {
+    if parked.items.is_empty() {
+        return Ok(0);
+    }
+    let mut items = parked.items.clone();
+    items.sort_by_key(|i| i.position);
+    let mut restored = 0usize;
+    for item in &items {
+        match conn.addid(&item.uri, Some(item.position)).await {
+            Ok(_) => restored += 1,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    uri = %item.uri,
+                    position = item.position,
+                    error = %e,
+                    "restore_parked_uris: addid failed; that row is skipped"
+                );
+            }
+        }
+    }
+    if restored == 0 {
+        return Ok(0);
+    }
+    if let Some(pos) = parked.current {
+        if parked.playing || parked.paused {
+            if let Err(e) = conn.play_position(pos).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    position = pos,
+                    error = %e,
+                    "restore_parked_uris: could not restore the current position"
+                );
+            } else if parked.paused {
+                if let Err(e) = conn.pause(true).await {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "restore_parked_uris: restored play but could not re-pause"
+                    );
+                }
+            }
+            publish_now_playing_after_transport(
+                ctx,
+                conn,
+                "restore_parked_uris",
+            )
+            .await;
+        }
+    }
+    publish_queue(ctx, conn).await;
+    Ok(restored)
+}
+
+/// Rewrite every queue item under `from_prefix` onto `to_prefix`.
+///
+/// USB rename remounts the same files under a new leaf. The
+/// operator's queue still holds the old MPD paths. Clearing
+/// those items would be a Remove they did not ask for; leaving
+/// them stale makes Play a no-op and lets gone-curation wipe
+/// them once the old source row is gone.
+///
+/// Each match is `addid` at the same position, then `deleteid`
+/// of the old row. `addid` first: if the new path is not in
+/// MPD's database yet the old row stays. Never `clear`. Never
+/// `stop`. Segment-aware, so `USB/MUSIC` does not take
+/// `USB/MUSIC2` with it.
+///
+/// When the current song is rewritten and the player was
+/// playing or paused, transport is restored at that index so
+/// the hero follows the new URI. Stopped stays stopped.
+///
+/// Returns how many items were rewritten.
+pub(crate) async fn rewrite_queue_uris_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    from_prefix: &str,
+    to_prefix: &str,
+) -> Result<usize, VerbError> {
+    if from_prefix.is_empty()
+        || to_prefix.is_empty()
+        || from_prefix == to_prefix
+    {
+        return Ok(0);
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "rewrite_uri_prefix".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let mut targets: Vec<(u32, u32, String)> = items
+        .iter()
+        .filter_map(|i| {
+            rewrite_queue_path(&i.file_path, from_prefix, to_prefix)
+                .map(|new_uri| (i.id, i.position, new_uri))
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    targets.sort_by(|a, b| b.1.cmp(&a.1));
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    let current_pos = status.song_position;
+    let restore = match (current_pos, status.state) {
+        (Some(pos), PlayState::Playing)
+            if targets.iter().any(|(_, p, _)| *p == pos) =>
+        {
+            Some((pos, false))
+        }
+        (Some(pos), PlayState::Paused)
+            if targets.iter().any(|(_, p, _)| *p == pos) =>
+        {
+            Some((pos, true))
+        }
+        _ => None,
+    };
+    let mut rewritten = 0usize;
+    for (old_id, pos, new_uri) in targets {
+        match conn.addid(&new_uri, Some(pos)).await {
+            Ok(_) => {
+                conn.deleteid(old_id)
+                    .await
+                    .map_err(|e| mpd(e, "deleteid"))?;
+                rewritten += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    from = %from_prefix,
+                    to = %to_prefix,
+                    uri = %new_uri,
+                    error = %e,
+                    "rewrite_uri_prefix: addid of the new path failed; \
+                     the old queue row is left in place"
+                );
+            }
+        }
+    }
+    if rewritten == 0 {
+        return Ok(0);
+    }
+    if let Some((pos, paused)) = restore {
+        if let Err(e) = conn.play_position(pos).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                position = pos,
+                error = %e,
+                "rewrite_uri_prefix: could not restore the current \
+                 position after the URI rewrite"
+            );
+        } else if paused {
+            if let Err(e) = conn.pause(true).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "rewrite_uri_prefix: restored play but could not \
+                     re-pause"
+                );
+            }
+        }
+        publish_now_playing_after_transport(ctx, conn, "rewrite_uri_prefix")
+            .await;
+    }
+    publish_queue(ctx, conn).await;
+    Ok(rewritten)
+}
+
 /// True when `file_path` is `prefix` itself or sits beneath it.
 ///
 /// Segment-aware: `USB/Stick` contains `USB/Stick/a.flac` but not
 /// `USB/Stick2/a.flac`. A raw `starts_with` would take the
 /// neighbouring stick's tracks out of the queue too.
-fn queue_path_is_under(file_path: &str, prefix: &str) -> bool {
+pub(crate) fn queue_path_is_under(file_path: &str, prefix: &str) -> bool {
     match file_path.strip_prefix(prefix) {
         Some(rest) => rest.is_empty() || rest.starts_with('/'),
         None => false,
     }
+}
+
+/// Map `USB/MUSIC/a.flac` under `USB/MUSIC` onto `USB/Audio`.
+pub(crate) fn rewrite_queue_path(
+    file_path: &str,
+    from: &str,
+    to: &str,
+) -> Option<String> {
+    if !queue_path_is_under(file_path, from) {
+        return None;
+    }
+    let rest = file_path.strip_prefix(from)?;
+    Some(format!("{to}{rest}"))
 }
 
 /// `queue.load_playlist_to_queue` — replace queue with stored
@@ -2547,6 +2838,104 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| c.starts_with("addid")),
             "Append must not addid: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_queue_path_is_segment_aware() {
+        assert_eq!(
+            rewrite_queue_path("USB/MUSIC/a.flac", "USB/MUSIC", "USB/Audio"),
+            Some("USB/Audio/a.flac".to_string()),
+        );
+        assert_eq!(
+            rewrite_queue_path("USB/MUSIC2/a.flac", "USB/MUSIC", "USB/Audio"),
+            None,
+        );
+        assert_eq!(
+            rewrite_queue_path("INTERNAL/a.flac", "USB/MUSIC", "USB/Audio"),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_source_floor_does_not_claim_usb_leftovers() {
+        // After rename the USB row is gone. The floor is mounted
+        // at music_directory, so a first-match walk would call
+        // USB leftovers Internal and gone-curation would empty
+        // the queue.
+        let registry = SourceRegistry::new();
+        registry
+            .register(local_source(
+                "local-internal",
+                "/var/lib/evo/music",
+                SourceState::Online,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "USB/MUSIC/a.flac",
+                &registry,
+            )
+            .await,
+            None,
+        );
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "INTERNAL/a.flac",
+                &registry,
+            )
+            .await
+            .as_deref(),
+            Some("local-internal"),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_source_longest_mount_wins_over_the_floor() {
+        let registry = SourceRegistry::new();
+        registry
+            .register(local_source(
+                "local-internal",
+                "/var/lib/evo/music",
+                SourceState::Online,
+            ))
+            .await
+            .unwrap();
+        registry
+            .register(SourceRecord {
+                id: "usb-audio".into(),
+                display_name: "Audio".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/sdb1".into(),
+                    label: "Audio".into(),
+                },
+                mount_path: PathBuf::from("/var/lib/evo/music/USB/Audio"),
+                mpd_storage_name: None,
+                state: SourceState::Online,
+                last_seen_online_at_ms: None,
+                probe_cadence_ms: 60_000,
+                scan_policy: ScanPolicy::EagerIncremental {
+                    on_online: true,
+                    on_mount_event: false,
+                },
+                track_count: 0,
+                track_count_available: 0,
+                last_scan_at_ms: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "USB/Audio/a.flac",
+                &registry,
+            )
+            .await
+            .as_deref(),
+            Some("usb-audio"),
         );
     }
 

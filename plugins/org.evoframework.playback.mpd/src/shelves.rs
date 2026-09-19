@@ -610,6 +610,15 @@ impl ShelfBundle {
             "library.remove_source" => {
                 Ok(Some(self.dispatch_library_remove_source(req).await?))
             }
+            "library.rewrite_uri_prefix" => {
+                Ok(Some(self.dispatch_library_rewrite_uri_prefix(req).await?))
+            }
+            "library.park_uri_prefix" => {
+                Ok(Some(self.dispatch_library_park_uri_prefix(req).await?))
+            }
+            "library.restore_parked_uris" => {
+                Ok(Some(self.dispatch_library_restore_parked_uris(req).await?))
+            }
             "library.probe_source" => {
                 Ok(Some(self.dispatch_library_probe_source(req).await?))
             }
@@ -1063,6 +1072,52 @@ impl ShelfBundle {
         encode_ok_response(req)
     }
 
+    async fn dispatch_library_rewrite_uri_prefix(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::RewriteUriPrefixPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res = library::handle_rewrite_uri_prefix(
+            &self.library,
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_park_uri_prefix(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::ParkUriPrefixPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res =
+            library::handle_park_uri_prefix(&self.queue, &mut conn, payload)
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_restore_parked_uris(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::RestoreParkedUrisPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res = library::handle_restore_parked_uris(
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
     async fn dispatch_library_probe_source(
         &self,
         req: &Request,
@@ -1326,9 +1381,10 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::SourceOffline { .. }
         | VerbError::Register { .. }
         | VerbError::SourceOutsideMusicDirectory { .. }
-        | VerbError::UnknownWork { .. } => {
-            PluginError::Permanent(e.to_string())
-        }
+        | VerbError::UnknownWork { .. }
+        | VerbError::RewritePrefixInvalid
+        | VerbError::RewritePrefixUnchanged
+        | VerbError::ParkPrefixInvalid => PluginError::Permanent(e.to_string()),
         // WorkAggregateNotReady is transient — the next
         // Database / Update idle event populates the cache.
         // Operator retry succeeds; treat as transient so

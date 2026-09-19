@@ -638,6 +638,8 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
             let mut next_id =
                 queue.iter().map(|(id, _)| *id).max().unwrap_or(99) + 1;
             let mut in_list = false;
+            let mut stored: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
             let mut line = String::new();
             loop {
                 line.clear();
@@ -713,6 +715,57 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                             .await;
                         next_id += 1;
                     }
+                } else if cmd.starts_with("listplaylists") {
+                    let mut out = String::new();
+                    for name in stored.keys() {
+                        out.push_str(&format!("playlist: {name}\n"));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("listplaylistinfo") {
+                    let name =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    let mut out = String::new();
+                    if let Some(entries) = stored.get(&name) {
+                        for (pos, path) in entries.iter().enumerate() {
+                            out.push_str(&format!(
+                                "file: {path}\nPos: {pos}\n"
+                            ));
+                        }
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("playlistadd") {
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("playlistadd")
+                    });
+                    let name = args.next().unwrap_or_default().to_string();
+                    let uri = args.next().unwrap_or_default().to_string();
+                    if !name.is_empty() && !uri.is_empty() {
+                        stored.entry(name).or_default().push(uri);
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistdelete") {
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("playlistdelete")
+                    });
+                    let name = args.next().unwrap_or_default().to_string();
+                    let pos = args
+                        .next()
+                        .and_then(|t| t.trim().parse::<usize>().ok());
+                    if let (Some(entries), Some(pos)) =
+                        (stored.get_mut(&name), pos)
+                    {
+                        if pos < entries.len() {
+                            entries.remove(pos);
+                        }
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistclear") {
+                    let name =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    stored.remove(&name);
+                    let _ = w.write_all(b"OK\n").await;
                 } else if cmd.starts_with("currentsong") {
                     // Ordered after `playlistinfo` and before
                     // `play`: MPD's queue verbs share prefixes
