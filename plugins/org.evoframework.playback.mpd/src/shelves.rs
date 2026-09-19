@@ -1068,6 +1068,12 @@ impl ShelfBundle {
         )
         .await
         .map_err(library_verb_to_plugin_error)?;
+        // Operator Remove drops USB leftovers from stored
+        // lists. The glass reads audio_playlist_index and the
+        // favourites subject — republish so it does not keep
+        // the stick's path until the next mutation.
+        playlist::publish_index(&self.playlist, &mut conn).await;
+        favourites::refresh_favourites(&self.favourites, &mut conn).await;
         encode_ok_response(req)
     }
 

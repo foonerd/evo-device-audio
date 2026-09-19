@@ -1310,6 +1310,61 @@ async fn rewrite_one_stored_playlist(
     Ok(changed)
 }
 
+/// Drop USB leftover URIs from every stored playlist,
+/// including favourites. Operator Remove: the stick is gone
+/// and the system must not keep those tracks. Positions are
+/// deleted high-to-low. Never `playlistclear`, never `save`.
+/// Segment-aware: `USB/MUSIC` does not take `USB/MUSIC2`.
+pub(crate) async fn drop_stored_uris_under(
+    conn: &mut MpdConnection,
+    prefix: &str,
+    favourites_name: &str,
+) -> Result<u32, String> {
+    let mut names: Vec<String> = match conn.listplaylists().await {
+        Ok(summaries) => summaries.into_iter().map(|s| s.name).collect(),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !favourites_name.is_empty()
+        && !names.iter().any(|n| n == favourites_name)
+    {
+        names.push(favourites_name.to_string());
+    }
+    let mut dropped = 0u32;
+    for name in names {
+        dropped += drop_one_stored_playlist(conn, &name, prefix).await?;
+    }
+    Ok(dropped)
+}
+
+async fn drop_one_stored_playlist(
+    conn: &mut MpdConnection,
+    name: &str,
+    prefix: &str,
+) -> Result<u32, String> {
+    let entries = match conn.listplaylistinfo(name).await {
+        Ok(e) => e,
+        Err(_) => return Ok(0),
+    };
+    let mut positions: Vec<u32> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            crate::queue::queue_path_is_under(&entry.file_path, prefix)
+        })
+        .map(|(i, _)| i as u32)
+        .collect();
+    if positions.is_empty() {
+        return Ok(0);
+    }
+    positions.sort_unstable_by(|a, b| b.cmp(a));
+    for pos in &positions {
+        conn.playlistdelete(name, *pos)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(positions.len() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,6 +1673,89 @@ mod tests {
         assert!(
             seen.iter().all(|c| !c.starts_with("playlistadd")),
             "nothing was written: {seen:?}",
+        );
+    }
+
+    async fn live_stored_conn(
+    ) -> (MpdConnection, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: Vec::new(),
+                playing: None,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        (conn, commands)
+    }
+
+    async fn held(conn: &mut MpdConnection, name: &str) -> Vec<String> {
+        conn.listplaylistinfo(name)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_remove_drops_usb_rows_from_favourites_and_named_lists() {
+        // Remove is remove: the stick's tracks leave every
+        // stored list. INTERNAL stays. A neighbour stick stays.
+        // Never playlistclear — that would wipe the rest.
+        let (mut conn, log) = live_stored_conn().await;
+        conn.playlistadd(
+            DEFAULT_FAVOURITES_PLAYLIST_NAME,
+            "USB/MUSIC/loved.flac",
+        )
+        .await
+        .unwrap();
+        conn.playlistadd(
+            DEFAULT_FAVOURITES_PLAYLIST_NAME,
+            "INTERNAL/keep.flac",
+        )
+        .await
+        .unwrap();
+        conn.playlistadd("Road", "USB/MUSIC/a.flac").await.unwrap();
+        conn.playlistadd("Road", "USB/MUSIC2/other.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+
+        let dropped = drop_stored_uris_under(
+            &mut conn,
+            "USB/MUSIC",
+            DEFAULT_FAVOURITES_PLAYLIST_NAME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dropped, 2, "one favourite and one Road row");
+        assert_eq!(
+            held(&mut conn, DEFAULT_FAVOURITES_PLAYLIST_NAME).await,
+            vec!["INTERNAL/keep.flac".to_string()],
+        );
+        assert_eq!(
+            held(&mut conn, "Road").await,
+            vec![
+                "USB/MUSIC2/other.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("playlistclear")
+                && !c.starts_with("save")
+                && !c.starts_with("clear")),
+            "drop is not a wipe: {seen:?}",
         );
     }
 

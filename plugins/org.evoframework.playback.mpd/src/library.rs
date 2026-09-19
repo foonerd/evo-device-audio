@@ -1127,7 +1127,20 @@ pub(crate) async fn handle_remove_source(
         // released here, before the volume is handed over, so the
         // detach that follows has nothing of ours to fight.
         release_queue_for_source(queue, ctx, conn, &record).await;
+        // Stored playlists and favourites are not open files on
+        // the mount, so they do not block umount. They still
+        // hold the stick's tracks after the floor is scrubbed:
+        // gone-curation retains an unresolved USB leftover so a
+        // rename does not empty the list. Remove is not rename.
+        release_stored_playlists_for_source(ctx, conn, &record).await;
         remove_usb_via_safe_remove(ctx, &payload.source_id, &record).await?;
+    } else if payload.scrub_mpd_entries && !payload.consumer_stop {
+        // Sources-page Remove already detached, then lands here
+        // with scrub set. The queue was released on the first
+        // door or was empty. The stored lists still hold the
+        // stick. Rename sets consumer_stop and must not take
+        // this branch — rewrite puts those URIs on the new name.
+        release_stored_playlists_for_source(ctx, conn, &record).await;
     }
 
     // Optional MPD scrub: run `update PATH` after unmount so
@@ -1410,6 +1423,60 @@ async fn release_queue_for_source(
             error = %e,
             "library.remove_source: queue release failed; the detach \
              still proceeds and may escalate to a lazy umount"
+        ),
+    }
+}
+
+/// Drop stored-playlist and favourites rows under one source.
+///
+/// Best-effort: Remove still proceeds if a list cannot be
+/// rewritten. Rename must not call this — it rewrites.
+async fn release_stored_playlists_for_source(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    record: &SourceRecord,
+) {
+    let prefix = match mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %record.id,
+                error = %e,
+                "library.remove_source: source is not under \
+                 music_directory; stored playlists have nothing of \
+                 it to drop"
+            );
+            return;
+        }
+    };
+    match crate::playlist::drop_stored_uris_under(
+        conn,
+        &prefix,
+        crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(dropped) => tracing::info!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            dropped,
+            "library.remove_source: dropped this source's tracks \
+             from stored playlists"
+        ),
+        Err(e) => tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            error = %e,
+            "library.remove_source: stored playlist drop failed; \
+             the detach still proceeds"
         ),
     }
 }
@@ -4210,6 +4277,122 @@ mod tests {
                 .all(|c| !c.starts_with("DISPATCH storage.usb.safe_remove")),
             "rename must not eject: {seen:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn a_remove_drops_usb_rows_from_stored_playlists() {
+        // Queue release already runs on Remove. Stored lists
+        // still held USB/MUSIC after the floor was scrubbed —
+        // gone-curation retains an unresolved leftover so a
+        // rename does not empty them. Remove must drop those
+        // rows. INTERNAL and a neighbour stick stay.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "USB/MUSIC/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/MUSIC/a.flac").await.unwrap();
+        conn.playlistadd("Road", "USB/MUSIC2/other.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["INTERNAL/keep.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(
+            road,
+            vec![
+                "USB/MUSIC2/other.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("playlistclear")
+                && !c.starts_with("save")
+                && !c.starts_with("clear")),
+            "Remove drops matching rows; it does not wipe the list: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_leaves_stored_playlist_uris() {
+        // Rename remounts. The old name's stored URIs are
+        // rewritten after the new tree is back. Dropping them
+        // here would empty favourites the operator did not
+        // ask to clear.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "USB/MUSIC/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/MUSIC/a.flac").await.unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["USB/MUSIC/loved.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(road, vec!["USB/MUSIC/a.flac".to_string()]);
     }
 
     #[tokio::test]
