@@ -1993,8 +1993,17 @@ pub(crate) async fn handle_save_queue_as_playlist(
 }
 
 /// `queue.skip_to_next_available` — run the skip-traversal
-/// against the current queue starting at the current position;
-/// disposition records fire through the shared emitter.
+/// against the current queue starting *after* the current
+/// position. Starting at the current song would
+/// `play_position` that song again whenever it is reachable,
+/// so the operator skip would be a no-op.
+///
+/// After the walk this call publishes both subjects on its
+/// own stack: now_playing first (the track the skip landed
+/// on is the hero surface), then the queue. Same gap as
+/// `play_from_position`: the walk drives MPD on the shelf's
+/// own connection, so the custody supervisor only hears
+/// about it on the next `player` idle event.
 pub(crate) async fn handle_skip_to_next_available(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
@@ -2012,12 +2021,13 @@ pub(crate) async fn handle_skip_to_next_available(
         verb: "skip_to_next_available".to_string(),
         reason: e.to_string(),
     })?;
-    let from = status.song_position.map(|p| p as i64).unwrap_or(-1);
+    let from = status
+        .song_position
+        .map(|p| i64::from(p).saturating_add(1))
+        .unwrap_or(0);
     let outcome = ctx.skip.advance_to_next_playable(conn, from, &view).await;
-    // Publish the queue to refresh per-item available flags
-    // after the traversal (a successful Playing changes the
-    // current_position; any disposition emission might have
-    // moved sticker reconciler state).
+    publish_now_playing_after_transport(ctx, conn, "skip_to_next_available")
+        .await;
     publish_queue(ctx, conn).await;
     Ok(outcome)
 }
@@ -3130,6 +3140,95 @@ mod tests {
         assert_eq!(
             now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac",
             "the track named is the one the operator addressed: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_to_next_available_publishes_now_playing_on_its_own_stack() {
+        // Skip drives MPD on the shelf's own connection. The
+        // walk starts after the current track; the verb
+        // publishes now_playing itself rather than leaving
+        // the hero surface on the previous track until the
+        // idle wake lands.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                    (13, "INTERNAL/c.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+        );
+
+        let outcome = handle_skip_to_next_available(
+            &ctx,
+            &mut conn,
+            SkipToNextAvailablePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SkipOutcome::Playing { position: 1 },
+            "skip leaves the current track and lands on the next"
+        );
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after the skip: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac",
+            "the track named is the one the skip landed on: {:?}",
             now_playing[0]
         );
 
