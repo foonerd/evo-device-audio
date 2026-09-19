@@ -3628,6 +3628,7 @@ mod tests {
             Arc::new(NullAnn),
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         )
     }
 

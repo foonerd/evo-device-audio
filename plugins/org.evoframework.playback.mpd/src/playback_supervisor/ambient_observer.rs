@@ -110,6 +110,7 @@ pub(crate) fn spawn(
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
     music_directory: Option<std::path::PathBuf>,
+    mute: crate::mute_cell::MuteCell,
 ) -> AmbientObserverHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
@@ -120,6 +121,7 @@ pub(crate) fn spawn(
             timeouts,
             subject_emitter,
             music_directory,
+            mute,
             task_shutdown,
         )
         .await;
@@ -133,6 +135,7 @@ async fn run(
     timeouts: ConnectTimeouts,
     subject_emitter: SubjectEmitter,
     music_directory: Option<std::path::PathBuf>,
+    mute: crate::mute_cell::MuteCell,
     shutdown: Arc<Notify>,
 ) {
     tracing::info!(
@@ -178,6 +181,7 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
+            &mute,
         )
         .await;
 
@@ -191,6 +195,7 @@ async fn run(
             &subject_emitter,
             music_directory.as_deref(),
             &mut last_probed_file,
+            &mute,
             &shutdown,
         )
         .await;
@@ -246,6 +251,7 @@ async fn run_inner(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
+    mute: &crate::mute_cell::MuteCell,
     shutdown: &Arc<Notify>,
 ) {
     // The supervisor uses the same idle subsystems + a 24-hour
@@ -284,6 +290,7 @@ async fn run_inner(
                             subject_emitter,
                             music_directory,
                             last_probed_file,
+                            mute,
                         )
                         .await;
                     }
@@ -326,6 +333,7 @@ async fn emit_now_playing(
     subject_emitter: &SubjectEmitter,
     music_directory: Option<&std::path::Path>,
     last_probed_file: &mut Option<String>,
+    mute: &crate::mute_cell::MuteCell,
 ) {
     let status = match cmd_conn.status().await {
         Ok(s) => s,
@@ -376,15 +384,7 @@ async fn emit_now_playing(
     )
     .await;
 
-    // The ambient observer cannot know the operator's mute
-    // intent (mute state is supervisor-task-local). Report the
-    // raw MPD volume; consumers that distinguish muted-vs-zero
-    // get that signal from the custody-held supervisor's
-    // reports. The visualiser gate only cares about
-    // `transport_state`, which is unaffected by mute.
-    let muted_unknown_to_observer = false;
-    let report =
-        PlaybackStateReport::from_mpd(status, song, muted_unknown_to_observer);
+    let report = PlaybackStateReport::from_mpd(status, song, mute.is_muted());
     subject_emitter.update_now_playing(&report).await;
 }
 

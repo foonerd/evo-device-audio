@@ -112,6 +112,10 @@ pub(crate) struct QueueContext {
     pub(crate) subjects: Arc<dyn SubjectAnnouncer>,
     /// Skip-traversal handle for queue.skip_to_next_available.
     pub(crate) skip: SkipTraversal,
+    /// Operator mute. Same cell the supervisor writes on
+    /// `set_mute`. A transport publish that guesses `false`
+    /// wipes a live mute on the hero surface.
+    pub(crate) mute: crate::mute_cell::MuteCell,
     /// In-memory mirror of the last published envelope, used
     /// by `queue.get_queue` to satisfy read-then-subscribe
     /// without round-tripping through the framework's subject
@@ -143,12 +147,14 @@ impl QueueContext {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
+        mute: crate::mute_cell::MuteCell,
     ) -> Self {
         Self {
             music_directory,
             registry,
             subjects,
             skip,
+            mute,
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
         }
@@ -2094,10 +2100,8 @@ pub(crate) async fn handle_play_from_position(
 /// operator the prompt update, not the gesture — the next idle
 /// wake publishes the same state.
 ///
-/// `muted` is the supervisor's task-local toggle and is not
-/// readable from MPD, so this publishes false exactly as the
-/// ambient observer does; the operator's mute intent reaches the
-/// subject from the custody-held supervisor's own reports.
+/// Mute is not in MPD. This reads the shared cell the
+/// supervisor writes on `set_mute`.
 async fn publish_now_playing_after_transport(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
@@ -2129,12 +2133,11 @@ async fn publish_now_playing_after_transport(
             return;
         }
     };
-    let muted_unknown_outside_the_supervisor = false;
     crate::playback_supervisor::publish_now_playing_from_mpd(
         &ctx.subjects,
         status,
         song,
-        muted_unknown_outside_the_supervisor,
+        ctx.mute.is_muted(),
     )
     .await;
 }
@@ -2230,6 +2233,7 @@ mod tests {
             ann as Arc<dyn SubjectAnnouncer>,
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
         (ctx, conn, commands)
     }
@@ -2840,6 +2844,7 @@ mod tests {
             Arc::new(NullAnn),
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         for uri in [
@@ -2925,6 +2930,7 @@ mod tests {
             Arc::new(NullAnn),
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         // Missing objectId after `dlna:<sid>/`.
@@ -3117,6 +3123,7 @@ mod tests {
             Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         handle_play_from_position(
@@ -3202,6 +3209,7 @@ mod tests {
             Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         let outcome = handle_skip_to_next_available(
@@ -3250,6 +3258,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skip_to_next_available_keeps_the_operator_mute() {
+        // The shelf used to publish muted=false because it
+        // could not see the supervisor's task-local flag. The
+        // shared cell is the operator's mute; a skip must not
+        // unmute the hero surface.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let mute = crate::mute_cell::MuteCell::new();
+        mute.set_muted(true);
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            mute,
+        );
+
+        handle_skip_to_next_available(
+            &ctx,
+            &mut conn,
+            SkipToNextAvailablePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1);
+        assert_eq!(
+            now_playing[0]["muted"], true,
+            "skip must not wipe a live mute: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac");
+    }
+
+    #[tokio::test]
     async fn a_refused_play_from_position_publishes_nothing() {
         // Out of range refuses before MPD is touched. A verb
         // that changed nothing must not move either subject.
@@ -3284,6 +3357,7 @@ mod tests {
             Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         handle_play_from_position(

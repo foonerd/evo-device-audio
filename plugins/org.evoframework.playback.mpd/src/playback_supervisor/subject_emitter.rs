@@ -625,11 +625,8 @@ async fn publish_now_playing_report(
 /// player has the two reads in hand and needs the subject to move
 /// on its own stack rather than on the next idle wake.
 ///
-/// `muted` is not in MPD — it is the supervisor's task-local
-/// toggle — so a caller outside the supervisor cannot know it and
-/// passes false, exactly as the ambient observer does. The
-/// operator's mute intent reaches the subject from the
-/// custody-held supervisor's own reports.
+/// `muted` is not in MPD. Callers pass the shared cell the
+/// supervisor writes on `set_mute`.
 pub(crate) async fn publish_now_playing_from_mpd(
     subjects: &Arc<dyn SubjectAnnouncer>,
     status: crate::mpd::MpdStatus,

@@ -45,7 +45,9 @@ pub(crate) mod test_mock;
 // `crate::playback_supervisor::{...}`. `report` types are not
 // re-exported because they are internal helpers used only inside
 // the module graph.
-pub(crate) use actor::{spawn, SupervisorCommandSender, SupervisorHandle};
+pub(crate) use actor::{
+    spawn, SupervisorCommandSender, SupervisorHandle, SupervisorSpawn,
+};
 pub(crate) use ambient_observer::{
     spawn as spawn_ambient_observer, AmbientObserverHandle,
 };

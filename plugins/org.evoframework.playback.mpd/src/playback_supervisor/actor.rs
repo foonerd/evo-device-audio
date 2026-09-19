@@ -286,6 +286,15 @@ impl SupervisorCommandSender {
 /// moment playback becomes active. Subject-emission failures are
 /// logged but not propagated (the state report is authoritative
 /// for spawn success).
+/// Paths and cells that outlive a single command.
+pub(crate) struct SupervisorSpawn {
+    /// MPD `music_directory` for the file-side format probe.
+    pub(crate) music_directory: Option<std::path::PathBuf>,
+    /// Operator mute. Shared with the ambient observer and
+    /// the queue shelf.
+    pub(crate) mute: crate::mute_cell::MuteCell,
+}
+
 pub(crate) async fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
@@ -293,7 +302,7 @@ pub(crate) async fn spawn(
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
     audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
-    music_directory: Option<std::path::PathBuf>,
+    io: SupervisorSpawn,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
         plugin = PLUGIN_NAME,
@@ -342,7 +351,6 @@ pub(crate) async fn spawn(
     // before silencing; `set_mute(false)` ahead of any prior
     // mute restores to this fallback rather than to an
     // operator-confusing 0.
-    let initial_muted: bool = false;
     let initial_pre_mute_volume: u8 = 50;
     emit_initial_report(
         &mut cmd_conn,
@@ -350,8 +358,8 @@ pub(crate) async fn spawn(
         reporter.as_ref(),
         &subject_emitter,
         &mut file_tracker,
-        music_directory.as_deref(),
-        initial_muted,
+        io.music_directory.as_deref(),
+        io.mute.is_muted(),
     )
     .await?;
 
@@ -378,8 +386,8 @@ pub(crate) async fn spawn(
         reporter,
         subject_emitter,
         file_tracker,
-        music_directory,
-        muted: initial_muted,
+        music_directory: io.music_directory,
+        muted: io.mute,
         pre_mute_volume: initial_pre_mute_volume,
     };
     let task_handle = tokio::spawn(task_state.run(
@@ -572,11 +580,9 @@ struct SupervisorTask {
     /// publishes None on every track change, which clears the
     /// source field rather than carrying stale data forward.
     music_directory: Option<std::path::PathBuf>,
-    /// Operator-toggled mute state. MPD has no native mute
-    /// primitive — mute is synthesised as `setvol 0` with the
-    /// pre-mute volume captured for restore on unmute. Defaults to
-    /// false (not muted) on session start.
-    muted: bool,
+    /// Operator mute. Same cell the ambient observer and the
+    /// queue shelf read when they publish now_playing.
+    muted: crate::mute_cell::MuteCell,
     /// Captured volume to restore on `set_mute(false)`. Updated
     /// every time the warden issues `set_mute(true)`: the actor
     /// reads MPD's current volume via `status()` before sending
@@ -635,7 +641,7 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                &mut self.muted,
+                                &self.muted,
                                 &mut self.pre_mute_volume,
                             ).await;
                             let ok = result.is_ok();
@@ -648,7 +654,7 @@ impl SupervisorTask {
                                     &self.subject_emitter,
                                     &mut self.file_tracker,
                                     self.music_directory.as_deref(),
-                                    self.muted,
+                                    self.muted.is_muted(),
                                 ).await;
                             }
                         }
@@ -702,7 +708,7 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                self.muted,
+                                self.muted.is_muted(),
                             ).await;
                             let _ = reply.send(result);
                         }
@@ -736,7 +742,7 @@ impl SupervisorTask {
                                 &self.subject_emitter,
                                 &mut self.file_tracker,
                                 self.music_directory.as_deref(),
-                                self.muted,
+                                self.muted.is_muted(),
                             ).await;
                         }
                     }
@@ -784,7 +790,7 @@ async fn handle_command(
     cmd_conn: &mut MpdConnection,
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    muted: &mut bool,
+    muted: &crate::mute_cell::MuteCell,
     pre_mute_volume: &mut u8,
 ) -> Result<(), PlaybackError> {
     // First attempt on the current connection.
@@ -971,7 +977,7 @@ async fn reconnect_cmd_conn(
 async fn dispatch_command(
     cmd: PlaybackCommand,
     cmd_conn: &mut MpdConnection,
-    muted: &mut bool,
+    muted: &crate::mute_cell::MuteCell,
     pre_mute_volume: &mut u8,
 ) -> Result<(), MpdError> {
     match cmd {
@@ -994,7 +1000,7 @@ async fn dispatch_command(
             // pre-mute volume rather than the zero the operator
             // just set.
             if v > 0 {
-                *muted = false;
+                muted.set_muted(false);
             }
             cmd_conn.set_volume(v).await
         }
@@ -1007,7 +1013,7 @@ async fn dispatch_command(
             // output. Already-muted is idempotent — re-issuing
             // set_mute(true) over an already-zero volume keeps
             // the previously captured pre-mute value.
-            if !*muted {
+            if !muted.is_muted() {
                 let status = cmd_conn.status().await?;
                 if let Some(current) = status.volume {
                     if current > 0 {
@@ -1015,7 +1021,7 @@ async fn dispatch_command(
                     }
                 }
             }
-            *muted = true;
+            muted.set_muted(true);
             cmd_conn.set_volume(0).await
         }
         PlaybackCommand::SetMute(false) => {
@@ -1023,7 +1029,7 @@ async fn dispatch_command(
             // 50 when no value was captured (e.g. unmute from a
             // session that started muted). Volume clamping is
             // handled by `MpdConnection::set_volume`.
-            *muted = false;
+            muted.set_muted(false);
             cmd_conn.set_volume(*pre_mute_volume).await
         }
         PlaybackCommand::SetRepeat(enabled) => {
@@ -1482,7 +1488,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1533,7 +1542,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1567,7 +1579,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1617,7 +1632,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1661,7 +1679,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1712,7 +1733,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1749,7 +1773,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1781,7 +1808,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1826,7 +1856,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1877,7 +1910,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1919,7 +1955,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1979,7 +2018,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();

@@ -119,6 +119,7 @@ mod library_triage;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
+mod mute_cell;
 mod network_shares_sync;
 mod playback_supervisor;
 mod playlist;
@@ -462,6 +463,10 @@ pub struct MpdPlaybackPlugin {
     /// the flag survives the plugin's reference-borrow
     /// boundary.
     test_tone_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Operator mute. Shared by the supervisor, the ambient
+    /// observer, and the queue shelf so a skip or a tap
+    /// cannot paint the hero surface unmuted.
+    mute: crate::mute_cell::MuteCell,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -698,6 +703,7 @@ impl MpdPlaybackPlugin {
             test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            mute: crate::mute_cell::MuteCell::new(),
             corrections_dispatched: 0,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -2304,6 +2310,7 @@ impl Plugin for MpdPlaybackPlugin {
                     self.timeouts,
                     ambient_emitter,
                     music_directory,
+                    self.mute.clone(),
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -2429,6 +2436,7 @@ impl Plugin for MpdPlaybackPlugin {
                 self.endpoint.clone(),
                 self.timeouts,
                 ctx.shelf_request_dispatcher.clone(),
+                self.mute.clone(),
             )
             .await;
             self.shelves = Some(shelves);
@@ -2698,9 +2706,15 @@ impl Warden for MpdPlaybackPlugin {
                 assignment.custody_state_reporter,
                 emitter,
                 self.audio_protocol_settings_tx.subscribe(),
-                source_probe::load_music_directory_from_mpd_conf(
-                    std::path::Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
-                ),
+                playback_supervisor::SupervisorSpawn {
+                    music_directory:
+                        source_probe::load_music_directory_from_mpd_conf(
+                            std::path::Path::new(
+                                source_probe::DEFAULT_MPD_CONF_PATH,
+                            ),
+                        ),
+                    mute: self.mute.clone(),
+                },
             )
             .await
             {
@@ -6220,7 +6234,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             rx,
-            None,
+            playback_supervisor::SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .expect("spawn should succeed against a Standard mock");

@@ -127,6 +127,7 @@ impl ShelfBundle {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
+        mute: crate::mute_cell::MuteCell,
     ) -> Self {
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
@@ -173,6 +174,7 @@ impl ShelfBundle {
             subjects.clone(),
             skip_traversal.clone(),
             shelf_dispatcher.clone(),
+            mute,
         );
         let playlist = PlaylistContext::new(
             music_directory.clone(),
