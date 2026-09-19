@@ -76,12 +76,11 @@ response_budget_ms = 180000
 # returned verb_capability_scope_not_granted and glass
 # painted "That didn't work" with no password card.
 "storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
-# Remove is the same operator gesture as glass
-# `library.remove_source`. That verb is admitted without
-# step-up; it then dispatches this one as plugin-system.
-# plugin-system's capability set is empty, so a step-up
-# gate here 400s in milliseconds and never reaches umount.
-# Mount / repair / rename are not that gesture.
-"storage.usb.safe_remove" = { kind = "none" }
+# Same household door as mount. Glass library Remove
+# still has no password of its own: it nests as
+# plugin-system, which now holds network_admin as
+# StepUp. A LAN-trust or unpaired peer cannot call
+# this verb directly.
+"storage.usb.safe_remove" = { kind = "step_up", scope = "network_admin" }
 "storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
 "storage.usb.rename" = { kind = "step_up", scope = "network_admin" }

@@ -373,15 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn safe_remove_is_not_step_up_gated() {
-        // Glass library Remove dispatches this verb as
-        // plugin-system. That principal holds no scopes. A
-        // step-up gate here is the 8 ms 400 that left the
-        // stick mounted. Mount / repair / rename stay on
-        // network_admin — the household mount door the
-        // steward already grants. storage_admin is not a
-        // granted scope, so those verbs never reached the
-        // plugin.
+    fn safe_remove_rides_the_household_network_door() {
+        // Glass library Remove still has no password: it
+        // nests as plugin-system, which holds network_admin
+        // as StepUp. Direct safe_remove on LAN-trust or an
+        // unpaired peer is refused. Mount / repair / rename
+        // stay on the same door. storage_admin is not a
+        // granted scope.
         use evo_plugin_sdk::manifest::VerbCapability;
         let m = manifest();
         let caps = &m
@@ -390,31 +388,20 @@ mod tests {
             .as_ref()
             .expect("respondent")
             .verb_capabilities;
-        assert_eq!(
-            caps.get("storage.usb.safe_remove"),
-            Some(&VerbCapability::None)
-        );
-        assert!(
-            matches!(
-                caps.get("storage.usb.mount"),
-                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
-            ),
-            "mount must stay household-gated: {:?}",
-            caps.get("storage.usb.mount")
-        );
-        assert!(
-            matches!(
-                caps.get("storage.usb.repair_filesystem"),
-                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
-            ),
-            "repair must stay household-gated"
-        );
-        assert!(
-            matches!(
-                caps.get("storage.usb.rename"),
-                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
-            ),
-            "rename must stay household-gated"
-        );
+        for verb in [
+            "storage.usb.safe_remove",
+            "storage.usb.mount",
+            "storage.usb.repair_filesystem",
+            "storage.usb.rename",
+        ] {
+            assert!(
+                matches!(
+                    caps.get(verb),
+                    Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
+                ),
+                "{verb} must stay household-gated: {:?}",
+                caps.get(verb)
+            );
+        }
     }
 }

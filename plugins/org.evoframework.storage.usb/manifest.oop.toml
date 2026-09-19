@@ -57,8 +57,6 @@ response_budget_ms = 180000
 [capabilities.respondent.verb_capabilities]
 "storage.usb.list_drives" = { kind = "none" }
 "storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
-# See manifest.toml: glass library Remove dispatches this
-# as plugin-system, which holds no scopes.
-"storage.usb.safe_remove" = { kind = "none" }
+"storage.usb.safe_remove" = { kind = "step_up", scope = "network_admin" }
 "storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
 "storage.usb.rename" = { kind = "step_up", scope = "network_admin" }

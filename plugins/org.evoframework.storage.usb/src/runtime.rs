@@ -2331,13 +2331,9 @@ pub struct SafeRemoveRequest {
     /// this verb names [`RemovalStage::Queue`] as done.
     ///
     /// Sources-page Remove leaves it true. There is no route
-    /// from here that releases the queue before the detach: the
-    /// only one would be a new prefix-drop verb on
-    /// `audio.queue`, and admitting plugin-system to it means
-    /// `kind = "none"`, which is the reachability question held
-    /// open on `plugin_system_capabilities`. Until that row is
-    /// pulled, a true here releases nothing and no Queue stage
-    /// is announced — the detach on that path escalates to a
+    /// from here that releases the queue before the detach.
+    /// A true here releases nothing and no Queue stage is
+    /// announced — the detach on that path escalates to a
     /// lazy umount exactly as it does today.
     #[serde(default = "release_queue_default")]
     pub release_queue: bool,
