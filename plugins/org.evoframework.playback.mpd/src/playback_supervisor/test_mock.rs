@@ -13,6 +13,7 @@
 //! The `#[cfg(test)]` gate lives on the `mod test_mock;` declaration
 //! in `playback_supervisor.rs`; no inner attribute needed here.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -431,6 +432,27 @@ pub(crate) enum ConnBehaviour {
         items: Vec<(u32, String)>,
         playing: Option<u32>,
     },
+    /// MPD's stored-playlist namespace, plus enough of the
+    /// library to seed a new playlist from.
+    ///
+    /// `listplaylists` indexes it; `playlistadd` creates the
+    /// playlist when it does not exist and appends when it does,
+    /// as MPD's own does; `playlistdelete` and `playlistclear`
+    /// mutate it; `lsinfo` walks `library`; and a
+    /// `command_list_ok_begin` block of `listplaylist` answers
+    /// the index's batched count query. `playlistinfo` and
+    /// `status` report `queue`, which nothing here may move.
+    ///
+    /// `playlists` is shared with the test so it can read what
+    /// MPD ended up holding. `library` maps an lsinfo path to
+    /// its `(subdirectories, files)`; the root is the empty
+    /// string.
+    StoredPlaylists {
+        commands: Arc<Mutex<Vec<String>>>,
+        playlists: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+        library: Vec<(String, Vec<String>, Vec<String>)>,
+        queue: Vec<String>,
+    },
 }
 
 /// Bind a loopback listener and serve incoming connections with
@@ -813,6 +835,163 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                 } else if !in_list {
                     let _ = w.write_all(b"OK\n").await;
                 }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::StoredPlaylists {
+            ref commands,
+            ref playlists,
+            ref library,
+            ref queue,
+        } => {
+            // `cmd "arg one" "arg two"` — MPD quotes every
+            // argument, so the odd-indexed splits are the args.
+            fn args(cmd: &str) -> Vec<String> {
+                cmd.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_string)
+                    .collect()
+            }
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                commands.lock().unwrap().push(cmd.clone());
+
+                // A command list is the one shape that reads more
+                // input before it can answer, so it is collected
+                // first and answered with the rest.
+                let mut block: Vec<String> = Vec::new();
+                if cmd.starts_with("command_list_ok_begin") {
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let c = line.trim_end().to_string();
+                        commands.lock().unwrap().push(c.clone());
+                        if c.starts_with("command_list_end") {
+                            break;
+                        }
+                        block.push(c);
+                    }
+                }
+
+                // Every arm computes its reply with the lock held
+                // only inside this block: a guard alive across the
+                // write below would make this future non-Send.
+                let reply = {
+                    let mut held = playlists.lock().unwrap();
+                    if cmd.starts_with("command_list_ok_begin") {
+                        let mut out = String::new();
+                        for c in &block {
+                            if c.starts_with("listplaylist") {
+                                let name = args(c)
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if let Some(entries) = held.get(&name) {
+                                    for e in entries {
+                                        out.push_str(&format!("file: {e}\n"));
+                                    }
+                                }
+                            }
+                            out.push_str("list_OK\n");
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("listplaylists") {
+                        let mut out = String::new();
+                        for name in held.keys() {
+                            out.push_str(&format!("playlist: {name}\n"));
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("lsinfo") {
+                        let path =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut out = String::new();
+                        if let Some((_, subdirs, files)) =
+                            library.iter().find(|(p, _, _)| *p == path)
+                        {
+                            for d in subdirs {
+                                out.push_str(&format!("directory: {d}\n"));
+                            }
+                            for f in files {
+                                out.push_str(&format!("file: {f}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("playlistadd") {
+                        let a = args(&cmd);
+                        if a.len() >= 2 {
+                            // MPD creates NAME.m3u when it is
+                            // absent; that creation is the whole
+                            // point of the seed.
+                            held.entry(a[0].clone())
+                                .or_default()
+                                .push(a[1].clone());
+                        }
+                        "OK\n".to_string()
+                    } else if cmd.starts_with("playlistdelete") {
+                        let a = args(&cmd);
+                        let pos =
+                            a.get(1).and_then(|p| p.parse::<usize>().ok());
+                        let entries = a.first().and_then(|n| held.get_mut(n));
+                        match (entries, pos) {
+                            (Some(entries), Some(p)) if p < entries.len() => {
+                                entries.remove(p);
+                                "OK\n".to_string()
+                            }
+                            _ => "ACK [2@0] {playlistdelete} Bad song index\n"
+                                .to_string(),
+                        }
+                    } else if cmd.starts_with("playlistclear") {
+                        if let Some(name) = args(&cmd).first() {
+                            if let Some(entries) = held.get_mut(name) {
+                                entries.clear();
+                            }
+                        }
+                        "OK\n".to_string()
+                    } else if cmd.starts_with("playlistinfo") {
+                        let mut out = String::new();
+                        for (pos, path) in queue.iter().enumerate() {
+                            out.push_str(&format!(
+                                "file: {path}\nPos: {pos}\nId: {}\n",
+                                pos + 1
+                            ));
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("status") {
+                        let mut out = format!(
+                            "state: play\nplaylistlength: {}\n",
+                            queue.len()
+                        );
+                        if !queue.is_empty() {
+                            out.push_str("song: 0\n");
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("idle") {
+                        String::new()
+                    } else {
+                        "OK\n".to_string()
+                    }
+                };
+
+                if cmd.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                }
+                let _ = w.write_all(reply.as_bytes()).await;
                 let _ = w.flush().await;
             }
         }

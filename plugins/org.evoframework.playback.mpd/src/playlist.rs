@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::mpd::{MpdConnection, MpdPlaylistEntry};
+use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdPlaylistEntry};
 use crate::queue::resolve_source;
 use crate::source_registry::SourceRegistry;
 
@@ -91,11 +91,6 @@ pub(crate) struct PlaylistContext {
     /// MPD's `music_directory` for the source resolver used
     /// by `get_playlist`'s per-entry availability projection.
     pub(crate) music_directory: PathBuf,
-    /// MPD's `playlist_directory` — where stored playlists
-    /// (`.m3u` files) live. Required by `create_playlist` to
-    /// materialise an empty playlist (MPD has no first-class
-    /// "create empty playlist" command).
-    pub(crate) playlist_directory: PathBuf,
     /// Shared source registry for resolving songs to sources
     /// in `get_playlist`.
     pub(crate) registry: SourceRegistry,
@@ -136,7 +131,6 @@ pub(crate) struct PlaylistContext {
 impl PlaylistContext {
     pub(crate) fn new(
         music_directory: PathBuf,
-        playlist_directory: PathBuf,
         registry: SourceRegistry,
         subjects: Arc<dyn SubjectAnnouncer>,
         favourites_name: String,
@@ -148,7 +142,6 @@ impl PlaylistContext {
     ) -> Self {
         Self {
             music_directory,
-            playlist_directory,
             registry,
             subjects,
             favourites_name,
@@ -603,25 +596,100 @@ pub(crate) async fn handle_create_playlist(
             name: payload.name.clone(),
         });
     }
-    // MPD has no "create empty playlist" command; we materialise
-    // an empty .m3u file in the playlist directory. The file's
-    // content is just the M3U header comment so MPD's parser
-    // accepts it cleanly.
-    let path = ctx.playlist_directory.join(format!("{}.m3u", payload.name));
-    tokio::fs::create_dir_all(&ctx.playlist_directory)
-        .await
-        .map_err(|e| VerbError::Mpd {
+    // MPD owns the stored-playlist namespace, and on a stock box
+    // this process cannot write it even if it wanted to:
+    // /var/lib/mpd/playlists is mpd:audio drwxr-xr-x, so the
+    // steward's group membership still only grants r-x. The host
+    // write failed, the verb answered Transient, and the operator
+    // got a refusal with the body dropped on the way through the
+    // socket. Widening the directory would be worse than the bug:
+    // a playlist file owned by the steward is one MPD can no
+    // longer rewrite, so every later add, move or rename breaks.
+    //
+    // MPD has no "create empty playlist" command, so the create is
+    // two commands MPD performs itself. `playlistadd` writes
+    // <name>.m3u — creating it, owned by mpd — and `playlistdelete`
+    // takes the seed back out, leaving the empty playlist the
+    // operator asked for. The seed is a song already in MPD's
+    // database, so nothing is read from disk and nothing of the
+    // operator's is touched.
+    //
+    // Not `save`: that stores the *current queue*, which would
+    // empty the operator's listening into their new playlist.
+    let Some(seed) = first_song_in_database(conn).await? else {
+        return Err(VerbError::Mpd {
             verb: "create_playlist".to_string(),
-            reason: format!("mkdir playlist directory: {e}"),
-        })?;
-    tokio::fs::write(&path, b"#EXTM3U\n").await.map_err(|e| {
+            reason: "MPD's database holds no song to seed the playlist \
+                     with. MPD creates a stored playlist by writing a \
+                     song into it, and this plugin must not write the \
+                     playlist directory itself"
+                .to_string(),
+        });
+    };
+    conn.playlistadd(&payload.name, &seed).await.map_err(|e| {
         VerbError::Mpd {
             verb: "create_playlist".to_string(),
-            reason: format!("write {path:?}: {e}"),
+            reason: format!("playlistadd seed: {e}"),
         }
     })?;
+    if let Err(e) = conn.playlistdelete(&payload.name, 0).await {
+        // The playlist exists and holds the seed. Leaving a track
+        // the operator never chose in a list they think is empty
+        // is worse than the failed create, so clear it before
+        // reporting.
+        let _ = conn.playlistclear(&payload.name).await;
+        return Err(VerbError::Mpd {
+            verb: "create_playlist".to_string(),
+            reason: format!("playlistdelete seed: {e}"),
+        });
+    }
     publish_index(ctx, conn).await;
     Ok(())
+}
+
+/// One song URI from MPD's database, for a caller that needs
+/// MPD to write a stored playlist into existence.
+///
+/// Walks with `lsinfo` rather than `listallinfo`: the whole
+/// database is materialised by the latter and all that is wanted
+/// here is the first file. The walk is depth-first in listing
+/// order and bounded — a library whose first song is further in
+/// than the budget answers `None`, which the caller reports
+/// honestly rather than falling back to a host write.
+async fn first_song_in_database(
+    conn: &mut MpdConnection,
+) -> Result<Option<String>, VerbError> {
+    /// Directory listings this walk will ask MPD for.
+    const LSINFO_BUDGET: usize = 64;
+
+    let mut pending = vec![String::new()];
+    let mut spent = 0usize;
+    while let Some(dir) = pending.pop() {
+        if spent >= LSINFO_BUDGET {
+            break;
+        }
+        spent += 1;
+        let entries = conn.lsinfo(&dir).await.map_err(|e| VerbError::Mpd {
+            verb: "create_playlist".to_string(),
+            reason: format!("lsinfo {dir:?}: {e}"),
+        })?;
+        let mut subdirs = Vec::new();
+        for entry in entries {
+            match entry {
+                MpdLibraryEntry::File { path, .. } => {
+                    return Ok(Some(path));
+                }
+                MpdLibraryEntry::Directory { path, .. } => {
+                    subdirs.push(path);
+                }
+                _ => {}
+            }
+        }
+        // Reversed so `pop` visits them in listing order.
+        subdirs.reverse();
+        pending.extend(subdirs);
+    }
+    Ok(None)
 }
 
 pub(crate) async fn handle_delete_playlist(
@@ -1245,6 +1313,313 @@ async fn rewrite_one_stored_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    /// One lsinfo path and what it holds: `(path, subdirectories,
+    /// files)`. The root is the empty string.
+    type LibraryTree = Vec<(String, Vec<String>, Vec<String>)>;
+
+    /// What MPD ends up holding, name to entries.
+    type HeldPlaylists = Arc<std::sync::Mutex<BTreeMap<String, Vec<String>>>>;
+
+    /// Every command line the mock was sent, in order.
+    type CommandLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A context plus a connection onto MPD's stored-playlist
+    /// namespace, with the favourites list already present and
+    /// a small library to seed from.
+    struct CreateHarness {
+        ctx: PlaylistContext,
+        conn: MpdConnection,
+        playlists: HeldPlaylists,
+        commands: CommandLog,
+    }
+
+    async fn create_harness(
+        library: LibraryTree,
+        queue: Vec<String>,
+    ) -> CreateHarness {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let playlists = Arc::new(std::sync::Mutex::new(BTreeMap::from([(
+            DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+            vec!["INTERNAL/loved.flac".to_string()],
+        )])));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::clone(&playlists),
+                library,
+                queue,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        struct NullAnn;
+        impl SubjectAnnouncer for NullAnn {
+            fn announce<'a>(
+                &'a self,
+                _a: SubjectAnnouncement,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn retract<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _reason: Option<String>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn update_state<'a>(
+                &'a self,
+                _addressing: ExternalAddressing,
+                _state: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                (),
+                                evo_plugin_sdk::contract::ReportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let ctx = PlaylistContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+            None,
+        );
+        CreateHarness {
+            ctx,
+            conn,
+            playlists,
+            commands,
+        }
+    }
+
+    /// A library whose first song sits one directory down, the
+    /// way a stock box's does.
+    fn stock_library() -> LibraryTree {
+        vec![
+            (
+                String::new(),
+                vec!["INTERNAL".to_string(), "USB".to_string()],
+                Vec::new(),
+            ),
+            (
+                "INTERNAL".to_string(),
+                Vec::new(),
+                vec!["INTERNAL/a.flac".to_string()],
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn create_playlist_is_written_by_mpd_not_by_this_process() {
+        // /var/lib/mpd/playlists is mpd:audio drwxr-xr-x. The
+        // steward is in `audio` and still only has r-x there, so
+        // the host write this verb used to do could not land —
+        // and a file this process did own would be one MPD could
+        // never rewrite afterwards.
+        let host_dir = tempfile::tempdir().expect("temp dir");
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+
+        handle_create_playlist(
+            &h.ctx,
+            &mut h.conn,
+            CreatePlaylistPayload {
+                v: PLAYLIST_PAYLOAD_VERSION,
+                name: "Road trip".to_string(),
+            },
+        )
+        .await
+        .expect("create must not refuse");
+
+        let held = h.playlists.lock().unwrap().clone();
+        assert!(
+            held.contains_key("Road trip"),
+            "MPD holds the new playlist: {:?}",
+            held.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            held.get("Road trip").map(Vec::len),
+            Some(0),
+            "and it is empty — the seed was taken back out",
+        );
+
+        let seen = h.commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("playlistadd")),
+            "MPD is what creates the file: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("playlistdelete")),
+            "and the seed is removed again: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("save")),
+            "`save` would store the operator's queue: {seen:?}",
+        );
+
+        let written: Vec<_> = std::fs::read_dir(host_dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            written.is_empty(),
+            "no .m3u is written by this process: {written:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_playlist_does_not_move_the_operator_queue() {
+        // `save` stores the current queue. Creating a playlist
+        // must not read, clear or rewrite what is playing.
+        let queue = vec![
+            "INTERNAL/one.flac".to_string(),
+            "INTERNAL/two.flac".to_string(),
+        ];
+        let mut h = create_harness(stock_library(), queue.clone()).await;
+
+        handle_create_playlist(
+            &h.ctx,
+            &mut h.conn,
+            CreatePlaylistPayload {
+                v: PLAYLIST_PAYLOAD_VERSION,
+                name: "Road trip".to_string(),
+            },
+        )
+        .await
+        .expect("create");
+
+        let after: Vec<String> = h
+            .conn
+            .playlistinfo()
+            .await
+            .expect("queue read")
+            .into_iter()
+            .map(|i| i.file_path)
+            .collect();
+        assert_eq!(after, queue, "the operator queue is untouched");
+        let status = h.conn.status().await.expect("status");
+        assert_eq!(
+            status.song_position,
+            Some(0),
+            "and the current track has not moved",
+        );
+
+        let seen = h.commands.lock().unwrap().clone();
+        for forbidden in ["save", "clear", "add ", "addid"] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "create must not touch the queue with {forbidden:?}: {seen:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_playlist_leaves_favourites_alone() {
+        // __favourites__ lives in the same namespace and is
+        // owned by mpd. Create must not read it, seed into it,
+        // or clear it.
+        let mut h = create_harness(stock_library(), Vec::new()).await;
+
+        handle_create_playlist(
+            &h.ctx,
+            &mut h.conn,
+            CreatePlaylistPayload {
+                v: PLAYLIST_PAYLOAD_VERSION,
+                name: "Road trip".to_string(),
+            },
+        )
+        .await
+        .expect("create");
+
+        let held = h.playlists.lock().unwrap().clone();
+        assert_eq!(
+            held.get(DEFAULT_FAVOURITES_PLAYLIST_NAME),
+            Some(&vec!["INTERNAL/loved.flac".to_string()]),
+            "favourites keeps its entry",
+        );
+        let seen = h.commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| {
+                !(c.starts_with("playlistadd")
+                    || c.starts_with("playlistdelete")
+                    || c.starts_with("playlistclear"))
+                    || !c.contains(DEFAULT_FAVOURITES_PLAYLIST_NAME)
+            }),
+            "no mutation names favourites: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_playlist_fails_honestly_when_the_library_is_empty() {
+        // MPD creates a stored playlist by writing a song into
+        // it. With no song to seed, there is nothing to fall
+        // back to — and pretending the host write worked is the
+        // bug this row removes.
+        let empty = vec![(String::new(), Vec::new(), Vec::new())];
+        let mut h = create_harness(empty, Vec::new()).await;
+
+        let err = handle_create_playlist(
+            &h.ctx,
+            &mut h.conn,
+            CreatePlaylistPayload {
+                v: PLAYLIST_PAYLOAD_VERSION,
+                name: "Road trip".to_string(),
+            },
+        )
+        .await
+        .expect_err("no seed, no playlist");
+
+        assert!(
+            matches!(err, VerbError::Mpd { .. }),
+            "Transient and honest, not a fabricated success: {err:?}",
+        );
+        assert!(
+            !h.playlists.lock().unwrap().contains_key("Road trip"),
+            "nothing half-created is left behind",
+        );
+        let seen = h.commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("playlistadd")),
+            "nothing was written: {seen:?}",
+        );
+    }
 
     #[test]
     fn render_index_entry_serialises_real_count_as_json_number() {

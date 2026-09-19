@@ -178,7 +178,6 @@ impl ShelfBundle {
         );
         let playlist = PlaylistContext::new(
             music_directory.clone(),
-            playlist_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
