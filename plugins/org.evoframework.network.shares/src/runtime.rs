@@ -10882,6 +10882,144 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
+    async fn add_whose_mount_fails_keeps_the_record_and_names_the_failure() {
+        // A mount that failed for a reason the operator can act
+        // on keeps the share: they retry with
+        // `network.share.mount`, which re-prompts. The add still
+        // answers Ok, and the body carries the reason so the
+        // glass can render it not-ok instead of a bare success.
+        let dir = tempdir();
+        let mut outputs = Vec::new();
+        for _ in 0..CIFS_VERS_PROBE_LADDER.len() {
+            outputs.push(err_mount_output());
+        }
+        let executor = ScriptedExecutor::new(outputs);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let req = AddShareRequest {
+            alias: "Fails To Mount".to_string(),
+            fstype: FsType::Cifs,
+            host: "192.0.2.31".to_string(),
+            path: "Music".to_string(),
+            credentials: Credentials::Guest,
+            advanced_options: String::new(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+
+        let bytes = rt
+            .dispatch_verb("network.share.add", &payload)
+            .await
+            .expect("a failed mount is not a failed add");
+        let response: AddShareResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        let named = response
+            .mount_error
+            .as_deref()
+            .expect("the body names the failed mount");
+        assert!(
+            named.contains("dialect probe exhausted"),
+            "the body names what actually failed: {named:?}",
+        );
+        assert!(
+            // The Display carries `last_error` on purpose, so
+            // the operator never sees a bare ladder list without
+            // the helper's own reason.
+            named.contains("cifs: bad option"),
+            "and carries the helper's reason with it: {named:?}",
+        );
+        assert!(
+            response.mount_report.is_none(),
+            "there is no report when the mount did not land",
+        );
+        let configured = rt.list_configured().await.unwrap();
+        assert!(
+            configured.iter().any(|r| r.share_id == response.share_id),
+            "the record stays so the operator can retry the mount: {:?}",
+            configured.iter().map(|r| &r.alias).collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refused_by_no_responder_leaves_no_record_behind() {
+        // The other arm, pinned in the same sitting so keep and
+        // rollback cannot be collapsed into one. No responder
+        // session was connected, so the operator never saw the
+        // prompt and never consented to keeping anything. The
+        // verb fails and the half-added record goes with it.
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+
+        #[derive(Debug)]
+        struct NoResponderPrompter;
+        #[async_trait]
+        impl PasswordPrompter for NoResponderPrompter {
+            async fn prompt_password(
+                &self,
+                _label: String,
+            ) -> Result<Option<Vec<u8>>, ReportError> {
+                Err(ReportError::Invalid(
+                    "no_responder_available: no user-interaction \
+                     responder session is currently connected"
+                        .into(),
+                ))
+            }
+        }
+
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(store as Arc<dyn CredentialStore>)
+            .with_password_prompter(
+                Arc::new(NoResponderPrompter) as Arc<dyn PasswordPrompter>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let req = AddShareRequest {
+            alias: "No Responder".to_string(),
+            fstype: FsType::Cifs,
+            host: "192.0.2.32".to_string(),
+            path: "Music".to_string(),
+            credentials: Credentials::UserPassword {
+                username: "op".to_string(),
+                credential_key: "absent_from_the_vault".to_string(),
+                domain: None,
+            },
+            advanced_options: String::new(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+
+        let err = rt
+            .dispatch_verb("network.share.add", &payload)
+            .await
+            .expect_err("no responder is a refused add, not a body");
+        assert!(
+            matches!(
+                err,
+                VerbDispatchError::Mount(
+                    MountError::NoResponderAvailable { .. }
+                )
+            ),
+            "the specific variant reaches the caller: {err:?}",
+        );
+
+        let configured = rt.list_configured().await.unwrap();
+        assert!(
+            configured.is_empty(),
+            "the record is rolled back, not left behind: {:?}",
+            configured.iter().map(|r| &r.alias).collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_verb_add_mounts_and_returns_share_id_and_report() {
         let dir = tempdir();
         let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
