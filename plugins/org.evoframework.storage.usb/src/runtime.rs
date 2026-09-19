@@ -1192,9 +1192,13 @@ impl StorageUsbRuntime {
     ///    with a foreign physical volume's current stable_id.
     ///    Same physical volume aliasing back to its own current
     ///    id is a no-op success.
-    /// 4. Consumer-stop: `library.remove_source` (best-effort).
-    /// 5. `sync` on the parent disk.
-    /// 6. Wrapper `umount <old-id>`.
+    /// 4. `sync` on the parent disk.
+    /// 5. Wrapper `umount <old-id>`.
+    /// 6. Consumer-stop + MPD scrub of the old name
+    ///    (`library.remove_source` with `consumer_stop` and
+    ///    `scrub_mpd_entries`). The files are already gone;
+    ///    MPD only prunes then. This is not Remove: the volume
+    ///    remounts under the new id and is not ejected.
     /// 7. Persist the alias to `aliases.toml` (or clear on
     ///    empty alias).
     /// 8. Reload the alias store into the runtime + reconcile
@@ -1296,40 +1300,10 @@ impl StorageUsbRuntime {
             }
         }
 
-        // 1. Consumer-stop (best-effort).
-        if let Some(source_id) = record.library_source_id.as_ref() {
-            if let Some(dispatcher) = self.shelf_dispatcher_clone() {
-                // Consumer-stop, not Remove: the volume is
-                // remounted under the new id straight after.
-                let stop_payload = serde_json::json!({
-                    "v": 1,
-                    "source_id": source_id,
-                    "consumer_stop": true,
-                });
-                if let Ok(bytes) = serde_json::to_vec(&stop_payload) {
-                    if let Err(e) = dispatcher
-                        .dispatch(
-                            "audio.library",
-                            "library.remove_source",
-                            bytes,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            plugin = "storage.usb",
-                            stable_id = %req.stable_id,
-                            source_id = %source_id,
-                            error = %e,
-                            "library.remove_source dispatch failed before rename; \
-                             proceeding (best-effort)"
-                        );
-                    }
-                }
-            }
-        }
-
-        // 2. sync + umount OLD path (if mounted).
+        // 1. sync + umount OLD path (if mounted). The library
+        //    row stays until this tree is gone — a scrub while
+        //    Music is still mounted reaffirms every file and
+        //    leaves that name in the floor.
         let _ = tokio::process::Command::new("sync")
             .arg(&record.parent_disk)
             .output()
@@ -1352,6 +1326,19 @@ impl StorageUsbRuntime {
                     },
                 ));
             }
+        }
+
+        // 2. Drop the old library row and scrub that name from
+        //    MPD. Consumer-stop, not Remove: the volume remounts
+        //    under the new id and is not ejected.
+        if let Some(source_id) = record.library_source_id.as_ref() {
+            self.dispatch_library_consumer_stop(
+                &req.stable_id,
+                source_id,
+                true,
+                "after umount, before remount",
+            )
+            .await;
         }
 
         // 3. Persist alias — set or clear.
@@ -1507,6 +1494,47 @@ impl StorageUsbRuntime {
         }
     }
 
+    /// Stop library consumers of this volume. Not Remove: the
+    /// volume stays on the host.
+    ///
+    /// `scrub_mpd_entries` is for rename after the old tree has
+    /// left the filesystem. MPD prunes a path only when the
+    /// files behind it are gone. Repair leaves this false — the
+    /// same path comes back after fsck.
+    async fn dispatch_library_consumer_stop(
+        &self,
+        stable_id: &str,
+        source_id: &str,
+        scrub_mpd_entries: bool,
+        when: &str,
+    ) {
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "source_id": source_id,
+            "consumer_stop": true,
+            "scrub_mpd_entries": scrub_mpd_entries,
+        });
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if let Err(e) = dispatcher
+            .dispatch("audio.library", "library.remove_source", bytes, None)
+            .await
+        {
+            tracing::warn!(
+                plugin = "storage.usb",
+                stable_id = %stable_id,
+                source_id = %source_id,
+                when,
+                error = %e,
+                "library.remove_source dispatch failed; proceeding (best-effort)"
+            );
+        }
+    }
+
     /// `storage.usb.repair_filesystem` handler. Consumer-stop
     /// before fsck, mirroring the shares MPD-stop-before-mutation
     /// pattern. No fsck runs while MPD holds files open.
@@ -1586,38 +1614,17 @@ impl StorageUsbRuntime {
 
         let before_class = record.class;
 
-        // 1. Consumer-stop — library.remove_source.
+        // 1. Consumer-stop — library.remove_source. Not Remove:
+        //    fsck runs against this volume next. Same path comes
+        //    back, so this call does not scrub.
         if let Some(source_id) = record.library_source_id.as_ref() {
-            if let Some(dispatcher) = self.shelf_dispatcher_clone() {
-                // Consumer-stop, not Remove: fsck runs against
-                // this volume next, so it must not be detached
-                // and ejected on the way.
-                let payload = serde_json::json!({
-                    "v": 1,
-                    "source_id": source_id,
-                    "consumer_stop": true,
-                });
-                if let Ok(bytes) = serde_json::to_vec(&payload) {
-                    if let Err(e) = dispatcher
-                        .dispatch(
-                            "audio.library",
-                            "library.remove_source",
-                            bytes,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            plugin = "storage.usb",
-                            stable_id = %req.stable_id,
-                            source_id = %source_id,
-                            error = %e,
-                            "library.remove_source dispatch failed before fsck; \
-                             proceeding (best-effort)"
-                        );
-                    }
-                }
-            }
+            self.dispatch_library_consumer_stop(
+                &req.stable_id,
+                source_id,
+                false,
+                "before fsck",
+            )
+            .await;
         }
 
         // 2. sync — flush kernel dirty pages on the parent disk.
@@ -3429,14 +3436,27 @@ mod tests {
     }
 
     /// Records the payload of every shelf dispatch.
-    #[derive(Default)]
     struct PayloadDispatcher {
         seen: StdMutex<Vec<(String, String)>>,
+        runner: Arc<FakeCommandRunner>,
+        umount_before_library_stop: StdMutex<Option<bool>>,
     }
 
     impl PayloadDispatcher {
+        fn recording(runner: Arc<FakeCommandRunner>) -> Self {
+            Self {
+                seen: StdMutex::new(Vec::new()),
+                runner,
+                umount_before_library_stop: StdMutex::new(None),
+            }
+        }
+
         fn seen(&self) -> Vec<(String, String)> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn umount_before_library_stop(&self) -> Option<bool> {
+            *self.umount_before_library_stop.lock().unwrap()
         }
     }
 
@@ -3458,6 +3478,14 @@ mod tests {
                     + 'a,
             >,
         > {
+            if request_type == "library.remove_source" {
+                let had_umount =
+                    self.runner.seen_argv.lock().unwrap().iter().any(|a| {
+                        a.first().map(String::as_str) == Some("umount")
+                    });
+                *self.umount_before_library_stop.lock().unwrap() =
+                    Some(had_umount);
+            }
             self.seen.lock().unwrap().push((
                 request_type.to_string(),
                 String::from_utf8_lossy(&payload).into_owned(),
@@ -3494,7 +3522,7 @@ mod tests {
             }),
             Arc::clone(&runner) as Arc<dyn CommandRunner>,
         ));
-        let d = Arc::new(PayloadDispatcher::default());
+        let d = Arc::new(PayloadDispatcher::recording(Arc::clone(&runner)));
         rt.attach_shelf_dispatcher(
             Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
         );
@@ -3537,12 +3565,30 @@ mod tests {
              library side hands it to safe_remove: {}",
             stop.1,
         );
+        assert!(
+            stop.1.contains("\"scrub_mpd_entries\":true")
+                || stop.1.contains("\"scrub_mpd_entries\": true"),
+            "rename must scrub the old name after umount, or Local \
+             library keeps that name's tracks under the new one: {}",
+            stop.1,
+        );
         let argv = runner.seen_argv.lock().unwrap().clone();
+        assert!(
+            argv.iter()
+                .any(|a| a.first().map(String::as_str) == Some("umount")),
+            "the old tree must be off the host before the scrub: {argv:?}",
+        );
         assert!(
             !argv
                 .iter()
                 .any(|a| a.first().map(String::as_str) == Some("eject")),
             "rename must not eject the volume: {argv:?}",
+        );
+        assert_eq!(
+            d.umount_before_library_stop(),
+            Some(true),
+            "scrub while the old tree is still mounted leaves that \
+             name in Local library",
         );
     }
 
@@ -3568,6 +3614,12 @@ mod tests {
         assert!(
             stop.1.contains("\"consumer_stop\":true"),
             "repair's stop must declare itself a consumer-stop: {}",
+            stop.1,
+        );
+        assert!(
+            !stop.1.contains("\"scrub_mpd_entries\":true")
+                && !stop.1.contains("\"scrub_mpd_entries\": true"),
+            "repair remounts the same name; scrub is rename's job: {}",
             stop.1,
         );
         let argv = runner.seen_argv.lock().unwrap().clone();
@@ -4207,7 +4259,7 @@ mod tests {
         rt.dispatch_verb("storage.usb.list_drives", b"{}")
             .await
             .unwrap();
-        let d = Arc::new(PayloadDispatcher::default());
+        let d = Arc::new(PayloadDispatcher::recording(Arc::clone(&runner)));
         rt.attach_shelf_dispatcher(
             Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
         );
@@ -4426,7 +4478,7 @@ mod tests {
         rt.dispatch_verb("storage.usb.list_drives", b"{}")
             .await
             .unwrap();
-        let d = Arc::new(PayloadDispatcher::default());
+        let d = Arc::new(PayloadDispatcher::recording(Arc::clone(&runner)));
         rt.attach_shelf_dispatcher(
             Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
         );

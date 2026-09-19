@@ -362,13 +362,18 @@ pub(crate) struct RemoveSourcePayload {
     pub(crate) source_id: String,
     #[serde(default)]
     pub(crate) scrub_mpd_entries: bool,
-    /// The caller is stopping consumers before it mutates the
-    /// volume itself, not removing the source.
+    /// The caller is stopping consumers, not removing the source.
     ///
     /// `storage.usb`'s rename and repair both drop the library
     /// source so MPD lets go of the tree, then remount it under a
     /// new id or run fsck against it. They are not Remove: the
     /// volume must still be there afterwards.
+    ///
+    /// Rename also sets [`Self::scrub_mpd_entries`]: the old
+    /// mount name is already gone from the filesystem, and the
+    /// floor must lose those rows or the next name's rescan
+    /// stacks on them. Repair leaves scrub off — the same path
+    /// comes back.
     ///
     /// Defaults to false, so the operator's Remove — which the
     /// shell sends as `source_id` alone — is unchanged and still
@@ -1034,10 +1039,11 @@ pub(crate) async fn handle_remove_source(
     //     (`retract_library: false`), then falls through.
     //   - Sources-page safe_remove after detach: scrub set.
     //     Falls through. USB may call us; we do not call USB.
-    //   - rename and repair stopping consumers before they touch
-    //     the volume: consumer_stop set. Falls through, because
-    //     detaching and ejecting a volume that is about to be
-    //     fsck'd or remounted is not what they asked for.
+    //   - rename after umount: consumer_stop and scrub set. The
+    //     old name's rows leave the floor; the volume remounts
+    //     under a new id, so this is not a detach.
+    //   - repair stopping consumers before fsck: consumer_stop
+    //     set. Same path comes back; scrub stays off.
     let usb_handover = !payload.consumer_stop
         && !payload.scrub_mpd_entries
         && matches!(record.kind, SourceKind::LocalUsb { .. });
@@ -3833,6 +3839,131 @@ mod tests {
             "the floor must carry the two INTERNAL songs and neither of \
              the three that left with the stick — counted after the prune, \
              not on the update ACK",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_prunes_the_old_name_from_the_floor() {
+        // Rename remounts under a new id. The old path is already
+        // gone from the filesystem when this call runs. Scrub
+        // must prune that name so Local library is INTERNAL
+        // plus the new name once, not the old name stacked
+        // under it. The volume is not handed to safe_remove.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "a rename scrub must not reach storage.usb — no detach, no \
+             eject; saw {:?}",
+            d.seen(),
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "the old name's row is dropped",
+        );
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must lose the three songs that lived under \
+             the previous USB name",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_leaves_the_operator_queue_alone() {
+        // The old name's queue URIs go stale after remount.
+        // Rewriting them is not this row. Emptying the queue
+        // would be a Remove the operator did not ask for.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "USB/MUSIC/a.flac".to_string(),
+                "USB/MUSIC/b.flac".to_string(),
+            ],
+            "a rename scrub is not a Remove; the queue is untouched",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "nor is the player stopped: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("DISPATCH storage.usb.safe_remove")),
+            "rename must not eject: {seen:?}",
         );
     }
 
