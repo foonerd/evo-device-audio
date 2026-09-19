@@ -376,8 +376,12 @@ mod tests {
     fn safe_remove_is_not_step_up_gated() {
         // Glass library Remove dispatches this verb as
         // plugin-system. That principal holds no scopes. A
-        // storage_admin step-up gate is the 8 ms 400 that left
-        // the stick mounted.
+        // step-up gate here is the 8 ms 400 that left the
+        // stick mounted. Mount / repair / rename stay on
+        // network_admin — the household mount door the
+        // steward already grants. storage_admin is not a
+        // granted scope, so those verbs never reached the
+        // plugin.
         use evo_plugin_sdk::manifest::VerbCapability;
         let m = manifest();
         let caps = &m
@@ -393,7 +397,7 @@ mod tests {
         assert!(
             matches!(
                 caps.get("storage.usb.mount"),
-                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
             ),
             "mount must stay household-gated: {:?}",
             caps.get("storage.usb.mount")
@@ -401,14 +405,14 @@ mod tests {
         assert!(
             matches!(
                 caps.get("storage.usb.repair_filesystem"),
-                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
             ),
             "repair must stay household-gated"
         );
         assert!(
             matches!(
                 caps.get("storage.usb.rename"),
-                Some(VerbCapability::StepUp { scope }) if scope == "storage_admin"
+                Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
             ),
             "rename must stay household-gated"
         );

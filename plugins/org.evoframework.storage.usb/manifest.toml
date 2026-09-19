@@ -70,8 +70,12 @@ response_budget_ms = 180000
 [capabilities.respondent.verb_capabilities]
 # Read verb anonymous (widget seed).
 "storage.usb.list_drives" = { kind = "none" }
-# Mount / repair / rename stay household-gated.
-"storage.usb.mount" = { kind = "step_up", scope = "storage_admin" }
+# Mount / repair / rename ride the same household door as
+# share.mount — `network_admin`. `storage_admin` is not on
+# the steward bootstrap or LAN-privileged set, so the gate
+# returned verb_capability_scope_not_granted and glass
+# painted "That didn't work" with no password card.
+"storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
 # Remove is the same operator gesture as glass
 # `library.remove_source`. That verb is admitted without
 # step-up; it then dispatches this one as plugin-system.
@@ -79,5 +83,5 @@ response_budget_ms = 180000
 # gate here 400s in milliseconds and never reaches umount.
 # Mount / repair / rename are not that gesture.
 "storage.usb.safe_remove" = { kind = "none" }
-"storage.usb.repair_filesystem" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.rename" = { kind = "step_up", scope = "storage_admin" }
+"storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.rename" = { kind = "step_up", scope = "network_admin" }
