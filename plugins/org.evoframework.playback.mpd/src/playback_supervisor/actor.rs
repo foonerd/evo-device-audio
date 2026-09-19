@@ -67,7 +67,7 @@ use evo_plugin_sdk::contract::{
 
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdError,
-    MpdSong,
+    MpdSong, PlayState,
 };
 use crate::PLUGIN_NAME;
 
@@ -974,6 +974,28 @@ async fn reconnect_cmd_conn(
     }
 }
 
+/// Operator Play / resume when the player is not already
+/// running. MPD `pause 0` only unpauses. After reboot,
+/// enqueue, or Play Next the player is often stopped with
+/// a queue and no current song — that must start the
+/// armed track, or the head of the queue.
+async fn start_or_resume_playback(
+    cmd_conn: &mut MpdConnection,
+) -> Result<(), MpdError> {
+    let status = cmd_conn.status().await?;
+    match status.state {
+        PlayState::Playing => Ok(()),
+        PlayState::Paused => cmd_conn.pause(false).await,
+        PlayState::Stopped => {
+            if status.song_position.is_some() {
+                cmd_conn.play().await
+            } else {
+                cmd_conn.play_position(0).await
+            }
+        }
+    }
+}
+
 async fn dispatch_command(
     cmd: PlaybackCommand,
     cmd_conn: &mut MpdConnection,
@@ -981,9 +1003,12 @@ async fn dispatch_command(
     pre_mute_volume: &mut u8,
 ) -> Result<(), MpdError> {
     match cmd {
-        PlaybackCommand::Play => cmd_conn.play().await,
+        PlaybackCommand::Play => start_or_resume_playback(cmd_conn).await,
         PlaybackCommand::PlayPosition(p) => cmd_conn.play_position(p).await,
-        PlaybackCommand::Pause(p) => cmd_conn.pause(p).await,
+        PlaybackCommand::Pause(true) => cmd_conn.pause(true).await,
+        PlaybackCommand::Pause(false) => {
+            start_or_resume_playback(cmd_conn).await
+        }
         PlaybackCommand::Stop => cmd_conn.stop().await,
         PlaybackCommand::Next => cmd_conn.next().await,
         PlaybackCommand::Previous => cmd_conn.previous().await,
@@ -1606,15 +1631,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_from_stop_starts_the_queue_head() {
+        // Glass Play is `resume` = Pause(false). After reboot
+        // or enqueue the player is stopped with no current
+        // song. `pause 0` is a no-op; this must play the head.
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle.command(PlaybackCommand::Pause(false)).await.unwrap();
+
+        let report = handle.query_state().await.unwrap();
+        assert_eq!(
+            report.state,
+            crate::mpd::PlayState::Playing,
+            "stopped-with-a-queue must start, not stay stopped: {report:?}"
+        );
+        assert_eq!(
+            report.current_song.as_ref().map(|s| s.file_path.as_str()),
+            Some("INTERNAL/a.flac"),
+            "the head of the queue is what Play arms: {report:?}"
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("play")),
+            "must start playback, not only unpause: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("pause")),
+            "pause 0 is a no-op when stopped: {seen:?}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn command_ack_returns_playback_error_ack() {
         // Command-conn: 1 = crossfade (apply_audio_protocol_settings),
         //               2 = single    (apply_audio_protocol_settings),
         //               3 = status    (initial report),
         //               4 = currentsong (initial report),
-        //               5 = play -> ACK.
+        //               5 = status    (start_or_resume_playback),
+        //               6 = play 0 -> ACK.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::AckOnNth {
-                nth: 5,
+                nth: 6,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
