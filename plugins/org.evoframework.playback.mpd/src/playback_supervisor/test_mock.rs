@@ -412,12 +412,16 @@ pub(crate) enum ConnBehaviour {
     ///
     /// `playlistinfo` lists what is in it with `Pos:` and `Id:`,
     /// `addid` inserts (refusing a position past the end with
-    /// MPD's Bad song index ACK), `deleteid` takes an entry out,
-    /// `play <pos>` selects and starts, `stop` stops,
-    /// `currentsong` answers with the selected entry, and
-    /// `status` names the current song by position. Every
-    /// command line is recorded, so a test can assert both what
-    /// survived and in which order the work was done.
+    /// MPD's Bad song index ACK), `add` appends, `clear` empties,
+    /// `deleteid` takes an entry out, `play <pos>` selects and
+    /// starts, `stop` stops, `currentsong` answers with the
+    /// selected entry, and `status` names the current song by
+    /// position. A `command_list_begin` … `command_list_end`
+    /// batch applies those writes and answers with one `OK` at
+    /// the end — the same wire shape MPD uses for atomic
+    /// replace. Every command line is recorded, so a test can
+    /// assert both what survived and in which order the work
+    /// was done.
     ///
     /// `items` is `(songid, mpd-relative path)` in queue order;
     /// `playing` is the position MPD reports as current, or
@@ -633,6 +637,7 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
             let mut state = if playing.is_some() { "play" } else { "stop" };
             let mut next_id =
                 queue.iter().map(|(id, _)| *id).max().unwrap_or(99) + 1;
+            let mut in_list = false;
             let mut line = String::new();
             loop {
                 line.clear();
@@ -642,7 +647,13 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                 }
                 let cmd = line.trim_end().to_string();
                 commands.lock().unwrap().push(cmd.clone());
-                if cmd.starts_with("playlistinfo") {
+                if cmd == "command_list_begin" {
+                    in_list = true;
+                    continue;
+                } else if cmd == "command_list_end" {
+                    in_list = false;
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistinfo") {
                     let mut out = String::new();
                     for (pos, (id, path)) in queue.iter().enumerate() {
                         out.push_str(&format!(
@@ -724,11 +735,29 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         current = Some(p);
                     }
                     state = "play";
-                    let _ = w.write_all(b"OK\n").await;
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
+                } else if cmd == "clear" {
+                    queue.clear();
+                    current = None;
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
+                } else if cmd.starts_with("add ") {
+                    let uri =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    if !uri.is_empty() {
+                        queue.push((next_id, uri));
+                        next_id += 1;
+                    }
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
                 } else if cmd.starts_with("idle") {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
-                } else {
+                } else if !in_list {
                     let _ = w.write_all(b"OK\n").await;
                 }
                 let _ = w.flush().await;

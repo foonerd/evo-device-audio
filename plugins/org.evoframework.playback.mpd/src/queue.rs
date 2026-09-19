@@ -773,6 +773,13 @@ pub(crate) async fn handle_enqueue(
 ///   resolution failure the existing queue is left intact.
 ///   On zero-match the queue is left intact and the response
 ///   returns `status: "empty"` — never a silent clear.
+///   After a successful replace the verb publishes
+///   `now_playing` on this stack: Browse Play Now drives MPD
+///   on the shelf connection, so the custody supervisor does
+///   not hear the transport change until the next `player`
+///   idle wake. Leaving that publish out keeps glass and
+///   kiosk on the previous track until pause / play / next /
+///   previous.
 /// - `Append` — `findadd/searchadd` (Filter) or `add`-loop
 ///   (UriList) at the tail. One MPD roundtrip.
 /// - `Next` — insert at `status.song + 1`. Filter is
@@ -901,6 +908,8 @@ async fn handle_enqueue_selection_criteria(
         }
         EnqueueSelectionMode::Replace => {
             apply_replace(conn, &resolved, &uris).await?;
+            publish_now_playing_after_transport(ctx, conn, "enqueue_selection")
+                .await;
         }
     }
     publish_queue(ctx, conn).await;
@@ -1286,6 +1295,8 @@ async fn handle_enqueue_selection_container(
                 verb: "enqueue_selection".into(),
                 reason: e.to_string(),
             })?;
+            publish_now_playing_after_transport(ctx, conn, "enqueue_selection")
+                .await;
         }
     }
     publish_queue(ctx, conn).await;
@@ -3024,6 +3035,24 @@ mod tests {
         }
     }
 
+    /// A resolver that returns a fixed selection so a test can
+    /// drive `enqueue_selection` without standing up MPD tags.
+    struct FixedResolver(crate::selection::ResolvedSelection);
+
+    #[async_trait::async_trait]
+    impl crate::selection::SelectionResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _conn: &mut MpdConnection,
+            _criteria: &crate::selection::SelectionCriteria,
+        ) -> Result<
+            crate::selection::ResolvedSelection,
+            crate::selection::SelectionError,
+        > {
+            Ok(self.0.clone())
+        }
+    }
+
     impl SubjectAnnouncer for RecordingAnn {
         fn announce<'a>(
             &'a self,
@@ -3164,6 +3193,175 @@ mod tests {
         assert!(
             seen.iter().all(|c| !c.starts_with("idle")),
             "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_selection_replace_publishes_now_playing_on_its_own_stack()
+    {
+        // Browse → folder → Play Now (and the same-class facet
+        // / album Play Now) is `enqueue_selection` replace:
+        // clear + add + play on the shelf connection. The
+        // custody supervisor does not hear that until MPD's
+        // next `player` idle event. The verb publishes
+        // now_playing itself so glass and kiosk name the new
+        // head without a later pause / play / next / previous.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/old.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let mute = crate::mute_cell::MuteCell::new();
+        mute.set_muted(true);
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            mute,
+        );
+
+        handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/new/01.flac".to_string(),
+                "INTERNAL/new/02.flac".to_string(),
+            ])),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Folder,
+                value: "INTERNAL/new".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Replace,
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after replace: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/new/01.flac",
+            "the track named is the new folder head, not the previous song: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["muted"], true,
+            "replace must not wipe a live mute: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|c| c == "command_list_begin"),
+            "replace is one atomic command list: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_selection_next_does_not_publish_now_playing() {
+        // Play Next inserts after the current track. The hero
+        // surface stays on what is playing; only replace starts
+        // a new head.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/old.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/next.flac".to_string(),
+            ])),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Album,
+                value: "Next".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Next,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ann.states_on("now_playing").is_empty(),
+            "Next must not steal the hero surface: {:?}",
+            ann.subjects_touched()
+        );
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["queue".to_string()],
+            "Next publishes the queue only",
         );
     }
 
