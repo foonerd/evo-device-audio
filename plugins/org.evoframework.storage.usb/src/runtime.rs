@@ -61,6 +61,18 @@ pub const USB_WRAPPER_PATH: &str = "/usr/local/bin/evo-usb-mount";
 /// Mount root under which every media USB volume mounts.
 pub const USB_MOUNT_ROOT: &str = "/var/lib/evo/music/USB";
 
+/// Catalogue snapshot used when an inherited mount has no
+/// `library_source_id`. `Unreadable` is not empty: adding a
+/// row then stacks a second card the next time list answers.
+enum CatalogueSources {
+    Unreadable,
+    Rows(Vec<(String, String)>),
+}
+
+fn same_mount_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 /// Reactive subject type published by this plugin.
 pub const STORAGE_USB_DRIVES_SUBJECT_TYPE: &str = "storage_usb_drives";
 
@@ -434,6 +446,7 @@ impl StorageUsbRuntime {
     pub async fn reconcile_once(&self) -> Result<(), VerbDispatchError> {
         self.refresh_registry().await?;
         self.auto_mount_unmounted_removable().await;
+        self.adopt_library_ids_for_inherited_mounts().await;
         self.republish_envelope().await;
         Ok(())
     }
@@ -1838,6 +1851,125 @@ impl StorageUsbRuntime {
             .lock()
             .expect("storage.usb: dispatcher lock poisoned on read");
         slot.as_ref().cloned()
+    }
+
+    /// A steward restart that inherits a live systemd mount
+    /// never re-runs `library.add_source`. The drive is
+    /// `mounted-clean` with `library_source_id` empty, so
+    /// Sources Remove goes USB-direct, the catalogue row stays,
+    /// and the queue is not released. Bind the persisted library
+    /// row by mount path, or register one if the catalogue is
+    /// readable and empty for that path.
+    ///
+    /// An unreadable catalogue is not an empty one. Adding a
+    /// row then would stack a second card the next time list
+    /// answers.
+    async fn adopt_library_ids_for_inherited_mounts(&self) {
+        let need: Vec<(String, DriveRecord)> = {
+            let inner = self.inner.lock().await;
+            inner
+                .drives
+                .iter()
+                .filter(|(_, rec)| {
+                    matches!(
+                        rec.class,
+                        DriveClass::MountedClean | DriveClass::MountedDirty
+                    ) && rec.library_source_id.is_none()
+                        && rec.mount_root.is_some()
+                })
+                .map(|(id, rec)| (id.clone(), rec.clone()))
+                .collect()
+        };
+        if need.is_empty() {
+            return;
+        }
+        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+            return;
+        };
+        let listed = match self.list_library_sources(&dispatcher).await {
+            CatalogueSources::Rows(rows) => rows,
+            CatalogueSources::Unreadable => {
+                tracing::warn!(
+                    plugin = "storage.usb",
+                    "inherited mount has no library id; \
+                     list_sources was unreadable, will retry next reconcile"
+                );
+                return;
+            }
+        };
+        for (stable_id, record) in need {
+            let Some(mount_root) = record.mount_root.as_deref() else {
+                continue;
+            };
+            let existing = listed.iter().find_map(|(id, path)| {
+                same_mount_path(path, mount_root).then(|| id.clone())
+            });
+            let source_id = if let Some(id) = existing {
+                Some(id)
+            } else {
+                match self
+                    .dispatch_library_add_source(
+                        Arc::clone(&dispatcher),
+                        &stable_id,
+                        &record.device_node,
+                        record.display_name.as_deref().unwrap_or(&stable_id),
+                        mount_root,
+                    )
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = "storage.usb",
+                            stable_id = %stable_id,
+                            error = %e,
+                            "inherited mount has no library row; \
+                             add_source failed, will retry next reconcile"
+                        );
+                        None
+                    }
+                }
+            };
+            if let Some(source_id) = source_id {
+                let mut inner = self.inner.lock().await;
+                if let Some(rec) = inner.drives.get_mut(&stable_id) {
+                    rec.library_source_id = Some(source_id);
+                }
+            }
+        }
+    }
+
+    async fn list_library_sources(
+        &self,
+        dispatcher: &Arc<dyn ShelfRequestDispatcher>,
+    ) -> CatalogueSources {
+        let Ok(bytes) = serde_json::to_vec(&serde_json::json!({ "v": 1 }))
+        else {
+            return CatalogueSources::Unreadable;
+        };
+        let Ok(response) = dispatcher
+            .dispatch("audio.library", "library.list_sources", bytes, None)
+            .await
+        else {
+            return CatalogueSources::Unreadable;
+        };
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&response)
+        else {
+            return CatalogueSources::Unreadable;
+        };
+        let Some(rows) = parsed.get("sources").and_then(|s| s.as_array())
+        else {
+            return CatalogueSources::Unreadable;
+        };
+        CatalogueSources::Rows(
+            rows.iter()
+                .filter_map(|row| {
+                    let id = row.get("id")?.as_str()?.to_string();
+                    let path = row.get("mount_path")?.as_str()?.to_string();
+                    Some((id, path))
+                })
+                .collect(),
+        )
     }
 
     fn aliases_clone(&self) -> Arc<AliasStore> {
@@ -3440,6 +3572,7 @@ mod tests {
         seen: StdMutex<Vec<(String, String)>>,
         runner: Arc<FakeCommandRunner>,
         umount_before_library_stop: StdMutex<Option<bool>>,
+        list_sources: StdMutex<serde_json::Value>,
     }
 
     impl PayloadDispatcher {
@@ -3448,6 +3581,10 @@ mod tests {
                 seen: StdMutex::new(Vec::new()),
                 runner,
                 umount_before_library_stop: StdMutex::new(None),
+                list_sources: StdMutex::new(serde_json::json!({
+                    "v": 1,
+                    "sources": []
+                })),
             }
         }
 
@@ -3492,6 +3629,8 @@ mod tests {
             ));
             let body = if request_type == "library.add_source" {
                 serde_json::json!({ "v": 1, "source_id": "usb-music" })
+            } else if request_type == "library.list_sources" {
+                self.list_sources.lock().unwrap().clone()
             } else {
                 serde_json::json!({ "v": 1 })
             };
@@ -3590,6 +3729,148 @@ mod tests {
             "scrub while the old tree is still mounted leaves that \
              name in Local library",
         );
+    }
+
+    fn inherited_music_mountinfo() -> &'static str {
+        "36 29 8:1 / /var/lib/evo/music/USB/MUSIC rw,relatime - vfat /dev/sda1 rw\n"
+    }
+
+    async fn inherited_mount_runtime(
+        list_sources: serde_json::Value,
+    ) -> (Arc<StorageUsbRuntime>, Arc<PayloadDispatcher>) {
+        let runner = Arc::new(FakeCommandRunner::new(vec![ok_outcome(); 4]));
+        let rt = Arc::new(StorageUsbRuntime::with_sources(
+            1000,
+            1000,
+            true,
+            Arc::new(FakeInputSource {
+                mountinfo: inherited_music_mountinfo().to_string(),
+                swaps: String::new(),
+                lsblk_json: removable_stick_lsblk().to_string(),
+            }),
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        ));
+        let d = Arc::new(PayloadDispatcher::recording(Arc::clone(&runner)));
+        *d.list_sources.lock().unwrap() = list_sources;
+        rt.attach_shelf_dispatcher(
+            Arc::clone(&d) as Arc<dyn ShelfRequestDispatcher>
+        );
+        (rt, d)
+    }
+
+    #[tokio::test]
+    async fn an_inherited_mount_binds_the_persisted_library_id() {
+        // Steward restart: systemd still has USB/MUSIC. The
+        // catalogue row survived in sources.toml. Sources Remove
+        // must see that id or it goes USB-direct and the card
+        // stays.
+        let (rt, d) = inherited_mount_runtime(serde_json::json!({
+            "v": 1,
+            "sources": [{
+                "id": "audio-701124",
+                "mount_path": "/var/lib/evo/music/USB/MUSIC"
+            }]
+        }))
+        .await;
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let music = env
+            .drives
+            .iter()
+            .find(|d| d.stable_id == "MUSIC")
+            .expect("MUSIC");
+        assert_eq!(
+            music.library_source_id.as_deref(),
+            Some("audio-701124"),
+            "the inherited mount must carry the catalogue id: {music:?}"
+        );
+        let seen = d.seen();
+        assert!(
+            seen.iter().any(|(v, _)| v == "library.list_sources"),
+            "bind reads the catalogue, does not guess: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(v, _)| v != "library.add_source"),
+            "a second add_source would stack a second card: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inherited_mount_registers_when_the_catalogue_has_no_row() {
+        let (rt, d) = inherited_mount_runtime(serde_json::json!({
+            "v": 1,
+            "sources": []
+        }))
+        .await;
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let music = env
+            .drives
+            .iter()
+            .find(|d| d.stable_id == "MUSIC")
+            .expect("MUSIC");
+        assert_eq!(
+            music.library_source_id.as_deref(),
+            Some("usb-music"),
+            "no persisted row: register one so Sources has an id"
+        );
+        let seen = d.seen();
+        assert!(
+            seen.iter().any(|(v, _)| v == "library.add_source"),
+            "empty catalogue must get a row: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_catalogue_does_not_stack_a_second_row() {
+        // list_sources without a sources array is not empty.
+        // Adding then would stack a card the next time list
+        // answers.
+        let (rt, d) = inherited_mount_runtime(serde_json::json!({
+            "v": 1
+        }))
+        .await;
+        let env: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let music = env
+            .drives
+            .iter()
+            .find(|d| d.stable_id == "MUSIC")
+            .expect("MUSIC");
+        assert_eq!(
+            music.library_source_id.as_deref(),
+            None,
+            "unreadable catalogue must retry, not invent a row: {music:?}"
+        );
+        let seen = d.seen();
+        assert!(
+            seen.iter().all(|(v, _)| v != "library.add_source"),
+            "must not stack: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn mount_paths_match_without_a_trailing_slash() {
+        assert!(same_mount_path(
+            "/var/lib/evo/music/USB/MUSIC",
+            "/var/lib/evo/music/USB/MUSIC/"
+        ));
+        assert!(!same_mount_path(
+            "/var/lib/evo/music/USB/MUSIC",
+            "/var/lib/evo/music/USB/Audio"
+        ));
     }
 
     #[tokio::test]
