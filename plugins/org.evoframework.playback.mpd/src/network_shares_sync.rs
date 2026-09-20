@@ -376,7 +376,14 @@ async fn drop_all_nas_sources(
 fn record_from_envelope_share(
     share: &serde_json::Value,
 ) -> Option<SourceRecord> {
-    let share_id = share.get("id").and_then(|v| v.as_str())?;
+    // The shares plugin publishes `ShareRecord` as `share_id`.
+    // Looking up `id` drops every Connected share: the registry
+    // stays empty, the floor filter hides NAS, and retract never
+    // sees a row to drop. `id` is kept only as a fallback.
+    let share_id = share
+        .get("share_id")
+        .or_else(|| share.get("id"))
+        .and_then(|v| v.as_str())?;
     let alias = share.get("alias").and_then(|v| v.as_str())?;
     let host = share.get("host").and_then(|v| v.as_str())?;
     let path = share.get("path").and_then(|v| v.as_str())?;
@@ -819,6 +826,75 @@ mod tests {
             playlists.lock().unwrap().get("Road mix"),
             Some(&vec!["INTERNAL/keep.flac".to_string()]),
             "and so do the stored lists",
+        );
+    }
+
+    /// The envelope `network.shares` actually publishes.
+    /// Field `.24` 2026-09-20: Connected NFS, key is `share_id`.
+    fn wire_share_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "shares": [{
+                "advanced_options": "",
+                "alias": "NFS",
+                "created_at_ms": 1_789_876_977_600i64,
+                "credentials": { "kind": "guest" },
+                "fstype": "nfs",
+                "host": "192.168.30.1",
+                "last_mounted_at_ms": null,
+                "mount_root": "/var/lib/evo/music/NAS/NFS",
+                "path": "/volume1/multimedia/broadcast/Audio",
+                "persisted_vers": null,
+                "share_id": "82befb0b-740a-4e65-bae2-5c29e81a6a58"
+            }]
+        })
+    }
+
+    #[test]
+    fn a_connected_share_from_the_wire_envelope_owns_the_floor() {
+        // Operator invert: Sources Connected, Local library has
+        // no NAS. The published key is `share_id`. Reading `id`
+        // only reddens this — the registry stays empty and
+        // 4da953c hides the live mount.
+        let share = &wire_share_envelope()["shares"][0];
+        let record = record_from_envelope_share(share)
+            .expect("the wire key is share_id");
+        assert_eq!(
+            record.id, "nas-82befb0b-740a-4e65-bae2-5c29e81a6a58",
+            "the registry row is keyed from the published share_id",
+        );
+        assert_eq!(
+            record.mount_path,
+            PathBuf::from("/var/lib/evo/music/NAS/NFS"),
+        );
+        let music = PathBuf::from("/var/lib/evo/music");
+        let live = vec![record];
+        assert!(
+            crate::library::floor_lists_directory("NAS", &music, &live),
+            "a Connected share must list the NAS root",
+        );
+        assert!(
+            crate::library::floor_lists_directory("NAS/NFS", &music, &live),
+            "and its own mount point",
+        );
+        assert!(
+            !crate::library::floor_lists_directory("NAS/Test", &music, &live),
+            "a leftover nobody owns still must not list",
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_envelope_registers_a_share_id_row() {
+        let (registry, retract, _ann, _playlists, _cmds) =
+            retire_harness().await;
+
+        apply_envelope(&registry, &retract, &wire_share_envelope()).await;
+
+        assert!(
+            registry
+                .get("nas-82befb0b-740a-4e65-bae2-5c29e81a6a58")
+                .await
+                .is_some(),
+            "the live envelope must produce a registry source",
         );
     }
 }
