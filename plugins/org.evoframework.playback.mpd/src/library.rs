@@ -1160,11 +1160,33 @@ pub(crate) async fn handle_remove_source(
             "",
         ) {
             Ok(path) => {
-                if let Err(e) = conn.update(Some(&path)).await {
+                // Scrub the PARENT, not the source's own path.
+                //
+                // By the time this runs the source's directory is
+                // usually gone: storage.usb has detached the
+                // volume and network.shares deletes its empty
+                // mount-root on remove. `update <path>` walks the
+                // filesystem at that path, so pointing it at a
+                // directory that no longer exists walks nothing
+                // and MPD keeps every stale row beneath it —
+                // Local library goes on listing a NAS the
+                // operator removed, and its tracks stay
+                // saveable into a playlist from that leftover
+                // browse.
+                //
+                // Updating the parent makes MPD re-walk the level
+                // the child vanished from, which is what actually
+                // prunes the child. A source sitting directly at
+                // the database root scrubs the whole root, which
+                // is the same walk by another name.
+                let scrub_at = scrub_parent_of(&path);
+                let target = scrub_at.as_deref();
+                if let Err(e) = conn.update(target).await {
                     tracing::warn!(
                         plugin = PLUGIN_NAME,
                         source_id = %payload.source_id,
                         mpd_base = %path,
+                        scrub_at = ?scrub_at,
                         error = %e,
                         "library.remove_source: MPD scrub update failed; \
                          source removal still proceeds"
@@ -1359,6 +1381,18 @@ pub(crate) async fn handle_restore_parked_uris(
         v: LIBRARY_PAYLOAD_VERSION,
         restored: restored as u32,
     })
+}
+
+/// The database-relative path whose re-walk prunes `path`.
+///
+/// `None` means the database root. A path with no separator
+/// (`"NAS"`) sits at the root, so the root is what has to be
+/// re-walked for MPD to notice it has gone.
+pub(crate) fn scrub_parent_of(path: &str) -> Option<String> {
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => Some(parent.to_string()),
+        _ => None,
+    }
 }
 
 /// Release the operator queue of one source's tracks.

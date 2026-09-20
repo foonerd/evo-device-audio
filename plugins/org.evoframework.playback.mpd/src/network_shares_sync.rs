@@ -568,10 +568,12 @@ mod tests {
         RetractHandles,
         Arc<RecordingAnn>,
         Arc<std::sync::Mutex<BTreeMap<String, Vec<String>>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
     ) {
         use crate::playback_supervisor::test_mock::{
             short_timeouts, spawn_mock_mpd, ConnBehaviour,
         };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
         let playlists = Arc::new(std::sync::Mutex::new(BTreeMap::from([
             (
                 "Road mix".to_string(),
@@ -590,7 +592,7 @@ mod tests {
         ])));
         let (endpoint, _mock) =
             spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
-                commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+                commands: Arc::clone(&commands),
                 playlists: Arc::clone(&playlists),
                 library: Vec::new(),
                 queue: Vec::new(),
@@ -627,7 +629,7 @@ mod tests {
             endpoint,
             timeouts: short_timeouts(),
         };
-        (registry, retract, ann, playlists)
+        (registry, retract, ann, playlists, commands)
     }
 
     /// The share is gone from the shares plugin's envelope.
@@ -640,7 +642,8 @@ mod tests {
         // Browse follows audio_library_sources. Dropping the
         // registry row without republishing leaves a NAS on the
         // glass that the operator already removed.
-        let (registry, retract, ann, _playlists) = retire_harness().await;
+        let (registry, retract, ann, _playlists, _cmds) =
+            retire_harness().await;
 
         apply_envelope(&registry, &retract, &empty_envelope()).await;
 
@@ -663,7 +666,8 @@ mod tests {
         // The tracks are not open files and nothing prunes them
         // on their own. A playlist that still lists a removed
         // NAS plays nothing and says nothing.
-        let (registry, retract, _ann, playlists) = retire_harness().await;
+        let (registry, retract, _ann, playlists, _cmds) =
+            retire_harness().await;
 
         apply_envelope(&registry, &retract, &empty_envelope()).await;
 
@@ -681,10 +685,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_scrub_rewalks_the_level_the_share_vanished_from() {
+        // Local library still listed the removed NAS in the
+        // field. The share's own directory is already gone when
+        // this runs — network.shares deletes its empty
+        // mount-root on remove — so an update aimed at that path
+        // walks nothing and MPD keeps every stale row beneath
+        // it. The parent is the level that has to be re-walked
+        // for MPD to notice the child has gone, and that is what
+        // takes NAS off the floor tree.
+        let (registry, retract, _ann, _playlists, cmds) =
+            retire_harness().await;
+
+        apply_envelope(&registry, &retract, &empty_envelope()).await;
+
+        let seen = cmds.lock().unwrap().clone();
+        let updates: Vec<&String> = seen
+            .iter()
+            .filter(|c| c.split_whitespace().next() == Some("update"))
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "the scrub must issue an update: {seen:?}",
+        );
+        assert!(
+            updates.iter().any(|c| c.contains("NAS")),
+            "the scrub re-walks a level that still exists: {updates:?}",
+        );
+        assert!(
+            updates.iter().all(|c| !c.contains("NAS/Music")),
+            "aiming the scrub at the path that is already gone walks \
+             nothing and leaves NAS on the floor: {updates:?}",
+        );
+    }
+
+    #[test]
+    fn the_scrub_target_is_the_parent_level() {
+        // The rule in one read, including a source sitting at
+        // the database root, where the root is the parent.
+        assert_eq!(
+            crate::library::scrub_parent_of("NAS/Music"),
+            Some("NAS".to_string()),
+        );
+        assert_eq!(
+            crate::library::scrub_parent_of("USB/STICK"),
+            Some("USB".to_string()),
+        );
+        assert_eq!(crate::library::scrub_parent_of("NAS"), None);
+        assert_eq!(crate::library::scrub_parent_of(""), None);
+    }
+
+    #[tokio::test]
     async fn a_cleared_envelope_retracts_the_same_way() {
         // The shares plugin retracting its envelope entirely is
         // the same operator outcome as removing each share.
-        let (registry, retract, ann, playlists) = retire_harness().await;
+        let (registry, retract, ann, playlists, _cmds) = retire_harness().await;
 
         drop_all_nas_sources(&registry, &retract).await;
 
