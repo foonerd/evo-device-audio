@@ -24,11 +24,11 @@
 //!    the walk can't complete within budget).
 //! 2. Polls MPD `status` every ~500 ms; when
 //!    `status.updating_db` is `Some(job_id)`, emits an
-//!    `audio_library_scan_progress` frame carrying the
-//!    per-source `scanned_tracks` (0 while in flight — MPD
-//!    has no per-source progress counter and the database
-//!    total is not this source's),
-//!    `estimated_total`, and `phase = "scanning"`.
+//!    `audio_library_scan_progress` frame carrying this
+//!    source's `scanned_tracks` (`count base` of songs
+//!    already in the database under the mount — not
+//!    `stats.songs`, which is the whole device), the
+//!    walker's `estimated_total`, and `phase = "scanning"`.
 //! 3. When `updating_db` returns to `None`, emits ONE
 //!    terminal frame with `phase = "complete"` carrying the
 //!    final counts; then republishes `audio_library_sources`
@@ -123,22 +123,31 @@ fn idle_envelope() -> serde_json::Value {
     })
 }
 
-/// What the in-flight frames report as `scanned_tracks`.
-///
-/// MPD has no per-source progress counter. `stats.songs` is the
-/// whole database, so on a device carrying a local library and a
-/// NAS it is mostly songs the running scan will never touch;
-/// publishing it as this source's progress told the operator
-/// "Indexing <the database> of <this source>".
-///
-/// There is no cheap honest per-source count on the poll path:
-/// `find base` every tick is a second enumerator under load, and
-/// a fabricated number is the same lie in a different hat. So
-/// the in-flight frames carry zero and the denominator carries
-/// the walker's per-source estimate — "Indexing 0 of M", which
-/// is true, or "Indexing 0" when the walker missed. The settled
-/// count lands on the card the moment the scan completes.
-const SCANNED_TRACKS_IN_FLIGHT: u32 = 0;
+/// Songs already in MPD under this source's mount. One
+/// `count base` roundtrip — not `find` (that materialises
+/// every URI) and not `stats.songs` (that is the whole
+/// device). Empty base is the floor library; a count
+/// without a path would be the database again, so this
+/// returns `None` and the last published number stands.
+async fn songs_under_base(
+    conn: &mut MpdConnection,
+    mpd_base: &str,
+) -> Option<u32> {
+    if mpd_base.is_empty() {
+        return None;
+    }
+    match conn.count_matching(&[("base", mpd_base)]).await {
+        Ok(n) => Some(n.min(u64::from(u32::MAX)) as u32),
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "scan_progress: count base failed; keeping the last count"
+            );
+            None
+        }
+    }
+}
 
 /// The active-scan envelope: one entry describing the
 /// in-flight (or just-completed) scan.
@@ -238,16 +247,29 @@ async fn run(
     // shows indeterminate progress rather than a wrong denominator.
     let estimated_total =
         estimate_source_track_count(&library, &source_id).await;
+    let mpd_base = if let Some(record) = library.registry.get(&source_id).await
+    {
+        crate::library::mpd_database_relative_path(
+            &library.music_directory,
+            &record.mount_path,
+            "",
+        )
+        .ok()
+    } else {
+        None
+    };
 
     // Initial frame — publishes phase=scanning so the UI can
-    // render "Indexing 0 of M" immediately.
+    // render the heartbeat immediately. scanned_tracks starts
+    // at 0; the first poll replaces it with count base.
+    let mut last_scanned: u32 = 0;
     publish(
         &subjects,
         active_envelope(
             &source_id,
             kind,
             started_at_ms,
-            SCANNED_TRACKS_IN_FLIGHT,
+            last_scanned,
             estimated_total,
             "scanning",
         ),
@@ -269,7 +291,7 @@ async fn run(
                 source_id: &source_id,
                 kind,
                 started_at_ms,
-                final_scanned: SCANNED_TRACKS_IN_FLIGHT,
+                final_scanned: last_scanned,
                 estimated_total,
                 endpoint: &endpoint,
                 timeouts,
@@ -314,8 +336,14 @@ async fn run(
         };
         // No stats read here. Its only use was the database song
         // total, which is not this source's progress. `status()`
-        // and `updating_db` carry everything the watcher needs.
+        // says whether the job is still running; `count base`
+        // says how many of THIS source's songs are already in.
         let now_updating = status.updating_db;
+        if let Some(base) = mpd_base.as_deref() {
+            if let Some(n) = songs_under_base(&mut conn, base).await {
+                last_scanned = n;
+            }
+        }
 
         // MPD reports updating_db while a scan is in flight.
         // Missing on the FIRST poll (before MPD picks up the
@@ -325,14 +353,13 @@ async fn run(
         // subsequent stable-None below.
         match (now_updating, last_updating_db) {
             (Some(_), _) => {
-                // Scan visibly in flight — emit progress.
                 publish(
                     &subjects,
                     active_envelope(
                         &source_id,
                         kind,
                         started_at_ms,
-                        SCANNED_TRACKS_IN_FLIGHT,
+                        last_scanned,
                         estimated_total,
                         "scanning",
                     ),
@@ -349,7 +376,7 @@ async fn run(
                     source_id: &source_id,
                     kind,
                     started_at_ms,
-                    final_scanned: SCANNED_TRACKS_IN_FLIGHT,
+                    final_scanned: last_scanned,
                     estimated_total,
                     endpoint: &endpoint,
                     timeouts,
@@ -370,7 +397,7 @@ async fn run(
                     source_id: &source_id,
                     kind,
                     started_at_ms,
-                    final_scanned: SCANNED_TRACKS_IN_FLIGHT,
+                    final_scanned: last_scanned,
                     estimated_total,
                     endpoint: &endpoint,
                     timeouts,
@@ -411,8 +438,9 @@ async fn emit_terminal(scan: TerminalScan<'_>) {
     // Terminal frame carries the final counts + phase=complete.
     // UI keys on phase=complete for its settle logic.
     // The walker's per-source estimate, or nothing. It must NOT
-    // fall back to `final_scanned`: that is zero by the rule
-    // above, and "0 of 0" reads as a finished, empty source.
+    // fall back to `final_scanned` when the walker missed:
+    // a missing estimate becoming "N of N" from a mid-scan
+    // count is a finished lie.
     let final_total = estimated_total;
     publish(
         &subjects,
@@ -790,24 +818,30 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_frames_report_zero_not_a_database_total() {
-        // "Indexing 0 of M" is true. "Indexing <database> of M"
-        // was not.
-        assert_eq!(SCANNED_TRACKS_IN_FLIGHT, 0);
+    fn in_flight_scanned_tracks_is_this_source_not_the_database() {
+        // A later poll publishes count-base of THIS mount.
+        // stats.songs of the whole device must never appear here.
         let env = active_envelope(
             "nas",
             ScanKind::Update,
             1_700_000_000_000,
-            SCANNED_TRACKS_IN_FLIGHT,
-            Some(42),
+            1_240,
+            Some(12_000),
             "scanning",
         );
         let scan = &env["scans"][0];
-        assert_eq!(scan["scanned_tracks"], 0);
-        // The denominator is the walker's per-source estimate
-        // and is untouched by this row.
-        assert_eq!(scan["estimated_total"], 42);
+        assert_eq!(scan["scanned_tracks"], 1_240);
+        assert_eq!(scan["estimated_total"], 12_000);
         assert_eq!(scan["phase"], "scanning");
+        let src = include_str!("scan_progress.rs");
+        assert!(
+            src.contains("count_matching"),
+            "the poll path must count this source via count base"
+        );
+        assert!(
+            src.contains("songs_under_base"),
+            "an empty base must not become the database total"
+        );
     }
 
     #[test]
@@ -818,7 +852,7 @@ mod tests {
             "nas",
             ScanKind::Update,
             1_700_000_000_000,
-            SCANNED_TRACKS_IN_FLIGHT,
+            0,
             None,
             "complete",
         );
