@@ -83,6 +83,16 @@ pub const CIFS_VERS_PROBE_LADDER: &[&str] =
 /// port. Injected so a unit suite never opens a socket.
 pub type HostReachableProbe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
 
+/// Probe that names what is holding a mount point, as
+/// `"<pid>:<comm>"` entries. Production shells out to `fuser`;
+/// injected so a unit suite never does, and so the refusal path
+/// can be proven end to end without a busy mount to hand.
+///
+/// Blocking on purpose: it forks a process and reads `/proc`,
+/// and the caller runs it on a blocking thread — the same
+/// posture as the `mpc` work in this file.
+pub type HolderProbe = Arc<dyn Fn(&Path) -> Vec<String> + Send + Sync>;
+
 /// Production host-reachability probe: a short-timeout TCP
 /// connect to the share host's service port.
 ///
@@ -867,6 +877,7 @@ impl MountError {
             Self::DialectProbeExhausted { .. }
             | Self::Timeout { .. }
             | Self::SubprocessIo(_)
+            | Self::Busy { .. }
             | Self::MountFailed { .. } => FailureClass::Transient,
 
             // Local conditions that clear on their own: a raced
@@ -1049,6 +1060,33 @@ pub enum MountError {
         /// The last error's exit code + stderr snippet, for
         /// operator visibility.
         last_error: String,
+    },
+    /// The unmount was refused because the mount is still in
+    /// use, with whatever held it at the moment of refusal.
+    ///
+    /// Distinct from [`Self::MountFailed`] on purpose: a busy
+    /// mount is not a broken one. The operator can stop the
+    /// holder and try again, and the glass can say who to stop
+    /// instead of printing a subprocess line. Mirrors
+    /// `storage.usb`'s `safe_remove` refusal so both removals
+    /// answer the same shape.
+    ///
+    /// `holders` is best-effort `fuser -m` output as
+    /// `"<pid>:<comm>"`; empty when `fuser` is absent or the
+    /// kernel names nobody.
+    #[error(
+        "unmount refused for share {id}: target is busy{}",
+        if holders.is_empty() {
+            String::new()
+        } else {
+            format!("; held by {}", holders.join(", "))
+        }
+    )]
+    Busy {
+        /// Share whose unmount was refused.
+        id: ShareId,
+        /// Processes holding the mount, `"<pid>:<comm>"`.
+        holders: Vec<String>,
     },
     /// The mount helper refused authentication (typically exit
     /// 13 / EACCES with an "NT_STATUS_LOGON_FAILURE" or
@@ -2188,7 +2226,10 @@ pub fn build_nfs_mount_args(record: &ShareRecord) -> Vec<String> {
 /// -l <mount_root>
 /// ```
 ///
-/// `systemd-umount` accepts these flags directly.
+/// `systemd-umount` accepts the flag but does not mean this by
+/// it — there `-l` is `--full`. Callers decide with
+/// `umount_flag_l_is_lazy`; this function only formats what it
+/// is told.
 pub fn build_umount_args(mount_root: &Path, lazy: bool) -> Vec<String> {
     let mut args = Vec::new();
     if lazy {
@@ -2703,6 +2744,11 @@ pub struct NetworkSharesRuntime {
     /// `mount_share` adopts an already-active host mount instead
     /// of re-running the dialect probe.
     mount_point_check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// Names what is holding a mount point when an unmount is
+    /// refused. Production shells out to `fuser`; tests inject
+    /// a fixture. Consulted only on an EBUSY, so the common
+    /// path forks nothing.
+    holder_probe: HolderProbe,
     /// Asks whether a share host answers on its service port.
     /// Production opens a short-timeout TCP connection; tests
     /// inject a fixture so unit suites never touch a socket.
@@ -2843,6 +2889,7 @@ impl NetworkSharesRuntime {
             publisher: StdMutex::new(None),
             now_fn: Arc::new(default_now_ms),
             mount_point_check: Arc::new(|p: &Path| is_path_mounted(p)),
+            holder_probe: Arc::new(fuser_holders_blocking),
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
@@ -2884,6 +2931,7 @@ impl NetworkSharesRuntime {
             smbclient_timeout_ms: None,
             now_fn: None,
             mount_point_check: None,
+            holder_probe: None,
             l3_gate: None,
             l3_wait_ms: None,
         })
@@ -2920,6 +2968,7 @@ impl NetworkSharesRuntime {
             // suites cannot accidentally adopt a host mount from
             // the machine running `cargo test`.
             mount_point_check: Arc::new(|_: &Path| false),
+            holder_probe: Arc::new(fuser_holders_blocking),
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
@@ -3186,30 +3235,195 @@ fn mpd_relative_mount_prefix(mount_root: &std::path::Path) -> Option<String> {
     Some(rel.into_owned())
 }
 
-/// Stop playback and prune the queue of everything under this
-/// share, then return.
+/// The binary an unmount invocation actually reaches.
+///
+/// Under sudo wrapping the runtime's `umount_program` is
+/// `sudo` and the real unmount binary is the last wrapper
+/// argument (`["-n", "/usr/bin/systemd-umount"]`). Deciding
+/// anything from `umount_program` alone therefore reads "not
+/// systemd" for exactly the configuration production runs
+/// under a non-root service identity.
+fn effective_umount_program<'a>(
+    umount_program: &'a str,
+    umount_wrapper_args: &'a [String],
+) -> &'a str {
+    umount_wrapper_args
+        .last()
+        .map(String::as_str)
+        .unwrap_or(umount_program)
+}
+
+/// Whether `-l` means "lazy detach" to this program.
+///
+/// It does to util-linux's `umount`. It does **not** to
+/// `systemd-umount`, where `-l` is the short form of `--full`,
+/// "do not ellipsize output" — verified against
+/// `systemd-mount --help` on systemd 255. The unmount there is
+/// exactly as synchronous either way, so a `-l` sent to
+/// `systemd-umount` bought nothing while reading, at both call
+/// sites and in `storage.usb`'s wrapper, as a busy-file safety
+/// net that was never in place. Send the flag only where the
+/// name is true.
+fn umount_flag_l_is_lazy(effective_umount_program: &str) -> bool {
+    Path::new(effective_umount_program)
+        .file_name()
+        .map(|n| n != "systemd-umount")
+        .unwrap_or(true)
+}
+
+/// Whether this umount stderr is the kernel saying "still in
+/// use".
+///
+/// util-linux says `target is busy`; systemd renders the same
+/// EBUSY as `Device or resource busy`. Both are the same
+/// refusal and both must classify as one. Mirrors the wording
+/// set `storage.usb`'s wrapper matches on.
+fn is_busy_stderr(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("target is busy")
+        || s.contains("device is busy")
+        || s.contains("device or resource busy")
+}
+
+/// Best-effort `fuser -m` enumeration of what holds the mount,
+/// as `"<pid>:<comm>"`.
+///
+/// Empty when `fuser` is absent, the mount is not held, or the
+/// output cannot be parsed — the refusal is still a refusal,
+/// it just cannot name anyone. Same shape and same
+/// best-effort posture as `storage.usb`'s holder list, so the
+/// glass renders one thing for both removals.
+///
+/// Unprivileged `fuser` can only name holders whose `/proc`
+/// entries this identity may read, so a root-owned holder may
+/// be missed. Naming it would need a sudoers entry for `fuser`,
+/// which this plugin does not ship and must not add. An empty
+/// list therefore means "nobody we can see", never "nobody".
+fn fuser_holders_blocking(mount_root: &Path) -> Vec<String> {
+    if mount_root.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("fuser")
+        .arg("-m")
+        .arg(mount_root)
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    // fuser prints pids to stderr, whitespace separated.
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    let mut held = Vec::new();
+    for tok in text.split_whitespace() {
+        let Ok(pid) = tok.parse::<u32>() else {
+            continue;
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if comm.is_empty() {
+            held.push(pid.to_string());
+        } else {
+            held.push(format!("{pid}:{comm}"));
+        }
+    }
+    held
+}
+
+/// How long to let an in-flight MPD database update finish
+/// before unmounting anyway.
+///
+/// A database walk under the share is an open directory, and an
+/// open directory is EBUSY — a third holder, after the playing
+/// file and the queue, and one no `mpc` command can cancel: the
+/// protocol has no "stop updating". The only lever is to wait
+/// for it, and a successful unmount publishes
+/// `trigger_mpd_update_best_effort`, so the update a Disconnect
+/// meets is routinely the one the previous action started.
+///
+/// Five seconds covers that tail without holding the operator
+/// behind a full library scan. Past it the unmount is attempted
+/// regardless, and an EBUSY comes back classified with `mpd`
+/// named in the holders — an honest refusal beats a spinner.
+const MPD_UPDATE_SETTLE_TIMEOUT_MS: u64 = 5_000;
+
+/// Gap between `mpc status` probes while waiting for the
+/// database update above to finish.
+const MPD_UPDATE_POLL_INTERVAL_MS: u64 = 200;
+
+/// Whether `mpc status` output says a database update is
+/// running.
+///
+/// mpc renders that as an `Updating DB (#<job>) ...` line, and
+/// prints it on no other occasion. Pure over its input so the
+/// pin does not need an MPD.
+fn mpd_status_is_updating(status_stdout: &str) -> bool {
+    status_stdout.to_ascii_lowercase().contains("updating db")
+}
+
+/// Block until MPD reports no database update in flight, or
+/// until [`MPD_UPDATE_SETTLE_TIMEOUT_MS`] elapses.
+///
+/// Returns whether the database went idle. A missing, hung or
+/// unhappy `mpc` reads as idle and returns immediately: this
+/// waits on a holder it can see, and must never become a reason
+/// the operator cannot unmount.
+fn await_mpd_database_idle_blocking() -> bool {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(MPD_UPDATE_SETTLE_TIMEOUT_MS);
+    loop {
+        let out = std::process::Command::new("/usr/bin/mpc")
+            .arg("status")
+            .output();
+        let Ok(out) = out else {
+            return true;
+        };
+        if !out.status.success() {
+            return true;
+        }
+        if !mpd_status_is_updating(&String::from_utf8_lossy(&out.stdout)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::info!(
+                waited_ms = MPD_UPDATE_SETTLE_TIMEOUT_MS,
+                "MPD database update still in flight — unmounting anyway; \
+                 an EBUSY from here names mpd as the holder"
+            );
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            MPD_UPDATE_POLL_INTERVAL_MS,
+        ));
+    }
+}
+
+/// Make MPD let go of everything under this share, then return.
 ///
 /// Both callers wait: Remove, so a playing share can unmount
 /// instead of staying mounted after the record is gone, and
 /// disconnect, so the umount does not meet a file MPD still has
 /// open.
 ///
-/// Two steps, both against the path MPD knows the mount by:
+/// Three holders, released in the order that makes the next
+/// release cheaper:
 ///   1. `mpc status --format '%file%'` — if the currently
 ///      playing file is under the prefix, `mpc stop`.
 ///   2. `mpc playlist -f '%position% %file%'` — delete every
 ///      queue entry under it, high position to low so the
 ///      positions do not shift under the enumerate.
+///   3. an in-flight database update — waited out, bounded.
 ///
 /// Best-effort throughout: a hung or absent mpc must not block
 /// the operator's unmount.
-async fn await_mpd_stop_and_prune(mount_root: &std::path::Path) {
+async fn await_mpd_release(mount_root: &std::path::Path) {
     if mount_root.as_os_str().is_empty() {
         return;
     }
     let root = mount_root.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || {
         mpd_stop_and_prune_blocking(&root);
+        await_mpd_database_idle_blocking();
     })
     .await;
 }
@@ -3471,6 +3685,8 @@ pub struct NetworkSharesRuntimeBuilder {
     // factoring a one-off type alias.
     #[allow(clippy::type_complexity)]
     mount_point_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
+    // Same shape as the runtime struct's `holder_probe`.
+    holder_probe: Option<HolderProbe>,
     // Same shape as the runtime struct's `host_reachable`.
     host_reachable: Option<HostReachableProbe>,
     l3_gate: Option<L3Gate>,
@@ -3600,6 +3816,15 @@ impl NetworkSharesRuntimeBuilder {
         check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
     ) -> Self {
         self.mount_point_check = Some(check);
+        self
+    }
+
+    /// Override the holder probe consulted when an unmount is
+    /// refused (test path). Production shells out to `fuser`.
+    /// Tests inject a fixture so the refusal path can be proven
+    /// without a busy mount.
+    pub fn with_holder_probe(mut self, probe: HolderProbe) -> Self {
+        self.holder_probe = Some(probe);
         self
     }
 
@@ -3738,6 +3963,13 @@ impl NetworkSharesRuntimeBuilder {
                     Arc::new(|p: &Path| is_path_mounted(p))
                 }
             }),
+            // Production default = `fuser`; tests may inject a
+            // fixture. No cfg(test) split: the default forks
+            // nothing until an unmount is actually refused, and
+            // a unit suite that never refuses never calls it.
+            holder_probe: self
+                .holder_probe
+                .unwrap_or_else(|| Arc::new(fuser_holders_blocking)),
             l3_gate: self.l3_gate,
             l3_wait_ms: self.l3_wait_ms.unwrap_or(DEFAULT_L3_WAIT_MS),
             pending_credential_prompts: Arc::new(std::sync::Mutex::new(
@@ -4208,24 +4440,27 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // Release MPD's hold BEFORE asking for the unmount.
         //
         // A queued or playing track under the share is an open
-        // file, and an open file is EBUSY. The `-l` below does
-        // not save us: these shares are mounted by
-        // `systemd-mount --collect`, so the unmount is a unit
-        // stop and systemd runs its own `umount` without our
-        // argv — laziness there is the `LazyUnmount=` unit
-        // property, not a flag we can pass. Field 11:28:54:
-        // `target is busy`, status 32, share still mounted,
-        // Activity saying failed to disconnect.
+        // file, a database walk under it is an open directory,
+        // and either is EBUSY. Nothing downstream rescues that:
+        // these shares are mounted by `systemd-mount --collect`,
+        // so the unmount is a unit stop and systemd runs its own
+        // `umount` without our argv — laziness there is the
+        // `LazyUnmount=` unit property, set at mount time, not a
+        // flag this call can pass. Field 11:28:54: `target is
+        // busy`, status 32, share still mounted, Activity saying
+        // failed to disconnect.
         //
-        // Awaited, not fire-and-forget: the point is to have let
-        // go before the umount runs. Remove already did this;
-        // the disconnect path released only afterwards, which is
-        // too late to prevent anything.
-        await_mpd_stop_and_prune(&record.mount_root).await;
-        // Lazy detach for CIFS (busy-file safety per volumio-evo
-        // reference network_mounts.rs:818). NFS is unmounted
-        // synchronously; kernel handles NFS-busy differently.
-        let lazy = matches!(record.fstype, FsType::Cifs);
+        // So the hold is released here instead, and the umount
+        // is asked for afterwards. Awaited, not fire-and-forget:
+        // the point is to have let go before it runs.
+        await_mpd_release(&record.mount_root).await;
+        // CIFS asks for a lazy detach. Whether `-l` delivers one
+        // depends on which binary receives it, so ask.
+        let lazy = matches!(record.fstype, FsType::Cifs)
+            && umount_flag_l_is_lazy(effective_umount_program(
+                &self.umount_program,
+                &self.umount_wrapper_args,
+            ));
         let args =
             self.wrap_umount_args(build_umount_args(&record.mount_root, lazy));
         let umount_program = self.umount_program.clone();
@@ -4236,11 +4471,30 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         let result = if output.exit_code == Some(0) {
             Ok(())
         } else {
-            Err(MountError::MountFailed {
-                id: share_id.clone(),
-                exit_code: output.exit_code,
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            })
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if is_busy_stderr(&stderr) {
+                // Still held after the release above: something
+                // outside our reach has it open — an in-flight
+                // database walk, an operator shell, another
+                // reader. Name it rather than reporting a
+                // subprocess line, so the glass can say who to
+                // stop instead of "that didn't work".
+                let probe = Arc::clone(&self.holder_probe);
+                let root = record.mount_root.clone();
+                let holders = tokio::task::spawn_blocking(move || probe(&root))
+                    .await
+                    .unwrap_or_default();
+                Err(MountError::Busy {
+                    id: share_id.clone(),
+                    holders,
+                })
+            } else {
+                Err(MountError::MountFailed {
+                    id: share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr,
+                })
+            }
         };
         match &result {
             Ok(()) => {
@@ -6140,9 +6394,12 @@ impl NetworkSharesRuntime {
                 // Activity "failed to disconnect", NFS still
                 // mounted.
                 //
-                // MPD holds files under a playing share. Release
-                // those first so a sync NFS umount can succeed.
-                // CIFS still lazy-detaches inside unmount_share.
+                // MPD's hold is released inside `unmount_share`,
+                // before the umount runs, for every caller —
+                // Remove and disconnect alike. Releasing again
+                // here would stop and prune an already-stopped,
+                // already-pruned MPD and pay the update-settle
+                // wait twice for one unmount.
                 let mount_root = self
                     .get_share(&req.share_id)
                     .await?
@@ -6150,7 +6407,6 @@ impl NetworkSharesRuntime {
                         id: req.share_id.clone(),
                     })?
                     .mount_root;
-                await_mpd_stop_and_prune(&mount_root).await;
                 let unmount = self.unmount_share(&req.share_id).await;
                 if (self.mount_point_check)(&mount_root) {
                     return Err(match unmount {
@@ -7727,8 +7983,8 @@ mount error(13): Permission denied",
 
         let err = rt.unmount_share(&id).await.unwrap_err();
         assert!(
-            matches!(err, MountError::MountFailed { .. }),
-            "the caller is still told the unmount failed: {err:?}"
+            matches!(err, MountError::Busy { .. }),
+            "a busy target is told apart from a broken one: {err:?}"
         );
         let g = rt.share_states.lock().await;
         let entry = g.get(&id).expect("share state recorded");
@@ -7741,6 +7997,141 @@ mount error(13): Permission denied",
             entry.failure_class, None,
             "a share that is still mounted carries no failure class"
         );
+    }
+
+    /// End to end over the argv, not just the decision helper:
+    /// a CIFS disconnect under production's wiring must not send
+    /// `-l` to `systemd-umount`, where it means `--full` and
+    /// never detached anything.
+    #[tokio::test]
+    async fn cifs_unmount_sends_no_lazy_flag_to_systemd_umount() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![CommandOutput {
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            // Non-root service identity: `sudo -n
+            // /usr/bin/systemd-umount <root>`.
+            .with_sudo_wrapping(true)
+            .build();
+        let record = built_record("cifs_share", "192.0.2.29");
+        let id = record.share_id.clone();
+        let mount_root = record.mount_root.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.unmount_share(&id).await.unwrap();
+
+        let calls = executor.calls.lock().await;
+        let (program, args) = calls.last().expect("umount ran");
+        assert_eq!(program, "sudo");
+        assert_eq!(
+            args,
+            &vec![
+                "-n".to_string(),
+                "/usr/bin/systemd-umount".to_string(),
+                mount_root.to_string_lossy().into_owned(),
+            ],
+            "no -l: systemd-umount reads it as --full"
+        );
+    }
+
+    /// The other direction. Where `-l` does mean lazy detach,
+    /// CIFS still gets it — removing the flag everywhere would
+    /// drop real busy-file safety on the util-linux path.
+    #[tokio::test]
+    async fn cifs_unmount_keeps_the_lazy_flag_for_plain_umount() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![CommandOutput {
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_umount_program("/bin/umount".to_string())
+            .build();
+        let record = built_record("cifs_plain", "192.0.2.30");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.unmount_share(&id).await.unwrap();
+
+        let calls = executor.calls.lock().await;
+        let (program, args) = calls.last().expect("umount ran");
+        assert_eq!(program, "/bin/umount");
+        assert_eq!(args.first().map(String::as_str), Some("-l"));
+    }
+
+    /// The refusal has to reach the glass, not just the caller:
+    /// the `unmount_failed` event detail is what Activity
+    /// renders, and it must be the classified sentence naming
+    /// who to stop — not the raw subprocess line, which happens
+    /// to contain the same three words and would let an
+    /// unclassified failure pass for a classified one.
+    #[tokio::test]
+    async fn a_busy_unmount_publishes_a_busy_reason() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /var/lib/evo/music/NAS/Audio: target is busy.",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            // Stand in for `fuser`: production cannot be asked
+            // to have a busy mount to hand, and the holders are
+            // the half of the message the operator acts on.
+            .with_holder_probe(Arc::new(
+                |_: &Path| vec!["4121:mpd".to_string()],
+            ))
+            .build();
+        let record = built_record("busy_event", "192.0.2.31");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let _ = rt.unmount_share(&id).await.unwrap_err();
+
+        let bytes = rt
+            .dispatch_verb("network.share.list_events", b"")
+            .await
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let events = response
+            .get("envelope")
+            .and_then(|e| e.get("events"))
+            .and_then(|e| e.as_array())
+            .expect("envelope.events array");
+        let last = events.last().expect("an event was published");
+        assert_eq!(
+            last.get("kind").and_then(|v| v.as_str()),
+            Some("unmount_failed")
+        );
+        let detail = last
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.starts_with("unmount refused for share"),
+            "the classified sentence reaches the glass, not the \
+             subprocess line: {detail}"
+        );
+        assert!(
+            detail.contains("target is busy"),
+            "the operator is told what refused: {detail}"
+        );
+        assert!(detail.contains("4121:mpd"), "and who to stop: {detail}");
     }
 
     #[tokio::test]
@@ -9074,6 +9465,96 @@ mount error(13): Permission denied",
             args,
             vec!["-l".to_string(), "/var/lib/evo/music/NAS/lazy".to_string()]
         );
+    }
+
+    /// `-l` reaches the binary at the end of the wrapper, not
+    /// the one the runtime field names. Under sudo wrapping
+    /// that field says `sudo`, and a decision taken on it alone
+    /// gets production — a non-root service identity — exactly
+    /// backwards.
+    #[test]
+    fn effective_umount_program_looks_past_the_sudo_wrapper() {
+        assert_eq!(
+            effective_umount_program(
+                "sudo",
+                &["-n".to_string(), "/usr/bin/systemd-umount".to_string()],
+            ),
+            "/usr/bin/systemd-umount",
+        );
+        assert_eq!(
+            effective_umount_program("/usr/bin/systemd-umount", &[]),
+            "/usr/bin/systemd-umount",
+        );
+        assert_eq!(effective_umount_program("/bin/umount", &[]), "/bin/umount");
+    }
+
+    /// The whole defect in one assertion: `-l` is a lazy detach
+    /// to `umount` and `--full` to `systemd-umount`.
+    #[test]
+    fn umount_flag_l_is_lazy_only_away_from_systemd_umount() {
+        assert!(umount_flag_l_is_lazy("/bin/umount"));
+        assert!(umount_flag_l_is_lazy("umount"));
+        assert!(!umount_flag_l_is_lazy("/usr/bin/systemd-umount"));
+        assert!(!umount_flag_l_is_lazy("systemd-umount"));
+    }
+
+    /// Both wordings for one refusal: util-linux says `target
+    /// is busy`, systemd renders the same EBUSY as `Device or
+    /// resource busy`. A classifier that knows only one leaves
+    /// half the field reports as unclassified subprocess text.
+    #[test]
+    fn is_busy_stderr_matches_both_umount_wordings() {
+        assert!(is_busy_stderr(
+            "umount: /var/lib/evo/music/NAS/Audio: target is busy."
+        ));
+        assert!(is_busy_stderr(
+            "Failed to unmount /var/lib/evo/music/NAS/Audio: \
+             Device or resource busy"
+        ));
+        assert!(is_busy_stderr("umount: /mnt: device is busy"));
+        assert!(!is_busy_stderr("umount: /mnt: not mounted or bad option"));
+        assert!(!is_busy_stderr(""));
+    }
+
+    /// The third holder is only visible in `mpc status` as an
+    /// `Updating DB` line, and the settle wait turns on seeing
+    /// it.
+    #[test]
+    fn mpd_status_is_updating_reads_the_updating_db_line() {
+        assert!(mpd_status_is_updating(
+            "volume: 60%   repeat: off   random: off\n\
+             Updating DB (#3) ...\n"
+        ));
+        assert!(!mpd_status_is_updating(
+            "volume: 60%   repeat: off   random: off\n"
+        ));
+        assert!(!mpd_status_is_updating(""));
+    }
+
+    /// A busy refusal is not a broken mount: it must classify
+    /// Transient so the retry ladder keeps the share, and its
+    /// message must name who to stop — that string is the
+    /// `unmount_failed` event reason the glass renders.
+    #[test]
+    fn busy_names_its_holders_and_classifies_transient() {
+        let e = MountError::Busy {
+            id: ShareId("s-1".to_string()),
+            holders: vec!["4121:mpd".to_string(), "901:bash".to_string()],
+        };
+        assert_eq!(e.failure_class(), FailureClass::Transient);
+        let rendered = format!("{e}");
+        assert!(rendered.contains("target is busy"), "{rendered}");
+        assert!(rendered.contains("4121:mpd"), "{rendered}");
+        assert!(rendered.contains("901:bash"), "{rendered}");
+
+        // Unprivileged fuser can name nobody. The refusal is
+        // still a refusal and must still render.
+        let blind = MountError::Busy {
+            id: ShareId("s-1".to_string()),
+            holders: Vec::new(),
+        };
+        assert_eq!(blind.failure_class(), FailureClass::Transient);
+        assert!(!format!("{blind}").contains("held by"));
     }
 
     #[test]
@@ -11306,11 +11787,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             .await
             .expect_err("a live mount must refuse Remove");
         assert!(
-            matches!(
-                err,
-                VerbDispatchError::Mount(MountError::MountFailed { .. })
-            ),
-            "Remove names the unmount refusal: {err:?}"
+            matches!(err, VerbDispatchError::Mount(MountError::Busy { .. })),
+            "Remove names the unmount refusal, classified: {err:?}"
         );
         let configured = rt.list_configured().await.unwrap();
         assert_eq!(
