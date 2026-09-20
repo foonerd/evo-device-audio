@@ -21,9 +21,10 @@
 //! `system_network_shares_configured` singleton (addressing
 //! scheme `evo.network.shares.configured`, value `local`). On
 //! every state update the subscriber walks the `shares` array
-//! and upserts one `SourceRecord` per entry, keyed by a stable
-//! `source_id` derived from the share's `id` field. Entries no
-//! longer present in the envelope are removed from the registry.
+//! and admits one `SourceRecord` per entry through the same
+//! source life `library.add_source` uses: register once, probe
+//! now, keep the observed state and counts on later ticks.
+//! Entries no longer present in the envelope are retracted.
 //!
 //! One-way: MPD is a consumer of the shares subject, no reverse
 //! coupling. The shares plugin does not know MPD subscribes.
@@ -46,7 +47,8 @@ use evo_plugin_sdk::contract::{
 use tokio::sync::Notify;
 
 use crate::source_registry::{
-    ScanPolicy, SourceKind, SourceRecord, SourceRegistry, SourceState,
+    default_probe_cadence_for, default_scan_policy_for, probe_source,
+    SourceKind, SourceRecord, SourceRegistry, SourceState, PROBE_BUDGET,
 };
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -337,7 +339,7 @@ async fn apply_envelope(
             continue;
         };
         desired_ids.insert(record.id.clone());
-        registry.upsert(record).await;
+        admit_attached_store(registry, retract, record).await;
     }
 
     // 2. Remove NAS-prefixed sources no longer present in the
@@ -368,6 +370,57 @@ async fn drop_all_nas_sources(
         }
         retract_retired_source(retract, registry, &record.id).await;
     }
+}
+
+/// USB, NFS, SMB, and every other attached store use this
+/// life: register once, probe now, keep the observed row.
+///
+/// A raw upsert of a Probing stub with cadence 0 is the field
+/// lie: Browse stuck on probing, index 0 until a hand Rescan,
+/// a later envelope tick wiping Online and the counts.
+async fn admit_attached_store(
+    registry: &SourceRegistry,
+    retract: &RetractHandles,
+    incoming: SourceRecord,
+) {
+    if let Some(existing) = registry.get(&incoming.id).await {
+        if existing.display_name != incoming.display_name
+            || existing.mount_path != incoming.mount_path
+            || existing.kind != incoming.kind
+        {
+            let mut kept = existing;
+            kept.display_name = incoming.display_name;
+            kept.mount_path = incoming.mount_path;
+            kept.kind = incoming.kind;
+            registry.upsert(kept).await;
+            crate::library::publish_subjects(&retract.library).await;
+        }
+        return;
+    }
+    let id = incoming.id.clone();
+    if let Err(e) = registry.register(incoming).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %id,
+            error = %e,
+            "shares-sync: admit register failed"
+        );
+        return;
+    }
+    if let Some(registered) = registry.get(&id).await {
+        let outcome = probe_source(&registered, PROBE_BUDGET).await;
+        if let Err(e) = registry.transition(&id, outcome.new_state).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %id,
+                error = %e,
+                "shares-sync: admit probe transition failed; \
+                 source stays Probing until the next probe"
+            );
+        }
+    }
+    let _ = registry.persist().await;
+    crate::library::publish_subjects(&retract.library).await;
 }
 
 /// Translate one share entry from the envelope into a
@@ -424,31 +477,21 @@ fn record_from_envelope_share(
     };
 
     let source_id = format!("{SHARES_SOURCE_ID_PREFIX}{share_id}");
+    let probe_cadence_ms = default_probe_cadence_for(&kind);
+    let scan_policy = default_scan_policy_for(&kind);
     Some(SourceRecord {
         id: source_id,
         display_name: alias.to_string(),
         kind,
         mount_path: std::path::PathBuf::from(mount_root),
         mpd_storage_name: None,
-        // Start Probing so the source is visible but not yet
-        // claimed reachable. The existing per-source probe
-        // machinery (see `probe_source` in source_registry) is
-        // what transitions Probing → Online / Degraded / Offline
-        // on its own cadence; this sync's only job is to keep
-        // the registry populated against the shares envelope.
+        // First sight is Probing. `admit_attached_store` probes
+        // immediately, the same door `library.add_source` uses
+        // for USB and every other attached store.
         state: SourceState::Probing,
         last_seen_online_at_ms: None,
-        probe_cadence_ms: 0,
-        // Same shape default_scan_policy_for uses for NAS: eager
-        // incremental with `update PATH` on Online transitions
-        // (mount events do not fire for NAS the way they do for
-        // LocalUsb — the shares plugin's mount-success hook is
-        // the mount event, and it already runs `mpc update`
-        // via F1.1).
-        scan_policy: ScanPolicy::EagerIncremental {
-            on_online: true,
-            on_mount_event: false,
-        },
+        probe_cadence_ms,
+        scan_policy,
         track_count: 0,
         track_count_available: 0,
         last_scan_at_ms: None,
@@ -896,5 +939,61 @@ mod tests {
                 .is_some(),
             "the live envelope must produce a registry source",
         );
+    }
+
+    #[test]
+    fn an_envelope_share_uses_the_kind_source_defaults() {
+        // The library model: NFS/SMB take the same cadence and
+        // scan policy as the kind, not a cadence-0 stub that
+        // never probes.
+        let share = &wire_share_envelope()["shares"][0];
+        let record = record_from_envelope_share(share)
+            .expect("the wire key is share_id");
+        assert_eq!(
+            record.probe_cadence_ms,
+            crate::source_registry::DEFAULT_NAS_PROBE_CADENCE_MS,
+        );
+        assert_eq!(record.scan_policy, default_scan_policy_for(&record.kind),);
+        assert_ne!(record.probe_cadence_ms, 0, "cadence 0 never probes");
+    }
+
+    #[tokio::test]
+    async fn admitting_a_new_share_probes_a_reachable_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, retract, _ann, _playlists, _cmds) =
+            retire_harness().await;
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(dir.path().display().to_string());
+        apply_envelope(&registry, &retract, &env).await;
+        let rec = registry
+            .get("nas-82befb0b-740a-4e65-bae2-5c29e81a6a58")
+            .await
+            .expect("admitted");
+        assert_eq!(
+            rec.state.discriminant(),
+            crate::source_registry::SourceState::Online.discriminant(),
+            "a reachable mount is observed, not left Probing",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_republish_does_not_reset_an_online_share_to_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, retract, _ann, _playlists, _cmds) =
+            retire_harness().await;
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(dir.path().display().to_string());
+        apply_envelope(&registry, &retract, &env).await;
+        let id = "nas-82befb0b-740a-4e65-bae2-5c29e81a6a58";
+        registry.update_track_counts(id, 40, 40).await.unwrap();
+        apply_envelope(&registry, &retract, &env).await;
+        let rec = registry.get(id).await.expect("still there");
+        assert_eq!(
+            rec.state.discriminant(),
+            crate::source_registry::SourceState::Online.discriminant(),
+        );
+        assert_eq!(rec.track_count, 40, "a republish must not wipe the index");
     }
 }
