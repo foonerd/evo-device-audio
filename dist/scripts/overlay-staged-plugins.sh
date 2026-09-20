@@ -45,6 +45,7 @@ set -euo pipefail
 PLUGINS=(
     "org.evoframework.playback.mpd"
     "org.evoframework.storage.usb"
+    "org.evoframework.network.shares"
 )
 WRAPPER_DEST="/usr/local/bin/evo-usb-mount"
 

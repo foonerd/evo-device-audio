@@ -3179,81 +3179,100 @@ fn trigger_mpd_stop_and_prune_best_effort(mount_root: &std::path::Path) {
     if mount_root.as_os_str().is_empty() {
         return;
     }
-    let root_display = mount_root.display().to_string();
+    let root = mount_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        // Step 1 — stop playback if current URI is under the
-        // vanishing prefix. `mpc status --format '%file%'` prints
-        // the currently-playing file on its own line when
-        // something is loaded; empty when stopped.
-        let status = std::process::Command::new("/usr/bin/mpc")
-            .arg("--format")
-            .arg("%file%")
-            .arg("status")
-            .output();
-        if let Ok(o) = status {
-            if o.status.success() {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let current = stdout.lines().next().unwrap_or("").trim();
-                if !current.is_empty() && current.starts_with(&root_display) {
-                    let _ = std::process::Command::new("/usr/bin/mpc")
-                        .arg("stop")
-                        .output();
-                    tracing::info!(
-                        mount_root = %root_display,
-                        current = %current,
-                        "mpc stop dispatched — currently-playing file was under vanishing share prefix"
-                    );
-                }
+        mpd_stop_and_prune_blocking(&root);
+    });
+}
+
+/// Same work as [`trigger_mpd_stop_and_prune_best_effort`],
+/// joined. Remove waits on this so a playing NFS share can
+/// unmount instead of staying mounted after the record is gone.
+async fn await_mpd_stop_and_prune(mount_root: &std::path::Path) {
+    if mount_root.as_os_str().is_empty() {
+        return;
+    }
+    let root = mount_root.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        mpd_stop_and_prune_blocking(&root);
+    })
+    .await;
+}
+
+fn mpd_stop_and_prune_blocking(mount_root: &std::path::Path) {
+    let root_display = mount_root.display().to_string();
+    // Step 1 — stop playback if current URI is under the
+    // vanishing prefix. `mpc status --format '%file%'` prints
+    // the currently-playing file on its own line when
+    // something is loaded; empty when stopped.
+    let status = std::process::Command::new("/usr/bin/mpc")
+        .arg("--format")
+        .arg("%file%")
+        .arg("status")
+        .output();
+    if let Ok(o) = status {
+        if o.status.success() {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let current = stdout.lines().next().unwrap_or("").trim();
+            if !current.is_empty() && current.starts_with(&root_display) {
+                let _ = std::process::Command::new("/usr/bin/mpc")
+                    .arg("stop")
+                    .output();
+                tracing::info!(
+                    mount_root = %root_display,
+                    current = %current,
+                    "mpc stop dispatched — currently-playing file was under vanishing share prefix"
+                );
             }
         }
+    }
 
-        // Step 2 — enumerate the queue and delete entries under
-        // the vanishing prefix. `mpc playlist -f '%position% %file%'`
-        // prints `<pos> <file>` one per line.
-        let pl = std::process::Command::new("/usr/bin/mpc")
-            .arg("-f")
-            .arg("%position% %file%")
-            .arg("playlist")
+    // Step 2 — enumerate the queue and delete entries under
+    // the vanishing prefix. `mpc playlist -f '%position% %file%'`
+    // prints `<pos> <file>` one per line.
+    let pl = std::process::Command::new("/usr/bin/mpc")
+        .arg("-f")
+        .arg("%position% %file%")
+        .arg("playlist")
+        .output();
+    let Ok(pl_out) = pl else {
+        return;
+    };
+    if !pl_out.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&pl_out.stdout);
+    // Collect positions (high-to-low) whose file is under the
+    // vanishing prefix. High-to-low so a subsequent delete does
+    // not shift the positions of yet-to-be-deleted entries.
+    let mut positions: Vec<u32> = text
+        .lines()
+        .filter_map(|line| {
+            let (pos_str, file) = line.split_once(' ')?;
+            if file.starts_with(&root_display) {
+                pos_str.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if positions.is_empty() {
+        return;
+    }
+    positions.sort_unstable();
+    positions.reverse();
+    let deleted = positions.len();
+    for pos in &positions {
+        let _ = std::process::Command::new("/usr/bin/mpc")
+            .arg("del")
+            .arg(pos.to_string())
             .output();
-        let Ok(pl_out) = pl else {
-            return;
-        };
-        if !pl_out.status.success() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&pl_out.stdout);
-        // Collect positions (high-to-low) whose file is under the
-        // vanishing prefix. High-to-low so a subsequent delete does
-        // not shift the positions of yet-to-be-deleted entries.
-        let mut positions: Vec<u32> = text
-            .lines()
-            .filter_map(|line| {
-                let (pos_str, file) = line.split_once(' ')?;
-                if file.starts_with(&root_display) {
-                    pos_str.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if positions.is_empty() {
-            return;
-        }
-        positions.sort_unstable();
-        positions.reverse();
-        let deleted = positions.len();
-        for pos in &positions {
-            let _ = std::process::Command::new("/usr/bin/mpc")
-                .arg("del")
-                .arg(pos.to_string())
-                .output();
-        }
-        tracing::info!(
-            mount_root = %root_display,
-            deleted,
-            "mpc del pruned queue entries under vanishing share prefix"
-        );
-    });
+    }
+    tracing::info!(
+        mount_root = %root_display,
+        deleted,
+        "mpc del pruned queue entries under vanishing share prefix"
+    );
 }
 
 // ------------------------------ event ring ---------------------------
@@ -6082,10 +6101,38 @@ impl NetworkSharesRuntime {
             "network.share.remove" => {
                 let req: RemoveShareRequest =
                     decode_payload(request_type, payload_bytes)?;
-                // Best-effort unmount before removal so busy CIFS
-                // mounts get the lazy-detach path; failure here
-                // does not block record deletion.
-                let _ = self.unmount_share(&req.share_id).await;
+                // Remove is remove. The OS mount must be gone
+                // before the row drops. Best-effort unmount then
+                // delete is the field lie: Sources empty,
+                // Activity "failed to disconnect", NFS still
+                // mounted.
+                //
+                // MPD holds files under a playing share. Release
+                // those first so a sync NFS umount can succeed.
+                // CIFS still lazy-detaches inside unmount_share.
+                let mount_root = self
+                    .get_share(&req.share_id)
+                    .await?
+                    .ok_or_else(|| MountError::ShareNotFound {
+                        id: req.share_id.clone(),
+                    })?
+                    .mount_root;
+                await_mpd_stop_and_prune(&mount_root).await;
+                let unmount = self.unmount_share(&req.share_id).await;
+                if (self.mount_point_check)(&mount_root) {
+                    return Err(match unmount {
+                        Err(e) => VerbDispatchError::Mount(e),
+                        Ok(()) => {
+                            VerbDispatchError::Mount(MountError::MountFailed {
+                                id: req.share_id,
+                                exit_code: None,
+                                stderr: "umount reported success but \
+                                         the path is still a mount"
+                                    .to_string(),
+                            })
+                        }
+                    });
+                }
                 let removed_record = self.remove_share(&req.share_id).await?;
                 encode_response(
                     request_type,
@@ -11125,8 +11172,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     #[tokio::test]
     async fn dispatch_verb_remove_returns_removed_record() {
         let dir = tempdir();
-        // Executor supplies one output for the pre-removal
-        // best-effort unmount call.
+        // Unmount refused, but the OS has no mount (default
+        // test check). The row still drops — already gone.
         let executor = ScriptedExecutor::new(vec![err_mount_output()]);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
@@ -11149,6 +11196,52 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response.removed_record.share_id, id);
         assert!(rt.list_configured().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_keeps_the_record_when_the_os_still_has_the_mount() {
+        // Field 2026-09-20 .24: Remove of playing NFS deleted
+        // the row, published unmount_failed, left the mount.
+        // Sources said none yet; Activity said failed to
+        // disconnect. The OS is the authority: a live mount
+        // keeps the record so the operator can see it and retry.
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![failure_output(
+            "umount: /mnt/x: target is busy",
+        )]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(|_: &Path| true))
+            .build();
+        let mut record = built_record("NFS", "192.0.2.61");
+        record.fstype = FsType::Nfs;
+        let id = rt.add_share(record).await.unwrap();
+
+        let req = RemoveShareRequest {
+            share_id: id.clone(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let err = rt
+            .dispatch_verb("network.share.remove", &payload)
+            .await
+            .expect_err("a live mount must refuse Remove");
+        assert!(
+            matches!(
+                err,
+                VerbDispatchError::Mount(MountError::MountFailed { .. })
+            ),
+            "Remove names the unmount refusal: {err:?}"
+        );
+        let configured = rt.list_configured().await.unwrap();
+        assert_eq!(
+            configured.len(),
+            1,
+            "the row stays so Sources can still show the share"
+        );
+        assert_eq!(configured[0].share_id, id);
     }
 
     #[tokio::test]
