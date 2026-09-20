@@ -3125,7 +3125,11 @@ fn trigger_mpd_update_best_effort(mount_root: &std::path::Path) {
     if mount_root.as_os_str().is_empty() {
         return;
     }
-    let path_arg = mount_root.display().to_string();
+    // Same rule: `mpc update` addresses MPD's database, so an
+    // absolute path is refused and prunes nothing.
+    let Some(path_arg) = mpd_relative_mount_prefix(mount_root) else {
+        return;
+    };
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new("/usr/bin/mpc")
             .arg("update")
@@ -3157,37 +3161,48 @@ fn trigger_mpd_update_best_effort(mount_root: &std::path::Path) {
     });
 }
 
-/// MPD queue safety: called BEFORE a share is unmounted (or
-/// after mount-loss is detected) so the operator does not end up
-/// with a stuck queue full of "No such song" errors when the
-/// share drops mid-playback. Volumio-evo lesson (`mpd.rs`
-/// unreachable-mitigation).
+/// The path MPD knows this mount by.
 ///
-/// Two steps:
-///   1. `mpc status --format '%file%'` — if the currently-playing
-///      file is under `mount_root`, `mpc stop` before the mount
-///      goes away.
-///   2. `mpc playlist -f '%position% %file%'` — enumerate the
-///      queue, `mpc del <position>` every entry pointing under
-///      `mount_root`. Deletions are processed high-to-low so
-///      positions do not shift under the enumerate.
+/// MPD addresses everything relative to its `music_directory`;
+/// it never speaks absolute filesystem paths, and handing it one
+/// is the `Bad URI` class. `mpc status --format %file%` and
+/// `mpc playlist` therefore print `NAS/<alias>/track.flac`, not
+/// `/var/lib/evo/music/NAS/<alias>/track.flac`, and `mpc update`
+/// wants the same shape.
 ///
-/// Fire-and-forget spawn_blocking; the caller does not wait.
-/// Failures log at debug — a hung mpc must not block unmount.
-/// Empty `mount_root` short-circuits.
-fn trigger_mpd_stop_and_prune_best_effort(mount_root: &std::path::Path) {
-    if mount_root.as_os_str().is_empty() {
-        return;
+/// [`NAS_MOUNT_ROOT`] is that music directory plus one segment,
+/// so its parent is the music directory and stripping it yields
+/// exactly what MPD is holding.
+///
+/// `None` for a mount outside the NAS root: MPD cannot address
+/// it, so there is nothing of it to stop or prune.
+fn mpd_relative_mount_prefix(mount_root: &std::path::Path) -> Option<String> {
+    let music_directory = std::path::Path::new(NAS_MOUNT_ROOT).parent()?;
+    let rel = mount_root.strip_prefix(music_directory).ok()?;
+    let rel = rel.to_string_lossy();
+    if rel.is_empty() {
+        return None;
     }
-    let root = mount_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        mpd_stop_and_prune_blocking(&root);
-    });
+    Some(rel.into_owned())
 }
 
-/// Same work as [`trigger_mpd_stop_and_prune_best_effort`],
-/// joined. Remove waits on this so a playing NFS share can
-/// unmount instead of staying mounted after the record is gone.
+/// Stop playback and prune the queue of everything under this
+/// share, then return.
+///
+/// Both callers wait: Remove, so a playing share can unmount
+/// instead of staying mounted after the record is gone, and
+/// disconnect, so the umount does not meet a file MPD still has
+/// open.
+///
+/// Two steps, both against the path MPD knows the mount by:
+///   1. `mpc status --format '%file%'` — if the currently
+///      playing file is under the prefix, `mpc stop`.
+///   2. `mpc playlist -f '%position% %file%'` — delete every
+///      queue entry under it, high position to low so the
+///      positions do not shift under the enumerate.
+///
+/// Best-effort throughout: a hung or absent mpc must not block
+/// the operator's unmount.
 async fn await_mpd_stop_and_prune(mount_root: &std::path::Path) {
     if mount_root.as_os_str().is_empty() {
         return;
@@ -3200,7 +3215,13 @@ async fn await_mpd_stop_and_prune(mount_root: &std::path::Path) {
 }
 
 fn mpd_stop_and_prune_blocking(mount_root: &std::path::Path) {
-    let root_display = mount_root.display().to_string();
+    // What MPD is holding, not what the filesystem calls it.
+    // Comparing `%file%` against the absolute mount root never
+    // matched, so the stop never fired and the queue was never
+    // pruned — the share stayed busy and the umount met EBUSY.
+    let Some(root_display) = mpd_relative_mount_prefix(mount_root) else {
+        return;
+    };
     // Step 1 — stop playback if current URI is under the
     // vanishing prefix. `mpc status --format '%file%'` prints
     // the currently-playing file on its own line when
@@ -4184,6 +4205,23 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 }
             })?
         };
+        // Release MPD's hold BEFORE asking for the unmount.
+        //
+        // A queued or playing track under the share is an open
+        // file, and an open file is EBUSY. The `-l` below does
+        // not save us: these shares are mounted by
+        // `systemd-mount --collect`, so the unmount is a unit
+        // stop and systemd runs its own `umount` without our
+        // argv — laziness there is the `LazyUnmount=` unit
+        // property, not a flag we can pass. Field 11:28:54:
+        // `target is busy`, status 32, share still mounted,
+        // Activity saying failed to disconnect.
+        //
+        // Awaited, not fire-and-forget: the point is to have let
+        // go before the umount runs. Remove already did this;
+        // the disconnect path released only afterwards, which is
+        // too late to prevent anything.
+        await_mpd_stop_and_prune(&record.mount_root).await;
         // Lazy detach for CIFS (busy-file safety per volumio-evo
         // reference network_mounts.rs:818). NFS is unmounted
         // synchronously; kernel handles NFS-busy differently.
@@ -4206,13 +4244,8 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         };
         match &result {
             Ok(()) => {
-                // MPD queue safety BEFORE we tell MPD to walk the
-                // (now-vanished) tree. Volumio-evo lesson: without
-                // this the operator sees "No such song" storms +
-                // an unresponsive queue when a share drops mid-
-                // playback. Best-effort — a hung mpc does not
-                // block the unmount response.
-                trigger_mpd_stop_and_prune_best_effort(&record.mount_root);
+                // The queue was released before the umount ran.
+                // Nothing to stop or prune here a second time.
                 self.set_share_state(
                     share_id,
                     MountState::Unmounted,
@@ -8976,6 +9009,50 @@ mount error(13): Permission denied",
         assert!(options.contains("rsize=1048576"));
         // Absolute paths are preserved as-is (no leading double slash).
         assert_eq!(args[3], "192.0.2.101:/export/music");
+    }
+
+    #[test]
+    fn the_mpd_prefix_is_what_mpd_holds_not_the_filesystem_path() {
+        // The operator invert. `mpc status --format %file%`
+        // prints NAS/<alias>/track.flac; comparing that against
+        // /var/lib/evo/music/NAS/<alias> never matched, so the
+        // stop never fired, the queue was never pruned, the
+        // share stayed busy and the unmount met `target is
+        // busy`, status 32.
+        let prefix = mpd_relative_mount_prefix(&PathBuf::from(
+            "/var/lib/evo/music/NAS/Audio",
+        ))
+        .expect("a share under the NAS root is addressable");
+        assert_eq!(prefix, "NAS/Audio");
+        assert!(
+            !prefix.starts_with('/'),
+            "an absolute path is the Bad URI class MPD refuses: {prefix}",
+        );
+
+        // What MPD actually reports has to match it.
+        let playing = "NAS/Audio/01.flac";
+        assert!(
+            playing.starts_with(&prefix),
+            "the currently-playing file must be recognised as under \
+             the share: {playing} vs {prefix}",
+        );
+        let other = "INTERNAL/keep.flac";
+        assert!(
+            !other.starts_with(&prefix),
+            "and nothing else may be: {other} vs {prefix}",
+        );
+    }
+
+    #[test]
+    fn a_mount_outside_the_nas_root_has_nothing_mpd_can_address() {
+        assert_eq!(
+            mpd_relative_mount_prefix(&PathBuf::from("/mnt/other")),
+            None
+        );
+        assert_eq!(
+            mpd_relative_mount_prefix(&PathBuf::from(NAS_MOUNT_ROOT)),
+            Some("NAS".to_string()),
+        );
     }
 
     #[test]
