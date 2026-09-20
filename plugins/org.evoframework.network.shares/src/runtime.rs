@@ -2983,6 +2983,31 @@ impl NetworkSharesRuntime {
         }
     }
 
+    /// Stock a password the operator typed on the Add dialog.
+    /// Empty / absent is a no-op so Guest and a later prompt
+    /// path stay. The secret is never written onto the share
+    /// record.
+    async fn stock_supplied_password(
+        &self,
+        credentials: &Credentials,
+        password: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(password) = password.filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let Credentials::UserPassword { credential_key, .. } = credentials
+        else {
+            return Ok(());
+        };
+        let Some(store) = self.credential_store.as_ref() else {
+            return Err("credential store is not wired".to_string());
+        };
+        store
+            .store_password(credential_key, password.as_bytes())
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
     /// Ensure the credential vault has an entry for the record's
     /// `credential_key`, raising a password prompt to the operator
     /// when it does not. Guest / KeyFile shares short-circuit to
@@ -6110,6 +6135,11 @@ pub struct AddShareRequest {
     /// Operator-supplied mount options string (may be empty).
     #[serde(default)]
     pub advanced_options: String,
+    /// Secret typed on the same Add dialog. Stocked in the vault
+    /// and never written onto the share record. Absent = the
+    /// existing empty-vault path (boot remount stays Unmounted).
+    #[serde(default, skip_serializing)]
+    pub password: Option<String>,
 }
 
 /// Response payload for `network.share.add`.
@@ -6326,6 +6356,7 @@ impl NetworkSharesRuntime {
             "network.share.add" => {
                 let req: AddShareRequest =
                     decode_payload(request_type, payload_bytes)?;
+                let supplied_password = req.password.clone();
                 let record = ShareRecord::new(
                     req.alias,
                     req.fstype,
@@ -6335,16 +6366,27 @@ impl NetworkSharesRuntime {
                     req.advanced_options,
                     (self.now_fn)() as i64,
                 );
+                let credentials = record.credentials.clone();
                 let share_id = self.add_share(record).await?;
-                // mount_share now runs the prompt-on-mount flow
-                // internally: for UserPassword shares whose
-                // credential_key is not in the vault, it raises
-                // a password prompt via the framework's user-
-                // interaction responder and stashes the answer
-                // before dispatching the mount helper. A
-                // cancelled prompt surfaces as a MountError the
-                // caller renders as mount_error; the operator
-                // retries via network.share.mount, which re-prompts.
+                // Same dialog as Windows / Volumio: the operator
+                // typed the secret with the Add. Stock it, then
+                // mount. The prompt bus is not this path.
+                if let Err(e) = self
+                    .stock_supplied_password(
+                        &credentials,
+                        supplied_password.as_deref(),
+                    )
+                    .await
+                {
+                    return encode_response(
+                        request_type,
+                        &AddShareResponse {
+                            share_id,
+                            mount_report: None,
+                            mount_error: Some(e),
+                        },
+                    );
+                }
                 let mount_res = self.mount_share(&share_id).await;
                 let response = match mount_res {
                     Ok(report) => AddShareResponse {
@@ -11512,6 +11554,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             path: "Music".to_string(),
             credentials: Credentials::Guest,
             advanced_options: String::new(),
+            password: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
 
@@ -11599,6 +11642,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                 domain: None,
             },
             advanced_options: String::new(),
+            password: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
 
@@ -11625,6 +11669,75 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     }
 
     #[tokio::test]
+    async fn add_with_password_on_the_dialog_stocks_the_vault_and_does_not_prompt(
+    ) {
+        // Windows / Volumio path: the secret arrives on the Add
+        // payload. The vault is stocked before mount. The prompt
+        // bus is not consulted. The share record never carries
+        // the secret.
+        let dir = tempdir();
+        let creds_root = dir.join("credentials");
+        std::fs::create_dir_all(&creds_root).unwrap();
+        let store = Arc::new(FileCredentialStore::new(creds_root));
+        let prompter = Arc::new(RecordingPrompter {
+            answer: std::sync::Mutex::new(Some(b"should-not-be-used".to_vec())),
+            calls: std::sync::Mutex::new(0),
+        });
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_password_prompter(
+                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
+            )
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .build();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "alias": "Dialog Secret",
+            "fstype": "cifs",
+            "host": "192.0.2.33",
+            "path": "Music",
+            "credentials": {
+                "kind": "user_password",
+                "username": "op",
+                "credential_key": "share.dialog_secret"
+            },
+            "advanced_options": "",
+            "password": "s3cret"
+        }))
+        .unwrap();
+
+        let bytes = rt
+            .dispatch_verb("network.share.add", &payload)
+            .await
+            .expect("a stocked add mounts without a prompt");
+        let response: AddShareResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(response.mount_error.is_none(), "{response:?}");
+        assert!(response.mount_report.is_some());
+        assert_eq!(
+            *prompter.calls.lock().unwrap(),
+            0,
+            "the dialog password must not raise a prompt card"
+        );
+        let stored = store
+            .fetch_password("share.dialog_secret")
+            .await
+            .expect("vaulted");
+        assert_eq!(stored, b"s3cret");
+        let toml = std::fs::read_to_string(dir.join(NETWORK_SHARES_FILE))
+            .expect("share record");
+        assert!(
+            !toml.contains("s3cret"),
+            "the secret must not land on the share record: {toml}"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_verb_add_mounts_and_returns_share_id_and_report() {
         let dir = tempdir();
         let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
@@ -11641,6 +11754,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             path: "Music".to_string(),
             credentials: Credentials::Guest,
             advanced_options: String::new(),
+            password: None,
         };
         let payload = serde_json::to_vec(&req).unwrap();
         let bytes = rt
