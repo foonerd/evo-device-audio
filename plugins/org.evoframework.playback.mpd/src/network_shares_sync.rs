@@ -1020,7 +1020,9 @@ mod tests {
     }
 
     /// The envelope `network.shares` actually publishes.
-    /// Field `.24` 2026-09-20: Connected NFS, key is `share_id`.
+    /// Taken from a field-observed Connected NFS share, with the
+    /// rig's address and export path replaced: the shape is the
+    /// contract, the identity is not.
     fn wire_share_envelope() -> serde_json::Value {
         serde_json::json!({
             "shares": [{
@@ -1029,10 +1031,10 @@ mod tests {
                 "created_at_ms": 1_789_876_977_600i64,
                 "credentials": { "kind": "guest" },
                 "fstype": "nfs",
-                "host": "192.168.30.1",
+                "host": "192.0.2.1",
                 "last_mounted_at_ms": null,
                 "mount_root": "/var/lib/evo/music/NAS/NFS",
-                "path": "/volume1/multimedia/broadcast/Audio",
+                "path": "/export/music",
                 "persisted_vers": null,
                 "share_id": "82befb0b-740a-4e65-bae2-5c29e81a6a58"
             }]
