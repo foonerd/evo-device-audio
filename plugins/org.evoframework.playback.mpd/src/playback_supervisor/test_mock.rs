@@ -933,6 +933,19 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                         // hits. A test needing a real count wants
                         // its own behaviour.
                         "songs: 0\nplaytime: 0\nOK\n".to_string()
+                    } else if cmd.starts_with("listplaylistinfo") {
+                        // Ordered before `listplaylists`: the
+                        // longer name would otherwise never match.
+                        let name =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut out = String::new();
+                        if let Some(entries) = held.get(&name) {
+                            for e in entries {
+                                out.push_str(&format!("file: {e}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
                     } else if cmd.starts_with("listplaylists") {
                         let mut out = String::new();
                         for name in held.keys() {

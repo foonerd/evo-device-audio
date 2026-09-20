@@ -92,19 +92,103 @@ pub(crate) fn spawn_shares_sync(
     subscriber: Arc<dyn SubjectStateSubscriber>,
     querier: Arc<dyn SubjectQuerier>,
     registry: SourceRegistry,
+    retract: RetractHandles,
 ) -> SharesSyncHandle {
     let shutdown = Arc::new(Notify::new());
     let task_shutdown = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
-        run(subscriber, querier, registry, task_shutdown).await;
+        run(subscriber, querier, registry, retract, task_shutdown).await;
     });
     SharesSyncHandle { task, shutdown }
+}
+
+/// What retiring a share needs beyond the registry.
+///
+/// A share leaving the envelope is a Remove: the operator is
+/// not going to see that NAS again. Dropping the registry row
+/// alone leaves its tracks in MPD's database, in every stored
+/// playlist and in favourites, and leaves `audio_library_sources`
+/// still naming it — Browse keeps listing a NAS that is gone.
+/// These handles let the retirement run the same retraction the
+/// Sources-page Remove runs, rather than a second implementation
+/// of it.
+#[derive(Clone)]
+pub(crate) struct RetractHandles {
+    pub(crate) library: crate::library::LibraryContext,
+    pub(crate) queue: crate::queue::QueueContext,
+    pub(crate) endpoint: crate::mpd::MpdEndpoint,
+    pub(crate) timeouts: crate::mpd::ConnectTimeouts,
+}
+
+/// Retract one retired share through the ordinary removal verb.
+///
+/// `library.remove_source` with the scrub flag is the Sources-page
+/// Remove's own path: it drops the source's rows from stored
+/// playlists and favourites, scrubs MPD's database, re-counts the
+/// floor and republishes the library subjects. Calling it here is
+/// what makes a share retired by the shares plugin leave Browse
+/// and the playlists, not only the registry map.
+///
+/// In-process, not a dispatch: this is the same plugin, so there
+/// is no nested-verb wait to walk into.
+///
+/// Best-effort. The share is gone from the shares plugin either
+/// way; a retraction that could not run must not strand the
+/// registry row, so a failure falls back to the bare drop.
+async fn retract_retired_source(
+    retract: &RetractHandles,
+    registry: &SourceRegistry,
+    source_id: &str,
+) {
+    let mut conn = match crate::mpd::MpdConnection::connect_with_timeouts(
+        retract.endpoint.clone(),
+        retract.timeouts,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "shares-sync: no MPD connection to retract a retired \
+                 share; dropping the registry row alone"
+            );
+            let _ = registry.remove(source_id).await;
+            return;
+        }
+    };
+    let payload = crate::library::RemoveSourcePayload {
+        v: crate::library::LIBRARY_PAYLOAD_VERSION,
+        source_id: source_id.to_string(),
+        scrub_mpd_entries: true,
+        consumer_stop: false,
+    };
+    if let Err(e) = crate::library::handle_remove_source(
+        &retract.library,
+        &retract.queue,
+        &mut conn,
+        payload,
+    )
+    .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %source_id,
+            error = %e,
+            "shares-sync: retraction of a retired share failed; \
+             dropping the registry row alone"
+        );
+        let _ = registry.remove(source_id).await;
+    }
 }
 
 async fn run(
     subscriber: Arc<dyn SubjectStateSubscriber>,
     querier: Arc<dyn SubjectQuerier>,
     registry: SourceRegistry,
+    retract: RetractHandles,
     shutdown: Arc<Notify>,
 ) {
     let addressing =
@@ -168,7 +252,7 @@ async fn run(
     if let Ok(Some(state)) =
         subscriber.current_state(canonical_id.clone()).await
     {
-        apply_envelope(&registry, &state).await;
+        apply_envelope(&registry, &retract, &state).await;
     }
 
     // 4. Loop on future updates.
@@ -185,13 +269,15 @@ async fn run(
                 match next {
                     Ok(update) => {
                         if let Some(state) = update.state.as_ref() {
-                            apply_envelope(&registry, state).await;
+                            apply_envelope(&registry, &retract, state)
+                                .await;
                         } else {
                             // Cleared state: shares plugin retracted
                             // its envelope entirely. Remove every
                             // NAS-prefixed source so downstream
                             // consumers do not surface dead entries.
-                            drop_all_nas_sources(&registry).await;
+                            drop_all_nas_sources(&registry, &retract)
+                                .await;
                         }
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
@@ -205,7 +291,7 @@ async fn run(
                             .current_state(canonical_id.clone())
                             .await
                         {
-                            apply_envelope(&registry, &state).await;
+                            apply_envelope(&registry, &retract, &state).await;
                         }
                     }
                     Err(SubjectStateStreamError::Closed) => {
@@ -224,7 +310,11 @@ async fn run(
 /// Reconcile the registry against the shares envelope. Adds /
 /// updates a `SourceRecord` per share entry; removes entries
 /// whose `source_id` is no longer present.
-async fn apply_envelope(registry: &SourceRegistry, state: &serde_json::Value) {
+async fn apply_envelope(
+    registry: &SourceRegistry,
+    retract: &RetractHandles,
+    state: &serde_json::Value,
+) {
     let shares = match state.get("shares").and_then(|v| v.as_array()) {
         Some(a) => a,
         None => {
@@ -261,33 +351,22 @@ async fn apply_envelope(registry: &SourceRegistry, state: &serde_json::Value) {
         if desired_ids.contains(&existing.id) {
             continue;
         }
-        if let Err(e) = registry.remove(&existing.id).await {
-            tracing::debug!(
-                plugin = PLUGIN_NAME,
-                source_id = %existing.id,
-                error = %e,
-                "shares-sync: remove of retired NAS source failed"
-            );
-        }
+        retract_retired_source(retract, registry, &existing.id).await;
     }
 }
 
 /// Remove every source in the registry whose id carries the
 /// NAS prefix. Called on a cleared-envelope update.
-async fn drop_all_nas_sources(registry: &SourceRegistry) {
+async fn drop_all_nas_sources(
+    registry: &SourceRegistry,
+    retract: &RetractHandles,
+) {
     let snapshot = registry.snapshot().await;
     for record in snapshot {
         if !record.id.starts_with(SHARES_SOURCE_ID_PREFIX) {
             continue;
         }
-        if let Err(e) = registry.remove(&record.id).await {
-            tracing::debug!(
-                plugin = PLUGIN_NAME,
-                source_id = %record.id,
-                error = %e,
-                "shares-sync: remove on cleared envelope failed"
-            );
-        }
+        retract_retired_source(retract, registry, &record.id).await;
     }
 }
 
@@ -367,4 +446,260 @@ fn record_from_envelope_share(
         track_count_available: 0,
         last_scan_at_ms: None,
     })
+}
+
+// ----- tests -----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evo_plugin_sdk::contract::SubjectAnnouncer;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// Records every subject state update, so a test can read
+    /// what Browse would be following.
+    #[derive(Default)]
+    struct RecordingAnn {
+        updates: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingAnn {
+        fn states_on(&self, value: &str) -> Vec<serde_json::Value> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(v, _)| v == value)
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+    }
+
+    impl SubjectAnnouncer for RecordingAnn {
+        fn announce<'a>(
+            &'a self,
+            _a: evo_plugin_sdk::contract::SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.updates.lock().unwrap().push((addressing.value, state));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    const NAS_ID: &str = "nas-music";
+    const NAS_MOUNT: &str = "/var/lib/evo/music/NAS/Music";
+
+    fn nas_record() -> crate::source_registry::SourceRecord {
+        crate::source_registry::SourceRecord {
+            id: NAS_ID.to_string(),
+            display_name: "Music".to_string(),
+            kind: crate::source_registry::SourceKind::NetworkNasSmb {
+                server: "192.0.2.10".to_string(),
+                share: "Music".to_string(),
+                username: "guest".to_string(),
+            },
+            mount_path: PathBuf::from(NAS_MOUNT),
+            mpd_storage_name: None,
+            state: crate::source_registry::SourceState::Online,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: 60_000,
+            scan_policy: crate::source_registry::ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 2,
+            track_count_available: 2,
+            last_scan_at_ms: None,
+        }
+    }
+
+    /// A registry holding the NAS, an MPD holding two stored
+    /// lists that carry its tracks, and the handles the
+    /// retirement needs.
+    #[allow(clippy::type_complexity)]
+    async fn retire_harness() -> (
+        SourceRegistry,
+        RetractHandles,
+        Arc<RecordingAnn>,
+        Arc<std::sync::Mutex<BTreeMap<String, Vec<String>>>>,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let playlists = Arc::new(std::sync::Mutex::new(BTreeMap::from([
+            (
+                "Road mix".to_string(),
+                vec![
+                    "NAS/Music/gone-one.flac".to_string(),
+                    "INTERNAL/keep.flac".to_string(),
+                ],
+            ),
+            (
+                crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
+                vec![
+                    "NAS/Music/gone-two.flac".to_string(),
+                    "INTERNAL/loved.flac".to_string(),
+                ],
+            ),
+        ])));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+                playlists: Arc::clone(&playlists),
+                library: Vec::new(),
+                queue: Vec::new(),
+            }])
+            .await;
+
+        let registry = SourceRegistry::new();
+        registry.register(nas_record()).await.unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let library = crate::library::LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        );
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        (registry, retract, ann, playlists)
+    }
+
+    /// The share is gone from the shares plugin's envelope.
+    fn empty_envelope() -> serde_json::Value {
+        serde_json::json!({ "shares": [] })
+    }
+
+    #[tokio::test]
+    async fn a_retired_share_leaves_browse() {
+        // Browse follows audio_library_sources. Dropping the
+        // registry row without republishing leaves a NAS on the
+        // glass that the operator already removed.
+        let (registry, retract, ann, _playlists) = retire_harness().await;
+
+        apply_envelope(&registry, &retract, &empty_envelope()).await;
+
+        assert!(
+            registry.get(NAS_ID).await.is_none(),
+            "the registry row is gone",
+        );
+        let published = ann.states_on("sources");
+        let last = published
+            .last()
+            .expect("the library sources subject must be republished");
+        assert!(
+            !serde_json::to_string(last).unwrap().contains(NAS_ID),
+            "Browse must not still list the removed NAS: {last}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retired_share_leaves_the_stored_playlists_and_favourites() {
+        // The tracks are not open files and nothing prunes them
+        // on their own. A playlist that still lists a removed
+        // NAS plays nothing and says nothing.
+        let (registry, retract, _ann, playlists) = retire_harness().await;
+
+        apply_envelope(&registry, &retract, &empty_envelope()).await;
+
+        let held = playlists.lock().unwrap().clone();
+        assert_eq!(
+            held.get("Road mix"),
+            Some(&vec!["INTERNAL/keep.flac".to_string()]),
+            "the named list keeps only what is still there",
+        );
+        assert_eq!(
+            held.get(crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME),
+            Some(&vec!["INTERNAL/loved.flac".to_string()]),
+            "favourites is a stored list too and retracts with them",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_envelope_retracts_the_same_way() {
+        // The shares plugin retracting its envelope entirely is
+        // the same operator outcome as removing each share.
+        let (registry, retract, ann, playlists) = retire_harness().await;
+
+        drop_all_nas_sources(&registry, &retract).await;
+
+        assert!(registry.get(NAS_ID).await.is_none());
+        let published = ann.states_on("sources");
+        assert!(
+            !serde_json::to_string(published.last().expect("republished"))
+                .unwrap()
+                .contains(NAS_ID),
+            "Browse retracts on a cleared envelope too",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec!["INTERNAL/keep.flac".to_string()]),
+            "and so do the stored lists",
+        );
+    }
 }

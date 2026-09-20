@@ -2465,6 +2465,12 @@ impl Plugin for MpdPlaybackPlugin {
                             Arc::clone(sub),
                             Arc::clone(q),
                             shelves.registry.clone(),
+                            network_shares_sync::RetractHandles {
+                                library: shelves.library.clone(),
+                                queue: shelves.queue.clone(),
+                                endpoint: shelves.endpoint.clone(),
+                                timeouts: shelves.timeouts,
+                            },
                         ));
                     tracing::info!(
                         plugin = PLUGIN_NAME,
