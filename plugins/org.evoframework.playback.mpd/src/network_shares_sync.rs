@@ -735,6 +735,70 @@ mod tests {
         assert_eq!(crate::library::scrub_parent_of(""), None);
     }
 
+    #[test]
+    fn the_floor_drops_a_mount_point_whose_source_is_gone() {
+        // The operator invert, not a command string. Remove
+        // deletes the record; it cannot delete a mount-root
+        // directory a failed unmount left behind, and MPD lists
+        // what is on disk. Local library must still stop
+        // offering it.
+        let music = std::path::PathBuf::from("/var/lib/evo/music");
+        let live: Vec<crate::source_registry::SourceRecord> = Vec::new();
+
+        assert!(
+            !crate::library::floor_lists_directory("NAS/Test", &music, &live),
+            "a leftover empty NFS/Test mount-root is a FAIL, not a skip",
+        );
+        assert!(
+            !crate::library::floor_lists_directory("NAS", &music, &live),
+            "and an emptied NAS root leaves the floor with it",
+        );
+        assert!(
+            !crate::library::floor_lists_directory("USB/STICK", &music, &live),
+            "the same rule holds for a detached stick",
+        );
+        assert!(
+            crate::library::floor_lists_directory("INTERNAL", &music, &live),
+            "ordinary content is never a mount point and always lists",
+        );
+        assert!(
+            crate::library::floor_lists_directory(
+                "INTERNAL/Albums",
+                &music,
+                &live
+            ),
+            "nor is anything under it",
+        );
+    }
+
+    #[test]
+    fn the_floor_keeps_a_mount_point_its_source_still_owns() {
+        // The other half: a live share is still the library.
+        let music = std::path::PathBuf::from("/var/lib/evo/music");
+        let live = vec![nas_record()];
+
+        assert!(
+            crate::library::floor_lists_directory("NAS/Music", &music, &live),
+            "a live share lists",
+        );
+        assert!(
+            crate::library::floor_lists_directory("NAS", &music, &live),
+            "and so does the root that still holds it",
+        );
+        assert!(
+            crate::library::floor_lists_directory(
+                "NAS/Music/Album",
+                &music,
+                &live
+            ),
+            "and its own tree beneath it",
+        );
+        assert!(
+            !crate::library::floor_lists_directory("NAS/Test", &music, &live),
+            "while a sibling nobody owns still does not",
+        );
+    }
+
     #[tokio::test]
     async fn a_cleared_envelope_retracts_the_same_way() {
         // The shares plugin retracting its envelope entirely is

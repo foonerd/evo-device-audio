@@ -1383,6 +1383,59 @@ pub(crate) async fn handle_restore_parked_uris(
     })
 }
 
+/// Mount roots owned by other plugins: their children are
+/// source mount points, not library content.
+///
+/// `network.shares` mounts each share at `NAS/<alias>` and
+/// `storage.usb` each volume at `USB/<stable-id>`. A directory
+/// directly beneath one of these is a source or it is nothing.
+const SOURCE_MOUNT_ROOTS: &[&str] = &["NAS", "USB"];
+
+/// Whether the floor should list this database-relative
+/// directory.
+///
+/// A mount point whose source is gone is a leftover directory,
+/// not a library entry. Remove deletes the record and the rows,
+/// but it cannot delete a mount-root directory a failed unmount
+/// left on disk — and MPD lists what is on disk. So the floor
+/// asks the registry, not the filesystem: a child of `NAS/` or
+/// `USB/` is listed only while a source owns it, and the mount
+/// root itself only while it still holds one. Anything outside
+/// those roots is ordinary content and is always listed.
+///
+/// This is what keeps Local library from offering a NAS the
+/// operator removed — and, because nothing can be browsed into
+/// it, from letting a playlist be saved out of it afterwards.
+pub(crate) fn floor_lists_directory(
+    path: &str,
+    music_directory: &std::path::Path,
+    sources: &[SourceRecord],
+) -> bool {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let Some(root) = segments.next() else {
+        return true;
+    };
+    if !SOURCE_MOUNT_ROOTS.contains(&root) {
+        return true;
+    }
+    let owned = |p: &std::path::Path| sources.iter().any(|s| s.mount_path == p);
+    match segments.next() {
+        // The mount root itself: keep it while it still holds a
+        // source, so an emptied `NAS/` leaves the floor too.
+        None => {
+            let root_path = music_directory.join(root);
+            sources.iter().any(|s| s.mount_path.starts_with(&root_path))
+        }
+        // A mount point: listed only while its source is live.
+        Some(_) if path.split('/').filter(|s| !s.is_empty()).count() == 2 => {
+            owned(&music_directory.join(path))
+        }
+        // Deeper than a mount point — inside a live source's own
+        // tree, reachable only through it.
+        Some(_) => true,
+    }
+}
+
 /// The database-relative path whose re-walk prunes `path`.
 ///
 /// `None` means the database root. A path with no separator
@@ -1971,6 +2024,19 @@ pub(crate) async fn handle_browse_library(
         verb: "browse_library".to_string(),
         reason: e.to_string(),
     })?;
+    // Drop mount points whose source is gone before rendering.
+    // MPD lists what is on disk; the floor lists what the
+    // registry still owns.
+    let live = ctx.registry.snapshot().await;
+    let entries: Vec<MpdLibraryEntry> = entries
+        .into_iter()
+        .filter(|e| match e {
+            MpdLibraryEntry::Directory { path, .. } => {
+                floor_lists_directory(path, &ctx.music_directory, &live)
+            }
+            _ => true,
+        })
+        .collect();
     let render_ctx = RenderCtx {
         music_directory: &ctx.music_directory,
     };
