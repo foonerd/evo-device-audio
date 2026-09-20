@@ -48,7 +48,8 @@ use tokio::sync::Notify;
 
 use crate::source_registry::{
     default_probe_cadence_for, default_scan_policy_for, probe_source,
-    SourceKind, SourceRecord, SourceRegistry, SourceState, PROBE_BUDGET,
+    should_start_online_scan, SourceKind, SourceRecord, SourceRegistry,
+    SourceState, PROBE_BUDGET,
 };
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -395,6 +396,7 @@ async fn admit_attached_store(
             registry.upsert(kept).await;
             crate::library::publish_subjects(&retract.library).await;
         }
+        start_online_scan_if_due(retract, &incoming.id).await;
         return;
     }
     let id = incoming.id.clone();
@@ -421,6 +423,70 @@ async fn admit_attached_store(
     }
     let _ = registry.persist().await;
     crate::library::publish_subjects(&retract.library).await;
+    start_online_scan_if_due(retract, &id).await;
+}
+
+/// Kick `library.update_source` for an Online store that has
+/// never been scanned. Same verb as operator Rescan. Fire and
+/// warn: admission has already landed.
+async fn start_online_scan_if_due(retract: &RetractHandles, source_id: &str) {
+    let Some(record) = retract.library.registry.get(source_id).await else {
+        return;
+    };
+    if !should_start_online_scan(&record) {
+        return;
+    }
+    let mut conn = match crate::mpd::MpdConnection::connect_with_timeouts(
+        retract.endpoint.clone(),
+        retract.timeouts,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "shares-sync: no MPD connection to start the first \
+                 index; operator Rescan remains"
+            );
+            return;
+        }
+    };
+    let payload = crate::library::UpdateSourcePayload {
+        v: crate::library::LIBRARY_PAYLOAD_VERSION,
+        source_id: source_id.to_string(),
+        force_rescan: false,
+    };
+    if let Err(e) = crate::library::handle_update_source(
+        &retract.library,
+        &mut conn,
+        payload,
+    )
+    .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %source_id,
+            error = %e,
+            "shares-sync: first online scan did not start; \
+             operator Rescan remains"
+        );
+        return;
+    }
+    // Stamp last_scan so a later configured-shares tick does not
+    // start a second update while the first is still walking.
+    // Scan-progress overwrites this with the completion time.
+    let _ = retract
+        .library
+        .registry
+        .update_track_counts(
+            source_id,
+            record.track_count,
+            record.track_count_available,
+        )
+        .await;
 }
 
 /// Translate one share entry from the envelope into a
@@ -995,5 +1061,83 @@ mod tests {
             crate::source_registry::SourceState::Online.discriminant(),
         );
         assert_eq!(rec.track_count, 40, "a republish must not wipe the index");
+    }
+
+    #[tokio::test]
+    async fn admitting_a_reachable_share_starts_the_first_index() {
+        // Operator invert: Browse NFS Online, index 0 until a
+        // hand Rescan. Online + on_online must issue the same
+        // update PATH Rescan uses.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let music = tempfile::tempdir().unwrap();
+        let mount = music.path().join("NAS").join("NFS");
+        std::fs::create_dir_all(&mount).unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let playlists = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists,
+                library: Vec::new(),
+                queue: Vec::new(),
+            }])
+            .await;
+        let registry = SourceRegistry::new();
+        let ann = Arc::new(RecordingAnn::default());
+        let library = crate::library::LibraryContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        );
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(mount.display().to_string());
+        apply_envelope(&registry, &retract, &env).await;
+        let rec = registry
+            .get("nas-82befb0b-740a-4e65-bae2-5c29e81a6a58")
+            .await
+            .expect("admitted");
+        assert_eq!(
+            rec.state.discriminant(),
+            crate::source_registry::SourceState::Online.discriminant(),
+        );
+        let sent = commands.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|c| c.starts_with("update")),
+            "the first Online must start an index, got {sent:?}"
+        );
+        apply_envelope(&registry, &retract, &env).await;
+        let after = commands.lock().unwrap().clone();
+        let updates = after.iter().filter(|c| c.starts_with("update")).count();
+        assert_eq!(
+            updates,
+            sent.iter().filter(|c| c.starts_with("update")).count(),
+            "a republish of an already-kicked share must not \
+             start another update: {after:?}"
+        );
     }
 }

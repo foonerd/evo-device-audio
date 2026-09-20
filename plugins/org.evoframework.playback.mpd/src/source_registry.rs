@@ -713,6 +713,23 @@ pub(crate) fn default_probe_cadence_for(kind: &SourceKind) -> u32 {
     }
 }
 
+/// True when an Online attached store has never been scanned and
+/// its policy says to index on Online. USB, NFS, SMB, and every
+/// other EagerIncremental store share this door. A later envelope
+/// tick that already carries `last_scan_at_ms` must not start
+/// another update.
+pub(crate) fn should_start_online_scan(record: &SourceRecord) -> bool {
+    matches!(record.state, SourceState::Online)
+        && matches!(
+            record.scan_policy,
+            ScanPolicy::EagerIncremental {
+                on_online: true,
+                ..
+            }
+        )
+        && record.last_scan_at_ms.is_none()
+}
+
 // ----- reachability probe -----
 
 /// Result of one reachability probe. Probes are bounded by the
@@ -1157,6 +1174,35 @@ mod tests {
             base_url: String::new(),
         });
         assert!(matches!(p, ScanPolicy::BrowseOnly));
+    }
+
+    #[test]
+    fn an_online_nas_that_has_never_been_scanned_starts_an_update() {
+        let mut rec = local_record("nas-a", PathBuf::from("/mnt/NAS/a"));
+        rec.kind = SourceKind::NetworkNasNfs {
+            server: "192.0.2.1".into(),
+            export: "/export".into(),
+        };
+        rec.state = SourceState::Online;
+        rec.scan_policy = default_scan_policy_for(&rec.kind);
+        assert!(
+            should_start_online_scan(&rec),
+            "Online + on_online + no last_scan is the first index"
+        );
+        rec.last_scan_at_ms = Some(1);
+        assert!(
+            !should_start_online_scan(&rec),
+            "a later tick must not start another update"
+        );
+        rec.last_scan_at_ms = None;
+        rec.state = SourceState::Probing;
+        assert!(!should_start_online_scan(&rec), "Probing is not a scan");
+        rec.state = SourceState::Online;
+        rec.scan_policy = ScanPolicy::BrowseOnly;
+        assert!(
+            !should_start_online_scan(&rec),
+            "BrowseOnly never eager-scans"
+        );
     }
 
     #[test]
