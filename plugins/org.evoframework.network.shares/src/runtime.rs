@@ -2693,12 +2693,14 @@ struct SharesPublisher {
 ///
 /// Subjects: when a [`SubjectAnnouncer`] has been attached via
 /// [`Self::attach_subject_publisher`], the runtime republishes
-/// `system_network_shares_configured` on every CRUD transition,
-/// `system_network_shares_discovered` on every discovery
-/// refresh, and one `network_share_state` per share on every
-/// mount / unmount transition. Republish failures are
-/// fire-and-forget (logged at debug); the next transition's
-/// envelope carries ground truth.
+/// `system_network_shares_configured` on every CRUD transition
+/// and on every Mounted / Unmounted transition (the library
+/// re-probes that tick so Browse goes Online and the first
+/// index starts without a hand Wake), `system_network_shares_discovered`
+/// on every discovery refresh, and one `network_share_state`
+/// per share on every mount / unmount transition. Republish
+/// failures are fire-and-forget (logged at debug); the next
+/// transition's envelope carries ground truth.
 pub struct NetworkSharesRuntime {
     inner: Arc<Mutex<NetworkSharesInner>>,
     executor: Arc<dyn MountExecutor>,
@@ -5678,6 +5680,14 @@ impl NetworkSharesRuntime {
         };
         if let Some(envelope) = envelope_opt {
             self.schedule_republish_share_state(envelope);
+        }
+        // The library only watches configured. Share-state
+        // Mounted without this tick leaves Browse on Wake: Add
+        // already admitted the row Offline, and a later tick
+        // that never arrives cannot re-probe.
+        if matches!(state, MountState::Mounted | MountState::Unmounted) {
+            let configured = self.compose_configured_envelope().await;
+            self.schedule_republish_configured(configured);
         }
     }
 
@@ -10419,6 +10429,14 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert!(mounting_at.is_some());
         assert!(mounted_at.is_some());
         assert!(mounted_at.unwrap() >= mounting_at.unwrap());
+        assert!(
+            announcer.calls().iter().any(|c| matches!(
+                c,
+                AnnouncerCall::UpdateState { addressing }
+                    if addressing == &configured_singleton_addressing()
+            )),
+            "Mounted must retick configured so the library re-probes"
+        );
     }
 
     #[tokio::test]
@@ -10492,6 +10510,14 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(
             latest.get("state").and_then(|v| v.as_str()),
             Some("unmounted")
+        );
+        assert!(
+            announcer.calls().iter().any(|c| matches!(
+                c,
+                AnnouncerCall::UpdateState { addressing }
+                    if addressing == &configured_singleton_addressing()
+            )),
+            "Unmounted must retick configured so the library goes Offline"
         );
     }
 

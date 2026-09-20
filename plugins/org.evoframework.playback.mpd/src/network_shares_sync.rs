@@ -23,11 +23,14 @@
 //! every state update the subscriber walks the `shares` array
 //! and admits one `SourceRecord` per entry through the same
 //! source life `library.add_source` uses: register once, probe
-//! now, keep the observed state and counts on later ticks.
-//! Entries no longer present in a fully-parsed envelope are
-//! retracted through the same Remove door as USB (queue,
-//! playlists, favourites, scrub). A cleared subject tick or a
-//! share we cannot parse is not Remove.
+//! now, re-probe on later ticks. Add publishes the row before
+//! the OS mount lands; the Mounted / Unmounted tick is what
+//! walks Offline → Online and starts the first index. A later
+//! tick that is still Online keeps the counts and does not
+//! start another update. Entries no longer present in a
+//! fully-parsed envelope are retracted through the same Remove
+//! door as USB (queue, playlists, favourites, scrub). A cleared
+//! subject tick or a share we cannot parse is not Remove.
 //!
 //! One-way: MPD is a consumer of the shares subject, no reverse
 //! coupling. The shares plugin does not know MPD subscribes.
@@ -51,8 +54,8 @@ use tokio::sync::Notify;
 
 use crate::source_registry::{
     default_probe_cadence_for, default_scan_policy_for, probe_source,
-    should_start_online_scan, SourceKind, SourceRecord, SourceRegistry,
-    SourceState, PROBE_BUDGET,
+    should_start_online_scan, ScanPolicy, SourceKind, SourceRecord,
+    SourceRegistry, SourceState, PROBE_BUDGET,
 };
 
 const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
@@ -417,29 +420,56 @@ async fn apply_envelope(
 }
 
 /// USB, NFS, SMB, and every other attached store use this
-/// life: register once, probe now, keep the observed row.
+/// life: register once, probe now, re-probe on later ticks.
 ///
 /// A raw upsert of a Probing stub with cadence 0 is the field
 /// lie: Browse stuck on probing, index 0 until a hand Rescan,
-/// a later envelope tick wiping Online and the counts.
+/// a later envelope tick wiping Online and the counts. A tick
+/// that ignores a Mounted share after Add left it Offline is
+/// the same lie: Browse stays on Wake until a hand wake.
 async fn admit_attached_store(
     registry: &SourceRegistry,
     retract: &RetractHandles,
     incoming: SourceRecord,
 ) {
     if let Some(existing) = registry.get(&incoming.id).await {
-        if existing.display_name != incoming.display_name
+        let prior_state = existing.state.clone();
+        let identity_changed = existing.display_name != incoming.display_name
             || existing.mount_path != incoming.mount_path
-            || existing.kind != incoming.kind
-        {
+            || existing.kind != incoming.kind;
+        if identity_changed {
             let mut kept = existing;
             kept.display_name = incoming.display_name;
             kept.mount_path = incoming.mount_path;
             kept.kind = incoming.kind;
             registry.upsert(kept).await;
+        }
+        let Some(current) = registry.get(&incoming.id).await else {
+            return;
+        };
+        let outcome = probe_source(&current, PROBE_BUDGET).await;
+        let state_changed = outcome.new_state != current.state;
+        if state_changed {
+            if let Err(e) = registry
+                .transition(&incoming.id, outcome.new_state.clone())
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source_id = %incoming.id,
+                    error = %e,
+                    "shares-sync: remount probe transition failed; \
+                     source keeps the prior state until the next tick"
+                );
+            }
+        }
+        if identity_changed || state_changed {
+            let _ = registry.persist().await;
             crate::library::publish_subjects(&retract.library).await;
         }
-        start_online_scan_if_due(retract, &incoming.id).await;
+        let became_online = !matches!(prior_state, SourceState::Online)
+            && matches!(outcome.new_state, SourceState::Online);
+        start_online_scan_if_due(retract, &incoming.id, became_online).await;
         return;
     }
     let id = incoming.id.clone();
@@ -452,8 +482,10 @@ async fn admit_attached_store(
         );
         return;
     }
+    let mut became_online = false;
     if let Some(registered) = registry.get(&id).await {
         let outcome = probe_source(&registered, PROBE_BUDGET).await;
+        became_online = matches!(outcome.new_state, SourceState::Online);
         if let Err(e) = registry.transition(&id, outcome.new_state).await {
             tracing::warn!(
                 plugin = PLUGIN_NAME,
@@ -462,21 +494,39 @@ async fn admit_attached_store(
                 "shares-sync: admit probe transition failed; \
                  source stays Probing until the next probe"
             );
+            became_online = false;
         }
     }
     let _ = registry.persist().await;
     crate::library::publish_subjects(&retract.library).await;
-    start_online_scan_if_due(retract, &id).await;
+    start_online_scan_if_due(retract, &id, became_online).await;
 }
 
-/// Kick `library.update_source` for an Online store that has
-/// never been scanned. Same verb as operator Rescan. Fire and
-/// warn: admission has already landed.
-async fn start_online_scan_if_due(retract: &RetractHandles, source_id: &str) {
+/// Kick `library.update_source` when an attached store becomes
+/// Online (`on_online`) or when it is Online and has never been
+/// scanned. Same verb as operator Rescan. Fire and warn:
+/// admission has already landed.
+async fn start_online_scan_if_due(
+    retract: &RetractHandles,
+    source_id: &str,
+    became_online: bool,
+) {
     let Some(record) = retract.library.registry.get(source_id).await else {
         return;
     };
-    if !should_start_online_scan(&record) {
+    let due = if became_online {
+        matches!(record.state, SourceState::Online)
+            && matches!(
+                record.scan_policy,
+                ScanPolicy::EagerIncremental {
+                    on_online: true,
+                    ..
+                }
+            )
+    } else {
+        should_start_online_scan(&record)
+    };
+    if !due {
         return;
     }
     let mut conn = match crate::mpd::MpdConnection::connect_with_timeouts(
@@ -1221,6 +1271,94 @@ mod tests {
             sent.iter().filter(|c| c.starts_with("update")).count(),
             "a republish of an already-kicked share must not \
              start another update: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_tick_after_the_mount_lands_goes_online_and_indexes() {
+        // Operator invert: Add publishes configured before the
+        // OS mount exists. First tick is Offline / Wake. The
+        // Mounted tick must re-probe, go Online, and start the
+        // same update a hand Wake + Rescan would.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let music = tempfile::tempdir().unwrap();
+        let mount = music.path().join("NAS").join("NFS");
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let playlists = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists,
+                library: Vec::new(),
+                queue: Vec::new(),
+            }])
+            .await;
+        let registry = SourceRegistry::new();
+        let ann = Arc::new(RecordingAnn::default());
+        let library = crate::library::LibraryContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            None,
+        );
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let queue = crate::queue::QueueContext::new(
+            music.path().to_path_buf(),
+            registry.clone(),
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        let retract = RetractHandles {
+            library,
+            queue,
+            endpoint,
+            timeouts: short_timeouts(),
+        };
+        let mut env = wire_share_envelope();
+        env["shares"][0]["mount_root"] =
+            serde_json::Value::String(mount.display().to_string());
+        apply_envelope(&registry, &retract, &env).await;
+        let id = "nas-82befb0b-740a-4e65-bae2-5c29e81a6a58";
+        let before = registry.get(id).await.expect("admitted");
+        assert_eq!(
+            before.state.discriminant(),
+            crate::source_registry::SourceState::Offline {
+                reason: String::new(),
+                since_ms: 0
+            }
+            .discriminant(),
+            "Add before the mount lands is Offline, not a fake Online"
+        );
+        assert!(
+            !commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("update")),
+            "Offline must not start an index"
+        );
+        std::fs::create_dir_all(&mount).unwrap();
+        apply_envelope(&registry, &retract, &env).await;
+        let after = registry.get(id).await.expect("still there");
+        assert_eq!(
+            after.state.discriminant(),
+            crate::source_registry::SourceState::Online.discriminant(),
+            "the Mounted tick must go Online without a hand Wake"
+        );
+        let sent = commands.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|c| c.starts_with("update")),
+            "the first Online after mount must start an index, got {sent:?}"
         );
     }
 }
