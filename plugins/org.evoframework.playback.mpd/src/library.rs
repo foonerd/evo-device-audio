@@ -1120,6 +1120,11 @@ pub(crate) async fn handle_remove_source(
     let usb_handover = !payload.consumer_stop
         && !payload.scrub_mpd_entries
         && matches!(record.kind, SourceKind::LocalUsb { .. });
+    let nas_remove = !payload.consumer_stop
+        && matches!(
+            record.kind,
+            SourceKind::NetworkNasSmb { .. } | SourceKind::NetworkNasNfs { .. }
+        );
     if usb_handover {
         // MPD holds every queued track under the stick's tree as
         // an open file, and an open file is what turns the clean
@@ -1134,6 +1139,14 @@ pub(crate) async fn handle_remove_source(
         // rename does not empty the list. Remove is not rename.
         release_stored_playlists_for_source(ctx, conn, &record).await;
         remove_usb_via_safe_remove(ctx, &payload.source_id, &record).await?;
+    } else if nas_remove {
+        // SMB and NFS Remove is the USB consumer door without
+        // a volume handover: queue, stored playlists, and
+        // favourites leave with the share. A later envelope
+        // tick must not have been the thing that dropped them
+        // in silence.
+        release_queue_for_source(queue, ctx, conn, &record).await;
+        release_stored_playlists_for_source(ctx, conn, &record).await;
     } else if payload.scrub_mpd_entries && !payload.consumer_stop {
         // Sources-page Remove already detached, then lands here
         // with scrub set. The queue was released on the first
@@ -1152,7 +1165,7 @@ pub(crate) async fn handle_remove_source(
     // silently did nothing and the stick's tracks stayed in the
     // database — Local library > USB > Audio still listing a
     // volume that had been detached.
-    let scrub = payload.scrub_mpd_entries || usb_handover;
+    let scrub = payload.scrub_mpd_entries || usb_handover || nas_remove;
     if scrub {
         match mpd_database_relative_path(
             &ctx.music_directory,
@@ -4789,6 +4802,60 @@ mod tests {
 
         assert!(d.seen().is_empty(), "only a USB source hands over");
         assert!(ctx.registry.get("nas-music").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_a_nas_source_releases_the_queue_like_usb() {
+        // Owner 2026-09-20: SMB Remove is USB Remove. Queue,
+        // playlists, favourites. A Connected share that leaves
+        // must take its tracks out of the queue, not leave a
+        // 400 browse of a URI that is gone.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "NAS/Music/a.flac".to_string()),
+                (12, "INTERNAL/keep.flac".to_string()),
+                (13, "NAS/Music/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        let mut nas = usb_record("nas-music", "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/Music");
+        ctx.registry.register(nas).await.unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["INTERNAL/keep.flac".to_string()],
+            "NAS tracks leave the queue; INTERNAL stays",
+        );
+        assert!(
+            ctx.registry.get("nas-music").await.is_none(),
+            "the library row is gone",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("deleteid")),
+            "the queue door ran: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("DISPATCH")),
+            "NAS does not hand a volume to USB: {seen:?}",
+        );
     }
 
     /// A dispatcher that writes into the same log the mock MPD

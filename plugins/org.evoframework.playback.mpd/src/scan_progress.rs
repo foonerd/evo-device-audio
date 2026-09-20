@@ -190,6 +190,33 @@ async fn publish(subjects: &Arc<dyn SubjectAnnouncer>, env: serde_json::Value) {
     }
 }
 
+/// Heartbeat while a share is retracted. Same subject the index
+/// walk uses, so the glass has one bus for "something is acting
+/// on this store". Phase `retracting` is not a scan.
+pub(crate) async fn publish_retracting(
+    subjects: &Arc<dyn SubjectAnnouncer>,
+    source_id: &str,
+) {
+    let env = json!({
+        "v": SCAN_PROGRESS_PAYLOAD_VERSION,
+        "scans": [{
+            "source_id": source_id,
+            "kind": "remove",
+            "started_at_ms": now_ms(),
+            "scanned_tracks": 0,
+            "estimated_total": serde_json::Value::Null,
+            "current_relative_path": serde_json::Value::Null,
+            "phase": "retracting",
+        }],
+    });
+    publish(subjects, env).await;
+}
+
+/// Resting scan-progress envelope after a retract finishes.
+pub(crate) async fn publish_retract_idle(subjects: &Arc<dyn SubjectAnnouncer>) {
+    publish(subjects, idle_envelope()).await;
+}
+
 /// Spawn a scan-progress watcher for the current scan. Best-
 /// effort: a watcher already in flight (singleton gate held)
 /// is a no-op, since MPD's scan is global and one watcher
@@ -841,6 +868,28 @@ mod tests {
         assert!(
             src.contains("songs_under_base"),
             "an empty base must not become the database total"
+        );
+    }
+
+    #[test]
+    fn a_retract_heartbeat_is_phase_retracting_not_a_scan() {
+        // Behind-the-scenes retract without a heartbeat is the
+        // field lie. The glass already follows this subject for
+        // index; Remove of SMB/NFS must ride the same bus.
+        let env = json!({
+            "v": SCAN_PROGRESS_PAYLOAD_VERSION,
+            "scans": [{
+                "source_id": "nas-smb",
+                "kind": "remove",
+                "phase": "retracting",
+            }],
+        });
+        assert_eq!(env["scans"][0]["phase"], "retracting");
+        assert_eq!(env["scans"][0]["kind"], "remove");
+        let src = include_str!("scan_progress.rs");
+        assert!(
+            src.contains("phase\": \"retracting\""),
+            "publish_retracting must emit the retracting phase",
         );
     }
 

@@ -24,7 +24,10 @@
 //! and admits one `SourceRecord` per entry through the same
 //! source life `library.add_source` uses: register once, probe
 //! now, keep the observed state and counts on later ticks.
-//! Entries no longer present in the envelope are retracted.
+//! Entries no longer present in a fully-parsed envelope are
+//! retracted through the same Remove door as USB (queue,
+//! playlists, favourites, scrub). A cleared subject tick or a
+//! share we cannot parse is not Remove.
 //!
 //! One-way: MPD is a consumer of the shares subject, no reverse
 //! coupling. The shares plugin does not know MPD subscribes.
@@ -143,6 +146,11 @@ async fn retract_retired_source(
     registry: &SourceRegistry,
     source_id: &str,
 ) {
+    crate::scan_progress::publish_retracting(
+        &retract.library.subjects,
+        source_id,
+    )
+    .await;
     let mut conn = match crate::mpd::MpdConnection::connect_with_timeouts(
         retract.endpoint.clone(),
         retract.timeouts,
@@ -159,6 +167,10 @@ async fn retract_retired_source(
                  share; dropping the registry row alone"
             );
             let _ = registry.remove(source_id).await;
+            crate::scan_progress::publish_retract_idle(
+                &retract.library.subjects,
+            )
+            .await;
             return;
         }
     };
@@ -185,6 +197,7 @@ async fn retract_retired_source(
         );
         let _ = registry.remove(source_id).await;
     }
+    crate::scan_progress::publish_retract_idle(&retract.library.subjects).await;
 }
 
 async fn run(
@@ -271,17 +284,14 @@ async fn run(
             next = stream.recv() => {
                 match next {
                     Ok(update) => {
-                        if let Some(state) = update.state.as_ref() {
-                            apply_envelope(&registry, &retract, state)
-                                .await;
-                        } else {
-                            // Cleared state: shares plugin retracted
-                            // its envelope entirely. Remove every
-                            // NAS-prefixed source so downstream
-                            // consumers do not surface dead entries.
-                            drop_all_nas_sources(&registry, &retract)
-                                .await;
-                        }
+                        apply_subject_state(
+                            &subscriber,
+                            &canonical_id,
+                            &registry,
+                            &retract,
+                            update.state.as_ref(),
+                        )
+                        .await;
                     }
                     Err(SubjectStateStreamError::Lagged { dropped }) => {
                         tracing::warn!(
@@ -310,6 +320,39 @@ async fn run(
     }
 }
 
+/// A subject tick with `state: None` is silence, not Remove.
+///
+/// The shares plugin clears the configured subject when the
+/// steward repeats a null, when a subscriber races the first
+/// announce, and when a happening carries no payload. Treating
+/// that as "every NAS is gone" is the field vanish: Sources
+/// still Connected, Library empty after a refresh, no heartbeat.
+/// Operator Remove is `shares: []` or a share id leaving a
+/// fully-parsed envelope. Those take [`retract_retired_source`].
+async fn apply_subject_state(
+    subscriber: &Arc<dyn SubjectStateSubscriber>,
+    canonical_id: &str,
+    registry: &SourceRegistry,
+    retract: &RetractHandles,
+    state: Option<&serde_json::Value>,
+) {
+    match state {
+        Some(payload) => apply_envelope(registry, retract, payload).await,
+        None => {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "shares-sync: cleared subject tick; Connected NAS \
+                 stays; resyncing from current_state"
+            );
+            if let Ok(Some(current)) =
+                subscriber.current_state(canonical_id.to_string()).await
+            {
+                apply_envelope(registry, retract, &current).await;
+            }
+        }
+    }
+}
+
 /// Reconcile the registry against the shares envelope. Adds /
 /// updates a `SourceRecord` per share entry; removes entries
 /// whose `source_id` is no longer present.
@@ -330,22 +373,37 @@ async fn apply_envelope(
     };
 
     // 1. Compose desired source records (one per share in the
-    //    envelope). Skip malformed entries with a debug log; the
-    //    envelope is well-formed on the happy path but a mid-
-    //    schema-migration envelope should not brick the sync.
+    //    envelope). A share we cannot parse is not a Remove of
+    //    its neighbours: skipping it and then retracting every
+    //    id not in `desired_ids` is the NFS vanish (live
+    //    Connected row dropped because the tick was incomplete).
     let mut desired_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut skipped = 0usize;
     for share in shares {
         let Some(record) = record_from_envelope_share(share) else {
+            skipped = skipped.saturating_add(1);
             continue;
         };
         desired_ids.insert(record.id.clone());
         admit_attached_store(registry, retract, record).await;
     }
+    if skipped > 0 {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            skipped,
+            admitted = desired_ids.len(),
+            "shares-sync: envelope was not fully parsed; \
+             Connected NAS stays until a complete tick"
+        );
+        return;
+    }
 
     // 2. Remove NAS-prefixed sources no longer present in the
     //    envelope (share was removed via the shares plugin's
-    //    remove_share verb; the envelope shrank).
+    //    remove_share verb; the envelope shrank). Empty
+    //    `shares: []` after a full parse is operator Remove of
+    //    the last share — same door as USB.
     let snapshot = registry.snapshot().await;
     for existing in snapshot {
         if !existing.id.starts_with(SHARES_SOURCE_ID_PREFIX) {
@@ -355,21 +413,6 @@ async fn apply_envelope(
             continue;
         }
         retract_retired_source(retract, registry, &existing.id).await;
-    }
-}
-
-/// Remove every source in the registry whose id carries the
-/// NAS prefix. Called on a cleared-envelope update.
-async fn drop_all_nas_sources(
-    registry: &SourceRegistry,
-    retract: &RetractHandles,
-) {
-    let snapshot = registry.snapshot().await;
-    for record in snapshot {
-        if !record.id.starts_with(SHARES_SOURCE_ID_PREFIX) {
-            continue;
-        }
-        retract_retired_source(retract, registry, &record.id).await;
     }
 }
 
@@ -916,25 +959,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cleared_envelope_retracts_the_same_way() {
-        // The shares plugin retracting its envelope entirely is
-        // the same operator outcome as removing each share.
-        let (registry, retract, ann, playlists, _cmds) = retire_harness().await;
+    async fn a_cleared_subject_tick_keeps_a_connected_share() {
+        // Field invert: Library SMB gone after a refresh while
+        // Sources still Connected. A null subject tick is
+        // silence, not operator Remove.
+        let (registry, retract, _ann, playlists, _cmds) =
+            retire_harness().await;
 
-        drop_all_nas_sources(&registry, &retract).await;
+        apply_envelope(&registry, &retract, &serde_json::json!({})).await;
 
-        assert!(registry.get(NAS_ID).await.is_none());
-        let published = ann.states_on("sources");
         assert!(
-            !serde_json::to_string(published.last().expect("republished"))
-                .unwrap()
-                .contains(NAS_ID),
-            "Browse retracts on a cleared envelope too",
+            registry.get(NAS_ID).await.is_some(),
+            "a tick with no shares array must not retract a Connected share",
         );
         assert_eq!(
             playlists.lock().unwrap().get("Road mix"),
-            Some(&vec!["INTERNAL/keep.flac".to_string()]),
-            "and so do the stored lists",
+            Some(&vec![
+                "NAS/Music/gone-one.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ]),
+            "queue and lists stay; this was not a Remove",
+        );
+        let src = include_str!("network_shares_sync.rs");
+        let silent_door = format!("fn drop_{}_{}", "all", "nas_sources");
+        assert!(
+            !src.contains(&silent_door),
+            "a cleared tick must not have a door that retracts every NAS",
+        );
+        assert!(
+            src.contains("Connected NAS stays"),
+            "the None-tick branch must keep the row",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_share_does_not_retract_a_connected_neighbour() {
+        // The NFS vanish: one unreadable entry emptied desired_ids
+        // and retract_retired_source walked the live Connected row.
+        let (registry, retract, _ann, playlists, _cmds) =
+            retire_harness().await;
+
+        apply_envelope(
+            &registry,
+            &retract,
+            &serde_json::json!({ "shares": [{ "alias": "broken" }] }),
+        )
+        .await;
+
+        assert!(
+            registry.get(NAS_ID).await.is_some(),
+            "a share we cannot parse is not a Remove of the neighbours",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec![
+                "NAS/Music/gone-one.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ]),
         );
     }
 
