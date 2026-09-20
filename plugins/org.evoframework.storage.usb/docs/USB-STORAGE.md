@@ -377,7 +377,7 @@ Wrapper actions:
 |---|---|
 | `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares). For `ntfs`, `--type=ntfs-3g` so §2 options reach the FUSE helper, not kernel `ntfs3`. Success is checked in PID 1's mount table. |
 | `umount <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>` |
-| `umount-force <stable-id>` | `systemd-umount -l /var/lib/evo/music/USB/<stable-id>` (only via `safe_remove force: true`) |
+| `umount-force <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>`, and if the target is held, `nsenter --mount=/proc/1/ns/mnt -- umount -l /var/lib/evo/music/USB/<stable-id>` — a lazy detach inside PID 1's mount namespace, where the volume is attached (only via `safe_remove force: true`) |
 | `fsck <stable-id> <fs-type> <device-node>` | dispatches per §2 repair-tool matrix |
 | `eject <parent-disk>` | `eject <parent-disk>` (best-effort; failure logged, not fatal) |
 
@@ -537,8 +537,9 @@ Consumer-stop-before-mutation is normative — mirrors the
 3. `sync` on the drive's parent disk.
 4. Wrapper `umount <stable-id>` (clean umount). Any non-zero —
    EBUSY, `Device or resource busy`, systemd `Job failed` —
-   escalates to `umount-force` (lazy detach `-l`). Holders do
-   not veto. The `force` field is accepted on the wire and is
+   escalates to `umount-force`, which retries cleanly once and
+   then lazily detaches the mount in PID 1's namespace. Holders
+   do not veto. The `force` field is accepted on the wire and is
    not a gate. A yank of a vanished `mounted-*` row takes the
    same detach, then the scrub below.
 5. After the volume is detached: `library.remove_source` with

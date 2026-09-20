@@ -1638,7 +1638,12 @@ verify_storage_usb_provisioning() {
     # Binary union — every tool the plugin's wrapper actions
     # will exec (per USB-STORAGE.md §2 matrix + §9 safe-remove).
     local missing_bins=()
-    for bin in mount umount blockdev fsck.vfat fsck.exfat ntfsfix e2fsck eject lsblk findmnt; do
+    # nsenter: the force-eject path's lazy detach runs inside
+    # PID 1's mount namespace. Same util-linux package as
+    # umount and findmnt, so a host missing it is a broken
+    # base image rather than an optional extra — but the
+    # wrapper execs it, so the union names it.
+    for bin in mount umount nsenter blockdev fsck.vfat fsck.exfat ntfsfix e2fsck eject lsblk findmnt; do
         if ! command -v "${bin}" >/dev/null 2>&1; then
             missing_bins+=("${bin}")
         fi

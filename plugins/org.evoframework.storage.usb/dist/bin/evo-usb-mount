@@ -277,10 +277,18 @@ case "${1:-}" in
             exit 0
         fi
         # umount exit code semantics vary across versions. Detect
-        # EBUSY by the "target is busy" stderr fragment which is
-        # stable in util-linux 2.30+ across the fleet.
-        if [[ "${umount_stderr}" == *"target is busy"* ]] \
-           || [[ "${umount_stderr}" == *"device is busy"* ]]; then
+        # EBUSY by the stderr wording instead. util-linux says
+        # "target is busy" (stable since 2.30 across the fleet);
+        # systemd renders the same EBUSY as "Device or resource
+        # busy", and only util-linux's wording was matched here —
+        # so a real EBUSY from systemd-umount left as exit 3 and
+        # the exit-4 contract in this file's header never fired
+        # on the path that produces it. Folded to lower case so
+        # the capitalised systemd wording matches too.
+        umount_stderr_lc="${umount_stderr,,}"
+        if [[ "${umount_stderr_lc}" == *"target is busy"* ]] \
+           || [[ "${umount_stderr_lc}" == *"device is busy"* ]] \
+           || [[ "${umount_stderr_lc}" == *"device or resource busy"* ]]; then
             die_busy "${target}: ${umount_stderr}"
         fi
         die_subprocess "systemd-umount ${target}: ${umount_stderr}"
@@ -297,12 +305,38 @@ case "${1:-}" in
             rmdir "${target}" 2>/dev/null || true
             exit 0
         fi
-        # Lazy detach via systemd-umount -l — same as
-        # network.shares. The mount table clears when the last
-        # file handle closes. Operator has acknowledged the
-        # data-loss risk at the storage.usb.safe_remove verb.
-        /usr/bin/systemd-umount -l "${target}" \
-            || die_subprocess "systemd-umount -l ${target}"
+        # Force means force. Ask systemd for a clean unmount
+        # first so it retires its own transient unit when it
+        # can; escalate to a real lazy detach when the target is
+        # held.
+        #
+        # `systemd-umount -l` was that escalation until now and
+        # never was one: to systemd-umount, `-l` is the short
+        # form of `--full`, "do not ellipsize output"
+        # (systemd-mount --help), and the unmount stayed exactly
+        # as synchronous as the clean attempt. Force eject
+        # therefore failed on the one thing it exists for — a
+        # busy volume — and the operator was told the subprocess
+        # failed.
+        #
+        # The lazy detach has to happen in PID 1's mount
+        # namespace: `systemd-mount --collect` attached the
+        # volume there, and a `umount -l` from the steward's
+        # private namespace (ProtectSystem=strict) would only
+        # drop this view of it. nsenter is util-linux, already
+        # required here alongside findmnt and umount.
+        #
+        # Operator has acknowledged the data-loss risk at the
+        # storage.usb.safe_remove verb.
+        if /usr/bin/systemd-umount "${target}" >/dev/null 2>&1; then
+            rmdir "${target}" 2>/dev/null || true
+            exit 0
+        fi
+        lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
+            umount -l "${target}" 2>&1)" && rc=0 || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            die_subprocess "lazy detach of ${target} in the host namespace: ${lazy_stderr}"
+        fi
         rmdir "${target}" 2>/dev/null || true
         exit 0
         ;;
