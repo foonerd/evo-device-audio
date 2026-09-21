@@ -183,27 +183,40 @@ refuse_system_backed_device() {
     fi
 }
 
+# Run a command as a child of PID 1 so it sees the host mount
+# table. nsenter cannot: evo.service has RestrictNamespaces=yes,
+# and a sudo child inherits that filter (setns → EPERM). The
+# mount path already uses this bus (systemd-mount --collect).
+# Never `-l` on systemd-umount (`-l` is `--full` there).
+host_run() {
+    /usr/bin/systemd-run --quiet --wait --collect --pipe \
+        --working-directory=/ -- "$@"
+}
+
 # Lazy detach in PID 1's mount namespace. NTFS/exFAT arrive as
 # fuseblk: `umount -l` still says "target is busy" while MPD is
 # indexing. fusermount -uz is the FUSE lazy detach. util-linux
-# `umount -l` stays the fallback. Never `-l` on systemd-umount.
+# `umount -l` stays the fallback for non-FUSE.
 lazy_detach_host() {
     local target="$1"
-    local fstype lazy_stderr rc=1
-    fstype="$(findmnt --task 1 --mountpoint "${target}" -o FSTYPE -n 2>/dev/null || true)"
+    local lazy_stderr rc=1
     local fuse_bin=""
-    if [[ "${fstype}" == fuseblk || "${fstype}" == fuse || "${fstype}" == fuse.* ]]; then
-        fuse_bin="$(command -v fusermount3 || command -v fusermount || true)"
+    if [[ -x /usr/bin/fusermount3 ]]; then
+        fuse_bin=/usr/bin/fusermount3
+    elif [[ -x /bin/fusermount3 ]]; then
+        fuse_bin=/bin/fusermount3
+    elif [[ -x /usr/bin/fusermount ]]; then
+        fuse_bin=/usr/bin/fusermount
+    elif [[ -x /bin/fusermount ]]; then
+        fuse_bin=/bin/fusermount
     fi
     if [[ -n "${fuse_bin}" ]]; then
-        lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
-            "${fuse_bin}" -uz "${target}" 2>&1)" && rc=0 || rc=$?
+        lazy_stderr="$(host_run "${fuse_bin}" -uz "${target}" 2>&1)" && rc=0 || rc=$?
         if [[ $rc -eq 0 ]]; then
             return 0
         fi
     fi
-    lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
-        umount -l "${target}" 2>&1)" && rc=0 || rc=$?
+    lazy_stderr="$(host_run /bin/umount -i -l "${target}" 2>&1)" && rc=0 || rc=$?
     if [[ $rc -ne 0 ]]; then
         die_subprocess "lazy detach of ${target} in the host namespace: ${lazy_stderr}"
     fi
@@ -213,7 +226,7 @@ case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 6"
+        echo "evo-usb-mount 7"
         exit 0
         ;;
     --help|-h|"")
@@ -334,23 +347,8 @@ case "${1:-}" in
         # Force means force. Ask systemd for a clean unmount
         # first so it retires its own transient unit when it
         # can; escalate to a real lazy detach when the target is
-        # held.
-        #
-        # `systemd-umount -l` was that escalation until now and
-        # never was one: to systemd-umount, `-l` is the short
-        # form of `--full`, "do not ellipsize output"
-        # (systemd-mount --help), and the unmount stayed exactly
-        # as synchronous as the clean attempt. Force eject
-        # therefore failed on the one thing it exists for — a
-        # busy volume — and the operator was told the subprocess
-        # failed.
-        #
-        # The lazy detach has to happen in PID 1's mount
-        # namespace: `systemd-mount --collect` attached the
-        # volume there, and a `umount -l` from the steward's
-        # private namespace (ProtectSystem=strict) would only
-        # drop this view of it. nsenter is util-linux, already
-        # required here alongside findmnt and umount.
+        # held. The lazy detach is host_run (PID 1), not
+        # nsenter: RestrictNamespaces=yes makes setns EPERM.
         #
         # Operator has acknowledged the data-loss risk at the
         # storage.usb.safe_remove verb.

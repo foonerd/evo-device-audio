@@ -29,22 +29,23 @@ assert_ok() {
 }
 
 assert_ok "wrapper is present" "[[ -f \"\$WRAPPER\" ]]"
-assert_ok "version is 6" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 6\" ]]"
+assert_ok "version is 7" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 7\" ]]"
 assert_ok "mount uses systemd-mount --collect" \
     "grep -qE -- 'systemd-mount --collect --fsck=no' \"\$WRAPPER\""
 assert_ok "umount uses systemd-umount" \
     "grep -qE -- '/usr/bin/systemd-umount' \"\$WRAPPER\""
 # Force eject must actually force. `-l` is a lazy detach to
 # util-linux's umount and `--full` to systemd-umount, so the
-# escalation has to reach `umount -l` — and it has to reach it
-# inside PID 1's namespace, where systemd-mount --collect put
-# the volume.
+# escalation has to reach `umount -l` / `fusermount -uz` as a
+# child of PID 1. nsenter cannot: RestrictNamespaces=yes.
 assert_ok "force detach never invokes systemd-umount -l" \
     "! grep -qE -- '^[[:space:]]*/usr/bin/systemd-umount -l' \"\$WRAPPER\""
-assert_ok "force detach enters PID 1's mount namespace" \
-    "grep -qF -- 'nsenter --mount=/proc/1/ns/mnt' \"\$WRAPPER\""
+assert_ok "force detach never nsenters (RestrictNamespaces blocks setns)" \
+    "! grep -vE '^[[:space:]]*#' \"\$WRAPPER\" | grep -qE -- 'nsenter'"
+assert_ok "force detach asks PID 1 via systemd-run" \
+    "grep -qF -- '/usr/bin/systemd-run --quiet --wait --collect --pipe' \"\$WRAPPER\""
 assert_ok "force detach lazily unmounts the target there" \
-    "grep -qF -- 'umount -l \"\${target}\" 2>&1' \"\$WRAPPER\""
+    "grep -qF -- '/bin/umount -i -l \"\${target}\"' \"\$WRAPPER\""
 assert_ok "force detach uses fusermount -uz on fuseblk while MPD indexes" \
     "grep -qE -- 'fusermount3|-uz' \"\$WRAPPER\""
 assert_ok "force detach tries a clean unmount before escalating" \

@@ -377,7 +377,7 @@ Wrapper actions:
 |---|---|
 | `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares). For `ntfs`, `--type=ntfs-3g` so §2 options reach the FUSE helper, not kernel `ntfs3`. Success is checked in PID 1's mount table. |
 | `umount <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>` |
-| `umount-force <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>`, and if the target is held, `nsenter --mount=/proc/1/ns/mnt -- umount -l /var/lib/evo/music/USB/<stable-id>` — a lazy detach inside PID 1's mount namespace, where the volume is attached (only via `safe_remove force: true`) |
+| `umount-force <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>`, and if the target is held, PID 1 runs `fusermount3 -uz` then `umount -i -l` via `systemd-run --wait --collect --pipe`. `nsenter` cannot: `evo.service` has `RestrictNamespaces=yes` and a sudo child inherits that filter. Never `-l` on `systemd-umount`. Only via `safe_remove`. |
 | `fsck <stable-id> <fs-type> <device-node>` | dispatches per §2 repair-tool matrix |
 | `eject <parent-disk>` | `eject <parent-disk>` (best-effort; failure logged, not fatal) |
 
