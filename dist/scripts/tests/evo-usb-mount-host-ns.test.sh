@@ -29,7 +29,7 @@ assert_ok() {
 }
 
 assert_ok "wrapper is present" "[[ -f \"\$WRAPPER\" ]]"
-assert_ok "version is 5" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 5\" ]]"
+assert_ok "version is 6" "[[ \"\$( \"\$WRAPPER\" --version )\" == \"evo-usb-mount 6\" ]]"
 assert_ok "mount uses systemd-mount --collect" \
     "grep -qE -- 'systemd-mount --collect --fsck=no' \"\$WRAPPER\""
 assert_ok "umount uses systemd-umount" \
@@ -45,6 +45,8 @@ assert_ok "force detach enters PID 1's mount namespace" \
     "grep -qF -- 'nsenter --mount=/proc/1/ns/mnt' \"\$WRAPPER\""
 assert_ok "force detach lazily unmounts the target there" \
     "grep -qF -- 'umount -l \"\${target}\" 2>&1' \"\$WRAPPER\""
+assert_ok "force detach uses fusermount -uz on fuseblk while MPD indexes" \
+    "grep -qE -- 'fusermount3|-uz' \"\$WRAPPER\""
 assert_ok "force detach tries a clean unmount before escalating" \
     "grep -qF -- 'if /usr/bin/systemd-umount \"\${target}\"' \"\$WRAPPER\""
 # One EBUSY, two wordings: util-linux's and systemd's. The

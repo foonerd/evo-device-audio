@@ -183,11 +183,37 @@ refuse_system_backed_device() {
     fi
 }
 
+# Lazy detach in PID 1's mount namespace. NTFS/exFAT arrive as
+# fuseblk: `umount -l` still says "target is busy" while MPD is
+# indexing. fusermount -uz is the FUSE lazy detach. util-linux
+# `umount -l` stays the fallback. Never `-l` on systemd-umount.
+lazy_detach_host() {
+    local target="$1"
+    local fstype lazy_stderr rc=1
+    fstype="$(findmnt --task 1 --mountpoint "${target}" -o FSTYPE -n 2>/dev/null || true)"
+    local fuse_bin=""
+    if [[ "${fstype}" == fuseblk || "${fstype}" == fuse || "${fstype}" == fuse.* ]]; then
+        fuse_bin="$(command -v fusermount3 || command -v fusermount || true)"
+    fi
+    if [[ -n "${fuse_bin}" ]]; then
+        lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
+            "${fuse_bin}" -uz "${target}" 2>&1)" && rc=0 || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+    fi
+    lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
+        umount -l "${target}" 2>&1)" && rc=0 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        die_subprocess "lazy detach of ${target} in the host namespace: ${lazy_stderr}"
+    fi
+}
+
 case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 5"
+        echo "evo-usb-mount 6"
         exit 0
         ;;
     --help|-h|"")
@@ -332,11 +358,7 @@ case "${1:-}" in
             rmdir "${target}" 2>/dev/null || true
             exit 0
         fi
-        lazy_stderr="$(nsenter --mount=/proc/1/ns/mnt -- \
-            umount -l "${target}" 2>&1)" && rc=0 || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            die_subprocess "lazy detach of ${target} in the host namespace: ${lazy_stderr}"
-        fi
+        lazy_detach_host "${target}"
         rmdir "${target}" 2>/dev/null || true
         exit 0
         ;;
