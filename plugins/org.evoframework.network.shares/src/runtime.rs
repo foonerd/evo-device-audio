@@ -43,9 +43,7 @@
 
 use async_trait::async_trait;
 use evo_plugin_sdk::contract::{
-    ExternalAddressing, PromptOutcome, PromptRequest, PromptResponse,
-    PromptType, ReportError, SubjectAnnouncement, SubjectAnnouncer,
-    UserInteractionRequester,
+    ExternalAddressing, SubjectAnnouncement, SubjectAnnouncer,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -833,8 +831,8 @@ pub enum FailureClass {
     /// reassociates. Worth another attempt.
     Transient,
     /// Nothing changes by waiting. The operator has to act:
-    /// fix the credential, restore the share on the server,
-    /// answer the prompt.
+    /// stock the password on the share's Edit dialog, fix the
+    /// credential, restore the share on the server.
     Permanent,
     /// The host has not answered yet. Worth retrying, but by
     /// asking the host again rather than by re-running a mount:
@@ -859,10 +857,7 @@ impl MountError {
             // this classification exists to stop.
             Self::AuthenticationRefused { .. }
             | Self::CredentialMissing { .. }
-            | Self::CredentialStoreUnavailable
-            | Self::CredentialPromptCancelled { .. }
-            | Self::CredentialPromptFailed { .. }
-            | Self::NoResponderAvailable { .. } => FailureClass::Permanent,
+            | Self::CredentialStoreUnavailable => FailureClass::Permanent,
 
             // No record to mount. A retry cannot invent one.
             Self::ShareNotFound { .. } => FailureClass::Permanent,
@@ -927,15 +922,25 @@ pub enum MountError {
     Persistence(#[from] SharesStateError),
     /// Password credential required by the share record but the
     /// framework credential vault did not return bytes for the
-    /// declared key. Operator UI: prompt to re-enter password.
+    /// declared key.
+    ///
+    /// This is a refusal, not a request: the plugin raises no
+    /// password card. The operator stocks the secret on the
+    /// share's Add / Edit dialog and connects again. Classed
+    /// Permanent, so the remount cadence does not re-ask for
+    /// something no amount of waiting supplies.
+    ///
+    /// The message below is the operator-facing wording the
+    /// glass maps on. Changing it moves a contract that lives
+    /// in another repo.
     #[error("credential vault has no entry for key {key}")]
     CredentialMissing {
         /// The credential-vault key the record referenced.
         key: String,
     },
     /// The plugin was wired without a read-write credential
-    /// store, so the prompt-on-add flow cannot persist an
-    /// operator-supplied password. Legacy fixtures only; the
+    /// store, so a password supplied on the Add / Edit dialog
+    /// has nowhere to be persisted. Legacy fixtures only; the
     /// production wiring in `lib.rs` always installs the
     /// file-backed store, so this variant never fires on the
     /// reference distribution.
@@ -969,51 +974,8 @@ pub enum MountError {
         /// snippet from the mount helper).
         reason: String,
     },
-    /// The operator declined to answer the password prompt
-    /// (cancelled or timed out). The share record is left in
-    /// place so the operator can retry mount later, at which
-    /// point the prompt fires again.
-    #[error("operator declined password prompt for key {key}")]
-    CredentialPromptCancelled {
-        /// The credential-vault key the aborted prompt targeted.
-        key: String,
-    },
-    /// The password prompt could not be issued — the framework's
-    /// user-interaction responder returned a
-    /// [`ReportError`].
-    /// The reason is preserved verbatim for operator visibility.
-    #[error("password prompt failed for key {key}: {reason}")]
-    CredentialPromptFailed {
-        /// The credential-vault key the prompt targeted.
-        key: String,
-        /// The framework-level reason (typically "no responder
-        /// connected" or "steward shutting down").
-        reason: String,
-    },
-    /// The password prompt was refused fast by the framework
-    /// because no session currently holds the user-interaction-
-    /// responder slot. Distinct from
-    /// [`Self::CredentialPromptFailed`] so the wire layer can
-    /// return the specific `no_responder_available` subclass
-    /// and the operator surface can render "no answering client
-    /// is connected" instead of a generic prompt failure. The
-    /// mutation refuses in the current tokio poll rather than
-    /// waiting for the framework's prompt TTL (default 60 s) —
-    /// the whole point of the fast path.
-    #[error(
-        "no responder session is currently connected to answer the \
-         password prompt for key {key}: {reason}"
-    )]
-    NoResponderAvailable {
-        /// The credential-vault key the prompt targeted.
-        key: String,
-        /// The framework-supplied refusal reason (includes the
-        /// prompt TTL that would otherwise have elapsed before
-        /// the operator got a response).
-        reason: String,
-    },
-    /// The prompt returned an answer but writing it to the
-    /// credential store failed at the IO layer. Rare — the
+    /// A password supplied on the Add / Edit dialog could not be
+    /// written to the credential store at the IO layer. Rare — the
     /// framework guarantees the credentials directory is
     /// writable and mode 0700 — but a full disk or a filesystem
     /// remount to read-only would surface here.
@@ -1242,9 +1204,10 @@ impl CredentialFetcher for CredentialStoreAsFetcher {
 }
 
 /// Read-write credential store. Extends [`CredentialFetcher`] with
-/// `store_password`, used by the prompt-on-add flow to persist an
-/// operator-supplied password into the plugin's credentials
-/// directory. The framework guarantees the credentials directory is
+/// `store_password`, used to persist a password the operator typed
+/// on the Add / Edit dialog into the plugin's credentials
+/// directory. Nothing else stocks it: this plugin raises no
+/// password card. The framework guarantees the credentials directory is
 /// mode-0600 and scoped to this plugin's identity; each entry is a
 /// file named for the `credential_key` a share record references.
 #[async_trait]
@@ -1263,9 +1226,12 @@ pub trait CredentialStore: CredentialFetcher {
     /// Remove the vault entry for `credential_key`. Idempotent —
     /// deleting an already-absent entry succeeds silently. Used
     /// by `mount_share` when the mount helper reports
-    /// `AuthenticationRefused` so the next mount attempt re-
-    /// prompts for the current credential (NAS-side password
-    /// rotation). See NETWORK-SOURCES-DESIGN.md §5.6.5.
+    /// `AuthenticationRefused`: the stored secret is the one the
+    /// server just rejected, so it is dropped rather than
+    /// re-offered. The next mount refuses with
+    /// [`MountError::CredentialMissing`] until the operator
+    /// stocks the current password on the Edit dialog (NAS-side
+    /// password rotation). See NETWORK-SOURCES-DESIGN.md §5.6.5.
     async fn delete_password(
         &self,
         credential_key: &str,
@@ -1512,7 +1478,8 @@ impl CredentialStore for VaultCredentialStore {
 /// Called at plugin load once, before the runtime opens against
 /// the vault-backed store. Failure of the migration for a specific
 /// file is logged and does not abort the boot — the plugin will
-/// simply prompt the operator to re-enter the affected credential.
+/// simply refuse that share's mount until the operator re-enters
+/// the affected credential on its Edit dialog.
 pub async fn migrate_plaintext_credentials_into_vault(
     credentials_dir: &std::path::Path,
     handle: Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
@@ -1619,111 +1586,6 @@ pub async fn migrate_plaintext_credentials_into_vault(
         migrated += 1;
     }
     Ok(migrated)
-}
-
-/// Adapter over the framework's [`UserInteractionRequester`]
-/// specialised for a single-field password prompt. Wrapping the
-/// framework handle behind a plugin-local trait lets tests
-/// deterministic-mock the responder without spinning up the
-/// framework's prompt-ledger substrate.
-#[async_trait]
-pub trait PasswordPrompter: Send + Sync + std::fmt::Debug {
-    /// Raise a password prompt with the supplied operator-visible
-    /// label and await the operator's answer.
-    ///
-    /// Returns:
-    /// - `Ok(Some(bytes))` — operator answered; bytes are the raw
-    ///   password.
-    /// - `Ok(None)` — prompt cancelled by either side or timed
-    ///   out. Caller decides whether to retry.
-    /// - `Err(ReportError::*)` — framework-level failure (no
-    ///   responder connected, steward shutting down).
-    async fn prompt_password(
-        &self,
-        label: String,
-    ) -> Result<Option<Vec<u8>>, ReportError>;
-}
-
-/// Production [`PasswordPrompter`] that dispatches through the
-/// framework's [`UserInteractionRequester`] handle stamped on
-/// `LoadContext`. Tests inject a mock; production wires this one.
-#[derive(Clone)]
-pub struct FrameworkPasswordPrompter {
-    requester: Arc<dyn UserInteractionRequester>,
-}
-
-impl std::fmt::Debug for FrameworkPasswordPrompter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FrameworkPasswordPrompter").finish()
-    }
-}
-
-impl FrameworkPasswordPrompter {
-    /// Wrap a framework requester so the runtime can raise a
-    /// password prompt without knowing about the underlying
-    /// prompt-ledger substrate.
-    pub fn new(requester: Arc<dyn UserInteractionRequester>) -> Self {
-        Self { requester }
-    }
-}
-
-#[async_trait]
-impl PasswordPrompter for FrameworkPasswordPrompter {
-    async fn prompt_password(
-        &self,
-        label: String,
-    ) -> Result<Option<Vec<u8>>, ReportError> {
-        // The prompt_id encodes the shares plugin's namespace plus
-        // a monotonic wall-clock component so re-issues of the
-        // same operator flow (add / retry-mount) share a session
-        // marker but do not collide with each other. Rendered by
-        // the responder as its stable prompt identity.
-        let ts = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let request = PromptRequest {
-            prompt_id: format!("org.evoframework.network.shares/password/{ts}"),
-            prompt_type: PromptType::Password { label },
-            timeout_ms: None,
-            session_id: None,
-            retention_hint: None,
-            error_context: None,
-            previous_answer: None,
-            priority: None,
-        };
-        let outcome = self.requester.request_user_interaction(request).await?;
-        match outcome {
-            PromptOutcome::Answered { response, .. } => match response {
-                PromptResponse::Password { value } => {
-                    Ok(Some(value.into_bytes()))
-                }
-                other => Err(ReportError::Invalid(format!(
-                    "network.shares password prompt received wrong response \
-                     shape from responder: {other:?}"
-                ))),
-            },
-            PromptOutcome::Cancelled { .. } | PromptOutcome::TimedOut => {
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// [`PasswordPrompter`] that always returns `Ok(None)`. Used by
-/// tests and by the framework's fixture builder when no
-/// user-interaction responder is wired.
-#[derive(Debug, Default, Clone)]
-pub struct NoPasswordPrompter;
-
-#[async_trait]
-impl PasswordPrompter for NoPasswordPrompter {
-    async fn prompt_password(
-        &self,
-        _label: String,
-    ) -> Result<Option<Vec<u8>>, ReportError> {
-        Ok(None)
-    }
 }
 
 /// Default subprocess timeout for a single mount attempt (30 s).
@@ -1931,29 +1793,6 @@ pub fn is_mount_directory_missing(stderr: &str, mount_root: &Path) -> bool {
     })
 }
 
-/// Compose the operator-facing title for a share's password
-/// prompt.
-///
-/// `host` and `path` are stored as the operator entered them:
-/// a CIFS share name usually carries no leading slash, an NFS
-/// export usually does. Concatenating the two put
-/// `user@hostshare` in front of the operator on the glass.
-///
-/// Join them with exactly one `/`, and with none at all when
-/// there is no path to name. This composes the title only —
-/// the mount builders keep their own per-fstype normalisation
-/// (CIFS trims the leading slash, NFS requires one) and are not
-/// touched by this.
-fn password_prompt_label(username: &str, host: &str, path: &str) -> String {
-    let host = host.trim_end_matches('/');
-    let path = path.trim_start_matches('/');
-    if path.is_empty() {
-        format!("Password for {username}@{host}")
-    } else {
-        format!("Password for {username}@{host}/{path}")
-    }
-}
-
 /// Both stderr sources for one failed mount attempt, together.
 ///
 /// `systemd-mount` prints an opaque "Job failed" on stdout while
@@ -1991,7 +1830,8 @@ enum MountFailureKind {
 /// present, the refusal is the one that matters. An ENOENT about
 /// the mount point clears on its own; a refused password does
 /// not, and must reach `AuthenticationRefused` so the vault entry
-/// is dropped and the next mount can prompt.
+/// is dropped rather than re-offered to a server that has already
+/// rejected it.
 fn classify_mount_failure(
     exit_code: Option<i32>,
     helper_stderr: &str,
@@ -2739,17 +2579,12 @@ pub struct NetworkSharesRuntime {
     /// wired with a store that supports `store_password` (the
     /// production path via [`FileCredentialStore`]); None in
     /// legacy fixtures that only supply a read-side fetcher.
-    /// When None, the prompt-on-add flow is skipped and any
-    /// UserPassword mount attempt reaches the mount helper with
-    /// whatever the fetcher returns (typically None → operator
-    /// sees the honest "credential vault has no entry" error).
+    /// When None, a password supplied on the Add / Edit dialog
+    /// has nowhere to be stocked, and any UserPassword mount
+    /// attempt reaches the mount helper with whatever the
+    /// fetcher returns (typically None → operator sees the
+    /// honest "credential vault has no entry" error).
     credential_store: Option<Arc<dyn CredentialStore>>,
-    /// Handle for raising password prompts. Defaults to
-    /// [`NoPasswordPrompter`] in test / builder-omitted paths
-    /// so unit tests never race the framework's prompt-ledger.
-    /// Production wires [`FrameworkPasswordPrompter`] via the
-    /// LoadContext's `user_interaction_requester`.
-    prompter: Arc<dyn PasswordPrompter>,
     mount_program: String,
     /// Args prepended to every mount invocation, ahead of the
     /// generated `-t / -o` argv. Empty when the plugin's service
@@ -2793,41 +2628,6 @@ pub struct NetworkSharesRuntime {
     l3_gate: Option<L3Gate>,
     /// How long boot-mount waits for L3 before giving up.
     l3_wait_ms: u64,
-    /// Deduplication map for in-flight credential prompts. Keyed
-    /// on `credential_key` so multiple concurrent mount / add
-    /// attempts against the same missing credential collapse to
-    /// a single prompt on the responder's shelf.
-    ///
-    /// Entry lifetime is decoupled from any single caller: the
-    /// entry lives from the first `or_insert_with` to the
-    /// explicit `remove_entry` that runs AFTER `get_or_init`
-    /// resolves. Later callers arriving during that whole window
-    /// observe the existing cell (Arc::clone), await
-    /// `get_or_init`, and all receive the same outcome the first
-    /// caller produced — no re-prompt.
-    ///
-    /// Retires an earlier CellOnDrop pattern whose removal fired
-    /// inside the first caller's `Drop` — the map entry was gone
-    /// before any concurrent add arriving one tokio poll later
-    /// could observe it, so peer callers re-inserted their own
-    /// cells and re-prompted. That race produced non-deterministic
-    /// prompt counts under concurrent dispatch on the same
-    /// credential key.
-    ///
-    /// [`tokio::sync::OnceCell`] provides both requirements the
-    /// dedup contract pins:
-    ///
-    /// - Single-writer initialization: the first caller to reach
-    ///   `get_or_init` runs the closure; all peers concurrently
-    ///   waiting on the same cell block on the same in-flight
-    ///   init future — exactly one prompt fires, however many
-    ///   callers arrive.
-    /// - Blocking-or-async wait for followers: peers `.await`
-    ///   the OnceCell; when the init resolves, every peer's
-    ///   await returns the same value reference. No polling, no
-    ///   spinning, no re-entry.
-    pending_credential_prompts:
-        Arc<std::sync::Mutex<HashMap<String, PromptCell>>>,
     /// Bounded ring of the most recent share-lifecycle events
     /// (mount / unmount / mount-failed / unmount-failed).
     /// Published as the `network_share_events` singleton on
@@ -2840,42 +2640,6 @@ pub struct NetworkSharesRuntime {
     /// needed.
     share_events_ring: Arc<StdMutex<std::collections::VecDeque<ShareEvent>>>,
 }
-
-/// Cloneable outcome the first prompt-caller broadcasts to
-/// concurrent waiters on the same credential key. Distinct
-/// from [`MountError`] because MountError is not Clone and
-/// waiters need their own copy of the outcome to raise a
-/// tailored error. Every variant maps back to a specific
-/// MountError shape on the waiter side.
-#[derive(Debug, Clone)]
-pub(crate) enum PromptDedupOutcome {
-    /// Credential answered + stored in the vault. Waiters
-    /// re-fetch from the vault and return `Ok(())`.
-    Success,
-    /// Responder cancelled or the framework's prompt TTL fired.
-    /// Waiters return [`MountError::CredentialPromptCancelled`].
-    Cancelled,
-    /// Framework fast-refused because no responder session was
-    /// connected. Waiters return
-    /// [`MountError::NoResponderAvailable`] with the same
-    /// reason the first caller received.
-    NoResponderAvailable(String),
-    /// Any other prompt / store failure. Waiters return a
-    /// generic [`MountError::CredentialPromptFailed`] carrying
-    /// this reason.
-    Other(String),
-}
-
-/// Shared once-cell entry held in [`NetworkSharesRuntime::
-/// pending_credential_prompts`]. Concurrent callers clone the
-/// `Arc` under the map's sync lock and then `.await` the
-/// OnceCell — the first arrival's `get_or_init` closure runs
-/// the prompt; every other arrival blocks on the same init.
-///
-/// `Arc` is used purely so the sync-mutex-held pointer can be
-/// cloned out cheaply and awaited without holding the map lock
-/// across `.await`.
-pub(crate) type PromptCell = Arc<tokio::sync::OnceCell<PromptDedupOutcome>>;
 
 impl std::fmt::Debug for NetworkSharesRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2906,7 +2670,6 @@ impl NetworkSharesRuntime {
             executor: Arc::new(SubprocessMountExecutor),
             credentials: Arc::new(NoCredentialFetcher),
             credential_store: None,
-            prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
             mount_wrapper_args: Vec::new(),
             umount_program: "/bin/umount".to_string(),
@@ -2925,9 +2688,6 @@ impl NetworkSharesRuntime {
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
-            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
-                HashMap::new(),
-            )),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -2937,8 +2697,8 @@ impl NetworkSharesRuntime {
     }
 
     /// Start a builder for constructing a runtime with custom
-    /// executor / credential fetcher / credential store / password
-    /// prompter / mount program / timeout / clock.
+    /// executor / credential fetcher / credential store / mount
+    /// program / timeout / clock.
     pub fn builder(
         state_dir: &Path,
     ) -> Result<NetworkSharesRuntimeBuilder, SharesStateError> {
@@ -2951,7 +2711,6 @@ impl NetworkSharesRuntime {
             credentials: None,
             host_reachable: None,
             credential_store: None,
-            prompter: None,
             mount_program: None,
             mount_wrapper_args: None,
             umount_program: None,
@@ -2982,7 +2741,6 @@ impl NetworkSharesRuntime {
             executor: Arc::new(SubprocessMountExecutor),
             credentials: Arc::new(NoCredentialFetcher),
             credential_store: None,
-            prompter: Arc::new(NoPasswordPrompter),
             mount_program: "/bin/mount".to_string(),
             mount_wrapper_args: Vec::new(),
             umount_program: "/bin/umount".to_string(),
@@ -3004,9 +2762,6 @@ impl NetworkSharesRuntime {
             host_reachable: Arc::new(|_: &str, _: u16| true),
             l3_gate: None,
             l3_wait_ms: DEFAULT_L3_WAIT_MS,
-            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
-                HashMap::new(),
-            )),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -3015,9 +2770,11 @@ impl NetworkSharesRuntime {
         }
     }
 
-    /// Stock a password the operator typed on the Add dialog.
-    /// Empty / absent is a no-op so Guest and a later prompt
-    /// path stay. The secret is never written onto the share
+    /// Stock a password the operator typed on the Add / Edit
+    /// dialog. This is the only way a secret enters the vault:
+    /// the plugin raises no password card. Empty / absent is a
+    /// no-op, so Guest and KeyFile records pass through
+    /// untouched. The secret is never written onto the share
     /// record.
     async fn stock_supplied_password(
         &self,
@@ -3040,36 +2797,38 @@ impl NetworkSharesRuntime {
             .map_err(|e| format!("{e}"))
     }
 
-    /// Ensure the credential vault has an entry for the record's
-    /// `credential_key`, raising a password prompt to the operator
-    /// when it does not. Guest / KeyFile shares short-circuit to
-    /// `Ok(())` — they carry no vault dependency.
+    /// Ensure the credential vault already carries an entry for
+    /// the record's `credential_key`. Guest / KeyFile shares
+    /// short-circuit to `Ok(())` — they carry no vault
+    /// dependency.
+    ///
+    /// Raises nothing. This used to open a password card when
+    /// the vault was empty, so a share with no stored secret
+    /// asked for one on Connect, on boot remount, and on every
+    /// restart after an overlay — a card the operator never
+    /// gestured for, on a path with no dialog to answer it in.
+    /// The secret belongs to Add and Edit, which stock the
+    /// vault; mounting only ever spends what is already there.
     ///
     /// Returns:
-    /// - `Ok(())` — vault already carried the entry, OR the
-    ///   prompt was answered and the answer was stored.
-    /// - `Err(MountError::CredentialPromptCancelled)` — the
-    ///   responder cancelled or the prompt timed out; the caller
-    ///   surfaces this as a mount_error the operator can retry.
+    /// - `Ok(())` — the vault carries the entry.
+    /// - `Err(MountError::CredentialMissing)` — it does not.
+    ///   The caller leaves the share Unmounted and says what is
+    ///   missing. The class is Permanent, so the remount
+    ///   cadence does not re-ask every five minutes for
+    ///   something no amount of waiting supplies.
     /// - `Err(MountError::CredentialStoreUnavailable)` — the
     ///   record needs a password but the runtime was wired
-    ///   without a credential store (legacy path); the operator
-    ///   sees the honest "no store wired" message rather than a
-    ///   silent hang.
+    ///   without a credential store (legacy path).
     ///
     /// Called by `network.share.add` and `network.share.mount`
-    /// before dispatching the mount helper; both entry points
-    /// share the same lookup-then-prompt-then-store pattern so a
-    /// re-mount after a cancelled prompt re-prompts.
+    /// before dispatching the mount helper.
     pub async fn ensure_credential_stocked(
         &self,
         record: &ShareRecord,
     ) -> Result<(), MountError> {
-        let Credentials::UserPassword {
-            credential_key,
-            username,
-            ..
-        } = &record.credentials
+        let Credentials::UserPassword { credential_key, .. } =
+            &record.credentials
         else {
             return Ok(());
         };
@@ -3081,140 +2840,12 @@ impl NetworkSharesRuntime {
         {
             return Ok(());
         }
-        let Some(store) = self.credential_store.as_ref() else {
+        if self.credential_store.is_none() {
             return Err(MountError::CredentialStoreUnavailable);
-        };
-
-        // Get (or atomically insert) the shared once-cell for
-        // this credential_key. The sync mutex serialises the
-        // check-and-insert so exactly one caller creates the
-        // cell; every peer arriving DURING the cell's lifetime
-        // clones the same `Arc` and awaits the same `get_or_init`.
-        //
-        // Under concurrent dispatch: N concurrent callers (any N)
-        // collapse to exactly one prompt on the responder's
-        // shelf; one operator answer (or cancel, or no-responder
-        // fast-refusal) resolves every waiter with the same
-        // outcome. The map entry outlives the first caller's
-        // exit, so a peer arriving one tokio poll after the
-        // first caller resolves still observes the resolved cell
-        // (via `get()`) and returns the cached outcome instead of
-        // falling into re-prompt.
-        let cell: PromptCell = {
-            let mut map = self
-                .pending_credential_prompts
-                .lock()
-                .expect("pending_credential_prompts mutex poisoned");
-            Arc::clone(
-                map.entry(credential_key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-            )
-        };
-
-        // Await the outcome. Exactly one arrival's closure runs
-        // (single-writer init); every peer awaits the same init
-        // future and returns the same `&PromptDedupOutcome`. If
-        // the first arrival panics inside the closure, tokio's
-        // OnceCell surfaces the panic to every waiter and drops
-        // the cell state so the NEXT batch re-initialises — we
-        // treat that as `CredentialPromptFailed`.
-        let label = password_prompt_label(username, &record.host, &record.path);
-        let key_for_closure = credential_key.clone();
-        let prompter = Arc::clone(&self.prompter);
-        let store_for_closure = Arc::clone(store);
-        let cell_for_await = Arc::clone(&cell);
-        let outcome_ref = cell_for_await
-            .get_or_init(|| async move {
-                match prompter.prompt_password(label).await {
-                    Ok(Some(bytes)) => {
-                        match store_for_closure
-                            .store_password(&key_for_closure, &bytes)
-                            .await
-                        {
-                            Ok(()) => PromptDedupOutcome::Success,
-                            Err(e) => PromptDedupOutcome::Other(format!("{e}")),
-                        }
-                    }
-                    Ok(None) => PromptDedupOutcome::Cancelled,
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if msg.contains("no_responder_available:") {
-                            PromptDedupOutcome::NoResponderAvailable(msg)
-                        } else {
-                            PromptDedupOutcome::Other(msg)
-                        }
-                    }
-                }
-            })
-            .await;
-        let outcome = outcome_ref.clone();
-
-        // Cleanup: remove this key's entry from the map ONLY if
-        // the entry still points at the cell we resolved. Under
-        // concurrent-dispatch there is no window where a peer
-        // could see the map empty AND the current batch's cell
-        // in flight — every peer that arrived during the init
-        // observed the existing cell before the removal, and
-        // every peer that arrives AFTER the removal starts a
-        // fresh batch (fresh cell, fresh prompt).
-        //
-        // `Arc::ptr_eq` guards against a rare cleanup race:
-        // if two callers reach cleanup and one already popped +
-        // re-inserted a subsequent batch's cell, the second's
-        // remove must not clobber the newer batch's entry.
-        {
-            let mut map = self
-                .pending_credential_prompts
-                .lock()
-                .expect("pending_credential_prompts mutex poisoned");
-            if map
-                .get(credential_key)
-                .is_some_and(|existing| Arc::ptr_eq(existing, &cell))
-            {
-                map.remove(credential_key);
-            }
         }
-
-        match outcome {
-            PromptDedupOutcome::Success => {
-                // Defensive re-check: the store completed Ok in the
-                // init closure, but confirm the fetcher observes
-                // the write (file-backed store; the re-check costs
-                // one filesystem stat).
-                if self
-                    .credentials
-                    .fetch_password(credential_key)
-                    .await
-                    .is_some()
-                {
-                    Ok(())
-                } else {
-                    Err(MountError::CredentialPromptFailed {
-                        key: credential_key.clone(),
-                        reason: "first caller reported Success but vault \
-                                 fetch returned None (store inconsistency)"
-                            .into(),
-                    })
-                }
-            }
-            PromptDedupOutcome::Cancelled => {
-                Err(MountError::CredentialPromptCancelled {
-                    key: credential_key.clone(),
-                })
-            }
-            PromptDedupOutcome::NoResponderAvailable(reason) => {
-                Err(MountError::NoResponderAvailable {
-                    key: credential_key.clone(),
-                    reason,
-                })
-            }
-            PromptDedupOutcome::Other(reason) => {
-                Err(MountError::CredentialPromptFailed {
-                    key: credential_key.clone(),
-                    reason,
-                })
-            }
-        }
+        Err(MountError::CredentialMissing {
+            key: credential_key.clone(),
+        })
     }
 }
 
@@ -3721,7 +3352,6 @@ pub struct NetworkSharesRuntimeBuilder {
     executor: Option<Arc<dyn MountExecutor>>,
     credentials: Option<Arc<dyn CredentialFetcher>>,
     credential_store: Option<Arc<dyn CredentialStore>>,
-    prompter: Option<Arc<dyn PasswordPrompter>>,
     mount_program: Option<String>,
     mount_wrapper_args: Option<Vec<String>>,
     umount_program: Option<String>,
@@ -3780,17 +3410,6 @@ impl NetworkSharesRuntimeBuilder {
         store: Arc<dyn CredentialStore>,
     ) -> Self {
         self.credential_store = Some(store);
-        self
-    }
-
-    /// Install a [`PasswordPrompter`]. Production passes
-    /// [`FrameworkPasswordPrompter`] wrapping the LoadContext's
-    /// `user_interaction_requester`; tests pass a mock.
-    pub fn with_password_prompter(
-        mut self,
-        prompter: Arc<dyn PasswordPrompter>,
-    ) -> Self {
-        self.prompter = Some(prompter);
         self
     }
 
@@ -3975,9 +3594,6 @@ impl NetworkSharesRuntimeBuilder {
                     .unwrap_or_else(|| Arc::new(NoCredentialFetcher))
             }),
             credential_store: self.credential_store,
-            prompter: self
-                .prompter
-                .unwrap_or_else(|| Arc::new(NoPasswordPrompter)),
             mount_program: self
                 .mount_program
                 .unwrap_or_else(|| "/bin/mount".to_string()),
@@ -4029,9 +3645,6 @@ impl NetworkSharesRuntimeBuilder {
                 .unwrap_or_else(|| Arc::new(fuser_holders_blocking)),
             l3_gate: self.l3_gate,
             l3_wait_ms: self.l3_wait_ms.unwrap_or(DEFAULT_L3_WAIT_MS),
-            pending_credential_prompts: Arc::new(std::sync::Mutex::new(
-                HashMap::new(),
-            )),
             share_events_ring: Arc::new(StdMutex::new(
                 std::collections::VecDeque::with_capacity(
                     SHARE_EVENTS_RING_CAPACITY,
@@ -4299,9 +3912,9 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         // plugin restart. Re-probing an already-active mount
         // walks the dialect ladder, clears persisted_vers, and
         // publishes Failed while the mount is healthy — the
-        // exact "Audio" tile bug. Adopt before credential prompt
-        // or mkdir so a live mount never triggers a password
-        // prompt or a destructive remount attempt.
+        // exact "Audio" tile bug. Adopt before the credential
+        // check or mkdir so a live mount is never refused for a
+        // missing password or put through a destructive remount.
         if (self.mount_point_check)(&record.mount_root) {
             let start_ms = (self.now_fn)();
             let was_mounted = {
@@ -4350,7 +3963,8 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         //
         // Placed after the OS-truth adopt so a live mount is never
         // second-guessed by a probe, and before credential work so
-        // an absent server cannot raise a password prompt.
+        // an absent server is reported as absent rather than as a
+        // missing password.
         {
             let host = record.host.trim().to_string();
             if !host.is_empty() {
@@ -4375,21 +3989,39 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
             }
         }
 
-        // Prompt-on-mount: for UserPassword shares whose
-        // credential_key is not in the vault, raise a password
-        // prompt via the framework's user-interaction responder
-        // and stash the answer before proceeding. Guest / KeyFile
-        // records short-circuit to Ok(()). Cancelled / timed-out
-        // prompts surface as MountError variants the operator UI
-        // renders per the mount_error contract on the wire.
+        // Mounting spends what the vault already holds. A
+        // UserPassword share whose credential_key is absent is
+        // refused here and nothing is asked for: the secret is
+        // typed on the Add / Edit dialog, which is the only
+        // surface that stocks it. Guest / KeyFile records
+        // short-circuit to Ok(()).
         //
-        // Publish the failure the same way a helper failure does.
-        // A prior HostUnreachable reason ("did not answer") must
-        // not stay painted when the operator cancelled or the
-        // prompt could not be issued. Permanent, so neither the
-        // remount cadence nor the unreachable poll storms.
+        // Publish the outcome the same way a helper failure
+        // does, so a prior HostUnreachable reason ("did not
+        // answer") does not stay painted over a share that is
+        // simply missing its password. Permanent either way, so
+        // neither the remount cadence nor the unreachable poll
+        // storms.
         if let Err(e) = self.ensure_credential_stocked(&record).await {
-            self.set_share_failed(share_id, &e).await;
+            if matches!(e, MountError::CredentialMissing { .. }) {
+                // Not a failure of the share — nothing about it
+                // is broken and nothing was attempted. It simply
+                // has no secret yet, so it stays down and says
+                // which key is missing. Failed would paint a
+                // fault the operator cannot act on and would put
+                // the tile in the retry set; Permanent keeps the
+                // cadence off it until Edit stocks the vault.
+                self.set_share_state_classified(
+                    share_id,
+                    MountState::Unmounted,
+                    Some(format!("{e}")),
+                    Some(e.failure_class()),
+                    None,
+                )
+                .await;
+            } else {
+                self.set_share_failed(share_id, &e).await;
+            }
             return Err(e);
         }
 
@@ -4448,8 +4080,11 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                 .await;
                 // Password refresh on auth-refusal (NETWORK-
                 // SOURCES-DESIGN.md §5.6.5): delete the vault
-                // entry so the next mount attempt re-prompts.
-                // Honest response to NAS-side password rotation.
+                // entry rather than re-offer a secret the
+                // server has already rejected. The next mount
+                // refuses for a missing credential until the
+                // operator stocks the new one on Edit. Honest
+                // response to NAS-side password rotation.
                 if let MountError::AuthenticationRefused { .. } = e {
                     if let Credentials::UserPassword {
                         credential_key, ..
@@ -6455,25 +6090,6 @@ impl NetworkSharesRuntime {
                         mount_report: Some(report),
                         mount_error: None,
                     },
-                    Err(MountError::NoResponderAvailable { key, reason }) => {
-                        // Roll back the persisted share record on
-                        // this specific failure: the mutation
-                        // could not be answered by any client
-                        // (no responder session was connected at
-                        // dispatch time), so leaving a half-added
-                        // share behind would litter the state
-                        // with a record the operator did not
-                        // consent to keeping. Distinct from
-                        // cancelled / timed-out prompt failures,
-                        // where the operator DID see the prompt
-                        // and chose not to answer — those keep
-                        // the record so `network.share.mount`
-                        // can retry.
-                        let _ = self.remove_share(&share_id).await;
-                        return Err(VerbDispatchError::Mount(
-                            MountError::NoResponderAvailable { key, reason },
-                        ));
-                    }
                     Err(e) => AddShareResponse {
                         share_id,
                         mount_report: None,
@@ -6534,9 +6150,9 @@ impl NetworkSharesRuntime {
             "network.share.mount" => {
                 let req: MountShareRequest =
                     decode_payload(request_type, payload_bytes)?;
-                // mount_share runs the prompt-on-mount flow
-                // internally, so a re-mount after a cancelled
-                // prompt re-prompts symmetrically with
+                // mount_share runs the same credential check
+                // internally, so a re-mount refuses for a
+                // missing password symmetrically with
                 // network.share.add.
                 let report = self.mount_share(&req.share_id).await?;
                 encode_response(request_type, &MountShareResponse { report })
@@ -7596,48 +7212,6 @@ tmpfs /tmp tmpfs rw 0 0\n";
     }
 
     #[test]
-    fn password_label_inserts_one_slash_when_the_path_has_none() {
-        // The live shape: a CIFS share name carries no leading
-        // slash, so concatenation read "operator@192.0.2.10share".
-        assert_eq!(
-            password_prompt_label("operator", "192.0.2.10", "multimedia/audio"),
-            "Password for operator@192.0.2.10/multimedia/audio"
-        );
-    }
-
-    #[test]
-    fn password_label_does_not_double_the_slash_when_the_path_has_one() {
-        // An NFS export already starts with a slash.
-        assert_eq!(
-            password_prompt_label("operator", "192.0.2.10", "/volume1/music"),
-            "Password for operator@192.0.2.10/volume1/music"
-        );
-    }
-
-    #[test]
-    fn password_label_omits_the_slash_when_there_is_no_path() {
-        assert_eq!(
-            password_prompt_label("operator", "192.0.2.10", ""),
-            "Password for operator@192.0.2.10"
-        );
-        // A path that is nothing but a slash names no path
-        // either.
-        assert_eq!(
-            password_prompt_label("operator", "192.0.2.10", "/"),
-            "Password for operator@192.0.2.10"
-        );
-    }
-
-    #[test]
-    fn password_label_emits_one_slash_even_if_the_host_carries_one() {
-        // Same contract from the other side: exactly one.
-        assert_eq!(
-            password_prompt_label("operator", "192.0.2.10/", "/music"),
-            "Password for operator@192.0.2.10/music"
-        );
-    }
-
-    #[test]
     fn is_mount_directory_missing_matches_common_enoent_renderings() {
         let root = Path::new("/var/lib/evo/music/NAS/foo");
         assert!(is_mount_directory_missing(
@@ -7796,7 +7370,10 @@ No such file or directory",
     #[tokio::test]
     async fn mount_cifs_userpassword_auth_refused_deletes_vault_entry() {
         // AuthenticationRefused triggers the runtime to clear
-        // the vault entry so the next mount attempt re-prompts.
+        // the vault entry rather than re-offer a secret the
+        // server has already rejected. The next mount refuses
+        // for a missing credential until Edit stocks the new
+        // one.
         // NETWORK-SOURCES-DESIGN.md §5.6.5 (password refresh on
         // NAS-side rotation).
         let dir = tempdir();
@@ -7828,7 +7405,8 @@ No such file or directory",
         let err = rt.mount_share(&id).await.unwrap_err();
         assert!(matches!(err, MountError::AuthenticationRefused { .. }));
 
-        // Vault entry MUST be gone so the next mount re-prompts.
+        // Vault entry MUST be gone: the rejected secret is not
+        // offered again.
         assert!(
             store.fetch_password("rotate_key").await.is_none(),
             "auth-refusal must clear the stale vault entry",
@@ -8591,7 +8169,7 @@ mount error(13): Permission denied",
     async fn mount_share_adopts_already_mounted_without_executor() {
         // Host mount already active (survived steward restart):
         // mount_share must report Mounted, invoke the executor
-        // zero times, and never prompt for credentials.
+        // zero times, and never reach the credential check.
         let dir = tempdir();
         let executor = ScriptedExecutor::new(Vec::new());
         let mount_root = dir.join("NAS").join("Audio");
@@ -8765,11 +8343,11 @@ mount error(13): Permission denied",
         let dir = tempdir();
         // Executor never fires because we bail before mount.
         let executor = ScriptedExecutor::new(Vec::new());
-        // Neither a store nor a prompter is wired — the legacy
-        // fixture path. The prompt-on-mount flow surfaces
-        // CredentialStoreUnavailable to make the "no store"
-        // condition operator-visible instead of silently
-        // hanging.
+        // No store is wired — the legacy fixture path. The
+        // credential check surfaces CredentialStoreUnavailable
+        // to make the "no store" condition operator-visible
+        // instead of failing as if the password were merely
+        // missing.
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
@@ -8791,747 +8369,6 @@ mount error(13): Permission denied",
             "expected CredentialStoreUnavailable when the runtime was wired without a store; got {err:?}"
         );
     }
-
-    #[derive(Debug, Default)]
-    struct RecordingPrompter {
-        answer: std::sync::Mutex<Option<Vec<u8>>>,
-        calls: std::sync::Mutex<u32>,
-    }
-
-    #[async_trait]
-    impl PasswordPrompter for RecordingPrompter {
-        async fn prompt_password(
-            &self,
-            _label: String,
-        ) -> Result<Option<Vec<u8>>, ReportError> {
-            let mut c = self.calls.lock().unwrap();
-            *c += 1;
-            let a = self.answer.lock().unwrap().clone();
-            Ok(a)
-        }
-    }
-
-    #[tokio::test]
-    async fn mount_cifs_userpassword_prompts_and_stores_then_mounts() {
-        // Runtime with a real file store + a prompter that
-        // returns the password on demand. The mount executor is
-        // a single canned success reply — proves the mount was
-        // attempted after the prompt round-trip.
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root.clone()));
-        let prompter = Arc::new(RecordingPrompter {
-            answer: std::sync::Mutex::new(Some(b"hunter2".to_vec())),
-            calls: std::sync::Mutex::new(0),
-        });
-        let executor = ScriptedExecutor::new(vec![CommandOutput {
-            exit_code: Some(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }]);
-        let rt = NetworkSharesRuntime::builder(&dir)
-            .unwrap()
-            .with_executor(executor)
-            .with_credential_store(
-                Arc::clone(&store) as Arc<dyn CredentialStore>
-            )
-            .with_password_prompter(
-                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-            )
-            .build();
-
-        let mut record = built_record("auth_success", "192.0.2.32");
-        record.credentials = Credentials::UserPassword {
-            username: "engineer".to_string(),
-            credential_key: "auth_success_key".to_string(),
-            domain: None,
-        };
-        let id = record.share_id.clone();
-        rt.add_share(record).await.unwrap();
-
-        rt.mount_share(&id)
-            .await
-            .expect("mount should succeed after prompt");
-
-        assert_eq!(
-            *prompter.calls.lock().unwrap(),
-            1,
-            "prompter fires exactly once"
-        );
-        // The password bytes are now in the file store.
-        let bytes = store.fetch_password("auth_success_key").await.unwrap();
-        assert_eq!(bytes, b"hunter2");
-    }
-
-    #[tokio::test]
-    async fn mount_cifs_userpassword_cancelled_prompt_surfaces_error() {
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-        // Prompter returns None: operator cancelled or timed out.
-        let prompter = Arc::new(RecordingPrompter::default());
-        let executor = ScriptedExecutor::new(Vec::new());
-        let rt = NetworkSharesRuntime::builder(&dir)
-            .unwrap()
-            .with_executor(executor)
-            .with_credential_store(store as Arc<dyn CredentialStore>)
-            .with_password_prompter(prompter as Arc<dyn PasswordPrompter>)
-            .build();
-
-        let mut record = built_record("auth_cancel", "192.0.2.33");
-        record.credentials = Credentials::UserPassword {
-            username: "engineer".to_string(),
-            credential_key: "cancelled_key".to_string(),
-            domain: None,
-        };
-        let id = record.share_id.clone();
-        rt.add_share(record).await.unwrap();
-
-        let err = rt.mount_share(&id).await.unwrap_err();
-        assert!(
-            matches!(&err, MountError::CredentialPromptCancelled { key } if key == "cancelled_key"),
-            "expected CredentialPromptCancelled; got {err:?}"
-        );
-        let g = rt.share_states.lock().await;
-        let entry = g.get(&id).expect("share state recorded");
-        assert_eq!(entry.state, MountState::Failed);
-        assert_eq!(
-            entry.failure_class,
-            Some(FailureClass::Permanent),
-            "a cancelled prompt is not an unanswered host"
-        );
-        let reason = entry.reason.as_deref().unwrap_or("");
-        assert!(
-            reason.contains("declined password prompt"),
-            "glass must show the credential miss: {reason}"
-        );
-        assert!(
-            !reason.contains("did not answer"),
-            "HostUnreachable must not be the painted reason: {reason}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_prompt_does_not_leave_host_did_not_answer() {
-        // Field case: first mount wrote HostUnreachable. The host
-        // came back. The credential step then cancelled.
-        // `ensure_credential_stocked` used to return with `?` and
-        // never republish, so the subject kept "did not answer".
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-        let prompter = Arc::new(RecordingPrompter::default());
-        let executor = ScriptedExecutor::new(Vec::new());
-        let reachable = Arc::new(AtomicBool::new(false));
-        let probe_flag = Arc::clone(&reachable);
-        let rt = NetworkSharesRuntime::builder(&dir)
-            .unwrap()
-            .with_executor(executor.clone())
-            .with_credential_store(store as Arc<dyn CredentialStore>)
-            .with_password_prompter(prompter as Arc<dyn PasswordPrompter>)
-            .with_host_reachable(Arc::new(move |_: &str, _: u16| {
-                probe_flag.load(Ordering::SeqCst)
-            }))
-            .build();
-
-        let mut record = built_record("stale_host", "192.0.2.40");
-        record.credentials = Credentials::UserPassword {
-            username: "engineer".to_string(),
-            credential_key: "stale_host_key".to_string(),
-            domain: None,
-        };
-        let id = record.share_id.clone();
-        rt.add_share(record).await.unwrap();
-
-        let first = rt.mount_share(&id).await.unwrap_err();
-        assert!(matches!(first, MountError::HostUnreachable { .. }));
-        {
-            let g = rt.share_states.lock().await;
-            let entry = g.get(&id).expect("first fail recorded");
-            assert_eq!(entry.failure_class, Some(FailureClass::Unreachable));
-            assert!(
-                entry
-                    .reason
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("did not answer"),
-                "{:?}",
-                entry.reason
-            );
-        }
-
-        reachable.store(true, Ordering::SeqCst);
-        let second = rt.mount_share(&id).await.unwrap_err();
-        assert!(
-            matches!(&second, MountError::CredentialPromptCancelled { key } if key == "stale_host_key"),
-            "expected CredentialPromptCancelled; got {second:?}"
-        );
-        {
-            let g = rt.share_states.lock().await;
-            let entry = g.get(&id).expect("credential fail recorded");
-            assert_eq!(entry.state, MountState::Failed);
-            assert_eq!(
-                entry.failure_class,
-                Some(FailureClass::Permanent),
-                "a cancelled prompt is not an unanswered host"
-            );
-            let reason = entry.reason.as_deref().unwrap_or("");
-            assert!(
-                reason.contains("declined password prompt"),
-                "glass must show the credential miss, not the stale host line: {reason}"
-            );
-            assert!(
-                !reason.contains("did not answer"),
-                "stale HostUnreachable must not survive the credential step: {reason}"
-            );
-        }
-        assert!(
-            rt.unreachable_poll_pass().await.is_empty(),
-            "Permanent credential miss is not the unreachable poll's business"
-        );
-        assert!(
-            rt.remount_retry_pass().await.is_empty(),
-            "Permanent credential miss must not remount-storm"
-        );
-        assert_eq!(
-            executor.calls.lock().await.len(),
-            0,
-            "no mount helper after a cancelled prompt"
-        );
-    }
-
-    /// Regression: cancelling the collapsed prompt must wake ALL
-    /// waiters with the exact CredentialPromptCancelled outcome
-    /// (not fall into a re-prompt loop that leaves waiters
-    /// parked). An earlier Notify-based dedup allowed this
-    /// symptom because waiters re-entered ensure_credential_stocked
-    /// on wake and issued their own prompts instead of receiving
-    /// the first caller's outcome.
-    #[tokio::test]
-    async fn ensure_credential_stocked_cancel_wakes_all_dedup_waiters() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-
-        // Prompter blocks on a Notify until the test releases
-        // it, then returns Ok(None) (operator cancelled). Also
-        // counts calls so we can assert exactly one prompt was
-        // issued across two concurrent callers.
-        #[derive(Debug)]
-        struct BlockingCancelPrompter {
-            release: tokio::sync::Notify,
-            calls: AtomicU32,
-        }
-        #[async_trait]
-        impl PasswordPrompter for BlockingCancelPrompter {
-            async fn prompt_password(
-                &self,
-                _label: String,
-            ) -> Result<Option<Vec<u8>>, ReportError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.release.notified().await;
-                Ok(None)
-            }
-        }
-
-        let prompter = Arc::new(BlockingCancelPrompter {
-            release: tokio::sync::Notify::new(),
-            calls: AtomicU32::new(0),
-        });
-        let executor = ScriptedExecutor::new(Vec::new());
-        let rt = Arc::new(
-            NetworkSharesRuntime::builder(&dir)
-                .unwrap()
-                .with_executor(executor)
-                .with_credential_store(store as Arc<dyn CredentialStore>)
-                .with_password_prompter(
-                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-                )
-                .build(),
-        );
-
-        // Two records sharing the same credential_key so both
-        // enter the same dedup slot.
-        let mut record_a = built_record("share_a", "192.0.2.90");
-        record_a.credentials = Credentials::UserPassword {
-            username: "op".to_string(),
-            credential_key: "shared_key".to_string(),
-            domain: None,
-        };
-        let mut record_b = built_record("share_b", "192.0.2.91");
-        record_b.credentials = Credentials::UserPassword {
-            username: "op".to_string(),
-            credential_key: "shared_key".to_string(),
-            domain: None,
-        };
-        rt.add_share(record_a.clone()).await.unwrap();
-        rt.add_share(record_b.clone()).await.unwrap();
-
-        // Spawn both concurrently. First to enter becomes the
-        // first-caller; second becomes a dedup waiter.
-        let rt_a = Arc::clone(&rt);
-        let rt_b = Arc::clone(&rt);
-        let handle_a = tokio::spawn(async move {
-            rt_a.ensure_credential_stocked(&record_a).await
-        });
-        let handle_b = tokio::spawn(async move {
-            rt_b.ensure_credential_stocked(&record_b).await
-        });
-
-        // Give both tasks a moment to reach their await points.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Exactly one prompt fired.
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "dedup must collapse concurrent callers to one prompt"
-        );
-
-        // Fire the cancel (prompter returns None).
-        prompter.release.notify_waiters();
-
-        // Both callers must resolve with CredentialPromptCancelled
-        // within a tight window — no re-prompt, no 30s hang.
-        let a_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle_a)
-                .await
-                .expect("first caller must resolve fast")
-                .expect("task join");
-        let b_result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle_b,
-        )
-        .await
-        .expect("dedup waiter must resolve fast (cancel-wakes-all regression)")
-        .expect("task join");
-
-        assert!(
-            matches!(
-                &a_result,
-                Err(MountError::CredentialPromptCancelled { key })
-                    if key == "shared_key"
-            ),
-            "first caller expected CredentialPromptCancelled, got: {:?}",
-            a_result
-        );
-        assert!(
-            matches!(
-                &b_result,
-                Err(MountError::CredentialPromptCancelled { key })
-                    if key == "shared_key"
-            ),
-            "dedup waiter expected the SAME cancel outcome without \
-             re-prompting; got: {:?}",
-            b_result
-        );
-
-        // Exactly one prompt still — waiter did not re-issue.
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "waiter must NOT re-prompt on wake (cancel-wakes-all regression)"
-        );
-    }
-
-    /// Regression: NoResponderAvailable must propagate through
-    /// the dedup path so both first-caller AND dedup-waiter
-    /// receive the specific MountError variant (not a generic
-    /// CredentialPromptFailed).
-    #[tokio::test]
-    async fn ensure_credential_stocked_no_responder_propagates_to_waiters() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-
-        // Prompter returns the framework's fast-refuse message
-        // shape (starts with `no_responder_available:`).
-        #[derive(Debug)]
-        struct NoResponderPrompter {
-            release: tokio::sync::Notify,
-            calls: AtomicU32,
-        }
-        #[async_trait]
-        impl PasswordPrompter for NoResponderPrompter {
-            async fn prompt_password(
-                &self,
-                _label: String,
-            ) -> Result<Option<Vec<u8>>, ReportError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.release.notified().await;
-                Err(ReportError::Invalid(
-                    "no_responder_available: no user-interaction \
-                     responder session is currently connected"
-                        .into(),
-                ))
-            }
-        }
-
-        let prompter = Arc::new(NoResponderPrompter {
-            release: tokio::sync::Notify::new(),
-            calls: AtomicU32::new(0),
-        });
-        let executor = ScriptedExecutor::new(Vec::new());
-        let rt = Arc::new(
-            NetworkSharesRuntime::builder(&dir)
-                .unwrap()
-                .with_executor(executor)
-                .with_credential_store(store as Arc<dyn CredentialStore>)
-                .with_password_prompter(
-                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-                )
-                .build(),
-        );
-
-        let mut record_a = built_record("share_a", "192.0.2.92");
-        record_a.credentials = Credentials::UserPassword {
-            username: "op".to_string(),
-            credential_key: "no_responder_key".to_string(),
-            domain: None,
-        };
-        let mut record_b = built_record("share_b", "192.0.2.93");
-        record_b.credentials = Credentials::UserPassword {
-            username: "op".to_string(),
-            credential_key: "no_responder_key".to_string(),
-            domain: None,
-        };
-        rt.add_share(record_a.clone()).await.unwrap();
-        rt.add_share(record_b.clone()).await.unwrap();
-
-        let rt_a = Arc::clone(&rt);
-        let rt_b = Arc::clone(&rt);
-        let handle_a = tokio::spawn(async move {
-            rt_a.ensure_credential_stocked(&record_a).await
-        });
-        let handle_b = tokio::spawn(async move {
-            rt_b.ensure_credential_stocked(&record_b).await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        prompter.release.notify_waiters();
-
-        let a_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle_a)
-                .await
-                .expect("first caller resolves fast")
-                .expect("task join");
-        let b_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle_b)
-                .await
-                .expect("waiter resolves fast")
-                .expect("task join");
-
-        assert!(
-            matches!(
-                &a_result,
-                Err(MountError::NoResponderAvailable { key, .. })
-                    if key == "no_responder_key"
-            ),
-            "first caller expected NoResponderAvailable, got: {:?}",
-            a_result
-        );
-        assert!(
-            matches!(
-                &b_result,
-                Err(MountError::NoResponderAvailable { key, .. })
-                    if key == "no_responder_key"
-            ),
-            "dedup waiter expected the SAME NoResponderAvailable \
-             outcome; got: {:?}",
-            b_result
-        );
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "only one prompt call across two concurrent callers"
-        );
-    }
-
-    /// Contract: N concurrent same-key adds must collapse to
-    /// EXACTLY ONE prompt at the prompter level. Under an
-    /// earlier CellOnDrop pattern that removed the map entry
-    /// synchronously with the first caller's exit, peers
-    /// arriving during the removal window inserted fresh cells
-    /// and re-prompted — the rig observed non-deterministic
-    /// prompt counts. The `OnceCell` guarantees exactly one
-    /// closure runs per key for the entire batch's lifetime;
-    /// this test pins that invariant at N = 20.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stress_20_concurrent_same_key_collapses_to_one_prompt() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        const N: usize = 20;
-
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-
-        // Prompter blocks until we release, then returns the
-        // supplied answer. Counts prompt_password calls so we can
-        // assert exactly one across 20 concurrent callers.
-        #[derive(Debug)]
-        struct BlockingAnswerPrompter {
-            release: tokio::sync::Notify,
-            calls: AtomicU32,
-        }
-        #[async_trait]
-        impl PasswordPrompter for BlockingAnswerPrompter {
-            async fn prompt_password(
-                &self,
-                _label: String,
-            ) -> Result<Option<Vec<u8>>, ReportError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.release.notified().await;
-                Ok(Some(b"answered-once".to_vec()))
-            }
-        }
-
-        let prompter = Arc::new(BlockingAnswerPrompter {
-            release: tokio::sync::Notify::new(),
-            calls: AtomicU32::new(0),
-        });
-        let executor = ScriptedExecutor::new(Vec::new());
-        let rt = Arc::new(
-            NetworkSharesRuntime::builder(&dir)
-                .unwrap()
-                .with_executor(executor)
-                .with_credential_store(store as Arc<dyn CredentialStore>)
-                .with_password_prompter(
-                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-                )
-                .build(),
-        );
-
-        // Add N records, all keyed on the SAME credential_key.
-        let mut records = Vec::with_capacity(N);
-        for i in 0..N {
-            let mut r = built_record(
-                &format!("stress_share_{i}"),
-                &format!("192.0.2.{}", 100 + i),
-            );
-            r.credentials = Credentials::UserPassword {
-                username: "op".to_string(),
-                credential_key: "stress_shared_key".to_string(),
-                domain: None,
-            };
-            rt.add_share(r.clone()).await.unwrap();
-            records.push(r);
-        }
-
-        // Spawn all N callers concurrently. Under the OnceCell
-        // dedup all N should await the same in-flight init and
-        // resolve together when we release the prompter.
-        let mut handles = Vec::with_capacity(N);
-        for r in records {
-            let rt_c = Arc::clone(&rt);
-            handles.push(tokio::spawn(async move {
-                rt_c.ensure_credential_stocked(&r).await
-            }));
-        }
-
-        // Give every task time to reach its `get_or_init.await`.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // Exactly ONE prompt fired across 20 concurrent callers.
-        // Prior to the OnceCell fix this asserted non-
-        // deterministically (0..N calls depending on scheduling).
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "20 concurrent same-key callers must produce exactly ONE \
-             prompt (dedup collapse under concurrent dispatch); got {} calls",
-            prompter.calls.load(Ordering::SeqCst),
-        );
-
-        // Answer once — every caller must wake with Ok(()).
-        prompter.release.notify_waiters();
-
-        for (i, h) in handles.into_iter().enumerate() {
-            let outcome =
-                tokio::time::timeout(std::time::Duration::from_secs(3), h)
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                    "caller {i} did not resolve within 3s of the shared \
-                     answer — cancel-wake-all/answer-wake-all invariant \
-                     broken under concurrent dispatch"
-                )
-                    })
-                    .expect("task join");
-            assert!(
-                outcome.is_ok(),
-                "caller {i} expected Ok after shared answer; got {outcome:?}"
-            );
-        }
-
-        // Still exactly one prompt after every waiter woke — no
-        // waiter re-prompted on wake (retires the pre-fix defect
-        // where waiters re-entered ensure_credential_stocked and
-        // issued their own prompts).
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "waiter re-prompted on wake; exactly one prompt should \
-             remain in the counter after every waiter resolved",
-        );
-    }
-
-    /// Contract: a real prompter answer wakes every waiter within
-    /// a bounded ceiling. Symmetric to the cancel-wakes-all test —
-    /// this one exercises the ANSWER-wakes-all branch (Success
-    /// outcome, credential stored, all waiters return Ok).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ensure_credential_stocked_answer_wakes_all_dedup_waiters() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-
-        #[derive(Debug)]
-        struct BlockingAnswerPrompter {
-            release: tokio::sync::Notify,
-            calls: AtomicU32,
-        }
-        #[async_trait]
-        impl PasswordPrompter for BlockingAnswerPrompter {
-            async fn prompt_password(
-                &self,
-                _label: String,
-            ) -> Result<Option<Vec<u8>>, ReportError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.release.notified().await;
-                Ok(Some(b"real-answer".to_vec()))
-            }
-        }
-
-        let prompter = Arc::new(BlockingAnswerPrompter {
-            release: tokio::sync::Notify::new(),
-            calls: AtomicU32::new(0),
-        });
-        let executor = ScriptedExecutor::new(Vec::new());
-        let rt = Arc::new(
-            NetworkSharesRuntime::builder(&dir)
-                .unwrap()
-                .with_executor(executor)
-                .with_credential_store(store as Arc<dyn CredentialStore>)
-                .with_password_prompter(
-                    Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-                )
-                .build(),
-        );
-
-        let mut r_a = built_record("share_a", "192.0.2.190");
-        r_a.credentials = Credentials::UserPassword {
-            username: "op".into(),
-            credential_key: "answer_key".into(),
-            domain: None,
-        };
-        let mut r_b = built_record("share_b", "192.0.2.191");
-        r_b.credentials = Credentials::UserPassword {
-            username: "op".into(),
-            credential_key: "answer_key".into(),
-            domain: None,
-        };
-        rt.add_share(r_a.clone()).await.unwrap();
-        rt.add_share(r_b.clone()).await.unwrap();
-
-        let rt_a = Arc::clone(&rt);
-        let rt_b = Arc::clone(&rt);
-        let h_a =
-            tokio::spawn(
-                async move { rt_a.ensure_credential_stocked(&r_a).await },
-            );
-        let h_b =
-            tokio::spawn(
-                async move { rt_b.ensure_credential_stocked(&r_b).await },
-            );
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
-
-        prompter.release.notify_waiters();
-
-        let out_a =
-            tokio::time::timeout(std::time::Duration::from_secs(2), h_a)
-                .await
-                .expect("first caller resolves under 2s of answer")
-                .expect("task join");
-        let out_b =
-            tokio::time::timeout(std::time::Duration::from_secs(2), h_b)
-                .await
-                .expect("waiter resolves under 2s of answer")
-                .expect("task join");
-        assert!(out_a.is_ok(), "first caller Ok on answer; got {out_a:?}");
-        assert!(
-            out_b.is_ok(),
-            "waiter Ok on answer without re-prompting; got {out_b:?}"
-        );
-
-        assert_eq!(
-            prompter.calls.load(Ordering::SeqCst),
-            1,
-            "waiter must not re-prompt on wake"
-        );
-    }
-
-    #[tokio::test]
-    async fn mount_cifs_userpassword_reuses_stored_password_without_reprompting(
-    ) {
-        // Pre-populate the store, then mount. The prompter must
-        // not fire because the vault already carries the entry.
-        let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-        store
-            .store_password("cached_key", b"already_stored")
-            .await
-            .unwrap();
-        let prompter = Arc::new(RecordingPrompter::default());
-        let executor = ScriptedExecutor::new(vec![CommandOutput {
-            exit_code: Some(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }]);
-        let rt = NetworkSharesRuntime::builder(&dir)
-            .unwrap()
-            .with_executor(executor)
-            .with_credential_store(store as Arc<dyn CredentialStore>)
-            .with_password_prompter(
-                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
-            )
-            .build();
-
-        let mut record = built_record("auth_cached", "192.0.2.34");
-        record.credentials = Credentials::UserPassword {
-            username: "engineer".to_string(),
-            credential_key: "cached_key".to_string(),
-            domain: None,
-        };
-        let id = record.share_id.clone();
-        rt.add_share(record).await.unwrap();
-
-        rt.mount_share(&id)
-            .await
-            .expect("mount should succeed against cached credential");
-        assert_eq!(
-            *prompter.calls.lock().unwrap(),
-            0,
-            "prompter must not fire when the vault already carries the entry"
-        );
-    }
-
-    // -----------------------------------------------------------
-    // Ship 2d: NFS mount + unmount + /proc/mounts parse tests
-    // -----------------------------------------------------------
 
     #[test]
     fn build_nfs_mount_args_defaults() {
@@ -11903,7 +10740,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     async fn add_whose_mount_fails_keeps_the_record_and_names_the_failure() {
         // A mount that failed for a reason the operator can act
         // on keeps the share: they retry with
-        // `network.share.mount`, which re-prompts. The add still
+        // `network.share.mount`. The add still
         // answers Ok, and the body carries the reason so the
         // glass can render it not-ok instead of a bare success.
         let dir = tempdir();
@@ -11963,80 +10800,103 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         );
     }
 
+    /// Empty vault, UserPassword: Connect raises no card and
+    /// the share stays Unmounted.
+    ///
+    /// This path used to open a password card, so a share with
+    /// no stored secret asked for one on Connect, on boot
+    /// remount, and on every restart after an overlay. The
+    /// operator now stocks the secret in Add / Edit, and
+    /// mounting spends what is already in the vault or refuses
+    /// and says which key is missing.
     #[tokio::test]
-    async fn add_refused_by_no_responder_leaves_no_record_behind() {
-        // The other arm, pinned in the same sitting so keep and
-        // rollback cannot be collapsed into one. No responder
-        // session was connected, so the operator never saw the
-        // prompt and never consented to keeping anything. The
-        // verb fails and the half-added record goes with it.
+    async fn an_empty_vault_connect_raises_no_card_and_stays_unmounted() {
         let dir = tempdir();
-        let creds_root = dir.join("credentials");
-        std::fs::create_dir_all(&creds_root).unwrap();
-        let store = Arc::new(FileCredentialStore::new(creds_root));
-
-        #[derive(Debug)]
-        struct NoResponderPrompter;
-        #[async_trait]
-        impl PasswordPrompter for NoResponderPrompter {
-            async fn prompt_password(
-                &self,
-                _label: String,
-            ) -> Result<Option<Vec<u8>>, ReportError> {
-                Err(ReportError::Invalid(
-                    "no_responder_available: no user-interaction \
-                     responder session is currently connected"
-                        .into(),
-                ))
-            }
-        }
-
-        let executor = ScriptedExecutor::new(Vec::new());
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        // A real store, wired and empty. Without one the path
+        // short-circuits on CredentialStoreUnavailable and never
+        // reaches the question this pin is about.
+        let store = Arc::new(FileCredentialStore::new(dir.join("creds")));
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
-            .with_executor(executor)
-            .with_credential_store(store as Arc<dyn CredentialStore>)
-            .with_password_prompter(
-                Arc::new(NoResponderPrompter) as Arc<dyn PasswordPrompter>
-            )
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
             .with_mount_timeout_ms(1_000)
-            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_credential_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>
+            )
+            .with_mount_point_check(Arc::new(|_: &Path| false))
             .build();
-        let req = AddShareRequest {
-            alias: "No Responder".to_string(),
-            fstype: FsType::Cifs,
-            host: "192.0.2.32".to_string(),
-            path: "Music".to_string(),
-            credentials: Credentials::UserPassword {
-                username: "op".to_string(),
-                credential_key: "absent_from_the_vault".to_string(),
-                domain: None,
-            },
-            advanced_options: String::new(),
-            password: None,
+
+        let mut record = built_record("empty_vault", "192.0.2.40");
+        record.credentials = Credentials::UserPassword {
+            username: "someone".to_string(),
+            credential_key: "share_empty_vault".to_string(),
+            domain: None,
         };
-        let payload = serde_json::to_vec(&req).unwrap();
+        let id = record.share_id.clone();
+        rt.add_share(record).await.ok();
 
         let err = rt
-            .dispatch_verb("network.share.add", &payload)
+            .mount_share(&id)
             .await
-            .expect_err("no responder is a refused add, not a body");
+            .expect_err("an empty vault cannot mount");
         assert!(
-            matches!(
-                err,
-                VerbDispatchError::Mount(
-                    MountError::NoResponderAvailable { .. }
-                )
-            ),
-            "the specific variant reaches the caller: {err:?}",
+            matches!(err, MountError::CredentialMissing { .. }),
+            "the refusal names the missing credential: {err:?}",
+        );
+        assert!(
+            executor.calls.lock().await.is_empty(),
+            "no mount helper is spent on a share with no secret",
         );
 
-        let configured = rt.list_configured().await.unwrap();
-        assert!(
-            configured.is_empty(),
-            "the record is rolled back, not left behind: {:?}",
-            configured.iter().map(|r| &r.alias).collect::<Vec<_>>(),
+        let g = rt.share_states.lock().await;
+        let entry = g.get(&id).expect("state recorded");
+        assert_eq!(
+            entry.state,
+            MountState::Unmounted,
+            "an empty vault stays Unmounted, not Failed",
         );
+        assert_eq!(
+            entry.failure_class,
+            Some(FailureClass::Permanent),
+            "no cadence storm against a share with no secret",
+        );
+    }
+
+    /// The structural half: this plugin holds no prompter, so a
+    /// card cannot rise from any path in it.
+    ///
+    /// The behavioural pin above proves one route is quiet.
+    /// This one proves there is no route: no prompt is raised
+    /// and no prompter is held anywhere in the runtime. It is
+    /// what reddens if a later sitting wires one back in
+    /// without opening this row.
+    #[test]
+    fn the_shares_runtime_holds_no_password_prompter() {
+        let src = include_str!("runtime.rs");
+        // Inside the module's own code, not in the prose that
+        // explains why the prompter is gone.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Built at runtime, not written out: a literal here
+        // would be a hit on this file and the pin would fail on
+        // itself.
+        let forbidden = [
+            format!("prompt_{}(", "password"),
+            format!("request_from_{}(", "operator"),
+            format!("request_user_{}(", "interaction"),
+        ];
+        for forbidden in forbidden {
+            assert!(
+                !code.contains(&forbidden),
+                "network.shares must raise no password card, and \
+                 `{forbidden}` is a call that raises one",
+            );
+        }
     }
 
     #[tokio::test]
@@ -12050,19 +10910,12 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let creds_root = dir.join("credentials");
         std::fs::create_dir_all(&creds_root).unwrap();
         let store = Arc::new(FileCredentialStore::new(creds_root));
-        let prompter = Arc::new(RecordingPrompter {
-            answer: std::sync::Mutex::new(Some(b"should-not-be-used".to_vec())),
-            calls: std::sync::Mutex::new(0),
-        });
         let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
             .with_credential_store(
                 Arc::clone(&store) as Arc<dyn CredentialStore>
-            )
-            .with_password_prompter(
-                Arc::clone(&prompter) as Arc<dyn PasswordPrompter>
             )
             .with_mount_timeout_ms(1_000)
             .with_now_fn(Arc::new(|| 1_700_000_777_000))
@@ -12090,11 +10943,12 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             serde_json::from_slice(&bytes).unwrap();
         assert!(response.mount_error.is_none(), "{response:?}");
         assert!(response.mount_report.is_some());
-        assert_eq!(
-            *prompter.calls.lock().unwrap(),
-            0,
-            "the dialog password must not raise a prompt card"
-        );
+        // No prompt card is possible here any more: this plugin
+        // holds no prompter at all, and the structural pin
+        // below keeps it that way. What this still proves is
+        // the half that matters to the operator — the dialog's
+        // secret reached the vault and the mount spent it.
+
         let stored = store
             .fetch_password("share.dialog_secret")
             .await

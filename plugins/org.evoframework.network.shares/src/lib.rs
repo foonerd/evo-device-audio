@@ -249,10 +249,11 @@ impl Plugin for NetworkSharesPlugin {
             // per-verb failure_mode.
 
             // Open the runtime against the plugin's state_dir
-            // via the builder so we can wire the credential store
-            // and the framework's user-interaction responder for
-            // the prompt-on-mount flow. Guest shares never need
-            // either handle; UserPassword shares need both.
+            // via the builder so we can wire the credential
+            // store. No user-interaction handle is wired: this
+            // plugin raises no password card, and a UserPassword
+            // share mounts from what the Add / Edit dialog
+            // already stocked. Guest shares need neither.
             //
             // Credential-store binding: prefer the framework
             // credential vault via LoadContext when populated (single
@@ -305,10 +306,6 @@ impl Plugin for NetworkSharesPlugin {
                         ctx.credentials_dir.clone(),
                     ))
                 };
-            let prompter =
-                Arc::new(crate::runtime::FrameworkPasswordPrompter::new(
-                    Arc::clone(&ctx.user_interaction_requester),
-                ));
             // Detect effective UID so we know whether the mount
             // helper needs `sudo -n` wrapping. Root plugins call
             // `mount` directly; non-root plugins need the
@@ -337,7 +334,6 @@ impl Plugin for NetworkSharesPlugin {
                         ))
                     })?
                     .with_credential_store(credential_store)
-                    .with_password_prompter(prompter)
                     .with_sudo_wrapping(needs_sudo)
                     .with_l3_gate(connectivity_l3_gate(ctx))
                     // Installed here, not defaulted in the builder,
@@ -492,25 +488,28 @@ fn verb_error_to_plugin_error(e: VerbDispatchError) -> PluginError {
         | VerbDispatchError::Persistence(_) => {
             PluginError::Permanent(e.to_string())
         }
-        // NoResponderAvailable: carry the distinct subclass end-
-        // to-end through the plugin error chain. Message is the
+        // CredentialMissing: carry the distinct subclass end-to-
+        // end through the plugin error chain. Message is the
         // plugin's clean operator-authoritative text — the
         // framework's plugin_error_to_wire_error will surface it
         // unwrapped, no nested "transient error: verb execution
         // failed (mount):" prefix stack.
-        VerbDispatchError::Mount(MountError::NoResponderAvailable {
-            key,
-            reason: _,
-        }) => PluginError::WithSubclass {
-            class: ErrorClass::PermissionDenied,
-            subclass: "no_responder_available".into(),
-            message: format!(
-                "network.share mutation refused: no user-interaction \
-                 responder session is currently connected to answer \
-                 the password prompt for credential key {key}. Try \
-                 again after a session claims the responder slot."
-            ),
-        },
+        //
+        // Permission-denied rather than transient: no amount of
+        // retrying supplies a secret. The operator stocks it in
+        // the Add / Edit dialog and then connects.
+        VerbDispatchError::Mount(MountError::CredentialMissing { key }) => {
+            PluginError::WithSubclass {
+                class: ErrorClass::PermissionDenied,
+                subclass: "credential_missing".into(),
+                message: format!(
+                    "network.share mutation refused: no password is \
+                     stored for credential key {key}. Add the \
+                     password on the share's Edit dialog, then \
+                     connect."
+                ),
+            }
+        }
         VerbDispatchError::Mount(_) => PluginError::Transient(e.to_string()),
         VerbDispatchError::ResponseSerialise { .. } => {
             PluginError::Permanent(e.to_string())
