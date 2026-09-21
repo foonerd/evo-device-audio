@@ -70,12 +70,35 @@ Cmnd_Alias EVO_NETWORK_SHARES_MOUNT = \
     /bin/mount, \
     /bin/umount
 
+# Force eject only. The operator has asked for the share to be
+# gone while something still holds it, and the detach has to
+# happen inside PID 1's mount namespace: `systemd-mount
+# --collect` attached the volume there, so a lazy detach from
+# the service's own namespace would drop only this view of it.
+#
+# ARGV-SCOPED, unlike the alias above, and deliberately so.
+# `nsenter` takes the command to run as an argument, so an
+# unscoped grant of this binary is a root shell for the asking
+# — a different class of grant from `mount` and `umount`,
+# which are bounded by what those binaries do. The shape below
+# is composed by `build_force_detach_argv`, which is pure and
+# pinned, so scoping it is stable rather than brittle: nothing
+# an operator types reaches this argv. The trailing wildcard
+# is the share's own mount point under the NAS root and
+# nothing else.
+Cmnd_Alias EVO_NETWORK_SHARES_FORCE_DETACH = \
+    /usr/bin/nsenter --mount=/proc/1/ns/mnt -- umount -l /var/lib/evo/music/NAS/*
+
 Cmnd_Alias EVO_NETWORK_SHARES_DISCOVERY = \
     /usr/bin/avahi-browse, \
     /usr/bin/smbclient
 
 Defaults!EVO_NETWORK_SHARES_MOUNT !pam_session, !syslog
+# Force is an operator gesture, not a cadence: it stays in the
+# journal. No !syslog here.
+Defaults!EVO_NETWORK_SHARES_FORCE_DETACH !pam_session
 Defaults!EVO_NETWORK_SHARES_DISCOVERY !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NETWORK_SHARES_MOUNT
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NETWORK_SHARES_FORCE_DETACH
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_NETWORK_SHARES_DISCOVERY

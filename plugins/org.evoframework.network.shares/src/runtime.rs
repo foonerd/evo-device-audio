@@ -2239,6 +2239,22 @@ pub fn build_umount_args(mount_root: &Path, lazy: bool) -> Vec<String> {
     args
 }
 
+/// USB Force parity: real lazy detach in PID 1's mount namespace.
+///
+/// Never names `systemd-umount`. `-l` is util-linux `umount`
+/// only. Callers prefix `sudo -n` when the service is
+/// sudo-wrapped.
+pub fn build_force_detach_argv(mount_root: &Path) -> Vec<String> {
+    vec![
+        "nsenter".to_string(),
+        "--mount=/proc/1/ns/mnt".to_string(),
+        "--".to_string(),
+        "umount".to_string(),
+        "-l".to_string(),
+        mount_root.to_string_lossy().into_owned(),
+    ]
+}
+
 /// Parse `/proc/mounts` contents for the NFS version negotiated
 /// for a given mount root. Returns the value of the `vers=` or
 /// `nfsvers=` option in the mount's option list, or `None` when
@@ -2656,6 +2672,20 @@ struct ShareStateEntry {
     /// `None` for every non-failure state.
     failure_class: Option<FailureClass>,
     negotiated_vers: Option<String>,
+    /// The operator forced this share off and has not asked for
+    /// it back.
+    ///
+    /// A forced detach lands Unmounted with no failure class,
+    /// which is exactly the shape [`NetworkSharesRuntime::
+    /// remount_retry_pass`] retries. Without this the next
+    /// cadence tick re-mounts the share the operator just
+    /// detached. Cleared by any mount the operator asks for.
+    ///
+    /// Set by the `network.share.unmount` verb — Disconnect and
+    /// Force alike, because both are the operator saying the
+    /// same thing. Not set by the edit cycle's internal
+    /// unmount, which is followed by a re-mount.
+    operator_detached: bool,
     last_transition_at_ms: u64,
 }
 
@@ -4032,6 +4062,9 @@ fn seed_share_states(
                     reason: None,
                     failure_class: None,
                     negotiated_vers: None,
+                    // Boot seed, not a gesture: a restart must
+                    // not inherit a forced detach.
+                    operator_detached: false,
                     last_transition_at_ms: now_ms,
                 },
             )
@@ -4456,136 +4489,7 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
         &self,
         share_id: &ShareId,
     ) -> Result<(), MountError> {
-        let record = {
-            let g = self.inner.lock().await;
-            g.state.find(share_id).cloned().ok_or_else(|| {
-                MountError::ShareNotFound {
-                    id: share_id.clone(),
-                }
-            })?
-        };
-        // Release MPD's hold BEFORE asking for the unmount.
-        //
-        // A queued or playing track under the share is an open
-        // file, a database walk under it is an open directory,
-        // and either is EBUSY. Nothing downstream rescues that:
-        // these shares are mounted by `systemd-mount --collect`,
-        // so the unmount is a unit stop and systemd runs its own
-        // `umount` without our argv — laziness there is the
-        // `LazyUnmount=` unit property, set at mount time, not a
-        // flag this call can pass. Field 11:28:54: `target is
-        // busy`, status 32, share still mounted, Activity saying
-        // failed to disconnect.
-        //
-        // So the hold is released here instead, and the umount
-        // is asked for afterwards. Awaited, not fire-and-forget:
-        // the point is to have let go before it runs.
-        await_mpd_release(&record.mount_root).await;
-        // CIFS asks for a lazy detach. Whether `-l` delivers one
-        // depends on which binary receives it, so ask.
-        let lazy = matches!(record.fstype, FsType::Cifs)
-            && umount_flag_l_is_lazy(effective_umount_program(
-                &self.umount_program,
-                &self.umount_wrapper_args,
-            ));
-        let args =
-            self.wrap_umount_args(build_umount_args(&record.mount_root, lazy));
-        let umount_program = self.umount_program.clone();
-        let output = self
-            .executor
-            .run(&umount_program, &args, self.mount_timeout_ms)
-            .await?;
-        let result = if output.exit_code == Some(0) {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            if is_busy_stderr(&stderr) {
-                // Still held after the release above: something
-                // outside our reach has it open — an in-flight
-                // database walk, an operator shell, another
-                // reader. Name it rather than reporting a
-                // subprocess line, so the glass can say who to
-                // stop instead of "that didn't work".
-                let probe = Arc::clone(&self.holder_probe);
-                let root = record.mount_root.clone();
-                let holders = tokio::task::spawn_blocking(move || probe(&root))
-                    .await
-                    .unwrap_or_default();
-                Err(MountError::Busy {
-                    id: share_id.clone(),
-                    holders,
-                })
-            } else {
-                Err(MountError::MountFailed {
-                    id: share_id.clone(),
-                    exit_code: output.exit_code,
-                    stderr,
-                })
-            }
-        };
-        match &result {
-            Ok(()) => {
-                // The queue was released before the umount ran.
-                // Nothing to stop or prune here a second time.
-                self.set_share_state(
-                    share_id,
-                    MountState::Unmounted,
-                    None,
-                    None,
-                )
-                .await;
-                // Prune MPD's database rows under the vanished
-                // path so the Library projection does not surface
-                // dead entries until the next mount / restart.
-                trigger_mpd_update_best_effort(&record.mount_root);
-                self.publish_share_event(ShareEvent::unmounted(
-                    &record,
-                    (self.now_fn)(),
-                ))
-                .await;
-            }
-            Err(e) => {
-                // A failed unmount says nothing about whether the
-                // share is mounted. `umount` refuses a busy target
-                // routinely — something is reading a file, MPD is
-                // mid-scan — and the mount is left exactly as it
-                // was: healthy, serving, still in the mount table.
-                //
-                // Recording Failed there is a lie the operator can
-                // see: the tile reads Failed over a share they are
-                // listening to, and the remount pass then treats a
-                // live mount as something to retry.
-                //
-                // The OS is the authority. If the path is still a
-                // mount point, the state stays Mounted and only the
-                // event reports the refusal.
-                if (self.mount_point_check)(&record.mount_root) {
-                    // Keep the negotiated dialect: nothing about it
-                    // changed, and dropping it would make the next
-                    // mount re-walk the ladder for no reason.
-                    let negotiated = {
-                        let g = self.share_states.lock().await;
-                        g.get(share_id).and_then(|e| e.negotiated_vers.clone())
-                    };
-                    self.set_share_state(
-                        share_id,
-                        MountState::Mounted,
-                        None,
-                        negotiated,
-                    )
-                    .await;
-                } else {
-                    self.set_share_failed(share_id, e).await;
-                }
-                self.publish_share_event(ShareEvent::unmount_failed(
-                    &record,
-                    format!("{e}"),
-                    (self.now_fn)(),
-                ))
-                .await;
-            }
-        }
-        result
+        self.unmount_share_ex(share_id, false).await
     }
 
     async fn list_discovered(&self) -> Vec<DiscoveredNas> {
@@ -4956,6 +4860,134 @@ impl NetworkSharesRuntime {
         let mut full = self.umount_wrapper_args.clone();
         full.extend(umount_args);
         full
+    }
+
+    /// Force argv: USB mechanic. Never wraps `systemd-umount`.
+    fn force_detach_invocation(
+        &self,
+        mount_root: &Path,
+    ) -> (String, Vec<String>) {
+        let argv = build_force_detach_argv(mount_root);
+        if self.umount_program == "sudo" {
+            let mut args = vec!["-n".to_string()];
+            args.extend(argv);
+            ("sudo".to_string(), args)
+        } else {
+            ("nsenter".to_string(), argv.into_iter().skip(1).collect())
+        }
+    }
+
+    /// Disconnect (`force = false`) or USB-parity Force (`force = true`).
+    /// Record that the operator asked for this share to be
+    /// detached, so the remount cadence leaves it alone until
+    /// they ask for it back.
+    ///
+    /// Reconnect spends the memory: any Mounting / Mounted
+    /// transition clears it.
+    async fn remember_operator_detach(&self, share_id: &ShareId) {
+        let mut g = self.share_states.lock().await;
+        if let Some(entry) = g.get_mut(share_id) {
+            entry.operator_detached = true;
+        }
+    }
+
+    async fn unmount_share_ex(
+        &self,
+        share_id: &ShareId,
+        force: bool,
+    ) -> Result<(), MountError> {
+        let record = {
+            let g = self.inner.lock().await;
+            g.state.find(share_id).cloned().ok_or_else(|| {
+                MountError::ShareNotFound {
+                    id: share_id.clone(),
+                }
+            })?
+        };
+        await_mpd_release(&record.mount_root).await;
+        let (umount_program, args) = if force {
+            self.force_detach_invocation(&record.mount_root)
+        } else {
+            let lazy = matches!(record.fstype, FsType::Cifs)
+                && umount_flag_l_is_lazy(effective_umount_program(
+                    &self.umount_program,
+                    &self.umount_wrapper_args,
+                ));
+            (
+                self.umount_program.clone(),
+                self.wrap_umount_args(build_umount_args(
+                    &record.mount_root,
+                    lazy,
+                )),
+            )
+        };
+        let output = self
+            .executor
+            .run(&umount_program, &args, self.mount_timeout_ms)
+            .await?;
+        let result = if output.exit_code == Some(0) {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if !force && is_busy_stderr(&stderr) {
+                let probe = Arc::clone(&self.holder_probe);
+                let root = record.mount_root.clone();
+                let holders = tokio::task::spawn_blocking(move || probe(&root))
+                    .await
+                    .unwrap_or_default();
+                Err(MountError::Busy {
+                    id: share_id.clone(),
+                    holders,
+                })
+            } else {
+                Err(MountError::MountFailed {
+                    id: share_id.clone(),
+                    exit_code: output.exit_code,
+                    stderr,
+                })
+            }
+        };
+        match &result {
+            Ok(()) => {
+                self.set_share_state(
+                    share_id,
+                    MountState::Unmounted,
+                    None,
+                    None,
+                )
+                .await;
+                trigger_mpd_update_best_effort(&record.mount_root);
+                self.publish_share_event(ShareEvent::unmounted(
+                    &record,
+                    (self.now_fn)(),
+                ))
+                .await;
+            }
+            Err(e) => {
+                if (self.mount_point_check)(&record.mount_root) {
+                    let negotiated = {
+                        let g = self.share_states.lock().await;
+                        g.get(share_id).and_then(|e| e.negotiated_vers.clone())
+                    };
+                    self.set_share_state(
+                        share_id,
+                        MountState::Mounted,
+                        None,
+                        negotiated,
+                    )
+                    .await;
+                } else {
+                    self.set_share_failed(share_id, e).await;
+                }
+                self.publish_share_event(ShareEvent::unmount_failed(
+                    &record,
+                    format!("{e}"),
+                    (self.now_fn)(),
+                ))
+                .await;
+            }
+        }
+        result
     }
 
     /// Stage a credentials file at `<state_dir>/.mount-creds-<share_id>`
@@ -5666,6 +5698,7 @@ impl NetworkSharesRuntime {
                 reason: None,
                 failure_class: None,
                 negotiated_vers: None,
+                operator_detached: false,
                 last_transition_at_ms: now_ms,
             });
             entry.state = state;
@@ -5675,6 +5708,14 @@ impl NetworkSharesRuntime {
             // again if it later drops out.
             entry.failure_class = failure_class;
             entry.negotiated_vers = negotiated_vers;
+            // A share that is mounting or mounted is one the
+            // operator asked back, so the forced-off memory is
+            // spent. Every other transition leaves it alone —
+            // in particular the Unmounted that Force itself
+            // writes, which is stamped just after this call.
+            if matches!(state, MountState::Mounted | MountState::Mounting) {
+                entry.operator_detached = false;
+            }
             entry.last_transition_at_ms = now_ms;
             Some(entry.to_envelope(share_id))
         };
@@ -5701,6 +5742,8 @@ impl NetworkSharesRuntime {
                 reason: None,
                 failure_class: None,
                 negotiated_vers: None,
+                // A newly added share was never forced off.
+                operator_detached: false,
                 last_transition_at_ms: now_ms,
             };
             let envelope = entry.to_envelope(&record.share_id);
@@ -6007,6 +6050,10 @@ impl NetworkSharesRuntime {
                 .filter(|(_, e)| {
                     e.failure_class != Some(FailureClass::Permanent)
                 })
+                // A share the operator forced off stays off. The
+                // cadence exists to bring back what fell over,
+                // not to undo a gesture. Reconnect clears it.
+                .filter(|(_, e)| !e.operator_detached)
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -6217,6 +6264,10 @@ pub struct MountShareResponse {
 pub struct UnmountShareRequest {
     /// The share to unmount.
     pub share_id: ShareId,
+    /// USB-parity Force. Absent / false is clean Disconnect.
+    /// `true` lazy-detaches in PID 1's mount namespace.
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 /// Response payload for `network.share.unmount`.
@@ -6493,7 +6544,26 @@ impl NetworkSharesRuntime {
             "network.share.unmount" => {
                 let req: UnmountShareRequest =
                     decode_payload(request_type, payload_bytes)?;
-                self.unmount_share(&req.share_id).await?;
+                self.unmount_share_ex(
+                    &req.share_id,
+                    req.force.unwrap_or(false),
+                )
+                .await?;
+                // The operator asked for this share to be off,
+                // by Disconnect or by Force. Remember it:
+                // Unmounted with no failure class is exactly
+                // what the remount cadence retries, so without
+                // this the share is back within the tick and
+                // the gesture reads as ignored.
+                //
+                // Stamped here rather than inside the unmount
+                // itself because the edit cycle unmounts too,
+                // and that is plumbing, not a gesture. Nothing
+                // breaks if it is stamped there — the Mounting
+                // transition that follows clears it either way
+                // — so this placement is about the flag meaning
+                // one thing: the operator asked.
+                self.remember_operator_detach(&req.share_id).await;
                 encode_response(request_type, &UnmountShareResponse {})
             }
             "network.discovery.refresh" => {
@@ -8093,6 +8163,49 @@ mount error(13): Permission denied",
         );
     }
 
+    #[tokio::test]
+    async fn force_unmount_is_nsenter_umount_l_never_systemd_umount() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![CommandOutput {
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_sudo_wrapping(true)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("force_share", "192.0.2.33");
+        let id = record.share_id.clone();
+        let mount_root = record.mount_root.clone();
+        rt.add_share(record).await.unwrap();
+
+        rt.unmount_share_ex(&id, true).await.unwrap();
+
+        let calls = executor.calls.lock().await;
+        let (program, args) = calls.last().expect("force ran");
+        assert_eq!(program, "sudo");
+        assert_eq!(
+            args,
+            &vec![
+                "-n".to_string(),
+                "nsenter".to_string(),
+                "--mount=/proc/1/ns/mnt".to_string(),
+                "--".to_string(),
+                "umount".to_string(),
+                "-l".to_string(),
+                mount_root.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(!args.iter().any(|s| s.contains("systemd-umount")));
+        let g = rt.share_states.lock().await;
+        assert_eq!(g.get(&id).expect("state").state, MountState::Unmounted);
+    }
+
     /// The other direction. Where `-l` does mean lazy detach,
     /// CIFS still gets it — removing the flag everywhere would
     /// drop real busy-file safety on the util-linux path.
@@ -9519,6 +9632,25 @@ mount error(13): Permission denied",
         );
     }
 
+    #[test]
+    fn force_detach_argv_is_nsenter_umount_l_never_systemd() {
+        let args = build_force_detach_argv(&PathBuf::from(
+            "/var/lib/evo/music/NAS/Audio",
+        ));
+        assert_eq!(
+            args,
+            vec![
+                "nsenter".to_string(),
+                "--mount=/proc/1/ns/mnt".to_string(),
+                "--".to_string(),
+                "umount".to_string(),
+                "-l".to_string(),
+                "/var/lib/evo/music/NAS/Audio".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|s| s.contains("systemd-umount")));
+    }
+
     /// `-l` reaches the binary at the end of the wrapper, not
     /// the one the runtime field names. Under sudo wrapping
     /// that field says `sudo`, and a decision taken on it alone
@@ -10635,6 +10767,219 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             let entry = g.values().next().expect("post-boot state");
             assert_eq!(entry.state, MountState::Mounted);
         }
+    }
+
+    /// The argv the runtime sends and the argv sudoers permits
+    /// are one thing, and nothing else checks that.
+    ///
+    /// Force runs under `sudo -n`, and the grant for it is
+    /// argv-scoped precisely because an unscoped `nsenter` is a
+    /// root shell. That makes the two halves a matched pair: a
+    /// flag reordered here, or a path edited there, and Force
+    /// stops at a sudoers refusal on the box while every test
+    /// in this file stays green. This reads the shipped
+    /// template and holds them together.
+    #[test]
+    fn the_force_argv_is_the_argv_sudoers_grants() {
+        let argv = build_force_detach_argv(
+            &PathBuf::from(NAS_MOUNT_ROOT).join("Audio"),
+        );
+        // Everything up to the mount point, as sudo matches it:
+        // the resolved binary path, then the fixed arguments.
+        let mut permitted = String::from("/usr/bin/");
+        permitted.push_str(&argv[..argv.len() - 1].join(" "));
+        permitted.push(' ');
+        permitted.push_str(NAS_MOUNT_ROOT);
+        permitted.push_str("/*");
+
+        let template = include_str!("../dist/sudoers.d/evo-network-shares.in");
+        assert!(
+            template.contains(&permitted),
+            "the shipped sudoers grant does not permit the argv \
+             Force sends.\n  sends:   {permitted}\n  grant is \
+             in dist/sudoers.d/evo-network-shares.in",
+        );
+    }
+
+    /// Reconnect spends the memory. Otherwise a share forced
+    /// off once could never be brought back by the cadence
+    /// again, and the operator's own Connect would leave a
+    /// stale flag behind it.
+    #[tokio::test]
+    async fn reconnect_clears_the_forced_off_memory() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            // the force
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            // the operator's reconnect
+            ok_mount_output(),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_sudo_wrapping(true)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("forced_then_back", "192.0.2.35");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "share_id": id,
+            "force": true,
+        }))
+        .unwrap();
+        rt.dispatch_verb("network.share.unmount", &payload)
+            .await
+            .unwrap();
+        assert!(
+            rt.share_states
+                .lock()
+                .await
+                .get(&id)
+                .expect("state")
+                .operator_detached,
+            "Force records the gesture",
+        );
+
+        rt.mount_share(&id).await.expect("reconnect mounts");
+
+        assert!(
+            !rt.share_states
+                .lock()
+                .await
+                .get(&id)
+                .expect("state")
+                .operator_detached,
+            "the operator asked for it back; the memory is spent",
+        );
+    }
+
+    /// Finding 1, on the fleet: a clean Disconnect is undone by
+    /// the remount cadence within five minutes.
+    ///
+    /// `unmount_share` writes Unmounted with no failure class,
+    /// and `remount_retry_pass` retries exactly that set. The
+    /// operator presses Disconnect, the tile goes Unmounted,
+    /// and the share is back on the next tick with no gesture
+    /// from anyone. That inverts the accepted Disconnect
+    /// contract, and it is live on the shipping stack — Force
+    /// stamps the gesture, a plain Disconnect does not.
+    #[tokio::test]
+    async fn a_clean_disconnect_is_not_undone_by_the_remount_cadence() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![
+            // the Disconnect
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            // a mount the cadence would spend if it tried
+            ok_mount_output(),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("disconnected", "192.0.2.36");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "share_id": id,
+        }))
+        .unwrap();
+        rt.dispatch_verb("network.share.unmount", &payload)
+            .await
+            .unwrap();
+        let after_disconnect = executor.calls.lock().await.len();
+
+        rt.remount_retry_pass().await;
+
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            after_disconnect,
+            "the cadence must not put back a share the operator \
+             disconnected",
+        );
+        let g = rt.share_states.lock().await;
+        assert_eq!(
+            g.get(&id).expect("state").state,
+            MountState::Unmounted,
+            "Disconnect means disconnected until the operator \
+             reconnects",
+        );
+    }
+
+    /// Force is the operator saying "let go of it". The
+    /// remount cadence must not put it straight back.
+    ///
+    /// `remount_retry_pass` selects Failed **or Unmounted** with
+    /// no Permanent class, and a forced detach lands exactly
+    /// there: Unmounted, class None. Without a memory of the
+    /// operator's gesture the next tick re-mounts the share
+    /// they just detached, and the stick they pulled is back on
+    /// the glass within the cadence.
+    #[tokio::test]
+    async fn force_detach_is_not_undone_by_the_remount_cadence() {
+        let dir = tempdir();
+        // Force succeeds, then the cadence is given a mount that
+        // would succeed if it were ever attempted.
+        let executor = ScriptedExecutor::new(vec![
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            ok_mount_output(),
+        ]);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(Arc::clone(&executor) as Arc<dyn MountExecutor>)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_100_000))
+            .with_sudo_wrapping(true)
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .build();
+        let record = built_record("forced_off", "192.0.2.34");
+        let id = record.share_id.clone();
+        rt.add_share(record).await.unwrap();
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "share_id": id,
+            "force": true,
+        }))
+        .unwrap();
+        rt.dispatch_verb("network.share.unmount", &payload)
+            .await
+            .unwrap();
+        let calls_after_force = executor.calls.lock().await.len();
+
+        rt.remount_retry_pass().await;
+
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            calls_after_force,
+            "the cadence must not spend a mount on a share the \
+             operator forced off",
+        );
+        let g = rt.share_states.lock().await;
+        assert_eq!(
+            g.get(&id).expect("state").state,
+            MountState::Unmounted,
+            "a forced detach stays detached until the operator \
+             reconnects",
+        );
     }
 
     #[tokio::test]
@@ -11827,6 +12172,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
 
         let unmount_req = UnmountShareRequest {
             share_id: id.clone(),
+            force: None,
         };
         let unmount_payload = serde_json::to_vec(&unmount_req).unwrap();
         let unmount_bytes = rt
@@ -12035,6 +12381,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
 
         let unmount_req = UnmountShareRequest {
             share_id: id.clone(),
+            force: None,
         };
         let unmount_payload = serde_json::to_vec(&unmount_req).unwrap();
         rt.dispatch_verb("network.share.unmount", &unmount_payload)
