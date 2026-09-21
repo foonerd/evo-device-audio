@@ -72,12 +72,20 @@ Cmnd_Alias EVO_NETWORK_SHARES_MOUNT = \
 
 # Force eject only. The operator has asked for the share to be
 # gone while something still holds it, and the detach has to
-# happen inside PID 1's mount namespace: `systemd-mount
-# --collect` attached the volume there, so a lazy detach from
-# the service's own namespace would drop only this view of it.
+# land in PID 1's mount namespace: `systemd-mount --collect`
+# attached the volume there, so a lazy detach from the
+# service's own namespace would drop only this view of it.
+#
+# It is asked of PID 1 rather than entered directly.
+# `evo.service` carries `RestrictNamespaces=yes`, and a sudo
+# child inherits that filter, so `nsenter` into
+# `/proc/1/ns/mnt` fails at `setns` with EPERM and never
+# reaches the umount — proved on the validation rig. This is
+# the same bus the mount side already uses, and the same shape
+# `storage.usb`'s wrapper now takes for its own Force.
 #
 # ARGV-SCOPED, unlike the alias above, and deliberately so.
-# `nsenter` takes the command to run as an argument, so an
+# `systemd-run` takes the command to run as an argument, so an
 # unscoped grant of this binary is a root shell for the asking
 # — a different class of grant from `mount` and `umount`,
 # which are bounded by what those binaries do. The shape below
@@ -87,7 +95,7 @@ Cmnd_Alias EVO_NETWORK_SHARES_MOUNT = \
 # is the share's own mount point under the NAS root and
 # nothing else.
 Cmnd_Alias EVO_NETWORK_SHARES_FORCE_DETACH = \
-    /usr/bin/nsenter --mount=/proc/1/ns/mnt -- umount -l /var/lib/evo/music/NAS/*
+    /usr/bin/systemd-run --quiet --wait --collect --pipe --working-directory=/ -- /bin/umount -i -l /var/lib/evo/music/NAS/*
 
 Cmnd_Alias EVO_NETWORK_SHARES_DISCOVERY = \
     /usr/bin/avahi-browse, \

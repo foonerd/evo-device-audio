@@ -2079,17 +2079,41 @@ pub fn build_umount_args(mount_root: &Path, lazy: bool) -> Vec<String> {
     args
 }
 
-/// USB Force parity: real lazy detach in PID 1's mount namespace.
+/// USB Force parity: a real lazy detach, run as a child of
+/// PID 1 so it lands in the host mount namespace.
 ///
-/// Never names `systemd-umount`. `-l` is util-linux `umount`
-/// only. Callers prefix `sudo -n` when the service is
-/// sudo-wrapped.
+/// It has to be PID 1's child rather than our own. The share
+/// was attached by `systemd-mount --collect`, so the mount
+/// lives in PID 1's namespace, and `evo.service` carries
+/// `RestrictNamespaces=yes` — a sudo child inherits that
+/// filter, so `nsenter` into `/proc/1/ns/mnt` is EPERM at
+/// `setns` and never reaches the umount at all. `systemd-run`
+/// asks PID 1 to run it instead, which is the same bus the
+/// mount side already uses.
+///
+/// `--wait` so the caller learns the outcome; `--collect` so a
+/// failed transient unit does not linger; `--pipe` so its
+/// stderr comes back as ours. `-i` keeps util-linux from
+/// handing off to a `umount.<type>` helper inside the
+/// transient unit.
+///
+/// Never names `systemd-umount`: `-l` is a lazy detach to
+/// util-linux `umount` and `--full` to systemd-umount. No FUSE
+/// arm here — CIFS and NFS are kernel filesystems, unlike the
+/// fuseblk volumes `storage.usb` also has to handle.
+///
+/// Callers prefix `sudo -n` when the service is sudo-wrapped.
 pub fn build_force_detach_argv(mount_root: &Path) -> Vec<String> {
     vec![
-        "nsenter".to_string(),
-        "--mount=/proc/1/ns/mnt".to_string(),
+        "/usr/bin/systemd-run".to_string(),
+        "--quiet".to_string(),
+        "--wait".to_string(),
+        "--collect".to_string(),
+        "--pipe".to_string(),
+        "--working-directory=/".to_string(),
         "--".to_string(),
-        "umount".to_string(),
+        "/bin/umount".to_string(),
+        "-i".to_string(),
         "-l".to_string(),
         mount_root.to_string_lossy().into_owned(),
     ]
@@ -4502,13 +4526,14 @@ impl NetworkSharesRuntime {
         &self,
         mount_root: &Path,
     ) -> (String, Vec<String>) {
-        let argv = build_force_detach_argv(mount_root);
+        let mut argv = build_force_detach_argv(mount_root);
         if self.umount_program == "sudo" {
             let mut args = vec!["-n".to_string()];
             args.extend(argv);
             ("sudo".to_string(), args)
         } else {
-            ("nsenter".to_string(), argv.into_iter().skip(1).collect())
+            let program = argv.remove(0);
+            (program, argv)
         }
     }
 
@@ -7742,7 +7767,7 @@ mount error(13): Permission denied",
     }
 
     #[tokio::test]
-    async fn force_unmount_is_nsenter_umount_l_never_systemd_umount() {
+    async fn force_unmount_asks_pid_one_and_never_systemd_umount() {
         let dir = tempdir();
         let executor = ScriptedExecutor::new(vec![CommandOutput {
             exit_code: Some(0),
@@ -7771,10 +7796,15 @@ mount error(13): Permission denied",
             args,
             &vec![
                 "-n".to_string(),
-                "nsenter".to_string(),
-                "--mount=/proc/1/ns/mnt".to_string(),
+                "/usr/bin/systemd-run".to_string(),
+                "--quiet".to_string(),
+                "--wait".to_string(),
+                "--collect".to_string(),
+                "--pipe".to_string(),
+                "--working-directory=/".to_string(),
                 "--".to_string(),
-                "umount".to_string(),
+                "/bin/umount".to_string(),
+                "-i".to_string(),
                 "-l".to_string(),
                 mount_root.to_string_lossy().into_owned(),
             ]
@@ -8470,22 +8500,37 @@ mount error(13): Permission denied",
     }
 
     #[test]
-    fn force_detach_argv_is_nsenter_umount_l_never_systemd() {
+    fn force_detach_runs_umount_l_as_a_child_of_pid_one() {
         let args = build_force_detach_argv(&PathBuf::from(
             "/var/lib/evo/music/NAS/Audio",
         ));
         assert_eq!(
             args,
             vec![
-                "nsenter".to_string(),
-                "--mount=/proc/1/ns/mnt".to_string(),
+                "/usr/bin/systemd-run".to_string(),
+                "--quiet".to_string(),
+                "--wait".to_string(),
+                "--collect".to_string(),
+                "--pipe".to_string(),
+                "--working-directory=/".to_string(),
                 "--".to_string(),
-                "umount".to_string(),
+                "/bin/umount".to_string(),
+                "-i".to_string(),
                 "-l".to_string(),
                 "/var/lib/evo/music/NAS/Audio".to_string(),
             ]
         );
+        // `-l` is a lazy detach to util-linux `umount` and
+        // `--full` to systemd-umount. It must never reach the
+        // latter.
         assert!(!args.iter().any(|s| s.contains("systemd-umount")));
+        // And it must never try to enter PID 1's namespace
+        // itself: evo.service carries RestrictNamespaces=yes,
+        // a sudo child inherits the filter, and setns is EPERM.
+        assert!(
+            !args.iter().any(|s| s.contains("nsenter")),
+            "the sandbox blocks setns; ask PID 1 instead",
+        );
     }
 
     /// `-l` reaches the binary at the end of the wrapper, not
@@ -9610,8 +9655,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     /// are one thing, and nothing else checks that.
     ///
     /// Force runs under `sudo -n`, and the grant for it is
-    /// argv-scoped precisely because an unscoped `nsenter` is a
-    /// root shell. That makes the two halves a matched pair: a
+    /// argv-scoped precisely because an unscoped `systemd-run`
+    /// is a root shell. That makes the two halves a matched pair: a
     /// flag reordered here, or a path edited there, and Force
     /// stops at a sudoers refusal on the box while every test
     /// in this file stays green. This reads the shipped
@@ -9622,8 +9667,16 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             &PathBuf::from(NAS_MOUNT_ROOT).join("Audio"),
         );
         // Everything up to the mount point, as sudo matches it:
-        // the resolved binary path, then the fixed arguments.
-        let mut permitted = String::from("/usr/bin/");
+        // the binary path, then the fixed arguments. argv[0] is
+        // already absolute, so nothing is prepended — a bare
+        // name here would have sudo resolve it through
+        // secure_path and the two halves could disagree.
+        assert!(
+            argv[0].starts_with('/'),
+            "argv[0] must be the absolute path sudoers names: {}",
+            argv[0],
+        );
+        let mut permitted = String::new();
         permitted.push_str(&argv[..argv.len() - 1].join(" "));
         permitted.push(' ');
         permitted.push_str(NAS_MOUNT_ROOT);
