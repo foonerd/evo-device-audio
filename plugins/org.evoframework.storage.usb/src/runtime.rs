@@ -1547,6 +1547,12 @@ impl StorageUsbRuntime {
 
     /// Name retract on the subject, then dispatch only when
     /// this verb owns the catalogue drop.
+    ///
+    /// The volume is already off the host. Waiting here for
+    /// `library.remove_source` holds Safe Remove (and the glass
+    /// heartbeat) for the whole in-flight MPD index. Safe means
+    /// unplug, not "MPD finished". The catalogue drop runs
+    /// after the verb returns.
     async fn finish_catalogue_stage(
         &self,
         retract_library: bool,
@@ -1556,7 +1562,17 @@ impl StorageUsbRuntime {
         self.announce_removal(stable_id, source_id, RemovalStage::Retract)
             .await;
         if retract_library {
-            self.retract_library_source(stable_id, source_id).await;
+            let dispatcher = self.shelf_dispatcher_clone();
+            let stable = stable_id.to_string();
+            let sid = source_id.map(str::to_string);
+            tokio::spawn(async move {
+                StorageUsbRuntime::retract_library_via(
+                    dispatcher,
+                    &stable,
+                    sid.as_deref(),
+                )
+                .await;
+            });
         }
     }
 
@@ -1576,10 +1592,23 @@ impl StorageUsbRuntime {
         stable_id: &str,
         source_id: Option<&str>,
     ) {
+        Self::retract_library_via(
+            self.shelf_dispatcher_clone(),
+            stable_id,
+            source_id,
+        )
+        .await;
+    }
+
+    async fn retract_library_via(
+        dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
+        stable_id: &str,
+        source_id: Option<&str>,
+    ) {
         let Some(source_id) = source_id else {
             return;
         };
-        let Some(dispatcher) = self.shelf_dispatcher_clone() else {
+        let Some(dispatcher) = dispatcher else {
             return;
         };
         let payload = serde_json::json!({
@@ -3808,6 +3837,19 @@ mod tests {
             self.seen.lock().unwrap().clone()
         }
 
+        /// Catalogue drop is spawned after the verb names
+        /// Safe. Poll until it lands, or the window closes.
+        async fn wait_until_seen(&self, verb: &str) -> Vec<(String, String)> {
+            for _ in 0..200 {
+                let seen = self.seen();
+                if seen.iter().any(|(v, _)| v == verb) {
+                    return seen;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            self.seen()
+        }
+
         fn umount_before_library_stop(&self) -> Option<bool> {
             *self.umount_before_library_stop.lock().unwrap()
         }
@@ -4835,16 +4877,20 @@ mod tests {
         rt.dispatch_verb("storage.usb.safe_remove", &first)
             .await
             .expect("first remove");
-        let before = d.seen().len();
+        let after_first = d.wait_until_seen("library.remove_source").await;
+        let before = after_first.len();
         rt.dispatch_verb("storage.usb.safe_remove", &first)
             .await
             .expect("second remove of the still-plugged stick");
         let seen = d.seen();
-        let retracts = seen
+        let retracts = after_first
             .iter()
             .filter(|(verb, _)| verb == "library.remove_source")
             .count();
-        assert!(retracts >= 1, "first Remove must retract; saw {seen:?}");
+        assert!(
+            retracts >= 1,
+            "first Remove must retract; saw {after_first:?}"
+        );
         // Second click: refresh rebuilds Unmounted without a
         // library_source_id, so a second retract is not required.
         // What is required is that the second click does not
@@ -4883,7 +4929,18 @@ mod tests {
         rt.dispatch_verb("storage.usb.safe_remove", &payload)
             .await
             .expect("remove");
-        let seen = d.seen();
+        let env_now: ListDrivesEnvelope = serde_json::from_slice(
+            &rt.dispatch_verb("storage.usb.list_drives", b"{}")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            env_now.removal.as_ref().map(|r| r.stage),
+            Some(RemovalStage::Safe),
+            "Safe is named before the catalogue drop finishes"
+        );
+        let seen = d.wait_until_seen("library.remove_source").await;
         let retract = seen
             .iter()
             .find(|(verb, _)| verb == "library.remove_source")
@@ -5179,6 +5236,19 @@ mod tests {
     #[derive(Clone)]
     struct OrderLog(Arc<StdMutex<Vec<String>>>);
 
+    impl OrderLog {
+        async fn wait_until(&self, cmd: &str) -> Vec<String> {
+            for _ in 0..200 {
+                let seen = self.0.lock().unwrap().clone();
+                if seen.iter().any(|c| c == cmd) {
+                    return seen;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            self.0.lock().unwrap().clone()
+        }
+    }
+
     struct OrderedRunner {
         log: OrderLog,
         outcomes: Arc<StdMutex<Vec<CommandOutcome>>>,
@@ -5283,7 +5353,7 @@ mod tests {
             .await
             .expect("safe_remove");
 
-        let seen = log.0.lock().unwrap().clone();
+        let seen = log.wait_until("library.remove_source").await;
         let detach = seen
             .iter()
             .position(|c| c == "umount" || c == "umount-force")
