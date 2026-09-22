@@ -681,6 +681,12 @@ fn audio_distribution_https_setup() -> evo::HttpsSetup {
                         validator: ctx.validator,
                         tier_provider: ctx.tier_provider,
                         lan_trust_caps: ctx.lan_trust_caps,
+                        // The captive frame cannot send a bearer.
+                        // This is the set a LAN session start already
+                        // holds. Artwork does not receive it.
+                        lan_privileged_caps: Some(
+                            evo::https_boot::lan_privileged_capability_set(),
+                        ),
                         state_dir: ctx.state_dir,
                         resolved_notifier: Some(notifier),
                     },

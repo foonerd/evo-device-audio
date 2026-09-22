@@ -62,6 +62,10 @@ pub struct MountConfig {
     pub tier_provider: Arc<dyn evo_runtime_http::AuthTierProvider>,
     /// Capabilities granted to LAN-trusted callers.
     pub lan_trust_caps: evo_auth_bearer::CapabilitySet,
+    /// Capabilities for a no-bearer LAN client. The captive
+    /// session frame is the only route here that uses them.
+    /// Artwork and track detail stay on the floor.
+    pub lan_privileged_caps: Option<evo_auth_bearer::CapabilitySet>,
     /// Directory the persistent resolve index lives under.
     pub state_dir: std::path::PathBuf,
     /// Told when a resolve lands, so a surface already on screen
@@ -126,12 +130,11 @@ pub fn mount(
         cfg.lan_trust_caps.clone(),
     )?;
 
-    // Device-proxied captive-portal session surface. Product for
-    // the same reason the artwork presenters are: it exists
-    // because a venue portal has to be fetched over the interface
-    // carrying it, which is a fact about this distribution's
-    // networking, not about serving HTTP. The route and its gate
-    // are unchanged by the move — only who mounts it.
+    // Device-proxied captive-portal session surface. The browser
+    // frame cannot send a bearer. A LAN client is admitted with
+    // the privileged set, the same set a LAN session start
+    // already holds. WAN stays on the floor and is refused.
+    // Artwork and track detail do not receive this set.
     router = captive_session_endpoint::attach_captive_session_endpoint(
         router,
         &cfg.api_prefix,
@@ -139,6 +142,7 @@ pub fn mount(
         Arc::clone(&cfg.validator),
         Arc::clone(&cfg.tier_provider),
         cfg.lan_trust_caps,
+        cfg.lan_privileged_caps,
     )?;
 
     Ok(router)

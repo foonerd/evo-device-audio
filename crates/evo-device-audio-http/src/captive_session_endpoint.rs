@@ -42,11 +42,12 @@
 //!   header — the SPA then `JSON.parse`s gzip bytes and
 //!   falls back to a default landing shell.
 //!
-//! Gate: `write:network_admin` — the paired-operator connect
-//! path. Same scope as `network.nm.captive.submit` and the
-//! plugin's `session.start` / `upstream.fetch` /
-//! `session.close` verbs, so the operator's bearer chain
-//! carries through end-to-end without an elevation prompt.
+//! Gate: `write:network_admin`. A paired bearer still
+//! satisfies it. A browser frame cannot send that bearer, so
+//! a no-bearer LAN client is admitted with the privileged
+//! set the steward already uses for a LAN session start.
+//! WAN stays on the floor and is refused. The session id is
+//! 128 bits; the plugin rejects an id it did not mint.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
@@ -94,6 +95,7 @@ pub fn attach_captive_session_endpoint(
     validator: Arc<BearerTokenValidator>,
     tier_provider: Arc<dyn AuthTierProvider>,
     lan_trust_caps: CapabilitySet,
+    lan_privileged_caps: Option<CapabilitySet>,
 ) -> Result<Router, evo_runtime_http::error::RuntimeHttpError> {
     // axum 0.7 route patterns: `:name` for one segment,
     // `*name` for the catch-all tail. axum 0.8's `{name}` /
@@ -114,11 +116,10 @@ pub fn attach_captive_session_endpoint(
         observatory: None,
         tier_provider,
         lan_trust_caps,
-        // Product endpoints keep the playback floor. The privileged
-        // LAN arm belongs to the framework's own routes, which the
-        // household-protection gate polices; a product route must
-        // not hand out network_admin / system_admin.
-        lan_privileged_caps: None,
+        // This frame is a navigation. It cannot present a bearer.
+        // The privileged set is LAN-only inside the gate; WAN
+        // keeps the floor. Other product routes do not get it.
+        lan_privileged_caps,
     };
     let state = HandlerState {
         dispatcher,
