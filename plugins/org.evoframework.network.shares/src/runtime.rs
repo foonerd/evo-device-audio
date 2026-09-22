@@ -2188,6 +2188,14 @@ pub struct DiscoveredNas {
     /// Shares the NAS advertises on the discovery listing.
     #[serde(default)]
     pub shares: Vec<DiscoveredShare>,
+    /// `cifs` for an SMB advertisement, `nfs` for an NFS one.
+    /// Absent on older payloads, which are SMB.
+    #[serde(default = "default_discovered_fstype")]
+    pub fstype: String,
+}
+
+fn default_discovered_fstype() -> String {
+    "cifs".to_string()
 }
 
 /// Parse `avahi-browse -atrk _smb._tcp` stdout into a list of
@@ -2380,7 +2388,42 @@ pub fn parse_smbclient_dialect(stderr: &str) -> Option<String> {
 /// argument-parse contract is now validated in unit tests
 /// against the exact avahi-browse usage error message.
 pub fn build_avahi_browse_args() -> Vec<String> {
-    vec!["-trkp".to_string(), "_smb._tcp".to_string()]
+    build_avahi_browse_args_for("_smb._tcp")
+}
+
+/// Same argv shape as [`build_avahi_browse_args`], for NFS
+/// servers advertising `_nfs._tcp`.
+pub fn build_avahi_browse_args_for(service: &str) -> Vec<String> {
+    vec!["-trkp".to_string(), service.to_string()]
+}
+
+/// `showmount -e <ip>` lists the exports an NFS server offers.
+pub fn build_showmount_args(ip: &str) -> Vec<String> {
+    vec!["-e".to_string(), ip.to_string()]
+}
+
+/// Parse `showmount -e` stdout. Each export is a line whose
+/// first token is an absolute path. Header lines are skipped.
+pub fn parse_showmount_exports(stdout: &str) -> Vec<DiscoveredShare> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = trimmed.split_whitespace().next().unwrap_or("");
+        if !path.starts_with('/') {
+            continue;
+        }
+        if out.iter().any(|s: &DiscoveredShare| s.name == path) {
+            continue;
+        }
+        out.push(DiscoveredShare {
+            name: path.to_string(),
+            comment: None,
+        });
+    }
+    out
 }
 
 /// Build the argv for `smbclient -N -L <ip> -m SMB3_11
@@ -2622,6 +2665,7 @@ pub struct NetworkSharesRuntime {
     umount_wrapper_args: Vec<String>,
     mount_timeout_ms: u64,
     avahi_browse_program: String,
+    showmount_program: String,
     avahi_browse_timeout_ms: u64,
     smbclient_program: String,
     smbclient_timeout_ms: u64,
@@ -2703,6 +2747,7 @@ impl NetworkSharesRuntime {
             avahi_browse_timeout_ms: DEFAULT_AVAHI_BROWSE_TIMEOUT_MS,
             smbclient_program: "/usr/bin/smbclient".to_string(),
             smbclient_timeout_ms: DEFAULT_SMBCLIENT_TIMEOUT_MS,
+            showmount_program: "/usr/sbin/showmount".to_string(),
             discovered: Arc::new(Mutex::new(Vec::new())),
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
@@ -2744,6 +2789,7 @@ impl NetworkSharesRuntime {
             avahi_browse_timeout_ms: None,
             smbclient_program: None,
             smbclient_timeout_ms: None,
+            showmount_program: None,
             now_fn: None,
             mount_point_check: None,
             holder_probe: None,
@@ -2774,6 +2820,7 @@ impl NetworkSharesRuntime {
             avahi_browse_timeout_ms: DEFAULT_AVAHI_BROWSE_TIMEOUT_MS,
             smbclient_program: "/usr/bin/smbclient".to_string(),
             smbclient_timeout_ms: DEFAULT_SMBCLIENT_TIMEOUT_MS,
+            showmount_program: "/usr/sbin/showmount".to_string(),
             discovered: Arc::new(Mutex::new(Vec::new())),
             share_states: Arc::new(Mutex::new(share_states)),
             publisher: StdMutex::new(None),
@@ -3385,6 +3432,7 @@ pub struct NetworkSharesRuntimeBuilder {
     avahi_browse_timeout_ms: Option<u64>,
     smbclient_program: Option<String>,
     smbclient_timeout_ms: Option<u64>,
+    showmount_program: Option<String>,
     now_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     // Same shape as the runtime struct's `mount_point_check`
     // field: `Arc<dyn Fn(&Path) -> bool + Send + Sync>`. The
@@ -3473,6 +3521,13 @@ impl NetworkSharesRuntimeBuilder {
     /// `/usr/bin/smbclient`).
     pub fn with_smbclient_program(mut self, program: String) -> Self {
         self.smbclient_program = Some(program);
+        self
+    }
+
+    /// Override the `showmount` program path (default
+    /// `/usr/sbin/showmount`).
+    pub fn with_showmount_program(mut self, program: String) -> Self {
+        self.showmount_program = Some(program);
         self
     }
 
@@ -3638,6 +3693,9 @@ impl NetworkSharesRuntimeBuilder {
             smbclient_program: self
                 .smbclient_program
                 .unwrap_or_else(|| "/usr/bin/smbclient".to_string()),
+            showmount_program: self
+                .showmount_program
+                .unwrap_or_else(|| "/usr/sbin/showmount".to_string()),
             smbclient_timeout_ms: self
                 .smbclient_timeout_ms
                 .unwrap_or(DEFAULT_SMBCLIENT_TIMEOUT_MS),
@@ -4159,35 +4217,13 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
     async fn refresh_discovery(
         &self,
     ) -> Result<Vec<DiscoveredNas>, MountError> {
-        // Step 1: enumerate SMB hosts via avahi-browse.
-        let browse_args = build_avahi_browse_args();
-        let browse_out = self
-            .executor
-            .run(
-                &self.avahi_browse_program,
-                &browse_args,
-                self.avahi_browse_timeout_ms,
-            )
-            .await?;
-        // avahi-browse in `-t` mode exits 0 after enumeration.
-        // Non-zero is treated as fatal: we keep the prior cache
-        // intact.
-        if browse_out.exit_code != Some(0) {
-            return Err(MountError::MountFailed {
-                id: ShareId(String::new()),
-                exit_code: browse_out.exit_code,
-                stderr: String::from_utf8_lossy(&browse_out.stderr)
-                    .into_owned(),
-            });
-        }
-        let browse_stdout =
-            String::from_utf8_lossy(&browse_out.stdout).into_owned();
-        let hosts = filter_self_out(parse_avahi_browse_output(&browse_stdout));
+        // SMB browse failure is fatal: the prior cache stays.
+        // An NFS browse failure does not wipe the SMB list.
+        let hosts = self.browse_service("_smb._tcp").await?;
 
-        // Step 2: per host, enumerate shares via smbclient. A
-        // per-host failure is NOT fatal — the NAS is still
-        // recorded with empty shares + None dialect so the
-        // operator can see it and add manually.
+        // Per host, enumerate shares via smbclient. A per-host
+        // failure is NOT fatal — the NAS is still recorded with
+        // empty shares so the operator can add it manually.
         let mut result = Vec::with_capacity(hosts.len());
         for (name, ip) in hosts {
             let list_args = build_smbclient_list_args(&ip);
@@ -4210,18 +4246,49 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
                         ip,
                         advertised_dialect,
                         shares,
+                        fstype: default_discovered_fstype(),
                     });
                 }
                 Ok(_) | Err(_) => {
-                    // Per-host failure: still surface the host
-                    // so the operator can add manually.
                     result.push(DiscoveredNas {
                         name,
                         ip,
                         advertised_dialect: None,
                         shares: Vec::new(),
+                        fstype: default_discovered_fstype(),
                     });
                 }
+            }
+        }
+
+        if let Ok(nfs_hosts) = self.browse_service("_nfs._tcp").await {
+            for (name, ip) in nfs_hosts {
+                if result.iter().any(|n| n.ip == ip) {
+                    continue;
+                }
+                let exports = match self
+                    .executor
+                    .run(
+                        &self.showmount_program,
+                        &build_showmount_args(&ip),
+                        self.smbclient_timeout_ms,
+                    )
+                    .await
+                {
+                    Ok(out) if out.exit_code == Some(0) => {
+                        parse_showmount_exports(&String::from_utf8_lossy(
+                            &out.stdout,
+                        ))
+                    }
+                    _ => Vec::new(),
+                };
+                result.push(DiscoveredNas {
+                    name,
+                    ip,
+                    advertised_dialect: None,
+                    shares: exports,
+                    fstype: "nfs".to_string(),
+                });
             }
         }
 
@@ -4239,6 +4306,34 @@ impl NetworkSharesHandle for NetworkSharesRuntime {
 }
 
 impl NetworkSharesRuntime {
+    /// One `avahi-browse -trkp <service>` sweep. Non-zero exit
+    /// is an error; the caller decides whether that wipes the
+    /// refresh.
+    async fn browse_service(
+        &self,
+        service: &str,
+    ) -> Result<Vec<(String, String)>, MountError> {
+        let args = build_avahi_browse_args_for(service);
+        let browse_out = self
+            .executor
+            .run(
+                &self.avahi_browse_program,
+                &args,
+                self.avahi_browse_timeout_ms,
+            )
+            .await?;
+        if browse_out.exit_code != Some(0) {
+            return Err(MountError::MountFailed {
+                id: ShareId(String::new()),
+                exit_code: browse_out.exit_code,
+                stderr: String::from_utf8_lossy(&browse_out.stderr)
+                    .into_owned(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&browse_out.stdout).into_owned();
+        Ok(filter_self_out(parse_avahi_browse_output(&stdout)))
+    }
+
     /// CIFS mount execution: fast-path with persisted dialect
     /// first, then full probe ladder on failure or if no
     /// dialect has been persisted yet. Successful dialect is
@@ -8906,6 +9001,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             .with_executor(executor.clone())
             .with_avahi_browse_program("avahi-browse".to_string())
             .with_smbclient_program("smbclient".to_string())
+            .with_showmount_program("showmount".to_string())
             .with_avahi_browse_timeout_ms(1_000)
             .with_smbclient_timeout_ms(1_000)
             .with_mount_timeout_ms(1_000)
@@ -8973,6 +9069,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                     Some("SMB3_11"),
                 ),
                 smbclient_output(&[("Users", "home folders")], Some("SMB3_02")),
+                success_output(),
             ],
         );
 
@@ -8992,10 +9089,13 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(cached, list);
 
         let calls = executor.calls.lock().await;
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "avahi-browse");
+        assert_eq!(calls[0].1, build_avahi_browse_args());
         assert_eq!(calls[1].0, "smbclient");
         assert_eq!(calls[2].0, "smbclient");
+        assert_eq!(calls[3].0, "avahi-browse");
+        assert_eq!(calls[3].1, build_avahi_browse_args_for("_nfs._tcp"));
     }
 
     #[tokio::test]
@@ -9007,6 +9107,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                 // First successful round.
                 avahi_output(&[("NAS-K", "192.0.2.30")]),
                 smbclient_output(&[("Media", "media root")], Some("SMB3_11")),
+                success_output(),
                 // Second round: avahi-browse fails.
                 CommandOutput {
                     exit_code: Some(1),
@@ -9043,6 +9144,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                     stdout: Vec::new(),
                     stderr: b"connection refused".to_vec(),
                 },
+                success_output(),
             ],
         );
 
@@ -9058,17 +9160,55 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     #[tokio::test]
     async fn refresh_discovery_empty_avahi_returns_empty_result() {
         let dir = tempdir();
-        let (rt, _) = discovery_runtime(
-            &dir,
-            vec![CommandOutput {
-                exit_code: Some(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            }],
-        );
+        let (rt, _) =
+            discovery_runtime(&dir, vec![success_output(), success_output()]);
         let list = rt.refresh_discovery().await.unwrap();
         assert!(list.is_empty());
         assert!(rt.list_discovered().await.is_empty());
+    }
+
+    #[test]
+    fn parse_showmount_exports_keeps_absolute_paths() {
+        let exports = parse_showmount_exports(
+            "Export list for 192.0.2.50:\n\
+             /volume1/music *\n\
+             /export/media  192.0.2.0/24\n\
+             \n",
+        );
+        assert_eq!(exports.len(), 2);
+        assert_eq!(exports[0].name, "/volume1/music");
+        assert_eq!(exports[1].name, "/export/media");
+    }
+
+    #[tokio::test]
+    async fn refresh_discovery_lists_an_nfs_server_showmount_did_not_see_as_smb(
+    ) {
+        let dir = tempdir();
+        let (rt, executor) = discovery_runtime(
+            &dir,
+            vec![
+                success_output(),
+                CommandOutput {
+                    exit_code: Some(0),
+                    stdout: b"=;eth0;IPv4;NAS-NFS;_nfs._tcp;local;nas-nfs.local;192.0.2.50;2049;txt\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+                CommandOutput {
+                    exit_code: Some(0),
+                    stdout: b"Export list for 192.0.2.50:\n/volume1/music *\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ],
+        );
+        let list = rt.refresh_discovery().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].fstype, "nfs");
+        assert_eq!(list[0].ip, "192.0.2.50");
+        assert_eq!(list[0].shares[0].name, "/volume1/music");
+        let calls = executor.calls.lock().await;
+        assert_eq!(calls[1].1, build_avahi_browse_args_for("_nfs._tcp"));
+        assert_eq!(calls[2].0, "showmount");
+        assert_eq!(calls[2].1, build_showmount_args("192.0.2.50"));
     }
 
     // -----------------------------------------------------------
@@ -9351,12 +9491,14 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let executor = ScriptedExecutor::new(vec![
             avahi_output(&[("NAS-P", "192.0.2.90")]),
             smbclient_output(&[("Music", "family music")], Some("SMB3_11")),
+            success_output(),
         ]);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
             .with_executor(executor)
             .with_avahi_browse_program("avahi-browse".to_string())
             .with_smbclient_program("smbclient".to_string())
+            .with_showmount_program("showmount".to_string())
             .with_avahi_browse_timeout_ms(1_000)
             .with_smbclient_timeout_ms(1_000)
             .with_mount_timeout_ms(1_000)
@@ -10715,6 +10857,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let executor = ScriptedExecutor::new(vec![
             avahi_output(&[("NAS-DT", "192.0.2.55")]),
             smbclient_output(&[("Music", "family music")], Some("SMB3_11")),
+            success_output(),
         ]);
         let rt = Arc::new(
             NetworkSharesRuntime::builder(&dir)
@@ -11198,6 +11341,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let executor = ScriptedExecutor::new(vec![
             avahi_output(&[("NAS-VD", "192.0.2.70")]),
             smbclient_output(&[("Music", "family music")], Some("SMB3_11")),
+            success_output(),
         ]);
         let rt = NetworkSharesRuntime::builder(&dir)
             .unwrap()
