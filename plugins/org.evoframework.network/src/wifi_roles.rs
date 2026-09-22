@@ -77,8 +77,13 @@ impl WifiRadio {
         capability: PhyCapability,
         connection_class: ConnectionClass,
     ) -> Self {
-        let is_ap_vif = dev.iftype.eq_ignore_ascii_case("ap")
-            || dev.iftype.to_ascii_lowercase().contains("__ap");
+        // The virtual access-point interface is the one this
+        // software creates (`ap`, `ap0`, `ap1`). Its momentary
+        // type is not that identity: a vif that is down reports
+        // `managed`, which would make it look like a second
+        // station, and the physical radio reports `AP` while it
+        // is beaconing, which would hide the only station.
+        let is_ap_vif = is_virtual_ap_ifname(&dev.ifname);
         Self {
             ifname: dev.ifname.clone(),
             phy: dev.phy.clone(),
@@ -310,6 +315,18 @@ pub fn assign_wifi_roles(
     }
 }
 
+/// `ap`, `ap0`, `ap1`: the virtual access-point interface this
+/// software creates beside the physical radio. Not a station.
+fn is_virtual_ap_ifname(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    match n.strip_prefix("ap") {
+        Some(rest) => {
+            rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Score-and-pick the best STA candidate. Higher score wins;
 /// ties broken by inventory order (which mirrors `iw dev`
 /// enumeration order, typically phy index ascending).
@@ -383,6 +400,50 @@ mod tests {
 
     fn default_band_priority() -> Vec<BandClass> {
         vec![BandClass::Ghz6, BandClass::Ghz5, BandClass::Ghz2_4]
+    }
+
+    #[test]
+    fn a_down_virtual_ap_is_not_a_station_and_a_beaconing_physical_radio_is() {
+        let cap = PhyCapability {
+            interface_modes: vec!["managed".into(), "AP".into()],
+            ..PhyCapability::default()
+        };
+        let ap0 = WifiRadio::from_dev_and_capability(
+            &crate::wifi_phy::WifiDev {
+                ifname: "ap0".into(),
+                phy: "phy0".into(),
+                iftype: "managed".into(),
+            },
+            cap.clone(),
+            ConnectionClass::Onboard,
+        );
+        let wlan0 = WifiRadio::from_dev_and_capability(
+            &crate::wifi_phy::WifiDev {
+                ifname: "wlan0".into(),
+                phy: "phy0".into(),
+                iftype: "AP".into(),
+            },
+            cap,
+            ConnectionClass::Onboard,
+        );
+        assert!(
+            ap0.is_ap_vif,
+            "ap0 is the virtual access point even when it is down"
+        );
+        assert!(
+            !wlan0.is_ap_vif,
+            "wlan0 stays the station radio while it is beaconing"
+        );
+        let assigned = assign_wifi_roles(
+            &[ap0, wlan0],
+            &default_band_priority(),
+            RoleOverrides {
+                explicit_sta: "ap0",
+                explicit_ap: "",
+                default_sta_fallback: "wlan0",
+            },
+        );
+        assert_eq!(assigned.sta_ifname, "wlan0");
     }
 
     #[test]

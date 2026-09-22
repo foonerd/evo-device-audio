@@ -2370,7 +2370,13 @@ impl NetworkPlugin {
                     Arc::new(move || {
                         let inner = inner.clone();
                         Box::pin(async move {
-                            let _ = inner.autonomous_critical_recovery().await;
+                            // An error is not a raise. The
+                            // latch releases either way, so the
+                            // next offline window tries again.
+                            inner
+                                .autonomous_critical_recovery()
+                                .await
+                                .unwrap_or(false)
                         })
                     })
                 },
@@ -4781,8 +4787,16 @@ impl NmInner {
                 // reached the wire. Read a connected `ap*` from
                 // `info` instead. STA rows keep the `link` path
                 // unchanged.
-                let runtime = if is_ap_vif_ifname(&row.device)
-                    && nm_state_is_connected(&row.state)
+                //
+                // Keyed on what the driver says the interface is
+                // doing, not on what it is called. A one-role
+                // radio carries the access point on `wlan0`, and
+                // a name test cannot see that: the glass showed
+                // a connected device with no network name on the
+                // one configuration where the access point is
+                // the only thing to name.
+                let runtime = if nm_state_is_connected(&row.state)
+                    && self.interface_is_beaconing(&row.device).await
                 {
                     self.wifi_ap_runtime_for(&row.device).await
                 } else {
@@ -4897,14 +4911,62 @@ impl NmInner {
         &self,
         requested: Option<&str>,
     ) -> Option<String> {
-        if let Some(n) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-            if !is_ap_scan_ifname(n) {
-                return Some(n.to_string());
+        let candidate = if let Some(n) =
+            requested.map(str::trim).filter(|s| !s.is_empty())
+        {
+            if is_ap_scan_ifname(n) {
+                return None;
             }
+            Some(n.to_string())
+        } else {
+            self.resolve_wifi_sta_ifname(None)
+                .await
+                .filter(|n| !is_ap_scan_ifname(n))
+        };
+        // Name is not role. `is_ap_scan_ifname` knows `ap0` and
+        // the p2p companions, and it cannot know `wlan0` — which
+        // is exactly the interface a one-role access point takes
+        // when there is no station to share the radio with.
+        //
+        // Ask the driver what the interface is doing. On this
+        // chip a scan aimed at a beaconing radio answers
+        // AP-DISABLED, driver -52, and an escan timeout, and the
+        // connection goes down behind it.
+        let candidate = candidate?;
+        if self.interface_is_beaconing(&candidate).await {
+            return None;
         }
-        self.resolve_wifi_sta_ifname(None)
-            .await
-            .filter(|n| !is_ap_scan_ifname(n))
+        Some(candidate)
+    }
+
+    /// Whether the driver reports this interface as an access
+    /// point right now.
+    ///
+    /// The one question that separates "a radio called wlan0"
+    /// from "a radio currently carrying the access point". Read
+    /// from `iw dev <ifname> info`, which is the only source
+    /// that reports an AP's own mode — an AP beacons rather than
+    /// associates, so there is no link to read.
+    async fn interface_is_beaconing(&self, ifname: &str) -> bool {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        let iw_exec = self.effective_iw_exec();
+        let Ok(raw) = wifi_phy::iw_output(
+            iw_exec.as_ref(),
+            &self.config.iw_path,
+            &["dev", name, "info"],
+            timeout,
+        )
+        .await
+        else {
+            // No answer is not an access point. A scan refused
+            // for want of a reading would be its own outage.
+            return false;
+        };
+        parse_iw_dev_info(&raw).iftype.eq_ignore_ascii_case("ap")
     }
 
     async fn wifi_scan(
@@ -5706,6 +5768,7 @@ impl NmInner {
         if con_name.trim().is_empty() {
             return HotspotBringUp::Failed;
         }
+        let mut last_err = String::new();
         for attempt in 1..=HOTSPOT_BRINGUP_ATTEMPTS {
             match self
                 .nmcli_spawn_output(&["connection", "up", con_name])
@@ -5729,11 +5792,14 @@ impl NmInner {
                     // is what the operator sees as the join
                     // dropping and coming back.
                     let stderr = String::from_utf8_lossy(&out.stderr);
+                    last_err = stderr.trim().to_string();
                     if is_phy_exclusive_failure(&stderr) {
                         return HotspotBringUp::PhyExclusive;
                     }
                 }
-                _ => {}
+                Err(e) => {
+                    last_err = e.to_string();
+                }
             }
             if attempt < HOTSPOT_BRINGUP_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(
@@ -5743,8 +5809,8 @@ impl NmInner {
             }
         }
         steps.push(format!(
-            "warning: {} did not come up after {} attempts",
-            con_name, HOTSPOT_BRINGUP_ATTEMPTS
+            "warning: {} did not come up after {} attempts: {}",
+            con_name, HOTSPOT_BRINGUP_ATTEMPTS, last_err
         ));
         HotspotBringUp::Failed
     }
@@ -6485,8 +6551,9 @@ impl NmInner {
     /// without physical access.
     /// Returns `true` when the fallback hotspot MUST NOT be
     /// raised because the operator is mid-captive-sign-in
-    /// (raising an AP on the STA-carrying radio would kill the
-    /// association the operator needs). Two signals compose:
+    /// on a radio that is still associated. Raising an AP
+    /// on that radio would kill the association the sign-in
+    /// needs. Two signals compose, and only while associated:
     ///
     /// 1. An open device-proxied captive session — the framework
     ///    proxy has an in-flight iframe against the venue.
@@ -6494,16 +6561,26 @@ impl NmInner {
     ///    AND the phase is one of `probe_detected` /
     ///    `awaiting_credentials` / `submitting`.
     ///
+    /// A disconnected radio is not a sign-in in progress.
+    /// A live session or a stale phase must not keep the
+    /// access point down when nothing is connected.
+    ///
     /// Read-only; no side effects. Cheap enough to call on
     /// every supervisor recovery-decision tick — both signals
     /// are file reads and evaluate to `false` on the common
     /// case of no captive activity.
     async fn captive_should_hold_hotspot(&self) -> bool {
+        let wifi_ifname = self.config.default_wifi_iface.trim().to_string();
+        let associated = !wifi_ifname.is_empty()
+            && self.wifi_interface_is_associated(&wifi_ifname).await;
+        if !associated {
+            return false;
+        }
         // Signal 1: any open device-proxied captive session.
         // Load the persisted jar collection; TTL pruning is
         // lazy on load, so a session past its expiry doesn't
         // count as active. Even one live session is enough
-        // to suppress recovery.
+        // to suppress recovery, while the station is up.
         if let Ok(sessions) = self.load_captive_sessions().await {
             if !sessions.is_empty() {
                 return true;
@@ -6528,22 +6605,25 @@ impl NmInner {
         false
     }
 
+    /// `Ok(true)` when the recovery access point is up.
+    /// `Ok(false)` when this call deliberately did not raise
+    /// it. The supervisor must not remember a raise that did
+    /// not happen, or a disconnected device never gets
+    /// another chance.
     pub(crate) async fn autonomous_critical_recovery(
         &self,
-    ) -> Result<(), PluginError> {
-        // Suppress the recovery hotspot while a captive-portal
-        // sign-in is in progress. Raising an AP on the STA-
-        // carrying radio (or on the same PHY under
-        // brcmfmac / rtl* / other single-radio chips) tears
-        // down the STA association the operator needs to
-        // complete the captive round-trip. Signal: a portal
-        // has been detected on wlan0 AND wlan0 is currently
-        // associated. Captive-session lifecycle
-        // (session.start / session.close) also flips an
-        // atomic; when either signal is live, this action is
-        // a no-op with an operator-facing trace so
-        // reachability-based recovery does not run past its
-        // grace window unnoticed.
+    ) -> Result<bool, PluginError> {
+        if self.wifi_flight_mode_enabled.load(Relaxed) {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "supervisor: critical-recovery suppressed \
+                 (flight mode is on)"
+            );
+            return Ok(false);
+        }
+        // Hold only while the station is still associated.
+        // A disconnected radio has no sign-in to protect, and
+        // the access point is the way back onto the device.
         if self.captive_should_hold_hotspot().await {
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -6551,9 +6631,17 @@ impl NmInner {
                  (captive-portal sign-in in progress; \
                  raising AP would disrupt STA association)"
             );
-            return Ok(());
+            return Ok(false);
         }
         let intent = self.load_intent().await?;
+        if matches!(intent.wifi.role, WifiRole::Disabled) {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                "supervisor: critical-recovery suppressed \
+                 (operator disabled Wi-Fi)"
+            );
+            return Ok(false);
+        }
         let hs_name = Self::hotspot_connection_name(&intent);
         let mut steps = Vec::new();
         match self
@@ -6568,7 +6656,7 @@ impl NmInner {
                     steps = ?steps,
                     "supervisor: autonomous critical-recovery action complete"
                 );
-                Ok(())
+                Ok(raised)
             }
             Err(e) => {
                 tracing::error!(
@@ -6703,11 +6791,55 @@ impl NmInner {
             if row.kind != "wifi" {
                 continue;
             }
-            if nm_state_is_connected(&row.state) {
-                return Ok(false);
+            if !nm_state_is_connected(&row.state) {
+                continue;
             }
+            // A beaconing radio is not an uplink.
+            //
+            // NetworkManager reports a device carrying an access
+            // point as `connected` exactly as it reports one
+            // associated to a network, because from its side both
+            // are an activated connection. Counting the access
+            // point as a way in meant the recovery that raised it
+            // then read it back as proof the device was reachable,
+            // and stood down. The device had no uplink and nobody
+            // at the glass.
+            //
+            // The driver is the one that can tell them apart.
+            if self.interface_is_beaconing(&row.device).await {
+                continue;
+            }
+            return Ok(false);
         }
         Ok(true)
+    }
+
+    /// The connection name the open recovery access point is
+    /// written under.
+    ///
+    /// Deliberately not the standing profile's name. `connection
+    /// add` with a name that already exists does not make a
+    /// second profile, so writing the recovery under the saved
+    /// name either collided with it or edited it — and editing
+    /// the operator's access point is the thing this sitting
+    /// took out. The recovery is its own profile, raised by its
+    /// own name, and the saved one is never touched.
+    fn recovery_ap_connection_name(hs_name: &str) -> String {
+        format!("{}-recovery", hs_name.trim())
+    }
+
+    /// The virtual interface name an access point takes when it
+    /// shares a radio with the station. `ap0` unless the
+    /// distribution overrides it.
+    ///
+    /// The same source the apply path reads, so recovery creates
+    /// the interface the standing profile is already pinned to.
+    fn configured_ap_vif_ifname() -> String {
+        std::env::var("EVO_NETWORK_AP_IFNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "ap0".to_string())
     }
 
     async fn try_critical_open_hotspot_recovery(
@@ -6719,23 +6851,24 @@ impl NmInner {
         if hs_name.trim().is_empty() {
             return Ok(false);
         }
-        // `fallback.hotspot_enabled` is deliberately not consulted.
+        // `fallback.hotspot_enabled == false` is the operator
+        // exception, and the only one. The operator has said this
+        // device does not offer an access point; recovery does not
+        // overrule that.
         //
-        // It is the standing-AP switch: whether this device offers
-        // an access point as part of how it normally runs. It is not
-        // a statement that the operator would rather the device be
-        // unreachable. Treating "no standing AP" as "stay dark when
-        // you fall off the network" left the only recovery route
-        // vetoed by a setting about something else, on exactly the
-        // devices that needed it — a Wi-Fi-only box that loses its
-        // network has no other way to be reached.
-        //
-        // The switch keeps its meaning everywhere it means
-        // something: apply still raises and lowers the standing AP
-        // by it, and a profile raised here does not become a
-        // standing one — see the autoconnect note in
-        // `write_open_recovery_ap_profile`.
-        //
+        // The default is on. A device that has simply never had a
+        // hotspot profile written is NOT policy off — a missing
+        // profile is an absence, not a decision, and that is
+        // precisely the device with no other way to be reached.
+        // The open recovery profile below covers it.
+        if !intent.fallback.hotspot_enabled {
+            steps.push(
+                "critical: hotspot policy is off; no access point raised"
+                    .to_string(),
+            );
+            return Ok(false);
+        }
+
         // Broad uplink check. Previously gated on
         // `ethernet_intent_has_no_carrier` alone, which failed
         // Wi-Fi-only deployments (never raised) and "all radios
@@ -6746,46 +6879,89 @@ impl NmInner {
             return Ok(false);
         }
 
-        // There may be no profile to raise. The standing AP is
-        // written by apply only when the switch is on, so a device
-        // that never offered one has nothing here — which is
-        // precisely the device that has just run out of ways to be
-        // reached.
-        if self.nm_connection_exists(hs_name).await {
-            let _ = self
-                .nmcli_output(&[
-                    "connection",
-                    "modify",
-                    hs_name,
-                    "remove",
-                    "802-11-wireless-security",
-                ])
-                .await;
-            // The same distinction the write path draws, drawn on a
-            // profile that was already here.
-            //
-            // A device that once offered a standing access point
-            // still carries its profile, autoconnect and all, after
-            // the switch is turned off. Opening that profile for
-            // recovery and leaving autoconnect alone would bring it
-            // back at the next boot — open, and standing — which is
-            // the back door the write path was careful to close,
-            // reached instead through a leftover.
-            //
-            // Only when the switch is off. With it on, autoconnect
-            // belongs to the operator's standing access point and
-            // recovery has no business touching it.
-            if !intent.fallback.hotspot_enabled {
-                self.nm_set_autoconnect(hs_name, false).await;
+        // The saved profile is raised as it stands.
+        //
+        // Recovery used to strip its security and re-pin
+        // `connection.interface-name` to the station radio. Both
+        // are rewrites of an operator's standing access point,
+        // done on the one path where nobody is watching, and the
+        // profile kept them afterwards: a WPA access point came
+        // back open, bound to a radio the operator never chose.
+        // Nothing here modifies a saved profile.
+        //
+        // The interface question is answered by making the vif
+        // exist rather than by re-pointing the profile. On a
+        // single-radio chip the standing AP is pinned to a
+        // virtual interface that only exists while the station
+        // is up; with the station down it is gone and
+        // NetworkManager has no device for the profile. So the
+        // vif is created first, and the saved profile activates
+        // against the name it already carries.
+        let sta_if = self.config.default_wifi_iface.trim().to_string();
+        let ap_if = Self::configured_ap_vif_ifname();
+        let saved = self.nm_connection_exists(hs_name).await;
+        let vif_ready = if sta_if.is_empty() || ap_if.is_empty() {
+            false
+        } else {
+            self.ensure_ap_vif_present(&sta_if, &ap_if).await
+        };
+
+        // A radio that cannot be an access point raises nothing.
+        //
+        // Writing the recovery profile and then failing the
+        // activation is still a raise attempt: the latch releases
+        // on the failure and the next offline window tries the
+        // same impossible thing again, leaving a profile behind
+        // on a device that can never use it. Ask the phy first.
+        //
+        // Only the write path is gated. A radio that IS capable
+        // keeps the saved profile and the `-recovery` name path
+        // exactly as they are.
+        if !saved || !vif_ready {
+            let radios = self.enumerate_wifi_radios().await;
+            let any_ap_capable = radios.iter().any(|r| r.ap_capable());
+            if !radios.is_empty() && !any_ap_capable {
+                steps.push(
+                    "critical: no radio on this device can carry an \
+                     access point; nothing raised"
+                        .to_string(),
+                );
+                return Ok(false);
+            }
+        }
+
+        // The name that will actually be raised. The saved
+        // profile when it can be used as it stands; otherwise the
+        // recovery's own profile, written under its own name.
+        let raise_name: String;
+        if saved && vif_ready {
+            raise_name = hs_name.to_string();
+            steps.push(format!(
+                "critical: {ap_if} present; raising the saved access \
+                 point {hs_name} unchanged"
+            ));
+        } else {
+            // No saved profile, or no vif to hang it on. Either
+            // way the saved profile is left exactly as it is and
+            // the open recovery access point carries this — it is
+            // written fresh, autoconnect no, and is not bound to
+            // an interface name.
+            if saved {
                 steps.push(format!(
-                    "critical: {hs_name} opened for recovery with \
-                     autoconnect no (no standing AP is offered, so it \
-                     must not return after a reboot)"
+                    "critical: {ap_if} could not be created; {hs_name} \
+                     left untouched and open recovery used instead"
                 ));
             }
-        } else {
-            self.write_open_recovery_ap_profile(intent, hs_name, steps)
-                .await?;
+            match self
+                .write_open_recovery_ap_profile(intent, hs_name, steps)
+                .await?
+            {
+                Some(name) => raise_name = name,
+                // Nothing to raise — no name was available for an
+                // access point. A station-only radio also lands
+                // here, and raises nothing.
+                None => return Ok(false),
+            }
         }
 
         // Free the radio before asking it to beacon.
@@ -6811,10 +6987,10 @@ impl NmInner {
 
         steps.push(format!(
             "critical: no serviceable uplink past grace; forcing open AP fallback on {}",
-            hs_name
+            raise_name
         ));
         Ok(matches!(
-            self.connection_up_hotspot_with_retries(hs_name, steps)
+            self.connection_up_hotspot_with_retries(&raise_name, steps)
                 .await,
             HotspotBringUp::Up
         ))
@@ -6847,7 +7023,8 @@ impl NmInner {
         intent: &NetworkIntent,
         hs_name: &str,
         steps: &mut Vec<String>,
-    ) -> Result<(), PluginError> {
+    ) -> Result<Option<String>, PluginError> {
+        let con_name = Self::recovery_ap_connection_name(hs_name);
         let ssid_owned;
         let ssid = if intent.wifi.ap_ssid.trim().is_empty() {
             ssid_owned = default_ap_ssid();
@@ -6861,7 +7038,15 @@ impl NmInner {
                  skipping"
                     .to_string(),
             );
-            return Ok(());
+            return Ok(None);
+        }
+        // A stale recovery profile from an earlier outage is
+        // replaced, not added beside. Only ever this name — the
+        // saved profile is not in reach of this call.
+        if self.nm_connection_exists(&con_name).await {
+            let _ = self
+                .nmcli_output(&["connection", "delete", &con_name])
+                .await;
         }
         self.nmcli_output_owned(&[
             "connection".to_string(),
@@ -6869,7 +7054,7 @@ impl NmInner {
             "type".to_string(),
             "wifi".to_string(),
             "con-name".to_string(),
-            hs_name.to_string(),
+            con_name.clone(),
             "ssid".to_string(),
             ssid.to_string(),
             "wifi.mode".to_string(),
@@ -6883,10 +7068,11 @@ impl NmInner {
         ])
         .await?;
         steps.push(format!(
-            "critical: wrote open recovery AP profile {hs_name} \
-             (autoconnect no; raised now, not standing)"
+            "critical: wrote open recovery AP profile {con_name} \
+             (autoconnect no; raised now, not standing; the saved \
+             profile is untouched)"
         ));
-        Ok(())
+        Ok(Some(con_name))
     }
 
     async fn nm_active_connection_names_on_device(
@@ -6992,6 +7178,150 @@ impl NmInner {
         Ok(())
     }
 
+    /// Hand the station interface to NetworkManager before the
+    /// attempt runs.
+    ///
+    /// At boot `wpa_supplicant` may still hold the interface from
+    /// the distribution's own config, and NetworkManager reports
+    /// it `unmanaged`. A station attempt against an unmanaged
+    /// device does nothing and reports nothing useful — the
+    /// operator's join silently does not happen. Take ownership
+    /// first, then attempt.
+    ///
+    /// Best-effort: a device that is already managed is left
+    /// alone, and a refusal is reported rather than fatal, so a
+    /// join on a normally-managed device is unaffected.
+    async fn ensure_sta_interface_managed(
+        &self,
+        ifname: &str,
+        steps: &mut Vec<String>,
+    ) {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Ok(rows) = self.nm_device_table().await else {
+            return;
+        };
+        let unmanaged = rows.iter().any(|r| {
+            r.device == name
+                && r.state.to_ascii_lowercase().contains("unmanaged")
+        });
+        if !unmanaged {
+            return;
+        }
+        let out = self
+            .nmcli_output(&["device", "set", name, "managed", "yes"])
+            .await;
+        match out {
+            Ok(_) => steps.push(format!(
+                "{name} was unmanaged; handed to NetworkManager before \
+                 the station attempt"
+            )),
+            Err(e) => steps.push(format!(
+                "warning: {name} is unmanaged and could not be handed to \
+                 NetworkManager ({e}); the station attempt may not run"
+            )),
+        }
+    }
+
+    /// Propagate an error out of the apply, but put the access
+    /// point back first.
+    ///
+    /// Every exit after the access point has been taken down for
+    /// a station attempt has to go through the return. A bare `?`
+    /// leaves by a door the return is not behind, and on a
+    /// one-role radio with no cable that door leads to a dark
+    /// headless player.
+    async fn bail_after_join_down(
+        &self,
+        err: PluginError,
+        intent: &NetworkIntent,
+        hs_name: &str,
+        already_raised: bool,
+        steps: &mut Vec<String>,
+    ) -> PluginError {
+        self.restore_ap_after_failed_join(
+            intent,
+            hs_name,
+            already_raised,
+            steps,
+        )
+        .await;
+        err
+    }
+
+    /// Put the access point back when a station attempt has
+    /// ended without a station.
+    ///
+    /// The apply takes the access point down to free the radio
+    /// for the join — it has to, because on a one-role radio the
+    /// station cannot come up beside a beacon. When the join then
+    /// fails, that down removed the only way in and nobody is at
+    /// the glass to notice. This is the way back.
+    ///
+    /// Keyed on what the radio is doing, not on what it is
+    /// called: the whole attempt happens on the station's own
+    /// interface when there is no second vif, so a name test
+    /// would never fire here.
+    ///
+    /// Raised through the same path the reachability floor uses,
+    /// so the saved profile is not stripped, not re-pinned, and a
+    /// radio that cannot carry an access point still gets
+    /// nothing.
+    async fn restore_ap_after_failed_join(
+        &self,
+        intent: &NetworkIntent,
+        hs_name: &str,
+        already_raised: bool,
+        steps: &mut Vec<String>,
+    ) {
+        if hs_name.trim().is_empty() {
+            return;
+        }
+        // Whether anything is carrying this device is asked
+        // once, inside the recovery path: a station that came up
+        // is an uplink, so is a cable, so is a second radio, and
+        // a radio that is merely beaconing is not. If the join
+        // succeeded, that gate declines and nothing is raised.
+        //
+        // Two earlier drafts of this function asked the same
+        // question again out here — first as "did the station
+        // associate", then as a second uplink check. Neither
+        // could be made to fail on its own, because the gate
+        // below already decides. A line nobody can pin does not
+        // stay.
+        // One raise. The apply tail may already have brought an
+        // access point up on its way out, and a beaconing radio
+        // is not an uplink — so the gate below would agree there
+        // is no way in and raise a second one, leaving the saved
+        // profile and the recovery profile both activated on a
+        // one-role radio.
+        if already_raised {
+            steps.push(
+                "an access point was already raised by this apply; \
+                 not raising another"
+                    .to_string(),
+            );
+            return;
+        }
+        match self
+            .try_critical_open_hotspot_recovery(intent, hs_name, steps)
+            .await
+        {
+            // The line belongs on the path that actually raised.
+            Ok(true) => steps.push(
+                "the join did not associate and nothing else is \
+                 carrying this device; the access point is back"
+                    .to_string(),
+            ),
+            Ok(false) => {}
+            Err(e) => steps.push(format!(
+                "warning: putting the access point back failed: {e}"
+            )),
+        }
+    }
+
     async fn apply_intent(
         &self,
         intent: &NetworkIntent,
@@ -7062,15 +7392,24 @@ impl NmInner {
             && !assignment.had_explicit_ap
             && phy_supports_concurrent
         {
-            std::env::var("EVO_NETWORK_AP_IFNAME")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "ap0".to_string())
+            Self::configured_ap_vif_ifname()
         } else {
             assignment.ap_ifname.clone()
         };
         let hs_name = Self::hotspot_connection_name(intent);
+        // Set when this apply takes the access point down to free
+        // the radio for a station attempt. If the attempt does not
+        // end with a station up, the access point goes back —
+        // otherwise a join that failed leaves a headless player
+        // with nothing to reach it on.
+        let mut hotspot_down_for_sta = false;
+        // Set when this apply has already brought an access point
+        // up on its way out. The return must not add a second
+        // one: a beaconing radio is not an uplink, so the gate it
+        // consults would agree there is no way in and raise again,
+        // leaving the saved profile and the recovery profile both
+        // activated on a one-role radio.
+        let mut hotspot_raised_in_apply = false;
 
         self.apply_regdomain(&intent.radio_policy, &mut steps).await;
 
@@ -7157,7 +7496,10 @@ impl NmInner {
                         );
                     }
                 } else {
+                    self.ensure_sta_interface_managed(&sta_ifname, &mut steps)
+                        .await;
                     self.connection_down_lossy(&hs_name).await;
+                    hotspot_down_for_sta = true;
                     if concurrent_vif {
                         let _ = self
                             .ensure_ap_vif_absent(&resolved_ap_ifname)
@@ -7181,6 +7523,19 @@ impl NmInner {
                             .sta_secret_is_reusable(&intent.wifi, sta_psk)
                             .await
                     {
+                        // The access point was taken down above to
+                        // free the radio. Refusing here without
+                        // putting it back is the headless player
+                        // going dark on a bad passphrase.
+                        if hotspot_down_for_sta {
+                            self.restore_ap_after_failed_join(
+                                intent,
+                                &hs_name,
+                                hotspot_raised_in_apply,
+                                &mut steps,
+                            )
+                            .await;
+                        }
                         return Err(PluginError::Permanent(format!(
                             "no passphrase for {:?} and no matching saved \
                          network to reuse one from; refusing before taking \
@@ -7195,15 +7550,27 @@ impl NmInner {
                 );
 
                     let sta_up_nonfatal = intent.fallback.hotspot_enabled;
-                    self.ensure_wifi_sta(
-                        &sta_ifname,
-                        &intent.wifi,
-                        &intent.radio_policy,
-                        sta_psk,
-                        sta_up_nonfatal,
-                        &mut steps,
-                    )
-                    .await?;
+                    if let Err(e) = self
+                        .ensure_wifi_sta(
+                            &sta_ifname,
+                            &intent.wifi,
+                            &intent.radio_policy,
+                            sta_psk,
+                            sta_up_nonfatal,
+                            &mut steps,
+                        )
+                        .await
+                    {
+                        return Err(self
+                            .bail_after_join_down(
+                                e,
+                                intent,
+                                &hs_name,
+                                hotspot_raised_in_apply,
+                                &mut steps,
+                            )
+                            .await);
+                    }
                     // Restore autoconnect on the STA profile so a
                     // subsequent apply after a `wifi.disconnect`
                     // hold undoes the hold. Best-effort.
@@ -7380,25 +7747,58 @@ impl NmInner {
                         // Phy-exclusive / failed raise already
                         // returned from ensure. Restore-after-
                         // hotspot is the only remaining work.
-                        self.ensure_hotspot_profile(
-                            &resolved_ap_ifname,
-                            &wifi_for_ap,
-                            ap_psk,
-                            &intent.fallback,
-                            &mut steps,
-                        )
-                        .await?;
+                        if let Err(e) = self
+                            .ensure_hotspot_profile(
+                                &resolved_ap_ifname,
+                                &wifi_for_ap,
+                                ap_psk,
+                                &intent.fallback,
+                                &mut steps,
+                            )
+                            .await
+                        {
+                            // The flag is still false here, on
+                            // purpose. Set before this call, it
+                            // would also suppress the return when
+                            // the call itself failed — the tail
+                            // raised nothing and the access point
+                            // would stay down. One-raise is about
+                            // a tail that succeeded.
+                            return Err(self
+                                .bail_after_join_down(
+                                    e,
+                                    intent,
+                                    &hs_name,
+                                    hotspot_raised_in_apply,
+                                    &mut steps,
+                                )
+                                .await);
+                        }
+                        hotspot_raised_in_apply =
+                            intent.fallback.hotspot_enabled;
 
                         if sta_ifname == resolved_ap_ifname
                             && !intent.wifi.sta_ssid.trim().is_empty()
                         {
-                            self.restore_sta_after_hotspot_on_shared_radio(
-                                intent,
-                                sta_ifname.as_str(),
-                                hs_name.as_str(),
-                                &mut steps,
-                            )
-                            .await?;
+                            if let Err(e) = self
+                                .restore_sta_after_hotspot_on_shared_radio(
+                                    intent,
+                                    sta_ifname.as_str(),
+                                    hs_name.as_str(),
+                                    &mut steps,
+                                )
+                                .await
+                            {
+                                return Err(self
+                                    .bail_after_join_down(
+                                        e,
+                                        intent,
+                                        &hs_name,
+                                        hotspot_raised_in_apply,
+                                        &mut steps,
+                                    )
+                                    .await);
+                            }
                         } else if sta_ifname == resolved_ap_ifname {
                             steps.push(
                                 "shared iface: no station in intent to \
@@ -7425,6 +7825,15 @@ impl NmInner {
                 )
                 .await?;
             }
+        }
+        if hotspot_down_for_sta {
+            self.restore_ap_after_failed_join(
+                intent,
+                &hs_name,
+                hotspot_raised_in_apply,
+                &mut steps,
+            )
+            .await;
         }
         Ok(ApplyReport { ok: true, steps })
     }
@@ -9234,10 +9643,10 @@ fn parse_portal_url(url: &str) -> Option<(String, String, String)> {
 /// returns to the UI. The framework's endpoint is mounted at
 /// `/api/v1/network/captive/session/{sid}`; the browser
 /// resolves relative URLs in portal content against this base,
-/// so the initial portal path + query MUST be preserved
-/// verbatim (portals encode operator AP BSSID / device MAC /
-/// timestamp in the initial query; stripping the query
-/// breaks admission).
+/// so the portal path and the admission query stay on the
+/// frame. The venue's `t` stamp does not: with `t` on the
+/// frame address the venue redirects and the access-code
+/// form never loads.
 fn compose_session_url(
     session_id: &str,
     initial_path: &str,
@@ -9249,11 +9658,28 @@ fn compose_session_url(
     } else {
         format!("/{initial_path}")
     };
-    if initial_query.is_empty() {
+    let query = frame_query(initial_query);
+    if query.is_empty() {
         format!("{base}{path_part}")
     } else {
-        format!("{base}{path_part}?{initial_query}")
+        format!("{base}{path_part}?{query}")
     }
+}
+
+/// Query string for the captive frame.
+///
+/// Keeps the venue's admission fields. Drops `t`. That one
+/// key makes the venue answer with a redirect, so the frame
+/// never receives the access-code form.
+fn frame_query(initial_query: &str) -> String {
+    initial_query
+        .split('&')
+        .filter(|part| {
+            let key = part.split_once('=').map(|(k, _)| k).unwrap_or(part);
+            !key.is_empty() && key != "t"
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Parse a `Set-Cookie` header value's first `name=value` pair.
@@ -13376,8 +13802,8 @@ exit 0\n",
             "empty state must not hold hotspot"
         );
 
-        // Case 1: is_captive:true + phase=ProbeDetected →
-        // MUST hold.
+        // A disconnected radio is not a sign-in. The phase
+        // file alone must not keep the access point down.
         let mut state = CaptiveSessionState {
             is_captive: Some(true),
             phase: CaptivePhase::ProbeDetected,
@@ -13385,8 +13811,8 @@ exit 0\n",
         };
         p.save_captive_state(&state).await.expect("save");
         assert!(
-            p.captive_should_hold_hotspot().await,
-            "is_captive=true + ProbeDetected must hold"
+            !p.captive_should_hold_hotspot().await,
+            "captive phase must not hold when the station is down"
         );
 
         // Case 2: is_captive:true + phase=Authenticated →
@@ -13418,8 +13844,8 @@ exit 0\n",
             .await
             .expect("save session");
         assert!(
-            p.captive_should_hold_hotspot().await,
-            "open session must hold hotspot even when captive state clean"
+            !p.captive_should_hold_hotspot().await,
+            "a live session must not hold the access point when the station is down"
         );
 
         // Case 4: session expired → MUST NOT hold (load
@@ -13439,6 +13865,58 @@ exit 0\n",
         assert!(
             !p.captive_should_hold_hotspot().await,
             "expired session must not hold hotspot (pruned on load)"
+        );
+    }
+
+    /// A live captive session holds the access point only
+    /// while the station is still associated. That is the
+    /// sign-in the raise would interrupt. Once the station
+    /// is down, the same session must not hold.
+    #[tokio::test]
+    async fn captive_session_holds_only_while_station_is_associated() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nmcli_path = dir.path().join("nmcli-mock-hold.sh");
+        std::fs::write(
+            &nmcli_path,
+            "#!/bin/sh\n\
+             cat <<EOF\n\
+             GENERAL.DEVICE:wlan0\n\
+             GENERAL.TYPE:wifi\n\
+             GENERAL.STATE:100 (connected)\n\
+             GENERAL.CONNECTION:guest\n\
+             GENERAL.HWADDR:02:00:00:00:12:34\n\
+             GENERAL.MTU:1500\n\
+             EOF\n",
+        )
+        .expect("write mock");
+        let mut perms = std::fs::metadata(&nmcli_path)
+            .expect("stat mock")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&nmcli_path, perms).expect("chmod mock");
+        let mut p = NetworkPlugin::new();
+        {
+            let inner = p.inner_mut();
+            inner.config.nmcli_path = nmcli_path.to_string_lossy().into_owned();
+            inner.config.default_wifi_iface = "wlan0".to_string();
+            inner.state_dir = Some(dir.path().to_path_buf());
+        }
+        let now = unix_epoch_seconds();
+        p.save_captive_sessions(&[CaptiveSession {
+            session_id: "live".to_string(),
+            upstream_host: "http://portal".to_string(),
+            initial_path: "/guest/".to_string(),
+            initial_query: String::new(),
+            cookies: Default::default(),
+            created_at_epoch: now,
+            expires_at_epoch: now + 1800,
+        }])
+        .await
+        .expect("save session");
+        assert!(
+            p.captive_should_hold_hotspot().await,
+            "an associated station with a live session must hold"
         );
     }
 
@@ -13740,9 +14218,14 @@ exit 1
             log.contains("dev wlan0 link"),
             "the STA path must still read `link`: {log}"
         );
+        // `info` on wlan0 is now expected: every connected wifi
+        // row is asked what it is doing before its runtime is
+        // read, because a one-role access point lives on wlan0
+        // and a name test cannot see that. What must not change
+        // is where the STA's runtime comes from — `link`, above.
         assert!(
-            !log.contains("dev wlan0 info"),
-            "the STA path must not move to `info`: {log}"
+            !log.contains("dev wlan0 link -t"),
+            "the STA runtime read must stay on plain `link`: {log}"
         );
     }
 
@@ -14014,6 +14497,36 @@ exit 0\n",
         path
     }
 
+    /// An `iw` that reports `type <iftype>` (and an SSID for an
+    /// AP) for every interface asked about. Enough for the one
+    /// question the guards put to the driver: what is this
+    /// interface doing right now.
+    fn iw_mock(dir: &Path, iftype: &str, ssid: &str) -> PathBuf {
+        let path = dir.join("iw-mock.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+printf 'Interface %s\\n\\tifindex 8\\n\\taddr aa:11:22:33:44:66\\n' \"$2\"\n\
+printf '\\tssid {ssid}\\n\\ttype {iftype}\\n'\n\
+exit 0\n",
+                ssid = ssid,
+                iftype = iftype,
+            ),
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod iw mock");
+        }
+        path
+    }
+
     fn recovery_plugin(dir: &Path, nmcli: &Path) -> NetworkPlugin {
         let mut p = NetworkPlugin::new();
         p.inner_mut().state_dir = Some(dir.to_path_buf());
@@ -14027,19 +14540,541 @@ exit 0\n",
         p
     }
 
-    /// A device with no way to be reached must raise an access point
-    /// even though it offers no standing one.
+    /// A beaconing radio is not a way in.
     ///
-    /// `fallback.hotspot_enabled` says whether an access point is
-    /// part of how this device normally runs. It does not say the
-    /// operator would rather the device stayed dark after falling
-    /// off the network. Reading it as a veto left a Wi-Fi-only box
-    /// that lost its network with no route back at all.
+    /// NetworkManager reports a device carrying an access point
+    /// as `connected`, exactly as it reports one associated to a
+    /// network. Counting that as an uplink meant the recovery
+    /// that raised the access point then read it back as proof
+    /// the device was reachable, and stood down — leaving a
+    /// device with no uplink and nobody at the glass.
     #[tokio::test]
-    async fn recovery_raises_an_ap_even_when_no_standing_ap_is_offered() {
+    async fn a_connected_ap_row_is_not_an_uplink() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", true);
+        let iw = iw_mock(dir.path(), "AP", "evo-4466");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+
+        assert!(
+            p.no_serviceable_uplink(&intent).await.expect("uplink read"),
+            "a connected radio that is beaconing is not an uplink",
+        );
+    }
+
+    /// The glass can name a one-role access point.
+    ///
+    /// An AP beacons rather than associates, so `link` answers
+    /// `Not connected.` and the SSID has to come from `info`.
+    /// That read used to be keyed on the interface being called
+    /// `ap0`, so a one-role access point on `wlan0` reached the
+    /// wire as a connected device with no network name.
+    #[tokio::test]
+    async fn a_beaconing_wlan0_carries_its_ssid_to_the_wire() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", true);
+        let iw = iw_mock(dir.path(), "AP", "evo-4466");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let rows = p.inner_mut().nm_device_table().await.expect("device table");
+        let wlan = rows
+            .iter()
+            .find(|r| r.device == "wlan0")
+            .expect("wlan0 row");
+        let wifi = wlan
+            .wifi
+            .as_ref()
+            .expect("a beaconing wlan0 must carry a wifi block");
+        assert_eq!(
+            wifi.ssid, "evo-4466",
+            "the access point's own SSID must reach the wire",
+        );
+    }
+
+    /// No vif, no rewrite. The open recovery is its own profile.
+    ///
+    /// `connection add` under a name that already exists does not
+    /// make a second profile. Writing the recovery under the
+    /// saved name either collided with it or edited it, and
+    /// editing the operator's access point is exactly what this
+    /// sitting took out.
+    #[tokio::test]
+    async fn a_saved_profile_without_a_vif_is_untouched_and_recovery_is_its_own_name(
+    ) {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Saved profile present; `iw` absent, so no vif can be made.
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection modify evo-network-hotspot "),
+            "the saved profile must be untouched: {calls}"
+        );
+        assert!(
+            calls.contains("con-name evo-network-hotspot-recovery"),
+            "the open recovery is written under its own name: {calls}"
+        );
+        assert!(
+            calls.contains("connection up evo-network-hotspot-recovery"),
+            "the raise must target the recovery profile: {calls}"
+        );
+    }
+
+    /// A radio that cannot be an access point raises nothing.
+    ///
+    /// Writing the recovery profile and then failing the
+    /// activation is still a raise attempt: the latch releases on
+    /// the failure and the next offline window tries the same
+    /// impossible thing again, leaving a profile behind on a
+    /// device that can never use it. The phy is asked before
+    /// anything is written.
+    #[tokio::test]
+    async fn a_station_only_radio_writes_nothing_and_raises_nothing() {
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+
+        // `iw` that reports one phy whose only interface mode is
+        // `managed` — a station-only radio.
+        let iw = dir.path().join("iw-station-only.sh");
+        std::fs::write(
+            &iw,
+            "#!/usr/bin/env bash\n\
+case \"$1\" in\n\
+  dev)\n\
+      printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n' ;;\n\
+  phy0)\n\
+      printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n' ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &iw,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod iw mock");
+        }
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+
+        assert!(
+            !raised,
+            "a station-only radio must raise nothing: {steps:?}"
+        );
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection add"),
+            "no recovery profile may be written for a radio that \
+             cannot carry an access point: {calls}"
+        );
+        assert!(
+            !calls.contains("connection up"),
+            "nothing may be raised on a station-only radio: {calls}"
+        );
+    }
+
+    /// One capable radio is enough.
+    ///
+    /// A device can carry a station-only radio beside one that
+    /// can beacon. Refusing because *some* radio cannot be an
+    /// access point would leave that device dark with a usable
+    /// radio sitting idle — so the question is whether any radio
+    /// can, not whether all of them can.
+    #[tokio::test]
+    async fn one_ap_capable_radio_beside_a_station_only_one_still_raises() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+
+        // phy0 is station-only; phy1 can carry an access point.
+        let iw = dir.path().join("iw-mixed.sh");
+        std::fs::write(
+            &iw,
+            "#!/usr/bin/env bash\n\
+case \"$1\" in\n\
+  dev)\n\
+      printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n' ;\n\
+      printf 'phy#1\\n\\tInterface wlan1\\n\\t\\tifindex 4\\n\\t\\ttype managed\\n' ;;\n\
+  phy1)\n\
+      printf 'Wiphy phy1\\n\\tSupported interface modes:\\n\\t\\t * managed\\n\\t\\t * AP\\n' ;;\n\
+  phy0)\n\
+      printf 'Wiphy phy0\\n\\tSupported interface modes:\\n\\t\\t * managed\\n' ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &iw,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod iw mock");
+        }
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.try_critical_open_hotspot_recovery(
+            &intent,
+            "evo-network-hotspot",
+            &mut steps,
+        )
+        .await
+        .expect("recovery");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("con-name evo-network-hotspot-recovery"),
+            "one AP-capable radio is enough to write the recovery \
+             profile: {calls}"
+        );
+    }
+
+    /// A failed join puts the access point back.
+    ///
+    /// One role, no cable: the apply takes the access point down
+    /// so the radio can try the station. When the station does
+    /// not come up, that down removed the only way in and there
+    /// is nobody at the glass. The whole attempt is on `wlan0`
+    /// and no `ap0` exists, so nothing here can be keyed on a
+    /// name.
+    #[tokio::test]
+    async fn a_failed_join_puts_the_access_point_back() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Station did not associate; saved hotspot exists.
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let iw = iw_mock(dir.path(), "managed", "");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.restore_ap_after_failed_join(
+            &intent,
+            "evo-network-hotspot",
+            false,
+            &mut steps,
+        )
+        .await;
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("connection up"),
+            "the access point must come back after a failed join: \
+             {calls}\nsteps: {steps:?}"
+        );
+        assert!(
+            !calls.contains(
+                "connection modify evo-network-hotspot remove \
+                 802-11-wireless-security"
+            ),
+            "the return must not strip the saved profile: {calls}"
+        );
+    }
+
+    /// A station that came up is the join succeeding, and the
+    /// access point stays down. The return is only for the
+    /// failure.
+    #[tokio::test]
+    async fn a_join_that_associated_does_not_bring_the_ap_back() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", true);
+        let iw = iw_mock(dir.path(), "managed", "");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let mut steps = Vec::new();
+        p.restore_ap_after_failed_join(
+            &intent,
+            "evo-network-hotspot",
+            false,
+            &mut steps,
+        )
+        .await;
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up"),
+            "the station is up; the access point stays down: {calls}"
+        );
+    }
+
+    /// An unmanaged station interface is handed to
+    /// NetworkManager before the attempt.
+    ///
+    /// At boot `wpa_supplicant` may still hold it, and a station
+    /// attempt against an unmanaged device silently does nothing.
+    #[tokio::test]
+    async fn an_unmanaged_station_interface_is_handed_over_first() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "unmanaged", true);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut steps = Vec::new();
+        p.ensure_sta_interface_managed("wlan0", &mut steps).await;
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.contains("device set wlan0 managed yes"),
+            "an unmanaged station interface must be taken over \
+             before the attempt: {calls}"
+        );
+    }
+
+    /// Through the apply, not around it: a one-role failed join
+    /// ends with exactly one access point up.
+    ///
+    /// The direct tests on the return never enter `apply_intent`,
+    /// so they stayed green while exits inside it bypassed the
+    /// return entirely, and while the apply tail's own raise plus
+    /// the return's raise could both fire. This drives the real
+    /// path: no Ethernet, the radio is `wlan0` throughout, the
+    /// station does not come up.
+    #[tokio::test]
+    async fn a_one_role_failed_join_ends_with_one_access_point_up() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Station never associates; a saved hotspot exists.
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let iw = iw_mock(dir.path(), "managed", "");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+        p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.role = WifiRole::Sta;
+        intent.wifi.sta_ssid = "some-network".to_string();
+        intent.wifi.sta_open = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let _ = p.apply_intent(&intent, None, None).await;
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        let ups = calls
+            .lines()
+            .filter(|l| l.starts_with("connection up"))
+            .filter(|l| l.contains("hotspot"))
+            .count();
+        assert_eq!(
+            ups, 1,
+            "a one-role failed join must end with exactly one \
+             access point raised, not none and not two: {calls}"
+        );
+        // Note: the apply's own AP write does set
+        // `connection.interface-name` on the standing profile.
+        // That is the apply writing the operator's access point,
+        // not recovery re-pinning it, and it is outside this
+        // row — `a_saved_hotspot_keeps_its_security_and_interface_name`
+        // is what holds the recovery path.
+    }
+
+    /// An error out of the station bring-up is still a failed
+    /// join.
+    ///
+    /// Those exits used to leave by `?`, which is a door the
+    /// return is not behind. On a one-role radio with no cable
+    /// that door leads to a dark headless player.
+    #[tokio::test]
+    async fn an_error_from_the_station_bringup_still_restores_the_ap() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
+        let iw = iw_mock(dir.path(), "managed", "");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+        p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.role = WifiRole::Sta;
+        intent.wifi.sta_ssid = "some-network".to_string();
+        // Not open and no passphrase: the apply refuses, and that
+        // refuse sits after the access point has been taken down.
+        intent.wifi.sta_open = false;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let out = p.apply_intent(&intent, None, None).await;
+        assert!(out.is_err(), "the apply must refuse: {out:?}");
+
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            calls.lines().any(
+                |l| l.starts_with("connection up") && l.contains("hotspot")
+            ),
+            "an error exit after the down must still put the access \
+             point back: {calls}"
+        );
+    }
+
+    /// A tail that failed to raise is not a tail that raised.
+    ///
+    /// The one-raise guard exists so a successful apply tail does
+    /// not get a second access point from the return. Set before
+    /// the tail's own write, it also suppressed the return when
+    /// that write failed — the tail raised nothing, the return
+    /// declined, and the access point stayed down with nobody at
+    /// the glass.
+    #[tokio::test]
+    async fn a_failed_hotspot_write_after_the_down_still_restores_the_ap() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // As the recovery mock, but the apply's own AP profile
+        // write fails. The recovery path writes `wifi.mode ap`,
+        // a different form, so it is unaffected.
+        let nmcli = dir.path().join("nmcli-ap-write-fails.sh");
+        let log = dir.path().join("nmcli.log");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  *802-11-wireless.mode*) exit 1 ;;\n\
+  \"connection show evo-network-hotspot\") exit 0 ;;\n\
+  \"-t -f GENERAL.DEVICE\"*)\n\
+      printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 (disconnected)\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &nmcli,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod nmcli mock");
+        }
+
+        let iw = iw_mock(dir.path(), "managed", "");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+        p.inner_mut().config.default_wifi_iface = "wlan0".to_string();
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+        intent.wifi.role = WifiRole::Sta;
+        intent.wifi.sta_ssid = "some-network".to_string();
+        intent.wifi.sta_open = true;
+        intent.wifi.ap_ssid = "evo-4466".to_string();
+
+        let _ = p.apply_intent(&intent, None, None).await;
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let ups = calls
+            .lines()
+            .filter(|l| l.starts_with("connection up"))
+            .filter(|l| l.contains("hotspot"))
+            .count();
+        assert_eq!(
+            ups, 1,
+            "a tail whose own AP write failed must still get the \
+             access point back — exactly once: {calls}"
+        );
+    }
+
+    /// Hotspot policy off is the operator exception, and the
+    /// only one.
+    ///
+    /// This used to raise anyway, on the reading that the switch
+    /// was about the standing access point and not about being
+    /// reachable. That reading made the switch unable to mean
+    /// what it says: a device told not to offer an access point
+    /// offered one the moment its network went away. Off means
+    /// off. A device with no profile at all is a separate case —
+    /// an absence is not a decision — and is covered below.
+    #[tokio::test]
+    async fn hotspot_policy_off_raises_nothing_and_touches_nothing() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
         let p = recovery_plugin(dir.path(), &nmcli);
 
         let mut intent = NetworkIntent::default();
@@ -14056,13 +15091,21 @@ exit 0\n",
             )
             .await
             .expect("recovery");
-        assert!(raised, "the recovery AP must come up: {steps:?}");
 
+        assert!(!raised, "policy off must raise nothing: {steps:?}");
         let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
             .unwrap_or_default();
         assert!(
-            calls.contains("connection up evo-network-hotspot"),
-            "the AP must be raised: {calls}"
+            !calls.contains("connection up"),
+            "policy off must not raise an access point: {calls}"
+        );
+        assert!(
+            !calls.contains("connection modify evo-network-hotspot"),
+            "policy off must not rewrite the saved profile: {calls}"
+        );
+        assert!(
+            !calls.contains("connection add"),
+            "policy off must not write a recovery profile: {calls}"
         );
     }
 
@@ -14081,7 +15124,8 @@ exit 0\n",
 
         let mut intent = NetworkIntent::default();
         intent.ethernet.enabled = false;
-        intent.fallback.hotspot_enabled = false;
+        // Policy on: the switch being off is its own test below.
+        intent.fallback.hotspot_enabled = true;
         intent.wifi.ap_ssid = "evo-4466".to_string();
 
         let mut steps = Vec::new();
@@ -14126,7 +15170,8 @@ exit 0\n",
 
         let mut intent = NetworkIntent::default();
         intent.ethernet.enabled = false;
-        intent.fallback.hotspot_enabled = false;
+        // Policy on: the switch being off is its own test below.
+        intent.fallback.hotspot_enabled = true;
 
         let mut steps = Vec::new();
         p.try_critical_open_hotspot_recovery(
@@ -14153,16 +15198,24 @@ exit 0\n",
             "the station must be released before the AP is raised: {calls}"
         );
         assert!(
-            !calls.contains("connection delete"),
+            !calls.contains("connection delete evo-network-wifi-sta"),
             "recovery must never delete the saved station: {calls}"
         );
-        // An existing profile is opened rather than replaced.
         assert!(
-            calls.contains(
+            !calls.contains("connection delete evo-network-hotspot\n")
+                && !calls.ends_with("connection delete evo-network-hotspot"),
+            "recovery must never delete the saved hotspot: {calls}"
+        );
+        // An existing profile is raised as it stands. Opening it
+        // was a rewrite of the operator's access point on the one
+        // path nobody is watching, and the profile kept it.
+        assert!(
+            !calls.contains(
                 "connection modify evo-network-hotspot remove \
                  802-11-wireless-security"
             ),
-            "an existing hotspot profile must be opened: {calls}"
+            "a saved hotspot must not have its security stripped: \
+             {calls}"
         );
     }
 
@@ -14204,56 +15257,11 @@ exit 0\n",
         );
     }
 
-    /// A device that once offered a standing access point still
-    /// carries its profile after the switch is turned off,
-    /// autoconnect and all. Opening that leftover for recovery and
-    /// leaving autoconnect alone would bring it back at the next
-    /// boot — open, and standing. Same back door the write path
-    /// closes, reached through a profile that was already here.
-    #[tokio::test]
-    async fn recovery_disarms_a_leftover_profile_when_no_ap_is_offered() {
-        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
-        let p = recovery_plugin(dir.path(), &nmcli);
-
-        let mut intent = NetworkIntent::default();
-        intent.ethernet.enabled = false;
-        intent.fallback.hotspot_enabled = false;
-
-        let mut steps = Vec::new();
-        p.try_critical_open_hotspot_recovery(
-            &intent,
-            "evo-network-hotspot",
-            &mut steps,
-        )
-        .await
-        .expect("recovery");
-
-        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
-            .unwrap_or_default();
-        assert!(
-            calls.contains(
-                "connection modify evo-network-hotspot \
-                 connection.autoconnect no"
-            ),
-            "a leftover profile must not return after a reboot: {calls}"
-        );
-        assert!(
-            !calls.contains("connection delete"),
-            "the profile is disarmed, not replaced: {calls}"
-        );
-        assert!(
-            !calls.lines().any(|l| l.starts_with("connection add")),
-            "an existing profile must not be rewritten: {calls}"
-        );
-    }
-
     /// With a standing access point offered, autoconnect belongs to
     /// the operator's profile and recovery has no business touching
     /// it. Recovery still opens the profile and raises it.
     #[tokio::test]
-    async fn recovery_leaves_autoconnect_alone_when_an_ap_is_offered() {
+    async fn a_saved_hotspot_keeps_its_security_and_interface_name() {
         let _exec_lock = MOCK_EXEC_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", true);
@@ -14280,12 +15288,29 @@ exit 0\n",
             !calls.contains("connection.autoconnect"),
             "a standing AP's autoconnect is the operator's: {calls}"
         );
+        // REQUIRED PIN: the saved profile is raised as it stands.
+        //
+        // Recovery used to strip the security off it and re-pin
+        // `connection.interface-name` to the station radio. Both
+        // survived in the profile afterwards, so a WPA access
+        // point the operator had configured came back open and
+        // bound to a radio they never chose — done on the one
+        // path where nobody is at the glass to see it.
         assert!(
-            calls.contains(
+            !calls.contains(
                 "connection modify evo-network-hotspot remove \
                  802-11-wireless-security"
             ),
-            "the profile is still opened for recovery: {calls}"
+            "the saved profile's security must be unchanged: {calls}"
+        );
+        assert!(
+            !calls.contains(
+                "connection modify evo-network-hotspot \
+                 connection.interface-name"
+            ),
+            "the saved profile's interface name must be unchanged; \
+             recovery creates the vif instead of re-pinning the \
+             profile: {calls}"
         );
     }
 
@@ -14666,6 +15691,27 @@ exit 0\n",
                 .lines()
                 .any(|l| l.split_whitespace().any(|a| a == "-s")),
             "the stored passphrase must never be read: {calls}"
+        );
+    }
+
+    #[test]
+    fn captive_frame_keeps_admission_fields_and_drops_the_redirect_stamp() {
+        let url = compose_session_url(
+            "sid",
+            "/guest/s/default/",
+            "ap=aa&id=bb&t=1790063975&url=http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate_204&ssid=Guest",
+        );
+        assert_eq!(
+            url,
+            "/api/v1/network/captive/session/sid/guest/s/default/?ap=aa&id=bb&url=http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate_204&ssid=Guest"
+        );
+        assert!(
+            !url.contains("t=1790063975"),
+            "t on the frame address makes the venue redirect away from the form"
+        );
+        assert_eq!(
+            compose_session_url("sid", "/guest/s/default/", "t=1"),
+            "/api/v1/network/captive/session/sid/guest/s/default/"
         );
     }
 }
