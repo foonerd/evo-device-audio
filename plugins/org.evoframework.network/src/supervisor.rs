@@ -98,6 +98,19 @@ pub struct SupervisorObservations {
     /// `true` when at least one Wi-Fi device reports `connected`
     /// in the iw link probe.
     pub wifi_associated: bool,
+    /// `true` when NetworkManager itself holds a non-loopback
+    /// device in a `connected` state — that is, when NM has an
+    /// uplink of its own to score.
+    ///
+    /// `nm_connectivity` is a verdict about the devices NM
+    /// manages, and nothing else. A host can carry traffic on an
+    /// interface NM was configured never to touch — Debian's
+    /// `[ifupdown] managed=false` beside an `iface … inet dhcp`
+    /// stanza leaves the cable to dhcpcd — and NM then answers
+    /// `none` because it manages no uplink, not because the host
+    /// is unreachable. This flag is what lets
+    /// [`classify_reachability`] tell those two apart.
+    pub nm_managed_uplink: bool,
 }
 
 /// Captive-portal info recorded when the supervisor detects a
@@ -300,7 +313,18 @@ pub fn classify_reachability(
             "full" => return ReachabilityState::Online,
             "portal" => return ReachabilityState::Portal,
             "limited" => return ReachabilityState::Limited,
-            "none" => return ReachabilityState::Offline,
+            // `none` is only a verdict when NM has an uplink of
+            // its own to score. Reaching this line means the floor
+            // above already found a carrier or an association, so
+            // when NM holds no connected device the two disagree
+            // about the same host — and NM is the one that cannot
+            // see the interface. A cable another manager owns is
+            // still a cable. Fall through to the probe rather than
+            // calling a working uplink Offline on the word of a
+            // manager that is not carrying it.
+            "none" if obs.nm_managed_uplink => {
+                return ReachabilityState::Offline
+            }
             _ => {}
         }
     }
@@ -792,6 +816,7 @@ mod tests {
             probe_effective_url: None,
             ethernet_carrier_up: false,
             wifi_associated: true,
+            nm_managed_uplink: true,
         }
     }
 
@@ -802,6 +827,7 @@ mod tests {
             probe_effective_url: None,
             ethernet_carrier_up: false,
             wifi_associated: false,
+            nm_managed_uplink: false,
         }
     }
 
@@ -812,6 +838,7 @@ mod tests {
             probe_effective_url: Some("http://hotel.portal/login".to_string()),
             ethernet_carrier_up: false,
             wifi_associated: true,
+            nm_managed_uplink: true,
         }
     }
 
@@ -847,6 +874,7 @@ mod tests {
             probe_effective_url: None,
             ethernet_carrier_up: true,
             wifi_associated: false,
+            nm_managed_uplink: false,
         };
         assert_eq!(classify_reachability(&obs), ReachabilityState::Limited);
     }
@@ -859,8 +887,70 @@ mod tests {
             probe_effective_url: None,
             ethernet_carrier_up: false,
             wifi_associated: true,
+            nm_managed_uplink: true,
         };
         assert_eq!(classify_reachability(&obs), ReachabilityState::Online);
+    }
+
+    /// A host whose only working uplink is a wired interface
+    /// NetworkManager was configured never to manage:
+    ///
+    /// ```text
+    /// /sys/class/net/<eth>/carrier     1
+    /// ip route show default            via <gateway> dev <eth>
+    /// nmcli -t -f CONNECTIVITY general none
+    /// nmcli device status              <eth>   ethernet  unmanaged
+    ///                                  <wifi>  wifi      disconnected
+    ///                                  lo      loopback  connected (externally)
+    /// ```
+    ///
+    /// `[ifupdown] managed=false` in `NetworkManager.conf`, beside
+    /// an `iface <eth> inet dhcp` stanza, leaves the cable to
+    /// dhcpcd. NM manages no uplink and so answers `none` — while
+    /// the host is routing over that very cable.
+    fn obs_carrier_held_outside_nm() -> SupervisorObservations {
+        SupervisorObservations {
+            nm_connectivity: Some("none".to_string()),
+            probe_http_code: None,
+            probe_effective_url: None,
+            ethernet_carrier_up: true,
+            wifi_associated: false,
+            nm_managed_uplink: false,
+        }
+    }
+
+    /// A carrier NetworkManager cannot see is still a carrier.
+    /// `none` from a manager holding no uplink must not sink a
+    /// routing host to `Offline`.
+    #[test]
+    fn classify_does_not_score_offline_when_nm_cannot_see_the_carrier() {
+        let got = classify_reachability(&obs_carrier_held_outside_nm());
+        assert_ne!(
+            got,
+            ReachabilityState::Offline,
+            "a cable NM does not manage was scored Offline on NM's word"
+        );
+        // Falls through to the probe. `ProbeKind::Off` leaves no
+        // HTTP code, so the honest verdict is Limited: the host
+        // routes, and internet reachability was never tested.
+        assert_eq!(got, ReachabilityState::Limited);
+        // The point of the row: Limited is serviceable, so the
+        // supervisor does not trigger critical recovery and does
+        // not take the station down to recover a working host.
+        assert!(got.is_serviceable());
+    }
+
+    /// The counterweight. `none` from a manager that *is* holding
+    /// a connected device remains a verdict, and still means
+    /// Offline — otherwise this row would have deleted the arm
+    /// rather than qualified it.
+    #[test]
+    fn classify_offline_when_nm_says_none_and_holds_the_uplink() {
+        let obs = SupervisorObservations {
+            nm_managed_uplink: true,
+            ..obs_carrier_held_outside_nm()
+        };
+        assert_eq!(classify_reachability(&obs), ReachabilityState::Offline);
     }
 
     #[test]

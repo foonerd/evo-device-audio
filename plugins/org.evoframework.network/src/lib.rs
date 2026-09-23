@@ -10054,6 +10054,8 @@ async fn probe_observations(
 ) -> supervisor::SupervisorObservations {
     let nm_connectivity =
         probe_nm_connectivity(nmcli_exec, nmcli_path, nmcli_timeout).await;
+    let nm_managed_uplink =
+        probe_nm_managed_uplink(nmcli_exec, nmcli_path, nmcli_timeout).await;
     let (probe_http_code, probe_effective_url) = match (probe_kind, probe_url) {
         (supervisor::ProbeKind::Off, _) | (_, None) => (None, None),
         (_, Some(url)) => {
@@ -10069,7 +10071,62 @@ async fn probe_observations(
         probe_effective_url,
         ethernet_carrier_up,
         wifi_associated,
+        nm_managed_uplink,
     }
+}
+
+/// Does NetworkManager hold an uplink of its own?
+///
+/// `nmcli general connectivity` reports on the devices NM manages.
+/// Where another manager owns the working interface — Debian's
+/// `[ifupdown] managed=false` leaves an `iface … inet dhcp` cable
+/// to dhcpcd, and NM reports the device `unmanaged` — NM has
+/// nothing to score and answers `none`. Without this probe the
+/// supervisor reads that `none` as "the host is unreachable" while
+/// the host is in fact routing.
+///
+/// Loopback is excluded deliberately: NM reports `lo` as connected
+/// on every host, so counting it would make this true everywhere
+/// and the distinction worthless.
+///
+/// Any failure answers `false`. That is consistent rather than
+/// merely safe: a dispatch that fails here fails in
+/// [`probe_nm_connectivity`] too, leaving `nm_connectivity` at
+/// `None`, which never reaches the `none` arm this flag guards.
+async fn probe_nm_managed_uplink(
+    exec: &dyn PrivilegedExec,
+    nmcli_path: &str,
+    timeout: Duration,
+) -> bool {
+    let Ok(out) = exec
+        .dispatch(
+            nmcli_path,
+            &["-t", "-f", "TYPE,STATE", "device", "status"],
+            timeout,
+        )
+        .await
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.lines().any(nm_device_row_is_managed_uplink)
+}
+
+/// One `nmcli -t -f TYPE,STATE device status` row: `wifi:connected`,
+/// `ethernet:unmanaged`, `loopback:connected (externally)`.
+///
+/// `connected` is matched as a prefix because NM qualifies it —
+/// `connected (externally)`, `connected (site only)` — and every
+/// such qualification still means NM is holding that device.
+fn nm_device_row_is_managed_uplink(row: &str) -> bool {
+    let mut fields = row.split(':');
+    let ty = fields.next().unwrap_or("").trim();
+    let state = fields.next().unwrap_or("").trim();
+    !ty.eq_ignore_ascii_case("loopback")
+        && state.to_ascii_lowercase().starts_with("connected")
 }
 
 async fn probe_nm_connectivity(
@@ -10582,6 +10639,36 @@ hotspot_fallback = true
         let (code, url) = parse_http_probe_metrics("not-a-code");
         assert_eq!(code, None);
         assert!(url.is_none());
+    }
+
+    /// `nmcli -t -f TYPE,STATE device status` on a host where
+    /// another manager owns the cable. Loopback reads
+    /// `connected (externally)` on every host; counting it would
+    /// make `nm_managed_uplink` true everywhere and leave the
+    /// `none` arm exactly as it was.
+    #[test]
+    fn nm_managed_uplink_ignores_loopback_and_unmanaged_devices() {
+        let nm_holds_no_uplink = [
+            "loopback:connected (externally)",
+            "wifi:disconnected",
+            "wifi-p2p:disconnected",
+            "wifi:unavailable",
+            "ethernet:unmanaged",
+        ];
+        assert!(
+            !nm_holds_no_uplink
+                .iter()
+                .copied()
+                .any(nm_device_row_is_managed_uplink),
+            "NM holds no uplink here — only loopback is connected"
+        );
+
+        // The same host once NM is actually carrying the cable.
+        assert!(nm_device_row_is_managed_uplink("ethernet:connected"));
+        // NM qualifies the state and still holds the device.
+        assert!(nm_device_row_is_managed_uplink(
+            "ethernet:connected (site only)"
+        ));
     }
 
     #[test]
