@@ -460,7 +460,7 @@ debian_package_for_binary() {
         lsblk|findmnt|blockdev)    echo "util-linux" ;;
         fsck.vfat)                 echo "dosfstools" ;;
         fsck.exfat)                echo "exfatprogs" ;;
-        ntfsfix)                   echo "ntfs-3g" ;;
+        ntfs-3g|ntfsfix)           echo "ntfs-3g" ;;
         e2fsck)                    echo "e2fsprogs" ;;
         eject)                     echo "eject" ;;
         evo-*)               echo "PLUGIN_PROVIDED" ;;
