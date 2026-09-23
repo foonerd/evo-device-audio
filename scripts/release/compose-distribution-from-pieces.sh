@@ -130,11 +130,14 @@ require_file "${steward_src}"
 mkdir -p "${STAGE}/bin"
 install -m 0755 "${steward_src}" "${STAGE}/bin/evo-device-audio"
 
-# Plugins (already signed)
+# Plugins (already signed). The slot key is the cut number,
+# not the version inside manifest.oop.toml.
+CUT_VER="$(tr -d ' \t\r\n' < "${REPO_ROOT}/CUT_VERSION" 2>/dev/null || true)"
+[[ -n "${CUT_VER}" ]] || die "CUT_VERSION is missing or empty; plugin slots are keyed on the cut number"
+[[ "${CUT_VER}" != v* ]] || die "CUT_VERSION must not carry a leading v (read: ${CUT_VER})"
 for entry in "${OOP_PLUGINS[@]}"; do
     IFS=':' read -r p_name _ _ _ <<< "${entry}"
-    p_ver="$(awk -F'"' '/^version *=/{print $2; exit}' "${REPO_ROOT}/plugins/${p_name}/manifest.oop.toml")"
-    [[ -n "${p_ver}" ]] || die "no version in plugins/${p_name}/manifest.oop.toml"
+    p_ver="${CUT_VER}"
     tgz="${ARTEFACTS}/bundles/${p_name}/${TARGET}/${p_name}-${p_ver}-${TARGET}.tar.gz"
     require_file "${tgz}"
     tmp="$(mktemp -d -t evo-plug-XXXXXX)"

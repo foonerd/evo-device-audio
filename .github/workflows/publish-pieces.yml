@@ -279,6 +279,21 @@ jobs:
           umask 077
           printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
 
+          # Slot key is the cut number. Manifest versions stay
+          # inside the bundle. Keying the path on them stored
+          # this cut's network, shares, playback, and USB
+          # rework into slots that were already full.
+          PLUGIN_VERSION=$(tr -d " \t\r\n" < CUT_VERSION 2>/dev/null || true)
+          if [ -z "$PLUGIN_VERSION" ]; then
+            echo "::error::CUT_VERSION is missing or empty at the repository root; the cut number is required to key a plugin slot"
+            exit 1
+          fi
+          case "$PLUGIN_VERSION" in
+            v*)
+              echo "::error::CUT_VERSION must not carry a leading v (read: $PLUGIN_VERSION)"
+              exit 1 ;;
+          esac
+
           STAGE=/tmp/stage
           BUNDLE_DIR_NAME="${PLUGIN_NAME}-${PLUGIN_VERSION}-${TARGET}"
           BUNDLE_DIR="${STAGE}/bundles-work/${BUNDLE_DIR_NAME}"
