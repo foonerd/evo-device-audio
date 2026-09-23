@@ -7,17 +7,18 @@
 #   bundles/distribution/<version>.toml is a projection of that
 #   Release. It is never written from compose tempdir hashes.
 #
-# A published Release asset is frozen. compose embeds
-# built_at_utc inside the tarball, so a second compose cannot
-# reproduce the published sha256. Missing triple = compose and
-# append. Present triple = do not touch the bytes.
+# A bake of this tag composes every triple from piece-pins.toml
+# and replaces evo-device-audio-<arch>-<cargo version>.tar.gz,
+# .sig, and .sha256 together on GitHub Release <tag>. The
+# tarball, the signature, and the checksum move as one set.
 #
 # The pointer writer is scripts/release/write-distribution-pointer.sh.
 # It uses jq(1) on `gh release view --json assets`. It does not
 # use `gh --jq --arg` (gh --jq takes one expression).
 #
-# Creates GitHub Release <tag> with --latest=false and does not
-# touch GitHub Release v0.1.13.
+# Creates GitHub Release <tag> with --latest=false when the
+# release is new. Does not touch GitHub Release v0.1.13.
+# Does not move Latest.
 #
 set -euo pipefail
 
@@ -140,17 +141,8 @@ load_release_inventory() {
     if gh release view "${TAG}" --repo "${ARTEFACTS_GH_REPO}" >/dev/null 2>&1; then
         RELEASE_EXISTS=1
         RELEASE_ASSETS_JSON="$(gh release view "${TAG}" --repo "${ARTEFACTS_GH_REPO}" --json assets)"
-        log_ok "GitHub Release ${TAG} exists; published assets are frozen"
+        log_ok "GitHub Release ${TAG} exists; composed assets will replace the published triple"
     fi
-}
-
-triple_is_frozen() {
-    local triple="$1" base
-    base="$(tarball_name "${triple}")"
-    [[ "${RELEASE_EXISTS}" -eq 1 ]] || return 1
-    asset_on_release "${base}" || return 1
-    asset_on_release "${base}.sig" || return 1
-    asset_on_release "${base}.sha256" || return 1
 }
 
 log_step "Cut ${TAG} (workspace ${CARGO_VERSION})"
@@ -175,13 +167,10 @@ BUNDLE_DIR="$(cd "${BUNDLE_DIR}" && pwd)"
 load_release_inventory
 
 COMPOSE_TRIPLES=()
-FROZEN_TRIPLES=()
 for triple in "${TRIPLES[@]}"; do
-    if [[ "${PUBLISH_ONLY}" -eq 0 ]] && triple_is_frozen "${triple}"; then
-        FROZEN_TRIPLES+=("${triple}")
-        log_ok "frozen $(tarball_name "${triple}"); will not recompose"
-    else
-        COMPOSE_TRIPLES+=("${triple}")
+    COMPOSE_TRIPLES+=("${triple}")
+    if [[ "${RELEASE_EXISTS}" -eq 1 ]] && asset_on_release "$(tarball_name "${triple}")"; then
+        log_ok "will replace $(tarball_name "${triple}") on Release ${TAG}"
     fi
 done
 
@@ -193,12 +182,8 @@ if [[ "${PUBLISH_ONLY}" -eq 0 ]]; then
 fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-    if [[ ${#COMPOSE_TRIPLES[@]} -eq 0 ]]; then
-        log_dry "would: compose nothing; all triples frozen"
-    else
-        log_dry "would: compose ${COMPOSE_TRIPLES[*]} from piece-pins.toml"
-    fi
-    log_dry "would: upload only newly composed assets"
+    log_dry "would: compose ${COMPOSE_TRIPLES[*]} from piece-pins.toml"
+    log_dry "would: replace the tarball, signature, and checksum on Release ${TAG}"
     log_dry "would: write pointer as a projection of Release ${TAG}"
     log_dry "would: leave GitHub Release ${PROTECTED_GH_RELEASE} and Latest untouched"
     log_ok "dry-run complete; artefacts repo not mutated"
@@ -206,7 +191,7 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
 fi
 
 if [[ "${PUBLISH_ONLY}" -eq 0 && ${#COMPOSE_TRIPLES[@]} -gt 0 ]]; then
-    log_step "Compose missing tarballs from published pieces"
+    log_step "Compose tarballs from published pieces"
     export EVO_BUNDLE_OUT_DIR="${BUNDLE_DIR}"
     for triple in "${COMPOSE_TRIPLES[@]}"; do
         bash "${SCRIPT_DIR}/compose-distribution-from-pieces.sh" \
@@ -215,8 +200,6 @@ if [[ "${PUBLISH_ONLY}" -eq 0 && ${#COMPOSE_TRIPLES[@]} -gt 0 ]]; then
             --bundle-dir "${BUNDLE_DIR}" \
             --cargo-version "${CARGO_VERSION}"
     done
-elif [[ "${PUBLISH_ONLY}" -eq 0 ]]; then
-    log_step "All triples frozen on Release ${TAG}"
 fi
 
 UPLOAD=()
@@ -255,14 +238,18 @@ if [[ "${RELEASE_EXISTS}" -eq 0 ]]; then
         "${assets[@]}"
     log_ok "created Release ${TAG}; Latest and ${PROTECTED_GH_RELEASE} untouched"
 else
-    for f in "${UPLOAD[@]+"${UPLOAD[@]}"}"; do
-        if asset_on_release "${f}"; then
-            log_ok "keep frozen asset ${f}"
-            continue
-        fi
-        gh release upload "${TAG}" "${BUNDLE_DIR}/${f}" --repo "${ARTEFACTS_GH_REPO}"
-        log_ok "appended asset ${f}"
+    if [[ ${#UPLOAD[@]} -eq 0 ]]; then
+        die "Release ${TAG} exists and nothing was composed to replace it"
+    fi
+    assets=()
+    for f in "${UPLOAD[@]}"; do
+        assets+=("${BUNDLE_DIR}/${f}")
     done
+    gh release upload "${TAG}" \
+        --repo "${ARTEFACTS_GH_REPO}" \
+        --clobber \
+        "${assets[@]}"
+    log_ok "replaced ${#UPLOAD[@]} assets on Release ${TAG}; ${PROTECTED_GH_RELEASE} untouched"
 fi
 
 log_step "Pointer from the store (not from compose tempdir)"

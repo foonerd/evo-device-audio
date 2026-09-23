@@ -460,7 +460,7 @@ debian_package_for_binary() {
         lsblk|findmnt|blockdev)    echo "util-linux" ;;
         fsck.vfat)                 echo "dosfstools" ;;
         fsck.exfat)                echo "exfatprogs" ;;
-        ntfsfix)                   echo "ntfs-3g" ;;
+        ntfs-3g|ntfsfix)           echo "ntfs-3g" ;;
         e2fsck)                    echo "e2fsprogs" ;;
         eject)                     echo "eject" ;;
         evo-*)               echo "PLUGIN_PROVIDED" ;;
@@ -1587,8 +1587,9 @@ verify_storage_usb_provisioning() {
 
     # Wrapper — exists, mode 0755, --version returns exit 0 and
     # prints the stable version tag. Accepted versions:
-    #   evo-usb-mount 5 — current (host-ns attach; NTFS via
-    #                     ntfs-3g, not kernel ntfs3).
+    #   evo-usb-mount 7 — current. Force detach is systemd-run
+    #                     as a child of PID 1, then umount -i -l.
+    #   evo-usb-mount 5 — host-ns attach; NTFS via ntfs-3g.
     #   evo-usb-mount 4 — systemd-mount --type as given (NTFS
     #                     hits ntfs3 and rejects §2 options).
     #   evo-usb-mount 3 — raw mount(8) inside the steward unit.
@@ -1600,7 +1601,8 @@ verify_storage_usb_provisioning() {
     if [[ -x /usr/local/bin/evo-usb-mount ]]; then
         local ver
         ver="$(/usr/local/bin/evo-usb-mount --version 2>/dev/null || true)"
-        if [[ "${ver}" == "evo-usb-mount 5" ]] \
+        if [[ "${ver}" == "evo-usb-mount 7" ]] \
+           || [[ "${ver}" == "evo-usb-mount 5" ]] \
            || [[ "${ver}" == "evo-usb-mount 4" ]] \
            || [[ "${ver}" == "evo-usb-mount 3" ]] \
            || [[ "${ver}" == "evo-usb-mount 2" ]] \

@@ -764,6 +764,39 @@ At the release-cut, the SDK pin flips back to a `git+tag` form, the path-dep wor
 3.  Rerun `cargo build --workspace` and `cargo test --workspace`.
 4.  Commit with a message naming the new evo-core version and any public-surface changes the bump forced.
 
+## The cut number
+
+`CUT_VERSION` at the repository root holds the number of the cut
+being made — `0.1.13.0`, `0.1.13.1`, `0.1.14`. One line, no `v`
+prefix.
+
+There is one operation, `cut(V)`, and the operator names `V`.
+Cutting `0.1.13.1` after `0.1.13.0` is not a bump; it is the next
+cut. Cutting `0.1.13.0` again is `cut(0.1.13.0)`.
+
+Cargo versions are three components, so `0.1.13.0` cannot live in
+`Cargo.toml`. The workspace version stays three components for
+crate resolution and nothing downstream keys on it. Before this
+file existed everything read that version instead, so the fourth
+component of the tag never reached a slot path: a second
+`cut(0.1.13.0)` staged into the `0.1.13` slot the first had
+filled, was skipped as already published, and the run went green
+having stored nothing.
+
+Piece slot paths read this file and fail when it is missing or
+malformed rather than falling back to the crate version. The
+fallback is what made the fourth component decorative. The
+installer tarball name stays the three-component Cargo version
+(`evo-device-audio-<arch>-0.1.13.tar.gz`). A later cut that must
+change that filename changes `EVO_BUNDLE_VERSION` in the same
+sitting. Do not commit `0.1.13.0` into this file on the
+`v0.1.13.1` branch. Write the number when that cut is the one
+being made.
+
+It is a product file, so the eng-to-public squash carries it. The
+publishing workflows are not carried by that squash; they live on
+the public branch and are edited there.
+
 ## License
 
 Apache 2.0. Each source file carries the SPDX identifier `Apache-2.0` in its header once code lands.
