@@ -19,7 +19,7 @@
 //! 2. Compose a [`SupervisorObservations`] snapshot from the
 //!    NetworkManager connectivity surface + a `curl` reachability
 //!    probe (RFC 8910 / HTTP 204 style).
-//! 3. Drive the [`SupervisorState`] state machine; publish the
+//! 3. Drive the `SupervisorState` state machine; publish the
 //!    new [`SupervisorView`] on a `tokio::sync::watch` channel so
 //!    wire-op handlers and reactive subscribers read consistent
 //!    state.
@@ -27,7 +27,7 @@
 //!    trigger critical-recovery action (caller-supplied). On
 //!    return-from-`Offline`, trigger the STA-restore action.
 //!
-//! All I/O is routed through the [`PrivilegedExec`] dispatchers
+//! All I/O is routed through the `PrivilegedExec` dispatchers
 //! the plugin holds; the supervisor never spawns commands
 //! directly. The probe / recovery actions are passed in as boxed
 //! futures so unit tests can substitute deterministic fakes.
@@ -459,6 +459,12 @@ type AsyncRecovery = Arc<
         + Send
         + Sync,
 >;
+type AsyncRaise = Arc<
+    dyn Fn()
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Bundle of action callbacks the supervisor task invokes.
 #[derive(Clone)]
@@ -467,7 +473,10 @@ pub struct SupervisorActions {
     pub probe: AsyncProbe,
     /// Raise the critical-recovery hotspot. Called once when
     /// `SupervisorDecision::RaiseCriticalRecovery` fires.
-    pub raise_critical_recovery: AsyncRecovery,
+    /// `true` means the access point is up. `false` means
+    /// this attempt did not raise it, and the latch must
+    /// be released so a later offline window can try again.
+    pub raise_critical_recovery: AsyncRaise,
     /// Tear the recovery hotspot down + re-apply the operator's
     /// intent. Called once when `SupervisorDecision::RestoreSta`
     /// fires.
@@ -745,7 +754,18 @@ async fn run_probe_cycle(
                 state_ticks = next.state_ticks,
                 "supervisor: raising critical-recovery hotspot"
             );
-            (actions.raise_critical_recovery)().await;
+            let raised = (actions.raise_critical_recovery)().await;
+            if !raised {
+                let mut rolled = view_tx.borrow().clone();
+                rolled.critical_recovery_active = false;
+                let _ = view_tx.send(rolled);
+                tracing::warn!(
+                    plugin = plugin_log_tag,
+                    trigger,
+                    "supervisor: critical-recovery did not raise; \
+                     the next offline window will try again"
+                );
+            }
         }
         SupervisorDecision::RestoreSta => {
             tracing::info!(
@@ -763,6 +783,7 @@ async fn run_probe_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn obs_online() -> SupervisorObservations {
         SupervisorObservations {
@@ -883,6 +904,145 @@ mod tests {
         assert_eq!(view.state_ticks, 3);
         assert!(view.critical_recovery_active);
         assert_eq!(dec, SupervisorDecision::RaiseCriticalRecovery);
+    }
+
+    #[tokio::test]
+    async fn missed_raise_does_not_stick() {
+        let config = SupervisorConfig {
+            interval_ms: 1000,
+            critical_grace_ms: 3000,
+            ..SupervisorConfig::default()
+        };
+        let (tx, _rx) = watch::channel(SupervisorView {
+            reachability: ReachabilityState::Offline,
+            state_ticks: 2,
+            critical_recovery_active: false,
+            ever_serviceable: true,
+            ..SupervisorView::default()
+        });
+        let raises = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(|| {
+            Box::pin(async { obs_offline() })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = SupervisorObservations>
+                            + Send,
+                    >,
+                >
+        });
+        let raises_for_cb = Arc::clone(&raises);
+        let raise = Arc::new(move || {
+            let raises_for_cb = Arc::clone(&raises_for_cb);
+            Box::pin(async move {
+                raises_for_cb.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = bool> + Send>,
+                >
+        });
+        let restore = Arc::new(|| {
+            Box::pin(async {})
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                >
+        });
+        let actions = SupervisorActions {
+            probe,
+            raise_critical_recovery: raise,
+            restore_sta: restore,
+        };
+        run_probe_cycle(&actions, &tx, &config, "test", "test").await;
+        assert_eq!(raises.load(Ordering::Relaxed), 1);
+        assert!(
+            !tx.borrow().critical_recovery_active,
+            "a raise that did not bring the access point up must not stick"
+        );
+        run_probe_cycle(&actions, &tx, &config, "test", "test").await;
+        assert_eq!(
+            raises.load(Ordering::Relaxed),
+            2,
+            "the next offline window must try again"
+        );
+    }
+
+    /// REQUIRED PIN: one raise per grace window.
+    ///
+    /// A raise that succeeded latches, and the latch is what
+    /// stops the supervisor spending a fresh activation on every
+    /// tick while the device is still offline. On a single-radio
+    /// chip each of those is the beacon stopping and restarting,
+    /// so a re-raise inside the same window is not a retry — it
+    /// is the access point going away again under whoever just
+    /// connected to it.
+    ///
+    /// The companion above covers the other direction: a raise
+    /// that did NOT come up releases the latch, so the next
+    /// window tries again.
+    #[tokio::test]
+    async fn a_successful_raise_does_not_fire_again_in_the_same_window() {
+        let config = SupervisorConfig {
+            interval_ms: 1000,
+            critical_grace_ms: 3000,
+            ..SupervisorConfig::default()
+        };
+        let (tx, _rx) = watch::channel(SupervisorView {
+            reachability: ReachabilityState::Offline,
+            state_ticks: 2,
+            critical_recovery_active: false,
+            ever_serviceable: true,
+            ..SupervisorView::default()
+        });
+        let raises = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(|| {
+            Box::pin(async { obs_offline() })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = SupervisorObservations>
+                            + Send,
+                    >,
+                >
+        });
+        let raises_for_cb = Arc::clone(&raises);
+        let raise = Arc::new(move || {
+            let raises_for_cb = Arc::clone(&raises_for_cb);
+            Box::pin(async move {
+                raises_for_cb.fetch_add(1, Ordering::Relaxed);
+                // This one came up.
+                true
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = bool> + Send>,
+                >
+        });
+        let restore = Arc::new(|| {
+            Box::pin(async {})
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                >
+        });
+        let actions = SupervisorActions {
+            probe,
+            raise_critical_recovery: raise,
+            restore_sta: restore,
+        };
+
+        run_probe_cycle(&actions, &tx, &config, "test", "test").await;
+        assert_eq!(raises.load(Ordering::Relaxed), 1);
+        assert!(
+            tx.borrow().critical_recovery_active,
+            "a raise that came up latches for this window"
+        );
+
+        // Still offline, still the same window.
+        run_probe_cycle(&actions, &tx, &config, "test", "test").await;
+        run_probe_cycle(&actions, &tx, &config, "test", "test").await;
+        assert_eq!(
+            raises.load(Ordering::Relaxed),
+            1,
+            "the access point is up; re-raising it inside the same \
+             window stops the beacon under a connected operator"
+        );
     }
 
     #[test]
@@ -1007,7 +1167,6 @@ mod tests {
     // -----------------------------------------------------
 
     use crate::source::{LinkEvent, LinkEventSource, LinkSourceCapabilities};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory test source that fires `count` events then
     /// stops responding (returns `None` on subsequent
@@ -1070,9 +1229,15 @@ mod tests {
                     Box<dyn std::future::Future<Output = ()> + Send>,
                 >
         });
+        let raise_noop = Arc::new(|| {
+            Box::pin(async { false })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = bool> + Send>,
+                >
+        });
         SupervisorActions {
             probe,
-            raise_critical_recovery: noop.clone(),
+            raise_critical_recovery: raise_noop,
             restore_sta: noop,
         }
     }

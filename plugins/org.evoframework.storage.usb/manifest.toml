@@ -70,8 +70,17 @@ response_budget_ms = 180000
 [capabilities.respondent.verb_capabilities]
 # Read verb anonymous (widget seed).
 "storage.usb.list_drives" = { kind = "none" }
-# Mutating verbs step-up-gated against storage_admin.
-"storage.usb.mount" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.safe_remove" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.repair_filesystem" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.rename" = { kind = "step_up", scope = "storage_admin" }
+# Mount / repair / rename ride the same household door as
+# share.mount — `network_admin`. `storage_admin` is not on
+# the steward bootstrap or LAN-privileged set, so the gate
+# returned verb_capability_scope_not_granted and glass
+# painted "That didn't work" with no password card.
+"storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
+# Same household door as mount. Glass library Remove
+# still has no password of its own: it nests as
+# plugin-system, which now holds network_admin as
+# StepUp. A LAN-trust or unpaired peer cannot call
+# this verb directly.
+"storage.usb.safe_remove" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.rename" = { kind = "step_up", scope = "network_admin" }

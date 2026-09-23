@@ -26,12 +26,16 @@
 //!
 //! Every mount / umount / fsck / eject invocation dispatches
 //! through the narrow root-only wrapper at
-//! `/usr/local/bin/evo-usb-mount`. The plugin does NOT hold raw
-//! sudo grants on the underlying tools; the wrapper's argv
-//! allowlist (path allowlist for mount targets + block-device
-//! allowlist for source arguments) is the last-mile runtime
-//! enforcement. The bootstrap installs the wrapper + sudoers
-//! drop-in at install time (Step 1g).
+//! `/usr/local/bin/evo-usb-mount`. The wrapper asks PID 1
+//! (`systemd-mount --collect`) so the volume is in the host
+//! mount namespace. NTFS attach uses `--type=ntfs-3g` (the
+//! §2 option string is ntfs-3g, not kernel `ntfs3`). The
+//! plugin does NOT hold raw sudo grants on the underlying
+//! tools; the wrapper's argv allowlist (path allowlist for
+//! mount targets + block-device allowlist for source
+//! arguments) is the last-mile runtime enforcement.
+//! The bootstrap installs the wrapper + sudoers drop-in at
+//! install time (Step 1g).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -366,5 +370,38 @@ mod tests {
         let m = manifest();
         assert_eq!(m.target.shelf, "storage.usb");
         assert_eq!(m.target.shape, 1);
+    }
+
+    #[test]
+    fn safe_remove_rides_the_household_network_door() {
+        // Glass library Remove still has no password: it
+        // nests as plugin-system, which holds network_admin
+        // as StepUp. Direct safe_remove on LAN-trust or an
+        // unpaired peer is refused. Mount / repair / rename
+        // stay on the same door. storage_admin is not a
+        // granted scope.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let m = manifest();
+        let caps = &m
+            .capabilities
+            .respondent
+            .as_ref()
+            .expect("respondent")
+            .verb_capabilities;
+        for verb in [
+            "storage.usb.safe_remove",
+            "storage.usb.mount",
+            "storage.usb.repair_filesystem",
+            "storage.usb.rename",
+        ] {
+            assert!(
+                matches!(
+                    caps.get(verb),
+                    Some(VerbCapability::StepUp { scope }) if scope == "network_admin"
+                ),
+                "{verb} must stay household-gated: {:?}",
+                caps.get(verb)
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@
 This document covers two distinct kinds of credential material:
 
 1. **Commons signing key.** Ed25519 keypair. The **public half** is committed in this repo at [`keys/commons-plugin-signing-public.pem`](keys/commons-plugin-signing-public.pem) and is read by every consumer that verifies plugins published from this commons. The **private half** lives only in the GitHub Actions repository secret `PLUGIN_SIGNING_KEY_PEM` and never leaves the runner.
-2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish.yml` and `promote.yml` workflows to push signed bytes from this repository's CI into [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts) (the workflows themselves land when the release-plane contract lands in evo-core).
+2. **Artefacts-push token.** Fine-grained GitHub Personal Access Token. Stored as the repository secret `ARTEFACTS_PUSH_TOKEN`. Used by `publish-pieces.yml`, `publish-distribution-bundle.yml`, and `promote.yml` to push signed bytes and create GitHub Releases on [evo-device-audio-artefacts](https://github.com/foonerd/evo-device-audio-artefacts). The first-boot tarball is a Release asset (git cannot hold files over 100 MB); piece slots stay under that limit and remain git blobs.
 
 Both secrets are kept distinct (compromising one does not compromise the other; defence in depth) and rotated independently.
 
@@ -15,8 +15,8 @@ Both secrets are kept distinct (compromising one does not compromise the other; 
 
 | Secret name | Type | Purpose | Used by | Rotation cadence |
 |-------------|------|---------|---------|------------------|
-| `PLUGIN_SIGNING_KEY_PEM` | Ed25519 PKCS#8 PEM (private key) | Signs plugin bundles and the release-plane manifest under the `org.evoframework.*` namespace | `continuous-dev.yml`, `manual-build.yml`, future `publish.yml`, `promote.yml` | 12 months, or on suspected compromise |
-| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Cross-repo write to `evo-device-audio-artefacts` | future `publish.yml`, `promote.yml` | 90 days (one calendar quarter) |
+| `PLUGIN_SIGNING_KEY_PEM` | Ed25519 PKCS#8 PEM (private key) | Signs the audio steward, plugin bundles, channel-pointer files, and the distribution-bundle pointer under the `org.evoframework.*` namespace | `secret-smoke.yml`, `publish-pieces.yml`, `publish-distribution-bundle.yml`, `promote.yml` | 12 months, or on suspected compromise |
+| `ARTEFACTS_PUSH_TOKEN` | Fine-grained GitHub PAT | Cross-repo write to `evo-device-audio-artefacts` (git push of piece slots and distribution pointers; `gh release create` for the first-boot tarball) | `publish-pieces.yml`, `publish-distribution-bundle.yml`, `promote.yml` | 90 days (one calendar quarter) |
 
 Public key fingerprint for the current commons signing key (SHA256 of the DER-encoded SubjectPublicKeyInfo): `9cd7d7381ee7c2b3bfa490b39077afdc925192299dda661ef94dddba71e574da`.
 
@@ -74,7 +74,7 @@ GitHub never shows the secret again after this; it can only be replaced.
 
 ### Step 1.5: Verify
 
-Trigger a workflow run that exercises signing (push to `main`, which fires `continuous-dev.yml`). Check the workflow log for the sign-smoke step. A successful signature against the new private key (verifying against the committed public key) confirms the secret value is correct.
+Run `secret-smoke.yml` (`workflow_dispatch`). A successful signing-key job confirms the secret verifies against the committed public key.
 
 ### Rotation
 
@@ -113,7 +113,7 @@ If the private key has leaked or is suspected to have leaked:
 2. Click **Generate new token**.
 3. Fill the form:
    - **Token name**: `evo-device-audio: publish (2026-Q2)`. GitHub limits the token name to 40 characters; this format fits. The `(YYYY-QN)` suffix is the rotation generation; future rotations increment to `(2026-Q3)`, `(2026-Q4)`, etc. Audit logs sort by name; consistent suffixing makes the active vs retiring generation obvious. The longer prose ("Cross-repo write from ... to ...") goes in the **Description** field below, which has no length limit.
-   - **Description**: `Cross-repo write from evo-device-audio CI to evo-device-audio-artefacts. Used by promote.yml and publish.yml. Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
+   - **Description**: `Cross-repo write from evo-device-audio CI to evo-device-audio-artefacts. Used by promote.yml, publish-pieces.yml, and publish-distribution-bundle.yml (git pointers + GitHub Release assets for the first-boot tarball). Stored as repo secret ARTEFACTS_PUSH_TOKEN. Rotated quarterly per project policy.`
    - **Expiration**: 90 days.
    - **Resource owner**: `foonerd`.
    - **Repository access**: **Only select repositories** → `foonerd/evo-device-audio-artefacts`. **Do not select any other repository.**
@@ -121,7 +121,7 @@ If the private key has leaked or is suspected to have leaked:
 
 | Group | Action |
 |-------|--------|
-| **Repository permissions** (the only group we touch) | Set **Contents = Read and write**. **Metadata = Read-only** is automatically enforced as a dependency once any Repository permission is set. Every other entry in this group (Actions, Administration, Code scanning alerts, Commit statuses, Custom properties, Dependabot ..., Deployments, Discussions, Environments, Issues, Merge queues, Pages, Pull requests, Secret scanning, Secrets, Variables, Webhooks, Workflows, etc.) stays at **No access**. |
+| **Repository permissions** (the only group we touch) | Set **Contents = Read and write**. That covers git push *and* `gh release create` / `gh release upload` (the first-boot tarball). **Metadata = Read-only** is automatically enforced as a dependency once any Repository permission is set. Every other entry in this group (Actions, Administration, Code scanning alerts, Commit statuses, Custom properties, Dependabot ..., Deployments, Discussions, Environments, Issues, Merge queues, Pages, Pull requests, Secret scanning, Secrets, Variables, Webhooks, Workflows, etc.) stays at **No access**. |
 | **Account permissions** | Every entry stays at **No access**. |
 | **Organization permissions** (only shown if the resource owner is an organisation; not shown for personal accounts) | If shown: every entry stays at **No access**. |
 
@@ -183,7 +183,7 @@ A compromised PAT can push unsigned content to the artefacts repository, but dev
 
 ## CI consumption preview
 
-When `publish.yml` is wired (after `RELEASE_PLANE.md` lands in evo-core), the secrets are consumed like this:
+`publish-pieces.yml`, `publish-distribution-bundle.yml`, and `promote.yml` consume the secrets like this. Piece slots (`binaries/`, `bundles/<plugin>/`) are git blobs under 100 MB. The first-boot tarball is uploaded with `gh release create` and must not be `git add`-ed.
 
 ```yaml
 - name: Sign and push pieces
@@ -202,7 +202,7 @@ When `publish.yml` is wired (after `RELEASE_PLANE.md` lands in evo-core), the se
     git clone "https://x-access-token:${GH_TOKEN}@github.com/foonerd/evo-device-audio-artefacts.git" artefacts
     cd artefacts
 
-    # ... copy pieces, update pieces.toml + signature, commit, push ...
+    # ... copy binaries/evo-device-audio/<ver>/ and bundles/<plugin>/ ...
 
     git push origin main
 
@@ -219,9 +219,10 @@ Both secrets are masked in workflow logs by GitHub Actions automatically.
 |---------|---------------|
 | https://github.com/foonerd/evo-device-audio/actions | Every workflow run that consumed either secret. Failed runs flag credential issues. |
 | https://github.com/settings/security-log | Every PAT use and every PAT lifecycle event (issue, expiration, revocation). |
-| https://github.com/foonerd/evo-device-audio-artefacts/commits | Every push from CI lands here; commit author "evo-device-audio CI" identifies the publish path. |
+| https://github.com/foonerd/evo-device-audio-artefacts/commits | Every git push from CI lands here; commit author "evo-device-audio CI" identifies the publish path. Pointers and piece slots only — not the first-boot tarball. |
+| https://github.com/foonerd/evo-device-audio-artefacts/releases | First-boot tarball assets. Testers curl Latest. |
 
-Cross-reference all three when investigating any unexpected publish.
+Cross-reference all four when investigating any unexpected publish.
 
 ---
 

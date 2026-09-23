@@ -9,7 +9,7 @@
 //! progress on the wire — the framework knows the scan
 //! started (from an `update_source` verb call or from an idle
 //! `Update` wake) and knows the total songs count on
-//! completion (from the next `stats` read), but the operator
+//! completion, but the operator
 //! UI sees nothing move between "scan started" and "scan
 //! completed". On a rescan of thousands of tracks the panel
 //! sits idle for minutes.
@@ -24,9 +24,11 @@
 //!    the walk can't complete within budget).
 //! 2. Polls MPD `status` every ~500 ms; when
 //!    `status.updating_db` is `Some(job_id)`, emits an
-//!    `audio_library_scan_progress` frame carrying the
-//!    per-source `scanned_tracks` (from `stats.songs`),
-//!    `estimated_total`, and `phase = "scanning"`.
+//!    `audio_library_scan_progress` frame carrying this
+//!    source's `scanned_tracks` (`count base` of songs
+//!    already in the database under the mount — not
+//!    `stats.songs`, which is the whole device), the
+//!    walker's `estimated_total`, and `phase = "scanning"`.
 //! 3. When `updating_db` returns to `None`, emits ONE
 //!    terminal frame with `phase = "complete"` carrying the
 //!    final counts; then republishes `audio_library_sources`
@@ -121,6 +123,32 @@ fn idle_envelope() -> serde_json::Value {
     })
 }
 
+/// Songs already in MPD under this source's mount. One
+/// `count base` roundtrip — not `find` (that materialises
+/// every URI) and not `stats.songs` (that is the whole
+/// device). Empty base is the floor library; a count
+/// without a path would be the database again, so this
+/// returns `None` and the last published number stands.
+async fn songs_under_base(
+    conn: &mut MpdConnection,
+    mpd_base: &str,
+) -> Option<u32> {
+    if mpd_base.is_empty() {
+        return None;
+    }
+    match conn.count_matching(&[("base", mpd_base)]).await {
+        Ok(n) => Some(n.min(u64::from(u32::MAX)) as u32),
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                "scan_progress: count base failed; keeping the last count"
+            );
+            None
+        }
+    }
+}
+
 /// The active-scan envelope: one entry describing the
 /// in-flight (or just-completed) scan.
 fn active_envelope(
@@ -160,6 +188,33 @@ async fn publish(subjects: &Arc<dyn SubjectAnnouncer>, env: serde_json::Value) {
             "audio_library_scan_progress update_state failed"
         );
     }
+}
+
+/// Heartbeat while a share is retracted. Same subject the index
+/// walk uses, so the glass has one bus for "something is acting
+/// on this store". Phase `retracting` is not a scan.
+pub(crate) async fn publish_retracting(
+    subjects: &Arc<dyn SubjectAnnouncer>,
+    source_id: &str,
+) {
+    let env = json!({
+        "v": SCAN_PROGRESS_PAYLOAD_VERSION,
+        "scans": [{
+            "source_id": source_id,
+            "kind": "remove",
+            "started_at_ms": now_ms(),
+            "scanned_tracks": 0,
+            "estimated_total": serde_json::Value::Null,
+            "current_relative_path": serde_json::Value::Null,
+            "phase": "retracting",
+        }],
+    });
+    publish(subjects, env).await;
+}
+
+/// Resting scan-progress envelope after a retract finishes.
+pub(crate) async fn publish_retract_idle(subjects: &Arc<dyn SubjectAnnouncer>) {
+    publish(subjects, idle_envelope()).await;
 }
 
 /// Spawn a scan-progress watcher for the current scan. Best-
@@ -219,23 +274,35 @@ async fn run(
     // shows indeterminate progress rather than a wrong denominator.
     let estimated_total =
         estimate_source_track_count(&library, &source_id).await;
+    let mpd_base = if let Some(record) = library.registry.get(&source_id).await
+    {
+        crate::library::mpd_database_relative_path(
+            &library.music_directory,
+            &record.mount_path,
+            "",
+        )
+        .ok()
+    } else {
+        None
+    };
 
-    // Initial frame — publishes phase=scanning with 0 scanned
-    // so the UI can render "Indexing 0 of M" immediately.
+    // Initial frame — publishes phase=scanning so the UI can
+    // render the heartbeat immediately. scanned_tracks starts
+    // at 0; the first poll replaces it with count base.
+    let mut last_scanned: u32 = 0;
     publish(
         &subjects,
         active_envelope(
             &source_id,
             kind,
             started_at_ms,
-            0,
+            last_scanned,
             estimated_total,
             "scanning",
         ),
     )
     .await;
 
-    let mut last_scanned: u32 = 0;
     let mut last_updating_db: Option<u32> = None;
 
     loop {
@@ -246,14 +313,16 @@ async fn run(
                 "scan_progress: watcher wall-clock ceiling reached; \
                  emitting terminal frame + exiting"
             );
-            emit_terminal(
-                &library,
-                &source_id,
+            emit_terminal(TerminalScan {
+                library: &library,
+                source_id: &source_id,
                 kind,
                 started_at_ms,
-                last_scanned,
+                final_scanned: last_scanned,
                 estimated_total,
-            )
+                endpoint: &endpoint,
+                timeouts,
+            })
             .await;
             return;
         }
@@ -292,20 +361,16 @@ async fn run(
                 continue;
             }
         };
-        let stats = match conn.stats().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    plugin = PLUGIN_NAME,
-                    error = %e,
-                    "scan_progress: poll stats failed; retrying"
-                );
-                continue;
-            }
-        };
-
-        last_scanned = stats.songs;
+        // No stats read here. Its only use was the database song
+        // total, which is not this source's progress. `status()`
+        // says whether the job is still running; `count base`
+        // says how many of THIS source's songs are already in.
         let now_updating = status.updating_db;
+        if let Some(base) = mpd_base.as_deref() {
+            if let Some(n) = songs_under_base(&mut conn, base).await {
+                last_scanned = n;
+            }
+        }
 
         // MPD reports updating_db while a scan is in flight.
         // Missing on the FIRST poll (before MPD picks up the
@@ -315,7 +380,6 @@ async fn run(
         // subsequent stable-None below.
         match (now_updating, last_updating_db) {
             (Some(_), _) => {
-                // Scan visibly in flight — emit progress.
                 publish(
                     &subjects,
                     active_envelope(
@@ -334,14 +398,16 @@ async fn run(
                 // Transition from scanning → idle. Emit
                 // terminal frame + settle the sources /
                 // state subjects.
-                emit_terminal(
-                    &library,
-                    &source_id,
+                emit_terminal(TerminalScan {
+                    library: &library,
+                    source_id: &source_id,
                     kind,
                     started_at_ms,
-                    last_scanned,
+                    final_scanned: last_scanned,
                     estimated_total,
-                )
+                    endpoint: &endpoint,
+                    timeouts,
+                })
                 .await;
                 return;
             }
@@ -353,14 +419,16 @@ async fn run(
                 // terminal frame with the observed final
                 // counts so the UI still sees a completion
                 // signal, then exit.
-                emit_terminal(
-                    &library,
-                    &source_id,
+                emit_terminal(TerminalScan {
+                    library: &library,
+                    source_id: &source_id,
                     kind,
                     started_at_ms,
-                    last_scanned,
+                    final_scanned: last_scanned,
                     estimated_total,
-                )
+                    endpoint: &endpoint,
+                    timeouts,
+                })
                 .await;
                 return;
             }
@@ -368,18 +436,39 @@ async fn run(
     }
 }
 
-async fn emit_terminal(
-    library: &LibraryContext,
-    source_id: &str,
+/// Everything one terminal frame needs, gathered into a value
+/// so the emitter takes a single argument rather than a list
+/// that widens each time the terminal path learns something new.
+struct TerminalScan<'a> {
+    library: &'a LibraryContext,
+    source_id: &'a str,
     kind: ScanKind,
     started_at_ms: u64,
     final_scanned: u32,
     estimated_total: Option<u32>,
-) {
+    endpoint: &'a MpdEndpoint,
+    timeouts: ConnectTimeouts,
+}
+
+async fn emit_terminal(scan: TerminalScan<'_>) {
+    let TerminalScan {
+        library,
+        source_id,
+        kind,
+        started_at_ms,
+        final_scanned,
+        estimated_total,
+        endpoint,
+        timeouts,
+    } = scan;
     let subjects = library.subjects.clone();
     // Terminal frame carries the final counts + phase=complete.
     // UI keys on phase=complete for its settle logic.
-    let final_total = estimated_total.or(Some(final_scanned));
+    // The walker's per-source estimate, or nothing. It must NOT
+    // fall back to `final_scanned` when the walker missed:
+    // a missing estimate becoming "N of N" from a mid-scan
+    // count is a finished lie.
+    let final_total = estimated_total;
     publish(
         &subjects,
         active_envelope(
@@ -392,6 +481,14 @@ async fn emit_terminal(
         ),
     )
     .await;
+
+    // Settle THIS source's counts before the sibling subjects
+    // are rebuilt. `publish_subjects` renders the registry as it
+    // finds it, so without this step the operator reads the
+    // count from before the scan until some unrelated state
+    // change happens to reconcile it — a rescan is not a state
+    // change.
+    settle_source_counts(library, source_id, endpoint, timeouts).await;
 
     // Republish the sibling subjects so the settled count
     // lands on the operator UI without a reload. `publish_subjects`
@@ -413,6 +510,134 @@ async fn emit_terminal(
         estimated_total = ?estimated_total,
         "scan_progress: terminal frame published; scan complete"
     );
+}
+
+/// Rewrite one source's track counts from MPD's own database.
+///
+/// The enumerator is the sticker reconciler's — `find base`
+/// asks MPD what it actually holds under this source. The base
+/// is the source's mount expressed relative to
+/// `music_directory`, which is the only form MPD's database
+/// understands; an absolute mount is a Bad URI to it. Browse and
+/// update_source resolve it the same way, through the same
+/// helper. It is deliberately NOT `stats.songs`: that counts the
+/// whole database, so attributing it to a NAS or USB source
+/// states a number that was never that source's.
+///
+/// Every failure path keeps the counts that are already there.
+/// A source whose enumeration did not come back is a source we
+/// know nothing new about; writing zero would turn a missing
+/// answer into a wrong one, and the caller republishes either
+/// way so the operator still sees a settled subject.
+async fn settle_source_counts(
+    library: &LibraryContext,
+    source_id: &str,
+    endpoint: &MpdEndpoint,
+    timeouts: ConnectTimeouts,
+) {
+    let Some(record) = library.registry.get(source_id).await else {
+        return;
+    };
+    let mpd_base = match crate::library::mpd_database_relative_path(
+        &library.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "scan terminal: source is not under music_directory; \
+                 keeping the counts already on the record"
+            );
+            return;
+        }
+    };
+    let mut conn = match crate::sticker_reconciler::open_connection(
+        endpoint.clone(),
+        timeouts,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "scan terminal: no MPD connection to settle counts; \
+                 keeping the counts already on the record"
+            );
+            return;
+        }
+    };
+    let songs = match crate::sticker_reconciler::enumerate_songs_under_mount(
+        &mut conn, &mpd_base,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                source_id = %source_id,
+                error = %e,
+                "scan terminal: enumeration failed; keeping the counts \
+                 already on the record"
+            );
+            return;
+        }
+    };
+    apply_settled_counts(library, source_id, songs.len()).await;
+}
+
+/// Apply an enumerated song count to one source and persist.
+///
+/// Split from the IO half so the rule is testable without an MPD
+/// on the other end. Availability follows the same rule the
+/// sticker reconciler applies: a reachable source has every song
+/// it holds available; an unreachable one has none.
+///
+/// Returns true when the record was found and updated.
+async fn apply_settled_counts(
+    library: &LibraryContext,
+    source_id: &str,
+    song_count: usize,
+) -> bool {
+    let Some(record) = library.registry.get(source_id).await else {
+        return false;
+    };
+    let total = song_count.min(u32::MAX as usize) as u32;
+    let available =
+        if crate::sticker_reconciler::sticker_value_for(&record.state) == "1" {
+            total
+        } else {
+            0
+        };
+    if let Err(e) = library
+        .registry
+        .update_track_counts(source_id, total, available)
+        .await
+    {
+        tracing::debug!(
+            plugin = PLUGIN_NAME,
+            source_id = %source_id,
+            error = %e,
+            "scan terminal: track-count update failed"
+        );
+        return false;
+    }
+    if let Err(e) = library.registry.persist().await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %source_id,
+            error = %e,
+            "scan terminal: counts updated in memory but not persisted"
+        );
+    }
+    true
 }
 
 /// Walk the source's mount path, counting music-file entries.
@@ -509,6 +734,349 @@ fn is_music_extension(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::library::LibraryContext;
+    use crate::source_registry::{
+        ScanPolicy, SourceKind, SourceRecord, SourceRegistry, SourceState,
+    };
+
+    struct NullAnn;
+    impl SubjectAnnouncer for NullAnn {
+        fn announce<'a>(
+            &'a self,
+            _a: evo_plugin_sdk::contract::SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn retract<'a>(
+            &'a self,
+            _addressing: evo_plugin_sdk::contract::ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn update_state<'a>(
+            &'a self,
+            _addressing: evo_plugin_sdk::contract::ExternalAddressing,
+            _state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn nas_kind() -> SourceKind {
+        SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        }
+    }
+
+    fn usb_kind() -> SourceKind {
+        SourceKind::LocalUsb {
+            device_node: "/dev/disk/by-uuid/test".to_string(),
+            label: "STICK".to_string(),
+        }
+    }
+
+    fn record(id: &str, kind: SourceKind, state: SourceState) -> SourceRecord {
+        SourceRecord {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            kind,
+            mount_path: PathBuf::from(format!("/var/lib/evo/music/{id}")),
+            mpd_storage_name: None,
+            state,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            // A stale number, as the registry carries between
+            // scans. Settling must overwrite it.
+            track_count: 999,
+            track_count_available: 999,
+            last_scan_at_ms: None,
+        }
+    }
+
+    async fn ctx_with(records: Vec<SourceRecord>) -> LibraryContext {
+        let registry = SourceRegistry::new();
+        for r in records {
+            registry.register(r).await.unwrap();
+        }
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::new(NullAnn),
+            None,
+        )
+    }
+
+    #[test]
+    fn in_flight_scanned_tracks_is_this_source_not_the_database() {
+        // A later poll publishes count-base of THIS mount.
+        // stats.songs of the whole device must never appear here.
+        let env = active_envelope(
+            "nas",
+            ScanKind::Update,
+            1_700_000_000_000,
+            1_240,
+            Some(12_000),
+            "scanning",
+        );
+        let scan = &env["scans"][0];
+        assert_eq!(scan["scanned_tracks"], 1_240);
+        assert_eq!(scan["estimated_total"], 12_000);
+        assert_eq!(scan["phase"], "scanning");
+        let src = include_str!("scan_progress.rs");
+        assert!(
+            src.contains("count_matching"),
+            "the poll path must count this source via count base"
+        );
+        assert!(
+            src.contains("songs_under_base"),
+            "an empty base must not become the database total"
+        );
+    }
+
+    #[test]
+    fn a_retract_heartbeat_is_phase_retracting_not_a_scan() {
+        // Behind-the-scenes retract without a heartbeat is the
+        // field lie. The glass already follows this subject for
+        // index; Remove of SMB/NFS must ride the same bus.
+        let env = json!({
+            "v": SCAN_PROGRESS_PAYLOAD_VERSION,
+            "scans": [{
+                "source_id": "nas-smb",
+                "kind": "remove",
+                "phase": "retracting",
+            }],
+        });
+        assert_eq!(env["scans"][0]["phase"], "retracting");
+        assert_eq!(env["scans"][0]["kind"], "remove");
+        let src = include_str!("scan_progress.rs");
+        assert!(
+            src.contains("phase\": \"retracting\""),
+            "publish_retracting must emit the retracting phase",
+        );
+    }
+
+    #[test]
+    fn a_missed_walker_leaves_the_denominator_absent_not_zero() {
+        // "Indexing 0" — indeterminate. Never "0 of 0", which
+        // reads as a finished, empty source.
+        let env = active_envelope(
+            "nas",
+            ScanKind::Update,
+            1_700_000_000_000,
+            0,
+            None,
+            "complete",
+        );
+        let scan = &env["scans"][0];
+        assert_eq!(scan["scanned_tracks"], 0);
+        assert!(
+            scan["estimated_total"].is_null(),
+            "a missing estimate must stay missing, not become 0",
+        );
+    }
+
+    #[test]
+    fn the_poll_path_takes_no_database_song_total() {
+        // Anti-drift: the watcher must not reacquire the
+        // database-wide count. The needle is built at runtime so
+        // this assertion does not match itself, and the prose
+        // elsewhere in the file that explains WHY the total is
+        // wrong stays readable.
+        let src = include_str!("scan_progress.rs");
+        let stats_read = format!("conn.{}()", "stats");
+        assert!(
+            !src.contains(&stats_read),
+            "the poll path must not read MPD's database stats",
+        );
+        let db_total = format!("{}.songs", "stats");
+        let code_hits = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.starts_with("//!")
+            })
+            .filter(|l| l.contains(&db_total))
+            .count();
+        assert_eq!(
+            code_hits, 0,
+            "no code line in this file may take the database song total",
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_rewrites_only_the_scanned_source() {
+        let ctx = ctx_with(vec![
+            record("nas", nas_kind(), SourceState::Online),
+            record("usb", usb_kind(), SourceState::Online),
+        ])
+        .await;
+        assert!(apply_settled_counts(&ctx, "nas", 7).await);
+
+        let nas = ctx.registry.get("nas").await.unwrap();
+        assert_eq!(nas.track_count, 7);
+        assert_eq!(nas.track_count_available, 7);
+        // The other source is not touched by this source's scan.
+        let usb = ctx.registry.get("usb").await.unwrap();
+        assert_eq!(usb.track_count, 999);
+        assert_eq!(usb.track_count_available, 999);
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_available_follows_the_source_state() {
+        let ctx = ctx_with(vec![record(
+            "nas",
+            nas_kind(),
+            SourceState::Offline {
+                reason: "unplugged".into(),
+                since_ms: 0,
+            },
+        )])
+        .await;
+        assert!(apply_settled_counts(&ctx, "nas", 12).await);
+
+        let nas = ctx.registry.get("nas").await.unwrap();
+        // It still holds twelve songs; none are reachable.
+        assert_eq!(nas.track_count, 12);
+        assert_eq!(nas.track_count_available, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_stamps_the_scan_time() {
+        let ctx =
+            ctx_with(vec![record("nas", nas_kind(), SourceState::Online)])
+                .await;
+        assert!(ctx
+            .registry
+            .get("nas")
+            .await
+            .unwrap()
+            .last_scan_at_ms
+            .is_none());
+        apply_settled_counts(&ctx, "nas", 3).await;
+        assert!(ctx
+            .registry
+            .get("nas")
+            .await
+            .unwrap()
+            .last_scan_at_ms
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn local_internal_settles_from_the_enumerator_not_the_database_total()
+    {
+        // stats.songs is the whole database. A local-internal
+        // source is settled from what the enumerator found under
+        // its own mount, even when that differs.
+        let ctx = ctx_with(vec![record(
+            "INTERNAL",
+            SourceKind::LocalInternal,
+            SourceState::Online,
+        )])
+        .await;
+        assert!(apply_settled_counts(&ctx, "INTERNAL", 4).await);
+        let r = ctx.registry.get("INTERNAL").await.unwrap();
+        assert_eq!(r.track_count, 4, "the enumerator wins, not a db total");
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_on_an_unknown_source_is_a_noop() {
+        let ctx = ctx_with(vec![]).await;
+        assert!(!apply_settled_counts(&ctx, "gone", 5).await);
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_existing_counts_when_the_source_is_outside_music_directory(
+    ) {
+        // MPD can only address its own database. A mount outside
+        // music_directory has no relative URI, so there is no
+        // question to ask — and no answer to write. The counts
+        // already on the record stand.
+        let mut outside = record("elsewhere", nas_kind(), SourceState::Online);
+        outside.mount_path = PathBuf::from("/mnt/external/library");
+        let ctx = ctx_with(vec![outside]).await;
+        let endpoint = MpdEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        };
+        let timeouts = ConnectTimeouts {
+            connect: Duration::from_millis(50),
+            welcome: Duration::from_millis(50),
+            command: Duration::from_millis(50),
+        };
+        settle_source_counts(&ctx, "elsewhere", &endpoint, timeouts).await;
+
+        let r = ctx.registry.get("elsewhere").await.unwrap();
+        assert_eq!(r.track_count, 999);
+        assert_eq!(r.track_count_available, 999);
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_existing_counts_when_mpd_is_unreachable() {
+        // Enumeration failure must never write zeros: the counts
+        // already on the record stand, and the caller still
+        // republishes.
+        let ctx =
+            ctx_with(vec![record("nas", nas_kind(), SourceState::Online)])
+                .await;
+        let endpoint = MpdEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        };
+        let timeouts = ConnectTimeouts {
+            connect: Duration::from_millis(50),
+            welcome: Duration::from_millis(50),
+            command: Duration::from_millis(50),
+        };
+        settle_source_counts(&ctx, "nas", &endpoint, timeouts).await;
+
+        let nas = ctx.registry.get("nas").await.unwrap();
+        assert_eq!(
+            nas.track_count, 999,
+            "counts must survive a failed enumerate"
+        );
+        assert_eq!(nas.track_count_available, 999);
+    }
 
     #[test]
     fn music_extension_recognition_is_case_insensitive() {

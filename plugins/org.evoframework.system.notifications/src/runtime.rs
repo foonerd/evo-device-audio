@@ -600,7 +600,7 @@ impl NotificationDispatcher {
     }
 
     /// Verb-dispatch entry point. Called by the plugin's
-    /// [`crate::NotificationsPlugin::handle_request`] with the
+    /// `crate::NotificationsPlugin::handle_request` with the
     /// verb name and the payload bytes. Deserialises the payload
     /// against the verb's expected shape, invokes the
     /// corresponding dispatcher method, and serialises the

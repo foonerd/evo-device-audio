@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly RTC_WAKEALARM_PATH="/sys/class/rtc/rtc0/wakealarm"
+readonly RTC_SECONDS_RE='^[0-9]+$'
+
+if [[ $# -ne 1 || ! "$1" =~ $RTC_SECONDS_RE ]]; then
+    echo "evo-rtc-wake: expected one non-negative UTC epoch-seconds argument" >&2
+    exit 1
+fi
+
+# Linux wakealarm consumes UTC Unix epoch seconds. Clear first so
+# replacing an alarm never leaves the previous wake programmed.
+printf '%s' '0' > "$RTC_WAKEALARM_PATH"
+printf '%s' "$1" > "$RTC_WAKEALARM_PATH"

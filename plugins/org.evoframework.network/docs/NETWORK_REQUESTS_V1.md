@@ -273,7 +273,7 @@ without parsing free-form step strings.
 - `degraded` (`true` when one or more backend checks fail)
 - `domain_health.device_table`
 - `domain_health.general_status`
-- `domain_health.wifi_scan`
+- `domain_health.wifi_scan` (`skipped: true` — status does not scan; look-only must not fight a live AP)
 - `domain_health.radio`
 
 Flight-mode/radio lock visibility:

@@ -50,6 +50,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use evo_plugin_sdk::contract::{
@@ -361,6 +362,84 @@ pub(crate) struct RemoveSourcePayload {
     pub(crate) source_id: String,
     #[serde(default)]
     pub(crate) scrub_mpd_entries: bool,
+    /// The caller is stopping consumers, not removing the source.
+    ///
+    /// `storage.usb`'s rename and repair both drop the library
+    /// source so MPD lets go of the tree, then remount it under a
+    /// new id or run fsck against it. They are not Remove: the
+    /// volume must still be there afterwards.
+    ///
+    /// Rename also sets [`Self::scrub_mpd_entries`]: the old
+    /// mount name is already gone from the filesystem, and the
+    /// floor must lose those rows or the next name's rescan
+    /// stacks on them. Repair leaves scrub off — the same path
+    /// comes back.
+    ///
+    /// Defaults to false, so the operator's Remove — which the
+    /// shell sends as `source_id` alone — is unchanged and still
+    /// hands a USB source to `storage.usb.safe_remove`.
+    #[serde(default)]
+    pub(crate) consumer_stop: bool,
+}
+
+/// `library.rewrite_uri_prefix` — USB rename after remount.
+///
+/// Queue rows still hold `USB/<old>/…`. This rewrites them in
+/// place onto `USB/<new>/…`. It is not Remove: the queue is
+/// never cleared.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RewriteUriPrefixPayload {
+    pub(crate) v: u32,
+    pub(crate) from_prefix: String,
+    pub(crate) to_prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RewriteUriPrefixResponse {
+    pub(crate) v: u32,
+    pub(crate) rewritten: u32,
+}
+
+/// `library.park_uri_prefix` — take queue rows under a USB
+/// leaf off MPD so rename can umount. Playing or not, those
+/// rows are open files.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ParkUriPrefixPayload {
+    pub(crate) v: u32,
+    pub(crate) prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ParkUriPrefixResponse {
+    pub(crate) v: u32,
+    pub(crate) items: Vec<crate::queue::ParkedQueueItem>,
+    pub(crate) playing: bool,
+    pub(crate) paused: bool,
+    pub(crate) current: Option<u32>,
+}
+
+/// `library.restore_parked_uris` — put the parked rows back.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RestoreParkedUrisPayload {
+    pub(crate) v: u32,
+    pub(crate) items: Vec<crate::queue::ParkedQueueItem>,
+    #[serde(default)]
+    pub(crate) playing: bool,
+    #[serde(default)]
+    pub(crate) paused: bool,
+    #[serde(default)]
+    pub(crate) current: Option<u32>,
+    /// MPD `update` this path before `addid` so a remount's
+    /// new leaf is in the database. Absent on the umount-fail
+    /// put-back (files are still at the old path).
+    #[serde(default)]
+    pub(crate) update_prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RestoreParkedUrisResponse {
+    pub(crate) v: u32,
+    pub(crate) restored: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,6 +583,19 @@ pub(crate) enum VerbError {
     WorkAggregateNotReady,
     #[error("library.get_work_recordings: work_id {work_id:?} not found in the current aggregate")]
     UnknownWork { work_id: String },
+    #[error(
+        "library.rewrite_uri_prefix: from_prefix and to_prefix must be \
+         non-empty MPD folder paths"
+    )]
+    RewritePrefixInvalid,
+    #[error(
+        "library.rewrite_uri_prefix: from_prefix and to_prefix must differ"
+    )]
+    RewritePrefixUnchanged,
+    #[error(
+        "library.park_uri_prefix: prefix must be a non-empty MPD folder path"
+    )]
+    ParkPrefixInvalid,
 }
 
 fn check_version(v: u32, verb: &str) -> Result<(), VerbError> {
@@ -929,6 +1021,39 @@ pub(crate) async fn handle_add_source(
         .map_err(|e| VerbError::Register {
             reason: e.to_string(),
         })?;
+
+    // Probe this one source now, the same way warm-start probes
+    // every source at admission: same `probe_source`, same
+    // budget, same `transition`.
+    //
+    // `register` inserts Probing and is deliberately silent, and
+    // the other transition callers are load-only, DLNA-only, or
+    // operator verbs. Without this a source added mid-session
+    // would sit at Probing with no state change on the bus, so
+    // the sticker + track-count writer would never wake for it
+    // and the operator would read 0 of 0 until the next explicit
+    // probe or a steward restart.
+    //
+    // Blocking, as `run_warm_start_probes_blocking` is: one
+    // source, a bounded budget, and the response then carries a
+    // state that was actually observed rather than a placeholder.
+    if let Some(registered) = ctx.registry.get(&id).await {
+        let outcome = crate::source_registry::probe_source(
+            &registered,
+            crate::source_registry::PROBE_BUDGET,
+        )
+        .await;
+        if let Err(e) = ctx.registry.transition(&id, outcome.new_state).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %id,
+                error = %e,
+                "add_source: probe transition failed; source stays Probing \
+                 until the next probe"
+            );
+        }
+    }
+
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
     Ok(AddSourceResponse {
@@ -956,6 +1081,7 @@ fn sanitise_id(name: &str) -> String {
 
 pub(crate) async fn handle_remove_source(
     ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
     conn: &mut MpdConnection,
     payload: RemoveSourcePayload,
 ) -> Result<(), VerbError> {
@@ -969,18 +1095,127 @@ pub(crate) async fn handle_remove_source(
                 source_id: payload.source_id.clone(),
             }
         })?;
+
+    // A USB source's Remove is a detach, then this same call
+    // drops the catalogue. USB must not dispatch this verb back:
+    // playback.mpd is one OOP process, and a nested
+    // library.remove_source never runs while this call is still
+    // waiting for safe_remove. Field 17:27:51 umount+eject then
+    // silence, glass stuck on retract, refresh Loading sources
+    // forever — that is this wait.
+    //
+    // Three callers reach this verb with a USB source and they
+    // are told apart by two flags, not one:
+    //
+    //   - the operator's Remove: neither flag, from the shell as
+    //     `source_id` alone. Hands the volume to USB
+    //     (`retract_library: false`), then falls through.
+    //   - Sources-page safe_remove after detach: scrub set.
+    //     Falls through. USB may call us; we do not call USB.
+    //   - rename after umount: consumer_stop and scrub set. The
+    //     old name's rows leave the floor; the volume remounts
+    //     under a new id, so this is not a detach.
+    //   - repair stopping consumers before fsck: consumer_stop
+    //     set. Same path comes back; scrub stays off.
+    let usb_handover = !payload.consumer_stop
+        && !payload.scrub_mpd_entries
+        && matches!(record.kind, SourceKind::LocalUsb { .. });
+    let nas_remove = !payload.consumer_stop
+        && matches!(
+            record.kind,
+            SourceKind::NetworkNasSmb { .. } | SourceKind::NetworkNasNfs { .. }
+        );
+    if usb_handover {
+        // MPD holds every queued track under the stick's tree as
+        // an open file, and an open file is what turns the clean
+        // umount into EBUSY and then a lazy detach. The queue is
+        // released here, before the volume is handed over, so the
+        // detach that follows has nothing of ours to fight.
+        release_queue_for_source(queue, ctx, conn, &record).await;
+        // Stored playlists and favourites are not open files on
+        // the mount, so they do not block umount. They still
+        // hold the stick's tracks after the floor is scrubbed:
+        // gone-curation retains an unresolved USB leftover so a
+        // rename does not empty the list. Remove is not rename.
+        release_stored_playlists_for_source(ctx, conn, &record).await;
+        remove_usb_via_safe_remove(ctx, &payload.source_id, &record).await?;
+    } else if nas_remove {
+        // SMB and NFS Remove is the USB consumer door without
+        // a volume handover: queue, stored playlists, and
+        // favourites leave with the share. A later envelope
+        // tick must not have been the thing that dropped them
+        // in silence.
+        release_queue_for_source(queue, ctx, conn, &record).await;
+        release_stored_playlists_for_source(ctx, conn, &record).await;
+    } else if payload.scrub_mpd_entries && !payload.consumer_stop {
+        // Sources-page Remove already detached, then lands here
+        // with scrub set. The queue was released on the first
+        // door or was empty. The stored lists still hold the
+        // stick. Rename sets consumer_stop and must not take
+        // this branch — rewrite puts those URIs on the new name.
+        release_stored_playlists_for_source(ctx, conn, &record).await;
+    }
+
     // Optional MPD scrub: run `update PATH` after unmount so
     // MPD's database notices the songs are gone.
-    if payload.scrub_mpd_entries {
-        let path = record.mount_path.to_string_lossy().into_owned();
-        if let Err(e) = conn.update(Some(&path)).await {
-            tracing::warn!(
-                plugin = PLUGIN_NAME,
-                source_id = %payload.source_id,
-                error = %e,
-                "library.remove_source: MPD scrub update failed; \
-                 source removal still proceeds"
-            );
+    //
+    // The path is the source's mount expressed relative to
+    // music_directory, the same basis browse and the enumerator
+    // use. An absolute mount is a Bad URI to MPD, so the scrub
+    // silently did nothing and the stick's tracks stayed in the
+    // database — Local library > USB > Audio still listing a
+    // volume that had been detached.
+    let scrub = payload.scrub_mpd_entries || usb_handover || nas_remove;
+    if scrub {
+        match mpd_database_relative_path(
+            &ctx.music_directory,
+            &record.mount_path,
+            "",
+        ) {
+            Ok(path) => {
+                // Scrub the PARENT, not the source's own path.
+                //
+                // By the time this runs the source's directory is
+                // usually gone: storage.usb has detached the
+                // volume and network.shares deletes its empty
+                // mount-root on remove. `update <path>` walks the
+                // filesystem at that path, so pointing it at a
+                // directory that no longer exists walks nothing
+                // and MPD keeps every stale row beneath it —
+                // Local library goes on listing a NAS the
+                // operator removed, and its tracks stay
+                // saveable into a playlist from that leftover
+                // browse.
+                //
+                // Updating the parent makes MPD re-walk the level
+                // the child vanished from, which is what actually
+                // prunes the child. A source sitting directly at
+                // the database root scrubs the whole root, which
+                // is the same walk by another name.
+                let scrub_at = scrub_parent_of(&path);
+                let target = scrub_at.as_deref();
+                if let Err(e) = conn.update(target).await {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        source_id = %payload.source_id,
+                        mpd_base = %path,
+                        scrub_at = ?scrub_at,
+                        error = %e,
+                        "library.remove_source: MPD scrub update failed; \
+                         source removal still proceeds"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    source_id = %payload.source_id,
+                    error = %e,
+                    "library.remove_source: source is not under \
+                     music_directory; MPD cannot address it, so there is \
+                     nothing to scrub"
+                );
+            }
         }
     }
     ctx.registry.remove(&payload.source_id).await.map_err(|e| {
@@ -988,9 +1223,543 @@ pub(crate) async fn handle_remove_source(
             reason: e.to_string(),
         }
     })?;
+    // The floor source is mounted at `music_directory`, so its
+    // `find base` is the database root and its count includes
+    // every source underneath it. The scrub above just took a
+    // stick's tracks out of that database; without re-counting,
+    // the card would be gone while Local library still reported
+    // the songs that went with it.
+    // The scrub above only queued an update job. Wait for MPD to
+    // finish pruning before re-counting, or the floor is written
+    // from a database that still holds the removed rows.
+    if scrub && wait_for_scrub_to_settle(conn).await {
+        settle_local_internal_counts(ctx, conn).await;
+    }
     let _ = ctx.registry.persist().await;
     publish_subjects(ctx).await;
     Ok(())
+}
+
+/// Rewrite leftover queue URIs after a volume remounts under a
+/// new name.
+///
+/// USB rename umounts, scrubs the old leaf from the floor, then
+/// remounts. The operator queue still holds `USB/<old>/…`.
+/// `addid` of the new path needs those files in MPD's database,
+/// so this waits for `update` of the new prefix to settle, then
+/// rewrites in place. A failed `addid` leaves the old row —
+/// never `clear`, never `stop`.
+pub(crate) async fn handle_rewrite_uri_prefix(
+    _ctx: &LibraryContext,
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RewriteUriPrefixPayload,
+) -> Result<RewriteUriPrefixResponse, VerbError> {
+    check_version(payload.v, "library.rewrite_uri_prefix")?;
+    let from = payload.from_prefix.trim().trim_end_matches('/');
+    let to = payload.to_prefix.trim().trim_end_matches('/');
+    if from.is_empty()
+        || to.is_empty()
+        || !from.contains('/')
+        || !to.contains('/')
+        || from.contains("://")
+        || to.contains("://")
+    {
+        return Err(VerbError::RewritePrefixInvalid);
+    }
+    if from == to {
+        return Err(VerbError::RewritePrefixUnchanged);
+    }
+    if let Err(e) = conn.update(Some(to)).await {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            to_prefix = %to,
+            error = %e,
+            "library.rewrite_uri_prefix: update of the new name failed; \
+             rewrite still tries so a scan that already landed is not lost"
+        );
+    } else {
+        let _ = wait_for_update_to_settle(
+            conn,
+            REWRITE_SETTLE_DEADLINE,
+            "rewrite_uri_prefix",
+        )
+        .await;
+    }
+    let rewritten =
+        crate::queue::rewrite_queue_uris_under(queue, conn, from, to)
+            .await
+            .map_err(|e| VerbError::Mpd {
+                verb: "rewrite_uri_prefix".into(),
+                reason: e.to_string(),
+            })?;
+    if let Err(e) = crate::playlist::rewrite_stored_uris_under(
+        conn,
+        from,
+        to,
+        crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME,
+    )
+    .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            from_prefix = %from,
+            to_prefix = %to,
+            error = %e,
+            "library.rewrite_uri_prefix: stored playlist rewrite failed; \
+             queue rows already moved"
+        );
+    }
+    Ok(RewriteUriPrefixResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        rewritten: rewritten as u32,
+    })
+}
+
+fn usb_folder_prefix(raw: &str) -> Option<&str> {
+    let prefix = raw.trim().trim_end_matches('/');
+    if prefix.is_empty() || !prefix.contains('/') || prefix.contains("://") {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+/// Take queue rows under a USB leaf off MPD so the volume can
+/// umount. Playing or stopped, those rows hold the tree open.
+pub(crate) async fn handle_park_uri_prefix(
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: ParkUriPrefixPayload,
+) -> Result<ParkUriPrefixResponse, VerbError> {
+    check_version(payload.v, "library.park_uri_prefix")?;
+    let prefix = usb_folder_prefix(&payload.prefix)
+        .ok_or(VerbError::ParkPrefixInvalid)?;
+    let parked = crate::queue::park_queue_items_under(queue, conn, prefix)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "park_uri_prefix".into(),
+            reason: e.to_string(),
+        })?;
+    Ok(ParkUriPrefixResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        items: parked.items,
+        playing: parked.playing,
+        paused: parked.paused,
+        current: parked.current,
+    })
+}
+
+/// Put parked queue rows back after remount (new URIs) or
+/// after a refused umount (same URIs).
+pub(crate) async fn handle_restore_parked_uris(
+    queue: &crate::queue::QueueContext,
+    conn: &mut MpdConnection,
+    payload: RestoreParkedUrisPayload,
+) -> Result<RestoreParkedUrisResponse, VerbError> {
+    check_version(payload.v, "library.restore_parked_uris")?;
+    if let Some(raw) = payload.update_prefix.as_deref() {
+        if let Some(prefix) = usb_folder_prefix(raw) {
+            if let Err(e) = conn.update(Some(prefix)).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    prefix,
+                    error = %e,
+                    "library.restore_parked_uris: update of the new name \
+                     failed; restore still tries"
+                );
+            } else {
+                let _ = wait_for_update_to_settle(
+                    conn,
+                    REWRITE_SETTLE_DEADLINE,
+                    "restore_parked_uris",
+                )
+                .await;
+            }
+        }
+    }
+    let parked = crate::queue::ParkedQueue {
+        items: payload.items,
+        playing: payload.playing,
+        paused: payload.paused,
+        current: payload.current,
+    };
+    let restored = crate::queue::restore_parked_queue(queue, conn, &parked)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "restore_parked_uris".into(),
+            reason: e.to_string(),
+        })?;
+    Ok(RestoreParkedUrisResponse {
+        v: LIBRARY_PAYLOAD_VERSION,
+        restored: restored as u32,
+    })
+}
+
+/// Mount roots owned by other plugins: their children are
+/// source mount points, not library content.
+///
+/// `network.shares` mounts each share at `NAS/<alias>` and
+/// `storage.usb` each volume at `USB/<stable-id>`. A directory
+/// directly beneath one of these is a source or it is nothing.
+const SOURCE_MOUNT_ROOTS: &[&str] = &["NAS", "USB"];
+
+/// Whether the floor should list this database-relative
+/// directory.
+///
+/// A mount point whose source is gone is a leftover directory,
+/// not a library entry. Remove deletes the record and the rows,
+/// but it cannot delete a mount-root directory a failed unmount
+/// left on disk — and MPD lists what is on disk. So the floor
+/// asks the registry, not the filesystem: a child of `NAS/` or
+/// `USB/` is listed only while a source owns it, and the mount
+/// root itself only while it still holds one. Anything outside
+/// those roots is ordinary content and is always listed.
+///
+/// This is what keeps Local library from offering a NAS the
+/// operator removed — and, because nothing can be browsed into
+/// it, from letting a playlist be saved out of it afterwards.
+pub(crate) fn floor_lists_directory(
+    path: &str,
+    music_directory: &std::path::Path,
+    sources: &[SourceRecord],
+) -> bool {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let Some(root) = segments.next() else {
+        return true;
+    };
+    if !SOURCE_MOUNT_ROOTS.contains(&root) {
+        return true;
+    }
+    let owned = |p: &std::path::Path| sources.iter().any(|s| s.mount_path == p);
+    match segments.next() {
+        // The mount root itself: keep it while it still holds a
+        // source, so an emptied `NAS/` leaves the floor too.
+        None => {
+            let root_path = music_directory.join(root);
+            sources.iter().any(|s| s.mount_path.starts_with(&root_path))
+        }
+        // A mount point: listed only while its source is live.
+        Some(_) if path.split('/').filter(|s| !s.is_empty()).count() == 2 => {
+            owned(&music_directory.join(path))
+        }
+        // Deeper than a mount point — inside a live source's own
+        // tree, reachable only through it.
+        Some(_) => true,
+    }
+}
+
+/// The database-relative path whose re-walk prunes `path`.
+///
+/// `None` means the database root. A path with no separator
+/// (`"NAS"`) sits at the root, so the root is what has to be
+/// re-walked for MPD to notice it has gone.
+pub(crate) fn scrub_parent_of(path: &str) -> Option<String> {
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => Some(parent.to_string()),
+        _ => None,
+    }
+}
+
+/// Release the operator queue of one source's tracks.
+///
+/// Best-effort throughout, and deliberately so: the operator
+/// asked for the volume to come off. A queue that could not be
+/// read is a dirtier detach — the wrapper escalates to a lazy
+/// umount — but it is not a reason to refuse the gesture and
+/// leave the stick stranded with nothing left to click. Same
+/// posture as the MPD scrub in [`handle_remove_source`].
+///
+/// A source whose mount is not under `music_directory` has no
+/// MPD-addressable prefix, so there is nothing of it in the
+/// queue to release.
+///
+/// The release has to happen before the detach is asked for —
+/// that is the whole point of it — so a detach that then
+/// refuses (a busy volume whose holders are not us, a
+/// system-live partition) leaves the operator with a queue that
+/// has already lost those tracks and a volume still mounted.
+/// The files are untouched and can be queued again; buying the
+/// alternative would mean releasing after the umount, which is
+/// exactly the ordering this exists to fix.
+async fn release_queue_for_source(
+    queue: &crate::queue::QueueContext,
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    record: &SourceRecord,
+) {
+    let prefix = match mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %record.id,
+                error = %e,
+                "library.remove_source: source is not under \
+                 music_directory; MPD cannot address it, so it has \
+                 nothing in the queue to release"
+            );
+            return;
+        }
+    };
+    match crate::queue::drop_queue_items_under(queue, conn, &prefix).await {
+        Ok(0) => {}
+        Ok(dropped) => tracing::info!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            dropped,
+            "library.remove_source: released the queue of this \
+             source's tracks before the detach"
+        ),
+        Err(e) => tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            error = %e,
+            "library.remove_source: queue release failed; the detach \
+             still proceeds and may escalate to a lazy umount"
+        ),
+    }
+}
+
+/// Drop stored-playlist and favourites rows under one source.
+///
+/// Best-effort: Remove still proceeds if a list cannot be
+/// rewritten. Rename must not call this — it rewrites.
+async fn release_stored_playlists_for_source(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+    record: &SourceRecord,
+) {
+    let prefix = match mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                source_id = %record.id,
+                error = %e,
+                "library.remove_source: source is not under \
+                 music_directory; stored playlists have nothing of \
+                 it to drop"
+            );
+            return;
+        }
+    };
+    match crate::playlist::drop_stored_uris_under(
+        conn,
+        &prefix,
+        crate::playlist::DEFAULT_FAVOURITES_PLAYLIST_NAME,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(dropped) => tracing::info!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            dropped,
+            "library.remove_source: dropped this source's tracks \
+             from stored playlists"
+        ),
+        Err(e) => tracing::warn!(
+            plugin = PLUGIN_NAME,
+            source_id = %record.id,
+            mpd_base = %prefix,
+            error = %e,
+            "library.remove_source: stored playlist drop failed; \
+             the detach still proceeds"
+        ),
+    }
+}
+
+/// Hand a USB source's removal to the plugin that owns the
+/// volume.
+///
+/// The mount target is always `/var/lib/evo/music/USB/<stable-id>`
+/// (the wrapper composes it that way), so the leaf of the record's
+/// mount path is the id `storage.usb.safe_remove` expects.
+///
+/// Returns once the volume is off the host. This caller then
+/// scrubs and drops the row — USB is told not to dispatch back.
+async fn remove_usb_via_safe_remove(
+    ctx: &LibraryContext,
+    source_id: &str,
+    record: &SourceRecord,
+) -> Result<(), VerbError> {
+    let Some(dispatcher) = ctx.shelf_dispatcher.as_ref() else {
+        return Err(VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!(
+                "remove_source: usb source {source_id} must be detached by                  storage.usb, but LoadContext.shelf_request_dispatcher was                  None at admission"
+            ),
+        });
+    };
+    let Some(stable_id) =
+        record.mount_path.file_name().map(|s| s.to_string_lossy())
+    else {
+        return Err(VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!(
+                "remove_source: usb source {source_id} has no mount leaf to                  name a volume with"
+            ),
+        });
+    };
+    let payload = serde_json::json!({
+        "stable_id": stable_id,
+        "library_source_id": source_id,
+        "retract_library": false,
+        // This call released the queue a moment ago, on its own
+        // connection. USB must not reach back for it: audio.queue
+        // is this same OOP process, and a dispatch into it from
+        // here is the nested-verb wait all over again.
+        "release_queue": false,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| VerbError::Mpd {
+        verb: "remove_source".into(),
+        reason: e.to_string(),
+    })?;
+    // plugin-system holds no scopes. safe_remove is admitted
+    // without step-up so this handoff is the same gesture the
+    // glass already ran (library.remove_source). A storage_admin
+    // gate here is the 8 ms 400: permission_denied, volume still
+    // mounted, toast `refused: 400 Bad Request`.
+    dispatcher
+        .dispatch("storage.usb", "storage.usb.safe_remove", bytes, None)
+        .await
+        .map_err(|e| VerbError::Mpd {
+            verb: "remove_source".into(),
+            reason: format!("storage.usb.safe_remove refused: {e}"),
+        })?;
+    Ok(())
+}
+
+/// How long to wait for a scrub's `update` job to finish before
+/// giving up on re-counting the floor.
+const SCRUB_SETTLE_DEADLINE: Duration = Duration::from_millis(1_500);
+
+/// How long to wait for the new USB name to land in MPD before
+/// rewriting leftover queue URIs. `addid` needs the song in
+/// the database. The verb budget is 30 s; this leaves headroom
+/// for the rewrite itself.
+const REWRITE_SETTLE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How often to ask MPD whether the update job is still running.
+const SCRUB_SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// Wait until an `update` job has left `updating_db`.
+///
+/// `MpdConnection::update` ACKs when the job is *queued*, not when
+/// it has run: MPD still holds every row under the scrubbed path
+/// until the job completes. Re-counting on the ACK reads a
+/// database that has not pruned, which is how the floor kept
+/// reporting songs that left with the stick. The same wait is
+/// what lets `addid` of a rewritten USB URI see the new name.
+///
+/// The grace is the scan watcher's: `updating_db` missing on the
+/// first poll means MPD has not picked the job up yet, not that it
+/// has finished, so two consecutive clear polls are required.
+///
+/// Returns false on timeout or a transport error — the caller then
+/// leaves the counts alone rather than writing a number it could
+/// not verify.
+async fn wait_for_update_to_settle(
+    conn: &mut MpdConnection,
+    budget: Duration,
+    why: &str,
+) -> bool {
+    let deadline = Instant::now() + budget;
+    let mut consecutive_clear = 0u8;
+    loop {
+        match conn.status().await {
+            Ok(status) => {
+                if status.updating_db.is_some() {
+                    consecutive_clear = 0;
+                } else {
+                    consecutive_clear = consecutive_clear.saturating_add(1);
+                    if consecutive_clear >= 2 {
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    plugin = PLUGIN_NAME,
+                    why,
+                    error = %e,
+                    "status read failed while waiting for an update to settle"
+                );
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                why,
+                "update did not settle within the deadline"
+            );
+            return false;
+        }
+        tokio::time::sleep(SCRUB_SETTLE_POLL).await;
+    }
+}
+
+async fn wait_for_scrub_to_settle(conn: &mut MpdConnection) -> bool {
+    wait_for_update_to_settle(conn, SCRUB_SETTLE_DEADLINE, "remove_source")
+        .await
+}
+
+/// Re-count the floor source from MPD's database.
+///
+/// Uses the enumerator the reconciler and scan-terminal use, over
+/// the same database-relative base. Best-effort: a source whose
+/// count could not be re-read keeps the count it has rather than
+/// being written to zero.
+async fn settle_local_internal_counts(
+    ctx: &LibraryContext,
+    conn: &mut MpdConnection,
+) {
+    let Some(record) = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await else {
+        return;
+    };
+    let Ok(base) = mpd_database_relative_path(
+        &ctx.music_directory,
+        &record.mount_path,
+        "",
+    ) else {
+        return;
+    };
+    let Ok(songs) =
+        crate::sticker_reconciler::enumerate_songs_under_mount(conn, &base)
+            .await
+    else {
+        return;
+    };
+    let total = songs.len().min(u32::MAX as usize) as u32;
+    let available = if record.state.is_reachable() {
+        total
+    } else {
+        0
+    };
+    if let Err(e) = ctx
+        .registry
+        .update_track_counts(LOCAL_INTERNAL_SOURCE_ID, total, available)
+        .await
+    {
+        tracing::debug!(
+            plugin = PLUGIN_NAME,
+            error = %e,
+            "remove_source: local-internal re-count failed"
+        );
+    }
 }
 
 pub(crate) async fn handle_probe_source(
@@ -1268,6 +2037,19 @@ pub(crate) async fn handle_browse_library(
         verb: "browse_library".to_string(),
         reason: e.to_string(),
     })?;
+    // Drop mount points whose source is gone before rendering.
+    // MPD lists what is on disk; the floor lists what the
+    // registry still owns.
+    let live = ctx.registry.snapshot().await;
+    let entries: Vec<MpdLibraryEntry> = entries
+        .into_iter()
+        .filter(|e| match e {
+            MpdLibraryEntry::Directory { path, .. } => {
+                floor_lists_directory(path, &ctx.music_directory, &live)
+            }
+            _ => true,
+        })
+        .collect();
     let render_ctx = RenderCtx {
         music_directory: &ctx.music_directory,
     };
@@ -1384,14 +2166,20 @@ pub(crate) struct BrowseSelectorParent {
 /// keyed on a representative track's `mpd-path` scheme so the
 /// framework's sidecar → embedded → online cascade decides
 /// the cover — the cover cannot be broken by a bad tag. Artist
-/// enumeration carries an `artwork_lookup` object that names
-/// the shelf, request type, and payload the UI dispatches per
-/// visible
-/// tile to obtain a live *portrait* URL — no synthesised
-/// `cover_url` (album art is the wrong image type for this
-/// facet). The UI fans out per-tile rather than following an
-/// `<img src>` URL, so live-fetch providers can honour their
-/// terms.
+/// enumeration carries a `cover_url` on the `artist-name`
+/// scheme, which the framework artwork endpoint resolves to
+/// validated bytes.
+///
+/// It previously also carried an `artwork_lookup` object naming
+/// the shelf, request type and payload for the URL-returning
+/// artist verb, so a client could dispatch per tile and paint
+/// the provider URL directly. That is a second paint path, and
+/// a paint path that skips the byte walk skips every check the
+/// byte walk performs — placeholder rejection above all. A
+/// client painting that URL shows images the serve path would
+/// refuse. The field is removed rather than documented, because
+/// a wire field is an invitation: the current UI ignored it, but
+/// the next consumer would not have.
 ///
 /// **Drill path** (payload.select present): issues MPD
 /// `find <tag> <value>` (case-sensitive exact) or, when the
@@ -1884,15 +2672,6 @@ async fn enumerate_artists_via_fanout(
         .into_iter()
         .map(|display| {
             let trimmed = display.trim();
-            let artwork_lookup = if trimmed.is_empty() {
-                None
-            } else {
-                Some(json!({
-                    "shelf":        "artwork.providers",
-                    "request_type": "artwork.resolve_artist_artwork",
-                    "payload":      { "v": 1, "artist": trimmed },
-                }))
-            };
             let cover_url = if trimmed.is_empty() {
                 None
             } else {
@@ -1905,7 +2684,6 @@ async fn enumerate_artists_via_fanout(
             json!({
                 "artist":         display,
                 "cover_url":      cover_url,
-                "artwork_lookup": artwork_lookup,
             })
         })
         .collect();
@@ -2375,7 +3153,7 @@ fn paginate(
 /// The operator-supplied path is taken as-is — separator
 /// normalisation is the caller's responsibility (the browse
 /// shelf's wire contract pins POSIX `/` separators).
-fn mpd_database_relative_path(
+pub(crate) fn mpd_database_relative_path(
     music_directory: &std::path::Path,
     mount_path: &std::path::Path,
     user_path: &str,
@@ -2431,30 +3209,56 @@ struct RenderCtx<'a> {
 ///    stored art inside the file). Stable-sorted first audio
 ///    track wins so repeat browses land on the same URL and the
 ///    browse cache stays coherent.
-/// 3. **Representative child cover** — the directory has no
-///    tracks of its own but has child subdirectories whose top
-///    level carries a sidecar or embedded art. Emit
-///    `mpd-directory?value=<self>/<first-child-with-cover>` so
-///    the artist tile shows an album cover from that artist's
-///    own discography. The child URL re-enters this cascade at
-///    the resolver, so a child whose art is embedded also
-///    surfaces here.
-/// 4. **Artist-name portrait** — when the directory has child
-///    subdirectories but none of them yielded a cover, and the
-///    directory has no tracks of its own, emit
-///    `artist-name?value=<basename>`. The framework's artwork
-///    cascade routes `artist-name` to `artwork.online`'s artist
-///    verb; TheAudioDB / Deezer / volumio_meta by name deliver a
-///    portrait when the MusicBrainz reconcile misses.
-/// 5. **Fallback** — emit the Tier 1 URL. The resolver returns
-///    `not_found` and the tile renders the honest glyph. Only
-///    reached for a leaf directory with no tracks, no sidecar,
-///    and no children.
+/// 3. **Representative child cover** — the directory has child
+///    subdirectories and no tracks of its own. Emit the first
+///    child carrying a sidecar as `mpd-directory`, or failing
+///    that the first child's first track as `mpd-path` so
+///    embedded art can surface. The folder shows the music it
+///    contains.
+///
+///    This tier emits NO portrait lookup, deliberately. "Has
+///    children and no files" does not mean "artist": a
+///    collaboration folder, a label or series, a box set, a
+///    genre bucket and the source root all share that shape.
+///    Keying `artist-name` on such a basename asks a provider
+///    for a person who does not exist — a guaranteed miss that
+///    still spends the rate-limited budget, once per container,
+///    on every first paint.
+///
+///    Portraits belong on the artist FACET, which is a
+///    different surface keyed on the artist TAG rather than on
+///    a directory name. Wrong-subject artwork on an artist tile
+///    is worse than a glyph; a glyph on a folder that
+///    demonstrably contains a record is worse than that
+///    record's sleeve.
+/// 4. **Fallback** — emit the Tier 1 URL. The resolver returns
+///    `not_found` and the tile renders the honest glyph. Reached
+///    for a leaf directory with no tracks, no sidecar, and no
+///    children with art.
 ///
 /// The picked URL is stored on the rendered entry which
 /// [`browse_library`] caches in `browse_cache` — repeat browses
 /// serve the same URL from the cache and never re-walk the
 /// filesystem.
+/// Ceiling on directories examined while looking for a
+/// container's representative art.
+///
+/// The bound is on WORK, not on depth. Depth is nearly free: a
+/// long narrow chain — `Artist / Album (Deluxe) / Disc 1 / ...`
+/// and every box-set or archival layout that nests further —
+/// costs one directory read per level, so capping depth would
+/// blind the search to exactly the libraries that need it most
+/// while saving nothing. Breadth is what costs, and a wide tree
+/// is bounded here regardless of how deep it goes.
+///
+/// The search runs per directory tile during a browse paint, so
+/// a pathological tree must not turn one screenful into a
+/// filesystem walk. Exhausting this budget ends the descent and
+/// the tile falls back to the glyph rather than stalling the
+/// browse. The picked URL is then cached in `browse_cache`, so
+/// the cost is paid once per folder, not once per paint.
+const CONTAINER_SCAN_MAX_DIRS: usize = 512;
+
 fn pick_directory_cover_url(
     mpd_relative_path: &str,
     music_directory: &std::path::Path,
@@ -2463,7 +3267,15 @@ fn pick_directory_cover_url(
 
     let abs_dir = music_directory.join(mpd_relative_path);
 
-    if sidecar_cover::find_cover_in_directory(&abs_dir).is_some() {
+    // Tier 1 also accepts `artist*.*`: a container folder often
+    // carries an artist portrait and no cover file, and the
+    // resolver treats that as the folder's own art. The emitter
+    // must agree, or the tile addresses a folder the resolver
+    // would have answered for and the browse cache remembers a
+    // glyph.
+    if sidecar_cover::find_cover_in_directory(&abs_dir).is_some()
+        || !sidecar_cover::find_artist_images_in_directory(&abs_dir).is_empty()
+    {
         return evo_device_audio_shared::artwork_target_url_sized(
             "mpd-directory",
             mpd_relative_path,
@@ -2486,34 +3298,97 @@ fn pick_directory_cover_url(
         );
     }
 
-    for child_name in sidecar_cover::stable_sorted_child_dir_names(&abs_dir) {
-        let child_abs = abs_dir.join(&child_name);
-        if sidecar_cover::find_cover_in_directory(&child_abs).is_some() {
-            let child_relative = if mpd_relative_path.is_empty() {
-                child_name.clone()
-            } else {
-                format!("{mpd_relative_path}/{child_name}")
-            };
-            return evo_device_audio_shared::artwork_target_url_sized(
-                "mpd-directory",
-                &child_relative,
-                Some("small"),
-            );
+    // Children only: this is a container — a collaboration
+    // folder, a label or series, a box set, a genre bucket, or
+    // an artist directory. Show the music it contains.
+    //
+    // Folder browse is a file tree, and the honest picture of a
+    // folder is what is inside it. That is true whether the
+    // basename happens to name one artist or not, which matters
+    // because "has children and no files" does NOT mean artist:
+    // a multi-artist collaboration folder, a label or series
+    // directory, a source root and every box set share the
+    // shape. Keying a
+    // portrait lookup on those strings asks a provider for a
+    // person who does not exist — a guaranteed 404 that still
+    // spends the rate-limited budget, once per container, on
+    // every first paint of a browse.
+    //
+    // The artist FACET is where a portrait belongs, and it is a
+    // different surface with a different key: `browse_by_artist`
+    // emits `artist-name` from the tag, not from a directory
+    // name. Wrong-subject artwork on an artist tile is worse
+    // than a glyph; a glyph on a folder that demonstrably
+    // contains a record is worse than that record's sleeve.
+    //
+    // Prefer a child carrying a sidecar — deterministic and
+    // known-present. Only when no child has one, fall back to a
+    // child's first track so embedded art can surface.
+    // Descend breadth-first so the NEAREST art wins, and a
+    // deluxe or multi-disc set does not defeat the search. A
+    // container's child is frequently a container itself —
+    // `Artist / Album (Deluxe) / Disc 1 / tracks` has no sidecar
+    // and no tracks at either of the first two levels, so a
+    // one-level scan finds nothing and paints a glyph on a
+    // folder whose album art is plainly visible one click in.
+    //
+    // At each level a sidecar beats embedded art: it is the
+    // album's own declared cover, and reading it costs a stat
+    // rather than a tag parse. The descent is bounded by work
+    // rather than by depth — see CONTAINER_SCAN_MAX_DIRS — so a
+    // deeply nested library is searched to the bottom while a
+    // pathologically wide one still cannot stall a browse.
+    let child_relative = |rel: &str| -> String {
+        if mpd_relative_path.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{mpd_relative_path}/{rel}")
         }
-    }
-
-    if sidecar_cover::directory_has_child_dirs(&abs_dir) {
-        let basename = mpd_relative_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(mpd_relative_path);
-        if !basename.is_empty() {
-            return evo_device_audio_shared::artwork_target_url_sized(
-                "artist-name",
-                basename,
-                Some("small"),
-            );
+    };
+    let mut frontier: Vec<String> =
+        sidecar_cover::stable_sorted_child_dir_names(&abs_dir);
+    let mut examined = frontier.len();
+    while !frontier.is_empty() {
+        for rel in &frontier {
+            if sidecar_cover::find_cover_in_directory(&abs_dir.join(rel))
+                .is_some()
+            {
+                return evo_device_audio_shared::artwork_target_url_sized(
+                    "mpd-directory",
+                    &child_relative(rel),
+                    Some("small"),
+                );
+            }
         }
+        for rel in &frontier {
+            if let Some(track_name) =
+                sidecar_cover::first_audio_file_name_in_directory(
+                    &abs_dir.join(rel),
+                )
+            {
+                return evo_device_audio_shared::artwork_target_url_sized(
+                    "mpd-path",
+                    &format!("{}/{}", child_relative(rel), track_name),
+                    Some("small"),
+                );
+            }
+        }
+        if examined >= CONTAINER_SCAN_MAX_DIRS {
+            break;
+        }
+        let mut next = Vec::new();
+        'descend: for rel in &frontier {
+            for name in
+                sidecar_cover::stable_sorted_child_dir_names(&abs_dir.join(rel))
+            {
+                next.push(format!("{rel}/{name}"));
+                examined += 1;
+                if examined >= CONTAINER_SCAN_MAX_DIRS {
+                    break 'descend;
+                }
+            }
+        }
+        frontier = next;
     }
 
     evo_device_audio_shared::artwork_target_url_sized(
@@ -2532,13 +3407,15 @@ fn render_library_entry(
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
             // Folder-cover surface: emit a `cover_url` that the
             // framework artwork endpoint resolves via the
-            // three-tier cascade in `pick_directory_cover_url`
-            // — direct sidecar → representative child cover →
-            // artist-name portrait → honest glyph. When the
-            // caller cannot supply filesystem context (facet-
-            // drill file-only render — directories never
-            // appear there in practice), we fall back to the
-            // Tier 1 URL only.
+            // cascade in `pick_directory_cover_url` — direct
+            // sidecar → own track's embedded art →
+            // representative child cover → honest glyph. It
+            // never emits a portrait lookup: a folder is a
+            // container, and portraits belong on the artist
+            // facet. When the caller cannot supply filesystem
+            // context (facet-drill file-only render —
+            // directories never appear there in practice), we
+            // fall back to the Tier 1 URL only.
             let cover_url = match ctx {
                 Some(ctx) => {
                     pick_directory_cover_url(path, ctx.music_directory)
@@ -3090,6 +3967,1181 @@ mod tests {
         )
     }
 
+    /// Records which peer-shelf verbs were dispatched.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingDispatcher {
+        fn seen(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(verb, _)| verb.clone())
+                .collect()
+        }
+
+        fn last_payload(&self, verb: &str) -> Option<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(v, _)| v == verb)
+                .map(|(_, payload)| payload.clone())
+        }
+    }
+
+    impl ShelfRequestDispatcher for RecordingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let body = String::from_utf8_lossy(&payload).into_owned();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request_type.to_string(), body));
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn ctx_with_dispatcher(d: Arc<RecordingDispatcher>) -> LibraryContext {
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(d as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    async fn mock_conn() -> MpdConnection {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::Standard]).await;
+        MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+            .await
+            .unwrap()
+    }
+
+    /// A queue context over the same registry the library
+    /// context holds, so a queue item under a registered mount
+    /// resolves to that source the way it does in the process.
+    fn queue_ctx_for(ctx: &LibraryContext) -> crate::queue::QueueContext {
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::new(NullAnn) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            ctx.registry.clone(),
+            disposition,
+        );
+        crate::queue::QueueContext::new(
+            ctx.music_directory.clone(),
+            ctx.registry.clone(),
+            Arc::new(NullAnn),
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        )
+    }
+
+    /// Connect to a mock serving one live operator queue and
+    /// hand back the connection plus the command log.
+    async fn live_queue_conn(
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    ) -> (MpdConnection, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items,
+                playing,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        (conn, commands)
+    }
+
+    /// What `playlistinfo` would answer now — the mock's queue
+    /// after whatever the call under test did to it.
+    async fn remaining_queue(conn: &mut MpdConnection) -> Vec<String> {
+        conn.playlistinfo()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.file_path)
+            .collect()
+    }
+
+    fn usb_record(id: &str, leaf: &str) -> SourceRecord {
+        SourceRecord {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            kind: SourceKind::LocalUsb {
+                device_node: "/dev/disk/by-uuid/test".to_string(),
+                label: "STICK".to_string(),
+            },
+            mount_path: PathBuf::from(format!("/var/lib/evo/music/USB/{leaf}")),
+            mpd_storage_name: None,
+            state: SourceState::Online,
+            last_seen_online_at_ms: None,
+            probe_cadence_ms: 60_000,
+            scan_policy: ScanPolicy::EagerIncremental {
+                on_online: true,
+                on_mount_event: false,
+            },
+            track_count: 1513,
+            track_count_available: 1513,
+            last_scan_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_usb_source_hands_over_then_drops_the_row() {
+        // The operator's Remove arrives with the scrub flag
+        // false. USB owns the volume. This same call then
+        // scrubs and drops — USB must not dispatch back into
+        // this OOP process.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: false,
+                consumer_stop: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(d.seen(), vec!["storage.usb.safe_remove".to_string()]);
+        let handed = d
+            .last_payload("storage.usb.safe_remove")
+            .expect("handover payload");
+        assert!(
+            handed.contains("\"library_source_id\":\"usb-audio\"")
+                || handed.contains("\"library_source_id\": \"usb-audio\""),
+            "glass source id must ride safe_remove: {handed}"
+        );
+        assert!(
+            handed.contains("\"retract_library\":false")
+                || handed.contains("\"retract_library\": false"),
+            "USB must not re-enter this shelf: {handed}"
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "this call drops the row after the volume is gone",
+        );
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must lose the three songs that left with the stick"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_floor_is_recounted_only_after_the_prune_has_run() {
+        // `update` ACKs a queued job; MPD holds every USB row
+        // until it finishes. The floor must be counted from the
+        // pruned database, so INTERNAL survives and the stick's
+        // songs do not.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "the scrub call must not dispatch safe_remove back",
+        );
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must carry the two INTERNAL songs and neither of \
+             the three that left with the stick — counted after the prune, \
+             not on the update ACK",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_prunes_the_old_name_from_the_floor() {
+        // Rename remounts under a new id. The old path is already
+        // gone from the filesystem when this call runs. Scrub
+        // must prune that name so Local library is INTERNAL
+        // plus the new name once, not the old name stacked
+        // under it. The volume is not handed to safe_remove.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::PrunesAfterUpdate {
+                internal: vec![
+                    "INTERNAL/a.flac".to_string(),
+                    "INTERNAL/b.flac".to_string(),
+                ],
+                usb: vec![
+                    "USB/MUSIC/x.flac".to_string(),
+                    "USB/MUSIC/y.flac".to_string(),
+                    "USB/MUSIC/z.flac".to_string(),
+                ],
+                in_flight_polls: 2,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut floor = usb_record(LOCAL_INTERNAL_SOURCE_ID, "unused");
+        floor.kind = SourceKind::LocalInternal;
+        floor.mount_path = PathBuf::from("/var/lib/evo/music");
+        ctx.registry.register(floor).await.unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "a rename scrub must not reach storage.usb — no detach, no \
+             eject; saw {:?}",
+            d.seen(),
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "the old name's row is dropped",
+        );
+        let floor = ctx.registry.get(LOCAL_INTERNAL_SOURCE_ID).await.unwrap();
+        assert_eq!(
+            floor.track_count, 2,
+            "the floor must lose the three songs that lived under \
+             the previous USB name",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_leaves_the_operator_queue_alone() {
+        // The old name's queue URIs go stale after remount.
+        // Rewriting them is `library.rewrite_uri_prefix` after
+        // the new tree is back. Emptying the queue here would
+        // be a Remove the operator did not ask for.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "USB/MUSIC/a.flac".to_string(),
+                "USB/MUSIC/b.flac".to_string(),
+            ],
+            "a rename scrub is not a Remove; the queue is untouched",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "nor is the player stopped: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("DISPATCH storage.usb.safe_remove")),
+            "rename must not eject: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remove_drops_usb_rows_from_stored_playlists() {
+        // Queue release already runs on Remove. Stored lists
+        // still held USB/MUSIC after the floor was scrubbed —
+        // gone-curation retains an unresolved leftover so a
+        // rename does not empty them. Remove must drop those
+        // rows. INTERNAL and a neighbour stick stay.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "USB/MUSIC/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/MUSIC/a.flac").await.unwrap();
+        conn.playlistadd("Road", "USB/MUSIC2/other.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["INTERNAL/keep.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(
+            road,
+            vec![
+                "USB/MUSIC2/other.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("playlistclear")
+                && !c.starts_with("save")
+                && !c.starts_with("clear")),
+            "Remove drops matching rows; it does not wipe the list: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_scrub_leaves_stored_playlist_uris() {
+        // Rename remounts. The old name's stored URIs are
+        // rewritten after the new tree is back. Dropping them
+        // here would empty favourites the operator did not
+        // ask to clear.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        conn.playlistadd("__favourites__", "USB/MUSIC/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/MUSIC/a.flac").await.unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: true,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["USB/MUSIC/loved.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(road, vec!["USB/MUSIC/a.flac".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_rename_park_releases_usb_rows_and_leaves_the_rest() {
+        // Playing or stopped, queued USB tracks hold the tree
+        // open. Park takes those rows off MPD so umount can
+        // run. INTERNAL and a neighbour stick stay.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (10, "INTERNAL/keep.flac".to_string()),
+                (11, "USB/Audio/a.flac".to_string()),
+                (12, "USB/Audio2/other.flac".to_string()),
+                (13, "USB/Audio/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+
+        let parked = handle_park_uri_prefix(
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            ParkUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parked.items.len(), 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Audio2/other.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("clear")),
+            "park is not a Remove of the whole queue: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_restore_puts_parked_rows_back_under_the_new_name() {
+        let (mut conn, log) =
+            live_queue_conn(vec![(10, "INTERNAL/keep.flac".to_string())], None)
+                .await;
+        let ctx = ctx_logging_to(&log);
+
+        let out = handle_restore_parked_uris(
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RestoreParkedUrisPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                items: vec![
+                    crate::queue::ParkedQueueItem {
+                        position: 1,
+                        uri: "USB/Road-Trip/a.flac".to_string(),
+                    },
+                    crate::queue::ParkedQueueItem {
+                        position: 2,
+                        uri: "USB/Road-Trip/b.flac".to_string(),
+                    },
+                ],
+                playing: false,
+                paused: false,
+                current: None,
+                update_prefix: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.restored, 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Road-Trip/a.flac".to_string(),
+                "USB/Road-Trip/b.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("clear") && !c.starts_with("stop")),
+            "restore is not a Remove: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_rewrite_moves_favourite_uris_onto_the_new_name() {
+        // Favourites and a stored playlist hold USB leftover
+        // URIs. They do not block umount; they go stale after
+        // remount unless this pass rewrites them. INTERNAL stays.
+        let (mut conn, log) = live_queue_conn(Vec::new(), None).await;
+        let ctx = ctx_logging_to(&log);
+        conn.playlistadd("__favourites__", "USB/Audio/loved.flac")
+            .await
+            .unwrap();
+        conn.playlistadd("Road", "USB/Audio/b.flac").await.unwrap();
+        conn.playlistadd("Road", "INTERNAL/keep.flac")
+            .await
+            .unwrap();
+
+        handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB/Audio".to_string(),
+                to_prefix: "USB/Road-Trip".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let fav: Vec<String> = conn
+            .listplaylistinfo("__favourites__")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(fav, vec!["USB/Road-Trip/loved.flac".to_string()]);
+        let road: Vec<String> = conn
+            .listplaylistinfo("Road")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file_path)
+            .collect();
+        assert_eq!(
+            road,
+            vec![
+                "USB/Road-Trip/b.flac".to_string(),
+                "INTERNAL/keep.flac".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_rewrite_moves_queue_uris_onto_the_new_name() {
+        // After remount the files live under USB/Audio. The
+        // queue still holds USB/MUSIC. Rewrite in place: keep
+        // INTERNAL, leave the neighbour stick, never clear.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (10, "INTERNAL/keep.flac".to_string()),
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC2/other.flac".to_string()),
+                (13, "USB/MUSIC/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+
+        let out = handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB/MUSIC".to_string(),
+                to_prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.rewritten, 2);
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/keep.flac".to_string(),
+                "USB/Audio/a.flac".to_string(),
+                "USB/MUSIC2/other.flac".to_string(),
+                "USB/Audio/b.flac".to_string(),
+            ],
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| !c.starts_with("clear") && !c.starts_with("stop")),
+            "a rewrite is not a Remove: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("addid")),
+            "the new path is inserted before the old row is dropped: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_refuses_a_whole_tree_prefix() {
+        let (mut conn, log) =
+            live_queue_conn(vec![(11, "USB/MUSIC/a.flac".to_string())], None)
+                .await;
+        let ctx = ctx_logging_to(&log);
+        let err = handle_rewrite_uri_prefix(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RewriteUriPrefixPayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                from_prefix: "USB".to_string(),
+                to_prefix: "USB/Audio".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, VerbError::RewritePrefixInvalid),
+            "USB alone would take every stick: {err}"
+        );
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["USB/MUSIC/a.flac".to_string()],
+            "a refused rewrite leaves the queue",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consumer_stop_drops_the_row_without_detaching_the_volume() {
+        // rename and repair stop consumers before they touch the
+        // volume: rename remounts it under a new id, repair runs
+        // fsck against it. Handing either to safe_remove would
+        // detach and eject the thing they are about to work on.
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "usb-audio".to_string(),
+                scrub_mpd_entries: false,
+                consumer_stop: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            d.seen().is_empty(),
+            "a consumer-stop must not reach storage.usb — no detach, no \
+             eject; saw {:?}",
+            d.seen(),
+        );
+        assert!(
+            ctx.registry.get("usb-audio").await.is_none(),
+            "the row is dropped so MPD lets go of the tree",
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_non_usb_source_does_not_call_safe_remove() {
+        let d = Arc::new(RecordingDispatcher::default());
+        let ctx = ctx_with_dispatcher(Arc::clone(&d));
+        let mut nas = usb_record("nas-music", "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/music");
+        ctx.registry.register(nas).await.unwrap();
+        let mut conn = mock_conn().await;
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            RemoveSourcePayload {
+                v: LIBRARY_PAYLOAD_VERSION,
+                source_id: "nas-music".to_string(),
+                scrub_mpd_entries: false,
+                consumer_stop: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(d.seen().is_empty(), "only a USB source hands over");
+        assert!(ctx.registry.get("nas-music").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_a_nas_source_releases_the_queue_like_usb() {
+        // Owner 2026-09-20: SMB Remove is USB Remove. Queue,
+        // playlists, favourites. A Connected share that leaves
+        // must take its tracks out of the queue, not leave a
+        // 400 browse of a URI that is gone.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "NAS/Music/a.flac".to_string()),
+                (12, "INTERNAL/keep.flac".to_string()),
+                (13, "NAS/Music/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        let mut nas = usb_record("nas-music", "unused");
+        nas.kind = SourceKind::NetworkNasSmb {
+            server: "192.0.2.10".to_string(),
+            share: "Music".to_string(),
+            username: "operator".to_string(),
+        };
+        nas.mount_path = PathBuf::from("/var/lib/evo/music/NAS/Music");
+        ctx.registry.register(nas).await.unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("nas-music", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["INTERNAL/keep.flac".to_string()],
+            "NAS tracks leave the queue; INTERNAL stays",
+        );
+        assert!(
+            ctx.registry.get("nas-music").await.is_none(),
+            "the library row is gone",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("deleteid")),
+            "the queue door ran: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("DISPATCH")),
+            "NAS does not hand a volume to USB: {seen:?}",
+        );
+    }
+
+    /// A dispatcher that writes into the same log the mock MPD
+    /// records commands in, so one ordered sequence shows both
+    /// what was asked of MPD and when the volume was handed
+    /// over.
+    struct OrderedDispatcher {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ShelfRequestDispatcher for OrderedDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let body = String::from_utf8_lossy(&payload).into_owned();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("DISPATCH {request_type} {body}"));
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn ctx_logging_to(
+        log: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> LibraryContext {
+        let d = Arc::new(OrderedDispatcher {
+            log: Arc::clone(log),
+        });
+        LibraryContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            SourceRegistry::new(),
+            Arc::new(NullAnn),
+            Some(d as Arc<dyn ShelfRequestDispatcher>),
+        )
+    }
+
+    fn remove_payload(
+        source_id: &str,
+        consumer_stop: bool,
+    ) -> RemoveSourcePayload {
+        RemoveSourcePayload {
+            v: LIBRARY_PAYLOAD_VERSION,
+            source_id: source_id.to_string(),
+            scrub_mpd_entries: false,
+            consumer_stop,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_drops_the_sticks_queue_items_before_the_handover() {
+        // Three tracks off the stick queued, the second of them
+        // playing. Remove takes all three out and stops the
+        // player before storage.usb is asked for the volume: a
+        // queued track is an open file, and an open file is the
+        // EBUSY that turns a clean umount into a lazy detach.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+                (13, "USB/MUSIC/c.flac".to_string()),
+            ],
+            Some(1),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            remaining_queue(&mut conn).await.is_empty(),
+            "every queue item under the stick must be gone",
+        );
+
+        let seen = log.lock().unwrap().clone();
+        let deletes = seen.iter().filter(|c| c.starts_with("deleteid")).count();
+        assert_eq!(deletes, 3, "one deleteid per queued track: {seen:?}");
+        let handover = seen
+            .iter()
+            .position(|c| c.starts_with("DISPATCH storage.usb.safe_remove"))
+            .expect("the volume must still be handed over");
+        let last_delete = seen
+            .iter()
+            .rposition(|c| c.starts_with("deleteid"))
+            .expect("deleteid");
+        assert!(
+            last_delete < handover,
+            "the queue is released before the detach, not after: {seen:?}",
+        );
+        let stop = seen
+            .iter()
+            .position(|c| c.starts_with("stop"))
+            .expect("the playing track was about to be deleted");
+        assert!(
+            stop < last_delete,
+            "stop the player before pulling its song out: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("clear")),
+            "clear would take INTERNAL with it: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usb_remove_leaves_the_internal_tracks_in_the_queue() {
+        // Mixed queue, INTERNAL playing. The stick's two tracks
+        // go; both INTERNAL tracks stay, in order, and the
+        // player is not stopped — it is not playing the thing
+        // that is leaving.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "INTERNAL/one.flac".to_string()),
+                (12, "USB/MUSIC/a.flac".to_string()),
+                (13, "INTERNAL/two.flac".to_string()),
+                (14, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "INTERNAL/one.flac".to_string(),
+                "INTERNAL/two.flac".to_string(),
+            ],
+            "INTERNAL is not this source and does not leave with it",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "the current song was INTERNAL; nothing to stop for: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_one_stick_does_not_take_the_neighbours_tracks() {
+        // `USB/MUSIC` is not a string prefix of the queue — it
+        // is a path prefix. `USB/MUSIC2` is a different volume.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC2/b.flac".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+        ctx.registry
+            .register(usb_record("usb-audio-2", "MUSIC2"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec!["USB/MUSIC2/b.flac".to_string()],
+            "the neighbouring stick's track stays queued",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remove_on_an_empty_queue_still_hands_the_volume_over() {
+        let (mut conn, log) = live_queue_conn(vec![], None).await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", false),
+        )
+        .await
+        .unwrap();
+
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("deleteid")),
+            "nothing was queued, so nothing is deleted: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c.starts_with("DISPATCH storage.usb.safe_remove")),
+            "an empty queue does not stop the detach: {seen:?}",
+        );
+        assert!(ctx.registry.get("usb-audio").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_consumer_stop_leaves_the_operator_queue_alone() {
+        // rename and repair put the volume back. Emptying the
+        // operator's queue on the way through would be a Remove
+        // they did not ask for.
+        let (mut conn, log) = live_queue_conn(
+            vec![
+                (11, "USB/MUSIC/a.flac".to_string()),
+                (12, "USB/MUSIC/b.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+        let ctx = ctx_logging_to(&log);
+        ctx.registry
+            .register(usb_record("usb-audio", "MUSIC"))
+            .await
+            .unwrap();
+
+        handle_remove_source(
+            &ctx,
+            &queue_ctx_for(&ctx),
+            &mut conn,
+            remove_payload("usb-audio", true),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            remaining_queue(&mut conn).await,
+            vec![
+                "USB/MUSIC/a.flac".to_string(),
+                "USB/MUSIC/b.flac".to_string(),
+            ],
+            "a consumer-stop is not a Remove; the queue is untouched",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|c| !c.starts_with("stop")),
+            "nor is the player stopped: {seen:?}",
+        );
+    }
+
     #[test]
     fn sanitise_id_lowercases_alphanumerics() {
         assert_eq!(sanitise_id("My NAS 2025"), "my-nas-2025");
@@ -3559,6 +5611,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_source_probes_a_reachable_usb_and_leaves_probing() {
+        // A mid-session adopt must end in an observed state, not
+        // the Probing placeholder, and must put exactly one
+        // change on the bus so the sticker + count writer wakes.
+        let ctx = ctx();
+        let mut rx = ctx.registry.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+
+        let res = handle_add_source(
+            &ctx,
+            AddSourcePayload {
+                v: 1,
+                display_name: "Audio".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/disk/by-uuid/test".into(),
+                    label: "STICK".into(),
+                },
+                mount_path: dir.path().to_path_buf(),
+                scan_policy: None,
+                probe_cadence_ms: None,
+                cloud_eager_scan_acknowledged: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rec = ctx.registry.get(&res.source_id).await.unwrap();
+        assert_eq!(
+            rec.state.discriminant(),
+            SourceState::Online.discriminant(),
+            "a reachable mount must be observed Online, not left Probing",
+        );
+
+        let change = rx.try_recv().expect("exactly one state change");
+        assert_eq!(change.source_id, res.source_id);
+        assert_eq!(
+            change.old_state.discriminant(),
+            SourceState::Probing.discriminant()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the adopt must fire one transition, not several",
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_with_an_absent_mount_still_leaves_probing() {
+        // A probe that fails is still an answer. Leaving the
+        // source at Probing forever would mean no broadcast, and
+        // no broadcast means nothing ever counts it.
+        let ctx = ctx();
+        let mut rx = ctx.registry.subscribe();
+
+        let res = handle_add_source(
+            &ctx,
+            AddSourcePayload {
+                v: 1,
+                display_name: "Gone".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/disk/by-uuid/absent".into(),
+                    label: "GONE".into(),
+                },
+                mount_path: PathBuf::from(
+                    "/var/lib/evo/music/USB/definitely-not-present",
+                ),
+                scan_policy: None,
+                probe_cadence_ms: None,
+                cloud_eager_scan_acknowledged: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rec = ctx.registry.get(&res.source_id).await.unwrap();
+        assert_ne!(
+            rec.state.discriminant(),
+            SourceState::Probing.discriminant(),
+            "a failed probe must still transition",
+        );
+        let change = rx.try_recv().expect("a failed probe still broadcasts");
+        assert_eq!(change.source_id, res.source_id);
+    }
+
+    #[tokio::test]
     async fn add_source_cloud_defaults_to_lazy() {
         let ctx = ctx();
         let res = handle_add_source(
@@ -3697,6 +5833,20 @@ mod tests {
     }
 
     #[test]
+    fn mpd_path_usb_source_is_the_alias_leaf_not_an_absolute_path() {
+        // What `find base` must be handed for a USB source. MPD
+        // addresses its database relative to music_directory; the
+        // absolute mount is a Bad URI to it.
+        let mpd_path = mpd_database_relative_path(
+            std::path::Path::new("/var/lib/evo/music"),
+            std::path::Path::new("/var/lib/evo/music/USB/Audio"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(mpd_path, "USB/Audio");
+    }
+
+    #[test]
     fn mpd_path_source_outside_music_directory_refuses() {
         // External mount NOT under music_directory: the helper
         // refuses with a structured error rather than emitting an
@@ -3799,9 +5949,13 @@ mod tests {
     //
     //   1. sidecar in this dir
     //   2. embedded art of representative track in this dir
-    //   3. sidecar cover in first stable-sorted child dir
-    //   4. artist-name portrait (basename)
-    //   5. fallback → honest glyph
+    //   3. sidecar cover in first stable-sorted child dir,
+    //      else first child's first track (embedded)
+    //   4. fallback → honest glyph
+    //
+    // Folder browse NEVER emits `artist-name`. That surface is
+    // a file tree; portraits belong on the artist facet, which
+    // keys on the tag. See `pick_directory_cover_url`'s docs.
     // -----------------------------------------------------------
 
     #[test]
@@ -3887,11 +6041,19 @@ mod tests {
     }
 
     #[test]
-    fn tier3_representative_child_cover_when_no_self_cover_no_tracks() {
-        // Artist folder with no direct art AND no tracks, but
-        // Abbey Road (child album) carries `cover.jpg`. Emit
-        // the child's mpd-directory URL so the artist tile
-        // shows an actual record cover.
+    fn container_folder_shows_a_child_album_sleeve() {
+        // Folder browse is a file tree. A directory with child
+        // albums and no tracks of its own is a container —
+        // possibly an artist, but just as possibly a
+        // multi-artist collaboration, a label or series, a box
+        // set or a genre bucket. The honest picture of a
+        // container is the music inside it.
+        //
+        // Emitting `artist-name` here instead asked a provider
+        // for a person who does not exist, spending the
+        // rate-limited budget once per container on every first
+        // paint and painting a glyph on folders that visibly
+        // contain records.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("The Beatles");
@@ -3903,20 +6065,155 @@ mod tests {
         let url = pick_directory_cover_url("The Beatles", music_dir);
         assert!(
             url.contains("scheme=mpd-directory"),
-            "Tier 3 must emit mpd-directory scheme, got {url}"
+            "container must point at the child carrying art, got {url}"
         );
         assert!(
             url.contains("Abbey%20Road"),
-            "Tier 3 must point at the child directory carrying the cover, \
-             got {url}"
+            "container must show the child album's sleeve, got {url}"
+        );
+        assert!(
+            !url.contains("artist-name"),
+            "folder browse must never emit a portrait lookup, got {url}"
         );
     }
 
+    /// The collaboration / label case from the field: a folder
+    /// name that is not one artist must still show its music,
+    /// not start a doomed portrait cascade.
     #[test]
-    fn tier3_stable_sort_picks_alphabetically_first_child() {
-        // Two children both have covers; alphabetically-first
-        // wins. Guarantees the same URL across repeat browses
-        // so `browse_cache` serves consistent art.
+    fn collaboration_and_label_folders_show_their_music() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        for container in [
+            "First Artist and Second Artist and Third Artist",
+            "Example Label Series",
+        ] {
+            let dir = music_dir.join(container);
+            let child = dir.join("Collaboration Single");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("cover.jpg"), b"c").unwrap();
+            let url = pick_directory_cover_url(container, music_dir);
+            assert!(
+                !url.contains("artist-name"),
+                "{container} is a container, not a person: got {url}"
+            );
+            assert!(
+                url.contains("Collaboration%20Single"),
+                "{container} must show the record it contains: got {url}"
+            );
+        }
+    }
+
+    /// The shape that defeated a one-level scan: the container's
+    /// child is itself a container. `Artist / Album (Deluxe) /
+    /// Disc 1 / tracks` has no sidecar and no tracks at either of
+    /// the first two levels, so a flat child scan found nothing
+    /// and painted a glyph on a folder whose album art is
+    /// plainly visible one click in.
+    #[test]
+    fn container_finds_art_nested_below_a_multi_disc_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let disc = music_dir
+            .join("Container Name")
+            .join("Album (Deluxe Edition)")
+            .join("Disc 1");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("Disc%201") && url.contains("scheme=mpd-path"),
+            "must descend past the multi-disc child, got {url}"
+        );
+        assert!(!url.contains("artist-name"), "got {url}");
+    }
+
+    /// A sidecar one level down beats embedded art two levels
+    /// down: nearest art wins, and at equal depth the album's own
+    /// declared cover beats a tag parse.
+    #[test]
+    fn nearest_art_wins_over_deeper_art() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let root = music_dir.join("Container Name");
+        let shallow = root.join("A Album");
+        let deep = root.join("B Album").join("Disc 1");
+        std::fs::create_dir_all(&shallow).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(shallow.join("cover.jpg"), b"c").unwrap();
+        std::fs::write(deep.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("A%20Album") && url.contains("scheme=mpd-directory"),
+            "shallower sidecar must win, got {url}"
+        );
+    }
+
+    /// Depth must NOT defeat the search. A long narrow chain is
+    /// one directory read per level, and real libraries nest far
+    /// deeper than any fixed cap would allow — archival and
+    /// box-set layouts especially. A depth limit would blind the
+    /// search to exactly the trees that need it while saving
+    /// nothing, because breadth is what costs.
+    #[test]
+    fn container_scan_follows_a_deeply_nested_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let mut p = music_dir.join("Container Name");
+        for i in 0..120 {
+            p = p.join(format!("level{i}"));
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-path") && url.contains("level119"),
+            "a 120-level narrow chain must still be searched, got {url}"
+        );
+    }
+
+    /// Breadth is bounded. A tree wide enough to exhaust the work
+    /// budget ends at the glyph rather than walking the
+    /// filesystem during a browse paint.
+    #[test]
+    fn container_scan_is_work_bounded_on_wide_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let root = music_dir.join("Container Name");
+        // Well past the budget, all empty, so the search can
+        // never succeed and must terminate on the cap.
+        for i in 0..(CONTAINER_SCAN_MAX_DIRS + 50) {
+            std::fs::create_dir_all(root.join(format!("child{i:04}"))).unwrap();
+        }
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "exhausting the budget must fall back to the glyph, got {url}"
+        );
+    }
+
+    /// No child sidecar, but a child holds tracks — fall back to
+    /// that child's first track so embedded art can surface
+    /// rather than dropping straight to a glyph.
+    #[test]
+    fn container_falls_back_to_a_child_track_for_embedded_art() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let child = music_dir.join("Box Set").join("Disc 1");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("01 - Track.flac"), b"x").unwrap();
+        let url = pick_directory_cover_url("Box Set", music_dir);
+        assert!(url.contains("scheme=mpd-path"), "got {url}");
+        assert!(url.contains("Disc%201"), "got {url}");
+        assert!(!url.contains("artist-name"), "got {url}");
+    }
+
+    #[test]
+    fn container_child_pick_is_stable_across_browses() {
+        // Two children both carry covers; the alphabetically
+        // first wins every time so `browse_cache` stays
+        // coherent across repeat browses.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
         let artist_dir = music_dir.join("Dire Straits");
@@ -3924,55 +6221,59 @@ mod tests {
         let money = artist_dir.join("Money for Nothing");
         std::fs::create_dir_all(&brothers).unwrap();
         std::fs::create_dir_all(&money).unwrap();
-        std::fs::write(brothers.join("cover.jpg"), b"bia").unwrap();
-        std::fs::write(money.join("cover.jpg"), b"mfn").unwrap();
-        let url = pick_directory_cover_url("Dire Straits", music_dir);
+        std::fs::write(brothers.join("cover.jpg"), b"a").unwrap();
+        std::fs::write(money.join("cover.jpg"), b"b").unwrap();
+        let first = pick_directory_cover_url("Dire Straits", music_dir);
+        let second = pick_directory_cover_url("Dire Straits", music_dir);
+        assert_eq!(first, second, "repeat browses must agree");
+        assert!(first.contains("Brothers%20in%20Arms"), "got {first}");
+    }
+
+    #[test]
+    fn container_with_no_child_art_falls_to_the_glyph() {
+        // Children exist but none carries a sidecar and none
+        // holds tracks, so there is no music to show. The tile
+        // renders the honest glyph.
+        //
+        // This tier previously emitted `artist-name` on the
+        // basename. Folder browse is a file tree, and "has
+        // children, has no files" does not identify an artist —
+        // a multi-artist collaboration folder, a label or series
+        // directory, a box set and the source root all match it.
+        // Asking a provider for a portrait of such a string is a
+        // guaranteed miss that still spends the rate-limited
+        // budget, once per container, on every first paint of a
+        // browse. Portraits are the artist facet's job, keyed on
+        // the tag rather than on a directory name.
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let container = music_dir.join("Container Name");
+        std::fs::create_dir_all(container.join("First Album")).unwrap();
+        std::fs::create_dir_all(container.join("Second Album")).unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
         assert!(
-            url.contains("Brothers%20in%20Arms"),
-            "stable sort must pick alphabetically-first child, got {url}"
+            !url.contains("artist-name"),
+            "folder browse must never emit a portrait lookup, got {url}"
+        );
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "fallback addresses the folder itself, got {url}"
         );
     }
 
     #[test]
-    fn tier4_artist_name_portrait_when_children_have_no_covers() {
-        // Artist folder has child album subdirectories but none
-        // carry any cover (sidecar or otherwise resolvable). No
-        // tracks at the artist level either. Route to
-        // `artist-name` so `artwork.online`'s artist cascade
-        // delivers a portrait.
+    fn nested_container_never_emits_a_portrait_lookup() {
+        // A nested container is still a container. Whatever the
+        // path depth, folder browse does not ask for a portrait.
         let tmp = tempfile::tempdir().unwrap();
         let music_dir = tmp.path();
-        let artist_dir = music_dir.join("Radiohead");
-        std::fs::create_dir_all(artist_dir.join("OK Computer")).unwrap();
-        std::fs::create_dir_all(artist_dir.join("Kid A")).unwrap();
-        let url = pick_directory_cover_url("Radiohead", music_dir);
+        let nested = music_dir.join("Genre").join("Container Name");
+        std::fs::create_dir_all(nested.join("First Album")).unwrap();
+        let url = pick_directory_cover_url("Genre/Container Name", music_dir);
         assert!(
-            url.contains("scheme=artist-name"),
-            "Tier 4 must emit artist-name scheme, got {url}"
-        );
-        assert!(
-            url.contains("Radiohead"),
-            "Tier 4 must carry the directory basename as artist name, \
-             got {url}"
-        );
-    }
-
-    #[test]
-    fn tier4_uses_basename_not_full_path() {
-        // For a nested container `Rock/Radiohead`, Tier 4 must
-        // carry the basename `Radiohead`, not the full path.
-        let tmp = tempfile::tempdir().unwrap();
-        let music_dir = tmp.path();
-        let nested = music_dir.join("Rock").join("Radiohead");
-        std::fs::create_dir_all(nested.join("OK Computer")).unwrap();
-        let url = pick_directory_cover_url("Rock/Radiohead", music_dir);
-        assert!(
-            url.contains("scheme=artist-name"),
-            "nested container should still trigger Tier 4, got {url}"
-        );
-        assert!(
-            url.contains("value=Radiohead"),
-            "Tier 4 must use basename, not full path, got {url}"
+            !url.contains("artist-name"),
+            "nested container must not emit a portrait lookup, got {url}"
         );
     }
 
@@ -4055,5 +6356,51 @@ mod tests {
             url.contains("scheme=mpd-directory"),
             "root-with-direct-art picks Tier 1, got {url}"
         );
+    }
+}
+
+#[cfg(test)]
+mod artist_image_container_tests {
+    use super::*;
+
+    /// A container folder carrying an operator's `artist*.*` shows
+    /// it. Before, tier 1 matched cover files only, so such a
+    /// folder found nothing and descended to a child album's
+    /// sleeve — or drew a glyph — while the picture the operator
+    /// had put there by hand sat unused.
+    #[test]
+    fn container_with_an_artist_image_addresses_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let dir = music_dir.join("Container Name");
+        std::fs::create_dir_all(dir.join("First Album")).unwrap();
+        std::fs::write(dir.join("artist.jpg"), b"a").unwrap();
+        std::fs::write(dir.join("First Album").join("cover.jpg"), b"c")
+            .unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(
+            url.contains("scheme=mpd-directory")
+                && url.contains("Container%20Name"),
+            "folder must address itself, got {url}"
+        );
+        assert!(
+            !url.contains("First%20Album"),
+            "must not borrow the child sleeve when it has its own \
+             artist image, got {url}"
+        );
+    }
+
+    /// Case must not matter — the operator's filesystem may or may
+    /// not preserve it.
+    #[test]
+    fn container_artist_image_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music_dir = tmp.path();
+        let dir = music_dir.join("Container Name");
+        std::fs::create_dir_all(dir.join("First Album")).unwrap();
+        std::fs::write(dir.join("ARTIST2.PNG"), b"a").unwrap();
+        let url = pick_directory_cover_url("Container Name", music_dir);
+        assert!(url.contains("Container%20Name"), "got {url}");
+        assert!(!url.contains("First%20Album"), "got {url}");
     }
 }

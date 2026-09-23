@@ -25,7 +25,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod announce_pump;
+pub mod audio_plane;
+pub mod audio_plane_handle;
+pub mod audio_plane_integration;
 pub mod election;
+pub mod inbound_pump;
 pub mod role_store;
 pub mod substrate_adapter;
 

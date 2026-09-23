@@ -10,15 +10,15 @@
 //! Compared to Volumio's `dacs.json` row, the evo-native [`DacEntry`]
 //! adds three load-bearing fields:
 //!
-//! * [`advanced_settings_enabled`] — per-DAC gate the UI honours
+//! * `advanced_settings_enabled` — per-DAC gate the UI honours
 //!   for the modder workflow and advanced-DSP controls. Defaults
 //!   to `true` in the reference (showcase) distribution; vendor
 //!   distributions override either per-DAC or via the
 //!   distribution-tier config flag.
-//! * [`dsp_options`] — the per-DAC list of ALSA mixer-control names
+//! * `dsp_options` — the per-DAC list of ALSA mixer-control names
 //!   the DSP capability resolver surfaces. Joined with the curated
 //!   pool + live `amixer cget` introspection in three-layer merge.
-//! * [`provenance`] — the source-of-truth origin string (e.g.
+//! * `provenance` — the source-of-truth origin string (e.g.
 //!   `volumio:dacs.json#hifiberry-dacplus`). The user-overlay
 //!   catalog from the modder workflow uses a different scheme
 //!   (e.g. `modder:operator-overlay-2026-05-20`).
@@ -215,7 +215,7 @@ pub struct DacEntry {
     /// surfaces for this DAC. Joined with the curated control
     /// pool + live `amixer cget` introspection. Empty Vec means
     /// the DAC has no surfaceable DSP controls beyond
-    /// [`in_card_mixer`].
+    /// `in_card_mixer`.
     #[serde(default)]
     pub dsp_options: Vec<String>,
     /// Source-of-truth provenance string. Volumio-imported rows

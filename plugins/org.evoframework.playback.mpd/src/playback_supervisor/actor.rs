@@ -67,7 +67,7 @@ use evo_plugin_sdk::contract::{
 
 use crate::mpd::{
     ConnectTimeouts, IdleSubsystem, MpdConnection, MpdEndpoint, MpdError,
-    MpdSong,
+    MpdSong, PlayState,
 };
 use crate::PLUGIN_NAME;
 
@@ -286,6 +286,15 @@ impl SupervisorCommandSender {
 /// moment playback becomes active. Subject-emission failures are
 /// logged but not propagated (the state report is authoritative
 /// for spawn success).
+/// Paths and cells that outlive a single command.
+pub(crate) struct SupervisorSpawn {
+    /// MPD `music_directory` for the file-side format probe.
+    pub(crate) music_directory: Option<std::path::PathBuf>,
+    /// Operator mute. Shared with the ambient observer and
+    /// the queue shelf.
+    pub(crate) mute: crate::mute_cell::MuteCell,
+}
+
 pub(crate) async fn spawn(
     endpoint: MpdEndpoint,
     timeouts: ConnectTimeouts,
@@ -293,7 +302,7 @@ pub(crate) async fn spawn(
     reporter: Arc<dyn CustodyStateReporter>,
     subject_emitter: SubjectEmitter,
     audio_protocol_settings_rx: watch::Receiver<AudioProtocolSettings>,
-    music_directory: Option<std::path::PathBuf>,
+    io: SupervisorSpawn,
 ) -> Result<SupervisorHandle, PlaybackError> {
     tracing::info!(
         plugin = PLUGIN_NAME,
@@ -342,7 +351,6 @@ pub(crate) async fn spawn(
     // before silencing; `set_mute(false)` ahead of any prior
     // mute restores to this fallback rather than to an
     // operator-confusing 0.
-    let initial_muted: bool = false;
     let initial_pre_mute_volume: u8 = 50;
     emit_initial_report(
         &mut cmd_conn,
@@ -350,8 +358,8 @@ pub(crate) async fn spawn(
         reporter.as_ref(),
         &subject_emitter,
         &mut file_tracker,
-        music_directory.as_deref(),
-        initial_muted,
+        io.music_directory.as_deref(),
+        io.mute.is_muted(),
     )
     .await?;
 
@@ -378,8 +386,8 @@ pub(crate) async fn spawn(
         reporter,
         subject_emitter,
         file_tracker,
-        music_directory,
-        muted: initial_muted,
+        music_directory: io.music_directory,
+        muted: io.mute,
         pre_mute_volume: initial_pre_mute_volume,
     };
     let task_handle = tokio::spawn(task_state.run(
@@ -572,11 +580,9 @@ struct SupervisorTask {
     /// publishes None on every track change, which clears the
     /// source field rather than carrying stale data forward.
     music_directory: Option<std::path::PathBuf>,
-    /// Operator-toggled mute state. MPD has no native mute
-    /// primitive — mute is synthesised as `setvol 0` with the
-    /// pre-mute volume captured for restore on unmute. Defaults to
-    /// false (not muted) on session start.
-    muted: bool,
+    /// Operator mute. Same cell the ambient observer and the
+    /// queue shelf read when they publish now_playing.
+    muted: crate::mute_cell::MuteCell,
     /// Captured volume to restore on `set_mute(false)`. Updated
     /// every time the warden issues `set_mute(true)`: the actor
     /// reads MPD's current volume via `status()` before sending
@@ -635,7 +641,7 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                &mut self.muted,
+                                &self.muted,
                                 &mut self.pre_mute_volume,
                             ).await;
                             let ok = result.is_ok();
@@ -648,7 +654,7 @@ impl SupervisorTask {
                                     &self.subject_emitter,
                                     &mut self.file_tracker,
                                     self.music_directory.as_deref(),
-                                    self.muted,
+                                    self.muted.is_muted(),
                                 ).await;
                             }
                         }
@@ -702,7 +708,7 @@ impl SupervisorTask {
                                 &mut self.cmd_conn,
                                 &self.endpoint,
                                 self.timeouts,
-                                self.muted,
+                                self.muted.is_muted(),
                             ).await;
                             let _ = reply.send(result);
                         }
@@ -736,7 +742,7 @@ impl SupervisorTask {
                                 &self.subject_emitter,
                                 &mut self.file_tracker,
                                 self.music_directory.as_deref(),
-                                self.muted,
+                                self.muted.is_muted(),
                             ).await;
                         }
                     }
@@ -784,7 +790,7 @@ async fn handle_command(
     cmd_conn: &mut MpdConnection,
     endpoint: &MpdEndpoint,
     timeouts: ConnectTimeouts,
-    muted: &mut bool,
+    muted: &crate::mute_cell::MuteCell,
     pre_mute_volume: &mut u8,
 ) -> Result<(), PlaybackError> {
     // First attempt on the current connection.
@@ -968,16 +974,41 @@ async fn reconnect_cmd_conn(
     }
 }
 
+/// Operator Play / resume when the player is not already
+/// running. MPD `pause 0` only unpauses. After reboot,
+/// enqueue, or Play Next the player is often stopped with
+/// a queue and no current song — that must start the
+/// armed track, or the head of the queue.
+async fn start_or_resume_playback(
+    cmd_conn: &mut MpdConnection,
+) -> Result<(), MpdError> {
+    let status = cmd_conn.status().await?;
+    match status.state {
+        PlayState::Playing => Ok(()),
+        PlayState::Paused => cmd_conn.pause(false).await,
+        PlayState::Stopped => {
+            if status.song_position.is_some() {
+                cmd_conn.play().await
+            } else {
+                cmd_conn.play_position(0).await
+            }
+        }
+    }
+}
+
 async fn dispatch_command(
     cmd: PlaybackCommand,
     cmd_conn: &mut MpdConnection,
-    muted: &mut bool,
+    muted: &crate::mute_cell::MuteCell,
     pre_mute_volume: &mut u8,
 ) -> Result<(), MpdError> {
     match cmd {
-        PlaybackCommand::Play => cmd_conn.play().await,
+        PlaybackCommand::Play => start_or_resume_playback(cmd_conn).await,
         PlaybackCommand::PlayPosition(p) => cmd_conn.play_position(p).await,
-        PlaybackCommand::Pause(p) => cmd_conn.pause(p).await,
+        PlaybackCommand::Pause(true) => cmd_conn.pause(true).await,
+        PlaybackCommand::Pause(false) => {
+            start_or_resume_playback(cmd_conn).await
+        }
         PlaybackCommand::Stop => cmd_conn.stop().await,
         PlaybackCommand::Next => cmd_conn.next().await,
         PlaybackCommand::Previous => cmd_conn.previous().await,
@@ -994,7 +1025,7 @@ async fn dispatch_command(
             // pre-mute volume rather than the zero the operator
             // just set.
             if v > 0 {
-                *muted = false;
+                muted.set_muted(false);
             }
             cmd_conn.set_volume(v).await
         }
@@ -1007,7 +1038,7 @@ async fn dispatch_command(
             // output. Already-muted is idempotent — re-issuing
             // set_mute(true) over an already-zero volume keeps
             // the previously captured pre-mute value.
-            if !*muted {
+            if !muted.is_muted() {
                 let status = cmd_conn.status().await?;
                 if let Some(current) = status.volume {
                     if current > 0 {
@@ -1015,7 +1046,7 @@ async fn dispatch_command(
                     }
                 }
             }
-            *muted = true;
+            muted.set_muted(true);
             cmd_conn.set_volume(0).await
         }
         PlaybackCommand::SetMute(false) => {
@@ -1023,7 +1054,7 @@ async fn dispatch_command(
             // 50 when no value was captured (e.g. unmute from a
             // session that started muted). Volume clamping is
             // handled by `MpdConnection::set_volume`.
-            *muted = false;
+            muted.set_muted(false);
             cmd_conn.set_volume(*pre_mute_volume).await
         }
         PlaybackCommand::SetRepeat(enabled) => {
@@ -1347,6 +1378,35 @@ async fn idle_task(
                             plugin = PLUGIN_NAME,
                             "idle connection re-established"
                         );
+                        // Whatever changed while the connection
+                        // was down was never queued for this new
+                        // one — MPD buffers idle events per
+                        // connection, and this connection did not
+                        // exist yet. Re-entering idle would sit
+                        // on the old envelope until the *next*
+                        // change, so a track started during the
+                        // outage stays invisible until something
+                        // else happens or the page is reloaded.
+                        //
+                        // The ambient observer already handles
+                        // this: it re-emits a snapshot after
+                        // every reconnect. Do the same here by
+                        // raising the event a wake raises, so
+                        // the actor re-reads through the
+                        // publisher it already uses. Not a
+                        // second publisher, and not a play.
+                        if tx
+                            .send(IdleEvent::Changed(IDLE_SUBSYSTEMS.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!(
+                                plugin = PLUGIN_NAME,
+                                "idle task: event receiver dropped after \
+                                 reconnect, exiting"
+                            );
+                            return;
+                        }
                     }
                     None => {
                         let _ = tx.send(IdleEvent::Exhausted).await;
@@ -1420,6 +1480,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_reconnect_publishes_the_song_mpd_has_now() {
+        // The gap: the idle connection drops, the player moves on
+        // while nothing is listening, the connection comes back.
+        // MPD queues idle events per connection and this one did
+        // not exist when the change happened, so re-entering idle
+        // would sit on the old envelope until the next change or
+        // a page reload.
+        //
+        // cmd conn changes its current song after the first read,
+        // so a replayed envelope and a fresh read are
+        // distinguishable. The idle conn closes on its first
+        // command; the third connection is the reconnect.
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::SongChangesAfterFirstRead {
+                first: "before-the-gap.flac".to_string(),
+                second: "started-during-the-gap.flac".to_string(),
+            },
+            ConnBehaviour::CloseOnNth { nth: 1 },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let (subjects, _relations, emitter) = capturing_emitter();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            emitter,
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Give the idle task time to fail, back off and reconnect.
+        let names_the_new_song = || {
+            (0..subjects.state_update_count()).any(|i| {
+                subjects
+                    .state_update_at(i)
+                    .map(|(_, v)| {
+                        v.to_string().contains("started-during-the-gap.flac")
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        for _ in 0..60 {
+            if names_the_new_song() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            names_the_new_song(),
+            "a reconnect must publish the song MPD has now, not replay the \
+             envelope from before the gap; {} update_state calls seen",
+            subjects.state_update_count(),
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn spawn_succeeds_and_emits_initial_report() {
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::Standard,
@@ -1437,7 +1567,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1471,7 +1604,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1495,15 +1631,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_from_stop_starts_the_queue_head() {
+        // Glass Play is `resume` = Pause(false). After reboot
+        // or enqueue the player is stopped with no current
+        // song. `pause 0` is a no-op; this must play the head.
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) = spawn_mock_mpd(vec![
+            ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                ],
+                playing: None,
+            },
+            ConnBehaviour::HoldAfterWelcome,
+        ])
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+        let handle = spawn(
+            endpoint,
+            short_timeouts(),
+            test_custody_handle(),
+            reporter_dyn,
+            SubjectEmitter::null(),
+            null_protocol_settings_rx(),
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle.command(PlaybackCommand::Pause(false)).await.unwrap();
+
+        let report = handle.query_state().await.unwrap();
+        assert_eq!(
+            report.state,
+            crate::mpd::PlayState::Playing,
+            "stopped-with-a-queue must start, not stay stopped: {report:?}"
+        );
+        assert_eq!(
+            report.current_song.as_ref().map(|s| s.file_path.as_str()),
+            Some("INTERNAL/a.flac"),
+            "the head of the queue is what Play arms: {report:?}"
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("play")),
+            "must start playback, not only unpause: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("pause")),
+            "pause 0 is a no-op when stopped: {seen:?}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn command_ack_returns_playback_error_ack() {
         // Command-conn: 1 = crossfade (apply_audio_protocol_settings),
         //               2 = single    (apply_audio_protocol_settings),
         //               3 = status    (initial report),
         //               4 = currentsong (initial report),
-        //               5 = play -> ACK.
+        //               5 = status    (start_or_resume_playback),
+        //               6 = play 0 -> ACK.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::AckOnNth {
-                nth: 5,
+                nth: 6,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -1521,7 +1721,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1565,7 +1768,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1616,7 +1822,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1653,7 +1862,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1685,7 +1897,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1730,7 +1945,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1781,7 +1999,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1823,7 +2044,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();
@@ -1883,7 +2107,10 @@ mod tests {
             reporter_dyn,
             emitter,
             null_protocol_settings_rx(),
-            None,
+            SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .unwrap();

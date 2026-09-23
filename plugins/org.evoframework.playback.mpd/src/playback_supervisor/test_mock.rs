@@ -13,6 +13,7 @@
 //! The `#[cfg(test)]` gate lives on the `mod test_mock;` declaration
 //! in `playback_supervisor.rs`; no inner attribute needed here.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -375,6 +376,83 @@ pub(crate) enum ConnBehaviour {
     /// Welcome, then respond to the first `idle` command with
     /// `changed: player\nOK\n`, then hold.
     IdleOnceThenHold,
+    /// A library that records every command it is sent.
+    ///
+    /// `listallinfo <path>` answers with `files`, so a caller
+    /// that expands a directory sees its tracks; `status`
+    /// reports a playing queue so a position can be computed;
+    /// `addid` answers with an id. The recorded command lines
+    /// let a test assert what was actually asked of MPD —
+    /// whether a directory or its files reached the queue.
+    RecordingLibrary {
+        commands: Arc<Mutex<Vec<String>>>,
+        files: Vec<String>,
+    },
+    /// A database that prunes only when the queued `update` job
+    /// finishes.
+    ///
+    /// `find` answers with `internal` + `usb` until the job has
+    /// run, then with `internal` alone. `status` carries
+    /// `updating_db` for `in_flight_polls` reads after the
+    /// `update` command, then clears — so a caller that re-counts
+    /// on the update ACK sees the unpruned set and one that waits
+    /// sees the pruned one.
+    PrunesAfterUpdate {
+        internal: Vec<String>,
+        usb: Vec<String>,
+        in_flight_polls: usize,
+    },
+    /// Like [`StandardWithSong`] but the current song changes
+    /// after the first `currentsong` read: the player moved on
+    /// while nobody was listening. Lets a test distinguish a
+    /// fresh read from a replayed envelope.
+    ///
+    /// [`StandardWithSong`]: Self::StandardWithSong
+    SongChangesAfterFirstRead { first: String, second: String },
+    /// A live operator queue that can actually be mutated.
+    ///
+    /// `playlistinfo` lists what is in it with `Pos:` and `Id:`,
+    /// `addid` inserts (refusing a position past the end with
+    /// MPD's Bad song index ACK), `add` appends, `clear` empties,
+    /// `deleteid` takes an entry out, `play <pos>` selects and
+    /// starts, `stop` stops, `currentsong` answers with the
+    /// selected entry, and `status` names the current song by
+    /// position. A `command_list_begin` … `command_list_end`
+    /// batch applies those writes and answers with one `OK` at
+    /// the end — the same wire shape MPD uses for atomic
+    /// replace. Every command line is recorded, so a test can
+    /// assert both what survived and in which order the work
+    /// was done.
+    ///
+    /// `items` is `(songid, mpd-relative path)` in queue order;
+    /// `playing` is the position MPD reports as current, or
+    /// `None` for a stopped player.
+    LiveQueue {
+        commands: Arc<Mutex<Vec<String>>>,
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    },
+    /// MPD's stored-playlist namespace, plus enough of the
+    /// library to seed a new playlist from.
+    ///
+    /// `listplaylists` indexes it; `playlistadd` creates the
+    /// playlist when it does not exist and appends when it does,
+    /// as MPD's own does; `playlistdelete` and `playlistclear`
+    /// mutate it; `lsinfo` walks `library`; and a
+    /// `command_list_ok_begin` block of `listplaylist` answers
+    /// the index's batched count query. `playlistinfo` and
+    /// `status` report `queue`, which nothing here may move.
+    ///
+    /// `playlists` is shared with the test so it can read what
+    /// MPD ended up holding. `library` maps an lsinfo path to
+    /// its `(subdirectories, files)`; the root is the empty
+    /// string.
+    StoredPlaylists {
+        commands: Arc<Mutex<Vec<String>>>,
+        playlists: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+        library: Vec<(String, Vec<String>, Vec<String>)>,
+        queue: Vec<String>,
+    },
 }
 
 /// Bind a loopback listener and serve incoming connections with
@@ -470,6 +548,558 @@ async fn serve_connection(mut stream: TcpStream, b: ConnBehaviour) {
                     return;
                 }
                 let _ = w.write_all(b"OK\n").await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::RecordingLibrary {
+            ref commands,
+            ref files,
+        } => {
+            let listing = {
+                let mut out = String::new();
+                for f in files {
+                    out.push_str(&format!("file: {f}\n"));
+                }
+                out.push_str("OK\n");
+                out
+            };
+            let mut next_id = 100u32;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                commands.lock().unwrap().push(line.trim_end().to_string());
+                if line.starts_with("status") {
+                    let _ = w
+                        .write_all(
+                            b"state: play\nsong: 0\nplaylistlength: 1\nOK\n",
+                        )
+                        .await;
+                } else if line.starts_with("listallinfo") {
+                    let _ = w.write_all(listing.as_bytes()).await;
+                } else if line.starts_with("addid") {
+                    let _ = w
+                        .write_all(format!("Id: {next_id}\nOK\n").as_bytes())
+                        .await;
+                    next_id += 1;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::PrunesAfterUpdate {
+            ref internal,
+            ref usb,
+            in_flight_polls,
+        } => {
+            let files = |v: &[String]| {
+                let mut out = String::new();
+                for f in v {
+                    out.push_str(&format!("file: {f}\n"));
+                }
+                out.push_str("OK\n");
+                out
+            };
+            let unpruned = {
+                let mut all = internal.clone();
+                all.extend(usb.iter().cloned());
+                files(&all)
+            };
+            let pruned = files(internal);
+            let mut update_seen = false;
+            let mut polls_after_update = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let job_done =
+                    update_seen && polls_after_update >= in_flight_polls;
+                if line.starts_with("update") {
+                    update_seen = true;
+                    polls_after_update = 0;
+                    let _ = w.write_all(b"updating_db: 1\nOK\n").await;
+                } else if line.starts_with("status") {
+                    if update_seen && polls_after_update < in_flight_polls {
+                        polls_after_update += 1;
+                        let _ = w
+                            .write_all(b"state: stop\nupdating_db: 1\nOK\n")
+                            .await;
+                    } else {
+                        let _ = w.write_all(b"state: stop\nOK\n").await;
+                    }
+                } else if line.starts_with("find") {
+                    let body = if job_done { &pruned } else { &unpruned };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::LiveQueue {
+            ref commands,
+            ref items,
+            playing,
+        } => {
+            let mut queue = items.clone();
+            let mut current = playing;
+            let mut state = if playing.is_some() { "play" } else { "stop" };
+            let mut next_id =
+                queue.iter().map(|(id, _)| *id).max().unwrap_or(99) + 1;
+            let mut in_list = false;
+            let mut stored: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                commands.lock().unwrap().push(cmd.clone());
+                if cmd == "command_list_begin" {
+                    in_list = true;
+                    continue;
+                } else if cmd == "command_list_end" {
+                    in_list = false;
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistinfo") {
+                    let mut out = String::new();
+                    for (pos, (id, path)) in queue.iter().enumerate() {
+                        out.push_str(&format!(
+                            "file: {path}\nPos: {pos}\nId: {id}\n"
+                        ));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("status") {
+                    let mut out = format!(
+                        "state: {state}\nplaylistlength: {}\n",
+                        queue.len()
+                    );
+                    if let Some(pos) = current {
+                        out.push_str(&format!("song: {pos}\n"));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("deleteid") {
+                    let id = cmd
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|t| t.trim_matches('"').parse::<u32>().ok());
+                    if let Some(id) = id {
+                        queue.retain(|(qid, _)| *qid != id);
+                    }
+                    if current.is_some_and(|p| p as usize >= queue.len()) {
+                        current = None;
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("stop") {
+                    state = "stop";
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("addid") {
+                    // `addid "<uri>" ["<pos>"]`. MPD refuses a
+                    // position past the end with a Bad song
+                    // index ACK — the mock refuses it the same
+                    // way, so a test sees the operator's
+                    // refusal rather than a silent success.
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("addid")
+                    });
+                    let uri = args.next().unwrap_or_default().to_string();
+                    let pos =
+                        args.next().and_then(|t| t.trim().parse::<u32>().ok());
+                    let at = pos.unwrap_or(queue.len() as u32) as usize;
+                    if at > queue.len() {
+                        let _ = w
+                            .write_all(b"ACK [2@0] {addid} Bad song index\n")
+                            .await;
+                    } else {
+                        queue.insert(at, (next_id, uri));
+                        let _ = w
+                            .write_all(
+                                format!("Id: {next_id}\nOK\n").as_bytes(),
+                            )
+                            .await;
+                        next_id += 1;
+                    }
+                } else if cmd.starts_with("listplaylists") {
+                    let mut out = String::new();
+                    for name in stored.keys() {
+                        out.push_str(&format!("playlist: {name}\n"));
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("listplaylistinfo") {
+                    let name =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    let mut out = String::new();
+                    if let Some(entries) = stored.get(&name) {
+                        for (pos, path) in entries.iter().enumerate() {
+                            out.push_str(&format!(
+                                "file: {path}\nPos: {pos}\n"
+                            ));
+                        }
+                    }
+                    out.push_str("OK\n");
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("playlistadd") {
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("playlistadd")
+                    });
+                    let name = args.next().unwrap_or_default().to_string();
+                    let uri = args.next().unwrap_or_default().to_string();
+                    if !name.is_empty() && !uri.is_empty() {
+                        stored.entry(name).or_default().push(uri);
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistdelete") {
+                    let mut args = cmd.split('"').filter(|s| {
+                        !s.trim().is_empty() && !s.starts_with("playlistdelete")
+                    });
+                    let name = args.next().unwrap_or_default().to_string();
+                    let pos = args
+                        .next()
+                        .and_then(|t| t.trim().parse::<usize>().ok());
+                    if let (Some(entries), Some(pos)) =
+                        (stored.get_mut(&name), pos)
+                    {
+                        if pos < entries.len() {
+                            entries.remove(pos);
+                        }
+                    }
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("playlistclear") {
+                    let name =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    stored.remove(&name);
+                    let _ = w.write_all(b"OK\n").await;
+                } else if cmd.starts_with("count") {
+                    // This mock models a library that matches
+                    // nothing: every `count` answers zero, the
+                    // way MPD answers a filter with no hits. A
+                    // test that needs a real match count wants
+                    // its own behaviour rather than this one.
+                    let _ = w.write_all(b"songs: 0\nplaytime: 0\nOK\n").await;
+                } else if cmd.starts_with("currentsong") {
+                    // Ordered after `playlistinfo` and before
+                    // `play`: MPD's queue verbs share prefixes
+                    // and the first match wins.
+                    let out =
+                        match current.and_then(|pos| queue.get(pos as usize)) {
+                            Some((_, path)) => format!(
+                                "file: {path}\nTitle: T\nArtist: A\nAlbum: X\n\
+                             Time: 180\nduration: 180.000\nOK\n"
+                            ),
+                            None => "OK\n".to_string(),
+                        };
+                    let _ = w.write_all(out.as_bytes()).await;
+                } else if cmd.starts_with("play") {
+                    let pos = cmd
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|t| t.trim_matches('"').parse::<u32>().ok());
+                    if let Some(p) = pos {
+                        current = Some(p);
+                    }
+                    state = "play";
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
+                } else if cmd == "clear" {
+                    queue.clear();
+                    current = None;
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
+                } else if cmd.starts_with("add ") {
+                    let uri =
+                        cmd.split('"').nth(1).unwrap_or_default().to_string();
+                    if !uri.is_empty() {
+                        queue.push((next_id, uri));
+                        next_id += 1;
+                    }
+                    if !in_list {
+                        let _ = w.write_all(b"OK\n").await;
+                    }
+                } else if cmd.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else if !in_list {
+                    let _ = w.write_all(b"OK\n").await;
+                }
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::StoredPlaylists {
+            ref commands,
+            ref playlists,
+            ref library,
+            ref queue,
+        } => {
+            // `cmd "arg one" "arg two"` — MPD quotes every
+            // argument, so the odd-indexed splits are the args.
+            fn args(cmd: &str) -> Vec<String> {
+                cmd.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_string)
+                    .collect()
+            }
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                commands.lock().unwrap().push(cmd.clone());
+
+                // A command list is the one shape that reads more
+                // input before it can answer, so it is collected
+                // first and answered with the rest.
+                let mut block: Vec<String> = Vec::new();
+                if cmd.starts_with("command_list")
+                    && !cmd.starts_with("command_list_end")
+                {
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let c = line.trim_end().to_string();
+                        commands.lock().unwrap().push(c.clone());
+                        if c.starts_with("command_list_end") {
+                            break;
+                        }
+                        block.push(c);
+                    }
+                }
+
+                // Every arm computes its reply with the lock held
+                // only inside this block: a guard alive across the
+                // write below would make this future non-Send.
+                let reply = {
+                    let mut held = playlists.lock().unwrap();
+                    if cmd.starts_with("command_list") {
+                        // `command_list_ok_begin` separates each
+                        // command's reply with `list_OK`; plain
+                        // `command_list_begin` answers once at
+                        // the end. Both apply their writes.
+                        let separated = cmd.starts_with("command_list_ok");
+                        let mut out = String::new();
+                        for c in &block {
+                            let a = args(c);
+                            if c.starts_with("listplaylist") {
+                                let name =
+                                    a.first().cloned().unwrap_or_default();
+                                if let Some(entries) = held.get(&name) {
+                                    for e in entries {
+                                        out.push_str(&format!("file: {e}\n"));
+                                    }
+                                }
+                            } else if c.starts_with("playlistadd")
+                                && a.len() >= 2
+                            {
+                                held.entry(a[0].clone())
+                                    .or_default()
+                                    .push(a[1].clone());
+                            }
+                            if separated {
+                                out.push_str("list_OK\n");
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("count") {
+                        // Models a library that matches nothing,
+                        // the way MPD answers a filter with no
+                        // hits. A test needing a real count wants
+                        // its own behaviour.
+                        "songs: 0\nplaytime: 0\nOK\n".to_string()
+                    } else if cmd.starts_with("listplaylistinfo") {
+                        // Ordered before `listplaylists`: the
+                        // longer name would otherwise never match.
+                        let name =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut out = String::new();
+                        if let Some(entries) = held.get(&name) {
+                            for e in entries {
+                                out.push_str(&format!("file: {e}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("listplaylists") {
+                        let mut out = String::new();
+                        for name in held.keys() {
+                            out.push_str(&format!("playlist: {name}\n"));
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("lsinfo") {
+                        let path =
+                            args(&cmd).first().cloned().unwrap_or_default();
+                        let mut out = String::new();
+                        if let Some((_, subdirs, files)) =
+                            library.iter().find(|(p, _, _)| *p == path)
+                        {
+                            for d in subdirs {
+                                out.push_str(&format!("directory: {d}\n"));
+                            }
+                            for f in files {
+                                out.push_str(&format!("file: {f}\n"));
+                            }
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("playlistadd") {
+                        let a = args(&cmd);
+                        if a.len() >= 2 {
+                            // MPD creates NAME.m3u when it is
+                            // absent; that creation is the whole
+                            // point of the seed.
+                            held.entry(a[0].clone())
+                                .or_default()
+                                .push(a[1].clone());
+                        }
+                        "OK\n".to_string()
+                    } else if cmd.starts_with("playlistdelete") {
+                        let a = args(&cmd);
+                        let pos =
+                            a.get(1).and_then(|p| p.parse::<usize>().ok());
+                        let entries = a.first().and_then(|n| held.get_mut(n));
+                        match (entries, pos) {
+                            (Some(entries), Some(p)) if p < entries.len() => {
+                                entries.remove(p);
+                                "OK\n".to_string()
+                            }
+                            _ => "ACK [2@0] {playlistdelete} Bad song index\n"
+                                .to_string(),
+                        }
+                    } else if cmd.starts_with("playlistclear") {
+                        if let Some(name) = args(&cmd).first() {
+                            if let Some(entries) = held.get_mut(name) {
+                                entries.clear();
+                            }
+                        }
+                        "OK\n".to_string()
+                    } else if cmd.starts_with("save") {
+                        // MPD's `save` ACKs 56 on a name that
+                        // already exists; otherwise it writes
+                        // the current queue under that name.
+                        match args(&cmd).first() {
+                            Some(name) if held.contains_key(name) => {
+                                "ACK [56@0] {save} Playlist already exists\n"
+                                    .to_string()
+                            }
+                            Some(name) => {
+                                held.insert(name.clone(), queue.clone());
+                                "OK\n".to_string()
+                            }
+                            None => "OK\n".to_string(),
+                        }
+                    } else if cmd.starts_with("rm") {
+                        // And `rm` ACKs 50 on a name that is not
+                        // there, which the save-as path swallows
+                        // on purpose.
+                        match args(&cmd).first() {
+                            Some(name) if held.remove(name).is_some() => {
+                                "OK\n".to_string()
+                            }
+                            _ => {
+                                "ACK [50@0] {rm} No such playlist\n".to_string()
+                            }
+                        }
+                    } else if cmd.starts_with("playlistinfo") {
+                        let mut out = String::new();
+                        for (pos, path) in queue.iter().enumerate() {
+                            out.push_str(&format!(
+                                "file: {path}\nPos: {pos}\nId: {}\n",
+                                pos + 1
+                            ));
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("status") {
+                        let mut out = format!(
+                            "state: play\nplaylistlength: {}\n",
+                            queue.len()
+                        );
+                        if !queue.is_empty() {
+                            out.push_str("song: 0\n");
+                        }
+                        out.push_str("OK\n");
+                        out
+                    } else if cmd.starts_with("idle") {
+                        String::new()
+                    } else {
+                        "OK\n".to_string()
+                    }
+                };
+
+                if cmd.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                }
+                let _ = w.write_all(reply.as_bytes()).await;
+                let _ = w.flush().await;
+            }
+        }
+        ConnBehaviour::SongChangesAfterFirstRead {
+            ref first,
+            ref second,
+        } => {
+            let song = |file: &str| {
+                format!(
+                    "file: {file}\nTitle: T\nArtist: A\nAlbum: X\n\
+                     Time: 180\nduration: 180.000\nOK\n"
+                )
+            };
+            let first_resp = song(first);
+            let second_resp = song(second);
+            let status_resp =
+                b"state: play\nsong: 0\nelapsed: 1.000\nduration: 180.000\nvolume: 50\nOK\n";
+            let mut reads = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                if line.starts_with("status") {
+                    let _ = w.write_all(status_resp).await;
+                } else if line.starts_with("currentsong") {
+                    reads += 1;
+                    let body = if reads <= 1 {
+                        &first_resp
+                    } else {
+                        &second_resp
+                    };
+                    let _ = w.write_all(body.as_bytes()).await;
+                } else if line.starts_with("idle") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                } else {
+                    let _ = w.write_all(b"OK\n").await;
+                }
                 let _ = w.flush().await;
             }
         }

@@ -399,11 +399,13 @@ name = "kiosk"
 shape = 1
 description = """
 On-device kiosk operator-settings respondent: answers \
-`set_display_rotation`, `set_touch_calibration`, and \
-`launch_touch_calibration` for the operator who needs to \
-align the physical display + touchscreen from either the \
-on-glass UI or a paired remote browser. All three verbs are \
-write-gated at the framework dispatcher (scope `system_admin`, \
+`set_display_rotation`, `set_touch_calibration`, \
+`launch_touch_calibration`, and \
+`derive_touch_calibration_from_corners` for the operator who \
+needs to align the physical display + touchscreen from \
+either the on-glass UI or a paired remote browser. Those \
+alignment verbs are write-gated at the framework dispatcher \
+(scope `system_admin`, \
 no step-up — a step-up card on a mis-calibrated glass would \
 be un-tappable, defeating the recovery path this shelf \
 exists for). Reference implementation is the \

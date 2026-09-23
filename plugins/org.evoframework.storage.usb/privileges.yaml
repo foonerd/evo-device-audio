@@ -57,6 +57,9 @@ required_binaries:
   - name: fsck.exfat
     min_version: "1.0"
     failure_mode: warn at admission with reason `fsck_exfat_missing`; exfat drives still enumerate + mount, but `repair_filesystem` on a dirty exfat drive returns `PluginError::Permanent` naming the missing binary. Debian Trixie ships in `exfatprogs`.
+  - name: ntfs-3g
+    min_version: "2017"
+    failure_mode: warn at admission with reason `ntfs_3g_missing`; ntfs drives still enumerate, but mount refuses because §2 options are ntfs-3g options. Debian ships the helper as `/bin/ntfs-3g` (`/sbin/mount.ntfs` → `mount.ntfs-3g`).
   - name: ntfsfix
     min_version: "2017"
     failure_mode: warn at admission with reason `ntfsfix_missing`; ntfs drives still enumerate + mount, but `repair_filesystem` on a dirty ntfs drive returns `PluginError::Permanent` naming the missing binary. Debian ships in `ntfs-3g`.
@@ -68,13 +71,12 @@ required_binaries:
     failure_mode: warn at admission with reason `eject_missing`; safe-remove still succeeds (umount + retract from subject), but the best-effort SCSI eject step is skipped. Debian ships in `eject`.
 
 required_kernel_modules:
-  # Filesystem support modules per the support matrix.
-  # `vfat` + `exfat` + `ntfs3` are the in-kernel drivers used
-  # via `mount -t <fs> ...`. `fuseblk` is the FUSE fallback
-  # some distributions use for ntfs-3g userspace mount.
+  # vfat + exfat are in-kernel. NTFS attach is ntfs-3g over
+  # FUSE (`fuse`); kernel ntfs3 is not used because §2 options
+  # (windows_names, big_writes, dmask, fmask) are ntfs-3g-only.
   - vfat
   - exfat
-  - ntfs3
+  - fuse
 
 required_system_services: []
 

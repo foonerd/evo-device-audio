@@ -119,6 +119,59 @@ EOF
 )"
 assert_detection "Loopback-only host: fallback → Loopback" "Loopback" "$LOOPBACK_ONLY_FIXTURE"
 
+# --- Locale fixtures -------------------------------------
+#
+# alsa-utils translates the leading word of a card line. A
+# French host emits `carte 0:`, a German one `Karte 0:`. The
+# shipped detector matched the literal English `card` and so
+# found no playback device on a non-English host, aborting the
+# install. bootstrap.sh now pins LC_ALL=C on its own `aplay`
+# calls; these fixtures pin the parser independently, because a
+# parser that only works when its caller remembers is the same
+# bug waiting for the next caller.
+
+FR_FIXTURE="$(cat <<'EOF'
+**** Liste des périphériques matériels PLAYBACK ****
+carte 0: Loopback [Loopback], périphérique 0: Loopback PCM [Loopback PCM]
+  Sous-périphériques: 8/8
+carte 1: DAC [I-Sabre Q2M DAC], périphérique 0: I-Sabre Q2M DAC i-sabre-codec-dai-0 [I-Sabre Q2M DAC i-sabre-codec-dai-0]
+  Sous-périphériques: 1/1
+EOF
+)"
+assert_detection "fr_FR: carte + Loopback → DAC" "DAC" "$FR_FIXTURE"
+
+DE_FIXTURE="$(cat <<'EOF'
+**** Liste der Hardware-Geräte (PLAYBACK) ****
+Karte 0: vc4hdmi0 [vc4-hdmi-0], Gerät 0: MAI PCM i2s-hifi-0 [MAI PCM i2s-hifi-0]
+  Unter-Geräte: 1/1
+Karte 1: PCH [HDA Intel PCH], Gerät 0: ALC233 Analog [ALC233 Analog]
+  Unter-Geräte: 1/1
+EOF
+)"
+assert_detection "de_DE: Karte + vc4hdmi → PCH" "PCH" "$DE_FIXTURE"
+
+# Non-Latin leading word. The parser matches the line shape,
+# not a word list, so a locale nobody enumerated still works.
+RU_FIXTURE="$(cat <<'EOF'
+**** Список устройств PLAYBACK ****
+карта 0: Loopback [Loopback], устройство 0: Loopback PCM [Loopback PCM]
+  Подустройства: 8/8
+карта 1: DAC [I-Sabre Q2M DAC], устройство 0: I-Sabre Q2M DAC i-sabre-codec-dai-0
+  Подустройства: 1/1
+EOF
+)"
+assert_detection "ru_RU: non-Latin card word + Loopback → DAC" "DAC" "$RU_FIXTURE"
+
+# Locale fallback: French host whose only card is HDMI. Must
+# still fall back rather than abort.
+FR_HDMI_ONLY_FIXTURE="$(cat <<'EOF'
+**** Liste des périphériques matériels PLAYBACK ****
+carte 0: vc4hdmi0 [vc4-hdmi-0], périphérique 0: MAI PCM i2s-hifi-0 [MAI PCM i2s-hifi-0]
+  Sous-périphériques: 1/1
+EOF
+)"
+assert_detection "fr_FR HDMI-only: fallback → vc4hdmi0" "vc4hdmi0" "$FR_HDMI_ONLY_FIXTURE"
+
 # Fixture: empty aplay output (no cards). Detector returns 1;
 # the test asserts the empty-string-as-no-card contract.
 NO_CARDS_FIXTURE=""

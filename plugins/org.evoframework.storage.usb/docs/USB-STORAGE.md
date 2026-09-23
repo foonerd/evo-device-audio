@@ -96,7 +96,7 @@ Every rule in the role taxonomy has at least one fixture; see
 |---|---|---|---|---|---|
 | `vfat` (FAT16 / FAT32) | **2 TiB** (FAT32 on-disk cap; refuse at mount when device size > 2 TiB with a copy-string surfaced to the operator recommending exFAT / ext4 reformat) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.vfat -n <dev>` exit code 1 = dirty | `fsck.vfat -a <dev>` | `dosfstools` |
 | `exfat` | no practical limit (128 PiB spec ceiling; plugin does not cap) | `noatime,dmask=0000,fmask=0000,iocharset=utf8,uid=<SERVICE_UID>,gid=<SERVICE_GID>` | `fsck.exfat -n <dev>` exit code non-zero = dirty | `fsck.exfat -a <dev>` | `exfatprogs` |
-| `ntfs` | no practical limit (256 TiB per volume; plugin does not cap) | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` |
+| `ntfs` | no practical limit (256 TiB per volume; plugin does not cap) | `noatime,dmask=0000,fmask=0000,uid=<SERVICE_UID>,gid=<SERVICE_GID>,windows_names,big_writes` (ntfs-3g only; kernel `ntfs3` rejects these options) | `ntfsfix --no-action <dev>` reports dirty / hiberfile | `ntfsfix <dev>` (accepts dirty + hiberfile per policy) | `ntfs-3g` (FUSE helper; wrapper passes `--type=ntfs-3g` to systemd-mount) |
 | `ext2` / `ext3` / `ext4` | no practical limit (1 EiB on ext4; plugin does not cap) | `noatime` | `dumpe2fs -h <dev>` needs_recovery flag OR feature-flag inspection | `e2fsck -p <dev>` (auto-repair; escalate to `-y` on operator confirm) | `e2fsprogs` |
 
 **Volume-size handling (large drives — > 2 TiB).** The
@@ -375,9 +375,9 @@ Wrapper actions:
 
 | Action | Invocation |
 |---|---|
-| `mount <stable-id> <fs-type> <device-node>` | `mount -t <fs> -o <options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` |
-| `umount <stable-id>` | `umount /var/lib/evo/music/USB/<stable-id>` |
-| `umount-force <stable-id>` | `umount -l /var/lib/evo/music/USB/<stable-id>` (only via `safe_remove force: true`) |
+| `mount <stable-id> <fs-type> <device-node>` | `systemd-mount --collect --fsck=no --type=<fs> --options=<options-per-§2> <device-node> /var/lib/evo/music/USB/<stable-id>` (PID 1 / host namespace; same as network.shares). For `ntfs`, `--type=ntfs-3g` so §2 options reach the FUSE helper, not kernel `ntfs3`. Success is checked in PID 1's mount table. |
+| `umount <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>` |
+| `umount-force <stable-id>` | `systemd-umount /var/lib/evo/music/USB/<stable-id>`, and if the target is held, PID 1 runs `fusermount3 -uz` then `umount -i -l` via `systemd-run --wait --collect --pipe`. `nsenter` cannot: `evo.service` has `RestrictNamespaces=yes` and a sudo child inherits that filter. Never `-l` on `systemd-umount`. Only via `safe_remove`. |
 | `fsck <stable-id> <fs-type> <device-node>` | dispatches per §2 repair-tool matrix |
 | `eject <parent-disk>` | `eject <parent-disk>` (best-effort; failure logged, not fatal) |
 
@@ -533,16 +533,20 @@ Consumer-stop-before-mutation is normative — mirrors the
 ## 9 Safe-remove path (R4 — normative)
 
 1. UI operator gestures "Safe remove" on a `mounted-*` drive.
-2. Plugin refuses if `class: system-disk` (§1 invariant).
-3. Consumer-stop: `library.remove_source` for the drive's
-   `library_source_id` (MPD update).
-4. `sync` on the drive's parent disk.
-5. Wrapper `umount <stable-id>` (clean umount). On EBUSY:
-   - If `force: false` (default), return `Busy { holders }`
-     with the fuser-derived holder list. UI shows "Files are
-     in use — stop playback and try again" or "Force" button.
-   - If `force: true`, wrapper `umount-force <stable-id>` (lazy
-     detach `-l`). Warn logged, `removed: true` returned.
+2. Plugin refuses if the role is `system-*` live (§1 invariant).
+3. `sync` on the drive's parent disk.
+4. Wrapper `umount <stable-id>` (clean umount). Any non-zero —
+   EBUSY, `Device or resource busy`, systemd `Job failed` —
+   escalates to `umount-force`, which retries cleanly once and
+   then lazily detaches the mount in PID 1's namespace. Holders
+   do not veto. The `force` field is accepted on the wire and is
+   not a gate. A yank of a vanished `mounted-*` row takes the
+   same detach, then the scrub below.
+5. After the volume is detached: `library.remove_source` with
+   `scrub_mpd_entries: true`. The scrub is an MPD `update` over
+   the database-relative path (`USB/Audio`, not the absolute
+   mount). Run before detach it would reaffirm every still-
+   present file and prune nothing.
 6. Best-effort SCSI eject via wrapper `eject <parent-disk>`.
    Failure logged; not fatal (some drives ignore eject).
 7. Retract from factory subject list.
@@ -563,7 +567,7 @@ Consumer-stop-before-mutation is normative — mirrors the
 | Rename validation | Live inline: min 1 / max 32 chars; first char alphanumeric; subsequent chars alphanumeric / underscore / hyphen. Reserved names refused with copy string ("This name conflicts with another drive currently plugged in — pick another"): tests against current mount roots + system-disk stub rows. |
 | Rename confirm | Only when the drive currently has a `library_source_id` (i.e. is mounted and in the library): "Renaming will briefly stop playback if this drive is playing. The name change reflects immediately on the network share and file browser. Continue?" |
 | Repair confirm | Modal: "This will unmount and check <display_name>. Files must be unopened; playback stops. Continue?" |
-| Force remove | Only offered on `Busy` response; second modal: "Files are still open. Force eject may cause data loss. Continue?" |
+| Force remove | Not the truth path. Remove always detaches; holders do not open a second modal. |
 | `remount_usb` recovery hint | Wired to `storage.usb.mount` retry against the drive's stable-id. Consumed by disposition renderer per `playback.v1.toml:602`. |
 | Multiple identical drives | Enumeration suffixes (`Music`, `Music-2`, `Music-3`) render as distinct rows with a "1 of 3" / "2 of 3" / "3 of 3" subscript when the operator has not renamed any of them. Rename encouraged via the tooltip hint. |
 | Oversized-FAT32 copy | Modal (dismissable, non-actionable): "This drive is <size> — larger than the 2 TB FAT32 limit. To use it as a music source, reformat as exFAT (Windows / macOS compatible) or ext4 (Linux native). Formatting is not offered in the operator UI — use your desktop's disk utility."|

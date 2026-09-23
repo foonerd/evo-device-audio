@@ -269,11 +269,11 @@ impl SpectrumAnalyser {
     ///   stage.
     /// - `frequency_scale` is the operator's demanded bin
     ///   spacing across `[MEL_LOW_HZ, MEL_HIGH_HZ]`.
-    ///   [`Log`](crate::demand::FrequencyScale::Log) matches
+    ///   `Log` matches
     ///   music-analyser convention (the default);
-    ///   [`Mel`](crate::demand::FrequencyScale::Mel) preserves the
+    ///   `Mel` preserves the
     ///   prior perceptual-bank shape;
-    ///   [`Linear`](crate::demand::FrequencyScale::Linear) is a
+    ///   `Linear` is a
     ///   diagnostics-only raw-Hz layout.
     pub fn new(
         sample_rate_hz: u32,
@@ -345,7 +345,7 @@ impl SpectrumAnalyser {
     /// regardless of output demand). The input is interleaved
     /// stereo: `[L0, R0, ..., L_{FFT_WINDOW-1}, R_{FFT_WINDOW-1}]`.
     /// Each sample is a normalised f32 in [-1, 1]. Capture feeds
-    /// this from its overlap ring (hop = [`HOP_SIZE`]). Returns
+    /// this from its overlap ring (hop = `HOP_SIZE`). Returns
     /// the per-frame perceptual signals in the analyser's current
     /// output shape; `at_ms` is left at 0 for the caller to stamp.
     ///

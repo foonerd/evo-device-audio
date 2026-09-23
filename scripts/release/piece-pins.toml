@@ -1,0 +1,15 @@
+# Pinned piece versions composed into the first-boot tarball.
+# A pin names a slot that must already exist on
+# foonerd/evo-device-audio-artefacts. Bump the pin only after
+# that version is minted. Bake refuses to compile a part whose
+# slot exists, and fails closed if a pin is missing.
+#
+# UI shell version is independent of the workspace 0.1.13 pin.
+
+[pins]
+evo-device-audio = "0.1.13"
+evo-ui-shell = "0.1.13"
+evo-ui-runtime = "0.1.13"
+evo-kiosk = "0.1.13"
+evo-device-boot = "0.1.13"
+evo-device-audio-dist = "0.1.13"

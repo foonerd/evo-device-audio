@@ -32,9 +32,11 @@
 #
 # Mount options passed as a 4th positional argv on the `mount`
 # action are validated against a strict allowlist (alphanumeric
-# + '=' + ',' + '_' + '-') before being handed to mount(8).
-# The runtime's fs_matrix.rs builds these strings; the wrapper
-# validates + relays.
+# + '=' + ',' + '_' + '-') before being handed to
+# systemd-mount. The runtime's fs_matrix.rs builds these
+# strings; the wrapper validates + relays. PID 1 attaches the
+# volume in the host mount namespace so mpd and the operator
+# see the same tree.
 #
 # Exit codes:
 #   0  — action completed successfully
@@ -181,11 +183,50 @@ refuse_system_backed_device() {
     fi
 }
 
+# Run a command as a child of PID 1 so it sees the host mount
+# table. nsenter cannot: evo.service has RestrictNamespaces=yes,
+# and a sudo child inherits that filter (setns → EPERM). The
+# mount path already uses this bus (systemd-mount --collect).
+# Never `-l` on systemd-umount (`-l` is `--full` there).
+host_run() {
+    /usr/bin/systemd-run --quiet --wait --collect --pipe \
+        --working-directory=/ -- "$@"
+}
+
+# Lazy detach in PID 1's mount namespace. NTFS/exFAT arrive as
+# fuseblk: `umount -l` still says "target is busy" while MPD is
+# indexing. fusermount -uz is the FUSE lazy detach. util-linux
+# `umount -l` stays the fallback for non-FUSE.
+lazy_detach_host() {
+    local target="$1"
+    local lazy_stderr rc=1
+    local fuse_bin=""
+    if [[ -x /usr/bin/fusermount3 ]]; then
+        fuse_bin=/usr/bin/fusermount3
+    elif [[ -x /bin/fusermount3 ]]; then
+        fuse_bin=/bin/fusermount3
+    elif [[ -x /usr/bin/fusermount ]]; then
+        fuse_bin=/usr/bin/fusermount
+    elif [[ -x /bin/fusermount ]]; then
+        fuse_bin=/bin/fusermount
+    fi
+    if [[ -n "${fuse_bin}" ]]; then
+        lazy_stderr="$(host_run "${fuse_bin}" -uz "${target}" 2>&1)" && rc=0 || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+    fi
+    lazy_stderr="$(host_run /bin/umount -i -l "${target}" 2>&1)" && rc=0 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        die_subprocess "lazy detach of ${target} in the host namespace: ${lazy_stderr}"
+    fi
+}
+
 case "${1:-}" in
     --version)
         # Stable version string bootstrap + installer can grep for.
         # Bump when the wrapper's argv shape changes.
-        echo "evo-usb-mount 3"
+        echo "evo-usb-mount 7"
         exit 0
         ;;
     --help|-h|"")
@@ -206,36 +247,68 @@ case "${1:-}" in
         # traversable 0755 and let the mount option uid=/gid= handle
         # the file-owner semantics for FAT-family filesystems.
         install -d -m 0755 "${target}" || die_subprocess "install -d ${target}"
-        # Idempotent: if target is already mounted with the correct
-        # source, exit 0 immediately (reconciler loop safety).
-        if findmnt --mountpoint "${target}" --source "$4" >/dev/null 2>&1; then
+        # Host truth is PID 1's mount table. findmnt without
+        # --task 1 reads THIS namespace (the steward's private
+        # ns under ProtectSystem=strict). A leftover FUSE there
+        # is invisible to mpd and the operator, and must not
+        # count as mounted.
+        if findmnt --task 1 --mountpoint "${target}" --source "$4" >/dev/null 2>&1; then
             exit 0
         fi
-        # Refuse if target is already mounted with a DIFFERENT source
-        # (avoid stacking mounts on the same path).
-        if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
-            die_subprocess "target '${target}' already has a different mount source"
+        if findmnt --task 1 --mountpoint "${target}" >/dev/null 2>&1; then
+            die_subprocess "target '${target}' already has a different mount source in the host namespace"
         fi
-        mount -t "$3" -o "$5" "$4" "${target}" || die_subprocess "mount -t $3 -o $5 $4 ${target}"
+        # Drop a leftover in this namespace (previous raw mount(8)
+        # or a dead device node after unplug). systemd-umount
+        # talks to PID 1 and cannot see it.
+        if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+            umount "${target}" 2>/dev/null \
+                || umount -l "${target}" \
+                || die_subprocess "umount leftover ${target} in this namespace"
+        fi
+        # §2 NTFS options (windows_names, big_writes, dmask, fmask)
+        # are ntfs-3g. systemd-mount --type=ntfs on a kernel that
+        # ships ntfs3 uses the in-kernel driver, which rejects
+        # those options. mount(8) -t ntfs used /sbin/mount.ntfs
+        # → ntfs-3g; keep that helper.
+        systemd_type="$3"
+        if [[ "$3" == "ntfs" ]]; then
+            if [[ ! -x /bin/ntfs-3g && ! -x /usr/bin/ntfs-3g && ! -x /sbin/mount.ntfs-3g ]]; then
+                die_subprocess "ntfs-3g is required to mount NTFS"
+            fi
+            systemd_type="ntfs-3g"
+        fi
+        # systemd-mount --collect asks PID 1 to attach the volume in
+        # the host mount namespace. --fsck=no: this wrapper owns
+        # dirty detection via fsck-check / fsck.
+        mount_stderr="$(/usr/bin/systemd-mount --collect --fsck=no --no-ask-password \
+            --type="${systemd_type}" --options="$5" "$4" "${target}" 2>&1)" && rc=0 || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            die_subprocess "systemd-mount --type=${systemd_type} $4 ${target}: ${mount_stderr}"
+        fi
+        if ! findmnt --task 1 --mountpoint "${target}" --source "$4" >/dev/null 2>&1; then
+            die_subprocess "systemd-mount returned 0 but the host namespace does not show ${target} from $4"
+        fi
         exit 0
         ;;
     umount)
         [[ $# -eq 2 ]] || die_invocation "umount requires 1 arg: <stable-id>"
         validate_stable_id "$2"
         target="$(mount_target_for "$2")"
-        # Idempotent: if target isn't a mount point, exit 0 (already
-        # unmounted).
-        if ! findmnt --mountpoint "${target}" >/dev/null 2>&1; then
-            # Best-effort empty-only rmdir cleanup so a mount root
-            # left behind after operator umount doesn't collect
-            # stale dirs. `rmdir` refuses non-empty; safe.
+        # Host first; then a leftover that exists only in this
+        # namespace (ProtectSystem private ns).
+        if ! findmnt --task 1 --mountpoint "${target}" >/dev/null 2>&1; then
+            if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+                umount "${target}" 2>/dev/null || umount -l "${target}" \
+                    || die_subprocess "umount leftover ${target} in this namespace"
+            fi
             rmdir "${target}" 2>/dev/null || true
             exit 0
         fi
         # Try a clean umount first; distinguish EBUSY from other
         # failures so the runtime can decide whether to escalate
         # to umount-force.
-        umount_stderr="$(umount "${target}" 2>&1)" && rc=0 || rc=$?
+        umount_stderr="$(/usr/bin/systemd-umount "${target}" 2>&1)" && rc=0 || rc=$?
         if [[ $rc -eq 0 ]]; then
             # Empty-only rmdir cleanup so the leaf mount root
             # doesn't stay lingering.
@@ -243,26 +316,47 @@ case "${1:-}" in
             exit 0
         fi
         # umount exit code semantics vary across versions. Detect
-        # EBUSY by the "target is busy" stderr fragment which is
-        # stable in util-linux 2.30+ across the fleet.
-        if [[ "${umount_stderr}" == *"target is busy"* ]] \
-           || [[ "${umount_stderr}" == *"device is busy"* ]]; then
+        # EBUSY by the stderr wording instead. util-linux says
+        # "target is busy" (stable since 2.30 across the fleet);
+        # systemd renders the same EBUSY as "Device or resource
+        # busy", and only util-linux's wording was matched here —
+        # so a real EBUSY from systemd-umount left as exit 3 and
+        # the exit-4 contract in this file's header never fired
+        # on the path that produces it. Folded to lower case so
+        # the capitalised systemd wording matches too.
+        umount_stderr_lc="${umount_stderr,,}"
+        if [[ "${umount_stderr_lc}" == *"target is busy"* ]] \
+           || [[ "${umount_stderr_lc}" == *"device is busy"* ]] \
+           || [[ "${umount_stderr_lc}" == *"device or resource busy"* ]]; then
             die_busy "${target}: ${umount_stderr}"
         fi
-        die_subprocess "umount ${target}: ${umount_stderr}"
+        die_subprocess "systemd-umount ${target}: ${umount_stderr}"
         ;;
     umount-force)
         [[ $# -eq 2 ]] || die_invocation "umount-force requires 1 arg: <stable-id>"
         validate_stable_id "$2"
         target="$(mount_target_for "$2")"
-        if ! findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+        if ! findmnt --task 1 --mountpoint "${target}" >/dev/null 2>&1; then
+            if findmnt --mountpoint "${target}" >/dev/null 2>&1; then
+                umount -l "${target}" \
+                    || die_subprocess "umount -l leftover ${target} in this namespace"
+            fi
             rmdir "${target}" 2>/dev/null || true
             exit 0
         fi
-        # Lazy detach — the mount table clears when the last file
-        # handle closes. Operator has acknowledged the data-loss
-        # risk at the storage.usb.safe_remove verb layer.
-        umount -l "${target}" || die_subprocess "umount -l ${target}"
+        # Force means force. Ask systemd for a clean unmount
+        # first so it retires its own transient unit when it
+        # can; escalate to a real lazy detach when the target is
+        # held. The lazy detach is host_run (PID 1), not
+        # nsenter: RestrictNamespaces=yes makes setns EPERM.
+        #
+        # Operator has acknowledged the data-loss risk at the
+        # storage.usb.safe_remove verb.
+        if /usr/bin/systemd-umount "${target}" >/dev/null 2>&1; then
+            rmdir "${target}" 2>/dev/null || true
+            exit 0
+        fi
+        lazy_detach_host "${target}"
         rmdir "${target}" 2>/dev/null || true
         exit 0
         ;;

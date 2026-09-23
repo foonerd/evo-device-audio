@@ -34,7 +34,7 @@ pub use discovered::{
     default_discovered_path, read_discovered, write_discovered, DiscoveredFile,
     DiscoveredServer, DISCOVERED_VERSION,
 };
-pub use ssdp::{discover_media_servers, SsdpHit};
+pub use ssdp::{discover_media_servers, spawn_notify_listener, SsdpHit};
 
 /// Crate error surface.
 #[derive(Debug, thiserror::Error)]

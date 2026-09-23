@@ -45,7 +45,9 @@ pub(crate) mod test_mock;
 // `crate::playback_supervisor::{...}`. `report` types are not
 // re-exported because they are internal helpers used only inside
 // the module graph.
-pub(crate) use actor::{spawn, SupervisorCommandSender, SupervisorHandle};
+pub(crate) use actor::{
+    spawn, SupervisorCommandSender, SupervisorHandle, SupervisorSpawn,
+};
 pub(crate) use ambient_observer::{
     spawn as spawn_ambient_observer, AmbientObserverHandle,
 };
@@ -54,4 +56,6 @@ pub(crate) use startup_volume::{
     spawn as spawn_startup_volume_applier, StartupVolume,
     StartupVolumeApplierHandle,
 };
-pub(crate) use subject_emitter::{render_now_playing_state, SubjectEmitter};
+pub(crate) use subject_emitter::{
+    publish_now_playing_from_mpd, render_now_playing_state, SubjectEmitter,
+};

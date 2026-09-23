@@ -6,7 +6,7 @@
 //! audio.favourites / audio.library shelf contexts plus the
 //! sticker reconciler handle in one struct so the plugin
 //! lifecycle (load/unload) and the verb dispatcher each touch
-//! a single Option<ShelfBundle> instead of N fields.
+//! a single `Option<ShelfBundle>` instead of N fields.
 //!
 //! # Verb dispatch
 //!
@@ -127,6 +127,7 @@ impl ShelfBundle {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
+        mute: crate::mute_cell::MuteCell,
     ) -> Self {
         let music_directory = source_probe::load_music_directory_from_mpd_conf(
             Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
@@ -173,10 +174,10 @@ impl ShelfBundle {
             subjects.clone(),
             skip_traversal.clone(),
             shelf_dispatcher.clone(),
+            mute,
         );
         let playlist = PlaylistContext::new(
             music_directory.clone(),
-            playlist_directory.clone(),
             registry.clone(),
             subjects.clone(),
             DEFAULT_FAVOURITES_PLAYLIST_NAME.to_string(),
@@ -248,7 +249,7 @@ impl ShelfBundle {
         let sticker_reconciler = Some(sticker_reconciler::spawn(
             endpoint.clone(),
             timeouts,
-            registry.clone(),
+            library.clone(),
         ));
 
         // Warm-start probe — BLOCKING. Every registered source
@@ -439,9 +440,11 @@ impl ShelfBundle {
                     Some(r) => r,
                     None => return, // removed mid-probe
                 };
-                let budget = std::time::Duration::from_millis(3_000);
-                let outcome =
-                    crate::source_registry::probe_source(&full, budget).await;
+                let outcome = crate::source_registry::probe_source(
+                    &full,
+                    crate::source_registry::PROBE_BUDGET,
+                )
+                .await;
                 if let Err(e) =
                     registry.transition(&source_id, outcome.new_state).await
                 {
@@ -605,6 +608,15 @@ impl ShelfBundle {
             }
             "library.remove_source" => {
                 Ok(Some(self.dispatch_library_remove_source(req).await?))
+            }
+            "library.rewrite_uri_prefix" => {
+                Ok(Some(self.dispatch_library_rewrite_uri_prefix(req).await?))
+            }
+            "library.park_uri_prefix" => {
+                Ok(Some(self.dispatch_library_park_uri_prefix(req).await?))
+            }
+            "library.restore_parked_uris" => {
+                Ok(Some(self.dispatch_library_restore_parked_uris(req).await?))
             }
             "library.probe_source" => {
                 Ok(Some(self.dispatch_library_probe_source(req).await?))
@@ -1048,10 +1060,67 @@ impl ShelfBundle {
     ) -> Result<Response, PluginError> {
         let payload: library::RemoveSourcePayload = parse_json(req)?;
         let mut conn = self.open_conn().await?;
-        library::handle_remove_source(&self.library, &mut conn, payload)
-            .await
-            .map_err(library_verb_to_plugin_error)?;
+        library::handle_remove_source(
+            &self.library,
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
+        // Operator Remove drops USB leftovers from stored
+        // lists. The glass reads audio_playlist_index and the
+        // favourites subject — republish so it does not keep
+        // the stick's path until the next mutation.
+        playlist::publish_index(&self.playlist, &mut conn).await;
+        favourites::refresh_favourites(&self.favourites, &mut conn).await;
         encode_ok_response(req)
+    }
+
+    async fn dispatch_library_rewrite_uri_prefix(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::RewriteUriPrefixPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res = library::handle_rewrite_uri_prefix(
+            &self.library,
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_park_uri_prefix(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::ParkUriPrefixPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res =
+            library::handle_park_uri_prefix(&self.queue, &mut conn, payload)
+                .await
+                .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
+    }
+
+    async fn dispatch_library_restore_parked_uris(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: library::RestoreParkedUrisPayload = parse_json(req)?;
+        let mut conn = self.open_conn().await?;
+        let res = library::handle_restore_parked_uris(
+            &self.queue,
+            &mut conn,
+            payload,
+        )
+        .await
+        .map_err(library_verb_to_plugin_error)?;
+        encode_json_response(req, &res)
     }
 
     async fn dispatch_library_probe_source(
@@ -1317,9 +1386,10 @@ fn library_verb_to_plugin_error(e: library::VerbError) -> PluginError {
         | VerbError::SourceOffline { .. }
         | VerbError::Register { .. }
         | VerbError::SourceOutsideMusicDirectory { .. }
-        | VerbError::UnknownWork { .. } => {
-            PluginError::Permanent(e.to_string())
-        }
+        | VerbError::UnknownWork { .. }
+        | VerbError::RewritePrefixInvalid
+        | VerbError::RewritePrefixUnchanged
+        | VerbError::ParkPrefixInvalid => PluginError::Permanent(e.to_string()),
         // WorkAggregateNotReady is transient — the next
         // Database / Update idle event populates the cache.
         // Operator retry succeeds; treat as transient so

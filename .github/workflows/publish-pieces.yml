@@ -1,0 +1,431 @@
+# Mint versioned audio pieces. First-boot composition is
+# publish-distribution-bundle (the installer tarball). This job
+# is the in-product plane: write each artefact once, then move
+# a channel pointer with promote.yml. No overwrite-in-place.
+#
+# Selector:
+#   all      — audio steward + every OOP plugin + dist tree
+#   steward  — evo-device-audio only
+#   plugin   — one plugin from dist/scripts/lib/oop-plugins.sh
+#   dist     — evo-device-audio-dist placement tree
+#
+# Slots (append-only):
+#   binaries/evo-device-audio/<version>/<target>/
+#   bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
+#
+# Does not publish evo-core's `evo` or `evo-plugin-tool`. Those
+# live on evo-core's own publish.yml / evo-core-artefacts.
+#
+# Between cuts: a published version slot is frozen. If the piece
+# changed, bump its version before dispatching this job again.
+# Re-running the same version is a no-op.
+name: publish-pieces
+
+"on":
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "What to mint"
+        type: choice
+        options: [all, steward, plugin, dist]
+        default: all
+      plugin:
+        description: "Plugin name when scope=plugin (must be in oop-plugins.sh)"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: publish-pieces
+  cancel-in-progress: false
+
+env:
+  ARTEFACTS_REPO: foonerd/evo-device-audio-artefacts
+  COMMIT_USER: evo-device-audio CI
+  COMMIT_EMAIL: ci@evoframework.org
+  RUST_TOOLCHAIN: "1.85"
+  STEWARD_PIECE: evo-device-audio
+  STEWARD_CRATE: evo-device-audio-distribution
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      build_steward: ${{ steps.resolve.outputs.build_steward }}
+      build_dist: ${{ steps.resolve.outputs.build_dist }}
+      plugin_count: ${{ steps.resolve.outputs.plugin_count }}
+      plugin_matrix: ${{ steps.resolve.outputs.plugin_matrix }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Resolve selector
+        id: resolve
+        run: |
+          set -euo pipefail
+          bash scripts/release/resolve-publish-pieces.sh \
+            "${{ inputs.scope }}" \
+            "${{ inputs.plugin }}"
+
+  host-tool:
+    needs: resolve
+    if: needs.resolve.outputs.plugin_count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Host-build evo-plugin-tool from the SDK pin
+        run: |
+          set -euo pipefail
+          PIN_LINE=$(awk '/^evo-plugin-sdk *=/{print; exit}' Cargo.toml)
+          echo "SDK pin line: $PIN_LINE"
+          REPO=$(printf '%s' "$PIN_LINE" | sed -n 's/.*git *= *"\([^"]*\)".*/\1/p')
+          if printf '%s' "$PIN_LINE" | grep -q 'tag *='; then
+              GITREF_FLAG="--tag"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*tag *= *"\([^"]*\)".*/\1/p')
+          elif printf '%s' "$PIN_LINE" | grep -q 'branch *='; then
+              GITREF_FLAG="--branch"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*branch *= *"\([^"]*\)".*/\1/p')
+          elif printf '%s' "$PIN_LINE" | grep -q 'rev *='; then
+              GITREF_FLAG="--rev"
+              GITREF=$(printf '%s' "$PIN_LINE" | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p')
+          else
+              echo "::error::Could not infer evo-core git ref from SDK pin"
+              exit 1
+          fi
+          echo "evo-core ref: $GITREF_FLAG $GITREF (repo $REPO)"
+          cargo install --git "$REPO" $GITREF_FLAG "$GITREF" \
+              --locked --root /tmp/evo-plugin-tool-host evo-plugin-tool
+          cp /tmp/evo-plugin-tool-host/bin/evo-plugin-tool /tmp/host-evo-plugin-tool
+          chmod +x /tmp/host-evo-plugin-tool
+
+      - name: Upload host evo-plugin-tool
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-evo-plugin-tool
+          path: /tmp/host-evo-plugin-tool
+          if-no-files-found: error
+          retention-days: 1
+
+  build-steward:
+    needs: resolve
+    if: needs.resolve.outputs.build_steward == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up Docker / Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Cross-build evo-device-audio for ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cross build --release --target ${{ matrix.target }} \
+            -p "${STEWARD_CRATE}" --bin evo-device-audio \
+            --features alsa-substrate
+
+      - name: Stage and sign steward for ${{ matrix.target }}
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          VERSION=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read workspace version"
+            exit 1
+          fi
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          STAGE=/tmp/stage/binaries/${STEWARD_PIECE}/${VERSION}/${TARGET}
+          mkdir -p "$STAGE"
+          src="target/${TARGET}/release/evo-device-audio"
+          dst="${STAGE}/evo-device-audio"
+          cp "$src" "$dst"
+          chmod 755 "$dst"
+          openssl pkeyutl -sign -inkey /tmp/key.pem -rawin -in "$dst" -out "${dst}.sig"
+          sha256sum "$dst" | awk '{print $1}' > "${dst}.sha256"
+
+          {
+            echo "schema_version = 0"
+            echo "kind = \"audio-steward\""
+            echo "piece = \"${STEWARD_PIECE}\""
+            echo "version = \"${VERSION}\""
+            echo "target = \"${TARGET}\""
+            echo "binaries = [\"evo-device-audio\"]"
+            echo "built_at = \"$(date -u +%FT%TZ)\""
+            echo "publisher = \"org.evoframework\""
+            echo "git_rev = \"$(git rev-parse HEAD)\""
+          } > "${STAGE}/build-info.toml"
+          openssl pkeyutl -sign \
+              -inkey /tmp/key.pem -rawin \
+              -in "${STAGE}/build-info.toml" \
+              -out "${STAGE}/build-info.sig"
+          shred -u /tmp/key.pem
+          ls -la "$STAGE"
+
+      - name: Upload steward artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: steward-${{ matrix.target }}
+          path: /tmp/stage/binaries/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-plugin:
+    needs: [resolve, host-tool]
+    if: needs.resolve.outputs.plugin_count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.plugin_matrix) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up Docker / Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Download host evo-plugin-tool
+        uses: actions/download-artifact@v8
+        with:
+          name: host-evo-plugin-tool
+          path: /tmp
+
+      - name: Cross-build ${{ matrix.name }} for ${{ matrix.target }}
+        env:
+          CRATE: ${{ matrix.crate }}
+          BIN: ${{ matrix.bin }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FEATURES" ]; then
+            cross build --release --target ${{ matrix.target }} \
+              -p "${CRATE}" --bin "${BIN}" --features "${FEATURES}"
+          else
+            cross build --release --target ${{ matrix.target }} \
+              -p "${CRATE}" --bin "${BIN}"
+          fi
+
+      - name: Stage, sign, and pack ${{ matrix.name }} for ${{ matrix.target }}
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+          TARGET: ${{ matrix.target }}
+          PLUGIN_NAME: ${{ matrix.name }}
+          PLUGIN_VERSION: ${{ matrix.version }}
+          PLUGIN_BIN: ${{ matrix.bin }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          chmod +x /tmp/host-evo-plugin-tool
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+
+          STAGE=/tmp/stage
+          BUNDLE_DIR_NAME="${PLUGIN_NAME}-${PLUGIN_VERSION}-${TARGET}"
+          BUNDLE_DIR="${STAGE}/bundles-work/${BUNDLE_DIR_NAME}"
+          mkdir -p "${BUNDLE_DIR}"
+          cp "plugins/${PLUGIN_NAME}/manifest.oop.toml" "${BUNDLE_DIR}/manifest.toml"
+          cp "target/${TARGET}/release/${PLUGIN_BIN}" "${BUNDLE_DIR}/plugin.bin"
+          chmod 755 "${BUNDLE_DIR}/plugin.bin"
+          if [ -f "plugins/${PLUGIN_NAME}/privileges.yaml" ]; then
+            cp "plugins/${PLUGIN_NAME}/privileges.yaml" "${BUNDLE_DIR}/privileges.yaml"
+          else
+            echo "::error::plugins/${PLUGIN_NAME}/privileges.yaml missing"
+            exit 1
+          fi
+
+          /tmp/host-evo-plugin-tool sign "${BUNDLE_DIR}" --key /tmp/key.pem
+
+          BUNDLE_OUT_DIR="${STAGE}/bundles/${PLUGIN_NAME}/${TARGET}"
+          mkdir -p "${BUNDLE_OUT_DIR}"
+          /tmp/host-evo-plugin-tool pack "${BUNDLE_DIR}" \
+              --out "${BUNDLE_OUT_DIR}/${BUNDLE_DIR_NAME}.tar.gz"
+          shred -u /tmp/key.pem
+          ls -la "${BUNDLE_OUT_DIR}"
+
+      - name: Upload plugin bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-bundle-${{ matrix.name }}-${{ matrix.target }}
+          path: /tmp/stage/bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-dist:
+    needs: resolve
+    if: needs.resolve.outputs.build_dist == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Stage and sign evo-device-audio-dist
+        env:
+          PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_KEY_PEM" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
+            exit 1
+          fi
+          VERSION=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
+          umask 077
+          printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
+          export EVO_PLUGIN_SIGNING_KEY=/tmp/key.pem
+          SRC=/tmp/dist-src
+          mkdir -p "$SRC"
+          bash scripts/release/stage-audio-dist-tree.sh \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --out-dir "$SRC"
+          OUT=/tmp/stage/bundles/evo-device-audio-dist/${VERSION}
+          mkdir -p "$OUT"
+          bash scripts/release/pack-signed-tree.sh \
+            --piece evo-device-audio-dist \
+            --version "$VERSION" \
+            --kind audio-dist \
+            --src "$SRC" \
+            --out-dir "$OUT"
+          shred -u /tmp/key.pem
+          ls -la "$OUT"
+
+      - name: Upload dist piece
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-tree
+          path: /tmp/stage/bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [resolve, host-tool, build-steward, build-plugin, build-dist]
+    if: |
+      always() &&
+      needs.resolve.result == 'success' &&
+      (needs.host-tool.result == 'success' || needs.host-tool.result == 'skipped') &&
+      (needs.build-steward.result == 'success' || needs.build-steward.result == 'skipped') &&
+      (needs.build-plugin.result == 'success' || needs.build-plugin.result == 'skipped') &&
+      (needs.build-dist.result == 'success' || needs.build-dist.result == 'skipped') &&
+      (needs.build-steward.result == 'success' || needs.build-plugin.result == 'success' || needs.build-dist.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download steward artefacts
+        if: needs.build-steward.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: steward-*
+          path: /tmp/stage/binaries/
+          merge-multiple: true
+
+      - name: Download plugin artefacts
+        if: needs.build-plugin.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: plugin-bundle-*
+          path: /tmp/stage/bundles/
+          merge-multiple: true
+
+      - name: Download dist artefact
+        if: needs.build-dist.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-tree
+          path: /tmp/stage/bundles/
+          merge-multiple: true
+
+      - name: Push versioned slots to artefacts
+        env:
+          GH_TOKEN: ${{ secrets.ARTEFACTS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ARTEFACTS_PUSH_TOKEN is empty or unset"
+            exit 1
+          fi
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ARTEFACTS_REPO}.git" "$ART"
+          cd "$ART"
+
+          NEW=()
+          if [ -d /tmp/stage/binaries ]; then
+            mkdir -p binaries
+            while IFS= read -r -d '' src; do
+              rel="${src#/tmp/stage/}"
+              dest="$ART/$rel"
+              if [ -e "$dest" ]; then
+                echo "::warning::Skipping $rel — version slot already published (append-only). Bump the piece version if the source moved since that slot was minted."
+                continue
+              fi
+              mkdir -p "$(dirname "$dest")"
+              cp -a "$src" "$dest"
+              NEW+=("$rel")
+              echo "Published $rel"
+            done < <(find /tmp/stage/binaries -type f -print0)
+          fi
+
+          if [ -d /tmp/stage/bundles ]; then
+            mkdir -p bundles
+            while IFS= read -r -d '' src; do
+              rel="${src#/tmp/stage/}"
+              dest="$ART/$rel"
+              if [ -e "$dest" ]; then
+                echo "::warning::Skipping $rel — version slot already published (append-only). Bump the piece version if the source moved since that slot was minted."
+                continue
+              fi
+              mkdir -p "$(dirname "$dest")"
+              cp -a "$src" "$dest"
+              NEW+=("$rel")
+              echo "Published $rel"
+            done < <(find /tmp/stage/bundles -type f -print0)
+          fi
+
+          if [ ${#NEW[@]} -eq 0 ]; then
+            echo "No new pieces to publish."
+            exit 0
+          fi
+
+          git add binaries/ bundles/ || true
+          git commit -m "publish: audio pieces (${{ inputs.scope }})"
+          git push origin main
+          echo "Pushed ${#NEW[@]} new files."

@@ -16,9 +16,9 @@
 //!
 //! ## Lifecycle and exit codes
 //!
-//! * `0` — steward disconnected cleanly, [`run_oop`] returned `Ok`.
+//! * `0` — steward disconnected cleanly, `run_oop` returned `Ok`.
 //! * `1` — argument parsing, socket binding, accept, or
-//!   [`run_oop`] errored.
+//!   `run_oop` errored.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -13,7 +13,7 @@ pub struct MediaServer {
     pub friendly_name: String,
     /// Absolute ContentDirectory control URL for SOAP Browse.
     pub control_url: String,
-    /// Origin of the device description (scheme://host[:port]).
+    /// Origin of the device description (`scheme://host[:port]`).
     pub base_url: String,
     /// Device description LOCATION URL.
     pub location: String,

@@ -361,6 +361,26 @@ pub struct MetadataOnlinePlugin {
     /// operator gesture lands, so reads never contend with
     /// themselves.
     provider_config: Arc<RwLock<cascade::ProviderConfig>>,
+    /// Provider ids the operator has explicitly configured through
+    /// the framework's `online_providers` store.
+    ///
+    /// A row in that table exists only because someone called
+    /// `set_enabled` / `set_priority`, so membership here means
+    /// "the operator has spoken about this provider". Credential
+    /// authority skips these: a stored key is the DEFAULT for a
+    /// provider nobody has touched, never an override of a
+    /// deliberate off. Populated at load from the store and
+    /// extended by the config reactor on every operator gesture.
+    explicitly_configured:
+        Arc<RwLock<std::collections::HashSet<cascade::ProviderId>>>,
+    /// Framework handle used to read the device's privacy posture
+    /// at request time. See
+    /// [`read_device_privacy_mode_fail_safe`] for why this is
+    /// read per-request and why every uncertain outcome resolves
+    /// to the most restrictive posture.
+    online_provider_config: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
     reconcile_cache: Option<cache::ReconcileCache>,
     lyrics_cache: Option<enrichment_cache::EnrichmentCache>,
     bio_cache: Option<enrichment_cache::EnrichmentCache>,
@@ -403,6 +423,10 @@ impl MetadataOnlinePlugin {
             provider_config: Arc::new(RwLock::new(
                 cascade::ProviderConfig::defaults(),
             )),
+            explicitly_configured: Arc::new(RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            online_provider_config: None,
             reconcile_cache: None,
             lyrics_cache: None,
             bio_cache: None,
@@ -503,9 +527,64 @@ impl Plugin for MetadataOnlinePlugin {
             // does not implement) are skipped with a debug log —
             // the store is framework-wide and other plugins
             // register their own ids there.
+            // Stash the provider-config handle so each request can
+            // read the device's current privacy posture.
+            self.online_provider_config = ctx.online_provider_config.clone();
+            // Provider ids the operator has explicitly configured
+            // via the framework store. Shared with both reactors
+            // so a later credential event cannot undo a
+            // deliberate toggle.
+            let explicitly_configured_slot =
+                Arc::clone(&self.explicitly_configured);
+            let mut explicitly_configured =
+                explicitly_configured_slot.write().await;
+            explicitly_configured.clear();
             {
                 let mut cfg = self.provider_config.write().await;
                 *cfg = self.config.provider_config.clone();
+                // Declare this cascade's providers before reading
+                // any config for them. Whether a provider costs
+                // the operator an identity is this plugin's fact,
+                // not something the store can infer, and
+                // registration is what seeds an identity-bearing
+                // source disabled. The order matters: a provider
+                // read before it registers takes the anonymous
+                // default, which for a keyed source means enabled
+                // with no key, no change-event, and so no
+                // credential prompt. Existing rows are left
+                // untouched.
+                if let Some(store) = ctx.online_provider_config.as_ref() {
+                    use cascade::PrivacyClass as Pc;
+                    use evo_plugin_sdk::contract::context::ProviderPrivacyClass;
+                    for pid in [
+                        cascade::ProviderId::MusicBrainz,
+                        cascade::ProviderId::Wikipedia,
+                        cascade::ProviderId::Wikidata,
+                        cascade::ProviderId::Lrclib,
+                        cascade::ProviderId::TheAudioDb,
+                        cascade::ProviderId::Lastfm,
+                        cascade::ProviderId::Discogs,
+                        cascade::ProviderId::Genius,
+                    ] {
+                        let class = match pid.privacy_class() {
+                            Pc::Anonymous => ProviderPrivacyClass::Anonymous,
+                            Pc::IdentityBearing => {
+                                ProviderPrivacyClass::IdentityBearing
+                            }
+                        };
+                        if let Err(e) =
+                            store.register(pid.as_str(), class).await
+                        {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                provider_id = pid.as_str(),
+                                error = %format!("{e:?}"),
+                                "online provider registration failed; the \
+                                 store keeps whatever row it already had"
+                            );
+                        }
+                    }
+                }
                 if let Some(store) = ctx.online_provider_config.as_ref() {
                     match store.list_all().await {
                         Ok(rows) => {
@@ -534,6 +613,16 @@ impl Plugin for MetadataOnlinePlugin {
                                 } else {
                                     Some(row.priority as u32)
                                 };
+                                // A row here IS an operator
+                                // gesture — the table only gains
+                                // one when someone calls
+                                // set_enabled / set_priority. Note
+                                // it so credential authority
+                                // below defaults only the
+                                // providers nobody has touched,
+                                // rather than overriding a
+                                // deliberate off.
+                                explicitly_configured.insert(pid);
                                 cfg.merge_override(
                                     pid,
                                     Some(row.enabled),
@@ -553,6 +642,7 @@ impl Plugin for MetadataOnlinePlugin {
                     }
                 }
             }
+            drop(explicitly_configured);
             // Shared HTTPS client — single connection pool +
             // DNS cache across every online provider in this
             // plugin.
@@ -674,12 +764,32 @@ impl Plugin for MetadataOnlinePlugin {
                     build_genius_client(&http, &self.config, token)
                 });
             let lastfm_configured = self.lastfm_client.read().await.is_some();
+            // Credential presence IS the enable authority for
+            // keyed providers. Runs AFTER the store overlay above
+            // so a stale store row cannot leave a provider dark
+            // while its key sits wired in the vault. See
+            // `ProviderConfig::apply_credential_authority` for the
+            // full rationale and the privacy-mode carve-out.
+            let discogs_configured = self.discogs_client.read().await.is_some();
+            let genius_configured = self.genius_client.read().await.is_some();
+            {
+                let explicit = self.explicitly_configured.read().await;
+                let mut cfg = self.provider_config.write().await;
+                cfg.apply_credential_authority(
+                    lastfm_configured,
+                    discogs_configured,
+                    genius_configured,
+                    &explicit,
+                );
+            }
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 cache_wired = self.reconcile_cache.is_some(),
                 musicbrainz_ua = %self.config.musicbrainz_user_agent,
                 mb_min_interval_ms = self.config.musicbrainz_min_interval.as_millis() as u64,
                 lastfm_configured = lastfm_configured,
+                discogs_configured = discogs_configured,
+                genius_configured = genius_configured,
                 lrclib_wired = self.lrclib_client.is_some(),
                 "load complete"
             );
@@ -706,6 +816,8 @@ impl Plugin for MetadataOnlinePlugin {
                 let genius_slot = Arc::clone(&self.genius_client);
                 let http_for_task = http.clone();
                 let config_for_task = self.config.clone();
+                let provider_config_for_task =
+                    Arc::clone(&self.provider_config);
                 self.reactor_tasks.push(tokio::spawn(credential_reactor(
                     rx,
                     vault_for_task,
@@ -714,6 +826,8 @@ impl Plugin for MetadataOnlinePlugin {
                     genius_slot,
                     http_for_task,
                     config_for_task,
+                    provider_config_for_task,
+                    Arc::clone(&self.explicitly_configured),
                 )));
             }
             // Spawn the online-provider-config reactor. On every
@@ -735,6 +849,7 @@ impl Plugin for MetadataOnlinePlugin {
                         rx,
                         config_slot,
                         vault_for_reactor,
+                        Arc::clone(&self.explicitly_configured),
                     ),
                 ));
             }
@@ -854,7 +969,32 @@ impl Respondent for MetadataOnlinePlugin {
             let wikipedia = self.wikipedia_client.clone();
             let wikidata = self.wikidata_client.clone();
             let theaudiodb = self.theaudiodb_client.clone();
-            let provider_config = self.provider_config.read().await.clone();
+            let mut provider_config = self.provider_config.read().await.clone();
+            // Overwrite the snapshot's posture with the device's,
+            // read from the framework. This plugin no longer
+            // carries a privacy posture of its own: it used to
+            // read one from its TOML, and that local copy is
+            // exactly why the artwork cascade — which had no copy
+            // at all — enforced nothing while this one enforced
+            // something. One device, one posture, read from the
+            // framework by every cascade.
+            //
+            // Read per-request, not cached: the posture is a
+            // safety control and a cached copy goes stale the
+            // moment an operator tightens it, which is precisely
+            // the window in which a leak would happen.
+            //
+            // Fail safe on any uncertainty — handle absent, read
+            // error, or a value this build cannot parse all
+            // resolve to the most restrictive posture. Missing
+            // enrichment is visible to an operator and
+            // recoverable; credentials sent against their stated
+            // wishes are neither.
+            provider_config.privacy_mode = read_device_privacy_mode_fail_safe(
+                self.online_provider_config.as_ref(),
+            )
+            .await;
+            let provider_config = provider_config;
             let reconcile_cache = self.reconcile_cache.clone();
             let lyrics_cache = self.lyrics_cache.clone();
             let bio_cache = self.bio_cache.clone();
@@ -1135,6 +1275,56 @@ fn identity_bearing_prompt(
 /// Fetch an operator-supplied credential from the framework vault
 /// under `key`. Returns `None` when the vault is not wired, when
 /// no row exists, or when the stored bytes are not valid UTF-8.
+/// Read the device's privacy posture from the framework, failing
+/// safe, and map it to this cascade's `PrivacyMode`.
+///
+/// Every uncertain outcome resolves to the most restrictive
+/// posture: handle absent (steward built without the
+/// provider-config store), read error, or a wire value this build
+/// does not recognise. The failure mode is missing enrichment,
+/// which an operator can see and report; the alternative failure
+/// mode is credentials leaving the device against an explicit
+/// instruction, which they cannot see at all.
+async fn read_device_privacy_mode_fail_safe(
+    handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
+) -> cascade::PrivacyMode {
+    use evo_plugin_sdk::contract::context::PrivacyPosture;
+    let posture = match handle {
+        None => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                posture = "offline",
+                reason = "provider_config_handle_absent",
+                "device privacy posture unreadable (no provider-config \
+                 handle); failing safe to the most restrictive posture — no \
+                 network provider will dispatch"
+            );
+            PrivacyPosture::Offline
+        }
+        Some(h) => match h.privacy_mode().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    posture = "offline",
+                    reason = "privacy_mode_read_failed",
+                    error = %e,
+                    "device privacy posture read failed; failing safe to the \
+                     most restrictive posture until the read succeeds"
+                );
+                PrivacyPosture::Offline
+            }
+        },
+    };
+    match posture {
+        PrivacyPosture::Enhanced => cascade::PrivacyMode::Enhanced,
+        PrivacyPosture::AnonymousOnly => cascade::PrivacyMode::AnonymousOnly,
+        PrivacyPosture::Offline => cascade::PrivacyMode::Offline,
+    }
+}
+
 async fn resolve_credential_from_vault(
     vault: Option<
         &Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
@@ -1303,6 +1493,13 @@ async fn credential_reactor(
     genius_slot: Arc<RwLock<Option<GeniusClient>>>,
     http: evo_online_providers::HttpClient,
     config: PluginConfig,
+    provider_config: Arc<RwLock<cascade::ProviderConfig>>,
+    // Providers the operator has explicitly toggled. Credential
+    // authority defaults only the untouched ones — a key event
+    // must never undo a deliberate off.
+    explicitly_configured: Arc<
+        RwLock<std::collections::HashSet<cascade::ProviderId>>,
+    >,
 ) {
     use evo_plugin_sdk::contract::context::CredentialChangeKind;
     loop {
@@ -1386,6 +1583,37 @@ async fn credential_reactor(
                         }
                     }
                 }
+                // Credential presence IS the enable authority.
+                // Re-derive the enable bit for all three keyed
+                // providers after every credential event, so a
+                // key add lights the provider on the next
+                // dispatch and a key delete darkens it — without
+                // a plugin restart and without the operator
+                // needing a second gesture anywhere. Re-deriving
+                // all three (rather than only the changed one)
+                // keeps the config convergent even if an earlier
+                // event was dropped under broadcast lag.
+                {
+                    let lastfm_present = lastfm_slot.read().await.is_some();
+                    let discogs_present = discogs_slot.read().await.is_some();
+                    let genius_present = genius_slot.read().await.is_some();
+                    let explicit = explicitly_configured.read().await;
+                    let mut cfg = provider_config.write().await;
+                    cfg.apply_credential_authority(
+                        lastfm_present,
+                        discogs_present,
+                        genius_present,
+                        &explicit,
+                    );
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        lastfm_enabled = lastfm_present,
+                        discogs_enabled = discogs_present,
+                        genius_enabled = genius_present,
+                        "reactor: credential authority re-applied to \
+                         keyed-provider enable bits"
+                    );
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::debug!(
@@ -1433,6 +1661,14 @@ async fn online_provider_config_reactor(
     vault: Option<
         Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
     >,
+    // Extended on every gesture that reaches this reactor. An
+    // operator toggle recorded here makes credential authority
+    // leave that provider alone from then on, so a later key
+    // add / delete cannot silently re-enable something they
+    // switched off.
+    explicitly_configured: Arc<
+        RwLock<std::collections::HashSet<cascade::ProviderId>>,
+    >,
 ) {
     loop {
         match rx.recv().await {
@@ -1458,6 +1694,13 @@ async fn online_provider_config_reactor(
                     Some(event.priority as u32)
                 };
                 {
+                    // The gesture itself marks this provider as
+                    // operator-configured, so credential
+                    // authority stops defaulting it. Recorded
+                    // before the merge so a concurrent credential
+                    // event cannot slip in between and clobber
+                    // the value we are about to write.
+                    explicitly_configured.write().await.insert(pid);
                     let mut cfg = config_slot.write().await;
                     cfg.merge_override(
                         pid,
@@ -1470,7 +1713,9 @@ async fn online_provider_config_reactor(
                     provider_id = %event.provider_id,
                     enabled = event.enabled,
                     priority = event.priority,
-                    "reactor: applied online_provider_config change"
+                    "reactor: applied online_provider_config change (provider \
+                     now operator-configured; credential authority will not \
+                     re-default it)"
                 );
 
                 // on `enabled=true` for an

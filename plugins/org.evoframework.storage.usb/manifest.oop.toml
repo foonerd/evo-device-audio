@@ -56,7 +56,7 @@ response_budget_ms = 180000
 
 [capabilities.respondent.verb_capabilities]
 "storage.usb.list_drives" = { kind = "none" }
-"storage.usb.mount" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.safe_remove" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.repair_filesystem" = { kind = "step_up", scope = "storage_admin" }
-"storage.usb.rename" = { kind = "step_up", scope = "storage_admin" }
+"storage.usb.mount" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.safe_remove" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.repair_filesystem" = { kind = "step_up", scope = "network_admin" }
+"storage.usb.rename" = { kind = "step_up", scope = "network_admin" }

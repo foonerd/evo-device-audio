@@ -71,6 +71,8 @@ From your ordinary user account, run:
 curl -fsSL https://raw.githubusercontent.com/foonerd/evo-device-audio/main/dist/scripts/evo-install.sh | sudo bash
 ```
 
+The installer downloads the signed bundle from the artefacts repo's **GitHub Release** (not from a git path). Default is `https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download`. The tarball is larger than GitHub's 100 MB git limit, so it is not stored as a blob on `main`. Pin a cut with `EVO_BUNDLE_URL_BASE=https://github.com/foonerd/evo-device-audio-artefacts/releases/download/<tag>` and `EVO_BUNDLE_VERSION=0.1.13`.
+
 The installer:
 
 1. Downloads the signed bundle for your architecture.
@@ -113,7 +115,7 @@ If a device is already installed and you want to start over:
 | Mode | Command | What it does |
 |---|---|---|
 | `install` (default) | `curl -fsSL <URL> \| sudo bash` | First-time install. Refuses if already installed. |
-| `reinstall` | `curl -fsSL <URL> \| sudo bash -s -- --mode=reinstall` | Full wipe and re-install. Deletes prior state. Preserves the music library at `/var/lib/evo/music`. |
+| `reinstall` | `curl -fsSL <URL> \| sudo bash -s -- --mode=reinstall` | Full wipe and re-install. **Deletes everything, including the music library at `/var/lib/evo/music`.** The host returns to its pre-evo state. To start over and keep your music, use `wipe-config`. |
 | `wipe-config` | `curl -fsSL <URL> \| sudo bash -s -- --mode=wipe-config` | Wipes binaries and config only. Keeps the music library untouched. |
 | `wipe-user-data` | `curl -fsSL <URL> \| sudo bash -s -- --mode=wipe-user-data` | Vacuums operator-generated state (queues, saved playlists, favourites). |
 

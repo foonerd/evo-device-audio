@@ -11,9 +11,9 @@
 //! `artwork.resolve` from the local plugin so consumers can
 //! use identical decoder logic across the two cascade tiers.
 //!
-//! Deezer is deliberately excluded from the album cascade
-//! per its live-fetch ToS invariant (see `providers.rs`
-//! module doc + DEFECT-4 comment).
+//! Deezer is not consulted by the album cascade — a
+//! provider-set choice, not a caching restriction. See the
+//! `providers.rs` module doc.
 
 use evo_device_audio_shared::transcode::{
     transcode, ArtworkSize, TranscodedArtwork,
@@ -233,6 +233,13 @@ pub(crate) async fn resolve_artwork(
         bytes,
         content_hash,
         mime,
+        // `flat_tone_ratio` is deliberately not consulted on the
+        // album surface. It distinguishes a photograph from a flat
+        // graphic, which is the right question for an artist
+        // portrait and the wrong one for a cover: plenty of real
+        // sleeves are two-tone typographic art, and rejecting them
+        // would blank legitimate covers.
+        ..
     } = match transcode(hit.bytes, &source_mime, size) {
         Ok(t) => t,
         Err(e) => {

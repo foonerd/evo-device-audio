@@ -151,7 +151,7 @@ pub enum ProbeOutcome {
     },
     /// Source stayed in `Demoted`; the re-probe failed
     /// again. The new failure count is in
-    /// [`Self::new_failure_count`]. Emit the same kind of
+    /// `Self::new_failure_count`. Emit the same kind of
     /// observation as the initial demotion so a long-running
     /// demotion is visible at a configurable cadence on the
     /// wire (one observation per probe failure).

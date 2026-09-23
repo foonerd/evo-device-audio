@@ -33,11 +33,12 @@
 //! - Volumio meta proxy — no key; disabled by default
 //!   (historical primary that shipped 500s).
 //!
-//! Deezer is deliberately excluded from the album cascade per
-//! its live-fetch ToS invariant — the artist cascade also
-//! forbids Deezer bytes structurally via `ArtistImageHit`'s
-//! missing `Serialize`. The `[providers.deezer]` toggle is
-//! retained for the artist path's live-fetch channel.
+//! Deezer is not consulted by the album cascade: Cover Art
+//! Archive and iTunes cover the practical case there. That is a
+//! provider-set choice for album covers, not a restriction on
+//! Deezer — its bytes are cached like any other provider's,
+//! governed by the operator's artwork-caching setting. The
+//! `[providers.deezer]` toggle governs the artist path.
 //!
 //! Each provider is enable/disable + per-key configurable via
 //! `/etc/evo/plugins.d/org.evoframework.artwork.online.toml`.
@@ -93,6 +94,7 @@ use std::time::Duration;
 
 use evo_online_providers::{
     deezer::DeezerClient,
+    discogs::DiscogsClient,
     fanart::FanartClient,
     musicbrainz::MusicBrainzClient,
     rate_limit::RateLimiter,
@@ -112,6 +114,16 @@ use crate::config::PluginConfig;
 /// plugin fetches the value at load and passes it to the fanart
 /// client constructor.
 const FANART_VAULT_KEY: &str = "fanart_tv_personal_api_key";
+
+/// Provider id this plugin names when asking the framework for
+/// the Discogs credential.
+///
+/// Deliberately a PROVIDER id, not a vault key: the token lives
+/// in `org.evoframework.metadata.online`'s scope and this plugin
+/// cannot address that scope directly. It names the provider and
+/// the framework's registry decides — see
+/// `CredentialVaultHandle::fetch_for_provider`.
+const DISCOGS_PROVIDER_ID: &str = "discogs";
 
 /// Embedded manifest.
 pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -146,12 +158,6 @@ const REQUEST_ARTWORK_RESOLVE_ARTIST_ARTWORK: &str =
 /// to `/api/v1/audio/artwork/{content_hash}` — same local
 /// serve path album covers already use.
 ///
-/// The Deezer live-fetch invariant is preserved structurally:
-/// any winning URL whose host is on Deezer's CDN is refused at
-/// the byte-cache path with `status=not_found` so the
-/// endpoint never persists ToS-restricted bytes locally. See
-/// [`crate::artist_cascade::resolve_artist_bytes_to_hash`]
-/// for the full contract.
 const REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE: &str =
     "artwork.resolve_artist_online";
 
@@ -164,6 +170,58 @@ const REQUEST_ARTWORK_RESOLVE_ARTIST_ONLINE: &str =
 /// Idempotent. Returns a small JSON envelope describing the
 /// cleared counts.
 const REQUEST_ARTWORK_ONLINE_CLEAR_CACHE: &str = "artwork.online.clear_cache";
+
+/// Read the device's privacy posture, failing safe.
+///
+/// The posture is a safety control, so every uncertain outcome
+/// resolves to the most restrictive answer rather than the
+/// permissive one:
+///
+/// - handle absent (steward built without the provider-config
+///   store) → `Offline`. We cannot establish that the operator
+///   permits identity-bearing traffic, so we do not send any.
+/// - read error → `Offline`, for the same reason. A storage
+///   fault must never be the reason credentials leave the device.
+/// - unrecognised value → `Offline`, applied inside
+///   `from_wire_fail_safe`; a newer steward may name a stricter
+///   posture this build predates.
+///
+/// The failure mode is therefore "artwork is missing", which an
+/// operator can see and report, rather than "credentials were
+/// sent against the operator's stated wishes", which they cannot.
+async fn read_privacy_posture_fail_safe(
+    handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
+) -> evo_plugin_sdk::contract::context::PrivacyPosture {
+    use evo_plugin_sdk::contract::context::PrivacyPosture;
+    let Some(h) = handle else {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            posture = "offline",
+            reason = "provider_config_handle_absent",
+            "privacy posture unreadable (no provider-config handle on this \
+             steward); failing safe to the most restrictive posture — no \
+             network artwork provider will dispatch"
+        );
+        return PrivacyPosture::Offline;
+    };
+    match h.privacy_mode().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                posture = "offline",
+                reason = "privacy_mode_read_failed",
+                error = %e,
+                "privacy posture read failed; failing safe to the most \
+                 restrictive posture — no network artwork provider will \
+                 dispatch until the read succeeds"
+            );
+            PrivacyPosture::Offline
+        }
+    }
+}
 
 /// Parse the embedded [`Manifest`].
 pub fn manifest() -> Manifest {
@@ -215,6 +273,35 @@ pub struct ArtworkOnlinePlugin {
     /// cascade treats the fanart source as disabled in that
     /// case.
     fanart_client: Option<Arc<FanartClient>>,
+    /// Discogs client for artist photography.
+    ///
+    /// The credential is the operator's Discogs Personal Access
+    /// Token, which is OWNED by
+    /// `org.evoframework.metadata.online` (it was entered there
+    /// for release-credits and artist-bio). This plugin reads it
+    /// through the framework's governed provider-credential
+    /// grant rather than holding a second copy — the operator
+    /// enters the key once and both surfaces work.
+    ///
+    /// `None` when the operator has stored no Discogs token, the
+    /// framework has no vault, or the grant is refused; the
+    /// artist-artwork cascade treats the Discogs source as
+    /// disabled in every one of those cases and walks on.
+    discogs_client: Option<Arc<DiscogsClient>>,
+    /// Framework handle used to read the device's privacy posture
+    /// at the start of each resolve.
+    ///
+    /// Read per-resolve rather than cached: the posture is a
+    /// safety control, and a cached copy would go stale the
+    /// moment an operator tightens it — the window between a
+    /// gesture and the next cache refresh is exactly when a leak
+    /// would happen. The cost is one local IPC on a path that is
+    /// already single-flight coalesced and about to do network
+    /// I/O, so it does not show up next to what the cascade
+    /// spends anyway.
+    online_provider_config: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
     /// MusicBrainz client used by the artist-artwork cascade to
     /// resolve a canonical MBID from an artist name (`ws/2/artist
     /// ?query=`) plus URL relationships (`ws/2/artist/<mbid>
@@ -249,9 +336,9 @@ pub struct ArtworkOnlinePlugin {
     /// memoises the MB reconcile outcome and the non-Deezer
     /// provider results so repeat browse of the same artist
     /// set does not re-hammer upstream. LRU-capped, TTL-bound,
-    /// dropped on unload. Deezer results never enter these
-    /// caches (live-fetch invariant enforced by
-    /// `ArtistImageHit`'s missing `Serialize`).
+    /// dropped on unload. Deezer's URL is not memoised here:
+    /// its CDN links are the shortest-lived of the set, so it is
+    /// re-derived per resolve rather than served stale.
     artwork_caches: Arc<artwork_caches::ArtworkCaches>,
     /// Single-flight coalescer for the artist-artwork cascade.
     /// Keyed on fold-key so a browse fan-out that surfaces the
@@ -281,6 +368,8 @@ impl ArtworkOnlinePlugin {
             theaudiodb_client: None,
             deezer_client: None,
             fanart_client: None,
+            discogs_client: None,
+            online_provider_config: None,
             mb_client: None,
             artist_provider_config: Arc::new(tokio::sync::RwLock::new(
                 artist_cascade::ArtistProviderConfig::defaults(),
@@ -458,7 +547,67 @@ impl Plugin for ArtworkOnlinePlugin {
                 None => None,
             };
             self.fanart_client = fanart_key.and_then(|key| {
-                FanartClient::new(http.clone(), one_req_per_sec(), ua, key)
+                FanartClient::new(
+                    http.clone(),
+                    one_req_per_sec(),
+                    ua.clone(),
+                    key,
+                )
+                .map(Arc::new)
+            });
+            // Discogs: the token is OWNED by
+            // org.evoframework.metadata.online — the operator
+            // entered it there for release-credits and artist-bio.
+            // Rather than making them paste it a second time into
+            // this plugin's scope, read it through the framework's
+            // governed provider-credential grant. We name the
+            // provider, never a scope or a key; the framework's
+            // registry decides whether this plugin may read it and
+            // fetches from the owner's scope, so the secret exists
+            // in exactly one place.
+            //
+            // A refused grant, an absent token, and an unknown
+            // provider are indistinguishable here — all three
+            // yield None and the cascade treats Discogs as
+            // disabled, exactly as it treats fanart without a key.
+            let discogs_token = match ctx.credential_vault.as_ref() {
+                Some(vault) => {
+                    match vault
+                        .fetch_for_provider(DISCOGS_PROVIDER_ID.to_string())
+                        .await
+                    {
+                        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                            Ok(s) if !s.trim().is_empty() => Some(s),
+                            Ok(_) => None,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = PLUGIN_NAME,
+                                    provider_id = DISCOGS_PROVIDER_ID,
+                                    error = %e,
+                                    "provider credential is not valid UTF-8; \
+                                     Discogs artist-image source stays \
+                                     disabled"
+                                );
+                                None
+                            }
+                        },
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                provider_id = DISCOGS_PROVIDER_ID,
+                                error = %e,
+                                "provider-credential fetch failed; Discogs \
+                                 artist-image source stays disabled"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            self.discogs_client = discogs_token.and_then(|token| {
+                DiscogsClient::new(http.clone(), one_req_per_sec(), ua, token)
                     .map(Arc::new)
             });
             // Runtime-store overlay for the artist-artwork
@@ -470,26 +619,86 @@ impl Plugin for ArtworkOnlinePlugin {
             // live-run so `set_enabled(false)` removes the
             // source on the next query, no restart.
             //
-            // Keyed-provider policy — credential-authoritative:
-            // when a keyed provider's credential IS present in
-            // the vault at load time, the framework's
-            // `online_provider_config` store row for that
-            // provider is skipped in this overlay. Plugin
-            // defaults hold (enabled = true, priority = the
-            // per-provider plugin default). Rationale: the
-            // framework historically seeds keyed providers with
-            // `enabled = false` as an implicit "credential not
-            // supplied yet" signal — once the operator has
-            // supplied the credential the seed is a stale
-            // intent-signal that would otherwise force-disable
-            // a source the operator IS trying to use. The
-            // binding requirement in
-            // `METADATA-ENRICHMENT-FLOW.md` — "off until the
-            // key exists" — treats credential presence as the
-            // enable-authority for keyed providers.
-            let fanart_credential_present = self.fanart_client.is_some();
+            // Stash the provider-config handle so each resolve can
+            // read the device's current privacy posture. See the
+            // field docs for why this is read per-resolve and not
+            // cached.
+            self.online_provider_config = ctx.online_provider_config.clone();
+            // Keyed-provider policy — an operator row always
+            // wins; credential presence is only the DEFAULT.
+            //
+            // This overlay used to SKIP the store row for any
+            // keyed provider whose credential was present, on the
+            // rationale that the framework seeded keyed providers
+            // `enabled = false` as an implicit "no credential
+            // yet" marker, making the row a stale intent-signal
+            // once the operator supplied the key.
+            //
+            // That seeding no longer exists. Rows in
+            // `online_providers` are written only by
+            // `set_enabled` / `set_priority` / `upsert` — every
+            // one of them an operator gesture — and the
+            // migration that rebuilt the table treats
+            // auto-inserted values as noise rather than intent.
+            // So a row here is the operator speaking, and
+            // skipping it silently reversed them: toggling a
+            // keyed provider off saw it snap straight back on,
+            // leaving "delete the key" as the only way to
+            // disable Discogs / Last.fm / Genius / fanart.tv —
+            // precisely the off-switch the settings toggle was
+            // added to replace.
+            //
+            // Both halves of the contract are still honoured,
+            // because they were never in conflict:
+            //   - no row  → `ArtistProviderConfig::defaults()`
+            //     ships both keyed providers enabled, so a
+            //     stored key means the source is used with no
+            //     second gesture;
+            //   - a row   → applied verbatim, so the operator
+            //     can switch a source off and keep its key.
             {
                 let mut cfg = self.artist_provider_config.write().await;
+                // Declare this cascade's providers before reading
+                // any config for them. The store cannot infer
+                // whether a provider costs the operator an
+                // identity — that is this plugin's fact — so
+                // registration is what seeds an identity-bearing
+                // source disabled. Seeding must land before the
+                // read below: a provider read first takes the
+                // anonymous default, which for a keyed source
+                // means enabled with no key, no change-event, and
+                // therefore no credential prompt. An existing row
+                // is left untouched, so this is safe on every
+                // boot and reload.
+                if let Some(store) = ctx.online_provider_config.as_ref() {
+                    use artist_cascade::ArtistPrivacyClass as Pc;
+                    use evo_plugin_sdk::contract::context::ProviderPrivacyClass;
+                    for pid in [
+                        artist_cascade::ArtistProviderId::VolumioMeta,
+                        artist_cascade::ArtistProviderId::TheAudioDb,
+                        artist_cascade::ArtistProviderId::Deezer,
+                        artist_cascade::ArtistProviderId::FanartTv,
+                        artist_cascade::ArtistProviderId::Discogs,
+                    ] {
+                        let class = match pid.privacy_class() {
+                            Pc::Anonymous => ProviderPrivacyClass::Anonymous,
+                            Pc::IdentityBearing => {
+                                ProviderPrivacyClass::IdentityBearing
+                            }
+                        };
+                        if let Err(e) =
+                            store.register(pid.as_str(), class).await
+                        {
+                            tracing::warn!(
+                                plugin = PLUGIN_NAME,
+                                provider_id = pid.as_str(),
+                                error = %format!("{e:?}"),
+                                "online provider registration failed; the \
+                                 store keeps whatever row it already had"
+                            );
+                        }
+                    }
+                }
                 if let Some(store) = ctx.online_provider_config.as_ref() {
                     match store.list_all().await {
                         Ok(rows) => {
@@ -509,20 +718,25 @@ impl Plugin for ArtworkOnlinePlugin {
                                     );
                                     continue;
                                 };
-                                if pid == artist_cascade::ArtistProviderId::FanartTv
-                                    && fanart_credential_present
-                                {
-                                    tracing::info!(
-                                        plugin = PLUGIN_NAME,
-                                        provider_id = %row.provider_id,
-                                        store_enabled = row.enabled,
-                                        store_priority = row.priority,
-                                        "credential-authoritative: fanart.tv API key is \
-                                         wired at load, so the store overlay row is skipped \
-                                         and plugin defaults hold (enabled=true, priority=40)"
-                                    );
-                                    continue;
-                                }
+                                // A store row IS an operator
+                                // gesture — the table only gains
+                                // one when someone calls
+                                // set_enabled / set_priority — so
+                                // it is applied verbatim, keyed
+                                // provider or not.
+                                //
+                                // Credential presence is the
+                                // DEFAULT for a provider nobody
+                                // has touched (see
+                                // `ArtistProviderConfig::defaults`,
+                                // where both keyed providers ship
+                                // enabled), never an override of
+                                // a deliberate off. Skipping the
+                                // row here made the operator's
+                                // toggle snap back on and left
+                                // "delete the key" as the only
+                                // way to disable a keyed
+                                // provider.
                                 // Sentinel semantics (migration 042):
                                 // priority < 0 means "operator has NOT
                                 // explicitly set a priority for this
@@ -563,11 +777,7 @@ impl Plugin for ArtworkOnlinePlugin {
                 let rx = store.subscribe_changes();
                 let config_slot = Arc::clone(&self.artist_provider_config);
                 self.reactor_tasks.push(tokio::spawn(
-                    online_provider_config_reactor(
-                        rx,
-                        config_slot,
-                        fanart_credential_present,
-                    ),
+                    online_provider_config_reactor(rx, config_slot),
                 ));
             }
             tracing::info!(
@@ -579,6 +789,16 @@ impl Plugin for ArtworkOnlinePlugin {
                 theaudiodb_wired = self.theaudiodb_client.is_some(),
                 deezer_wired = self.deezer_client.is_some(),
                 fanart_wired = self.fanart_client.is_some(),
+                // Whether the framework's provider-credential
+                // grant handed us the operator's Discogs token.
+                // False means one of: no token stored, grant
+                // refused, or no vault — the three are
+                // deliberately indistinguishable to this plugin,
+                // and all three disable the source. Reported here
+                // because without it there is no way to tell a
+                // wiring failure from a provider that simply had
+                // nothing for the artist.
+                discogs_wired = self.discogs_client.is_some(),
                 "load complete"
             );
             self.loaded = true;
@@ -730,12 +950,18 @@ impl Respondent for ArtworkOnlinePlugin {
                         .expect("http client present after load");
                     let config_snapshot =
                         self.artist_provider_config.read().await.clone();
+                    let privacy_posture = read_privacy_posture_fail_safe(
+                        self.online_provider_config.as_ref(),
+                    )
+                    .await;
                     let catalogue = artist_cascade::ArtistCatalogue {
                         volumio_meta_http: Arc::new(http),
                         volumio_meta_variant: self.volumio_meta_variant.clone(),
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
+                        discogs: self.discogs_client.clone(),
+                        privacy_posture,
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
@@ -761,12 +987,18 @@ impl Respondent for ArtworkOnlinePlugin {
                         .expect("http client present after load");
                     let config_snapshot =
                         self.artist_provider_config.read().await.clone();
+                    let privacy_posture = read_privacy_posture_fail_safe(
+                        self.online_provider_config.as_ref(),
+                    )
+                    .await;
                     let catalogue = artist_cascade::ArtistCatalogue {
                         volumio_meta_http: Arc::new(http.clone()),
                         volumio_meta_variant: self.volumio_meta_variant.clone(),
                         theaudiodb: self.theaudiodb_client.clone(),
                         deezer: self.deezer_client.clone(),
                         fanart: self.fanart_client.clone(),
+                        discogs: self.discogs_client.clone(),
+                        privacy_posture,
                         mb: self.mb_client.clone(),
                         caches: Arc::clone(&self.artwork_caches),
                         coalescer: Arc::clone(&self.reconcile_coalescer),
@@ -1085,7 +1317,6 @@ async fn online_provider_config_reactor(
         evo_plugin_sdk::contract::context::OnlineProviderConfigChangeEvent,
     >,
     config_slot: Arc<tokio::sync::RwLock<artist_cascade::ArtistProviderConfig>>,
-    fanart_credential_present: bool,
 ) {
     loop {
         match rx.recv().await {
@@ -1102,20 +1333,13 @@ async fn online_provider_config_reactor(
                     );
                     continue;
                 };
-                if pid == artist_cascade::ArtistProviderId::FanartTv
-                    && fanart_credential_present
-                {
-                    tracing::info!(
-                        plugin = PLUGIN_NAME,
-                        provider_id = %event.provider_id,
-                        event_enabled = event.enabled,
-                        event_priority = event.priority,
-                        "reactor: credential-authoritative — fanart.tv credential is \
-                         present, so this config-change event is not applied to the \
-                         plugin's local cascade (plugin defaults hold)"
-                    );
-                    continue;
-                }
+                // Every operator gesture is applied, keyed
+                // provider or not. Credential presence is the
+                // default for an untouched provider, never an
+                // override of a deliberate toggle — the earlier
+                // credential-authoritative skip here is what made
+                // the off-switch snap back on.
+                //
                 // Sentinel: priority < 0 means "operator has not
                 // explicitly set a priority" (migration 042).
                 // Keep the plugin's cascade default; still apply

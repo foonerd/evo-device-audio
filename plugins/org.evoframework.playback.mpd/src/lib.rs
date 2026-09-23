@@ -23,7 +23,7 @@
 //! ## Operator configuration
 //!
 //! The schema, defaults, validation rules, and error hierarchy
-//! live in the [`config`] module. In brief:
+//! live in the `config` module. In brief:
 //!
 //! ```toml
 //! [endpoint]
@@ -61,7 +61,7 @@
 //! announcer errors are logged but do not disrupt playback. A
 //! song whose `Album` tag is missing or empty produces only a
 //! track subject (no album, no relation). See the
-//! [`playback_supervisor::subject_emitter`] module for details.
+//! `playback_supervisor::subject_emitter` module for details.
 //!
 //! ## Course-correction payload encoding
 //!
@@ -71,7 +71,7 @@
 //!
 //! | `correction_type` | payload              | maps to                     |
 //! |-------------------|----------------------|-----------------------------|
-//! | `play`            | empty                | [`PlaybackCommand::Play`]   |
+//! | `play`            | empty                | `PlaybackCommand::Play`     |
 //! | `play`            | `"3"` (u32)          | `PlayPosition(3)`           |
 //! | `pause`           | `"1"` / `"true"`     | `Pause(true)`               |
 //! | `pause`           | `"0"` / `"false"`   | `Pause(false)`              |
@@ -119,6 +119,7 @@ mod library_triage;
 mod mpd;
 mod mpd_fragment;
 mod mpd_restart;
+mod mute_cell;
 mod network_shares_sync;
 mod playback_supervisor;
 mod playlist;
@@ -270,6 +271,9 @@ const SOURCE_REQUEST_TYPES: &[&str] = &[
     "library.list_sources",
     "library.add_source",
     "library.remove_source",
+    "library.rewrite_uri_prefix",
+    "library.park_uri_prefix",
+    "library.restore_parked_uris",
     "library.probe_source",
     "library.wake_source",
     "library.update_source",
@@ -383,12 +387,12 @@ struct TrackedCustody {
 /// `127.0.0.1:6600`, default timeouts, no subject emitter).
 /// [`Plugin::load`] replaces the defaults with values from
 /// [`LoadContext::config`] if the operator has supplied a config
-/// file, and populates the [`SubjectEmitter`] from the load
+/// file, and populates the `SubjectEmitter` from the load
 /// context's announcer handles. Tests may also use
-/// [`MpdPlaybackPlugin::with_endpoint`] to construct a plugin
+/// `MpdPlaybackPlugin::with_endpoint` to construct a plugin
 /// pointing at a specific endpoint without going through the
-/// `load` path; such tests set [`Self::subject_emitter`]
-/// directly (typically to [`SubjectEmitter::null`]) before
+/// `load` path; such tests set `Self::subject_emitter`
+/// directly (typically to `SubjectEmitter::null`) before
 /// exercising custody verbs.
 pub struct MpdPlaybackPlugin {
     loaded: bool,
@@ -462,6 +466,10 @@ pub struct MpdPlaybackPlugin {
     /// the flag survives the plugin's reference-borrow
     /// boundary.
     test_tone_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Operator mute. Shared by the supervisor, the ambient
+    /// observer, and the queue shelf so a skip or a tap
+    /// cannot paint the hero surface unmuted.
+    mute: crate::mute_cell::MuteCell,
     /// Cumulative count of course corrections dispatched to the
     /// supervisor since construction. Counts attempts, not
     /// successes: a dispatched command that the supervisor then
@@ -698,6 +706,7 @@ impl MpdPlaybackPlugin {
             test_tone_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            mute: crate::mute_cell::MuteCell::new(),
             corrections_dispatched: 0,
             requests_handled: std::sync::atomic::AtomicU64::new(0),
             fragment_path: PathBuf::from(config::DEFAULT_FRAGMENT_PATH),
@@ -2304,6 +2313,7 @@ impl Plugin for MpdPlaybackPlugin {
                     self.timeouts,
                     ambient_emitter,
                     music_directory,
+                    self.mute.clone(),
                 ));
             tracing::info!(
                 plugin = PLUGIN_NAME,
@@ -2429,6 +2439,7 @@ impl Plugin for MpdPlaybackPlugin {
                 self.endpoint.clone(),
                 self.timeouts,
                 ctx.shelf_request_dispatcher.clone(),
+                self.mute.clone(),
             )
             .await;
             self.shelves = Some(shelves);
@@ -2454,6 +2465,12 @@ impl Plugin for MpdPlaybackPlugin {
                             Arc::clone(sub),
                             Arc::clone(q),
                             shelves.registry.clone(),
+                            network_shares_sync::RetractHandles {
+                                library: shelves.library.clone(),
+                                queue: shelves.queue.clone(),
+                                endpoint: shelves.endpoint.clone(),
+                                timeouts: shelves.timeouts,
+                            },
                         ));
                     tracing::info!(
                         plugin = PLUGIN_NAME,
@@ -2698,9 +2715,15 @@ impl Warden for MpdPlaybackPlugin {
                 assignment.custody_state_reporter,
                 emitter,
                 self.audio_protocol_settings_tx.subscribe(),
-                source_probe::load_music_directory_from_mpd_conf(
-                    std::path::Path::new(source_probe::DEFAULT_MPD_CONF_PATH),
-                ),
+                playback_supervisor::SupervisorSpawn {
+                    music_directory:
+                        source_probe::load_music_directory_from_mpd_conf(
+                            std::path::Path::new(
+                                source_probe::DEFAULT_MPD_CONF_PATH,
+                            ),
+                        ),
+                    mute: self.mute.clone(),
+                },
             )
             .await
             {
@@ -6220,7 +6243,10 @@ mod tests {
             reporter_dyn,
             SubjectEmitter::null(),
             rx,
-            None,
+            playback_supervisor::SupervisorSpawn {
+                music_directory: None,
+                mute: crate::mute_cell::MuteCell::new(),
+            },
         )
         .await
         .expect("spawn should succeed against a Standard mock");

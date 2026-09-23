@@ -296,10 +296,12 @@ impl Plugin for SmbServerPlugin {
             // until the operator gestures a Device-name change
             // — a class where the LAN identity silently drifts
             // from what the plugin now considers correct. This
-            // reconcile fires ONLY when the persisted state
-            // carries `enabled = true` (matches operator
-            // intent). When disabled, no smb.conf write is
-            // due; the state stays parked.
+            // reconcile runs for either persisted value. When
+            // enabled it re-renders and restarts. When disabled
+            // it re-renders and stops `smbd` — the daemon is
+            // unit-enabled at the OS level, so a box that was
+            // turned off would otherwise return from a reboot
+            // serving the last conf written.
             //
             // A failure here does NOT block plugin admission —
             // the plugin's dispatch_verb surface must remain
@@ -308,33 +310,28 @@ impl Plugin for SmbServerPlugin {
             // the reactive subject's next envelope carries the
             // divergence via the on-disk-vs-runtime comparison
             // helper.
-            let state_at_load = rt.get_state().await;
-            if state_at_load.enabled {
-                match rt
-                    .apply(
-                        state_at_load.enabled,
-                        state_at_load.min_protocol,
-                        state_at_load.extra_shares.clone(),
-                    )
-                    .await
-                {
-                    Ok(_report) => {
-                        tracing::info!(
-                            plugin = PLUGIN_NAME,
-                            "network.smb-server reconcile-on-load: \
-                             re-rendered smb.conf with live hostname"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = PLUGIN_NAME,
-                            error = %e,
-                            "network.smb-server reconcile-on-load failed; \
-                             smb.conf on disk may not match current \
-                             hostname until the operator gestures an \
-                             apply"
-                        );
-                    }
+            let enabled_at_load = rt.get_state().await.enabled;
+            match rt.reconcile_smb_conf_on_load().await {
+                Ok(report) => {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        enabled = enabled_at_load,
+                        smbd_restarted = report.smbd_restarted,
+                        "network.smb-server reconcile-on-load: re-rendered \
+                         smb.conf with live hostname; smbd restarted when \
+                         enabled, stopped when not"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        enabled = enabled_at_load,
+                        "network.smb-server reconcile-on-load failed; \
+                         smb.conf on disk may not match current hostname, \
+                         and smbd may not match the persisted enabled \
+                         state, until the operator gestures an apply"
+                    );
                 }
             }
 

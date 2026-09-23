@@ -78,7 +78,7 @@ pub struct TrackAnnotationHit {
     /// Optional annotation prose (`description`).
     pub description: Option<String>,
     /// URL of the Genius web page for this song. When
-    /// [`LrclibClient`] returns `not_found`, the operator UI can
+    /// `LrclibClient` returns `not_found`, the operator UI can
     /// render this as an outbound "View lyrics on Genius" link.
     /// Never fetch this URL server-side to extract lyrics text.
     pub source_url: Option<String>,

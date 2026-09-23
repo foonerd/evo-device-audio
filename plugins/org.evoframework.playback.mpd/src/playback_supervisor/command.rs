@@ -19,11 +19,15 @@ use std::time::Duration;
 /// [`MpdConnection`]: crate::mpd::MpdConnection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlaybackCommand {
-    /// Start or resume playback from the current queue position.
+    /// Start or resume playback. Current song if one is armed;
+    /// otherwise the head of the queue. A stopped player with
+    /// a populated queue is not a no-op.
     Play,
     /// Start playback at a specific queue position (zero-based).
     PlayPosition(u32),
-    /// Pause (`true`) or resume (`false`) playback.
+    /// Pause (`true`). `false` is the operator Play/resume
+    /// gesture: unpause when paused, otherwise start the
+    /// armed or first queue track.
     Pause(bool),
     /// Stop playback. Position is not preserved.
     Stop,

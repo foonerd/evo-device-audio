@@ -91,6 +91,9 @@ request_types = [
     "library.list_sources",
     "library.add_source",
     "library.remove_source",
+    "library.rewrite_uri_prefix",
+    "library.park_uri_prefix",
+    "library.restore_parked_uris",
     "library.probe_source",
     "library.wake_source",
     "library.update_source",
@@ -268,6 +271,9 @@ request_types = [
     "library.list_sources",
     "library.add_source",
     "library.remove_source",
+    "library.rewrite_uri_prefix",
+    "library.park_uri_prefix",
+    "library.restore_parked_uris",
     "library.probe_source",
     "library.wake_source",
     "library.update_source",
@@ -282,4 +288,9 @@ request_types = [
     "library.get_triage",
     "library.reconcile_triage",
 ]
-response_budget_ms = 2000
+# USB Remove on this shelf waits for storage.usb to detach
+# then for MPD to prune. 2 s was the glass 400: the nested
+# call never finished, or finished after the steward cut it.
+# 30 s covers umount + the 1.5 s scrub settle; mount/repair
+# stay on storage.usb's own 180 s budget.
+response_budget_ms = 30000

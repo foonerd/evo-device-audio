@@ -52,11 +52,13 @@
 //! `source_id` for the wire envelope's per-item record, the
 //! module's source resolver combines MPD's `music_directory`
 //! with the file path to get an absolute path, then walks the
-//! source registry to find which source's `mount_path` is a
-//! prefix. The first match wins; items that don't resolve
-//! under any registered source carry `source_id: null` on the
-//! wire and are treated by the skip-traversal as `Probing`
-//! sources (try-MPD-and-classify).
+//! source registry and keeps the longest matching `mount_path`.
+//! The floor source is mounted at `music_directory`, so a first-
+//! match walk would claim every `USB/` / `NAS/` leftover as
+//! Internal. A URI under those sibling trees that has no
+//! matching source stays unresolved (`source_id: null`) so
+//! gone-curation retains it — a rename must not empty the
+//! queue. Skip-traversal treats unresolved items as `Probing`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +71,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::library::LIBRARY_PAYLOAD_VERSION;
-use crate::mpd::{MpdConnection, MpdLibraryEntry};
+use crate::mpd::{MpdConnection, MpdLibraryEntry, MpdQueueItem, PlayState};
 use crate::skip_traversal::{PlayableQueueItem, SkipOutcome, SkipTraversal};
 use crate::source_registry::SourceRegistry;
 
@@ -112,6 +114,10 @@ pub(crate) struct QueueContext {
     pub(crate) subjects: Arc<dyn SubjectAnnouncer>,
     /// Skip-traversal handle for queue.skip_to_next_available.
     pub(crate) skip: SkipTraversal,
+    /// Operator mute. Same cell the supervisor writes on
+    /// `set_mute`. A transport publish that guesses `false`
+    /// wipes a live mute on the hero surface.
+    pub(crate) mute: crate::mute_cell::MuteCell,
     /// In-memory mirror of the last published envelope, used
     /// by `queue.get_queue` to satisfy read-then-subscribe
     /// without round-tripping through the framework's subject
@@ -143,12 +149,14 @@ impl QueueContext {
                 dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
             >,
         >,
+        mute: crate::mute_cell::MuteCell,
     ) -> Self {
         Self {
             music_directory,
             registry,
             subjects,
             skip,
+            mute,
             mirror: Arc::new(Mutex::new(None)),
             shelf_dispatcher,
         }
@@ -373,12 +381,38 @@ pub(crate) async fn resolve_source(
         return None;
     }
     let absolute = music_directory.join(file_path);
+    let mut best: Option<(usize, String, std::path::PathBuf)> = None;
     for source in registry.snapshot().await {
         if absolute.starts_with(&source.mount_path) {
-            return Some(source.id);
+            let len = source.mount_path.as_os_str().len();
+            if best.as_ref().is_none_or(|(best_len, _, _)| len > *best_len) {
+                best =
+                    Some((len, source.id.clone(), source.mount_path.clone()));
+            }
         }
     }
-    None
+    match best {
+        Some((_, _, mount))
+            if first_segment_is_sibling_tree(file_path)
+                && mount == music_directory =>
+        {
+            // Floor is mounted at music_directory. After a USB
+            // rename the old `USB/<name>/…` rows are still in
+            // the queue and no USB source owns that name.
+            // Attributing them to Internal makes gone-curation
+            // treat a rename as a wipe.
+            None
+        }
+        Some((_, id, _)) => Some(id),
+        None => None,
+    }
+}
+
+/// Trees that sit next to Internal under `music_directory`.
+/// The floor source must not claim leftovers in these trees
+/// when their own source row is gone (rename / unmount window).
+fn first_segment_is_sibling_tree(file_path: &str) -> bool {
+    matches!(file_path.split('/').next(), Some("USB" | "NAS"))
 }
 
 /// Compute the per-item `available` flag — delegates to the
@@ -727,27 +761,27 @@ pub(crate) async fn handle_enqueue(
     for uri in &payload.uris {
         resolved.push(resolve_uri_for_mpd(ctx, "enqueue", uri).await?);
     }
-    if let Some(start_pos) = payload.position {
-        let mut current = start_pos;
-        for r in &resolved {
-            let id = conn.addid(&r.uri, Some(current)).await.map_err(|e| {
-                VerbError::Mpd {
-                    verb: "enqueue".to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
-            apply_resolved_tags(conn, id, r).await;
-            current = current.saturating_add(1);
-        }
-    } else {
-        for r in &resolved {
-            let id =
-                conn.addid(&r.uri, None).await.map_err(|e| VerbError::Mpd {
-                    verb: "enqueue".to_string(),
-                    reason: e.to_string(),
-                })?;
-            apply_resolved_tags(conn, id, r).await;
-        }
+    // A requested position is an insert after something. With
+    // no current index there is nothing to insert after: the
+    // queue is empty or stopped, `addid <uri> "1"` against it is
+    // a Bad song index ACK, and that ACK is the refusal the
+    // operator meets on Play Next into an empty queue. Fall back
+    // to the tail, which is where "next" lands when there is no
+    // current track. An omitted position still appends, as it
+    // always did, and costs no extra round-trip.
+    let mut at = match payload.position {
+        Some(requested) => next_insert_position(conn, "enqueue")
+            .await?
+            .map(|_| requested),
+        None => None,
+    };
+    for r in &resolved {
+        let id = conn.addid(&r.uri, at).await.map_err(|e| VerbError::Mpd {
+            verb: "enqueue".to_string(),
+            reason: e.to_string(),
+        })?;
+        apply_resolved_tags(conn, id, r).await;
+        at = at.map(|p| p.saturating_add(1));
     }
     publish_queue(ctx, conn).await;
     Ok(())
@@ -767,6 +801,13 @@ pub(crate) async fn handle_enqueue(
 ///   resolution failure the existing queue is left intact.
 ///   On zero-match the queue is left intact and the response
 ///   returns `status: "empty"` — never a silent clear.
+///   After a successful replace the verb publishes
+///   `now_playing` on this stack: Browse Play Now drives MPD
+///   on the shelf connection, so the custody supervisor does
+///   not hear the transport change until the next `player`
+///   idle wake. Leaving that publish out keeps glass and
+///   kiosk on the previous track until pause / play / next /
+///   previous.
 /// - `Append` — `findadd/searchadd` (Filter) or `add`-loop
 ///   (UriList) at the tail. One MPD roundtrip.
 /// - `Next` — insert at `status.song + 1`. Filter is
@@ -866,12 +907,12 @@ async fn handle_enqueue_selection_criteria(
     // as-is via findadd/searchadd for a single roundtrip.
     let materialise_needed = matches!(mode, EnqueueSelectionMode::Next);
     let uris: Vec<String> = if materialise_needed {
-        materialise_to_uris(conn, &resolved).await.map_err(|e| {
-            VerbError::Mpd {
+        materialise_to_uris(conn, &resolved, criteria.dimension)
+            .await
+            .map_err(|e| VerbError::Mpd {
                 verb: "enqueue_selection".to_string(),
                 reason: e.to_string(),
-            }
-        })?
+            })?
     } else {
         match &resolved {
             crate::selection::ResolvedSelection::UriList(list) => list.clone(),
@@ -883,20 +924,20 @@ async fn handle_enqueue_selection_criteria(
             apply_append(conn, &resolved, &uris).await?;
         }
         EnqueueSelectionMode::Next => {
-            let start_pos = current_song_position(conn).await? + 1;
-            let mut current = start_pos;
+            let mut at =
+                next_insert_position(conn, "enqueue_selection").await?;
             for uri in &uris {
-                conn.addid(uri, Some(current)).await.map_err(|e| {
-                    VerbError::Mpd {
-                        verb: "enqueue_selection".to_string(),
-                        reason: e.to_string(),
-                    }
+                conn.addid(uri, at).await.map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".to_string(),
+                    reason: e.to_string(),
                 })?;
-                current = current.saturating_add(1);
+                at = at.map(|p| p.saturating_add(1));
             }
         }
         EnqueueSelectionMode::Replace => {
             apply_replace(conn, &resolved, &uris).await?;
+            publish_now_playing_after_transport(ctx, conn, "enqueue_selection")
+                .await;
         }
     }
     publish_queue(ctx, conn).await;
@@ -924,30 +965,229 @@ async fn handle_enqueue_selection_criteria(
 pub(crate) const AUDIO_DLNA_SHELF: &str = "audio.dlna";
 pub(crate) const SOURCE_DLNA_BROWSE_VERB: &str = "source.dlna.browse";
 
-/// Container-shape handler: peer-dispatches `source.dlna.browse`
-/// on `audio.dlna` for the requested `(service_id, objectId)` at
-/// the caller's page + page_size (or the source-plugin-owned
-/// defaults), extracts the leaf items' stream URIs, and enqueues
-/// them with mode semantics identical to the Criteria path.
+/// Default maximum recursion depth when the enqueue-container
+/// handler walks a DLNA browse subtree. Six covers every
+/// realistic library shape (root → artists → albums → disks →
+/// tracks is 4 levels; genres / decades / collections rarely
+/// push beyond 5). Overridden via plugin config
+/// `dlna.enqueue.max_depth`.
+const DLNA_ENQUEUE_MAX_DEPTH_DEFAULT: u32 = 6;
+
+/// Default cap on total leaf tracks the recursive descent will
+/// enqueue in a single verb call. 5000 is generous (one
+/// artist's full discography is ~200 tracks, an "all favourites"
+/// container tops out well below this on any reasonable
+/// library) yet bounded — protects against pathological
+/// MediaServer shapes (one container with a million
+/// descendants). Overridden via plugin config
+/// `dlna.enqueue.max_tracks`.
+const DLNA_ENQUEUE_MAX_TRACKS_DEFAULT: usize = 5000;
+
+/// Depth-first descent over a DLNA container subtree; returns the
+/// stable leaf URIs collected in tree order alongside a `truncated`
+/// flag set when either the depth or the total-tracks cap fired.
 ///
-/// Subcontainers in the response entry list are ignored: only
-/// leaf items are enqueued in one call. The UI drills into a
-/// subcontainer via `library.browse_library` and issues a fresh
-/// `queue.enqueue_selection` against the drilled objectId — no
-/// recursive descent inside a single verb call.
+/// Pure w.r.t. MPD — takes a shelf-request dispatcher and the DLNA
+/// service parameters and does one thing: browse subcontainers,
+/// collect leaves, return. The caller performs URI resolution and
+/// MPD writes. Extracted from
+/// [`handle_enqueue_selection_container`] so the descent shape is
+/// unit-testable against a scripted `ShelfRequestDispatcher` without
+/// having to fake an MPD connection.
 ///
-/// Paging is honoured verbatim: the response envelope's
-/// `truncated` + `next_page` come straight from
-/// `source.dlna.browse` so the caller drives the next page by
-/// re-issuing the verb with `page = next_page` and the same
-/// mode.
+/// Descent contract:
+///
+/// - Iterative DFS. `stack` carries `(object_id, remaining_depth)`
+///   pairs; the top of the stack is the container currently being
+///   walked.
+/// - Tree order preserved by pushing subcontainers in reverse per
+///   page (so the first-listed subcontainer is popped first).
+/// - Each container is browsed page-by-page until the peer-shelf
+///   response's `truncated` flag clears (which the source-plugin
+///   sets when `NumberReturned + StartingIndex < TotalMatches`).
+/// - Depth cap: descent into a container at `depth == 0` sets
+///   `truncated_by_cap = true` and skips it.
+/// - Track cap: on hitting `max_tracks` collected leaves, descent
+///   aborts immediately (breaks the outer loop) with
+///   `truncated_by_cap = true`.
+///
+/// Field-name contract with the source-plugin browse response
+/// (`source.dlna.browse`):
+///
+/// - `entries[i].kind`  — `"file"` for leaves, `"directory"` for
+///   subcontainers.
+/// - `entries[i].uri`   — present ONLY on leaves; carries the
+///   stable playback identity (`dlna:<service_id>/<object_id>`).
+///   This is what the caller feeds to `resolve_uri_for_mpd`.
+/// - `entries[i].path`  — present on BOTH leaves and containers;
+///   carries the raw ContentDirectory `ObjectID`. This is what we
+///   feed back into the next SOAP Browse to descend into a
+///   subcontainer.
+///
+/// A pre-fix version of this descent read `entries[i].uri` for the
+/// directory branch too. Containers carry no `uri` field, so the
+/// recursion silently no-op'd on every subcontainer — an operator
+/// tapping an artist / genre / folder / decade tile would find the
+/// queue unchanged even though the payload envelope reported
+/// `status: ok`. The regression test
+/// [`dlna_descent_walks_two_level_container_tree_via_path_field`]
+/// pins the field-name contract so this can never regress silently
+/// again.
+pub(crate) async fn collect_dlna_container_leaves(
+    dispatcher: &dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher,
+    service_id: &str,
+    root_object_id: &str,
+    max_depth: u32,
+    max_tracks: usize,
+    page_size: u32,
+) -> Result<(Vec<String>, bool), VerbError> {
+    let mut stable_uris: Vec<String> = Vec::new();
+    let mut stack: Vec<(String, u32)> =
+        vec![(root_object_id.to_string(), max_depth)];
+    let mut truncated_by_cap = false;
+
+    'descent: while let Some((oid, depth)) = stack.pop() {
+        if depth == 0 {
+            truncated_by_cap = true;
+            continue;
+        }
+        let mut page: u32 = 0;
+        loop {
+            let request = serde_json::json!({
+                "v":          1,
+                "service_id": service_id,
+                "object_id":  oid,
+                "page":       page,
+                "page_size":  page_size,
+            });
+            let request_bytes =
+                serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!("dlna container: serialise request: {e}"),
+                })?;
+            let response_bytes = dispatcher
+                .dispatch(
+                    AUDIO_DLNA_SHELF,
+                    SOURCE_DLNA_BROWSE_VERB,
+                    request_bytes,
+                    None,
+                )
+                .await
+                .map_err(|e| VerbError::Mpd {
+                    verb: "enqueue_selection".into(),
+                    reason: format!(
+                        "dlna container: {}",
+                        shelf_error_reason(&e)
+                    ),
+                })?;
+            let response: serde_json::Value =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: format!("dlna container: parse response: {e}"),
+                    }
+                })?;
+            let entries = response
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            // Two passes over this page in one iteration:
+            // 1) collect leaves in reading order + subcontainer
+            //    URIs in reading order; 2) push subcontainers onto
+            //    the stack in reverse so the first-listed
+            //    subcontainer pops first (tree order).
+            let mut subcontainers_this_page: Vec<String> = Vec::new();
+            for entry in &entries {
+                let kind = entry.get("kind").and_then(|v| v.as_str());
+                let uri = entry
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let path = entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                match (kind, uri, path) {
+                    (Some("file"), Some(u), _) => {
+                        stable_uris.push(u.to_string());
+                        if stable_uris.len() >= max_tracks {
+                            truncated_by_cap = true;
+                            break 'descent;
+                        }
+                    }
+                    (Some("directory"), _, Some(p)) => {
+                        subcontainers_this_page.push(p.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            for sub in subcontainers_this_page.into_iter().rev() {
+                stack.push((sub, depth - 1));
+            }
+            let page_truncated = response
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !page_truncated {
+                break;
+            }
+            page = response
+                .get("next_page")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(page + 1);
+        }
+    }
+    Ok((stable_uris, truncated_by_cap))
+}
+
+/// Container-shape handler: recursively browses a DLNA
+/// container and enqueues every leaf track its subtree carries,
+/// under bounded depth + total-track caps.
+///
+/// Descent shape: depth-first, tree-order. The caller's
+/// starting container is browsed page-by-page; each page's
+/// leaf items enqueue in reading order; each page's
+/// subcontainers push onto a DFS stack in reverse (so the
+/// first-listed subcontainer is popped first, preserving
+/// tree order). Descent continues until the subtree is
+/// exhausted, the depth cap fires, or the total-track cap
+/// fires.
+///
+/// Caps: [`DLNA_ENQUEUE_MAX_DEPTH_DEFAULT`] +
+/// [`DLNA_ENQUEUE_MAX_TRACKS_DEFAULT`], both plugin-config-
+/// settable via `dlna.enqueue.max_depth` +
+/// `dlna.enqueue.max_tracks`. When either cap fires, the
+/// response envelope's `truncated` field is set to `true` and
+/// the operator can see (via `enqueued_count`) how many tracks
+/// were actually queued.
+///
+/// This shape supersedes an earlier "direct-child leaves only,
+/// no recursion" behaviour that meant only album-shaped
+/// containers (whose direct children are tracks) enqueued
+/// anything — artist / folder / genre / decade / year /
+/// collection containers all silently no-op'd because their
+/// direct children were subcontainers.
+///
+/// The response envelope carries:
+///
+/// - `enqueued` + `enqueued_count`: number of leaf tracks
+///   actually queued. Both fields carry the same value;
+///   `enqueued_count` is the canonical name for new consumers;
+///   `enqueued` is retained for back-compat with earlier UI
+///   consumers.
+/// - `truncated`: `true` iff descent hit a cap (depth or
+///   track budget) before exhausting the subtree.
+/// - `next_page`: always `null` under recursive descent
+///   (the whole subtree resolves within one verb call).
 async fn handle_enqueue_selection_container(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
     source_id: Option<String>,
     selection: ContainerSelection,
     mode: EnqueueSelectionMode,
-    page: Option<u32>,
+    _page: Option<u32>,
     page_size: Option<u32>,
 ) -> Result<serde_json::Value, VerbError> {
     let mode_label = mode.as_str().to_string();
@@ -992,62 +1232,22 @@ async fn handle_enqueue_selection_container(
                     .into(),
             })?;
 
-    let request = serde_json::json!({
-        "v":          1,
-        "service_id": service_id,
-        "object_id":  selection.uri,
-        "page":       page.unwrap_or(0),
-        "page_size":  page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT),
-    });
-    let request_bytes =
-        serde_json::to_vec(&request).map_err(|e| VerbError::Mpd {
-            verb: "enqueue_selection".into(),
-            reason: format!("dlna container: serialise request: {e}"),
-        })?;
-    let response_bytes = dispatcher
-        .dispatch(
-            AUDIO_DLNA_SHELF,
-            SOURCE_DLNA_BROWSE_VERB,
-            request_bytes,
-            None,
-        )
-        .await
-        .map_err(|e| VerbError::Mpd {
-            verb: "enqueue_selection".into(),
-            reason: format!("dlna container: {}", shelf_error_reason(&e)),
-        })?;
-    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
-        .map_err(|e| VerbError::Mpd {
-        verb: "enqueue_selection".into(),
-        reason: format!("dlna container: parse response: {e}"),
-    })?;
+    let effective_page_size = page_size.unwrap_or(evo_dlna::DLNA_PAGE_DEFAULT);
+    let max_depth = DLNA_ENQUEUE_MAX_DEPTH_DEFAULT;
+    let max_tracks = DLNA_ENQUEUE_MAX_TRACKS_DEFAULT;
 
-    let entries = response
-        .get("entries")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // Extract the stable-identity `dlna:` URI each leaf item
-    // carries. source.dlna.browse emits `uri: dlna:<sid>/<oid>`
-    // as the entry's identity post-follow-up. Sub-containers
-    // are silently skipped: only leaf items enqueue in one
-    // call (the UI drills into subcontainers via a fresh
-    // browse_library + enqueue_selection pair).
-    let stable_uris: Vec<String> = entries
-        .iter()
-        .filter_map(|e| {
-            if e.get("kind").and_then(|v| v.as_str()) != Some("file") {
-                return None;
-            }
-            e.get("uri")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .collect();
+    let (stable_uris, truncated_by_cap) = collect_dlna_container_leaves(
+        dispatcher.as_ref(),
+        &service_id,
+        &selection.uri,
+        max_depth,
+        max_tracks,
+        effective_page_size,
+    )
+    .await?;
     // Resolve each stable identity to a concrete `http(s)` at
     // MPD-add time via the shared boundary helper. Resolve
-    // BEFORE any MPD write so a mid-page resolve failure
+    // BEFORE any MPD write so a mid-descent resolve failure
     // leaves the queue intact (all-or-nothing). The resolver
     // returns the full `ResolvedTrack` so the enqueue paths
     // below can `addtagid` DIDL tags onto MPD immediately after
@@ -1060,22 +1260,18 @@ async fn handle_enqueue_selection_container(
         resolved
             .push(resolve_uri_for_mpd(ctx, "enqueue_selection", uri).await?);
     }
-    let truncated = response
-        .get("truncated")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let next_page = response.get("next_page").cloned();
 
     if resolved.is_empty() {
         return Ok(serde_json::json!({
-            "v":         LIBRARY_PAYLOAD_VERSION,
-            "status":    "empty",
-            "mode":      mode_label,
-            "kind":      "container",
-            "enqueued":  0,
-            "truncated": truncated,
-            "next_page": next_page,
-            "detail":    "container page carried no playable leaf items; queue unchanged",
+            "v":              LIBRARY_PAYLOAD_VERSION,
+            "status":         "empty",
+            "mode":           mode_label,
+            "kind":           "container",
+            "enqueued":       0,
+            "enqueued_count": 0,
+            "truncated":      truncated_by_cap,
+            "next_page":      serde_json::Value::Null,
+            "detail":         "container subtree carried no playable leaf items; queue unchanged",
         }));
     }
 
@@ -1096,18 +1292,17 @@ async fn handle_enqueue_selection_container(
             }
         }
         EnqueueSelectionMode::Next => {
-            let start_pos = current_song_position(conn).await? + 1;
-            let mut current = start_pos;
+            let mut at =
+                next_insert_position(conn, "enqueue_selection").await?;
             for r in &resolved {
-                let id =
-                    conn.addid(&r.uri, Some(current)).await.map_err(|e| {
-                        VerbError::Mpd {
-                            verb: "enqueue_selection".into(),
-                            reason: e.to_string(),
-                        }
-                    })?;
+                let id = conn.addid(&r.uri, at).await.map_err(|e| {
+                    VerbError::Mpd {
+                        verb: "enqueue_selection".into(),
+                        reason: e.to_string(),
+                    }
+                })?;
                 apply_resolved_tags(conn, id, r).await;
-                current = current.saturating_add(1);
+                at = at.map(|p| p.saturating_add(1));
             }
         }
         EnqueueSelectionMode::Replace => {
@@ -1128,17 +1323,20 @@ async fn handle_enqueue_selection_container(
                 verb: "enqueue_selection".into(),
                 reason: e.to_string(),
             })?;
+            publish_now_playing_after_transport(ctx, conn, "enqueue_selection")
+                .await;
         }
     }
     publish_queue(ctx, conn).await;
     Ok(serde_json::json!({
-        "v":         LIBRARY_PAYLOAD_VERSION,
-        "status":    "ok",
-        "mode":      mode_label,
-        "kind":      "container",
-        "enqueued":  resolved.len(),
-        "truncated": truncated,
-        "next_page": next_page,
+        "v":              LIBRARY_PAYLOAD_VERSION,
+        "status":         "ok",
+        "mode":           mode_label,
+        "kind":           "container",
+        "enqueued":       resolved.len(),
+        "enqueued_count": resolved.len(),
+        "truncated":      truncated_by_cap,
+        "next_page":      serde_json::Value::Null,
     }))
 }
 
@@ -1496,9 +1694,36 @@ async fn apply_replace(
 async fn materialise_to_uris(
     conn: &mut MpdConnection,
     resolved: &crate::selection::ResolvedSelection,
+    dimension: crate::selection::SelectionDimension,
 ) -> Result<Vec<String>, crate::mpd::MpdError> {
     match resolved {
-        crate::selection::ResolvedSelection::UriList(list) => Ok(list.clone()),
+        crate::selection::ResolvedSelection::UriList(list) => {
+            // `Folder` resolves to the directory itself, because
+            // Append and Replace hand it to MPD's `add DIR` and
+            // let MPD walk it in one command. `Next` cannot: it
+            // places each track with `addid <uri> <position>`,
+            // and `addid` takes a song, not a directory — MPD
+            // refuses the whole call and the operator gets a
+            // 400 on Play Next over a folder.
+            //
+            // So for this dimension, and only this one, ask MPD
+            // what the directory holds and place those. Every
+            // other `UriList` dimension already resolves to song
+            // or stream URIs; walking those would be a round
+            // trip per track to learn what we were told.
+            if dimension != crate::selection::SelectionDimension::Folder {
+                return Ok(list.clone());
+            }
+            let mut out = Vec::new();
+            for dir in list {
+                for entry in conn.listallinfo(dir).await? {
+                    if let MpdLibraryEntry::File { path, .. } = entry {
+                        out.push(path);
+                    }
+                }
+            }
+            Ok(out)
+        }
         crate::selection::ResolvedSelection::Filter { pairs, substring } => {
             let pairs_ref: Vec<(crate::mpd::MpdSearchField, &str)> = pairs
                 .iter()
@@ -1538,14 +1763,28 @@ async fn materialise_to_uris(
     }
 }
 
-async fn current_song_position(
+/// Where a `Next` insert goes, given what the player is doing.
+///
+/// `Some(current + 1)` when MPD reports a current song: the
+/// insert lands directly after it. `None` when nothing is
+/// current — an empty or stopped queue has no "after this", and
+/// `addid <uri> "1"` against it is a Bad song index ACK. That
+/// ACK is the refusal the operator meets when they Play Next
+/// into an empty queue, and appending is what "next" means when
+/// there is no current track to follow.
+///
+/// `None` is also what the caller hands straight to `addid`, so
+/// the empty-queue case needs no second code path: the batch
+/// appends in selection order.
+async fn next_insert_position(
     conn: &mut MpdConnection,
-) -> Result<u32, VerbError> {
+    verb: &str,
+) -> Result<Option<u32>, VerbError> {
     let status = conn.status().await.map_err(|e| VerbError::Mpd {
-        verb: "enqueue_selection".to_string(),
+        verb: verb.to_string(),
         reason: e.to_string(),
     })?;
-    Ok(status.song_position.unwrap_or(0))
+    Ok(status.song_position.map(|p| p.saturating_add(1)))
 }
 
 /// `queue.remove_queue_item` — delete by songid.
@@ -1593,6 +1832,345 @@ pub(crate) async fn handle_clear_queue(
     })?;
     publish_queue(ctx, conn).await;
     Ok(())
+}
+
+/// Drop every queue item that lives under one source's
+/// MPD-relative prefix.
+///
+/// The operator's USB Remove takes the volume off the host, and
+/// MPD is a consumer of that volume: a queued track under the
+/// stick's tree is an open file, and an open file is what turns
+/// a clean umount into EBUSY and then a lazy detach. Releasing
+/// those items first is what lets the umount be clean.
+///
+/// Matching is on segment boundaries, not raw string prefix, so
+/// removing `USB/Stick` does not carry `USB/Stick2/track.flac`
+/// out with it. An empty prefix addresses the whole database and
+/// drops nothing: that gesture is [`handle_clear_queue`], which
+/// would take INTERNAL with it, and a source removal is never
+/// that.
+///
+/// When the current song is one of the doomed items the player
+/// is stopped first, so MPD does not auto-advance into whatever
+/// happens to follow while the tree is being pulled out from
+/// under it.
+///
+/// Returns how many items were dropped, and publishes the queue
+/// only when at least one was — a Remove of a source with
+/// nothing queued must not emit an envelope that says nothing
+/// new.
+pub(crate) async fn drop_queue_items_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    prefix: &str,
+) -> Result<usize, VerbError> {
+    if prefix.is_empty() {
+        return Ok(0);
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "remove_source".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let doomed: Vec<&MpdQueueItem> = items
+        .iter()
+        .filter(|i| queue_path_is_under(&i.file_path, prefix))
+        .collect();
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    if let Some(current) = status.song_position {
+        if doomed.iter().any(|i| i.position == current) {
+            conn.stop().await.map_err(|e| mpd(e, "stop"))?;
+        }
+    }
+    let dropped = doomed.len();
+    for item in doomed {
+        conn.deleteid(item.id)
+            .await
+            .map_err(|e| mpd(e, "deleteid"))?;
+    }
+    publish_queue(ctx, conn).await;
+    Ok(dropped)
+}
+
+/// One queue row set aside so a USB rename can umount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedQueueItem {
+    pub(crate) position: u32,
+    pub(crate) uri: String,
+}
+
+/// Queue rows taken off MPD so it closes the files, to be put
+/// back after remount. Not a Remove: the operator's list is
+/// held here, not discarded.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedQueue {
+    pub(crate) items: Vec<ParkedQueueItem>,
+    pub(crate) playing: bool,
+    pub(crate) paused: bool,
+    pub(crate) current: Option<u32>,
+}
+
+/// Snapshot then drop every queue item under `prefix`.
+///
+/// Rename must umount the volume. A queued track under that
+/// tree is an open file, playing or not, and an open file is
+/// EBUSY. This takes those rows off MPD so the umount is
+/// clean. The caller puts them back after remount. INTERNAL
+/// and a neighbour stick stay in the queue.
+pub(crate) async fn park_queue_items_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    prefix: &str,
+) -> Result<ParkedQueue, VerbError> {
+    if prefix.is_empty() {
+        return Ok(ParkedQueue::default());
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "park_uri_prefix".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let parked_items: Vec<ParkedQueueItem> = items
+        .iter()
+        .filter(|i| queue_path_is_under(&i.file_path, prefix))
+        .map(|i| ParkedQueueItem {
+            position: i.position,
+            uri: i.file_path.clone(),
+        })
+        .collect();
+    if parked_items.is_empty() {
+        return Ok(ParkedQueue::default());
+    }
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    let current = status.song_position;
+    let on_parked = current
+        .is_some_and(|pos| parked_items.iter().any(|i| i.position == pos));
+    let (playing, paused) = if on_parked {
+        (
+            matches!(status.state, PlayState::Playing),
+            matches!(status.state, PlayState::Paused),
+        )
+    } else {
+        (false, false)
+    };
+    drop_queue_items_under(ctx, conn, prefix).await?;
+    Ok(ParkedQueue {
+        items: parked_items,
+        playing,
+        paused,
+        current: if on_parked { current } else { None },
+    })
+}
+
+/// Put parked rows back. `addid` at the original positions.
+/// Never `clear`. Transport is restored only when the parked
+/// current was playing or paused.
+pub(crate) async fn restore_parked_queue(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    parked: &ParkedQueue,
+) -> Result<usize, VerbError> {
+    if parked.items.is_empty() {
+        return Ok(0);
+    }
+    let mut items = parked.items.clone();
+    items.sort_by_key(|i| i.position);
+    let mut restored = 0usize;
+    for item in &items {
+        match conn.addid(&item.uri, Some(item.position)).await {
+            Ok(_) => restored += 1,
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    uri = %item.uri,
+                    position = item.position,
+                    error = %e,
+                    "restore_parked_uris: addid failed; that row is skipped"
+                );
+            }
+        }
+    }
+    if restored == 0 {
+        return Ok(0);
+    }
+    if let Some(pos) = parked.current {
+        if parked.playing || parked.paused {
+            if let Err(e) = conn.play_position(pos).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    position = pos,
+                    error = %e,
+                    "restore_parked_uris: could not restore the current position"
+                );
+            } else if parked.paused {
+                if let Err(e) = conn.pause(true).await {
+                    tracing::warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %e,
+                        "restore_parked_uris: restored play but could not re-pause"
+                    );
+                }
+            }
+            publish_now_playing_after_transport(
+                ctx,
+                conn,
+                "restore_parked_uris",
+            )
+            .await;
+        }
+    }
+    publish_queue(ctx, conn).await;
+    Ok(restored)
+}
+
+/// Rewrite every queue item under `from_prefix` onto `to_prefix`.
+///
+/// USB rename remounts the same files under a new leaf. The
+/// operator's queue still holds the old MPD paths. Clearing
+/// those items would be a Remove they did not ask for; leaving
+/// them stale makes Play a no-op and lets gone-curation wipe
+/// them once the old source row is gone.
+///
+/// Each match is `addid` at the same position, then `deleteid`
+/// of the old row. `addid` first: if the new path is not in
+/// MPD's database yet the old row stays. Never `clear`. Never
+/// `stop`. Segment-aware, so `USB/MUSIC` does not take
+/// `USB/MUSIC2` with it.
+///
+/// When the current song is rewritten and the player was
+/// playing or paused, transport is restored at that index so
+/// the hero follows the new URI. Stopped stays stopped.
+///
+/// Returns how many items were rewritten.
+pub(crate) async fn rewrite_queue_uris_under(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    from_prefix: &str,
+    to_prefix: &str,
+) -> Result<usize, VerbError> {
+    if from_prefix.is_empty()
+        || to_prefix.is_empty()
+        || from_prefix == to_prefix
+    {
+        return Ok(0);
+    }
+    let mpd = |e: crate::mpd::MpdError, what: &str| VerbError::Mpd {
+        verb: "rewrite_uri_prefix".to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let items = conn
+        .playlistinfo()
+        .await
+        .map_err(|e| mpd(e, "playlistinfo"))?;
+    let mut targets: Vec<(u32, u32, String)> = items
+        .iter()
+        .filter_map(|i| {
+            rewrite_queue_path(&i.file_path, from_prefix, to_prefix)
+                .map(|new_uri| (i.id, i.position, new_uri))
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    targets.sort_by(|a, b| b.1.cmp(&a.1));
+    let status = conn.status().await.map_err(|e| mpd(e, "status"))?;
+    let current_pos = status.song_position;
+    let restore = match (current_pos, status.state) {
+        (Some(pos), PlayState::Playing)
+            if targets.iter().any(|(_, p, _)| *p == pos) =>
+        {
+            Some((pos, false))
+        }
+        (Some(pos), PlayState::Paused)
+            if targets.iter().any(|(_, p, _)| *p == pos) =>
+        {
+            Some((pos, true))
+        }
+        _ => None,
+    };
+    let mut rewritten = 0usize;
+    for (old_id, pos, new_uri) in targets {
+        match conn.addid(&new_uri, Some(pos)).await {
+            Ok(_) => {
+                conn.deleteid(old_id)
+                    .await
+                    .map_err(|e| mpd(e, "deleteid"))?;
+                rewritten += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    from = %from_prefix,
+                    to = %to_prefix,
+                    uri = %new_uri,
+                    error = %e,
+                    "rewrite_uri_prefix: addid of the new path failed; \
+                     the old queue row is left in place"
+                );
+            }
+        }
+    }
+    if rewritten == 0 {
+        return Ok(0);
+    }
+    if let Some((pos, paused)) = restore {
+        if let Err(e) = conn.play_position(pos).await {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                position = pos,
+                error = %e,
+                "rewrite_uri_prefix: could not restore the current \
+                 position after the URI rewrite"
+            );
+        } else if paused {
+            if let Err(e) = conn.pause(true).await {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %e,
+                    "rewrite_uri_prefix: restored play but could not \
+                     re-pause"
+                );
+            }
+        }
+        publish_now_playing_after_transport(ctx, conn, "rewrite_uri_prefix")
+            .await;
+    }
+    publish_queue(ctx, conn).await;
+    Ok(rewritten)
+}
+
+/// True when `file_path` is `prefix` itself or sits beneath it.
+///
+/// Segment-aware: `USB/Stick` contains `USB/Stick/a.flac` but not
+/// `USB/Stick2/a.flac`. A raw `starts_with` would take the
+/// neighbouring stick's tracks out of the queue too.
+pub(crate) fn queue_path_is_under(file_path: &str, prefix: &str) -> bool {
+    match file_path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Map `USB/MUSIC/a.flac` under `USB/MUSIC` onto `USB/Audio`.
+pub(crate) fn rewrite_queue_path(
+    file_path: &str,
+    from: &str,
+    to: &str,
+) -> Option<String> {
+    if !queue_path_is_under(file_path, from) {
+        return None;
+    }
+    let rest = file_path.strip_prefix(from)?;
+    Some(format!("{to}{rest}"))
 }
 
 /// `queue.load_playlist_to_queue` — replace queue with stored
@@ -1723,8 +2301,17 @@ pub(crate) async fn handle_save_queue_as_playlist(
 }
 
 /// `queue.skip_to_next_available` — run the skip-traversal
-/// against the current queue starting at the current position;
-/// disposition records fire through the shared emitter.
+/// against the current queue starting *after* the current
+/// position. Starting at the current song would
+/// `play_position` that song again whenever it is reachable,
+/// so the operator skip would be a no-op.
+///
+/// After the walk this call publishes both subjects on its
+/// own stack: now_playing first (the track the skip landed
+/// on is the hero surface), then the queue. Same gap as
+/// `play_from_position`: the walk drives MPD on the shelf's
+/// own connection, so the custody supervisor only hears
+/// about it on the next `player` idle event.
 pub(crate) async fn handle_skip_to_next_available(
     ctx: &QueueContext,
     conn: &mut MpdConnection,
@@ -1742,12 +2329,13 @@ pub(crate) async fn handle_skip_to_next_available(
         verb: "skip_to_next_available".to_string(),
         reason: e.to_string(),
     })?;
-    let from = status.song_position.map(|p| p as i64).unwrap_or(-1);
+    let from = status
+        .song_position
+        .map(|p| i64::from(p).saturating_add(1))
+        .unwrap_or(0);
     let outcome = ctx.skip.advance_to_next_playable(conn, from, &view).await;
-    // Publish the queue to refresh per-item available flags
-    // after the traversal (a successful Playing changes the
-    // current_position; any disposition emission might have
-    // moved sticker reconciler state).
+    publish_now_playing_after_transport(ctx, conn, "skip_to_next_available")
+        .await;
     publish_queue(ctx, conn).await;
     Ok(outcome)
 }
@@ -1763,11 +2351,20 @@ pub(crate) async fn handle_skip_to_next_available(
 /// regardless of prior state (Stop / Pause / already-Playing at
 /// a different position).
 ///
-/// After a successful dispatch, the queue subject is refreshed
-/// so the operator UI's Queue panel reflects the new
-/// `current_position` immediately (the `audio_now_playing`
-/// subject also republishes via the playback shelf's idle-wake
-/// path — no explicit fan-out is needed here).
+/// After a successful dispatch this call publishes both
+/// subjects on its own stack: now_playing first, because the
+/// track the operator just addressed is the hero surface, then
+/// the queue so the Queue panel's `current_position` follows.
+///
+/// The now_playing publish is not redundant with the idle-wake
+/// path. This verb drives MPD on the shelf's own connection, so
+/// the custody supervisor learns of the transport change only
+/// when MPD's `player` idle event reaches it — the operator taps
+/// a track and watches the now-playing surface sit on the
+/// previous one until that wake lands. Reading `status` +
+/// `currentsong` here and publishing through the warden's own
+/// renderer closes that gap without racing it: a later idle-wake
+/// publish carries the same state.
 ///
 /// Shuffle-active behaviour: MPD's `play <pos>` addresses the
 /// operator-facing queue position regardless of `random 1`; the
@@ -1792,8 +2389,59 @@ pub(crate) async fn handle_play_from_position(
             verb: "play_from_position".to_string(),
             reason: e.to_string(),
         })?;
+    publish_now_playing_after_transport(ctx, conn, "play_from_position").await;
     publish_queue(ctx, conn).await;
     Ok(())
+}
+
+/// Read the player and publish now_playing, for a verb that has
+/// just changed MPD's transport on this shelf's own connection.
+///
+/// Best-effort: the transport change has already happened and
+/// the verb has already succeeded. A failed read here costs the
+/// operator the prompt update, not the gesture — the next idle
+/// wake publishes the same state.
+///
+/// Mute is not in MPD. This reads the shared cell the
+/// supervisor writes on `set_mute`.
+async fn publish_now_playing_after_transport(
+    ctx: &QueueContext,
+    conn: &mut MpdConnection,
+    verb: &str,
+) {
+    let status = match conn.status().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb,
+                error = %e,
+                "status read failed after transport change; now_playing \
+                 waits for the next idle wake"
+            );
+            return;
+        }
+    };
+    let song = match conn.current_song().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb,
+                error = %e,
+                "currentsong read failed after transport change; \
+                 now_playing waits for the next idle wake"
+            );
+            return;
+        }
+    };
+    crate::playback_supervisor::publish_now_playing_from_mpd(
+        &ctx.subjects,
+        status,
+        song,
+        ctx.mute.is_muted(),
+    )
+    .await;
 }
 
 // ----- tests -----
@@ -1804,6 +2452,7 @@ mod tests {
     use crate::source_registry::{
         ScanPolicy, SourceKind, SourceRecord, SourceState,
     };
+    use std::collections::HashMap;
 
     fn local_source(id: &str, mount: &str, state: SourceState) -> SourceRecord {
         SourceRecord {
@@ -1823,6 +2472,471 @@ mod tests {
             track_count_available: 0,
             last_scan_at_ms: None,
         }
+    }
+
+    async fn recording_conn(
+        files: Vec<String>,
+    ) -> (MpdConnection, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::RecordingLibrary {
+                commands: Arc::clone(&log),
+                files,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        (conn, log)
+    }
+
+    /// A queue context over a live-queue mock, with the mock's
+    /// command log. Everything the Next proofs need and nothing
+    /// they do not.
+    async fn next_harness(
+        items: Vec<(u32, String)>,
+        playing: Option<u32>,
+    ) -> (
+        QueueContext,
+        MpdConnection,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items,
+                playing,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            ann as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        (ctx, conn, commands)
+    }
+
+    /// The queue as the mock now holds it, in order.
+    async fn queue_paths(conn: &mut MpdConnection) -> Vec<String> {
+        conn.playlistinfo()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.file_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn play_next_on_a_file_places_it_after_the_current_track() {
+        // The row: the URI Add-to-queue takes must Play Next
+        // without a refusal, and it lands after the current
+        // track rather than at the tail.
+        let (ctx, mut conn, log) = next_harness(
+            vec![
+                (11, "INTERNAL/a.flac".to_string()),
+                (12, "INTERNAL/b.flac".to_string()),
+                (13, "INTERNAL/c.flac".to_string()),
+            ],
+            Some(0),
+        )
+        .await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec!["INTERNAL/new.flac".to_string()],
+                position: Some(1),
+            },
+        )
+        .await
+        .expect("Play Next on a file must not refuse");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/a.flac".to_string(),
+                "INTERNAL/new.flac".to_string(),
+                "INTERNAL/b.flac".to_string(),
+                "INTERNAL/c.flac".to_string(),
+            ],
+            "Next lands directly after the current track",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|c| c.contains("addid") && c.contains("\"1\"")),
+            "placed by position, not appended: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_file_uri_appends_when_no_position_is_given() {
+        // Add to queue is the same verb without a position. It
+        // must keep appending, and must not read status to do
+        // it.
+        let (ctx, mut conn, _log) =
+            next_harness(vec![(11, "INTERNAL/a.flac".to_string())], Some(0))
+                .await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec!["INTERNAL/new.flac".to_string()],
+                position: None,
+            },
+        )
+        .await
+        .expect("Add to queue");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/a.flac".to_string(),
+                "INTERNAL/new.flac".to_string(),
+            ],
+            "an omitted position still appends",
+        );
+    }
+
+    #[tokio::test]
+    async fn play_next_on_an_empty_queue_appends_and_never_addids_at_one() {
+        // Nothing is current, so there is no "after this". MPD
+        // answers `addid <uri> "1"` on an empty queue with a Bad
+        // song index ACK — that ACK is the refusal the operator
+        // meets. Next appends instead.
+        let (ctx, mut conn, log) = next_harness(Vec::new(), None).await;
+
+        handle_enqueue(
+            &ctx,
+            &mut conn,
+            EnqueuePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                uris: vec![
+                    "INTERNAL/one.flac".to_string(),
+                    "INTERNAL/two.flac".to_string(),
+                ],
+                position: Some(1),
+            },
+        )
+        .await
+        .expect("Play Next into an empty queue must not refuse");
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/one.flac".to_string(),
+                "INTERNAL/two.flac".to_string(),
+            ],
+            "both tracks land, in order",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .filter(|c| c.starts_with("addid"))
+                .all(|c| !c.contains("\"1\"")),
+            "no addid at position 1 against an empty queue: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_next_on_an_empty_queue_appends_the_files() {
+        // Album / artist / genre Next resolves to a file list
+        // and walks it with addid. The same empty-queue rule
+        // applies, or the operator gets the refusal on every
+        // facet as well as on a file.
+        let (_ctx, mut conn, log) = next_harness(Vec::new(), None).await;
+
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "INTERNAL/album/01.flac".to_string(),
+            "INTERNAL/album/02.flac".to_string(),
+        ]);
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Album,
+        )
+        .await
+        .expect("an album already resolves to files");
+
+        let mut at = next_insert_position(&mut conn, "enqueue_selection")
+            .await
+            .expect("status");
+        assert_eq!(at, None, "an empty queue has no track to follow");
+        for uri in &uris {
+            conn.addid(uri, at).await.expect("no refusal");
+            at = at.map(|p| p.saturating_add(1));
+        }
+
+        assert_eq!(
+            queue_paths(&mut conn).await,
+            vec![
+                "INTERNAL/album/01.flac".to_string(),
+                "INTERNAL/album/02.flac".to_string(),
+            ],
+            "the album's files land in order",
+        );
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("addid")),
+            "the files were placed: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("listallinfo")),
+            "an album is already a file list; do not walk it: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn next_insert_position_follows_the_current_track() {
+        // The whole rule in one read: a current index means
+        // insert after it; no current index means append.
+        let (_ctx, mut conn, _log) = next_harness(
+            vec![
+                (11, "INTERNAL/a.flac".to_string()),
+                (12, "INTERNAL/b.flac".to_string()),
+            ],
+            Some(1),
+        )
+        .await;
+        assert_eq!(
+            next_insert_position(&mut conn, "enqueue").await.unwrap(),
+            Some(2),
+            "after the current track, not at it",
+        );
+
+        let (_ctx2, mut stopped, _log2) =
+            next_harness(vec![(11, "INTERNAL/a.flac".to_string())], None).await;
+        assert_eq!(
+            next_insert_position(&mut stopped, "enqueue").await.unwrap(),
+            None,
+            "a stopped player has no track to follow, so append",
+        );
+    }
+
+    #[tokio::test]
+    async fn play_next_over_a_folder_places_files_never_the_directory() {
+        // `addid` takes a song. Handing it the directory is the
+        // 400 the operator sees on Play Next over a folder.
+        let (mut conn, log) = recording_conn(vec![
+            "USB/Audio/01.flac".to_string(),
+            "USB/Audio/02.flac".to_string(),
+        ])
+        .await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "USB/Audio".to_string(),
+        ]);
+
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Folder,
+        )
+        .await
+        .expect("materialise");
+
+        assert_eq!(
+            uris,
+            vec![
+                "USB/Audio/01.flac".to_string(),
+                "USB/Audio/02.flac".to_string()
+            ],
+            "Next must place the folder's files"
+        );
+        assert!(
+            !uris.iter().any(|u| u == "USB/Audio"),
+            "the directory itself must never reach addid: {uris:?}"
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("listallinfo")),
+            "the expansion must ask MPD what the folder holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_next_over_a_playlist_is_not_walked() {
+        // Every other UriList dimension already resolves to song
+        // or stream URIs. Walking them would be a round trip per
+        // track to learn what we were already told.
+        let (mut conn, log) = recording_conn(vec!["ignored".to_string()]).await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "http://stream.example/live".to_string(),
+        ]);
+
+        let uris = materialise_to_uris(
+            &mut conn,
+            &resolved,
+            crate::selection::SelectionDimension::Playlist,
+        )
+        .await
+        .expect("materialise");
+
+        assert_eq!(uris, vec!["http://stream.example/live".to_string()]);
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("listallinfo")),
+            "a non-folder dimension must not be walked: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn append_over_a_folder_is_still_one_add_of_the_directory() {
+        // Append and Replace hand the directory to MPD's
+        // `add DIR` and let MPD walk it in one command. This
+        // row must not turn that into a per-file addid storm.
+        let (mut conn, log) = recording_conn(Vec::new()).await;
+        let resolved = crate::selection::ResolvedSelection::UriList(vec![
+            "USB/Audio".to_string(),
+        ]);
+
+        apply_append(&mut conn, &resolved, &["USB/Audio".to_string()])
+            .await
+            .expect("append");
+
+        let cmds = log.lock().unwrap().clone();
+        let adds: Vec<&String> =
+            cmds.iter().filter(|c| c.starts_with("add ")).collect();
+        assert_eq!(adds.len(), 1, "exactly one add: {cmds:?}");
+        assert!(
+            adds[0].contains("USB/Audio"),
+            "and it must name the directory: {:?}",
+            adds[0]
+        );
+        assert!(
+            !cmds.iter().any(|c| c.starts_with("addid")),
+            "Append must not addid: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_queue_path_is_segment_aware() {
+        assert_eq!(
+            rewrite_queue_path("USB/MUSIC/a.flac", "USB/MUSIC", "USB/Audio"),
+            Some("USB/Audio/a.flac".to_string()),
+        );
+        assert_eq!(
+            rewrite_queue_path("USB/MUSIC2/a.flac", "USB/MUSIC", "USB/Audio"),
+            None,
+        );
+        assert_eq!(
+            rewrite_queue_path("INTERNAL/a.flac", "USB/MUSIC", "USB/Audio"),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_source_floor_does_not_claim_usb_leftovers() {
+        // After rename the USB row is gone. The floor is mounted
+        // at music_directory, so a first-match walk would call
+        // USB leftovers Internal and gone-curation would empty
+        // the queue.
+        let registry = SourceRegistry::new();
+        registry
+            .register(local_source(
+                "local-internal",
+                "/var/lib/evo/music",
+                SourceState::Online,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "USB/MUSIC/a.flac",
+                &registry,
+            )
+            .await,
+            None,
+        );
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "INTERNAL/a.flac",
+                &registry,
+            )
+            .await
+            .as_deref(),
+            Some("local-internal"),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_source_longest_mount_wins_over_the_floor() {
+        let registry = SourceRegistry::new();
+        registry
+            .register(local_source(
+                "local-internal",
+                "/var/lib/evo/music",
+                SourceState::Online,
+            ))
+            .await
+            .unwrap();
+        registry
+            .register(SourceRecord {
+                id: "usb-audio".into(),
+                display_name: "Audio".into(),
+                kind: SourceKind::LocalUsb {
+                    device_node: "/dev/sdb1".into(),
+                    label: "Audio".into(),
+                },
+                mount_path: PathBuf::from("/var/lib/evo/music/USB/Audio"),
+                mpd_storage_name: None,
+                state: SourceState::Online,
+                last_seen_online_at_ms: None,
+                probe_cadence_ms: 60_000,
+                scan_policy: ScanPolicy::EagerIncremental {
+                    on_online: true,
+                    on_mount_event: false,
+                },
+                track_count: 0,
+                track_count_available: 0,
+                last_scan_at_ms: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_source(
+                Path::new("/var/lib/evo/music"),
+                "USB/Audio/a.flac",
+                &registry,
+            )
+            .await
+            .as_deref(),
+            Some("usb-audio"),
+        );
     }
 
     #[tokio::test]
@@ -2130,6 +3244,7 @@ mod tests {
             Arc::new(NullAnn),
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         for uri in [
@@ -2215,6 +3330,7 @@ mod tests {
             Arc::new(NullAnn),
             skip,
             None,
+            crate::mute_cell::MuteCell::new(),
         );
 
         // Missing objectId after `dlna:<sid>/`.
@@ -2277,6 +3393,1090 @@ mod tests {
         assert_eq!(payload.position, 3);
     }
 
+    /// Records every subject state update in call order, so a
+    /// test can read what a verb published, on which subject,
+    /// and in which order.
+    #[derive(Default)]
+    struct RecordingAnn {
+        updates: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingAnn {
+        /// The addressing values published, in order.
+        fn subjects_touched(&self) -> Vec<String> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(v, _)| v.clone())
+                .collect()
+        }
+
+        /// The states published on one addressing value.
+        fn states_on(&self, value: &str) -> Vec<serde_json::Value> {
+            self.updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(v, _)| v == value)
+                .map(|(_, s)| s.clone())
+                .collect()
+        }
+    }
+
+    /// A resolver that returns a fixed selection so a test can
+    /// drive `enqueue_selection` without standing up MPD tags.
+    struct FixedResolver(crate::selection::ResolvedSelection);
+
+    #[async_trait::async_trait]
+    impl crate::selection::SelectionResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _conn: &mut MpdConnection,
+            _criteria: &crate::selection::SelectionCriteria,
+        ) -> Result<
+            crate::selection::ResolvedSelection,
+            crate::selection::SelectionError,
+        > {
+            Ok(self.0.clone())
+        }
+    }
+
+    impl SubjectAnnouncer for RecordingAnn {
+        fn announce<'a>(
+            &'a self,
+            _a: SubjectAnnouncement,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            addressing: ExternalAddressing,
+            state: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            evo_plugin_sdk::contract::ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.updates.lock().unwrap().push((addressing.value, state));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn play_from_position_publishes_now_playing_on_its_own_stack() {
+        // Tap-to-play drives MPD on the shelf's own connection,
+        // so the custody supervisor does not hear about the
+        // transport change until MPD's next `player` idle event.
+        // The verb publishes now_playing itself rather than
+        // leaving the hero surface on the previous track until
+        // that wake lands.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                    (13, "INTERNAL/c.flac".to_string()),
+                ],
+                playing: None,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        handle_play_from_position(
+            &ctx,
+            &mut conn,
+            PlayFromPositionPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                position: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after play <pos>: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac",
+            "the track named is the one the operator addressed: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_selection_replace_publishes_now_playing_on_its_own_stack()
+    {
+        // Browse → folder → Play Now (and the same-class facet
+        // / album Play Now) is `enqueue_selection` replace:
+        // clear + add + play on the shelf connection. The
+        // custody supervisor does not hear that until MPD's
+        // next `player` idle event. The verb publishes
+        // now_playing itself so glass and kiosk name the new
+        // head without a later pause / play / next / previous.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/old.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let mute = crate::mute_cell::MuteCell::new();
+        mute.set_muted(true);
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            mute,
+        );
+
+        handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/new/01.flac".to_string(),
+                "INTERNAL/new/02.flac".to_string(),
+            ])),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Folder,
+                value: "INTERNAL/new".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Replace,
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after replace: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/new/01.flac",
+            "the track named is the new folder head, not the previous song: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["muted"], true,
+            "replace must not wipe a live mute: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|c| c == "command_list_begin"),
+            "replace is one atomic command list: {seen:?}",
+        );
+        assert!(
+            // `play "0"`, not a bare `play`. Plain `play` uses
+            // the queue's song_position pointer, which survives
+            // the clear and lands playback in the middle of the
+            // freshly-materialised selection.
+            seen.iter().any(|c| {
+                let mut w = c.split_whitespace();
+                w.next() == Some("play")
+                    && w.next().map(|a| a.trim_matches('"')) == Some("0")
+            }),
+            "replace starts at the head of the new queue: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    /// Every command line the mock was sent, in order.
+    type CommandLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A live two-track queue, a context over it, and the
+    /// mock's command log — what a zero-match pin needs to show
+    /// the queue is still standing afterwards.
+    async fn zero_match_harness(
+    ) -> (QueueContext, MpdConnection, Arc<RecordingAnn>, CommandLog) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/keep-one.flac".to_string()),
+                    (12, "INTERNAL/keep-two.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        (ctx, conn, ann, commands)
+    }
+
+    /// Nothing that could mutate the queue may have been sent.
+    /// `clear` is the one that empties it; the rest would mean
+    /// the short-circuit did not short-circuit.
+    fn assert_queue_was_never_touched(seen: &[String], what: &str) {
+        for forbidden in ["clear", "command_list_begin", "addid", "findadd"] {
+            assert!(
+                seen.iter().all(|c| !c.starts_with(forbidden)),
+                "{what}: a zero match must not send {forbidden:?}: {seen:?}",
+            );
+        }
+        for word in ["add", "play"] {
+            assert!(
+                seen.iter()
+                    .all(|c| c.split_whitespace().next() != Some(word)),
+                "{what}: a zero match must not send {word:?}: {seen:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_criteria_selection_leaves_the_queue_in_every_mode() {
+        // The zero-match short-circuit is what stands between a
+        // selection that matched nothing and Replace's `clear`
+        // on a live queue. Every mode returns before the
+        // mutation, and before the now_playing publish: nothing
+        // was transported.
+        for mode in [
+            EnqueueSelectionMode::Replace,
+            EnqueueSelectionMode::Append,
+            EnqueueSelectionMode::Next,
+        ] {
+            let label = mode.as_str().to_string();
+            let (ctx, mut conn, ann, commands) = zero_match_harness().await;
+
+            let body = handle_enqueue_selection_criteria(
+                &ctx,
+                &mut conn,
+                &FixedResolver(crate::selection::ResolvedSelection::UriList(
+                    Vec::new(),
+                )),
+                crate::selection::SelectionCriteria {
+                    dimension: crate::selection::SelectionDimension::Album,
+                    value: "No Such Album".to_string(),
+                    parent: None,
+                },
+                mode,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{label}: zero match is not an error: {e:?}")
+            });
+
+            assert_eq!(body["status"], "empty", "{label}: {body}");
+            assert_eq!(body["added_uris_count"], 0, "{label}: {body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("queue unchanged"),
+                "{label}: the body says so too: {body}",
+            );
+            assert!(
+                ann.subjects_touched().is_empty(),
+                "{label}: nothing moved, so neither subject publishes: {:?}",
+                ann.subjects_touched(),
+            );
+            let seen = commands.lock().unwrap().clone();
+            assert_queue_was_never_touched(&seen, &label);
+            assert_eq!(
+                conn.playlistinfo()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.file_path)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "INTERNAL/keep-one.flac".to_string(),
+                    "INTERNAL/keep-two.flac".to_string(),
+                ],
+                "{label}: the operator's queue is still standing",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_leaves_the_queue_on_replace() {
+        // The second door. A `Filter` resolves without knowing
+        // its own match count, so the guard pays for one MPD
+        // `count` to find out. Pinning only the UriList door
+        // would leave this one open — and a facet Play Now is a
+        // Filter.
+        let (ctx, mut conn, ann, commands) = zero_match_harness().await;
+
+        let body = handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::Filter {
+                pairs: vec![("album".to_string(), "No Such Album".to_string())],
+                substring: false,
+            }),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Album,
+                value: "No Such Album".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Replace,
+        )
+        .await
+        .expect("zero match is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("count")),
+            "the count door is the one under test: {seen:?}",
+        );
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing transported, nothing published: {:?}",
+            ann.subjects_touched(),
+        );
+        assert_queue_was_never_touched(&seen, "filter");
+    }
+
+    #[tokio::test]
+    async fn a_container_with_no_leaves_leaves_the_queue_on_replace() {
+        // The third door. A DLNA container that carried no
+        // playable leaf must not clear the queue either.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/keep-one.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert("empty-oid".into(), browse_page_response(Vec::new()));
+        let dispatcher = Arc::new(ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let mut dlna = local_source("dlna-1", "/unused", SourceState::Online);
+        dlna.kind = SourceKind::NetworkDlna {
+            service_id: "svc".to_string(),
+            control_url: String::new(),
+            base_url: String::new(),
+        };
+        registry.register(dlna).await.unwrap();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            Some(dispatcher as Arc<dyn evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher>),
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        let body = handle_enqueue_selection_container(
+            &ctx,
+            &mut conn,
+            Some("dlna-1".to_string()),
+            ContainerSelection {
+                kind: ContainerSelectionKind::Container,
+                uri: "empty-oid".to_string(),
+            },
+            EnqueueSelectionMode::Replace,
+            None,
+            None,
+        )
+        .await
+        .expect("an empty container is not an error");
+
+        assert_eq!(body["status"], "empty", "{body}");
+        assert_eq!(body["enqueued_count"], 0, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("queue unchanged"),
+            "the body says so too: {body}",
+        );
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing transported, nothing published: {:?}",
+            ann.subjects_touched(),
+        );
+        let seen = commands.lock().unwrap().clone();
+        assert_queue_was_never_touched(&seen, "container");
+    }
+
+    /// A context and a connection onto MPD's stored-playlist
+    /// namespace with a live queue behind it, for the save-as
+    /// pins. `held` starts with whatever the test seeds.
+    async fn save_as_harness(
+        seeded: Vec<(String, Vec<String>)>,
+        queue: Vec<String>,
+    ) -> (
+        QueueContext,
+        MpdConnection,
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+        CommandLog,
+    ) {
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let playlists = Arc::new(std::sync::Mutex::new(
+            seeded
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::StoredPlaylists {
+                commands: Arc::clone(&commands),
+                playlists: Arc::clone(&playlists),
+                library: Vec::new(),
+                queue,
+            }])
+            .await;
+        let conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            ann as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+        (ctx, conn, playlists, commands)
+    }
+
+    fn live_queue_uris() -> Vec<String> {
+        vec![
+            "INTERNAL/playing-one.flac".to_string(),
+            "INTERNAL/playing-two.flac".to_string(),
+        ]
+    }
+
+    fn already_held() -> Vec<(String, Vec<String>)> {
+        vec![(
+            "Road mix".to_string(),
+            vec!["INTERNAL/had-one.flac".to_string()],
+        )]
+    }
+
+    fn save_as(name: &str, overwrite: bool) -> SaveQueueAsPlaylistPayload {
+        SaveQueueAsPlaylistPayload {
+            v: QUEUE_PAYLOAD_VERSION,
+            playlist_name: name.to_string(),
+            overwrite,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_as_with_overwrite_rms_the_name_then_saves() {
+        // Overwrite is the operator saying "replace that one".
+        // MPD's `save` ACKs 56 on a name that exists, so the
+        // pre-delete is what makes the overwrite land at all.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Road mix", true),
+        )
+        .await
+        .expect("overwrite saves");
+
+        let seen = commands.lock().unwrap().clone();
+        let removed = seen
+            .iter()
+            .position(|c| c.split_whitespace().next() == Some("rm"))
+            .expect("overwrite deletes the old name first");
+        let saved = seen
+            .iter()
+            .position(|c| c.split_whitespace().next() == Some("save"))
+            .expect("then saves");
+        assert!(removed < saved, "rm precedes save: {seen:?}");
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&live_queue_uris()),
+            "the list now holds the queue",
+        );
+        assert_eq!(
+            conn.playlistinfo()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|i| i.file_path)
+                .collect::<Vec<_>>(),
+            live_queue_uris(),
+            "save-as does not mutate the queue it saved",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_without_overwrite_refuses_a_collision_and_keeps_the_list()
+    {
+        // Without overwrite the operator has not agreed to lose
+        // anything. MPD refuses the name, and nothing of theirs
+        // is deleted on the way to finding that out.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        let err = handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Road mix", false),
+        )
+        .await
+        .expect_err("a taken name refuses");
+        assert!(
+            matches!(err, VerbError::Mpd { .. }),
+            "the ACK reaches the caller: {err:?}",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("rm")),
+            "a refused overwrite must not delete the operator's list: {seen:?}",
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c.split_whitespace().next() == Some("save")),
+            "the save was still attempted: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec!["INTERNAL/had-one.flac".to_string()]),
+            "the list is exactly as it was",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_without_overwrite_saves_a_name_nobody_holds() {
+        // The common Save as: a fresh name, no collision, and
+        // no rm anywhere near it.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Brand new", false),
+        )
+        .await
+        .expect("a free name saves");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("rm")),
+            "a first-time name is not deleted first: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Brand new"),
+            Some(&live_queue_uris()),
+            "the new list holds the queue",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Road mix"),
+            Some(&vec!["INTERNAL/had-one.flac".to_string()]),
+            "and the unrelated list is untouched",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_as_with_overwrite_still_saves_a_name_nobody_holds() {
+        // Overwrite against a name that does not exist: MPD ACKs
+        // the rm, the handler swallows that one on purpose, and
+        // the save still lands.
+        let (ctx, mut conn, playlists, commands) =
+            save_as_harness(already_held(), live_queue_uris()).await;
+
+        handle_save_queue_as_playlist(
+            &ctx,
+            &mut conn,
+            save_as("Brand new", true),
+        )
+        .await
+        .expect("a missing name is not a failed save-as");
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|c| c.split_whitespace().next() == Some("save")),
+            "the save still lands: {seen:?}",
+        );
+        assert_eq!(
+            playlists.lock().unwrap().get("Brand new"),
+            Some(&live_queue_uris()),
+            "the new list holds the queue",
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_selection_next_does_not_publish_now_playing() {
+        // Play Next inserts after the current track. The hero
+        // surface stays on what is playing; only replace starts
+        // a new head.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/old.flac".to_string())],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        handle_enqueue_selection_criteria(
+            &ctx,
+            &mut conn,
+            &FixedResolver(crate::selection::ResolvedSelection::UriList(vec![
+                "INTERNAL/next.flac".to_string(),
+            ])),
+            crate::selection::SelectionCriteria {
+                dimension: crate::selection::SelectionDimension::Album,
+                value: "Next".to_string(),
+                parent: None,
+            },
+            EnqueueSelectionMode::Next,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ann.states_on("now_playing").is_empty(),
+            "Next must not steal the hero surface: {:?}",
+            ann.subjects_touched()
+        );
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["queue".to_string()],
+            "Next publishes the queue only",
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_to_next_available_publishes_now_playing_on_its_own_stack() {
+        // Skip drives MPD on the shelf's own connection. The
+        // walk starts after the current track; the verb
+        // publishes now_playing itself rather than leaving
+        // the hero surface on the previous track until the
+        // idle wake lands.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                    (13, "INTERNAL/c.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        let outcome = handle_skip_to_next_available(
+            &ctx,
+            &mut conn,
+            SkipToNextAvailablePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SkipOutcome::Playing { position: 1 },
+            "skip leaves the current track and lands on the next"
+        );
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1, "one now_playing publish");
+        assert_eq!(
+            now_playing[0]["transport_state"], "playing",
+            "the player is playing after the skip: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(
+            now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac",
+            "the track named is the one the skip landed on: {:?}",
+            now_playing[0]
+        );
+
+        assert_eq!(
+            ann.subjects_touched(),
+            vec!["now_playing".to_string(), "queue".to_string()],
+            "the hero surface first, then the queue — and nothing else",
+        );
+
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.starts_with("currentsong")),
+            "the same call reads currentsong: {seen:?}",
+        );
+        assert!(
+            seen.iter().all(|c| !c.starts_with("idle")),
+            "it does not wait for an idle wake: {seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_to_next_available_keeps_the_operator_mute() {
+        // The shelf used to publish muted=false because it
+        // could not see the supervisor's task-local flag. The
+        // shared cell is the operator's mute; a skip must not
+        // unmute the hero surface.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![
+                    (11, "INTERNAL/a.flac".to_string()),
+                    (12, "INTERNAL/b.flac".to_string()),
+                ],
+                playing: Some(0),
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let mute = crate::mute_cell::MuteCell::new();
+        mute.set_muted(true);
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            mute,
+        );
+
+        handle_skip_to_next_available(
+            &ctx,
+            &mut conn,
+            SkipToNextAvailablePayload {
+                v: QUEUE_PAYLOAD_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+
+        let now_playing = ann.states_on("now_playing");
+        assert_eq!(now_playing.len(), 1);
+        assert_eq!(
+            now_playing[0]["muted"], true,
+            "skip must not wipe a live mute: {:?}",
+            now_playing[0]
+        );
+        assert_eq!(now_playing[0]["track"]["mpd_path"], "INTERNAL/b.flac");
+    }
+
+    #[tokio::test]
+    async fn a_refused_play_from_position_publishes_nothing() {
+        // Out of range refuses before MPD is touched. A verb
+        // that changed nothing must not move either subject.
+        use crate::playback_supervisor::test_mock::{
+            short_timeouts, spawn_mock_mpd, ConnBehaviour,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, _mock) =
+            spawn_mock_mpd(vec![ConnBehaviour::LiveQueue {
+                commands: Arc::clone(&commands),
+                items: vec![(11, "INTERNAL/a.flac".to_string())],
+                playing: None,
+            }])
+            .await;
+        let mut conn =
+            MpdConnection::connect_with_timeouts(endpoint, short_timeouts())
+                .await
+                .unwrap();
+
+        let ann = Arc::new(RecordingAnn::default());
+        let registry = SourceRegistry::new();
+        let disposition = crate::disposition_emitter::DispositionEmitter::new(
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+        );
+        let skip = crate::skip_traversal::SkipTraversal::new(
+            registry.clone(),
+            disposition,
+        );
+        let ctx = QueueContext::new(
+            PathBuf::from("/var/lib/evo/music"),
+            registry,
+            Arc::clone(&ann) as Arc<dyn SubjectAnnouncer>,
+            skip,
+            None,
+            crate::mute_cell::MuteCell::new(),
+        );
+
+        handle_play_from_position(
+            &ctx,
+            &mut conn,
+            PlayFromPositionPayload {
+                v: QUEUE_PAYLOAD_VERSION,
+                position: 7,
+            },
+        )
+        .await
+        .expect_err("position 7 of a one-item queue refuses");
+
+        assert!(
+            ann.subjects_touched().is_empty(),
+            "nothing changed, so nothing is published: {:?}",
+            ann.subjects_touched(),
+        );
+        let seen = commands.lock().unwrap().clone();
+        assert!(
+            // `playlistinfo` is the pre-validation read and also
+            // starts with "play" — match the command word, not
+            // its prefix.
+            seen.iter()
+                .all(|c| c.split_whitespace().next() != Some("play")),
+            "MPD is left untouched beyond the pre-validation read: {seen:?}",
+        );
+    }
+
+    #[test]
+    fn a_source_prefix_matches_on_path_segments_not_characters() {
+        // The stick being removed is `USB/MUSIC`. Everything
+        // under it goes; the neighbouring volume whose name
+        // merely starts with the same characters does not.
+        assert!(queue_path_is_under("USB/MUSIC/a.flac", "USB/MUSIC"));
+        assert!(queue_path_is_under("USB/MUSIC/sub/a.flac", "USB/MUSIC"));
+        assert!(queue_path_is_under("USB/MUSIC", "USB/MUSIC"));
+        assert!(!queue_path_is_under("USB/MUSIC2/a.flac", "USB/MUSIC"));
+        assert!(!queue_path_is_under("USB/MUSICAL/a.flac", "USB/MUSIC"));
+        assert!(!queue_path_is_under("INTERNAL/a.flac", "USB/MUSIC"));
+        // Stream URIs live under no mount at all.
+        assert!(!queue_path_is_under(
+            "http://example.com/a.flac",
+            "USB/MUSIC"
+        ));
+    }
+
     #[test]
     fn play_from_position_payload_rejects_missing_position() {
         let json = serde_json::json!({ "v": 1 });
@@ -2300,5 +4500,255 @@ mod tests {
             }
             other => panic!("expected PayloadVersion, got {other:?}"),
         }
+    }
+
+    // --- collect_dlna_container_leaves: descent shape + field
+    //     contract regression guard ----------------------------
+
+    /// Scripted `ShelfRequestDispatcher` that answers a
+    /// `source.dlna.browse` for each `object_id` it recognises
+    /// from a pre-populated map, and errors on any unrecognised
+    /// object_id. Records the object_ids it was asked about in
+    /// call order.
+    struct ScriptedBrowseDispatcher {
+        by_object_id: HashMap<String, serde_json::Value>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl evo_plugin_sdk::contract::shelf_dispatch::ShelfRequestDispatcher
+        for ScriptedBrowseDispatcher
+    {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::shelf_dispatch::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        >{
+            Box::pin(async move {
+                let body: serde_json::Value = serde_json::from_slice(&payload)
+                    .expect("scripted dispatcher: payload is valid JSON");
+                let oid = body
+                    .get("object_id")
+                    .and_then(|v| v.as_str())
+                    .expect("scripted dispatcher: payload carries object_id")
+                    .to_string();
+                self.calls.lock().unwrap().push(oid.clone());
+                let response =
+                    self.by_object_id.get(&oid).unwrap_or_else(|| {
+                        panic!(
+                            "scripted dispatcher: no canned response for \
+                         object_id {oid:?}"
+                        )
+                    });
+                Ok(serde_json::to_vec(response).unwrap())
+            })
+        }
+    }
+
+    /// Build a browse-response entry shaped like the real
+    /// `source.dlna.browse` handler emits — a container carries
+    /// `kind: "directory"` + `path` + `name` but NO `uri`.
+    fn dir_entry(name: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "directory",
+            "name": name,
+            "path": path,
+            "child_count": null,
+        })
+    }
+
+    /// Build a browse-response entry shaped like the real
+    /// `source.dlna.browse` handler emits — a leaf carries
+    /// `kind: "file"` + `path` + `uri` (the stable
+    /// `dlna:<service_id>/<object_id>` playback identity).
+    fn file_entry(name: &str, path: &str, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "file",
+            "name": name,
+            "path": path,
+            "title": name,
+            "uri": uri,
+            "playable": true,
+        })
+    }
+
+    fn browse_page_response(
+        entries: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "status": "ok",
+            "entries": entries,
+            "page": 0,
+            "page_size": 50,
+            "total": entries.len(),
+            "truncated": false,
+            "next_page": serde_json::Value::Null,
+        })
+    }
+
+    /// Regression guard for the pre-fix descent bug: the descent
+    /// used to read `entry.uri` for the directory branch, but the
+    /// peer-shelf browse response emits `uri` ONLY on leaves. So
+    /// subcontainers never made it onto the DFS stack and
+    /// enqueue collapsed to "direct-child leaves of the starting
+    /// container only" — an operator tapping an artist / genre /
+    /// folder / decade tile silently no-op'd the queue.
+    ///
+    /// This test walks a two-level tree
+    ///   root  ->  [artist-A, artist-B]
+    ///   A     ->  [track-A1, track-A2]
+    ///   B     ->  [track-B1, track-B2, track-B3]
+    /// and asserts:
+    ///   1. The dispatcher was called for both artist object_ids
+    ///      (not just root) — proving descent actually pushed
+    ///      subcontainers.
+    ///   2. All 5 leaf URIs came back in tree order.
+    ///   3. The truncated flag is false (subtree exhausted, no
+    ///      cap fired).
+    #[tokio::test]
+    async fn dlna_descent_walks_two_level_container_tree_via_path_field() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![
+                dir_entry("Artist A", "oid-artist-a"),
+                dir_entry("Artist B", "oid-artist-b"),
+            ]),
+        );
+        by_oid.insert(
+            "oid-artist-a".into(),
+            browse_page_response(vec![
+                file_entry("A1", "oid-a1", "dlna:svc/oid-a1"),
+                file_entry("A2", "oid-a2", "dlna:svc/oid-a2"),
+            ]),
+        );
+        by_oid.insert(
+            "oid-artist-b".into(),
+            browse_page_response(vec![
+                file_entry("B1", "oid-b1", "dlna:svc/oid-b1"),
+                file_entry("B2", "oid-b2", "dlna:svc/oid-b2"),
+                file_entry("B3", "oid-b3", "dlna:svc/oid-b3"),
+            ]),
+        );
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            /* max_depth  */ 6,
+            /* max_tracks */ 100,
+            /* page_size  */ 50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert_eq!(
+            leaves,
+            vec![
+                "dlna:svc/oid-a1".to_string(),
+                "dlna:svc/oid-a2".to_string(),
+                "dlna:svc/oid-b1".to_string(),
+                "dlna:svc/oid-b2".to_string(),
+                "dlna:svc/oid-b3".to_string(),
+            ],
+            "leaves collected in tree order across both subcontainers"
+        );
+        assert!(!truncated, "subtree fully exhausted within caps");
+
+        let calls = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "root".to_string(),
+                "oid-artist-a".to_string(),
+                "oid-artist-b".to_string(),
+            ],
+            "descent visited both subcontainers — the pre-fix bug \
+             visited only root"
+        );
+    }
+
+    /// Track-cap regression guard: hitting `max_tracks` mid-page
+    /// aborts descent immediately and sets `truncated`.
+    #[tokio::test]
+    async fn dlna_descent_caps_tracks_and_marks_truncated() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![
+                file_entry("t1", "o1", "dlna:svc/o1"),
+                file_entry("t2", "o2", "dlna:svc/o2"),
+                file_entry("t3", "o3", "dlna:svc/o3"),
+            ]),
+        );
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            6,
+            /* max_tracks = */ 2,
+            50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert_eq!(
+            leaves,
+            vec!["dlna:svc/o1".to_string(), "dlna:svc/o2".to_string()]
+        );
+        assert!(truncated, "cap fired at 2 tracks");
+    }
+
+    /// Depth-cap regression guard: at `max_depth = 1`, the root is
+    /// browsed but its subcontainers are refused entry and
+    /// `truncated` is set.
+    #[tokio::test]
+    async fn dlna_descent_caps_depth_and_marks_truncated() {
+        let mut by_oid: HashMap<String, serde_json::Value> = HashMap::new();
+        by_oid.insert(
+            "root".into(),
+            browse_page_response(vec![dir_entry("child", "oid-child")]),
+        );
+        // deliberately don't register "oid-child": if descent
+        // reached it the dispatcher would panic.
+        let dispatcher = ScriptedBrowseDispatcher {
+            by_object_id: by_oid,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let (leaves, truncated) = collect_dlna_container_leaves(
+            &dispatcher,
+            "svc",
+            "root",
+            /* max_depth = */ 1,
+            100,
+            50,
+        )
+        .await
+        .expect("descent succeeds");
+
+        assert!(leaves.is_empty(), "no leaves at depth 1");
+        assert!(truncated, "depth cap fired on child");
     }
 }

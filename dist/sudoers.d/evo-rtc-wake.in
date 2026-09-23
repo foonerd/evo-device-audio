@@ -1,0 +1,7 @@
+# Narrow NOPASSWD grant for the distribution RTC wake wrapper.
+# The wrapper is root-owned, installed mode 0755, and validates
+# its single UTC epoch-seconds argument before writing wakealarm.
+
+Cmnd_Alias EVO_RTC_WAKE = /usr/local/bin/evo-rtc-wake
+
+@EVO_SERVICE_USER@ ALL=(ALL) NOPASSWD: EVO_RTC_WAKE

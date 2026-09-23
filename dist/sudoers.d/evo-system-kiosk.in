@@ -4,9 +4,9 @@
 #
 # Grants the steward service user (substituted at install
 # time for the `@EVO_SERVICE_USER@` placeholder) NOPASSWD
-# access to exactly two commands the
+# access to exactly three commands the
 # `org.evoframework.system.kiosk` plugin invokes for the
-# operator-gestured `set_enabled` verb:
+# operator-gestured `set_enabled` and `set_cursor` verbs:
 #
 # 1. `EVO_SYSTEM_KIOSK_ENABLE` — `/usr/bin/systemctl enable
 #    --now evo-kiosk.service`. Turns the kiosk session on
@@ -15,6 +15,14 @@
 # 2. `EVO_SYSTEM_KIOSK_DISABLE` — `/usr/bin/systemctl disable
 #    --now evo-kiosk.service`. Turns the kiosk session off
 #    persistently + stops it now.
+#
+# 3. `EVO_SYSTEM_KIOSK_RESTART` — `/usr/bin/systemctl restart
+#    evo-kiosk.service`. Used by `set_cursor`. Pointer
+#    visibility is decided by which cursor theme the compositor
+#    loads, and a compositor only loads that at startup, so the
+#    operator's toggle is applied by restarting the session.
+#    Note the deliberate absence of `--now`: this alias restarts
+#    a session, it never changes whether the unit is enabled.
 #
 # Both aliases are EXACT-MATCH. The framework dispatcher's
 # per-verb capability gate (`write:system_admin`) is the FIRST
@@ -45,9 +53,12 @@
 
 Cmnd_Alias EVO_SYSTEM_KIOSK_ENABLE = /usr/bin/systemctl enable --now evo-kiosk.service
 Cmnd_Alias EVO_SYSTEM_KIOSK_DISABLE = /usr/bin/systemctl disable --now evo-kiosk.service
+Cmnd_Alias EVO_SYSTEM_KIOSK_RESTART = /usr/bin/systemctl restart evo-kiosk.service
 
 Defaults!EVO_SYSTEM_KIOSK_ENABLE !pam_session, !syslog
 Defaults!EVO_SYSTEM_KIOSK_DISABLE !pam_session, !syslog
+Defaults!EVO_SYSTEM_KIOSK_RESTART !pam_session, !syslog
 
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_KIOSK_ENABLE
 @EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_KIOSK_DISABLE
+@EVO_SERVICE_USER@ ALL=(root) NOPASSWD: EVO_SYSTEM_KIOSK_RESTART

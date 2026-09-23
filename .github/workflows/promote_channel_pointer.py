@@ -9,9 +9,10 @@ Behaviour:
   replace or insert the (piece, version) entry passed on the command
   line, and write back a sorted pointer list.
 
-The format is provisional (v0); see SECRETS.md and the framework's
-release-plane contract documentation for the ongoing work in
-evo-core that will reshape this in-place.
+Piece names are evo-device-audio (the audio steward) or an
+OOP plugin from dist/scripts/lib/oop-plugins.sh. Versions must
+already exist as published bytes (binaries/evo-device-audio/<ver>/
+or bundles/<plugin>/<target>/<plugin>-<ver>-<target>.tar.gz).
 """
 
 from __future__ import annotations
