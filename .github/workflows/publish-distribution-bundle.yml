@@ -13,12 +13,11 @@
 #
 # The tarball is a GitHub Release asset, not a git blob.
 # GitHub rejects files over 100 MB; these tarballs are ~110 MB.
-# Testers already curl releases/latest/download. Git on
-# artefacts holds only bundles/distribution/<version>.toml.
-# Creates GitHub Release <tag> with --latest=false and does
-# not modify GitHub Release v0.1.13. Testers curl Latest; the
-# operator marks the remint release Latest after this job is
-# green so they stop installing the previous cut's tarball.
+# Testers curl releases/latest/download. Latest is v0.1.13.0.
+# A bake of that tag replaces the tarball, the signature, and
+# the checksum on that release. Git on artefacts holds only
+# bundles/distribution/<version>.toml. Does not modify GitHub
+# Release v0.1.13. Does not move Latest.
 name: publish-distribution-bundle
 
 "on":
