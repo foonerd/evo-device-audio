@@ -9,8 +9,10 @@
 #   plugin   — one plugin from dist/scripts/lib/oop-plugins.sh
 #   dist     — evo-device-audio-dist placement tree
 #
-# Slots (append-only):
-#   binaries/evo-device-audio/<version>/<target>/
+# Slots (append-only), keyed on the cut number in CUT_VERSION
+# at the repository root — not on the three-component crate
+# version in Cargo.toml:
+#   binaries/evo-device-audio/<cut>/<target>/
 #   bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz
 #
 # Does not publish evo-core's `evo` or `evo-plugin-tool`. Those
@@ -156,11 +158,29 @@ jobs:
             echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
             exit 1
           fi
-          VERSION=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
+          # The cut number, not the crate version.
+          #
+          # Cargo versions are three components, so `0.1.13.0`
+          # cannot live in Cargo.toml. Reading the crate version
+          # here is what made the tag's fourth component
+          # decorative: a second cut(0.1.13.0) landed in the
+          # `0.1.13` slot the first cut had filled, was skipped
+          # as already published, and the run went green having
+          # stored nothing.
+          #
+          # No fallback to Cargo.toml. A missing or malformed
+          # CUT_VERSION is a hard failure, because a fallback
+          # would restore that defect while looking correct.
+          VERSION=$(tr -d " \t\r\n" < CUT_VERSION 2>/dev/null || true)
           if [ -z "$VERSION" ]; then
-            echo "::error::Could not read workspace version"
+            echo "::error::CUT_VERSION is missing or empty at the repository root; the cut number is required to key a slot"
             exit 1
           fi
+          case "$VERSION" in
+            v*)
+              echo "::error::CUT_VERSION must not carry a leading v (read: $VERSION)"
+              exit 1 ;;
+          esac
           umask 077
           printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
 
@@ -307,7 +327,29 @@ jobs:
             echo "::error::PLUGIN_SIGNING_KEY_PEM is empty or unset"
             exit 1
           fi
-          VERSION=$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)
+          # The cut number, not the crate version.
+          #
+          # Cargo versions are three components, so `0.1.13.0`
+          # cannot live in Cargo.toml. Reading the crate version
+          # here is what made the tag's fourth component
+          # decorative: a second cut(0.1.13.0) landed in the
+          # `0.1.13` slot the first cut had filled, was skipped
+          # as already published, and the run went green having
+          # stored nothing.
+          #
+          # No fallback to Cargo.toml. A missing or malformed
+          # CUT_VERSION is a hard failure, because a fallback
+          # would restore that defect while looking correct.
+          VERSION=$(tr -d " \t\r\n" < CUT_VERSION 2>/dev/null || true)
+          if [ -z "$VERSION" ]; then
+            echo "::error::CUT_VERSION is missing or empty at the repository root; the cut number is required to key a slot"
+            exit 1
+          fi
+          case "$VERSION" in
+            v*)
+              echo "::error::CUT_VERSION must not carry a leading v (read: $VERSION)"
+              exit 1 ;;
+          esac
           umask 077
           printenv PLUGIN_SIGNING_KEY_PEM > /tmp/key.pem
           export EVO_PLUGIN_SIGNING_KEY=/tmp/key.pem
