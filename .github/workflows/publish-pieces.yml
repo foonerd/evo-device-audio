@@ -55,6 +55,7 @@ jobs:
     outputs:
       build_steward: ${{ steps.resolve.outputs.build_steward }}
       build_dist: ${{ steps.resolve.outputs.build_dist }}
+      build_kiosk: ${{ steps.resolve.outputs.build_kiosk }}
       plugin_count: ${{ steps.resolve.outputs.plugin_count }}
       plugin_matrix: ${{ steps.resolve.outputs.plugin_matrix }}
     steps:
