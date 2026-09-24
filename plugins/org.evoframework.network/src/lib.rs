@@ -6228,6 +6228,192 @@ impl NmInner {
         Ok(())
     }
 
+    /// Bring the saved hotspot back up at load.
+    ///
+    /// NetworkManager used to do this. The saved profile carries
+    /// autoconnect, so when the access-point vif appeared NM
+    /// activated it without anyone asking. Marking that vif
+    /// unmanaged — which is what stops NM claiming it as a station
+    /// and wedging it on "device or resource busy" — also stops
+    /// the autoconnect that raised it. A restart then left the
+    /// access point down with nothing to bring it back, and on a
+    /// headless player with no cable that access point is the only
+    /// way in.
+    ///
+    /// The saved profile is raised exactly as it stands. Its
+    /// interface is read off the profile rather than chosen here,
+    /// so nothing is retargeted onto the station radio, and its
+    /// security is neither read nor rewritten.
+    ///
+    /// Best-effort: every exit is a recorded step and the load
+    /// continues. A device whose hotspot did not come up still
+    /// serves whatever else it has.
+    async fn raise_saved_hotspot_at_load(
+        &self,
+        intent: &NetworkIntent,
+    ) -> Vec<String> {
+        let mut steps: Vec<String> = Vec::new();
+        if !intent.fallback.hotspot_enabled {
+            return steps;
+        }
+        if intent.radio_policy.flight_mode {
+            steps.push(
+                "load: flight mode is on; the saved hotspot is not raised"
+                    .to_string(),
+            );
+            return steps;
+        }
+        let hs_name = Self::hotspot_connection_name(intent);
+        if hs_name.trim().is_empty() {
+            return steps;
+        }
+        // A profile that is not there is not this path's to write.
+        // The apply owns creating one; this only restores what the
+        // operator already has.
+        if self
+            .nm_profile_field(&hs_name, "connection.id")
+            .await
+            .is_none()
+        {
+            steps.push(format!(
+                "load: no saved hotspot profile {hs_name}; nothing to raise"
+            ));
+            return steps;
+        }
+        let Some(ap_ifname) = self
+            .nm_profile_field(&hs_name, "connection.interface-name")
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            // An unpinned profile would be raised on whatever
+            // NetworkManager picks. Guessing one here is how an
+            // access point lands on the station radio.
+            steps.push(format!(
+                "load: saved hotspot {hs_name} names no interface; not \
+                 raising it on a guess"
+            ));
+            return steps;
+        };
+
+        let sta_ifname = self
+            .resolve_wifi_sta_ifname(Some(intent.wifi.ifname.as_str()))
+            .await
+            .unwrap_or_default();
+        let ap_on_own_vif = !sta_ifname.is_empty() && ap_ifname != sta_ifname;
+        if ap_on_own_vif {
+            // The vif does not survive a reboot, and after a
+            // restart it may be there but claimed. This creates it
+            // when absent, takes it off NetworkManager, and puts a
+            // station-typed vif back into AP mode.
+            if !self.ensure_ap_vif_present(&sta_ifname, &ap_ifname).await {
+                steps.push(format!(
+                    "load: could not make the access point vif {ap_ifname} \
+                     present; saved hotspot {hs_name} not raised"
+                ));
+                return steps;
+            }
+        }
+        if let Err(e) = self
+            .gate_ap_vif_type(&ap_ifname, ap_on_own_vif, &hs_name, &mut steps)
+            .await
+        {
+            steps.push(format!("load: {e}"));
+            return steps;
+        }
+        match self
+            .connection_up_hotspot_with_retries(&hs_name, &mut steps)
+            .await
+        {
+            HotspotBringUp::Up => steps.push(format!(
+                "load: raised the saved hotspot {hs_name} on {ap_ifname}"
+            )),
+            HotspotBringUp::PhyExclusive => steps.push(format!(
+                "load: this radio will not carry {hs_name} beside what is \
+                 already on it"
+            )),
+            HotspotBringUp::Failed => steps
+                .push(format!("load: saved hotspot {hs_name} did not come up")),
+        }
+        steps
+    }
+
+    /// The access point may not be raised on a station.
+    ///
+    /// When the hotspot has its own virtual interface, that vif
+    /// was created `type __ap`. If it reads back anything else,
+    /// NetworkManager claimed it before the profile bound and
+    /// wpa_supplicant set it up as a station. Raising on it would
+    /// put a second `managed` interface on a phy that allows one,
+    /// and the kernel's refusal — "device or resource busy" —
+    /// would be retried until NetworkManager gave up.
+    ///
+    /// So the type is read, and a wrong type stops the raise
+    /// instead of feeding it. The vif is not re-typed here and the
+    /// saved profile is not retargeted onto the station radio:
+    /// this reports what it found and leaves the repair to a path
+    /// that is allowed to make it.
+    ///
+    /// Every path that raises the hotspot goes through this — the
+    /// apply, and the raise at load — so there is one gate rather
+    /// than one per caller.
+    async fn gate_ap_vif_type(
+        &self,
+        ifname: &str,
+        ap_on_own_vif: bool,
+        hotspot_name: &str,
+        steps: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        // The access point may not be raised on a station.
+        //
+        // When the hotspot has its own virtual interface, that vif
+        // was created `type __ap`. If it reads back anything else,
+        // NetworkManager claimed it before the profile bound and
+        // wpa_supplicant set it up as a station. Raising here would
+        // put a second `managed` interface on a phy that allows
+        // one, and the kernel's refusal — "device or resource
+        // busy" — would be retried until NetworkManager gave up.
+        //
+        // So the type is read, and a wrong type stops the raise
+        // instead of feeding it. The vif is not re-typed and the
+        // saved profile is not retargeted onto the station radio:
+        // this reports what it found and leaves the repair to a
+        // path that is allowed to make it.
+        if ap_on_own_vif && !ifname.is_empty() {
+            match self.iw_iftype(ifname).await {
+                Some(ty) if ty.eq_ignore_ascii_case("ap") => {}
+                Some(ty) => {
+                    steps.push(format!(
+                        "hotspot {hotspot_name} not raised: {ifname} is \
+                         type {ty}, not AP — NetworkManager claimed the \
+                         vif before the profile bound"
+                    ));
+                    return Err(PluginError::Permanent(format!(
+                        "access point vif {ifname} is type {ty}, not AP; \
+                         refusing to raise the hotspot on a station \
+                         interface"
+                    )));
+                }
+                None => {
+                    steps.push(format!(
+                        "hotspot {hotspot_name} not raised: could not read \
+                         the interface type of {ifname}; the access point \
+                         is only raised on a confirmed AP interface"
+                    ));
+                    return Err(PluginError::Transient(format!(
+                        "could not read the interface type of access point \
+                         vif {ifname}"
+                    )));
+                }
+            }
+            // Confirmed AP. Hand it back so the profile can bind;
+            // the window this reopens is the activation itself.
+            self.release_nm_onto_ap_vif(ifname, steps).await;
+        }
+
+        Ok(())
+    }
+
     /// Write the hotspot profile and raise it on `wifi_ifname`.
     ///
     /// `ap_on_own_vif` is `true` when the access point has its own
@@ -6436,52 +6622,8 @@ impl NmInner {
             steps.push(format!("added hotspot profile {hotspot_name}"));
         }
 
-        // The access point may not be raised on a station.
-        //
-        // When the hotspot has its own virtual interface, that vif
-        // was created `type __ap`. If it reads back anything else,
-        // NetworkManager claimed it before the profile bound and
-        // wpa_supplicant set it up as a station. Raising here would
-        // put a second `managed` interface on a phy that allows
-        // one, and the kernel's refusal — "device or resource
-        // busy" — would be retried until NetworkManager gave up.
-        //
-        // So the type is read, and a wrong type stops the raise
-        // instead of feeding it. The vif is not re-typed and the
-        // saved profile is not retargeted onto the station radio:
-        // this reports what it found and leaves the repair to a
-        // path that is allowed to make it.
-        if ap_on_own_vif && !ifname.is_empty() {
-            match self.iw_iftype(ifname).await {
-                Some(ty) if ty.eq_ignore_ascii_case("ap") => {}
-                Some(ty) => {
-                    steps.push(format!(
-                        "hotspot {hotspot_name} not raised: {ifname} is \
-                         type {ty}, not AP — NetworkManager claimed the \
-                         vif before the profile bound"
-                    ));
-                    return Err(PluginError::Permanent(format!(
-                        "access point vif {ifname} is type {ty}, not AP; \
-                         refusing to raise the hotspot on a station \
-                         interface"
-                    )));
-                }
-                None => {
-                    steps.push(format!(
-                        "hotspot {hotspot_name} not raised: could not read \
-                         the interface type of {ifname}; the access point \
-                         is only raised on a confirmed AP interface"
-                    ));
-                    return Err(PluginError::Transient(format!(
-                        "could not read the interface type of access point \
-                         vif {ifname}"
-                    )));
-                }
-            }
-            // Confirmed AP. Hand it back so the profile can bind;
-            // the window this reopens is the activation itself.
-            self.release_nm_onto_ap_vif(ifname, steps).await;
-        }
+        self.gate_ap_vif_type(ifname, ap_on_own_vif, hotspot_name, steps)
+            .await?;
 
         match self
             .connection_up_hotspot_with_retries(hotspot_name, steps)
@@ -8359,6 +8501,15 @@ impl Plugin for NetworkPlugin {
                 .store(intent.radio_policy.flight_mode, Relaxed);
             self.wifi_preference_enabled
                 .store(intent.radio_policy.wifi_enabled_pref, Relaxed);
+            // The saved access point comes back by itself or it
+            // does not come back at all — nothing else on the box
+            // raises it now that its vif is unmanaged. Runs before
+            // the supervisor starts so a device that has no other
+            // way in is reachable by the time anything is watching
+            // it.
+            for step in self.inner.raise_saved_hotspot_at_load(&intent).await {
+                tracing::info!(plugin = PLUGIN_NAME, step = %step, "load: hotspot");
+            }
             self.spawn_supervisor().await;
             if let Some(rx) = self.supervisor_view_rx.clone() {
                 self.spawn_supervisor_emitter(rx);
@@ -15087,6 +15238,242 @@ exit 0\n",
         let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
             .unwrap_or_default();
         (got, steps, calls)
+    }
+
+    /// The raise has to be wired into `load`, not merely exist.
+    ///
+    /// The defect this row fixes was not a broken raise — it was
+    /// no raise at all: a restart read the intent, started the
+    /// supervisor, and left the access point down. The tests
+    /// either side of this one call
+    /// `raise_saved_hotspot_at_load` directly and stay green
+    /// whether or not anything ever calls it, and `load` cannot be
+    /// driven from here without a whole `LoadContext` and a live
+    /// supervisor. So the wiring is pinned where it lives.
+    #[test]
+    fn load_raises_the_saved_hotspot() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        // `load` runs to the next item at impl depth.
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+        assert!(
+            body.contains("raise_saved_hotspot_at_load(&intent)"),
+            "load must raise the saved hotspot: nothing else does now \
+             that the access point's vif is unmanaged and \
+             NetworkManager no longer autoconnects it"
+        );
+    }
+
+    /// A rig for the raise at load: an `nmcli` that knows one
+    /// saved hotspot pinned to `ap0`, and an `iw` that starts the
+    /// vif as a station and turns it into an access point only
+    /// when something actually re-types it. Both append to one log.
+    fn load_raise_mocks(dir: &Path, ap_iface: &str) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let state = dir.join("ap-iftype");
+        let nmcli = dir.join("nmcli-load.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"-g connection.id connection show evo-network-hotspot\")\n\
+      echo evo-network-hotspot ;;\n\
+  \"-g connection.interface-name connection show evo-network-hotspot\")\n\
+      echo {ap_iface} ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                ap_iface = ap_iface,
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw = dir.join("iw-load.sh");
+        std::fs::write(
+            &iw,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"iw $*\" >> \"{log}\"\n\
+[ -f \"{state}\" ] || echo managed > \"{state}\"\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"set\" ] && [ \"$4\" = \"type\" ]; then\n\
+  echo AP > \"{state}\"; exit 0\n\
+fi\n\
+TY=\"$(cat \"{state}\")\"\n\
+if [ \"$1\" = \"dev\" ] && [ -z \"$2\" ]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n\\tInterface {ap_iface}\\n\\t\\tifindex 4\\n\\t\\ttype %s\\n' \"$TY\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"info\" ]; then\n\
+  printf 'Interface %s\\n\\tifindex 8\\n\\taddr aa:11:22:33:44:66\\n\\ttype %s\\n' \"$2\" \"$TY\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                state = state.display(),
+                ap_iface = ap_iface,
+            ),
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [&nmcli, &iw] {
+                std::fs::set_permissions(
+                    f,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("chmod mock");
+            }
+        }
+        (nmcli, iw)
+    }
+
+    /// A restart brings the saved access point back.
+    ///
+    /// NetworkManager used to raise it: the profile autoconnects
+    /// and NM activated it when the vif appeared. Marking that vif
+    /// unmanaged — which is what stops NM claiming it as a station
+    /// and wedging it busy — also stops that autoconnect. Without
+    /// a raise at load a restart leaves the access point down with
+    /// nothing to bring it back, which on a headless player with
+    /// no cable is the only way in.
+    #[tokio::test]
+    async fn a_restart_raises_the_saved_hotspot_on_its_own_vif() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            ..NetworkIntent::default()
+        };
+
+        let steps = p.raise_saved_hotspot_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+
+        assert!(
+            calls.contains("nmcli connection up evo-network-hotspot"),
+            "the saved hotspot must be raised at load: {calls}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("raised the saved hotspot")),
+            "the raise must be recorded: {steps:?}"
+        );
+        // Raised as it stands. The interface came off the profile,
+        // so the access point is not moved onto the station radio,
+        // and the profile's security is neither read nor written.
+        assert!(
+            !calls.contains("connection modify"),
+            "the saved profile must not be rewritten at load: {calls}"
+        );
+        assert!(
+            !calls.contains("wifi-sec"),
+            "the profile's security must not be touched at load: {calls}"
+        );
+        assert!(
+            !calls.contains("wlan0 managed") && !calls.contains("up wlan0"),
+            "the hotspot must not be retargeted onto the station: {calls}"
+        );
+    }
+
+    /// The vif is found a station after a restart, and is put back
+    /// into AP mode before the profile binds — not raised on a
+    /// station, and not left down either.
+    #[tokio::test]
+    async fn a_restart_retypes_a_claimed_vif_before_raising() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            ..NetworkIntent::default()
+        };
+        let _ = p.raise_saved_hotspot_at_load(&intent).await;
+
+        let calls: Vec<String> =
+            std::fs::read_to_string(dir.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+        let idx = |needle: &str| {
+            calls.iter().position(|c| c == needle).unwrap_or_else(|| {
+                panic!("missing {needle}: {calls:?}");
+            })
+        };
+        let hold = idx("nmcli device set ap0 managed no");
+        let retype = idx("iw dev ap0 set type __ap");
+        let back = idx("nmcli device set ap0 managed yes");
+        let up = idx("nmcli connection up evo-network-hotspot");
+        assert!(
+            hold < retype && retype < back && back < up,
+            "order must be hold, retype, hand back, raise: {calls:?}"
+        );
+    }
+
+    /// Flight mode is still flight mode at load.
+    #[tokio::test]
+    async fn a_restart_in_flight_mode_raises_nothing() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = load_raise_mocks(dir.path(), "ap0");
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+
+        let intent = NetworkIntent {
+            wifi: WifiIntent {
+                ifname: "wlan0".to_string(),
+                ap_ssid: "evo-4466".to_string(),
+                ..WifiIntent::default()
+            },
+            fallback: FallbackIntent {
+                hotspot_enabled: true,
+                ..FallbackIntent::default()
+            },
+            radio_policy: RadioPolicy {
+                flight_mode: true,
+                ..RadioPolicy::default()
+            },
+            ..NetworkIntent::default()
+        };
+        let _ = p.raise_saved_hotspot_at_load(&intent).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up"),
+            "flight mode must raise nothing: {calls}"
+        );
     }
 
     /// An `nmcli` and an `iw` that append to one log, so the order
