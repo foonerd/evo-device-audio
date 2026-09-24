@@ -4029,6 +4029,19 @@ impl NmInner {
     async fn ensure_ap_vif_present(&self, sta_if: &str, ap_if: &str) -> bool {
         let exec = self.effective_iw_exec();
         let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+
+        // Take the vif off NetworkManager before anything else
+        // touches it.
+        //
+        // A vif that survived an earlier apply is the one NM has
+        // already claimed, and it is still claimed now. Holding
+        // first means the read below, and the profile bind after
+        // it, happen on a device NM has let go of — rather than
+        // racing a claim we then try to undo. When the vif does
+        // not exist yet this is a no-op and costs one refused
+        // nmcli call.
+        self.hold_nm_off_ap_vif(ap_if).await;
+
         match wifi_phy::ensure_ap_vif_present(
             exec.as_ref(),
             &self.config.iw_path,
@@ -4039,7 +4052,14 @@ impl NmInner {
         .await
         {
             Ok(()) => {
+                // A vif created just now is new to NetworkManager,
+                // which sees the netlink event and claims it. That
+                // gap cannot be closed with nmcli — the device has
+                // to exist before it can be named — so it is shut
+                // as fast as a call allows, and the type repair
+                // below cleans up a claim that won the race.
                 self.hold_nm_off_ap_vif(ap_if).await;
+                self.reassert_ap_vif_type(ap_if).await;
                 true
             }
             Err(e) => {
@@ -4074,6 +4094,51 @@ impl NmInner {
     /// Best-effort by design. A failure here is not fatal — the
     /// type gate before the raise is what actually refuses, and it
     /// reads the interface rather than trusting this call.
+    /// Put the vif back into AP mode when something else has left
+    /// it a station.
+    ///
+    /// Holding NetworkManager off stops the next claim; it does
+    /// not undo the last one. A vif that NetworkManager took —
+    /// and that wpa_supplicant then failed to set up, because a
+    /// second station on that phy is refused as "device or
+    /// resource busy" — keeps `type managed` afterwards. Left
+    /// alone it stays wrong for the life of the interface and
+    /// every apply declines at the gate.
+    ///
+    /// Called only with the device already unmanaged, so the link
+    /// is down and `iw` will accept the change. A refusal is
+    /// recorded and nothing is retried: the type gate before the
+    /// raise reads the interface again and declines if this did
+    /// not take.
+    async fn reassert_ap_vif_type(&self, ap_if: &str) {
+        let name = ap_if.trim();
+        if name.is_empty() {
+            return;
+        }
+        match self.iw_iftype(name).await {
+            Some(ty) if ty.eq_ignore_ascii_case("ap") => return,
+            _ => {}
+        }
+        let exec = self.effective_iw_exec();
+        let timeout = Duration::from_millis(self.config.iw_timeout_ms);
+        if let Err(e) = wifi_phy::set_ap_vif_iftype(
+            exec.as_ref(),
+            &self.config.iw_path,
+            name,
+            timeout,
+        )
+        .await
+        {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                ap_if = name,
+                error = %e,
+                "could not re-assert the AP vif type; the type gate \
+                 before the raise still applies"
+            );
+        }
+    }
+
     /// Hand a confirmed access-point vif back to NetworkManager so
     /// its profile can bind. The counterpart to
     /// [`Self::hold_nm_off_ap_vif`]; called only once the type has
@@ -15022,6 +15087,162 @@ exit 0\n",
         let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
             .unwrap_or_default();
         (got, steps, calls)
+    }
+
+    /// An `nmcli` and an `iw` that append to one log, so the order
+    /// of calls across the two is visible. `ap_present` puts `ap0`
+    /// in the `iw dev` listing; `iftype` is what every `info` read
+    /// reports.
+    fn ordered_ap_vif_mocks(
+        dir: &Path,
+        iftype: &str,
+        ap_present: bool,
+    ) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let nmcli = dir.join("nmcli-ordered.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        let iw = dir.join("iw-ordered.sh");
+        let ap_line = if ap_present {
+            format!(
+                "\\tInterface ap0\\n\\t\\tifindex 4\\n\\t\\ttype {iftype}\\n"
+            )
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &iw,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"iw $*\" >> \"{log}\"\n\
+if [ \"$1\" = \"dev\" ] && [ -z \"$2\" ]; then\n\
+  printf 'phy#0\\n\\tInterface wlan0\\n\\t\\tifindex 3\\n\\t\\ttype managed\\n{ap_line}'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"dev\" ] && [ \"$3\" = \"info\" ]; then\n\
+  printf 'Interface %s\\n\\tifindex 8\\n\\taddr aa:11:22:33:44:66\\n\\ttype {iftype}\\n' \"$2\"\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log = log.display(),
+                ap_line = ap_line,
+                iftype = iftype,
+            ),
+        )
+        .expect("write iw mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [&nmcli, &iw] {
+                std::fs::set_permissions(
+                    f,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("chmod mock");
+            }
+        }
+        (nmcli, iw)
+    }
+
+    async fn ensure_ap_vif_calls(
+        iftype: &str,
+        ap_present: bool,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (nmcli, iw) = ordered_ap_vif_mocks(dir.path(), iftype, ap_present);
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        p.inner_mut().config.iw_path = iw.to_string_lossy().into_owned();
+        p.inner_mut().config.iw_timeout_ms = 2_000;
+        assert!(p.ensure_ap_vif_present("wlan0", "ap0").await);
+        std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Nothing touches the vif before NetworkManager is let go of
+    /// it.
+    ///
+    /// A vif left over from an earlier apply is one NetworkManager
+    /// already holds. Reading its type, re-typing it, or binding a
+    /// profile to it while NM still holds it is racing a claim
+    /// instead of ending it — and a hold that lands afterwards
+    /// marks an already-broken interface unmanaged, which is what
+    /// the field showed. The hold is the first thing that
+    /// addresses `ap0`, or this is red.
+    #[tokio::test]
+    async fn the_ap_vif_is_taken_off_networkmanager_before_anything_reads_it() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("managed", true).await;
+
+        let first_ap0 = calls
+            .iter()
+            .position(|c| c.contains("ap0"))
+            .expect("something must address ap0");
+        assert_eq!(
+            calls[first_ap0], "nmcli device set ap0 managed no",
+            "the hold must come before anything else touches the vif; \
+             call order was {calls:?}"
+        );
+        // And specifically before the type is read. A reading
+        // taken while NetworkManager still holds the vif is a
+        // reading of a race, not of the interface.
+        let read = calls
+            .iter()
+            .position(|c| c == "iw dev ap0 info")
+            .expect("the type must be read");
+        assert!(
+            first_ap0 < read,
+            "the type must be read only after the hold: {calls:?}"
+        );
+    }
+
+    /// Holding NetworkManager off stops the next claim. It does
+    /// not undo the last one: a vif NM already took keeps
+    /// `type managed` after NM gives up on it, and stays wrong for
+    /// the life of the interface. It is re-typed — and only once
+    /// NM has been let go of it, because `iw` will not retype an
+    /// interface that is up.
+    #[tokio::test]
+    async fn an_ap_vif_left_a_station_is_retyped_after_the_hold() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("managed", true).await;
+
+        let hold = calls
+            .iter()
+            .position(|c| c == "nmcli device set ap0 managed no")
+            .expect("the vif must be taken off NetworkManager");
+        let retype = calls
+            .iter()
+            .position(|c| c == "iw dev ap0 set type __ap")
+            .expect("a station vif must be put back into AP mode");
+        assert!(
+            hold < retype,
+            "the retype must follow the hold, not race it: {calls:?}"
+        );
+    }
+
+    /// The counterweight: a vif that is already an access point is
+    /// left alone. Without this the row could be "passed" by
+    /// re-typing on every apply, which tears down a working
+    /// access point each time.
+    #[tokio::test]
+    async fn an_ap_vif_already_in_ap_mode_is_not_retyped() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let calls = ensure_ap_vif_calls("AP", true).await;
+        assert!(
+            !calls.iter().any(|c| c == "iw dev ap0 set type __ap"),
+            "an AP vif must not be re-typed: {calls:?}"
+        );
     }
 
     /// The window is closed at the moment the vif appears.
