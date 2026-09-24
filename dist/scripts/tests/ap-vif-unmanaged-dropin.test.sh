@@ -38,10 +38,23 @@ assert_ok() {
 }
 
 assert_ok "the drop-in ships" "[[ -f \"\$DROP_IN\" ]]"
-assert_ok "it is a keyfile-plugin setting" \
-    "grep -qE '^\[keyfile\]' \"\$DROP_IN\""
-assert_ok "it marks the AP vif unmanaged" \
-    "grep -qE '^unmanaged-devices=interface-name:ap0\$' \"\$DROP_IN\""
+assert_ok "it is a per-device section" \
+    "grep -qE '^\[device-' \"\$DROP_IN\""
+assert_ok "it matches the AP vif by interface name" \
+    "grep -qE '^match-device=interface-name:ap0\$' \"\$DROP_IN\""
+assert_ok "it marks that device unmanaged" \
+    "grep -qE '^managed=0\$' \"\$DROP_IN\""
+
+# The whole point is a rule the steward can lift again moments
+# later. NetworkManager.conf(5): a device unmanaged via
+# keyfile.unmanaged-devices "is strictly unmanaged and cannot be
+# overruled by using the API like nmcli device set $IFNAME managed
+# yes", and it names device*.managed as the better choice. Used
+# here it kept the access point down for good.
+assert_ok "it does not use the strict, unliftable setting" \
+    "! grep -qE '^unmanaged-devices=' \"\$DROP_IN\""
+assert_ok "it does not declare a keyfile section" \
+    "! grep -qE '^\[keyfile\]' \"\$DROP_IN\""
 
 # The rule and the steward have to name the same interface. If
 # the steward's default vif name ever moves, a drop-in still

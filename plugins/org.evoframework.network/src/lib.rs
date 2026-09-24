@@ -5968,17 +5968,17 @@ impl NmInner {
                     if is_phy_exclusive_failure(&stderr) {
                         return HotspotBringUp::PhyExclusive;
                     }
-                    // The profile naming one interface and
-                    // NetworkManager offering another is not a
-                    // transient. Retrying asks the same wrong
-                    // radio the same question three more times,
-                    // and on a shared phy each attempt is another
-                    // shove at the station.
-                    if is_device_mismatch_failure(&stderr) {
+                    // NetworkManager refusing this profile on
+                    // this device is not a transient — whether it
+                    // reached for the wrong radio or the right one
+                    // is out of its reach. Retrying asks the same
+                    // question of the same refusal, and on a
+                    // shared phy each attempt is another shove at
+                    // the station.
+                    if is_unretryable_device_refusal(&stderr) {
                         steps.push(format!(
-                            "{con_name} was offered a device it does not \
-                             name ({}); not retried",
-                            last_err
+                            "{con_name} was refused on the device it \
+                             names ({last_err}); not retried"
                         ));
                         return HotspotBringUp::Failed;
                     }
@@ -9760,20 +9760,26 @@ fn is_phy_exclusive_failure(stderr: &str) -> bool {
         && (s.contains("flags (up)") || s.contains("set interface"))
 }
 
-/// NetworkManager was asked to raise a profile and reached for a
-/// device the profile does not name.
+/// NetworkManager will not activate this profile on this device,
+/// and asking again will not change that.
 ///
-/// It says so two ways — "mismatching interface name" on the
-/// device it picked, and "not compatible with device" — and both
-/// mean the same thing: the interface the profile is pinned to
-/// was not a candidate at that moment. On a box whose only other
-/// wifi device is the station, the device it reaches for is the
-/// station, and every retry is another shove at the radio the
-/// operator is using.
-fn is_device_mismatch_failure(stderr: &str) -> bool {
+/// Three wordings, one meaning. Two say the device it reached for
+/// is not the one the profile names — "mismatching interface
+/// name" and "not compatible with device" — which on a box whose
+/// only other wifi device is the station means it reached for the
+/// station. The third says the device the profile *does* name has
+/// been placed beyond NetworkManager's reach: "because device is
+/// strictly unmanaged", which is what a `keyfile.unmanaged-devices`
+/// rule produces and what no hand-back can lift.
+///
+/// None of them is transient. Each retry asks the same question
+/// of the same refusal, and on a shared phy every attempt is
+/// another shove at the radio the operator is using.
+fn is_unretryable_device_refusal(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("mismatching interface name")
         || s.contains("not compatible with device")
+        || s.contains("strictly unmanaged")
 }
 
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
@@ -15521,6 +15527,64 @@ exit 0\n",
             !calls.iter().any(|c| c.contains("wlp0s20f3")
                 || c.contains("up evo-network-hotspot ifname wlan0")),
             "the hotspot must never be offered to the station: {calls:?}"
+        );
+    }
+
+    /// A device the hand-back cannot reach is not a retry either.
+    ///
+    /// `keyfile.unmanaged-devices` puts a device beyond
+    /// NetworkManager's own API: the hand-back reports success and
+    /// the activation is still refused, "because device is
+    /// strictly unmanaged". Asking four times does not lift it.
+    #[tokio::test]
+    async fn a_strictly_unmanaged_refusal_is_not_retried() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("calls.log");
+        let nmcli = dir.path().join("nmcli-strict.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection up\"*)\n\
+      echo \"Error: Connection 'evo-network-hotspot' is not available on device ap0 because device is strictly unmanaged\" >&2\n\
+      exit 4 ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                Some("ap0"),
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let ups = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("connection up"))
+            .count();
+        assert_eq!(ups, 1, "a strictly unmanaged device is asked once");
+        assert!(
+            steps.iter().any(|s| s.contains("not retried")),
+            "the refusal must say why it stopped: {steps:?}"
         );
     }
 
