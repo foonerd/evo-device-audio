@@ -85,12 +85,6 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Reverse-DNS plugin name.
 pub const PLUGIN_NAME: &str = "org.evoframework.network";
 
-/// How long to wait for a just-handed-back access-point vif to
-/// become a device NetworkManager will bind a profile to, and how
-/// often to ask.
-const AP_VIF_USABLE_BUDGET_MS: u64 = 5_000;
-const AP_VIF_USABLE_POLL_MS: u64 = 200;
-
 const REQUEST_NETWORK_STATUS: &str = "network.nm.status";
 const REQUEST_NETWORK_SCAN: &str = "network.nm.scan";
 const REQUEST_NETWORK_INTENT_GET: &str = "network.nm.intent.get";
@@ -4145,56 +4139,6 @@ impl NmInner {
         }
     }
 
-    /// Wait until NetworkManager will bind a profile to `ifname`.
-    ///
-    /// NetworkManager walks a device it has just been given from
-    /// `unmanaged` through `unavailable` to `disconnected`, and
-    /// only from `disconnected` on is it a candidate for an
-    /// activation. Polls until it gets there, or until the budget
-    /// runs out.
-    ///
-    /// Returns `false` on a device that never becomes usable and
-    /// on a state that cannot be read at all. The caller declines
-    /// to raise rather than starting an activation
-    /// NetworkManager will hand to the wrong radio.
-    async fn wait_for_nm_device_usable(
-        &self,
-        ifname: &str,
-        budget_ms: u64,
-    ) -> bool {
-        let name = ifname.trim();
-        if name.is_empty() {
-            return false;
-        }
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(budget_ms);
-        loop {
-            if let Some(state) = self
-                .nm_device_state_field(name)
-                .await
-                .filter(|s| !s.trim().is_empty())
-            {
-                if nm_device_state_is_usable(&state) {
-                    return true;
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(AP_VIF_USABLE_POLL_MS))
-                .await;
-        }
-    }
-
-    /// `GENERAL.STATE` for one device, as nmcli renders it —
-    /// `30 (disconnected)`, `100 (connected)`, `10 (unmanaged)`.
-    async fn nm_device_state_field(&self, ifname: &str) -> Option<String> {
-        self.nmcli_output(&["-g", "GENERAL.STATE", "device", "show", ifname])
-            .await
-            .ok()
-            .map(|s| s.trim().to_string())
-    }
-
     /// Hand a confirmed access-point vif back to NetworkManager so
     /// its profile can bind. The counterpart to
     /// [`Self::hold_nm_off_ap_vif`]; called only once the type has
@@ -6495,28 +6439,13 @@ impl NmInner {
             // Confirmed AP. Hand it back so the profile can bind;
             // the window this reopens is the activation itself.
             self.release_nm_onto_ap_vif(ifname, steps).await;
-            // And wait for NetworkManager to finish taking it.
-            //
-            // `device set managed yes` returns when the request is
-            // accepted, not when the device is ready. Until
-            // NetworkManager has walked the vif out of unmanaged
-            // it is not a device any profile can bind to, and an
-            // activation started in that window is offered to
-            // whatever other wifi device exists — the station —
-            // which refuses it as "mismatching interface name".
-            if !self
-                .wait_for_nm_device_usable(ifname, AP_VIF_USABLE_BUDGET_MS)
-                .await
-            {
-                steps.push(format!(
-                    "hotspot {hotspot_name} not raised: {ifname} did not \
-                     become a device NetworkManager will bind within \
-                     {AP_VIF_USABLE_BUDGET_MS}ms"
-                ));
-                return Err(PluginError::Transient(format!(
-                    "access point vif {ifname} did not become usable"
-                )));
-            }
+            // Nothing is waited for here. On this radio the vif
+            // reaches `disconnected` as a *result* of the
+            // activation, not before it, so a readiness gate on
+            // that state is a gate that never opens — five
+            // seconds of silence and then a refusal. The device is
+            // named on the activation instead, which is what stops
+            // NetworkManager offering the profile to the station.
         }
 
         Ok(())
@@ -9841,29 +9770,6 @@ fn is_phy_exclusive_failure(stderr: &str) -> bool {
 /// wifi device is the station, the device it reaches for is the
 /// station, and every retry is another shove at the radio the
 /// operator is using.
-/// NetworkManager's device states, as `GENERAL.STATE` renders
-/// them: `10 (unmanaged)`, `20 (unavailable)`, `30 (disconnected)`
-/// and up. A profile can be activated on a device from
-/// `disconnected` onwards; below that the device is not a
-/// candidate and NetworkManager looks elsewhere.
-///
-/// The number is the contract — the parenthesised word is
-/// localised — so an unparsable reading falls back to the word
-/// and, failing that, is treated as not usable. Waiting a little
-/// longer costs a delayed access point; guessing "usable" costs
-/// an activation offered to the station.
-fn nm_device_state_is_usable(state: &str) -> bool {
-    let t = state.trim();
-    let head: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if let Ok(code) = head.parse::<u32>() {
-        return code >= 30;
-    }
-    let lc = t.to_ascii_lowercase();
-    lc.contains("disconnected")
-        || lc.contains("connected")
-        || lc.contains("activat")
-}
-
 fn is_device_mismatch_failure(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("mismatching interface name")
@@ -15109,7 +15015,6 @@ exit 0\n",
 echo \"$@\" >> \"{log}\"\n\
 case \"$*\" in\n\
   \"connection show evo-network-hotspot\") exit {hs_rc} ;;\n\
-  \"-g GENERAL.STATE device show \"*) printf '30 (disconnected)\\n' ;;\n\
   \"-t -f GENERAL.DEVICE\"*)\n\
       printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 ({state})\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
 esac\n\
@@ -15442,8 +15347,6 @@ case \"$*\" in\n\
       echo evo-network-hotspot ;;\n\
   \"-g connection.interface-name connection show evo-network-hotspot\")\n\
       echo {ap_iface} ;;\n\
-  \"-g GENERAL.STATE device show \"*)\n\
-      echo '30 (disconnected)' ;;\n\
 esac\n\
 exit 0\n",
                 log = log.display(),
@@ -15592,12 +15495,20 @@ exit 0\n",
         let hold = idx("nmcli device set ap0 managed no");
         let retype = idx("iw dev ap0 set type __ap");
         let back = idx("nmcli device set ap0 managed yes");
-        let ready = idx("nmcli -g GENERAL.STATE device show ap0");
         let up = idx("nmcli connection up evo-network-hotspot");
         assert!(
-            hold < retype && retype < back && back < ready && ready < up,
-            "order must be hold, retype, hand back, wait for the device, \
-             raise: {calls:?}"
+            hold < retype && retype < back && back < up,
+            "order must be hold, retype, hand back, raise: {calls:?}"
+        );
+        // And the raise follows the hand-back directly. This
+        // radio reaches `disconnected` as a result of the
+        // activation, not before it, so anything that waits on
+        // the device state here is a wait that never ends.
+        assert_eq!(
+            up,
+            back + 1,
+            "nothing may come between the hand-back and the raise: \
+             {calls:?}"
         );
         // The activation names the device the profile names. Left
         // to choose, NetworkManager reaches for the station and
@@ -15675,28 +15586,6 @@ exit 0\n",
             steps.iter().any(|s| s.contains("not retried")),
             "the refusal must say why it stopped: {steps:?}"
         );
-    }
-
-    /// A device NetworkManager has not finished taking is not one
-    /// it will bind a profile to. `10 (unmanaged)` and
-    /// `20 (unavailable)` are too early; `30 (disconnected)` is
-    /// the floor. An unreadable state waits rather than guesses,
-    /// because guessing "ready" is what offers the access point to
-    /// the station.
-    #[test]
-    fn nm_device_state_usability_starts_at_disconnected() {
-        for early in ["10 (unmanaged)", "20 (unavailable)", "", "?"] {
-            assert!(
-                !nm_device_state_is_usable(early),
-                "{early:?} must not count as usable"
-            );
-        }
-        for ready in ["30 (disconnected)", "100 (connected)", "50 (config)"] {
-            assert!(
-                nm_device_state_is_usable(ready),
-                "{ready:?} must count as usable"
-            );
-        }
     }
 
     /// Flight mode is still flight mode at load.
@@ -16271,7 +16160,6 @@ echo \"$@\" >> \"{log}\"\n\
 case \"$*\" in\n\
   *802-11-wireless.mode*) exit 1 ;;\n\
   \"connection show evo-network-hotspot\") exit 0 ;;\n\
-  \"-g GENERAL.STATE device show \"*) printf '30 (disconnected)\\n' ;;\n\
   \"-t -f GENERAL.DEVICE\"*)\n\
       printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 (disconnected)\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
 esac\n\
