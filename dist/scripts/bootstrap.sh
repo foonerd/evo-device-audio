@@ -35,6 +35,7 @@
 #   EVO_INSTALL_MPD_SUDOERS=0          — skip /etc/sudoers.d/evo-mpd-restart
 #   EVO_INSTALL_NETWORK_NM_SUDOERS=0   — skip /etc/sudoers.d/evo-network-nm
 #   EVO_INSTALL_NETWORK_CAPTIVE_SUDOERS=0 — skip /etc/sudoers.d/evo-network-captive
+#   EVO_INSTALL_NETWORK_AP_VIF_CONF=0  — skip /etc/NetworkManager/conf.d/evo-ap-vif.conf
 #                                       + /usr/local/bin/evo-captive-probe
 #   EVO_INSTALL_HARDWARE_AUDIO_SUDOERS=0 — skip /etc/sudoers.d/evo-hardware-audio
 #   EVO_INSTALL_SYSTEM_POWER_SUDOERS=0  — skip /etc/sudoers.d/evo-system-power
@@ -113,6 +114,8 @@ SYSTEMCTL_BIN="/usr/bin/systemctl"
 SUDOERS_FILE="/etc/sudoers.d/evo-mpd-restart"
 NETWORK_NM_SUDOERS_FILE="/etc/sudoers.d/evo-network-nm"
 NETWORK_CAPTIVE_SUDOERS_FILE="/etc/sudoers.d/evo-network-captive"
+NETWORK_AP_VIF_CONF_DIR="/etc/NetworkManager/conf.d"
+NETWORK_AP_VIF_CONF_FILE="$NETWORK_AP_VIF_CONF_DIR/evo-ap-vif.conf"
 CAPTIVE_PROBE_WRAPPER_SRC=""
 CAPTIVE_PROBE_WRAPPER_DST="/usr/local/bin/evo-captive-probe"
 HARDWARE_AUDIO_SUDOERS_FILE="/etc/sudoers.d/evo-hardware-audio"
@@ -433,6 +436,51 @@ if [[ "${EVO_INSTALL_NETWORK_NM_SUDOERS:-1}" != "0" ]]; then
     echo "[bootstrap] installed $NETWORK_NM_SUDOERS_FILE"
 else
     echo "[bootstrap] EVO_INSTALL_NETWORK_NM_SUDOERS=0 — skipping network.nm sudoers drop-in"
+fi
+
+# ----------------------------------------------------------
+# Step 1b1: /etc/NetworkManager/conf.d/evo-ap-vif.conf
+# ----------------------------------------------------------
+# The access point's virtual interface must be unmanaged before
+# it exists.
+#
+# The steward creates the vif `type __ap` and then marks it
+# unmanaged, but `nmcli` can only name an interface that is
+# already there. In the gap between the netlink event and that
+# call NetworkManager claims the device and wpa_supplicant sets
+# it up as a station, which is refused on a one-station phy as
+# "device or resource busy" — and the vif keeps the wrong type
+# afterwards. A rule that is already in place when the interface
+# appears has no gap to lose.
+#
+# This does not hold the access point down: the steward issues
+# `nmcli device set ap0 managed yes` immediately before it raises
+# the hotspot, which overrides this file at runtime.
+if [[ "${EVO_INSTALL_NETWORK_AP_VIF_CONF:-1}" != "0" ]]; then
+    AP_VIF_CONF_TEMPLATE="$DIST_DIR/networkmanager.conf.d/evo-ap-vif.conf"
+    if [[ ! -f "$AP_VIF_CONF_TEMPLATE" ]]; then
+        echo "AP vif NetworkManager drop-in not found at $AP_VIF_CONF_TEMPLATE" >&2
+        exit 2
+    fi
+    install -d -m 0755 -o root -g root "$NETWORK_AP_VIF_CONF_DIR"
+    install -m 0644 -o root -g root \
+        "$AP_VIF_CONF_TEMPLATE" "$NETWORK_AP_VIF_CONF_FILE"
+    echo "[bootstrap] installed $NETWORK_AP_VIF_CONF_FILE"
+    # Take effect without waiting for a reboot. `reload conf`
+    # re-reads configuration in place; it does not restart
+    # NetworkManager and does not tear down active connections.
+    # Skipped when NetworkManager is not running — a fresh image
+    # reads the file when it first starts.
+    if command -v systemctl >/dev/null 2>&1 &&
+        systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        if "$NMCLI_BIN" general reload conf >/dev/null 2>&1; then
+            echo "[bootstrap] NetworkManager re-read its configuration"
+        else
+            echo "[bootstrap] WARN: could not ask NetworkManager to re-read its configuration; it applies at the next start"
+        fi
+    fi
+else
+    echo "[bootstrap] EVO_INSTALL_NETWORK_AP_VIF_CONF=0 — skipping the AP vif NetworkManager drop-in"
 fi
 
 # ----------------------------------------------------------
