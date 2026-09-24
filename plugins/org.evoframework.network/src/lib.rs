@@ -7322,7 +7322,15 @@ impl NmInner {
         hs_name: &str,
         steps: &mut Vec<String>,
     ) -> Result<bool, PluginError> {
+        // No name, nothing to raise. Silence here reads in the
+        // log as recovery having run and decided nothing, which is
+        // the one thing the operator cannot act on.
         if hs_name.trim().is_empty() {
+            steps.push(
+                "critical: no hotspot connection name is configured; \
+                 no access point raised"
+                    .to_string(),
+            );
             return Ok(false);
         }
         // `fallback.hotspot_enabled == false` is the operator
@@ -7349,7 +7357,20 @@ impl NmInner {
         // down without eth in intent" cases. Now: raise when the
         // supervisor said Offline AND no declared uplink is
         // serving.
+        //
+        // Declining here is the common case and the correct one:
+        // a device that is reachable does not need an access point
+        // forced onto it. But a decline that says nothing is
+        // indistinguishable in the log from recovery failing, and
+        // the supervisor reaching this point at all means something
+        // scored the device Offline. Naming the uplink that is
+        // serving is what tells those two apart.
         if !self.no_serviceable_uplink(intent).await? {
+            steps.push(
+                "critical: a declared uplink is still serving; no access \
+                 point raised"
+                    .to_string(),
+            );
             return Ok(false);
         }
 
@@ -15142,6 +15163,89 @@ exit 0\n",
         p.inner_mut().config.iw_path =
             dir.join("no-such-iw").to_string_lossy().into_owned();
         p
+    }
+
+    /// Recovery declining is not the same as recovery failing, and
+    /// a step list cannot say which if the decline says nothing.
+    ///
+    /// Reaching this function at all means the supervisor scored
+    /// the device Offline for longer than its grace. Coming back
+    /// with `raised=false` and an empty list reads as "recovery
+    /// ran and nothing happened" — which is the one outcome an
+    /// operator cannot act on, because it is indistinguishable
+    /// from the access point having failed to come up.
+    #[tokio::test]
+    async fn recovery_says_why_it_declined_with_no_hotspot_name() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = recovery_nmcli_mock(dir.path(), "disconnected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(&intent, "   ", &mut steps)
+            .await
+            .expect("recovery");
+
+        assert!(!raised, "nothing can be raised without a name");
+        assert!(!steps.is_empty(), "a decline must not be silent: {steps:?}");
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("critical:") && s.contains("name")),
+            "the decline must name its reason: {steps:?}"
+        );
+    }
+
+    /// The common decline, and the correct one: this device is
+    /// reachable, so recovery does not force an access point onto
+    /// it. It still has to say so — a cable that is up and a
+    /// recovery that broke look identical in an empty list.
+    #[tokio::test]
+    async fn recovery_says_why_it_declined_with_an_uplink_still_serving() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A wifi device NetworkManager reports connected is a
+        // serviceable uplink. Ethernet stays out of the intent so
+        // the answer comes from the mock rather than from whatever
+        // interfaces the machine running this happens to have.
+        let nmcli = recovery_nmcli_mock(dir.path(), "connected", false);
+        let p = recovery_plugin(dir.path(), &nmcli);
+
+        let mut intent = NetworkIntent::default();
+        intent.ethernet.enabled = false;
+        intent.fallback.hotspot_enabled = true;
+
+        let mut steps = Vec::new();
+        let raised = p
+            .try_critical_open_hotspot_recovery(
+                &intent,
+                "evo-network-hotspot",
+                &mut steps,
+            )
+            .await
+            .expect("recovery");
+
+        assert!(!raised, "a served device must not be forced an AP");
+        assert!(!steps.is_empty(), "a decline must not be silent: {steps:?}");
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("critical:") && s.contains("serving")),
+            "the decline must name its reason: {steps:?}"
+        );
+        // Declining means declining. Nothing is raised and the
+        // saved profile is not touched on the way past.
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        assert!(
+            !calls.contains("connection up")
+                && !calls.contains("connection modify"),
+            "a decline must raise and rewrite nothing: {calls}"
+        );
     }
 
     /// A beaconing radio is not a way in.
