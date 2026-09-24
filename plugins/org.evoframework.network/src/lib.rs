@@ -5534,6 +5534,48 @@ impl NmInner {
         activated == 0 || written.as_secs() > activated
     }
 
+    /// Is the wired interface up and held by something that is
+    /// not NetworkManager?
+    ///
+    /// Both halves have to be true. An unmanaged device with no
+    /// carrier is a cable that genuinely is not working, and the
+    /// ordinary path should still run for it. An unmanaged device
+    /// that is carrying traffic is somebody else's — ifupdown and
+    /// dhcpcd, on a Debian host whose `[ifupdown] managed=false`
+    /// leaves the stanza in `/etc/network/interfaces` in charge.
+    ///
+    /// Both facts come from NetworkManager in one call, including
+    /// for a device it does not manage. Reading the carrier from
+    /// sysfs instead would tie this to a path no test can stand up
+    /// and would make the answer depend on the machine running it.
+    ///
+    /// Anything unreadable answers `false`, which leaves the
+    /// ordinary path in place. This exists to suppress a pointless
+    /// activation, not to become a new way to skip one.
+    async fn ethernet_is_served_outside_nm(&self, ifname: &str) -> bool {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Ok(raw) = self
+            .nmcli_output(&[
+                "-g",
+                "GENERAL.STATE,WIRED-PROPERTIES.CARRIER",
+                "device",
+                "show",
+                name,
+            ])
+            .await
+        else {
+            return false;
+        };
+        let mut lines = raw.lines().map(str::trim);
+        let state = lines.next().unwrap_or("");
+        let carrier = lines.next().unwrap_or("");
+        state.to_ascii_lowercase().contains("unmanaged")
+            && carrier.eq_ignore_ascii_case("on")
+    }
+
     async fn ensure_ethernet(
         &self,
         intent: &NetworkIntent,
@@ -5578,6 +5620,28 @@ impl NmInner {
                  ethernet profile"
                     .to_string(),
             );
+            return Ok(());
+        }
+        // A cable somebody else is already holding.
+        //
+        // Debian's `[ifupdown] managed=false`, beside an
+        // `iface <eth> inet dhcp` stanza, leaves the wired
+        // interface to ifupdown and dhcpcd. NetworkManager reports
+        // the device unmanaged and will not bind a profile to it,
+        // so activating one can only fail — and the failure is
+        // noise, because the interface it names is carrying
+        // traffic already. On a host reached over that cable it is
+        // also the operator's way in.
+        //
+        // Recorded and stepped over, not repaired: whose cable
+        // this is belongs to a provisioning decision, not to an
+        // apply.
+        if self.ethernet_is_served_outside_nm(&ifname).await {
+            steps.push(format!(
+                "{ifname} is carrying the network under another manager \
+                 and NetworkManager reports it unmanaged; \
+                 {NM_CON_ETHERNET} left alone"
+            ));
             return Ok(());
         }
         let props = Self::nm_ipv4_args(
@@ -16582,6 +16646,112 @@ exit 0\n",
         intent.ethernet.device = "eth0".to_string();
         intent.ethernet.ipv4_mode = Ipv4Mode::Dhcp;
         intent
+    }
+
+    /// An `nmcli` that answers the device-state and carrier probe
+    /// for `eth0` and logs everything it is asked.
+    fn wired_state_nmcli_mock(
+        dir: &Path,
+        state: &str,
+        carrier: &str,
+    ) -> PathBuf {
+        let log = dir.join("nmcli.log");
+        let path = dir.join("nmcli-wired.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"$@\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"-g GENERAL.STATE,WIRED-PROPERTIES.CARRIER device show eth0\")\n\
+      printf '{state}\\n{carrier}\\n' ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display(),
+                state = state,
+                carrier = carrier,
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
+    async fn ethernet_calls(
+        state: &str,
+        carrier: &str,
+    ) -> (Vec<String>, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nmcli = wired_state_nmcli_mock(dir.path(), state, carrier);
+        let p = satisfies_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        p.ensure_ethernet(&dhcp_ethernet_intent(), &mut steps)
+            .await
+            .expect("ensure_ethernet");
+        let calls = std::fs::read_to_string(dir.path().join("nmcli.log"))
+            .unwrap_or_default();
+        (steps, calls)
+    }
+
+    /// A cable somebody else is already holding is not activated.
+    ///
+    /// `[ifupdown] managed=false` beside an `iface <eth> inet dhcp`
+    /// stanza leaves the wired interface to ifupdown and dhcpcd.
+    /// NetworkManager reports the device unmanaged and will not
+    /// bind a profile to it, so the activation can only fail —
+    /// while the interface it names is carrying traffic, and on a
+    /// host reached over that cable is the operator's way in.
+    #[tokio::test]
+    async fn an_unmanaged_cable_that_is_up_is_recorded_not_activated() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (steps, calls) = ethernet_calls("10 (unmanaged)", "on").await;
+
+        assert!(
+            !calls.contains("connection up evo-network-ethernet"),
+            "a cable NetworkManager does not manage must not be \
+             activated: {calls}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("eth0") && s.contains("another manager")),
+            "the interface must be recorded: {steps:?}"
+        );
+        // Recorded and stepped over. Whose cable this is belongs to
+        // a provisioning decision, not to an apply.
+        assert!(
+            !calls.contains("connection modify")
+                && !calls.contains("connection add"),
+            "the profile must be left alone: {calls}"
+        );
+    }
+
+    /// Unmanaged with no carrier is a cable that genuinely is not
+    /// working. That is not this, and the ordinary path still runs
+    /// — otherwise the skip becomes a way to never configure
+    /// ethernet at all.
+    #[tokio::test]
+    async fn an_unmanaged_cable_with_no_carrier_still_takes_the_normal_path() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (_steps, calls) = ethernet_calls("10 (unmanaged)", "off").await;
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a dead cable still goes through the usual path: {calls}"
+        );
+    }
+
+    /// And a cable NetworkManager does manage is activated as it
+    /// always was, carrier or no.
+    #[tokio::test]
+    async fn a_managed_cable_is_still_activated() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let (_steps, calls) = ethernet_calls("30 (disconnected)", "on").await;
+        assert!(
+            calls.contains("connection up evo-network-ethernet"),
+            "a managed cable is still activated: {calls}"
+        );
     }
 
     /// A wired link that is already up and already carries exactly
