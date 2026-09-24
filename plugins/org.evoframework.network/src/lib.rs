@@ -85,6 +85,12 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// Reverse-DNS plugin name.
 pub const PLUGIN_NAME: &str = "org.evoframework.network";
 
+/// How long to wait for a just-handed-back access-point vif to
+/// become a device NetworkManager will bind a profile to, and how
+/// often to ask.
+const AP_VIF_USABLE_BUDGET_MS: u64 = 5_000;
+const AP_VIF_USABLE_POLL_MS: u64 = 200;
+
 const REQUEST_NETWORK_STATUS: &str = "network.nm.status";
 const REQUEST_NETWORK_SCAN: &str = "network.nm.scan";
 const REQUEST_NETWORK_INTENT_GET: &str = "network.nm.intent.get";
@@ -4139,6 +4145,56 @@ impl NmInner {
         }
     }
 
+    /// Wait until NetworkManager will bind a profile to `ifname`.
+    ///
+    /// NetworkManager walks a device it has just been given from
+    /// `unmanaged` through `unavailable` to `disconnected`, and
+    /// only from `disconnected` on is it a candidate for an
+    /// activation. Polls until it gets there, or until the budget
+    /// runs out.
+    ///
+    /// Returns `false` on a device that never becomes usable and
+    /// on a state that cannot be read at all. The caller declines
+    /// to raise rather than starting an activation
+    /// NetworkManager will hand to the wrong radio.
+    async fn wait_for_nm_device_usable(
+        &self,
+        ifname: &str,
+        budget_ms: u64,
+    ) -> bool {
+        let name = ifname.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(budget_ms);
+        loop {
+            if let Some(state) = self
+                .nm_device_state_field(name)
+                .await
+                .filter(|s| !s.trim().is_empty())
+            {
+                if nm_device_state_is_usable(&state) {
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(AP_VIF_USABLE_POLL_MS))
+                .await;
+        }
+    }
+
+    /// `GENERAL.STATE` for one device, as nmcli renders it —
+    /// `30 (disconnected)`, `100 (connected)`, `10 (unmanaged)`.
+    async fn nm_device_state_field(&self, ifname: &str) -> Option<String> {
+        self.nmcli_output(&["-g", "GENERAL.STATE", "device", "show", ifname])
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
     /// Hand a confirmed access-point vif back to NetworkManager so
     /// its profile can bind. The counterpart to
     /// [`Self::hold_nm_off_ap_vif`]; called only once the type has
@@ -5917,9 +5973,20 @@ impl NmInner {
         Ok(())
     }
 
+    /// Raise the hotspot, on `ifname` when the caller knows which
+    /// device the profile belongs to.
+    ///
+    /// Without the device pinned, `nmcli connection up` picks one
+    /// itself. A vif that NetworkManager has not finished taking
+    /// is not a candidate, so it reaches for the other wifi device
+    /// on the box — the station — which then refuses the profile
+    /// as "mismatching interface name". Naming the device here
+    /// selects the profile's own interface for this activation; it
+    /// writes nothing and moves nothing.
     async fn connection_up_hotspot_with_retries(
         &self,
         con_name: &str,
+        ifname: Option<&str>,
         steps: &mut Vec<String>,
     ) -> HotspotBringUp {
         const HOTSPOT_BRINGUP_ATTEMPTS: u32 = 4;
@@ -5930,10 +5997,11 @@ impl NmInner {
         }
         let mut last_err = String::new();
         for attempt in 1..=HOTSPOT_BRINGUP_ATTEMPTS {
-            match self
-                .nmcli_spawn_output(&["connection", "up", con_name])
-                .await
-            {
+            let mut argv: Vec<&str> = vec!["connection", "up", con_name];
+            if let Some(dev) = ifname.map(str::trim).filter(|d| !d.is_empty()) {
+                argv.extend(["ifname", dev]);
+            }
+            match self.nmcli_spawn_output(&argv).await {
                 Ok(out) if out.status.success() => {
                     if attempt > 1 {
                         steps.push(format!(
@@ -5955,6 +6023,20 @@ impl NmInner {
                     last_err = stderr.trim().to_string();
                     if is_phy_exclusive_failure(&stderr) {
                         return HotspotBringUp::PhyExclusive;
+                    }
+                    // The profile naming one interface and
+                    // NetworkManager offering another is not a
+                    // transient. Retrying asks the same wrong
+                    // radio the same question three more times,
+                    // and on a shared phy each attempt is another
+                    // shove at the station.
+                    if is_device_mismatch_failure(&stderr) {
+                        steps.push(format!(
+                            "{con_name} was offered a device it does not \
+                             name ({}); not retried",
+                            last_err
+                        ));
+                        return HotspotBringUp::Failed;
                     }
                 }
                 Err(e) => {
@@ -6322,7 +6404,11 @@ impl NmInner {
             return steps;
         }
         match self
-            .connection_up_hotspot_with_retries(&hs_name, &mut steps)
+            .connection_up_hotspot_with_retries(
+                &hs_name,
+                Some(ap_ifname.as_str()),
+                &mut steps,
+            )
             .await
         {
             HotspotBringUp::Up => steps.push(format!(
@@ -6409,6 +6495,28 @@ impl NmInner {
             // Confirmed AP. Hand it back so the profile can bind;
             // the window this reopens is the activation itself.
             self.release_nm_onto_ap_vif(ifname, steps).await;
+            // And wait for NetworkManager to finish taking it.
+            //
+            // `device set managed yes` returns when the request is
+            // accepted, not when the device is ready. Until
+            // NetworkManager has walked the vif out of unmanaged
+            // it is not a device any profile can bind to, and an
+            // activation started in that window is offered to
+            // whatever other wifi device exists — the station —
+            // which refuses it as "mismatching interface name".
+            if !self
+                .wait_for_nm_device_usable(ifname, AP_VIF_USABLE_BUDGET_MS)
+                .await
+            {
+                steps.push(format!(
+                    "hotspot {hotspot_name} not raised: {ifname} did not \
+                     become a device NetworkManager will bind within \
+                     {AP_VIF_USABLE_BUDGET_MS}ms"
+                ));
+                return Err(PluginError::Transient(format!(
+                    "access point vif {ifname} did not become usable"
+                )));
+            }
         }
 
         Ok(())
@@ -6626,7 +6734,11 @@ impl NmInner {
             .await?;
 
         match self
-            .connection_up_hotspot_with_retries(hotspot_name, steps)
+            .connection_up_hotspot_with_retries(
+                hotspot_name,
+                Some(ifname),
+                steps,
+            )
             .await
         {
             HotspotBringUp::Up => {}
@@ -7359,7 +7471,7 @@ impl NmInner {
             raise_name
         ));
         Ok(matches!(
-            self.connection_up_hotspot_with_retries(&raise_name, steps)
+            self.connection_up_hotspot_with_retries(&raise_name, None, steps)
                 .await,
             HotspotBringUp::Up
         ))
@@ -9717,6 +9829,45 @@ fn is_phy_exclusive_failure(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("device or resource busy")
         && (s.contains("flags (up)") || s.contains("set interface"))
+}
+
+/// NetworkManager was asked to raise a profile and reached for a
+/// device the profile does not name.
+///
+/// It says so two ways — "mismatching interface name" on the
+/// device it picked, and "not compatible with device" — and both
+/// mean the same thing: the interface the profile is pinned to
+/// was not a candidate at that moment. On a box whose only other
+/// wifi device is the station, the device it reaches for is the
+/// station, and every retry is another shove at the radio the
+/// operator is using.
+/// NetworkManager's device states, as `GENERAL.STATE` renders
+/// them: `10 (unmanaged)`, `20 (unavailable)`, `30 (disconnected)`
+/// and up. A profile can be activated on a device from
+/// `disconnected` onwards; below that the device is not a
+/// candidate and NetworkManager looks elsewhere.
+///
+/// The number is the contract — the parenthesised word is
+/// localised — so an unparsable reading falls back to the word
+/// and, failing that, is treated as not usable. Waiting a little
+/// longer costs a delayed access point; guessing "usable" costs
+/// an activation offered to the station.
+fn nm_device_state_is_usable(state: &str) -> bool {
+    let t = state.trim();
+    let head: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(code) = head.parse::<u32>() {
+        return code >= 30;
+    }
+    let lc = t.to_ascii_lowercase();
+    lc.contains("disconnected")
+        || lc.contains("connected")
+        || lc.contains("activat")
+}
+
+fn is_device_mismatch_failure(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("mismatching interface name")
+        || s.contains("not compatible with device")
 }
 
 fn first_ethernet_device(devices: &[DeviceRow]) -> Option<String> {
@@ -12485,6 +12636,7 @@ exit 0\n",
             .inner_mut()
             .connection_up_hotspot_with_retries(
                 "evo-network-hotspot",
+                None,
                 &mut steps,
             )
             .await;
@@ -12546,6 +12698,7 @@ exit 0\n",
             .inner_mut()
             .connection_up_hotspot_with_retries(
                 "evo-network-hotspot",
+                None,
                 &mut steps,
             )
             .await;
@@ -14956,6 +15109,7 @@ exit 0\n",
 echo \"$@\" >> \"{log}\"\n\
 case \"$*\" in\n\
   \"connection show evo-network-hotspot\") exit {hs_rc} ;;\n\
+  \"-g GENERAL.STATE device show \"*) printf '30 (disconnected)\\n' ;;\n\
   \"-t -f GENERAL.DEVICE\"*)\n\
       printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 ({state})\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
 esac\n\
@@ -15288,6 +15442,8 @@ case \"$*\" in\n\
       echo evo-network-hotspot ;;\n\
   \"-g connection.interface-name connection show evo-network-hotspot\")\n\
       echo {ap_iface} ;;\n\
+  \"-g GENERAL.STATE device show \"*)\n\
+      echo '30 (disconnected)' ;;\n\
 esac\n\
 exit 0\n",
                 log = log.display(),
@@ -15428,18 +15584,119 @@ exit 0\n",
                 .map(str::to_string)
                 .collect();
         let idx = |needle: &str| {
-            calls.iter().position(|c| c == needle).unwrap_or_else(|| {
-                panic!("missing {needle}: {calls:?}");
-            })
+            calls
+                .iter()
+                .position(|c| c.starts_with(needle))
+                .unwrap_or_else(|| panic!("missing {needle}: {calls:?}"))
         };
         let hold = idx("nmcli device set ap0 managed no");
         let retype = idx("iw dev ap0 set type __ap");
         let back = idx("nmcli device set ap0 managed yes");
+        let ready = idx("nmcli -g GENERAL.STATE device show ap0");
         let up = idx("nmcli connection up evo-network-hotspot");
         assert!(
-            hold < retype && retype < back && back < up,
-            "order must be hold, retype, hand back, raise: {calls:?}"
+            hold < retype && retype < back && back < ready && ready < up,
+            "order must be hold, retype, hand back, wait for the device, \
+             raise: {calls:?}"
         );
+        // The activation names the device the profile names. Left
+        // to choose, NetworkManager reaches for the station and
+        // refuses its own profile as a mismatched interface.
+        assert_eq!(
+            calls[up], "nmcli connection up evo-network-hotspot ifname ap0",
+            "the raise must name ap0: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("wlp0s20f3")
+                || c.contains("up evo-network-hotspot ifname wlan0")),
+            "the hotspot must never be offered to the station: {calls:?}"
+        );
+    }
+
+    /// A mismatch on the station radio is not a retry.
+    ///
+    /// When the access-point vif is not a candidate,
+    /// NetworkManager reaches for the other wifi device on the box
+    /// and then refuses its own profile — "device wlp… not
+    /// available because profile is not compatible with device
+    /// (mismatching interface name)". Asking three more times asks
+    /// the same wrong radio, and on a shared phy each attempt is
+    /// another shove at the station the operator is using.
+    #[tokio::test]
+    async fn a_device_mismatch_is_not_retried() {
+        let _exec_lock = MOCK_EXEC_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("calls.log");
+        let nmcli = dir.path().join("nmcli-mismatch.sh");
+        std::fs::write(
+            &nmcli,
+            format!(
+                "#!/usr/bin/env bash\n\
+echo \"nmcli $*\" >> \"{log}\"\n\
+case \"$*\" in\n\
+  \"connection up\"*)\n\
+      echo 'Error: Connection activation failed: device wlp0s20f3 not available because profile is not compatible with device (mismatching interface name).' >&2\n\
+      exit 4 ;;\n\
+esac\n\
+exit 0\n",
+                log = log.display()
+            ),
+        )
+        .expect("write nmcli mock");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &nmcli,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut p = recovery_plugin(dir.path(), &nmcli);
+        let mut steps = Vec::new();
+        let verdict = p
+            .inner_mut()
+            .connection_up_hotspot_with_retries(
+                "evo-network-hotspot",
+                Some("ap0"),
+                &mut steps,
+            )
+            .await;
+
+        assert_eq!(verdict, HotspotBringUp::Failed);
+        let ups = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("connection up"))
+            .count();
+        assert_eq!(
+            ups, 1,
+            "a mismatched device must be asked once, not four times"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("not retried")),
+            "the refusal must say why it stopped: {steps:?}"
+        );
+    }
+
+    /// A device NetworkManager has not finished taking is not one
+    /// it will bind a profile to. `10 (unmanaged)` and
+    /// `20 (unavailable)` are too early; `30 (disconnected)` is
+    /// the floor. An unreadable state waits rather than guesses,
+    /// because guessing "ready" is what offers the access point to
+    /// the station.
+    #[test]
+    fn nm_device_state_usability_starts_at_disconnected() {
+        for early in ["10 (unmanaged)", "20 (unavailable)", "", "?"] {
+            assert!(
+                !nm_device_state_is_usable(early),
+                "{early:?} must not count as usable"
+            );
+        }
+        for ready in ["30 (disconnected)", "100 (connected)", "50 (config)"] {
+            assert!(
+                nm_device_state_is_usable(ready),
+                "{ready:?} must count as usable"
+            );
+        }
     }
 
     /// Flight mode is still flight mode at load.
@@ -16014,6 +16271,7 @@ echo \"$@\" >> \"{log}\"\n\
 case \"$*\" in\n\
   *802-11-wireless.mode*) exit 1 ;;\n\
   \"connection show evo-network-hotspot\") exit 0 ;;\n\
+  \"-g GENERAL.STATE device show \"*) printf '30 (disconnected)\\n' ;;\n\
   \"-t -f GENERAL.DEVICE\"*)\n\
       printf 'GENERAL.DEVICE:wlan0\\nGENERAL.TYPE:wifi\\nGENERAL.STATE:30 (disconnected)\\nGENERAL.CONNECTION:\\nGENERAL.HWADDR:AA:11:22:33:44:77\\nGENERAL.MTU:1500\\n' ;;\n\
 esac\n\
