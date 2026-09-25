@@ -5814,10 +5814,74 @@ impl NetworkSharesRuntime {
         };
         let mut outcomes = Vec::with_capacity(candidates.len());
         for share_id in candidates {
+            // Ask the host before spending anything on the mount.
+            //
+            // A share already recorded as waiting on a host that
+            // still is not answering has nothing to learn from
+            // another mount attempt: the answer is the same, and
+            // getting it costs a record clone, a mount-table read,
+            // a state write and a republish of the share-state
+            // subject. On a cadence, for a NAS that is simply off,
+            // that is the glass being repainted with the same
+            // failure for as long as the device is powered down.
+            //
+            // One refused connection replaces all of it, and the
+            // mount is re-run on the tick after the host answers.
+            if let Some(err) = self.remount_host_still_absent(&share_id).await {
+                outcomes.push(BootMountOutcome {
+                    share_id,
+                    result: Err(err),
+                });
+                continue;
+            }
             let result = self.mount_share(&share_id).await;
             outcomes.push(BootMountOutcome { share_id, result });
         }
         outcomes
+    }
+
+    /// Is this share already waiting on a host that still is not
+    /// answering?
+    ///
+    /// Returns the refusal to report, or `None` when the mount
+    /// should be attempted.
+    ///
+    /// Only shares already classified
+    /// [`FailureClass::Unreachable`] are held back. A share whose
+    /// host has just gone down is not yet recorded that way, so it
+    /// goes through the mount once — which is what writes the
+    /// classified state that later ticks read. Skipping it on the
+    /// first tick would leave the operator looking at whatever the
+    /// previous failure was.
+    ///
+    /// Anything unreadable answers `None` and the mount is
+    /// attempted. This exists to spare a pointless attempt against
+    /// a known-absent server, not to become a new way to skip one.
+    async fn remount_host_still_absent(
+        &self,
+        share_id: &ShareId,
+    ) -> Option<MountError> {
+        let already_waiting = {
+            let g = self.share_states.lock().await;
+            g.get(share_id).and_then(|e| e.failure_class)
+                == Some(FailureClass::Unreachable)
+        };
+        if !already_waiting {
+            return None;
+        }
+        let record = {
+            let g = self.inner.lock().await;
+            g.state.find(share_id).cloned()?
+        };
+        let host = record.host.trim().to_string();
+        if host.is_empty() {
+            return None;
+        }
+        let port = probe_port_for_fstype(record.fstype);
+        if (self.host_reachable)(&host, port) {
+            return None;
+        }
+        Some(MountError::HostUnreachable { host, port })
     }
 }
 
@@ -10067,6 +10131,184 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
 
         // Nothing left in a retryable state.
         assert!(rt.remount_retry_pass().await.is_empty());
+    }
+
+    /// The remount pass asks the host. It does not re-run the
+    /// mount until the host answers.
+    ///
+    /// A share already waiting on an absent server learns nothing
+    /// from another attempt, and getting the same answer costs a
+    /// record clone, a mount-table read, a state write and a
+    /// republish of the share-state subject. On a cadence, for a
+    /// NAS that is simply switched off, that is the glass being
+    /// repainted with the same failure for as long as it stays
+    /// off.
+    #[tokio::test]
+    async fn remount_pass_asks_the_host_before_re_running_the_mount() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let exec_for_count = Arc::clone(&executor);
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes_for_rt = Arc::clone(&probes);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            // The NAS port is down. Carrier says nothing about it.
+            .with_host_reachable(Arc::new(move |_: &str, _: u16| {
+                probes_for_rt.fetch_add(1, Ordering::SeqCst);
+                false
+            }))
+            .build();
+        let record = built_record("Absent", "192.0.2.77");
+        let id = rt.add_share(record).await.unwrap();
+
+        // First attempt records the class. This is the tick that
+        // is allowed to write state, and it must: skipping it
+        // would leave whatever the previous failure was on screen.
+        let _ = rt.mount_share(&id).await;
+        {
+            let g = rt.share_states.lock().await;
+            let e = g.get(&id).unwrap();
+            assert_eq!(e.state, MountState::Failed);
+            assert_eq!(e.failure_class, Some(FailureClass::Unreachable));
+        }
+        let probes_after_first = probes.load(Ordering::SeqCst);
+
+        // A witness for "the mount ran". `mount_share` rewrites the
+        // recorded reason on its way past the probe, so a sentinel
+        // that survives the pass proves the mount was never
+        // entered — which the executor cursor alone cannot show,
+        // because `mount_share` short-circuits before the
+        // executor too.
+        const SENTINEL: &str = "sentinel: written by the test";
+        {
+            let mut g = rt.share_states.lock().await;
+            g.get_mut(&id).unwrap().reason = Some(SENTINEL.to_string());
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert_eq!(outcomes.len(), 1, "the share is still reported on");
+        assert!(outcomes[0].result.is_err(), "it is still down");
+
+        // The host was asked again.
+        assert!(
+            probes.load(Ordering::SeqCst) > probes_after_first,
+            "the remount pass must ask the host"
+        );
+        // And the mount was not re-run: no state rewrite, so no
+        // republish of the share-state subject either.
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(
+                g.get(&id).unwrap().reason.as_deref(),
+                Some(SENTINEL),
+                "the mount must not be re-run while the host is absent"
+            );
+        }
+        // And nothing reached the ladder.
+        assert_eq!(
+            exec_for_count.cursor.load(Ordering::SeqCst),
+            0,
+            "no mount may be attempted against an absent host"
+        );
+    }
+
+    /// Only a share already recorded as waiting is held back.
+    ///
+    /// A share whose host has just gone down is still classified
+    /// from its previous failure, so it goes through the mount
+    /// once — that attempt is what records the absent host.
+    /// Skipping it on the first tick would leave the operator
+    /// looking at a dialect failure for a NAS that is switched
+    /// off.
+    #[tokio::test]
+    async fn a_share_not_yet_recorded_as_waiting_still_gets_its_attempt() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(Vec::new());
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(|_: &Path| false))
+            .with_host_reachable(Arc::new(|_: &str, _: u16| false))
+            .build();
+        let record = built_record("JustDropped", "192.0.2.79");
+        let id = rt.add_share(record).await.unwrap();
+
+        // The share is carrying an earlier, unrelated failure.
+        {
+            let mut g = rt.share_states.lock().await;
+            let e = g.get_mut(&id).unwrap();
+            e.state = MountState::Failed;
+            e.failure_class = Some(FailureClass::Transient);
+            e.reason = Some("an earlier dialect failure".to_string());
+        }
+
+        let outcomes = rt.remount_retry_pass().await;
+        assert_eq!(outcomes.len(), 1);
+
+        let g = rt.share_states.lock().await;
+        let e = g.get(&id).unwrap();
+        assert_eq!(
+            e.failure_class,
+            Some(FailureClass::Unreachable),
+            "the attempt must reclassify the share onto the host probe"
+        );
+        assert_ne!(
+            e.reason.as_deref(),
+            Some("an earlier dialect failure"),
+            "the recorded reason must stop blaming dialects"
+        );
+    }
+
+    /// And the mount is re-run on the tick after the host answers
+    /// — otherwise the skip is just a share that never comes back.
+    #[tokio::test]
+    async fn remount_pass_re_runs_the_mount_once_the_host_answers() {
+        let dir = tempdir();
+        let executor = ScriptedExecutor::new(vec![ok_mount_output()]);
+        let exec_for_check = Arc::clone(&executor);
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up_for_rt = Arc::clone(&up);
+        let rt = NetworkSharesRuntime::builder(&dir)
+            .unwrap()
+            .with_executor(executor)
+            .with_mount_timeout_ms(1_000)
+            .with_now_fn(Arc::new(|| 1_700_000_777_000))
+            .with_mount_point_check(Arc::new(move |_: &Path| {
+                exec_for_check.cursor.load(Ordering::SeqCst) > 0
+            }))
+            .with_host_reachable(Arc::new(move |_: &str, _: u16| {
+                up_for_rt.load(Ordering::SeqCst)
+            }))
+            .build();
+        let record = built_record("Returns", "192.0.2.78");
+        let id = rt.add_share(record).await.unwrap();
+
+        let _ = rt.mount_share(&id).await;
+        {
+            let g = rt.share_states.lock().await;
+            assert_eq!(
+                g.get(&id).unwrap().failure_class,
+                Some(FailureClass::Unreachable)
+            );
+        }
+
+        // The NAS comes back.
+        up.store(true, Ordering::SeqCst);
+        let outcomes = rt.remount_retry_pass().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].result.is_ok(),
+            "the mount must run once the host answers: {:?}",
+            outcomes[0].result
+        );
+        let g = rt.share_states.lock().await;
+        assert_eq!(g.get(&id).unwrap().state, MountState::Mounted);
     }
 
     #[tokio::test]
