@@ -311,6 +311,29 @@ pub fn render_audio_output_fragment(
     let format_str = render_format_string(&ep.format)?;
     let device = ep.path.to_string_lossy();
     let mixer_block = render_mixer_block(mixer);
+    // Boot-time playback state.
+    //
+    // This file is what `/etc/mpd.conf` includes, and this
+    // renderer overwrites it — so every directive the shipped
+    // template declares has to be re-declared here or it is
+    // silently dropped the first time a fragment is rendered.
+    // `restore_paused` was exactly that: bootstrap installed a
+    // template carrying it, the first render replaced the file
+    // without it, and from then on MPD read its own state file
+    // and resumed playing seconds into boot.
+    //
+    // That resume is the one this must not allow. MPD restores
+    // its own volume from that state file too, and the
+    // framework's configured startup volume cannot be applied
+    // until the plugin has loaded and read the operator's audio
+    // options — far later than MPD starts. A device whose last
+    // session ended loud would be heard at that level in the gap.
+    // Booting Paused closes it: nothing is audible until a Play
+    // gesture, by which time the startup volume has been set.
+    //
+    // It also keeps a remote current-song URI from stalling the
+    // boot, which is why the shipped template declared it.
+    //
     // Local Unix-domain control socket. The
     // `emit_test_tone` course-correct verb opens a dedicated
     // MPD connection here to dispatch `add file://...` +
@@ -323,6 +346,7 @@ pub fn render_audio_output_fragment(
     // /etc/mpd.conf's TCP / localhost binds.
     Ok(format!(
         "bind_to_address \"/run/mpd/socket\"\n\n\
+         restore_paused \"yes\"\n\n\
          audio_output {{\n    \
          type            \"alsa\"\n    \
          name            \"evo-device-audio\"\n    \
@@ -476,6 +500,32 @@ mod tests {
         // brace so concatenation with neighbouring fragments
         // is well-formed.
         assert!(out.ends_with("}\n"));
+    }
+
+    /// Nothing is audible before the startup volume has been
+    /// applied.
+    ///
+    /// MPD starts seconds into boot and restores both its
+    /// playing state and its own volume from its state file. The
+    /// framework's configured startup volume cannot be applied
+    /// until this plugin has loaded and read the operator's
+    /// audio options, which is far later — so a device whose
+    /// last session ended loud is heard at that level in the gap.
+    ///
+    /// Booting Paused closes the gap. This renderer overwrites
+    /// the very file `/etc/mpd.conf` includes, so the directive
+    /// has to be emitted here: a template that declares it is
+    /// replaced the first time a fragment is rendered.
+    #[test]
+    fn the_rendered_fragment_boots_paused() {
+        let ep = pcm_endpoint("hw:2,0", PcmCodec::PcmS16Le, 44_100, 2);
+        for mixer in [MixerConfig::Software, MixerConfig::None] {
+            let out = render_audio_output_fragment(&ep, &mixer).unwrap();
+            assert!(
+                out.contains("restore_paused \"yes\""),
+                "the fragment must boot the device paused: {out}"
+            );
+        }
     }
 
     /// The fragment emits a `bind_to_address` directive for the
