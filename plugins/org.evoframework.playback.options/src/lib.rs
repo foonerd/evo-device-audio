@@ -191,6 +191,12 @@ const STATE_FILENAME: &str = "state.toml";
 /// `manifest.toml`'s `[capabilities.respondent].request_types`;
 /// admission would refuse a mismatch. Lockstep enforced by the
 /// `manifest_request_types_match_runtime` test.
+/// Mode tokens the `audio.composition` shelf declares. Kept here
+/// so a mode this distribution does not implement cannot be
+/// recorded for the glass to paint. `resampler` is reserved in
+/// the schema and deliberately absent until it exists.
+const DECLARED_COMPOSITION_MODES: &[&str] = &["passthrough", "eq_only"];
+
 const REQUEST_TYPES: &[&str] = &[
     "options.get_settings",
     "options.set_resampling",
@@ -206,6 +212,7 @@ const REQUEST_TYPES: &[&str] = &[
     "options.set_exclusive_mode",
     "options.set_crossfade_seconds",
     "options.set_gapless",
+    "options.set_composition_mode",
     "options.set_eq_engaged",
     "options.set_eq_band",
     "options.list_eq_presets",
@@ -444,6 +451,20 @@ pub struct Settings {
     /// brief gap between adjacent tracks).
     #[serde(default = "default_gapless")]
     pub gapless: bool,
+    /// Which composition mode is active.
+    ///
+    /// Written by the composition plugin, which owns the mode
+    /// and is the only party that knows when it changed —
+    /// including the mode it restores from its own state at
+    /// load. It lives here so the operator's glass can read it
+    /// at mount from the settings subject it already holds,
+    /// rather than asking a second shelf.
+    ///
+    /// Empty until the composition plugin reports one. Empty
+    /// means "not yet reported", not "passthrough": a glass
+    /// painting a mode it was never told is guessing.
+    #[serde(default)]
+    pub composition_mode: String,
     /// Parametric-EQ engagement flag. When `true`, the
     /// composition plugin's eq_only mode applies the
     /// configured bands to the PCM byte stream. When `false`,
@@ -537,6 +558,7 @@ impl Default for Settings {
             output_device: String::new(),
             volume_normalization: false,
             startup_volume_percent: default_startup_volume_percent(),
+            composition_mode: String::new(),
             max_volume_percent: default_max_volume_percent(),
             volume_curve: VolumeCurve::default(),
             exclusive_mode: false,
@@ -1620,6 +1642,9 @@ impl Respondent for PlaybackOptionsPlugin {
                     self.handle_set_crossfade_seconds(req).await
                 }
                 "options.set_gapless" => self.handle_set_gapless(req).await,
+                "options.set_composition_mode" => {
+                    self.handle_set_composition_mode(req).await
+                }
                 "options.set_eq_engaged" => {
                     self.handle_set_eq_engaged(req).await
                 }
@@ -2327,6 +2352,59 @@ impl PlaybackOptionsPlugin {
             .gapless = payload.value;
         self.persist_settings().await?;
         self.emit_changed("gapless", serde_json::Value::Bool(payload.value))
+            .await;
+        encode(
+            req,
+            &SimpleOk {
+                v: PAYLOAD_VERSION,
+                status: "ok",
+            },
+        )
+    }
+
+    /// Record which composition mode is active.
+    ///
+    /// The composition shelf owns the mode; this only carries it
+    /// so the glass can read it at mount from the settings
+    /// subject it already holds. The value must be a mode that
+    /// shelf declares — an unknown token is refused rather than
+    /// recorded, because a glass painting a mode no plugin
+    /// implements is worse than one painting nothing.
+    ///
+    /// Idempotent by construction: recording the mode already
+    /// recorded persists nothing and emits nothing. The
+    /// composition plugin reports on every change AND on the
+    /// mode it restores at load, so without this a restart would
+    /// republish the settings subject for a mode that did not
+    /// move — and every subscriber would re-render for it.
+    async fn handle_set_composition_mode(
+        &self,
+        req: &Request,
+    ) -> Result<Response, PluginError> {
+        let payload: SetCompositionModePayload = parse_versioned(req)?;
+        let mode = payload.mode.trim().to_string();
+        if !DECLARED_COMPOSITION_MODES.contains(&mode.as_str()) {
+            return Err(PluginError::Permanent(format!(
+                "unknown composition mode {:?}; declared modes: {:?}",
+                mode, DECLARED_COMPOSITION_MODES
+            )));
+        }
+        {
+            let mut w =
+                self.settings.write().expect("settings RwLock poisoned");
+            if w.composition_mode == mode {
+                return encode(
+                    req,
+                    &SimpleOk {
+                        v: PAYLOAD_VERSION,
+                        status: "ok",
+                    },
+                );
+            }
+            w.composition_mode = mode.clone();
+        }
+        self.persist_settings().await?;
+        self.emit_changed("composition_mode", serde_json::Value::String(mode))
             .await;
         encode(
             req,
@@ -3140,6 +3218,19 @@ impl HasPayloadVersion for SetCrossfadeSecondsPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetCompositionModePayload {
+    #[serde(default = "default_payload_version")]
+    v: u32,
+    mode: String,
+}
+
+impl HasPayloadVersion for SetCompositionModePayload {
+    fn payload_version(&self) -> u32 {
+        self.v
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct SetGaplessPayload {
     #[serde(default = "default_payload_version")]
     v: u32,
@@ -4065,6 +4156,98 @@ mod tests {
             "audiophile default — no in-chain fade"
         );
         assert!(s.gapless, "audiophile default — gapless on");
+    }
+
+    /// The glass reads the active composition mode at mount from
+    /// the settings subject it already holds.
+    #[tokio::test]
+    async fn composition_mode_round_trips_through_settings() {
+        let (p, _dir) = loaded_plugin().await;
+        assert_eq!(
+            p.settings().composition_mode,
+            "",
+            "empty until the composition plugin reports one — empty \
+             means 'not yet reported', not 'passthrough'"
+        );
+
+        p.handle_request(&req(
+            "options.set_composition_mode",
+            json!({ "v": 1, "mode": "eq_only" }),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(p.settings().composition_mode, "eq_only");
+
+        let resp = p
+            .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(
+            v["composition_mode"], "eq_only",
+            "the field must be on the settings projection the glass reads"
+        );
+    }
+
+    /// A mode no plugin implements is refused, not recorded. A
+    /// glass painting a mode the device cannot be in is worse
+    /// than one painting nothing.
+    #[tokio::test]
+    async fn an_undeclared_composition_mode_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        for junk in ["resampler", "", "EQ_ONLY", "../etc"] {
+            let got = p
+                .handle_request(&req(
+                    "options.set_composition_mode",
+                    json!({ "v": 1, "mode": junk }),
+                ))
+                .await;
+            assert!(got.is_err(), "{junk:?} must be refused");
+            assert_eq!(
+                p.settings().composition_mode,
+                "",
+                "{junk:?} must not be recorded"
+            );
+        }
+    }
+
+    /// Recording the mode already recorded changes nothing.
+    ///
+    /// The composition plugin reports on every change and again
+    /// on the mode it restores at load, so without this a restart
+    /// would republish the settings subject — and every
+    /// subscriber would re-render — for a mode that did not move.
+    #[tokio::test]
+    async fn recording_an_unchanged_composition_mode_emits_nothing() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(CapturingEmitter::default());
+        let mut p = PlaybackOptionsPlugin::new()
+            .with_state_path(dir.path().join(STATE_FILENAME));
+        p.happening_emitter = Some(Arc::clone(&emitter) as Arc<_>);
+        p.subject_announcer = Some(Arc::new(CapturingAnnouncer::default()));
+        p.loaded = true;
+
+        let set = |mode: &str| {
+            req(
+                "options.set_composition_mode",
+                json!({ "v": 1, "mode": mode }),
+            )
+        };
+        let emitted = || emitter.events.lock().unwrap().len();
+
+        p.handle_request(&set("eq_only")).await.unwrap();
+        let after_first = emitted();
+        assert!(after_first > 0, "a real change must emit");
+
+        p.handle_request(&set("eq_only")).await.unwrap();
+        assert_eq!(
+            emitted(),
+            after_first,
+            "an unchanged mode must not emit a change"
+        );
+
+        p.handle_request(&set("passthrough")).await.unwrap();
+        assert!(emitted() > after_first, "a real change must still emit");
     }
 
     #[tokio::test]

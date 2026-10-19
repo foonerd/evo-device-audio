@@ -116,7 +116,8 @@ use evo_plugin_sdk::contract::audio_routing::{
 use evo_plugin_sdk::contract::{
     BuildInfo, ExternalAddressing, HealthReport, LoadContext, Plugin,
     PluginDescription, PluginError, PluginIdentity, Request, Respondent,
-    Response, RuntimeCapabilities, SubjectStateStreamError,
+    Response, RuntimeCapabilities, ShelfRequestDispatcher,
+    SubjectStateStreamError,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -211,6 +212,13 @@ pub struct AlsaCompositionPlugin {
     /// between passthrough and eq_only processing without
     /// restarting the substrate lifecycle.
     mode_tx: watch::Sender<String>,
+    /// Cross-shelf dispatcher, from
+    /// [`LoadContext::shelf_request_dispatcher`]. Used to report
+    /// the active mode onto the operator's audio-options
+    /// settings, which is the subject the glass already reads at
+    /// mount. `None` in an in-process test harness; the steward's
+    /// wire adapter always populates it in production.
+    shelf_dispatcher: Option<Arc<dyn ShelfRequestDispatcher>>,
     /// The plugin's own state directory, from
     /// [`LoadContext::state_dir`]. `None` before load, which is
     /// how a unit-test construction stays off the filesystem.
@@ -305,6 +313,7 @@ impl AlsaCompositionPlugin {
         let (mode_tx, _) = watch::channel(MODE_PASSTHROUGH.to_string());
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
+            shelf_dispatcher: None,
             state_dir: None,
             loaded: false,
             mode_tx,
@@ -354,6 +363,55 @@ impl AlsaCompositionPlugin {
     /// not write to the machine running it.
     fn mode_state_path(&self) -> Option<PathBuf> {
         self.state_dir.as_ref().map(|d| d.join(MODE_STATE_FILE))
+    }
+
+    /// Report the active mode onto the operator's audio-options
+    /// settings.
+    ///
+    /// The mode lives on this shelf, but the glass reads
+    /// `audio.options.settings` at mount and nothing else. Rather
+    /// than giving it a second shelf to ask, the mode is written
+    /// where it already looks.
+    ///
+    /// The options verb is idempotent — reporting the mode it
+    /// already holds persists nothing and republishes nothing —
+    /// which is what makes it safe to call on every change and
+    /// again on the mode restored at load.
+    ///
+    /// Best-effort and detached: a glass that paints a stale mode
+    /// is a worse outcome than a slow one, but neither is worth
+    /// failing a load or a mode gesture over. Absent dispatcher
+    /// (an in-process harness) is silent.
+    fn report_mode_to_options(&self, mode: &str) {
+        let Some(dispatcher) = self.shelf_dispatcher.clone() else {
+            return;
+        };
+        let mode = mode.to_string();
+        tokio::spawn(async move {
+            let payload = serde_json::json!({ "v": 1, "mode": mode });
+            let Ok(bytes) = serde_json::to_vec(&payload) else {
+                return;
+            };
+            if let Err(e) = dispatcher
+                .dispatch(
+                    "audio.options",
+                    "options.set_composition_mode",
+                    bytes,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    plugin = PLUGIN_NAME,
+                    mode = %mode,
+                    error = %e,
+                    "could not report the composition mode to audio \
+                     options; the glass may paint a stale mode until the \
+                     next change. LOGGING.md §2: operator-visible state \
+                     diverging from the device."
+                );
+            }
+        });
     }
 
     /// Record the active mode so the next load restores it.
@@ -1141,6 +1199,8 @@ impl Plugin for AlsaCompositionPlugin {
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
             self.state_dir = Some(ctx.state_dir.clone());
+            self.shelf_dispatcher =
+                ctx.shelf_request_dispatcher.as_ref().map(Arc::clone);
             // Restore the operator's mode before the substrate
             // starts, so the first worker subscribes to the mode
             // they chose rather than to the default and then
@@ -1155,6 +1215,11 @@ impl Plugin for AlsaCompositionPlugin {
                     self.mode_tx.send_replace(mode);
                 }
             }
+            // Report whatever mode this load came up in —
+            // restored or default. A device that has been in
+            // eq_only since before the glass existed still has to
+            // say so the first time anything asks.
+            self.report_mode_to_options(&self.current_mode());
             self.install_routing(ctx.audio_routing.clone())?;
             self.spawn_reactor().await?;
             self.spawn_worker().await?;
@@ -1336,6 +1401,9 @@ impl Respondent for AlsaCompositionPlugin {
             // defect's own severity. A mode recorded but refused
             // by the substrate would be worse.
             self.persist_mode(&new_mode);
+            // And tell the glass, through the settings subject it
+            // already reads at mount.
+            self.report_mode_to_options(&new_mode);
             encode_response(req, SelectModeResponse::ok(new_mode))
         }
     }
@@ -1535,6 +1603,155 @@ mod tests {
         assert!(
             restore < spawn,
             "the mode must be restored before the substrate starts"
+        );
+
+        // And the glass is told what this load came up in.
+        // Persisting the mode is invisible to an operator whose
+        // glass reads only the settings subject.
+        assert!(
+            body.contains("ctx.shelf_request_dispatcher"),
+            "load must take the cross-shelf dispatcher, or the mode \
+             cannot be reported to audio options"
+        );
+        assert!(
+            body.contains("self.report_mode_to_options(&self.current_mode())"),
+            "load must report the mode it came up in, restored or default"
+        );
+    }
+
+    /// A dispatcher that records what was sent to which shelf.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl std::fmt::Debug for RecordingDispatcher {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingDispatcher")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ShelfRequestDispatcher for RecordingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            shelf: &'a str,
+            request_type: &'a str,
+            payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((
+                    shelf.to_string(),
+                    request_type.to_string(),
+                    String::from_utf8_lossy(&payload).to_string(),
+                ));
+                Ok(b"{}".to_vec())
+            })
+        }
+    }
+
+    /// Wait for the detached report to land, or give up.
+    async fn wait_for_dispatch(
+        d: &Arc<RecordingDispatcher>,
+        n: usize,
+    ) -> Vec<(String, String, String)> {
+        for _ in 0..100 {
+            {
+                let calls = d.calls.lock().unwrap();
+                if calls.len() >= n {
+                    return calls.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        d.calls.lock().unwrap().clone()
+    }
+
+    /// Choosing a mode tells the glass, through the settings
+    /// subject it already reads at mount.
+    ///
+    /// The mode lives on this shelf, but the glass reads
+    /// `audio.options.settings` and nothing else. Rather than
+    /// giving it a second shelf to ask, the mode is written where
+    /// it already looks.
+    #[tokio::test]
+    async fn selecting_a_mode_reports_it_to_audio_options() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.shelf_dispatcher =
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 9,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "ok");
+
+        let calls = wait_for_dispatch(&dispatcher, 1).await;
+        assert_eq!(calls.len(), 1, "exactly one report: {calls:?}");
+        assert_eq!(calls[0].0, "audio.options", "the shelf the glass reads");
+        assert_eq!(calls[0].1, "options.set_composition_mode");
+        assert!(
+            calls[0].2.contains("eq_only"),
+            "the report must carry the mode: {}",
+            calls[0].2
+        );
+    }
+
+    /// A refused gesture reports nothing. The device did not
+    /// change mode, so the glass must not be told it did.
+    #[tokio::test]
+    async fn a_refused_mode_is_not_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.shelf_dispatcher =
+            Some(Arc::clone(&dispatcher) as Arc<dyn ShelfRequestDispatcher>);
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "resampler" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 10,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "bad_request");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            dispatcher.calls.lock().unwrap().is_empty(),
+            "a refused mode must not be reported"
         );
     }
 

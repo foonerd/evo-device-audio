@@ -72,6 +72,7 @@ request_types = [
     "options.set_exclusive_mode",
     "options.set_crossfade_seconds",
     "options.set_gapless",
+    "options.set_composition_mode",
     "options.set_eq_engaged",
     "options.set_eq_band",
     "options.list_eq_presets",
