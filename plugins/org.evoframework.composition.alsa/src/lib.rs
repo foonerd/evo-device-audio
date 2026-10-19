@@ -106,6 +106,7 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use evo_plugin_sdk::contract::audio_routing::{
@@ -138,6 +139,13 @@ pub const PLUGIN_NAME: &str = "org.evoframework.composition.alsa";
 
 /// Sole respondent surface this plugin exposes.
 const REQUEST_COMPOSITION_SELECT_MODE: &str = "composition.select_mode";
+
+/// Filename under the plugin's state directory holding the
+/// active composition mode. One declared mode token, newline
+/// terminated — small enough to read and write whole, and
+/// readable by an operator looking at why their device came back
+/// in the mode it did.
+const MODE_STATE_FILE: &str = "composition_mode";
 
 /// Wire-protocol payload version for the request/response
 /// envelope.
@@ -203,6 +211,10 @@ pub struct AlsaCompositionPlugin {
     /// between passthrough and eq_only processing without
     /// restarting the substrate lifecycle.
     mode_tx: watch::Sender<String>,
+    /// The plugin's own state directory, from
+    /// [`LoadContext::state_dir`]. `None` before load, which is
+    /// how a unit-test construction stays off the filesystem.
+    state_dir: Option<PathBuf>,
     /// Watch channel publishing the operator's EQ runtime
     /// state (engaged flag + 10 band parameters). Seeded with
     /// the audiophile-grade flat defaults at construction;
@@ -293,6 +305,7 @@ impl AlsaCompositionPlugin {
         let (mode_tx, _) = watch::channel(MODE_PASSTHROUGH.to_string());
         let (eq_state_tx, _) = watch::channel(EqRuntimeState::default());
         Self {
+            state_dir: None,
             loaded: false,
             mode_tx,
             eq_state_tx,
@@ -332,6 +345,54 @@ impl AlsaCompositionPlugin {
     pub fn requests_handled(&self) -> u64 {
         self.requests_handled
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Where the active mode is remembered between loads.
+    ///
+    /// `None` until [`Plugin::load`] supplies the plugin's state
+    /// directory, so a plugin constructed for a unit test does
+    /// not write to the machine running it.
+    fn mode_state_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(MODE_STATE_FILE))
+    }
+
+    /// Record the active mode so the next load restores it.
+    ///
+    /// Best-effort and deliberately quiet about absence: with no
+    /// state directory there is nothing to write to and nothing
+    /// to warn about. A write that fails is logged, because the
+    /// operator's next boot will not carry their choice.
+    fn persist_mode(&self, mode: &str) {
+        let Some(path) = self.mode_state_path() else {
+            return;
+        };
+        if let Err(e) = std::fs::write(&path, format!("{}\n", mode.trim())) {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                error = %e,
+                "could not record the active composition mode; the next \
+                 load will fall back to the default. LOGGING.md §2: an \
+                 operator's processing choice silently not surviving a \
+                 restart is the defect this records."
+            );
+        }
+    }
+
+    /// Read back the mode recorded by a previous load.
+    ///
+    /// Anything unreadable, empty, or not a declared mode answers
+    /// `None` and the caller keeps the default. A state file is
+    /// not a reason to refuse a load, and an unknown token in it
+    /// is not a mode this build can honour.
+    fn recorded_mode(&self) -> Option<String> {
+        let path = self.mode_state_path()?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        let mode = raw.trim();
+        if mode.is_empty() || !DECLARED_MODES.contains(&mode) {
+            return None;
+        }
+        Some(mode.to_string())
     }
 
     /// Currently active composition mode. Reads through `mode_tx`
@@ -1079,6 +1140,21 @@ impl Plugin for AlsaCompositionPlugin {
         ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            self.state_dir = Some(ctx.state_dir.clone());
+            // Restore the operator's mode before the substrate
+            // starts, so the first worker subscribes to the mode
+            // they chose rather than to the default and then
+            // switches under them.
+            if let Some(mode) = self.recorded_mode() {
+                if mode != *self.mode_tx.borrow() {
+                    tracing::info!(
+                        plugin = PLUGIN_NAME,
+                        mode = %mode,
+                        "restored the recorded composition mode"
+                    );
+                    self.mode_tx.send_replace(mode);
+                }
+            }
             self.install_routing(ctx.audio_routing.clone())?;
             self.spawn_reactor().await?;
             self.spawn_worker().await?;
@@ -1249,6 +1325,17 @@ impl Respondent for AlsaCompositionPlugin {
             // interior mutability so `handle_request` stays
             // `&self` under the concurrent-dispatch contract.
             self.mode_tx.send_replace(new_mode.clone());
+            // And remember it. The mode was held in memory only,
+            // so a device the operator put into eq_only came back
+            // in passthrough at the next load — their processing
+            // silently off, with nothing on the glass to say so.
+            //
+            // Written after the substrate has been told, and
+            // best-effort: a mode that is active but unrecorded is
+            // a mode that does not survive a restart, which is the
+            // defect's own severity. A mode recorded but refused
+            // by the substrate would be worse.
+            self.persist_mode(&new_mode);
             encode_response(req, SelectModeResponse::ok(new_mode))
         }
     }
@@ -1405,6 +1492,179 @@ mod tests {
                 DECLARED_MODES
             );
         }
+    }
+
+    /// Load has to wire the state directory and restore the
+    /// recorded mode, not merely be able to.
+    ///
+    /// Persisting the mode is worth nothing if nothing reads it
+    /// back, and the read happens in `load`. No test in this tree
+    /// constructs a `LoadContext` — the SDK offers no test
+    /// constructor for one — so `load` cannot be driven from here
+    /// and the wiring is pinned where it lives. Mutating either
+    /// line away leaves every behavioural test green.
+    #[test]
+    fn load_wires_the_state_dir_and_restores_the_mode() {
+        let src = include_str!("lib.rs");
+        let load_at = src
+            .find("    fn load<'a>(")
+            .expect("the plugin must have a load");
+        let body_end = src[load_at + 1..]
+            .find("\n    fn ")
+            .map(|i| load_at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[load_at..body_end];
+
+        assert!(
+            body.contains("self.state_dir = Some(ctx.state_dir.clone())"),
+            "load must take the plugin's state directory, or nothing \
+             can be recorded or read back"
+        );
+        assert!(
+            body.contains("self.recorded_mode()"),
+            "load must restore the recorded mode, or persisting it \
+             changes nothing an operator sees"
+        );
+        // Before the substrate starts, so the first worker
+        // subscribes to the restored mode rather than to the
+        // default and then switching under the operator.
+        let restore = body.find("self.recorded_mode()").expect("checked above");
+        let spawn = body
+            .find("self.spawn_reactor()")
+            .expect("load must spawn the reactor");
+        assert!(
+            restore < spawn,
+            "the mode must be restored before the substrate starts"
+        );
+    }
+
+    /// The gesture itself records the mode.
+    ///
+    /// The tests below drive the helpers directly and stay green
+    /// whether or not anything ever calls them. This one goes in
+    /// through `handle_request`, which is the only path an
+    /// operator has.
+    #[tokio::test]
+    async fn selecting_a_mode_writes_it_to_the_plugin_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "eq_only" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 7,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "ok");
+
+        let recorded =
+            std::fs::read_to_string(dir.path().join(MODE_STATE_FILE))
+                .expect("the gesture must write the state file");
+        assert_eq!(recorded.trim(), MODE_EQ_ONLY);
+    }
+
+    /// A refused gesture records nothing. The device is still in
+    /// the mode it was in, and the state file must say so.
+    #[tokio::test]
+    async fn a_refused_mode_is_not_recorded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.install_routing(Some(Arc::new(StubAudioRouting::new()) as _))
+            .unwrap();
+
+        let req = Request {
+            request_type: REQUEST_COMPOSITION_SELECT_MODE.to_string(),
+            payload: json!({ "v": 1, "mode": "resampler" })
+                .to_string()
+                .into_bytes(),
+            correlation_id: 8,
+            deadline: None,
+            instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
+        };
+        let resp = p.handle_request(&req).await.unwrap();
+        assert_eq!(decode_payload(&resp.payload)["status"], "bad_request");
+        assert!(
+            !dir.path().join(MODE_STATE_FILE).exists(),
+            "a refused mode must not be recorded"
+        );
+    }
+
+    /// The operator's mode survives a restart.
+    ///
+    /// It was held in memory only, so a device put into eq_only
+    /// came back in passthrough at the next load — the operator's
+    /// processing silently off, with nothing on the glass saying
+    /// so. The gesture now records it and the next load reads it
+    /// back.
+    #[tokio::test]
+    async fn the_selected_mode_is_recorded_and_restored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // A gesture on a plugin that knows its state directory.
+        let p = AlsaCompositionPlugin::new();
+        p.persist_mode(MODE_EQ_ONLY);
+        assert!(
+            p.recorded_mode().is_none(),
+            "with no state directory nothing is written and nothing read"
+        );
+
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+        p.persist_mode(MODE_EQ_ONLY);
+        assert_eq!(
+            p.recorded_mode().as_deref(),
+            Some(MODE_EQ_ONLY),
+            "the mode must be readable back"
+        );
+
+        // A fresh load over the same state directory comes up in
+        // the recorded mode, not the default.
+        let mut next = AlsaCompositionPlugin::new();
+        assert_eq!(next.current_mode(), MODE_PASSTHROUGH);
+        next.state_dir = Some(dir.path().to_path_buf());
+        let restored = next.recorded_mode().expect("a mode was recorded");
+        next.mode_tx.send_replace(restored);
+        assert_eq!(
+            next.current_mode(),
+            MODE_EQ_ONLY,
+            "the next load must come up in the recorded mode"
+        );
+    }
+
+    /// A state file is not a reason to refuse a load, and a token
+    /// this build does not declare is not a mode it can honour.
+    #[tokio::test]
+    async fn an_unusable_recorded_mode_falls_back_to_the_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut p = AlsaCompositionPlugin::new();
+        p.state_dir = Some(dir.path().to_path_buf());
+
+        for junk in ["", "   ", "eq-only", "passthru", "../etc/passwd"] {
+            std::fs::write(dir.path().join(MODE_STATE_FILE), junk)
+                .expect("write state");
+            assert!(
+                p.recorded_mode().is_none(),
+                "{junk:?} must not be honoured as a mode"
+            );
+        }
+
+        // And a declared mode still reads back, so the guard above
+        // is not simply refusing everything.
+        std::fs::write(dir.path().join(MODE_STATE_FILE), "eq_only\n")
+            .expect("write state");
+        assert_eq!(p.recorded_mode().as_deref(), Some(MODE_EQ_ONLY));
     }
 
     #[tokio::test]
