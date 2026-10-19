@@ -305,6 +305,30 @@ impl MpdConnection {
         Ok(())
     }
 
+    /// Set MPD's ReplayGain mode.
+    ///
+    /// Wire form: `replay_gain_mode "<off|track|album>"\n`.
+    /// MPD applies the gain tags the decoder read from the file,
+    /// so the mode decides what the listener actually hears:
+    /// `off` plays the file as mastered, `track` levels each
+    /// track against its own tag, `album` levels the album as one
+    /// so the quiet track on a loud record stays quiet.
+    ///
+    /// This is not a volume command. It changes how MPD scales
+    /// the decoded stream, and leaves the mixer — and the
+    /// operator's startup volume — exactly where they are.
+    ///
+    /// MPD also accepts `auto`; this distribution does not offer
+    /// it, because "whichever tag happens to be present" is not a
+    /// choice an operator can reason about.
+    pub async fn set_replay_gain_mode(
+        &mut self,
+        mode: &str,
+    ) -> Result<(), MpdError> {
+        self.dispatch("replay_gain_mode", &[mode]).await?;
+        Ok(())
+    }
+
     /// Set MPD's `single` mode.
     ///
     /// Wire form: `single "<0|1>"\n`. Controls whether MPD stops

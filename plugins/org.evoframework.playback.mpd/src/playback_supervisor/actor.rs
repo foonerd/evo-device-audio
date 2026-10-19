@@ -436,6 +436,27 @@ async fn apply_audio_protocol_settings(
              for this session"
         );
     }
+    // The operator's ReplayGain mode is what MPD plays: `off`
+    // leaves the file as mastered, `track` levels each track
+    // against its own tag, `album` levels the album as one. This
+    // is where the setting stops being a stored preference and
+    // starts changing what the listener hears.
+    //
+    // Not a volume command, and deliberately not sent as one: it
+    // scales the decoded stream and leaves the mixer and the
+    // operator's startup volume where they are.
+    if let Err(e) = cmd_conn
+        .set_replay_gain_mode(settings.replay_gain_mode)
+        .await
+    {
+        tracing::warn!(
+            plugin = PLUGIN_NAME,
+            replay_gain_mode = settings.replay_gain_mode,
+            error = %e,
+            "set_replay_gain_mode rejected; mpd keeps its previous \
+             ReplayGain mode for this session"
+        );
+    }
 }
 
 // ----- internal types -----
@@ -1630,6 +1651,72 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// A protocol-settings receiver carrying one chosen mode.
+    fn protocol_settings_rx_with(
+        replay_gain_mode: &'static str,
+    ) -> watch::Receiver<AudioProtocolSettings> {
+        let (tx, rx) = watch::channel(AudioProtocolSettings {
+            replay_gain_mode,
+            ..AudioProtocolSettings::audiophile_default()
+        });
+        Box::leak(Box::new(tx));
+        rx
+    }
+
+    /// The operator's ReplayGain mode reaches MPD.
+    ///
+    /// The setting existed and changed nothing: no code path
+    /// carried it to the player, so choosing it was a stored
+    /// preference and no more. This is where it stops being that
+    /// and starts changing what the listener hears.
+    #[tokio::test]
+    async fn the_replay_gain_mode_is_applied_to_mpd() {
+        for mode in ["off", "track", "album"] {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (endpoint, _mock) = spawn_mock_mpd(vec![
+                ConnBehaviour::LiveQueue {
+                    commands: Arc::clone(&commands),
+                    items: vec![(11, "INTERNAL/a.flac".to_string())],
+                    playing: None,
+                },
+                ConnBehaviour::HoldAfterWelcome,
+            ])
+            .await;
+
+            let reporter = Arc::new(CapturingReporter::default());
+            let reporter_dyn: Arc<dyn CustodyStateReporter> = reporter.clone();
+            let handle = spawn(
+                endpoint,
+                short_timeouts(),
+                test_custody_handle(),
+                reporter_dyn,
+                SubjectEmitter::null(),
+                protocol_settings_rx_with(mode),
+                SupervisorSpawn {
+                    music_directory: None,
+                    mute: crate::mute_cell::MuteCell::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let seen = commands.lock().unwrap().clone();
+            assert!(
+                seen.iter()
+                    .any(|c| c == &format!("replay_gain_mode \"{mode}\"")),
+                "the chosen mode must reach MPD: wanted {mode}, saw {seen:?}"
+            );
+            // And it is not sent as a volume command. The mixer
+            // and the operator's startup volume stay where they
+            // are.
+            assert!(
+                seen.iter().all(|c| !c.starts_with("setvol")),
+                "ReplayGain must not move the volume: {seen:?}"
+            );
+            handle.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn resume_from_stop_starts_the_queue_head() {
         // Glass Play is `resume` = Pause(false). After reboot
@@ -1697,10 +1784,11 @@ mod tests {
     async fn command_ack_returns_playback_error_ack() {
         // Command-conn: 1 = crossfade (apply_audio_protocol_settings),
         //               2 = single    (apply_audio_protocol_settings),
-        //               3 = status    (initial report),
-        //               4 = currentsong (initial report),
-        //               5 = status    (start_or_resume_playback),
-        //               6 = play 0 -> ACK.
+        //               3 = replay_gain_mode (same),
+        //               4 = status    (initial report),
+        //               5 = currentsong (initial report),
+        //               6 = status    (start_or_resume_playback),
+        //               7 = play 0 -> ACK.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
             ConnBehaviour::AckOnNth {
                 nth: 6,
@@ -1746,13 +1834,14 @@ mod tests {
     async fn command_reconnects_after_transient_drop() {
         // First command-conn:  1 = crossfade (apply_audio_protocol_settings),
         //                      2 = single    (apply_audio_protocol_settings),
-        //                      3 = status    (initial report),
-        //                      4 = currentsong (initial report),
-        //                      5 = play -> close connection.
+        //                      3 = replay_gain_mode (same),
+        //                      4 = status    (initial report),
+        //                      5 = currentsong (initial report),
+        //                      6 = play -> close connection.
         // Second command-conn (reconnect): Standard -> OK on play.
         // Idle conn: hold.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
-            ConnBehaviour::CloseOnNth { nth: 5 },
+            ConnBehaviour::CloseOnNth { nth: 6 },
             ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
         ])
@@ -1799,14 +1888,15 @@ mod tests {
         //   First command-conn:
         //     1 = crossfade (apply_audio_protocol_settings),
         //     2 = single    (apply_audio_protocol_settings),
-        //     3 = status    (initial report),
-        //     4 = currentsong (initial report),
-        //     5 = status (query_state first attempt) -> close.
+        //     3 = replay_gain_mode (same),
+        //     4 = status    (initial report),
+        //     5 = currentsong (initial report),
+        //     6 = status (query_state first attempt) -> close.
         //   Second command-conn (reconnect): Standard -> OK on
         //     status + currentsong retry.
         //   Idle conn: hold.
         let (endpoint, _mock) = spawn_mock_mpd(vec![
-            ConnBehaviour::CloseOnNth { nth: 5 },
+            ConnBehaviour::CloseOnNth { nth: 6 },
             ConnBehaviour::HoldAfterWelcome,
             ConnBehaviour::Standard,
         ])

@@ -197,6 +197,86 @@ const STATE_FILENAME: &str = "state.toml";
 /// the schema and deliberately absent until it exists.
 const DECLARED_COMPOSITION_MODES: &[&str] = &["passthrough", "eq_only"];
 
+/// What ReplayGain does to playback.
+///
+/// MPD applies the gain tags the decoder read from the file, so
+/// this decides what the listener hears: `Disabled` plays the
+/// file as mastered, `Track` levels each track against its own
+/// tag, `Album` levels the album as one so the quiet track on a
+/// loud record stays quiet.
+///
+/// This replaced a bool. A bool could say "level it" but not
+/// "level it against what", and track-vs-album is the whole
+/// question for anyone playing albums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeNormalization {
+    /// Play the file as mastered. The audiophile default: no
+    /// in-chain post-processing unless the operator asks.
+    #[default]
+    Disabled,
+    /// Level each track against its own ReplayGain tag.
+    Track,
+    /// Level the album as one, preserving the dynamics the
+    /// mastering engineer put between its tracks.
+    Album,
+}
+
+impl VolumeNormalization {
+    /// The token carried on the wire and stored in settings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Track => "track",
+            Self::Album => "album",
+        }
+    }
+
+    /// Parse a wire token. `None` for anything this
+    /// distribution does not offer — MPD's `auto` included,
+    /// because "whichever tag happens to be present" is not a
+    /// choice an operator can reason about.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "disabled" => Some(Self::Disabled),
+            "track" => Some(Self::Track),
+            "album" => Some(Self::Album),
+            _ => None,
+        }
+    }
+}
+
+/// Accept the token, and the bool this field used to be.
+///
+/// A device that already has settings on disk carries
+/// `volume_normalization = false` (or `true`). Refusing those
+/// would fail the settings load on upgrade and take every other
+/// option down with it, so the old shape is still read: `false`
+/// is `Disabled`, and `true` is `Track` — levelling per track is
+/// what MPD's `replay_gain_mode track` does and what the bool
+/// was understood to mean.
+impl<'de> serde::Deserialize<'de> for VolumeNormalization {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Bool(true) => Ok(Self::Track),
+            serde_json::Value::Bool(false) => Ok(Self::Disabled),
+            serde_json::Value::String(s) => Self::parse(&s).ok_or_else(|| {
+                D::Error::custom(format!(
+                    "unknown volume_normalization {s:?}; expected \
+                     disabled, track or album"
+                ))
+            }),
+            other => Err(D::Error::custom(format!(
+                "volume_normalization must be a string, got {other}"
+            ))),
+        }
+    }
+}
+
 const REQUEST_TYPES: &[&str] = &[
     "options.get_settings",
     "options.set_resampling",
@@ -395,11 +475,12 @@ pub struct Settings {
     /// distribution's first detected playback card).
     #[serde(default)]
     pub output_device: String,
-    /// `volume_normalization` MPD policy. `true` enables MPD's
-    /// loudness equalisation across tracks; `false` is the
-    /// audiophile default (no in-chain post-processing).
+    /// What ReplayGain does to playback — disabled, per track,
+    /// or per album. See [`VolumeNormalization`]. Default
+    /// `Disabled`: the audiophile posture is no in-chain
+    /// post-processing unless the operator asks for it.
     #[serde(default)]
-    pub volume_normalization: bool,
+    pub volume_normalization: VolumeNormalization,
     /// Initial volume the playback plugin restores on plugin
     /// load / steward restart. Valid range 0..=100. Default 30
     /// — protects ears + speakers when the device boots after a
@@ -556,7 +637,7 @@ impl Default for Settings {
             mixer_control: String::new(),
             dop: false,
             output_device: String::new(),
-            volume_normalization: false,
+            volume_normalization: VolumeNormalization::default(),
             startup_volume_percent: default_startup_volume_percent(),
             composition_mode: String::new(),
             max_volume_percent: default_max_volume_percent(),
@@ -2783,14 +2864,21 @@ impl PlaybackOptionsPlugin {
         req: &Request,
     ) -> Result<Response, PluginError> {
         let payload: SetVolumeNormalizationPayload = parse_versioned(req)?;
+        let Some(mode) = VolumeNormalization::parse(&payload.mode) else {
+            return Err(PluginError::Permanent(format!(
+                "unknown volume_normalization {:?}; expected disabled, \
+                 track or album",
+                payload.mode
+            )));
+        };
         self.settings
             .write()
             .expect("settings RwLock poisoned")
-            .volume_normalization = payload.value;
+            .volume_normalization = mode;
         self.persist_settings().await?;
         self.emit_changed(
             "volume_normalization",
-            serde_json::Value::Bool(payload.value),
+            serde_json::Value::String(mode.as_str().to_string()),
         )
         .await;
         encode(
@@ -3156,7 +3244,9 @@ impl HasPayloadVersion for SetOutputDevicePayload {
 struct SetVolumeNormalizationPayload {
     #[serde(default = "default_payload_version")]
     v: u32,
-    value: bool,
+    /// The mode token. Named `mode`, not `value`: a bool's
+    /// `value` could not say which of two levellings was meant.
+    mode: String,
 }
 
 impl HasPayloadVersion for SetVolumeNormalizationPayload {
@@ -3873,7 +3963,11 @@ mod tests {
         assert!(matches!(s.mixer_type, MixerType::Software));
         assert!(!s.dop);
         assert!(s.output_device.is_empty());
-        assert!(!s.volume_normalization);
+        assert_eq!(
+            s.volume_normalization,
+            VolumeNormalization::Disabled,
+            "audiophile default — the file plays as mastered"
+        );
     }
 
     #[test]
@@ -3905,7 +3999,7 @@ mod tests {
         assert_eq!(v["v"], 1);
         assert_eq!(v["mixer_type"], "software");
         assert_eq!(v["dop"], false);
-        assert_eq!(v["volume_normalization"], false);
+        assert_eq!(v["volume_normalization"], "disabled");
     }
 
     #[tokio::test]
@@ -4138,13 +4232,84 @@ mod tests {
     #[tokio::test]
     async fn set_volume_normalization_round_trips() {
         let (p, _dir) = loaded_plugin().await;
-        p.handle_request(&req(
-            "options.set_volume_normalization",
-            json!({ "v": 1, "value": true }),
-        ))
-        .await
-        .unwrap();
-        assert!(p.settings().volume_normalization);
+        for (token, want) in [
+            ("track", VolumeNormalization::Track),
+            ("album", VolumeNormalization::Album),
+            ("disabled", VolumeNormalization::Disabled),
+        ] {
+            p.handle_request(&req(
+                "options.set_volume_normalization",
+                json!({ "v": 1, "mode": token }),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(p.settings().volume_normalization, want);
+
+            let resp = p
+                .handle_request(&req("options.get_settings", json!({ "v": 1 })))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&resp.payload).unwrap();
+            assert_eq!(
+                v["volume_normalization"], token,
+                "the mode must reach the settings projection the glass reads"
+            );
+        }
+    }
+
+    /// A mode this distribution does not offer is refused, not
+    /// recorded. MPD's `auto` is deliberately absent: "whichever
+    /// tag happens to be present" is not a choice an operator can
+    /// reason about.
+    #[tokio::test]
+    async fn an_unknown_volume_normalization_mode_is_refused() {
+        let (p, _dir) = loaded_plugin().await;
+        for junk in ["auto", "", "Track", "on", "true"] {
+            let got = p
+                .handle_request(&req(
+                    "options.set_volume_normalization",
+                    json!({ "v": 1, "mode": junk }),
+                ))
+                .await;
+            assert!(got.is_err(), "{junk:?} must be refused");
+            assert_eq!(
+                p.settings().volume_normalization,
+                VolumeNormalization::Disabled,
+                "{junk:?} must not be recorded"
+            );
+        }
+    }
+
+    /// Settings already on disk still load.
+    ///
+    /// This field was a bool. Refusing the old shape would fail
+    /// the settings load on upgrade and take every other option
+    /// down with it, so `false` reads as Disabled and `true` as
+    /// Track — levelling per track is what the bool meant.
+    #[test]
+    fn the_bool_this_field_used_to_be_still_loads() {
+        let as_bool: Settings =
+            serde_json::from_value(json!({ "volume_normalization": true }))
+                .expect("a stored bool must still load");
+        assert_eq!(as_bool.volume_normalization, VolumeNormalization::Track);
+
+        let off: Settings =
+            serde_json::from_value(json!({ "volume_normalization": false }))
+                .expect("a stored bool must still load");
+        assert_eq!(off.volume_normalization, VolumeNormalization::Disabled);
+
+        let as_token: Settings =
+            serde_json::from_value(json!({ "volume_normalization": "album" }))
+                .expect("the token must load");
+        assert_eq!(as_token.volume_normalization, VolumeNormalization::Album);
+
+        assert!(
+            serde_json::from_value::<Settings>(
+                json!({ "volume_normalization": "auto" })
+            )
+            .is_err(),
+            "a mode this build does not implement must not load"
+        );
     }
 
     #[tokio::test]

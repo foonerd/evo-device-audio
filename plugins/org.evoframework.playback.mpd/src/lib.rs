@@ -181,6 +181,14 @@ pub const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 /// `identity_name_matches_manifest` test enforces parity.
 pub const PLUGIN_NAME: &str = "org.evoframework.playback.mpd";
 
+/// MPD `replay_gain_mode` arguments this distribution uses.
+/// MPD also accepts `auto`; it is deliberately absent, because
+/// "whichever tag happens to be present" is not a choice an
+/// operator can reason about.
+const REPLAY_GAIN_OFF: &str = "off";
+const REPLAY_GAIN_TRACK: &str = "track";
+const REPLAY_GAIN_ALBUM: &str = "album";
+
 /// Default MPD host for a locally-running daemon.
 const DEFAULT_MPD_HOST: &str = "127.0.0.1";
 /// Default MPD TCP port (matches MPD's upstream default).
@@ -596,6 +604,15 @@ pub(crate) struct AudioProtocolSettings {
     /// engages MPD `single 0` — continue through the queue;
     /// `false` engages MPD `single 1` — stop after each track.
     pub(crate) gapless: bool,
+    /// What ReplayGain does to playback, as the MPD
+    /// `replay_gain_mode` argument: `off`, `track` or `album`.
+    ///
+    /// Carried as the wire token rather than a local enum so
+    /// there is one spelling between the operator's settings,
+    /// this channel and the MPD command. Default `off` — the
+    /// file plays as mastered unless the operator asks
+    /// otherwise.
+    pub(crate) replay_gain_mode: &'static str,
 }
 
 impl AudioProtocolSettings {
@@ -606,6 +623,7 @@ impl AudioProtocolSettings {
         Self {
             crossfade_seconds: 0,
             gapless: true,
+            replay_gain_mode: REPLAY_GAIN_OFF,
         }
     }
 }
@@ -1388,9 +1406,44 @@ fn parse_audio_protocol_settings_from_state(
         .get("gapless")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let replay_gain_mode = state
+        .get("volume_normalization")
+        .and_then(replay_gain_mode_from_setting)
+        .unwrap_or(REPLAY_GAIN_OFF);
     AudioProtocolSettings {
         crossfade_seconds,
         gapless,
+        replay_gain_mode,
+    }
+}
+
+/// MPD's `replay_gain_mode` argument for the operator's
+/// `volume_normalization` setting.
+///
+/// The setting is the mode token `disabled` / `track` / `album`.
+/// `disabled` is MPD's `off`; the other two carry across
+/// unchanged. A token this build does not implement — MPD's
+/// `auto` included — answers `None` and the caller keeps `off`,
+/// because playing a file as mastered is the one outcome that is
+/// never a surprise.
+///
+/// A bool is still read: this field was one, and a device
+/// upgrading has `true` or `false` on disk until the options
+/// plugin next writes its settings. `true` meant levelling per
+/// track.
+fn replay_gain_mode_from_setting(
+    value: &serde_json::Value,
+) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Bool(true) => Some(REPLAY_GAIN_TRACK),
+        serde_json::Value::Bool(false) => Some(REPLAY_GAIN_OFF),
+        serde_json::Value::String(s) => match s.trim() {
+            "disabled" => Some(REPLAY_GAIN_OFF),
+            "track" => Some(REPLAY_GAIN_TRACK),
+            "album" => Some(REPLAY_GAIN_ALBUM),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -4916,7 +4969,7 @@ mod tests {
         // 4 = currentsong, 5 = play -> ACK.
         let (mut p, _mock) = loaded_plugin_with_mock(vec![
             ConnBehaviour::AckOnNth {
-                nth: 5,
+                nth: 6,
                 code: 2,
                 message: "Bad song index".to_string(),
             },
@@ -6245,6 +6298,52 @@ mod tests {
         assert!(!s.gapless);
     }
 
+    /// The operator's mode token becomes MPD's argument.
+    #[test]
+    fn volume_normalization_maps_to_the_mpd_replay_gain_argument() {
+        for (setting, want) in [
+            (json!("disabled"), REPLAY_GAIN_OFF),
+            (json!("track"), REPLAY_GAIN_TRACK),
+            (json!("album"), REPLAY_GAIN_ALBUM),
+        ] {
+            let s = parse_audio_protocol_settings_from_state(
+                &json!({ "volume_normalization": setting }),
+            );
+            assert_eq!(s.replay_gain_mode, want, "for {setting}");
+        }
+    }
+
+    /// The field this setting used to be still reads, so a device
+    /// upgrading keeps playing the way it did until the options
+    /// plugin next writes its settings. `true` meant levelling
+    /// per track.
+    #[test]
+    fn the_bool_volume_normalization_used_to_be_still_maps() {
+        let on = parse_audio_protocol_settings_from_state(
+            &json!({ "volume_normalization": true }),
+        );
+        assert_eq!(on.replay_gain_mode, REPLAY_GAIN_TRACK);
+        let off = parse_audio_protocol_settings_from_state(
+            &json!({ "volume_normalization": false }),
+        );
+        assert_eq!(off.replay_gain_mode, REPLAY_GAIN_OFF);
+    }
+
+    /// Absent, or a mode this build does not implement, plays the
+    /// file as mastered. That is the one outcome that is never a
+    /// surprise.
+    #[test]
+    fn an_unknown_volume_normalization_plays_the_file_as_mastered() {
+        for setting in [json!("auto"), json!("Album"), json!(7), json!(null)] {
+            let s = parse_audio_protocol_settings_from_state(
+                &json!({ "volume_normalization": setting }),
+            );
+            assert_eq!(s.replay_gain_mode, REPLAY_GAIN_OFF, "for {setting}");
+        }
+        let absent = parse_audio_protocol_settings_from_state(&json!({}));
+        assert_eq!(absent.replay_gain_mode, REPLAY_GAIN_OFF);
+    }
+
     #[test]
     fn protocol_settings_ignores_unrelated_fields() {
         let s = parse_audio_protocol_settings_from_state(&json!({
@@ -6388,6 +6487,7 @@ mod tests {
         let (tx, rx) = watch::channel(AudioProtocolSettings {
             crossfade_seconds: 7,
             gapless: false,
+            replay_gain_mode: REPLAY_GAIN_OFF,
         });
 
         let handle = playback_supervisor::spawn(
