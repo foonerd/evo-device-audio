@@ -494,6 +494,32 @@ pub fn extract_options_settings_from_state(
 /// not writable by the steward's service user, or the rename
 /// fails. The caller logs the failure at warn level (recoverable;
 /// the previous drop-in remains on disk).
+/// Would writing `body` to `path` change anything?
+///
+/// The drop-in was rewritten on every settings update, whether
+/// or not the rendered bytes differed, and each rewrite is an
+/// operator-visible "pipeline definition changed" happening plus
+/// a reason for downstream consumers to re-read. An options
+/// change that does not touch this file should not look like one
+/// that does.
+///
+/// `Ok(true)` means the bytes differ, or there is no file yet,
+/// and the write should proceed. `Err` is returned for a read
+/// that failed for any other reason: without the current bytes
+/// there is no evidence a rewrite is needed, and the caller
+/// decides what to do rather than being told "unchanged" or
+/// "changed" on no evidence.
+pub async fn drop_in_needs_rewrite(
+    path: &Path,
+    body: &str,
+) -> io::Result<bool> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(existing) => Ok(existing != body),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn atomic_write_drop_in(path: &Path, body: &str) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::other(format!(
@@ -573,6 +599,56 @@ fn parse_card_device(descriptor: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The drop-in is rewritten only when the bytes changed.
+    ///
+    /// It was rewritten on every settings update, and each
+    /// rewrite is an operator-visible "the pipeline definition
+    /// changed" happening plus a reason for consumers to re-read.
+    /// An options change that does not touch this file must not
+    /// look like one that does.
+    #[tokio::test]
+    async fn a_drop_in_is_rewritten_only_when_the_bytes_changed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evo-options.conf");
+
+        // Absent: there is nothing to compare against, so write.
+        assert!(
+            drop_in_needs_rewrite(&path, "body\n").await.unwrap(),
+            "an absent drop-in must be written"
+        );
+
+        tokio::fs::write(&path, "body\n").await.unwrap();
+        assert!(
+            !drop_in_needs_rewrite(&path, "body\n").await.unwrap(),
+            "identical bytes must not be rewritten"
+        );
+        assert!(
+            drop_in_needs_rewrite(&path, "other\n").await.unwrap(),
+            "changed bytes must be rewritten"
+        );
+    }
+
+    /// A drop-in that cannot be read leaves the file alone.
+    ///
+    /// Without the current bytes there is no evidence a rewrite is
+    /// needed, and the caller must not be told "changed" on no
+    /// evidence — that is how a transient read error becomes a
+    /// rewrite and a happening on every update.
+    #[tokio::test]
+    async fn an_unreadable_drop_in_is_an_error_not_a_rewrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A directory where a file is expected: the read fails
+        // with something other than NotFound.
+        let path = dir.path().join("evo-options.conf");
+        tokio::fs::create_dir(&path).await.unwrap();
+
+        let got = drop_in_needs_rewrite(&path, "body\n").await;
+        assert!(
+            got.is_err(),
+            "an unreadable drop-in must not answer 'rewrite': {got:?}"
+        );
+    }
     use super::*;
 
     #[test]

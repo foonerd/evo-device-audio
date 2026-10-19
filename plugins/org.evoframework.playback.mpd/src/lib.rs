@@ -1086,7 +1086,7 @@ impl MpdPlaybackPlugin {
                 if let Some(cfg) =
                     parse_mixer_config_from_settings_state(&state)
                 {
-                    let _ = mixer_tx.send(cfg);
+                    publish_mixer_config_if_changed(&mixer_tx, cfg);
                 }
                 let protocol = parse_audio_protocol_settings_from_state(&state);
                 let _ = protocol_tx.send(protocol);
@@ -1104,7 +1104,7 @@ impl MpdPlaybackPlugin {
                             if let Some(cfg) =
                                 parse_mixer_config_from_settings_state(state)
                             {
-                                let _ = mixer_tx.send(cfg);
+                                publish_mixer_config_if_changed(&mixer_tx, cfg);
                             }
                             let protocol =
                                 parse_audio_protocol_settings_from_state(state);
@@ -1753,7 +1753,34 @@ async fn apply_fragment_cycle(
     // audio_output is already what we would have written and
     // restarting it under active playback is exactly the fault
     // the audio.terminus WARN classifier flagged.
-    let existing = tokio::fs::read_to_string(fragment_path).await.ok();
+    // A read that fails is not a fragment that differs.
+    //
+    // `.ok()` used to fold every error into `None`, which the
+    // compare below reads as "no file yet" — so an unreadable
+    // fragment took the write-and-restart path on every options
+    // update. A permission change or a transient IO error on that
+    // path became MPD restarting under playback, repeatedly,
+    // until systemd's restart budget stopped it.
+    //
+    // Absent is still absent and still legitimately written. Only
+    // an error we cannot interpret stops the cycle, because
+    // without the current bytes there is no evidence the fragment
+    // needs changing, and a restart on no evidence is the fault.
+    let existing = match tokio::fs::read_to_string(fragment_path).await {
+        Ok(contents) => Some(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                plugin = PLUGIN_NAME,
+                error = %e,
+                path = %fragment_path.display(),
+                "fragment could not be read; leaving it and MPD alone. \
+                 LOGGING.md §2: the operator's audio_output may be stale \
+                 and this names why."
+            );
+            return FragmentWorkerStatus::Idle;
+        }
+    };
     if fragment_content_matches(existing.as_deref(), &rendered) {
         tracing::debug!(
             plugin = PLUGIN_NAME,
@@ -1805,6 +1832,31 @@ async fn apply_fragment_cycle(
 ///
 /// Isolated from `apply_fragment_cycle` so the dedupe rule is
 /// unit-testable without a filesystem or a restarter mock.
+/// Publish a mixer config only when it differs from the one
+/// already on the channel. Returns `true` when subscribers were
+/// notified.
+///
+/// `watch::Sender::send` notifies unconditionally, and the
+/// fragment worker wakes on every notification. The operator's
+/// audio options carry far more than the mixer mode, so an update
+/// that changed a band or a volume used to start a render cycle
+/// whose only possible outcome was reading the fragment back and
+/// finding it identical — and on a box where that read fails, a
+/// restart.
+fn publish_mixer_config_if_changed(
+    tx: &watch::Sender<MixerConfig>,
+    cfg: MixerConfig,
+) -> bool {
+    tx.send_if_modified(|current| {
+        if *current == cfg {
+            false
+        } else {
+            *current = cfg;
+            true
+        }
+    })
+}
+
 fn fragment_content_matches(existing: Option<&str>, rendered: &str) -> bool {
     match existing {
         Some(prev) => prev == rendered,
@@ -5272,6 +5324,108 @@ mod tests {
 
         p.stop_fragment_worker().await;
         p.stop_reactor().await;
+    }
+
+    /// Both options-update paths go through the gate.
+    ///
+    /// The subscriber publishes the mixer config from two places —
+    /// the seed read and each subsequent state update — and the
+    /// gate only helps where it is actually called. A bare
+    /// `mixer_tx.send` at either site restores the wake-on-every-
+    /// update behaviour with the helper's own test still green.
+    #[test]
+    fn every_mixer_publication_goes_through_the_gate() {
+        let src = include_str!("lib.rs");
+        let body = &src[..src.find("mod tests {").unwrap_or(src.len())];
+        assert_eq!(
+            body.matches("publish_mixer_config_if_changed(&mixer_tx,")
+                .count(),
+            2,
+            "both publication sites must use the gate"
+        );
+        assert!(
+            !body.contains("mixer_tx.send("),
+            "no publication may bypass the gate"
+        );
+    }
+
+    /// An unchanged mixer config does not wake the worker.
+    ///
+    /// The operator's audio options carry bands, volumes and a
+    /// mixer mode on one subject. Every update used to republish
+    /// the mixer mode whether or not it moved, and the fragment
+    /// worker wakes on every publication — so changing a band
+    /// started a render cycle whose only possible outcome was
+    /// finding the fragment identical.
+    #[test]
+    fn an_unchanged_mixer_config_is_not_republished() {
+        let (tx, mut rx) = watch::channel(MixerConfig::Software);
+        rx.borrow_and_update();
+
+        assert!(
+            !publish_mixer_config_if_changed(&tx, MixerConfig::Software),
+            "the same mixer config must not notify"
+        );
+        assert!(!rx.has_changed().unwrap(), "no subscriber may be woken");
+
+        assert!(
+            publish_mixer_config_if_changed(&tx, MixerConfig::None),
+            "a different mixer config must notify"
+        );
+        assert!(rx.has_changed().unwrap(), "a real change must wake");
+        assert_eq!(*rx.borrow_and_update(), MixerConfig::None);
+    }
+
+    /// A fragment that cannot be read is not a fragment that
+    /// differs, and must not restart MPD.
+    ///
+    /// The read folded every error into "no file yet", which the
+    /// compare treats as a reason to write and restart. A
+    /// permission change or a transient IO error on that path
+    /// became MPD restarting under playback on every options
+    /// update, until systemd's restart budget stopped it.
+    #[tokio::test]
+    async fn an_unreadable_fragment_warns_and_does_not_restart_mpd() {
+        let tempdir = tempfile::tempdir().unwrap();
+        // A directory where a file is expected: the read fails
+        // with something other than NotFound.
+        let fragment_path = tempdir.path().join("mpd.conf");
+        std::fs::create_dir(&fragment_path).unwrap();
+
+        let restarter = Arc::new(NoOpRestarter::new());
+        let mut p = MpdPlaybackPlugin::new()
+            .with_restarter(Arc::clone(&restarter) as Arc<dyn MpdRestarter>)
+            .with_fragment_path(fragment_path.clone());
+        let stub = Arc::new(StubSourceAudioRouting::new());
+        stub.set_write_endpoint(default_alsa_write_endpoint());
+        p.install_routing(Some(Arc::clone(&stub) as Arc<dyn F3AudioRouting>))
+            .unwrap();
+        p.spawn_reactor().await.unwrap();
+        p.spawn_fragment_worker().await.unwrap();
+
+        // The witness is whether a write was attempted at all.
+        // `atomic_write_fragment` stages through a sibling
+        // `.<name>.tmp`, so that file appearing means the cycle
+        // went past the read and tried to replace the fragment —
+        // which is the path that ends in a restart. Waiting on a
+        // worker status cannot witness this: the status channel is
+        // seeded Idle, so a wait for Idle succeeds before any
+        // cycle has run.
+        let staging = tempdir.path().join(".mpd.conf.tmp");
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                !staging.exists(),
+                "no write may be attempted when the fragment cannot be read"
+            );
+            assert_eq!(
+                restarter.call_count(),
+                0,
+                "MPD must not be restarted on a failed fragment read"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

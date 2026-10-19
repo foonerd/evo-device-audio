@@ -679,13 +679,70 @@ impl AlsaDeliveryPlugin {
                                     }
                                 };
                                 let render_bytes = body.len();
-                                let write_outcome = options_render::atomic_write_drop_in(
+                                // Compare before rewriting. Every
+                                // rewrite is an operator-visible
+                                // "the pipeline definition
+                                // changed" happening and a reason
+                                // for consumers to re-read; an
+                                // options update that left this
+                                // file alone should not look like
+                                // one that changed it. A read that
+                                // fails for any reason other than
+                                // absence leaves the file alone,
+                                // because without the current
+                                // bytes there is no evidence a
+                                // rewrite is needed.
+                                let mut read_failed = false;
+                                let rewrite = match options_render::drop_in_needs_rewrite(
                                     &drop_in_path,
                                     &body,
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            plugin = PLUGIN_NAME,
+                                            drop_in_path = %drop_in_path.display(),
+                                            error = %e,
+                                            "audio-options drop-in could not be \
+                                             read; prior pipeline retained. \
+                                             LOGGING.md §2: the on-disk pipeline \
+                                             may be stale and this names why."
+                                        );
+                                        read_failed = true;
+                                        false
+                                    }
+                                };
+                                if !rewrite {
+                                    tracing::debug!(
+                                        plugin = PLUGIN_NAME,
+                                        drop_in_path = %drop_in_path.display(),
+                                        "audio-options drop-in unchanged; \
+                                         not rewritten"
+                                    );
+                                }
+                                // The observation below is still
+                                // emitted either way: it records
+                                // that the settings were seen, not
+                                // that the file moved.
+                                let write_outcome = if rewrite {
+                                    Some(
+                                        options_render::atomic_write_drop_in(
+                                            &drop_in_path,
+                                            &body,
+                                        )
+                                        .await,
+                                    )
+                                } else {
+                                    None
+                                };
                                 match &write_outcome {
-                                    Ok(()) => {
+                                    // Nothing was written, so
+                                    // nothing is reported as
+                                    // written.
+                                    None => {}
+                                    Some(Ok(())) => {
                                         // LOGGING.md §2: info
                                         // (operator-visible
                                         // lifecycle narrative —
@@ -699,7 +756,7 @@ impl AlsaDeliveryPlugin {
                                             "audio-options drop-in rewritten"
                                         );
                                     }
-                                    Err(e) => {
+                                    Some(Err(e)) => {
                                         // LOGGING.md §2: warn
                                         // (recoverable; the
                                         // previous drop-in
@@ -750,7 +807,17 @@ impl AlsaDeliveryPlugin {
                                     "drop_in_path":
                                         drop_in_path.display().to_string(),
                                     "render_bytes": render_bytes,
-                                    "write_ok": write_outcome.is_ok(),
+                                    // True when the drop-in on disk is
+                                    // what we just rendered —
+                                    // whether this update wrote it
+                                    // or found it already matching.
+                                    // A read we could not perform
+                                    // leaves that unknown, and
+                                    // unknown is not ok.
+                                    "write_ok": match &write_outcome {
+                                        Some(r) => r.is_ok(),
+                                        None => !read_failed,
+                                    },
                                 });
                                 if let Err(e) = happening_emitter
                                     .emit_plugin_event(
